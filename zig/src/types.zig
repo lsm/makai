@@ -1,0 +1,269 @@
+const std = @import("std");
+
+// Tool parameter schema (JSON Schema subset)
+pub const ToolParameter = struct {
+    name: []const u8,
+    param_type: []const u8, // "string", "number", "boolean", "object", "array"
+    description: ?[]const u8 = null,
+    required: bool = false,
+};
+
+// Tool definition for function calling
+pub const Tool = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    parameters: []const ToolParameter = &[_]ToolParameter{},
+};
+
+// Tool choice options
+pub const ToolChoice = union(enum) {
+    auto,
+    none,
+    any,
+    specific: []const u8, // tool name
+};
+
+// Content block types
+pub const TextBlock = struct {
+    text: []const u8,
+};
+
+pub const ToolUseBlock = struct {
+    id: []const u8,
+    name: []const u8,
+    input_json: []const u8,
+};
+
+pub const ThinkingBlock = struct {
+    thinking: []const u8,
+};
+
+pub const ImageBlock = struct {
+    media_type: []const u8, // "image/jpeg", "image/png", etc.
+    data: []const u8, // base64 encoded
+};
+
+// ContentBlock - tagged union
+pub const ContentBlock = union(enum) {
+    text: TextBlock,
+    tool_use: ToolUseBlock,
+    thinking: ThinkingBlock,
+    image: ImageBlock,
+};
+
+// Usage tracking
+pub const Usage = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_tokens: u64 = 0,
+    cache_write_tokens: u64 = 0,
+
+    pub fn add(self: *Usage, other: Usage) void {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_write_tokens += other.cache_write_tokens;
+    }
+
+    pub fn total(self: Usage) u64 {
+        return self.input_tokens + self.output_tokens +
+               self.cache_read_tokens + self.cache_write_tokens;
+    }
+};
+
+// Message roles
+pub const Role = enum {
+    user,
+    assistant,
+    tool_result,
+};
+
+// Stop reasons
+pub const StopReason = enum {
+    stop,
+    length,
+    tool_use,
+    @"error",
+    aborted,
+};
+
+// Basic message
+pub const Message = struct {
+    role: Role,
+    content: []const ContentBlock,
+    timestamp: i64,
+};
+
+// Assistant message with full metadata
+pub const AssistantMessage = struct {
+    content: []const ContentBlock,
+    usage: Usage,
+    stop_reason: StopReason,
+    model: []const u8,
+    timestamp: i64,
+};
+
+// Event structures for streaming
+pub const StartEvent = struct {
+    model: []const u8,
+};
+
+pub const ContentIndexEvent = struct {
+    index: usize,
+};
+
+pub const DeltaEvent = struct {
+    index: usize,
+    delta: []const u8,
+};
+
+pub const ContentEndEvent = struct {
+    index: usize,
+};
+
+pub const ToolCallStartEvent = struct {
+    index: usize,
+    id: []const u8,
+    name: []const u8,
+};
+
+pub const ToolCallEndEvent = struct {
+    index: usize,
+    input_json: []const u8,
+};
+
+pub const DoneEvent = struct {
+    usage: Usage,
+    stop_reason: StopReason,
+};
+
+pub const ErrorEvent = struct {
+    message: []const u8,
+};
+
+// MessageEvent - 13-variant tagged union for streaming
+pub const MessageEvent = union(enum) {
+    start: StartEvent,
+    text_start: ContentIndexEvent,
+    text_delta: DeltaEvent,
+    text_end: ContentEndEvent,
+    thinking_start: ContentIndexEvent,
+    thinking_delta: DeltaEvent,
+    thinking_end: ContentEndEvent,
+    toolcall_start: ToolCallStartEvent,
+    toolcall_delta: DeltaEvent,
+    toolcall_end: ToolCallEndEvent,
+    done: DoneEvent,
+    @"error": ErrorEvent,
+    ping: void,
+};
+
+// Tests
+test "Usage add and total" {
+    var usage1 = Usage{
+        .input_tokens = 100,
+        .output_tokens = 50,
+        .cache_read_tokens = 20,
+        .cache_write_tokens = 10,
+    };
+
+    const usage2 = Usage{
+        .input_tokens = 50,
+        .output_tokens = 30,
+        .cache_read_tokens = 10,
+        .cache_write_tokens = 5,
+    };
+
+    usage1.add(usage2);
+
+    try std.testing.expectEqual(@as(u64, 150), usage1.input_tokens);
+    try std.testing.expectEqual(@as(u64, 80), usage1.output_tokens);
+    try std.testing.expectEqual(@as(u64, 30), usage1.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 15), usage1.cache_write_tokens);
+    try std.testing.expectEqual(@as(u64, 275), usage1.total());
+}
+
+test "ContentBlock variants" {
+    const text_block = ContentBlock{ .text = TextBlock{ .text = "hello" } };
+    const tool_block = ContentBlock{ .tool_use = ToolUseBlock{
+        .id = "1",
+        .name = "search",
+        .input_json = "{}",
+    } };
+    const thinking_block = ContentBlock{ .thinking = ThinkingBlock{ .thinking = "thinking..." } };
+
+    try std.testing.expect(std.meta.activeTag(text_block) == .text);
+    try std.testing.expect(std.meta.activeTag(tool_block) == .tool_use);
+    try std.testing.expect(std.meta.activeTag(thinking_block) == .thinking);
+}
+
+test "MessageEvent variants" {
+    const start_event = MessageEvent{ .start = StartEvent{ .model = "claude-3" } };
+    const text_delta = MessageEvent{ .text_delta = DeltaEvent{ .index = 0, .delta = "hello" } };
+    const done_event = MessageEvent{ .done = DoneEvent{
+        .usage = Usage{},
+        .stop_reason = .stop,
+    } };
+
+    try std.testing.expect(std.meta.activeTag(start_event) == .start);
+    try std.testing.expect(std.meta.activeTag(text_delta) == .text_delta);
+    try std.testing.expect(std.meta.activeTag(done_event) == .done);
+}
+
+test "Tool and ToolParameter" {
+    const param = ToolParameter{
+        .name = "location",
+        .param_type = "string",
+        .description = "City name",
+        .required = true,
+    };
+
+    try std.testing.expectEqualStrings("location", param.name);
+    try std.testing.expectEqualStrings("string", param.param_type);
+    try std.testing.expectEqualStrings("City name", param.description.?);
+    try std.testing.expect(param.required);
+
+    const tool = Tool{
+        .name = "get_weather",
+        .description = "Get weather info",
+        .parameters = &[_]ToolParameter{param},
+    };
+
+    try std.testing.expectEqualStrings("get_weather", tool.name);
+    try std.testing.expectEqualStrings("Get weather info", tool.description.?);
+    try std.testing.expectEqual(@as(usize, 1), tool.parameters.len);
+}
+
+test "ToolChoice variants" {
+    const auto_choice = ToolChoice{ .auto = {} };
+    const none_choice = ToolChoice{ .none = {} };
+    const any_choice = ToolChoice{ .any = {} };
+    const specific_choice = ToolChoice{ .specific = "get_weather" };
+
+    try std.testing.expect(std.meta.activeTag(auto_choice) == .auto);
+    try std.testing.expect(std.meta.activeTag(none_choice) == .none);
+    try std.testing.expect(std.meta.activeTag(any_choice) == .any);
+    try std.testing.expect(std.meta.activeTag(specific_choice) == .specific);
+    try std.testing.expectEqualStrings("get_weather", specific_choice.specific);
+}
+
+test "ImageBlock" {
+    const image = ImageBlock{
+        .media_type = "image/jpeg",
+        .data = "base64data",
+    };
+
+    try std.testing.expectEqualStrings("image/jpeg", image.media_type);
+    try std.testing.expectEqualStrings("base64data", image.data);
+}
+
+test "ContentBlock with image" {
+    const image_block = ContentBlock{ .image = ImageBlock{
+        .media_type = "image/png",
+        .data = "iVBORw0KGgo=",
+    } };
+
+    try std.testing.expect(std.meta.activeTag(image_block) == .image);
+    try std.testing.expectEqualStrings("image/png", image_block.image.media_type);
+    try std.testing.expectEqualStrings("iVBORw0KGgo=", image_block.image.data);
+}
