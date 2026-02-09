@@ -2,7 +2,6 @@ const std = @import("std");
 const types = @import("types");
 const event_stream = @import("event_stream");
 const provider = @import("provider");
-const zio = @import("zio");
 
 pub const MockConfig = struct {
     events: []const types.MessageEvent,
@@ -18,7 +17,7 @@ const StreamContext = struct {
     allocator: std.mem.Allocator,
 };
 
-fn fiberTask(context: *StreamContext) !void {
+fn producerThread(context: *StreamContext) void {
     for (context.events) |event| {
         context.stream.push(event) catch |err| {
             const err_msg = std.fmt.allocPrint(
@@ -26,7 +25,9 @@ fn fiberTask(context: *StreamContext) !void {
                 "Failed to push event: {any}",
                 .{err},
             ) catch "Unknown error";
-            context.stream.completeWithError(err_msg);
+            const stream = context.stream;
+            context.allocator.destroy(context);
+            stream.completeWithError(err_msg);
             return;
         };
 
@@ -35,54 +36,22 @@ fn fiberTask(context: *StreamContext) !void {
         }
     }
 
-    context.stream.complete(context.final_result);
-}
-
-fn runtimeThread(context: *StreamContext) void {
-    defer context.allocator.destroy(context);
-
-    const rt = zio.Runtime.init(context.allocator, .{}) catch |err| {
-        const err_msg = std.fmt.allocPrint(
-            context.allocator,
-            "Failed to init ZIO runtime: {any}",
-            .{err},
-        ) catch "Unknown error";
-        context.stream.completeWithError(err_msg);
-        return;
-    };
-    defer rt.deinit();
-
-    var group: zio.Group = .init;
-    defer group.cancel();
-
-    group.spawn(fiberTask, .{context}) catch |err| {
-        const err_msg = std.fmt.allocPrint(
-            context.allocator,
-            "Failed to spawn fiber: {any}",
-            .{err},
-        ) catch "Unknown error";
-        context.stream.completeWithError(err_msg);
-        return;
-    };
-
-    group.wait() catch |err| {
-        const err_msg = std.fmt.allocPrint(
-            context.allocator,
-            "Fiber execution failed: {any}",
-            .{err},
-        ) catch "Unknown error";
-        context.stream.completeWithError(err_msg);
-    };
+    // Free context before signaling completion, since the consumer
+    // may exit immediately after complete() and trigger leak detection.
+    const stream = context.stream;
+    const final_result = context.final_result;
+    context.allocator.destroy(context);
+    stream.complete(final_result);
 }
 
 fn mockStreamFn(
+    ctx: *anyopaque,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) !*event_stream.AssistantMessageStream {
+    _ = ctx;
     _ = messages;
 
-    // This is a simplified version - in real usage, config would be captured in a closure
-    // For now, we'll create a basic stream that immediately completes
     const stream = try allocator.create(event_stream.AssistantMessageStream);
     stream.* = event_stream.AssistantMessageStream.init(allocator);
 
@@ -98,14 +67,21 @@ fn mockStreamFn(
     return stream;
 }
 
+fn mockDeinitFn(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const config: *MockConfig = @ptrCast(@alignCast(ctx));
+    allocator.destroy(config);
+}
+
 pub fn createMockProvider(config: MockConfig, allocator: std.mem.Allocator) !provider.Provider {
-    _ = config;
-    _ = allocator;
+    const config_ptr = try allocator.create(MockConfig);
+    config_ptr.* = config;
 
     return provider.Provider{
         .id = "mock",
         .name = "Mock Provider",
+        .context = config_ptr,
         .stream_fn = mockStreamFn,
+        .deinit_fn = mockDeinitFn,
     };
 }
 
@@ -131,8 +107,7 @@ pub fn createMockStream(
         .allocator = allocator,
     };
 
-    // Spawn a thread that will run a ZIO runtime and execute the fiber
-    const thread = try std.Thread.spawn(.{}, runtimeThread, .{context});
+    const thread = try std.Thread.spawn(.{}, producerThread, .{context});
     thread.detach();
 
     return stream;
@@ -151,9 +126,10 @@ test "Mock provider creation" {
         },
     };
 
-    const mock_provider = try createMockProvider(config, std.testing.allocator);
-    try std.testing.expectEqualStrings("mock", mock_provider.id);
-    try std.testing.expectEqualStrings("Mock Provider", mock_provider.name);
+    var mock = try createMockProvider(config, std.testing.allocator);
+    defer mock.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("mock", mock.id);
+    try std.testing.expectEqualStrings("Mock Provider", mock.name);
 }
 
 test "Mock stream immediate completion" {
