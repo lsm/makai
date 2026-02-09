@@ -19,8 +19,6 @@ const FiberContext = struct {
 };
 
 fn fiberTask(context: *FiberContext) void {
-    defer context.allocator.destroy(context);
-
     for (context.events) |event| {
         context.stream.push(event) catch |err| {
             const err_msg = std.fmt.allocPrint(
@@ -28,7 +26,9 @@ fn fiberTask(context: *FiberContext) void {
                 "Failed to push event: {any}",
                 .{err},
             ) catch "Unknown error";
-            context.stream.completeWithError(err_msg);
+            const stream = context.stream;
+            context.allocator.destroy(context);
+            stream.completeWithError(err_msg);
             return;
         };
 
@@ -37,13 +37,20 @@ fn fiberTask(context: *FiberContext) void {
         }
     }
 
-    context.stream.complete(context.final_result);
+    // Free context before signaling completion, since the consumer
+    // may exit immediately after complete() and trigger leak detection.
+    const stream = context.stream;
+    const final_result = context.final_result;
+    context.allocator.destroy(context);
+    stream.complete(final_result);
 }
 
 fn mockStreamFn(
+    ctx: *anyopaque,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) !*event_stream.AssistantMessageStream {
+    _ = ctx;
     _ = messages;
 
     const stream = try allocator.create(event_stream.AssistantMessageStream);
@@ -61,14 +68,21 @@ fn mockStreamFn(
     return stream;
 }
 
+fn fiberMockDeinitFn(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    const config: *FiberMockConfig = @ptrCast(@alignCast(ctx));
+    allocator.destroy(config);
+}
+
 pub fn createFiberMockProvider(config: FiberMockConfig, allocator: std.mem.Allocator) !provider.Provider {
-    _ = config;
-    _ = allocator;
+    const config_ptr = try allocator.create(FiberMockConfig);
+    config_ptr.* = config;
 
     return provider.Provider{
         .id = "fiber-mock",
         .name = "Fiber Mock Provider (ZIO-based)",
+        .context = config_ptr,
         .stream_fn = mockStreamFn,
+        .deinit_fn = fiberMockDeinitFn,
     };
 }
 
@@ -114,8 +128,9 @@ test "Fiber mock provider creation" {
         },
     };
 
-    const mock_provider = try createFiberMockProvider(config, std.testing.allocator);
-    try std.testing.expectEqualStrings("fiber-mock", mock_provider.id);
+    var mock = try createFiberMockProvider(config, std.testing.allocator);
+    defer mock.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("fiber-mock", mock.id);
 }
 
 test "Fiber mock stream immediate completion" {

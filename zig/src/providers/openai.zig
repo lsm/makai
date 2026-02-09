@@ -16,14 +16,14 @@ pub const OpenAIContext = struct {
 pub fn createProvider(
     cfg: config.OpenAIConfig,
     allocator: std.mem.Allocator,
-) !provider.ProviderV2 {
+) !provider.Provider {
     const ctx = try allocator.create(OpenAIContext);
     ctx.* = .{
         .config = cfg,
         .allocator = allocator,
     };
 
-    return provider.ProviderV2{
+    return provider.Provider{
         .id = "openai",
         .name = "OpenAI GPT",
         .context = @ptrCast(ctx),

@@ -16,14 +16,14 @@ pub const AnthropicContext = struct {
 pub fn createProvider(
     cfg: config.AnthropicConfig,
     allocator: std.mem.Allocator,
-) !provider.ProviderV2 {
+) !provider.Provider {
     const ctx = try allocator.create(AnthropicContext);
     ctx.* = .{
         .config = cfg,
         .allocator = allocator,
     };
 
-    return provider.ProviderV2{
+    return provider.Provider{
         .id = "anthropic",
         .name = "Anthropic Claude",
         .context = @ptrCast(ctx),

@@ -15,14 +15,14 @@ pub const OllamaContext = struct {
 pub fn createProvider(
     cfg: config.OllamaConfig,
     allocator: std.mem.Allocator,
-) !provider.ProviderV2 {
+) !provider.Provider {
     const ctx = try allocator.create(OllamaContext);
     ctx.* = .{
         .config = cfg,
         .allocator = allocator,
     };
 
-    return provider.ProviderV2{
+    return provider.Provider{
         .id = "ollama",
         .name = "Ollama Local",
         .context = @ptrCast(ctx),

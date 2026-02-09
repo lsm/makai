@@ -170,6 +170,7 @@ fn benchContentBlockSwitch(allocator: std.mem.Allocator) !void {
             .text => sum += 1,
             .tool_use => sum += 2,
             .thinking => sum += 3,
+            .image => sum += 4,
         }
     }
 
