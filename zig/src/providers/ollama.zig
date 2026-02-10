@@ -88,6 +88,14 @@ fn streamThread(ctx: *StreamThreadContext) void {
 
 /// Main streaming implementation
 fn streamImpl(ctx: *StreamThreadContext) !void {
+    // Check cancellation before starting
+    if (ctx.config.cancel_token) |token| {
+        if (token.isCancelled()) {
+            ctx.stream.completeWithError("Stream cancelled");
+            return;
+        }
+    }
+
     var client = std.http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
 
@@ -105,6 +113,13 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     request.transfer_encoding = .chunked;
 
     try request.headers.append("content-type", "application/json");
+
+    // Apply custom headers
+    if (ctx.config.custom_headers) |headers| {
+        for (headers) |h| {
+            request.headers.append(h.name, h.value) catch {};
+        }
+    }
 
     try request.send();
     try request.writeAll(ctx.request_body);
@@ -153,6 +168,14 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     defer if (model_owned) |m| ctx.allocator.free(m);
 
     while (true) {
+        // Check cancellation between chunks
+        if (ctx.config.cancel_token) |token| {
+            if (token.isCancelled()) {
+                ctx.stream.completeWithError("Stream cancelled");
+                return;
+            }
+        }
+
         const bytes_read = try request.reader().read(&buffer);
         if (bytes_read == 0) break;
 

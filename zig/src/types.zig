@@ -26,16 +26,19 @@ pub const ToolChoice = union(enum) {
 // Content block types
 pub const TextBlock = struct {
     text: []const u8,
+    signature: ?[]const u8 = null,
 };
 
 pub const ToolUseBlock = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
+    thought_signature: ?[]const u8 = null,
 };
 
 pub const ThinkingBlock = struct {
     thinking: []const u8,
+    signature: ?[]const u8 = null,
 };
 
 pub const ImageBlock = struct {
@@ -83,6 +86,7 @@ pub const StopReason = enum {
     stop,
     length,
     tool_use,
+    content_filter,
     @"error",
     aborted,
 };
@@ -91,6 +95,9 @@ pub const StopReason = enum {
 pub const Message = struct {
     role: Role,
     content: []const ContentBlock,
+    tool_call_id: ?[]const u8 = null,
+    tool_name: ?[]const u8 = null,
+    is_error: bool = false,
     timestamp: i64,
 };
 
@@ -266,4 +273,47 @@ test "ContentBlock with image" {
     try std.testing.expect(std.meta.activeTag(image_block) == .image);
     try std.testing.expectEqualStrings("image/png", image_block.image.media_type);
     try std.testing.expectEqualStrings("iVBORw0KGgo=", image_block.image.data);
+}
+
+test "TextBlock with signature" {
+    const block = TextBlock{ .text = "hello", .signature = "sig123" };
+    try std.testing.expectEqualStrings("sig123", block.signature.?);
+
+    const block_no_sig = TextBlock{ .text = "hello" };
+    try std.testing.expect(block_no_sig.signature == null);
+}
+
+test "ThinkingBlock with signature" {
+    const block = ThinkingBlock{ .thinking = "reasoning", .signature = "think_sig" };
+    try std.testing.expectEqualStrings("think_sig", block.signature.?);
+}
+
+test "ToolUseBlock with thought signature" {
+    const block = ToolUseBlock{ .id = "id1", .name = "tool1", .input_json = "{}", .thought_signature = "thought_sig" };
+    try std.testing.expectEqualStrings("thought_sig", block.thought_signature.?);
+}
+
+test "Message with tool result metadata" {
+    const msg = Message{
+        .role = .tool_result,
+        .content = &[_]ContentBlock{},
+        .tool_call_id = "call_123",
+        .tool_name = "bash",
+        .is_error = true,
+        .timestamp = 1000,
+    };
+    try std.testing.expectEqualStrings("call_123", msg.tool_call_id.?);
+    try std.testing.expectEqualStrings("bash", msg.tool_name.?);
+    try std.testing.expect(msg.is_error);
+}
+
+test "Message defaults backward compatible" {
+    const msg = Message{
+        .role = .user,
+        .content = &[_]ContentBlock{},
+        .timestamp = 1000,
+    };
+    try std.testing.expect(msg.tool_name == null);
+    try std.testing.expect(!msg.is_error);
+    try std.testing.expect(msg.tool_call_id == null);
 }
