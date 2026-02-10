@@ -89,6 +89,14 @@ fn streamThread(ctx: *StreamThreadContext) void {
 
 /// Main streaming implementation
 fn streamImpl(ctx: *StreamThreadContext) !void {
+    // Check cancellation before starting
+    if (ctx.config.cancel_token) |token| {
+        if (token.isCancelled()) {
+            ctx.stream.completeWithError("Stream cancelled");
+            return;
+        }
+    }
+
     var client = std.http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
 
@@ -108,6 +116,13 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     try request.headers.append("x-api-key", ctx.config.auth.api_key);
     try request.headers.append("anthropic-version", ctx.config.api_version);
     try request.headers.append("content-type", "application/json");
+
+    // Apply custom headers
+    if (ctx.config.custom_headers) |headers| {
+        for (headers) |h| {
+            request.headers.append(h.name, h.value) catch {};
+        }
+    }
 
     try request.send();
     try request.writeAll(ctx.request_body);
@@ -147,6 +162,15 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         accumulated_content.deinit();
     }
 
+    var signatures = std.AutoHashMap(usize, std.ArrayList(u8)).init(ctx.allocator);
+    defer {
+        var it = signatures.valueIterator();
+        while (it.next()) |list| {
+            list.deinit();
+        }
+        signatures.deinit();
+    }
+
     var usage = types.Usage{};
     var stop_reason: types.StopReason = .stop;
     var model: []const u8 = ctx.config.model;
@@ -154,12 +178,52 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     defer if (model_owned) |m| ctx.allocator.free(m);
 
     while (true) {
+        // Check cancellation between chunks
+        if (ctx.config.cancel_token) |token| {
+            if (token.isCancelled()) {
+                ctx.stream.completeWithError("Stream cancelled");
+                return;
+            }
+        }
+
         const bytes_read = try request.reader().read(&buffer);
         if (bytes_read == 0) break;
 
         const events = try parser.feed(buffer[0..bytes_read]);
 
         for (events) |event| {
+            // Check for signature_delta before normal event processing
+            if (event.data.len > 0) {
+                if (std.mem.indexOf(u8, event.data, "\"signature_delta\"") != null) {
+                    // Parse signature delta
+                    const parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, event.data, .{}) catch continue;
+                    defer parsed.deinit();
+                    const root = parsed.value;
+
+                    if (root == .object) {
+                        const delta_obj = root.object.get("delta") orelse continue;
+                        if (delta_obj == .object) {
+                            const delta_type = delta_obj.object.get("type") orelse continue;
+                            if (delta_type == .string and std.mem.eql(u8, delta_type.string, "signature_delta")) {
+                                const sig_val = delta_obj.object.get("signature") orelse continue;
+                                if (sig_val == .string) {
+                                    const index_val = root.object.get("index") orelse continue;
+                                    if (index_val == .integer) {
+                                        const idx: usize = @intCast(@as(u64, @bitCast(index_val.integer)));
+                                        const entry = try signatures.getOrPut(idx);
+                                        if (!entry.found_existing) {
+                                            entry.value_ptr.* = std.ArrayList(u8).init(ctx.allocator);
+                                        }
+                                        try entry.value_ptr.appendSlice(sig_val.string);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue; // Skip normal event processing for signature events
+                }
+            }
+
             const message_event = try mapSSEToMessageEvent(event, ctx.allocator);
             if (message_event) |evt| {
                 switch (evt) {
@@ -216,6 +280,19 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 
     const final_content = try ctx.allocator.alloc(types.ContentBlock, accumulated_content.items.len);
     @memcpy(final_content, accumulated_content.items);
+
+    // Attach signatures to content blocks
+    for (final_content, 0..) |*block, i| {
+        if (signatures.get(i)) |sig_list| {
+            const sig = try ctx.allocator.dupe(u8, sig_list.items);
+            switch (block.*) {
+                .thinking => |*t| t.signature = sig,
+                .text => |*t| t.signature = sig,
+                .tool_use => |*t| t.thought_signature = sig,
+                else => {},
+            }
+        }
+    }
 
     const result = types.AssistantMessage{
         .content = final_content,
@@ -345,19 +422,50 @@ pub fn buildRequestBody(
         };
         try writer.writeStringField("role", role_str);
 
-        if (message.content.len == 1) {
-            switch (message.content[0]) {
-                .text => |text| {
-                    try writer.writeStringField("content", text.text);
-                },
-                else => {
-                    try writer.writeKey("content");
-                    try writeContentBlocks(&writer, message.content);
-                },
-            }
-        } else {
+        if (message.role == .tool_result) {
+            // Tool results require special serialization with tool_use_id and is_error
             try writer.writeKey("content");
-            try writeContentBlocks(&writer, message.content);
+            try writer.beginArray();
+            try writer.beginObject();
+            try writer.writeStringField("type", "tool_result");
+            if (message.tool_call_id) |tool_id| {
+                try writer.writeStringField("tool_use_id", tool_id);
+            }
+            if (message.is_error) {
+                try writer.writeBoolField("is_error", true);
+            }
+            // Serialize the content as the content field
+            if (message.content.len == 1) {
+                switch (message.content[0]) {
+                    .text => |text| {
+                        try writer.writeStringField("content", text.text);
+                    },
+                    else => {
+                        try writer.writeKey("content");
+                        try writeContentBlocks(&writer, message.content);
+                    },
+                }
+            } else {
+                try writer.writeKey("content");
+                try writeContentBlocks(&writer, message.content);
+            }
+            try writer.endObject();
+            try writer.endArray();
+        } else {
+            if (message.content.len == 1) {
+                switch (message.content[0]) {
+                    .text => |text| {
+                        try writer.writeStringField("content", text.text);
+                    },
+                    else => {
+                        try writer.writeKey("content");
+                        try writeContentBlocks(&writer, message.content);
+                    },
+                }
+            } else {
+                try writer.writeKey("content");
+                try writeContentBlocks(&writer, message.content);
+            }
         }
 
         try writer.endObject();
@@ -902,4 +1010,71 @@ test "buildRequestBody with metadata_user_id" {
 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"metadata\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"user_id\":\"user-456\"") != null);
+}
+
+test "buildRequestBody includes is_error for tool results" {
+    const allocator = std.testing.allocator;
+
+    const cfg = config.AnthropicConfig{
+        .auth = .{ .api_key = "test-key" },
+        .model = "claude-sonnet-4-20250514",
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Use the tool" } },
+            },
+            .timestamp = 0,
+        },
+        .{
+            .role = .tool_result,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Tool execution failed" } },
+            },
+            .tool_call_id = "toolu_123",
+            .tool_name = "test_tool",
+            .is_error = true,
+            .timestamp = 1,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_use_id\":\"toolu_123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Tool execution failed\"") != null);
+}
+
+test "buildRequestBody tool result without error" {
+    const allocator = std.testing.allocator;
+
+    const cfg = config.AnthropicConfig{
+        .auth = .{ .api_key = "test-key" },
+        .model = "claude-sonnet-4-20250514",
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .tool_result,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Success" } },
+            },
+            .tool_call_id = "toolu_456",
+            .is_error = false,
+            .timestamp = 1,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"tool_result\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_use_id\":\"toolu_456\"") != null);
+    // Should not include is_error if false
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Success\"") != null);
 }

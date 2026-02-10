@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Run tests
+        working-directory: zig
+        run: zig build test

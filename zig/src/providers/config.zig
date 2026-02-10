@@ -41,6 +41,40 @@ pub const ResponseFormat = union(enum) {
     json_schema: []const u8, // JSON schema string
 };
 
+/// OpenAI reasoning effort levels (only low/medium/high are valid for the API)
+pub const OpenAIReasoningEffort = enum {
+    low,
+    medium,
+    high,
+};
+
+/// Custom HTTP header pair for provider requests.
+pub const HeaderPair = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// Configuration for automatic retry on transient errors.
+pub const RetryConfig = struct {
+    max_retries: u8 = 3,
+    base_delay_ms: u32 = 1000,
+    max_delay_ms: u32 = 60_000,
+};
+
+/// Cancellation token for aborting in-flight streaming requests.
+/// Shared between caller and streaming thread via atomic pointer.
+pub const CancelToken = struct {
+    cancelled: *std.atomic.Value(bool),
+
+    pub fn isCancelled(self: CancelToken) bool {
+        return self.cancelled.load(.acquire);
+    }
+
+    pub fn cancel(self: CancelToken) void {
+        self.cancelled.store(true, .release);
+    }
+};
+
 /// Common request parameters
 pub const RequestParams = struct {
     max_tokens: u32 = 4096,
@@ -68,6 +102,9 @@ pub const AnthropicConfig = struct {
     thinking_budget: ?u32 = null,
     cache_retention: CacheRetention = .none,
     metadata_user_id: ?[]const u8 = null,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
 };
 
 /// OpenAI-specific configuration
@@ -76,14 +113,15 @@ pub const OpenAIConfig = struct {
     model: []const u8 = "gpt-4o",
     base_url: []const u8 = "https://api.openai.com",
     params: RequestParams = .{},
-    reasoning_effort: ?ThinkingLevel = null,
-    frequency_penalty: ?f32 = null,
-    presence_penalty: ?f32 = null,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    max_completion_tokens: ?u32 = null,
     max_reasoning_tokens: ?u32 = null,
     parallel_tool_calls: ?bool = null,
-    seed: ?u64 = null,
-    user: ?[]const u8 = null,
     response_format: ?ResponseFormat = null,
+    include_usage: bool = true,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
 };
 
 /// Ollama-specific configuration
@@ -98,6 +136,9 @@ pub const OllamaConfig = struct {
     format: ?ResponseFormat = null,
     repeat_penalty: ?f32 = null,
     seed: ?u64 = null,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
 };
 
 // Unit tests
@@ -322,17 +363,17 @@ test "AnthropicConfig with metadata_user_id" {
 test "OpenAIConfig with frequency_penalty" {
     const config = OpenAIConfig{
         .auth = .{ .api_key = "sk-test" },
-        .frequency_penalty = 0.5,
+        .params = .{ .frequency_penalty = 0.5 },
     };
-    try std.testing.expectEqual(@as(f32, 0.5), config.frequency_penalty.?);
+    try std.testing.expectEqual(@as(f32, 0.5), config.params.frequency_penalty.?);
 }
 
 test "OpenAIConfig with presence_penalty" {
     const config = OpenAIConfig{
         .auth = .{ .api_key = "sk-test" },
-        .presence_penalty = -0.5,
+        .params = .{ .presence_penalty = -0.5 },
     };
-    try std.testing.expectEqual(@as(f32, -0.5), config.presence_penalty.?);
+    try std.testing.expectEqual(@as(f32, -0.5), config.params.presence_penalty.?);
 }
 
 test "OpenAIConfig with max_reasoning_tokens" {
@@ -354,17 +395,17 @@ test "OpenAIConfig with parallel_tool_calls" {
 test "OpenAIConfig with seed" {
     const config = OpenAIConfig{
         .auth = .{ .api_key = "sk-test" },
-        .seed = 42,
+        .params = .{ .seed = 42 },
     };
-    try std.testing.expectEqual(@as(u64, 42), config.seed.?);
+    try std.testing.expectEqual(@as(u64, 42), config.params.seed.?);
 }
 
 test "OpenAIConfig with user" {
     const config = OpenAIConfig{
         .auth = .{ .api_key = "sk-test" },
-        .user = "user-456",
+        .params = .{ .user = "user-456" },
     };
-    try std.testing.expectEqualStrings("user-456", config.user.?);
+    try std.testing.expectEqualStrings("user-456", config.params.user.?);
 }
 
 test "OpenAIConfig with response_format" {
@@ -457,22 +498,24 @@ test "OpenAIConfig comprehensive" {
         .auth = .{ .api_key = "sk-test", .org_id = "org-123" },
         .model = "gpt-4o-mini",
         .reasoning_effort = .high,
-        .frequency_penalty = 0.8,
-        .presence_penalty = 0.6,
+        .params = .{
+            .frequency_penalty = 0.8,
+            .presence_penalty = 0.6,
+            .seed = 42,
+            .user = "test-user",
+        },
         .max_reasoning_tokens = 5000,
         .parallel_tool_calls = false,
-        .seed = 42,
-        .user = "test-user",
         .response_format = .{ .json_schema = "{\"type\":\"object\"}" },
     };
     try std.testing.expectEqualStrings("gpt-4o-mini", config.model);
     try std.testing.expect(config.reasoning_effort.? == .high);
-    try std.testing.expectEqual(@as(f32, 0.8), config.frequency_penalty.?);
-    try std.testing.expectEqual(@as(f32, 0.6), config.presence_penalty.?);
+    try std.testing.expectEqual(@as(f32, 0.8), config.params.frequency_penalty.?);
+    try std.testing.expectEqual(@as(f32, 0.6), config.params.presence_penalty.?);
     try std.testing.expectEqual(@as(u32, 5000), config.max_reasoning_tokens.?);
     try std.testing.expect(!config.parallel_tool_calls.?);
-    try std.testing.expectEqual(@as(u64, 42), config.seed.?);
-    try std.testing.expectEqualStrings("test-user", config.user.?);
+    try std.testing.expectEqual(@as(u64, 42), config.params.seed.?);
+    try std.testing.expectEqualStrings("test-user", config.params.user.?);
     try std.testing.expect(std.meta.activeTag(config.response_format.?) == .json_schema);
 }
 
@@ -495,4 +538,104 @@ test "OllamaConfig comprehensive" {
     try std.testing.expect(std.meta.activeTag(config.format.?) == .text);
     try std.testing.expectEqual(@as(f32, 1.2), config.repeat_penalty.?);
     try std.testing.expectEqual(@as(u64, 54321), config.seed.?);
+}
+
+test "OpenAIReasoningEffort enum values" {
+    const low: OpenAIReasoningEffort = .low;
+    const medium: OpenAIReasoningEffort = .medium;
+    const high: OpenAIReasoningEffort = .high;
+    try std.testing.expect(low == .low);
+    try std.testing.expect(medium == .medium);
+    try std.testing.expect(high == .high);
+}
+
+test "OpenAIConfig with max_completion_tokens" {
+    const cfg = OpenAIConfig{
+        .auth = .{ .api_key = "sk-test" },
+        .max_completion_tokens = 8192,
+    };
+    try std.testing.expectEqual(@as(u32, 8192), cfg.max_completion_tokens.?);
+}
+
+test "OpenAIConfig include_usage defaults to true" {
+    const cfg = OpenAIConfig{
+        .auth = .{ .api_key = "sk-test" },
+    };
+    try std.testing.expect(cfg.include_usage);
+}
+
+test "HeaderPair creation" {
+    const header = HeaderPair{ .name = "X-Custom", .value = "test-value" };
+    try std.testing.expectEqualStrings("X-Custom", header.name);
+    try std.testing.expectEqualStrings("test-value", header.value);
+}
+
+test "RetryConfig defaults" {
+    const cfg = RetryConfig{};
+    try std.testing.expectEqual(@as(u8, 3), cfg.max_retries);
+    try std.testing.expectEqual(@as(u32, 1000), cfg.base_delay_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), cfg.max_delay_ms);
+}
+
+test "RetryConfig custom values" {
+    const cfg = RetryConfig{
+        .max_retries = 5,
+        .base_delay_ms = 500,
+        .max_delay_ms = 30_000,
+    };
+    try std.testing.expectEqual(@as(u8, 5), cfg.max_retries);
+    try std.testing.expectEqual(@as(u32, 500), cfg.base_delay_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), cfg.max_delay_ms);
+}
+
+test "CancelToken" {
+    var cancelled_val = std.atomic.Value(bool).init(false);
+    const token = CancelToken{ .cancelled = &cancelled_val };
+
+    try std.testing.expect(!token.isCancelled());
+    token.cancel();
+    try std.testing.expect(token.isCancelled());
+}
+
+test "AnthropicConfig with new stream options" {
+    const cfg = AnthropicConfig{
+        .auth = .{ .api_key = "key" },
+        .custom_headers = &[_]HeaderPair{
+            .{ .name = "X-Test", .value = "val" },
+        },
+        .retry_config = .{ .max_retries = 5 },
+    };
+    try std.testing.expectEqual(@as(usize, 1), cfg.custom_headers.?.len);
+    try std.testing.expectEqual(@as(u8, 5), cfg.retry_config.max_retries);
+    try std.testing.expect(cfg.cancel_token == null);
+}
+
+test "OpenAIConfig with new stream options" {
+    var cancelled_val = std.atomic.Value(bool).init(false);
+    const cfg = OpenAIConfig{
+        .auth = .{ .api_key = "key" },
+        .cancel_token = CancelToken{ .cancelled = &cancelled_val },
+    };
+    try std.testing.expect(cfg.cancel_token != null);
+    try std.testing.expect(!cfg.cancel_token.?.isCancelled());
+}
+
+test "OllamaConfig with new stream options" {
+    const cfg = OllamaConfig{
+        .retry_config = .{ .base_delay_ms = 2000 },
+    };
+    try std.testing.expectEqual(@as(u32, 2000), cfg.retry_config.base_delay_ms);
+    try std.testing.expect(cfg.custom_headers == null);
+}
+
+test "existing configs still work with defaults" {
+    // Verify backward compatibility - old-style config creation still works
+    const anthropic = AnthropicConfig{ .auth = .{ .api_key = "test" } };
+    try std.testing.expectEqual(RetryConfig{}, anthropic.retry_config);
+
+    const openai = OpenAIConfig{ .auth = .{ .api_key = "test" } };
+    try std.testing.expectEqual(RetryConfig{}, openai.retry_config);
+
+    const ollama = OllamaConfig{};
+    try std.testing.expectEqual(RetryConfig{}, ollama.retry_config);
 }
