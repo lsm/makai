@@ -104,45 +104,48 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 
     const uri = try std.Uri.parse(url);
 
-    var header_buffer: [4096]u8 = undefined;
-    var request = try client.open(.POST, uri, .{
-        .server_header_buffer = &header_buffer,
-    });
-    defer request.deinit();
-
-    request.transfer_encoding = .chunked;
-
-    try request.headers.append("content-type", "application/json");
+    // Build headers
+    var headers: std.ArrayList(std.http.Header) = .{};
+    defer headers.deinit(ctx.allocator);
+    try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
 
     // Apply custom headers
-    if (ctx.config.custom_headers) |headers| {
-        for (headers) |h| {
-            request.headers.append(h.name, h.value) catch {};
+    if (ctx.config.custom_headers) |custom| {
+        for (custom) |h| {
+            headers.append(ctx.allocator, .{ .name = h.name, .value = h.value }) catch {};
         }
     }
 
-    try request.send();
-    try request.writeAll(ctx.request_body);
-    try request.finish();
+    var request = try client.request(.POST, uri, .{
+        .extra_headers = headers.items,
+    });
+    defer request.deinit();
 
-    try request.wait();
+    request.transfer_encoding = .{ .content_length = ctx.request_body.len };
 
-    if (request.response.status != .ok) {
-        const error_body = try request.reader().readAllAlloc(ctx.allocator, 8192);
+    try request.sendBodyComplete(ctx.request_body);
+
+    var header_buffer: [4096]u8 = undefined;
+    var response = try request.receiveHead(&header_buffer);
+
+    if (response.head.status != .ok) {
+        var buffer: [4096]u8 = undefined;
+        const error_body = try response.reader(&buffer).*.allocRemaining(ctx.allocator, std.io.Limit.limited(8192));
         defer ctx.allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(request.response.status), error_body });
+        const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         ctx.stream.completeWithError(err_msg);
         return;
     }
 
+    var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
-    var line_buffer = std.ArrayList(u8).init(ctx.allocator);
-    defer line_buffer.deinit();
+    var line_buffer: std.ArrayList(u8) = .{};
+    defer line_buffer.deinit(ctx.allocator);
 
     var state = OllamaStreamState.init(ctx.allocator);
     defer state.deinit();
 
-    var accumulated_content = std.ArrayList(types.ContentBlock).init(ctx.allocator);
+    var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
     defer {
         for (accumulated_content.items) |block| {
             switch (block) {
@@ -159,7 +162,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 },
             }
         }
-        accumulated_content.deinit();
+        accumulated_content.deinit(ctx.allocator);
     }
 
     var usage = types.Usage{};
@@ -176,7 +179,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
             }
         }
 
-        const bytes_read = try request.reader().read(&buffer);
+        const bytes_read = try response.reader(&transfer_buffer).*.readSliceShort(&buffer);
         if (bytes_read == 0) break;
 
         // Process newline-delimited JSON
@@ -191,7 +194,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                                 model_owned = try ctx.allocator.dupe(u8, s.model);
                             },
                             .text_start => {
-                                try accumulated_content.append(types.ContentBlock{ .text = .{ .text = "" } });
+                                try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = "" } });
                             },
                             .text_delta => |delta| {
                                 if (delta.index < accumulated_content.items.len) {
@@ -218,7 +221,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                     line_buffer.clearRetainingCapacity();
                 }
             } else {
-                try line_buffer.append(byte);
+                try line_buffer.append(ctx.allocator, byte);
             }
         }
     }

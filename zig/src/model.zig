@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("types");
 
-pub const ApiType = enum { anthropic, openai, ollama };
+pub const ApiType = enum { anthropic, openai, ollama, azure, google, bedrock };
 pub const InputModality = enum { text, image };
 
 pub const CostPerMillion = struct {
@@ -153,6 +153,74 @@ const known_models = [_]Model{
         .context_window = 200_000,
         .max_tokens = 100_000,
     },
+    // Azure OpenAI models (same pricing as OpenAI)
+    .{
+        .id = "azure-gpt-4o",
+        .name = "Azure GPT-4o",
+        .api_type = .azure,
+        .provider = "azure",
+        .reasoning = false,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 2.50, .output = 10.0, .cache_read = 1.25, .cache_write = 2.50 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    },
+    .{
+        .id = "azure-gpt-4o-mini",
+        .name = "Azure GPT-4o Mini",
+        .api_type = .azure,
+        .provider = "azure",
+        .reasoning = false,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 0.15, .output = 0.60, .cache_read = 0.075, .cache_write = 0.15 },
+        .context_window = 128_000,
+        .max_tokens = 16_384,
+    },
+    .{
+        .id = "azure-o3-mini",
+        .name = "Azure O3 Mini",
+        .api_type = .azure,
+        .provider = "azure",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 1.10, .output = 4.40, .cache_read = 0.55, .cache_write = 1.10 },
+        .context_window = 200_000,
+        .max_tokens = 100_000,
+    },
+    // Google models
+    .{
+        .id = "gemini-2.5-pro",
+        .name = "Gemini 2.5 Pro",
+        .api_type = .google,
+        .provider = "google",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 1.25, .output = 5.0, .cache_read = 0.3125, .cache_write = 1.5625 },
+        .context_window = 1_000_000,
+        .max_tokens = 8192,
+    },
+    .{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api_type = .google,
+        .provider = "google",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 0.075, .output = 0.30, .cache_read = 0.01875, .cache_write = 0.09375 },
+        .context_window = 1_000_000,
+        .max_tokens = 8192,
+    },
+    .{
+        .id = "gemini-3-pro",
+        .name = "Gemini 3 Pro",
+        .api_type = .google,
+        .provider = "google",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 2.50, .output = 10.0, .cache_read = 0.625, .cache_write = 3.125 },
+        .context_window = 2_000_000,
+        .max_tokens = 16_384,
+    },
     // Ollama models (local, zero cost)
     .{
         .id = "llama3.1",
@@ -186,6 +254,29 @@ const known_models = [_]Model{
         .cost = .{},
         .context_window = 32_768,
         .max_tokens = 4096,
+    },
+    // AWS Bedrock models
+    .{
+        .id = "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        .name = "Claude 3.5 Sonnet (Bedrock)",
+        .api_type = .bedrock,
+        .provider = "bedrock",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 },
+        .context_window = 200_000,
+        .max_tokens = 8192,
+    },
+    .{
+        .id = "anthropic.claude-opus-4-20250514-v1:0",
+        .name = "Claude Opus 4 (Bedrock)",
+        .api_type = .bedrock,
+        .provider = "bedrock",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 15.0, .output = 75.0, .cache_read = 1.50, .cache_write = 18.75 },
+        .context_window = 200_000,
+        .max_tokens = 32_000,
     },
 };
 
@@ -258,7 +349,7 @@ test "getModel returns null for unknown" {
 
 test "getModels returns all known models" {
     const models = getModels();
-    try std.testing.expectEqual(@as(usize, 11), models.len);
+    try std.testing.expectEqual(@as(usize, 19), models.len);
 }
 
 test "calculateCost basic" {
