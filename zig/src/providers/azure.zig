@@ -6,39 +6,39 @@ const config = @import("config");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
-/// OpenAI provider context
-pub const OpenAIContext = struct {
-    config: config.OpenAIConfig,
+/// Azure OpenAI provider context
+pub const AzureContext = struct {
+    config: config.AzureConfig,
     allocator: std.mem.Allocator,
 };
 
-/// Create an OpenAI provider
+/// Create an Azure OpenAI provider
 pub fn createProvider(
-    cfg: config.OpenAIConfig,
+    cfg: config.AzureConfig,
     allocator: std.mem.Allocator,
 ) !provider.Provider {
-    const ctx = try allocator.create(OpenAIContext);
+    const ctx = try allocator.create(AzureContext);
     ctx.* = .{
         .config = cfg,
         .allocator = allocator,
     };
 
     return provider.Provider{
-        .id = "openai",
-        .name = "OpenAI GPT",
+        .id = "azure",
+        .name = "Azure OpenAI",
         .context = @ptrCast(ctx),
-        .stream_fn = openaiStreamFn,
-        .deinit_fn = openaiDeinitFn,
+        .stream_fn = azureStreamFn,
+        .deinit_fn = azureDeinitFn,
     };
 }
 
 /// Stream function implementation
-fn openaiStreamFn(
+fn azureStreamFn(
     ctx_ptr: *anyopaque,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) !*event_stream.AssistantMessageStream {
-    const ctx: *OpenAIContext = @ptrCast(@alignCast(ctx_ptr));
+    const ctx: *AzureContext = @ptrCast(@alignCast(ctx_ptr));
 
     const stream = try allocator.create(event_stream.AssistantMessageStream);
     stream.* = event_stream.AssistantMessageStream.init(allocator);
@@ -61,8 +61,8 @@ fn openaiStreamFn(
 }
 
 /// Cleanup function
-fn openaiDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-    const ctx: *OpenAIContext = @ptrCast(@alignCast(ctx_ptr));
+fn azureDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const ctx: *AzureContext = @ptrCast(@alignCast(ctx_ptr));
     allocator.destroy(ctx);
 }
 
@@ -70,7 +70,7 @@ fn openaiDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
 const StreamThreadContext = struct {
     stream: *event_stream.AssistantMessageStream,
     request_body: []u8,
-    config: config.OpenAIConfig,
+    config: config.AzureConfig,
     allocator: std.mem.Allocator,
 };
 
@@ -100,24 +100,16 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var client = std.http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
 
-    const url = try std.fmt.allocPrint(ctx.allocator, "{s}/v1/chat/completions", .{ctx.config.base_url});
+    const url = try buildEndpoint(ctx.config, ctx.allocator);
     defer ctx.allocator.free(url);
 
     const uri = try std.Uri.parse(url);
 
     // Build headers
-    const auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
-    defer ctx.allocator.free(auth_header);
-
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
-    try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header });
+    try headers.append(ctx.allocator, .{ .name = "api-key", .value = ctx.config.api_key });
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
-
-    // Optional organization header
-    if (ctx.config.auth.org_id) |org_id| {
-        try headers.append(ctx.allocator, .{ .name = "openai-organization", .value = org_id });
-    }
 
     // Apply custom headers
     if (ctx.config.custom_headers) |custom| {
@@ -150,7 +142,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var parser = sse_parser.SSEParser.init(ctx.allocator);
     defer parser.deinit();
 
-    var state = OpenAIStreamState.init(ctx.allocator);
+    var state = AzureStreamState.init(ctx.allocator);
     defer state.deinit();
 
     var transfer_buffer: [4096]u8 = undefined;
@@ -248,7 +240,6 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         .content = final_content,
         .usage = state.usage,
         .stop_reason = if (state.has_emitted_done) (
-            // Use the stop reason from the done event - retrieve from the last pushed event
             .stop
         ) else .stop,
         .model = if (state.model) |m| try ctx.allocator.dupe(u8, m) else try ctx.allocator.dupe(u8, ctx.config.model),
@@ -258,9 +249,26 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     ctx.stream.complete(result);
 }
 
-/// Build request body for OpenAI API
+/// Build Azure endpoint URL
+pub fn buildEndpoint(cfg: config.AzureConfig, allocator: std.mem.Allocator) ![]u8 {
+    // If base_url provided, use directly
+    if (cfg.base_url) |base| {
+        return try allocator.dupe(u8, base);
+    }
+
+    // Build from resource_name
+    const deployment = cfg.deployment_name orelse cfg.model;
+
+    return try std.fmt.allocPrint(
+        allocator,
+        "https://{s}.openai.azure.com/openai/deployments/{s}/chat/completions?api-version={s}",
+        .{ cfg.resource_name, deployment, cfg.api_version },
+    );
+}
+
+/// Build request body for Azure OpenAI API (OpenAI Responses API format)
 pub fn buildRequestBody(
-    cfg: config.OpenAIConfig,
+    cfg: config.AzureConfig,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -270,7 +278,6 @@ pub fn buildRequestBody(
     var writer = json_writer.JsonWriter.init(&buffer, allocator);
 
     try writer.beginObject();
-    try writer.writeStringField("model", cfg.model);
     try writer.writeBoolField("stream", true);
 
     // Stream options for usage tracking
@@ -281,23 +288,46 @@ pub fn buildRequestBody(
         try writer.endObject();
     }
 
-    // Write messages array
-    try writer.writeKey("messages");
+    // Write messages array as "input" (Responses API format)
+    try writer.writeKey("input");
     try writer.beginArray();
 
     // Prepend system/developer message if system_prompt is provided
     if (cfg.params.system_prompt) |system| {
         try writer.beginObject();
-        // Use "developer" role for reasoning models (o1/o3/o4), "system" for others
-        const system_role = if (std.mem.startsWith(u8, cfg.model, "o1") or
-            std.mem.startsWith(u8, cfg.model, "o3") or
-            std.mem.startsWith(u8, cfg.model, "o4"))
-            "developer"
-        else
-            "system";
-        try writer.writeStringField("role", system_role);
-        try writer.writeStringField("content", system);
+        // GPT-5 quirk: inject developer message to disable auto-reasoning
+        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
+        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
+
+        if (needs_juice_injection) {
+            // Inject developer message with juice directive
+            const juice_system = try std.fmt.allocPrint(allocator, "{s}\n\n# Juice: 0 !important", .{system});
+            defer allocator.free(juice_system);
+            try writer.writeStringField("role", "developer");
+            try writer.writeStringField("content", juice_system);
+        } else {
+            // Use "developer" role for reasoning models (o1/o3/o4), "system" for others
+            const system_role = if (std.mem.startsWith(u8, cfg.model, "o1") or
+                std.mem.startsWith(u8, cfg.model, "o3") or
+                std.mem.startsWith(u8, cfg.model, "o4"))
+                "developer"
+            else
+                "system";
+            try writer.writeStringField("role", system_role);
+            try writer.writeStringField("content", system);
+        }
         try writer.endObject();
+    } else {
+        // No system prompt, but need juice injection for GPT-5
+        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
+        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
+
+        if (needs_juice_injection) {
+            try writer.beginObject();
+            try writer.writeStringField("role", "developer");
+            try writer.writeStringField("content", "# Juice: 0 !important");
+            try writer.endObject();
+        }
     }
 
     for (messages) |msg| {
@@ -334,7 +364,6 @@ pub fn buildRequestBody(
                         try writer.writeStringField("text", text.text);
                     },
                     .tool_use => |tool| {
-                        // OpenAI represents tool use differently in messages
                         try writer.writeStringField("type", "tool_use");
                         try writer.writeStringField("id", tool.id);
                         try writer.writeStringField("name", tool.name);
@@ -347,7 +376,6 @@ pub fn buildRequestBody(
                         try writer.writeStringField("type", "image_url");
                         try writer.writeKey("image_url");
                         try writer.beginObject();
-                        // OpenAI uses data URL format
                         const url = try std.fmt.allocPrint(writer.allocator, "data:{s};base64,{s}", .{ image.media_type, image.data });
                         defer writer.allocator.free(url);
                         try writer.writeStringField("url", url);
@@ -505,7 +533,6 @@ pub fn buildRequestBody(
             .json_schema => |schema| {
                 try writer.writeStringField("type", "json_schema");
                 try writer.writeKey("json_schema");
-                // Write raw JSON by appending directly to buffer
                 try writer.buffer.appendSlice(writer.allocator, schema);
                 writer.needs_comma = true;
             },
@@ -513,13 +540,18 @@ pub fn buildRequestBody(
         try writer.endObject();
     }
 
+    // Session ID for prompt caching
+    if (cfg.session_id) |session_id| {
+        try writer.writeStringField("prompt_cache_key", session_id);
+    }
+
     try writer.endObject();
 
     return buffer.toOwnedSlice(allocator);
 }
 
-/// Track state across OpenAI streaming events
-pub const OpenAIStreamState = struct {
+/// Track state across Azure streaming events (same as OpenAI)
+pub const AzureStreamState = struct {
     text_started: bool = false,
     current_tool_index: ?usize = null,
     accumulated_content: std.ArrayList(u8),
@@ -528,7 +560,7 @@ pub const OpenAIStreamState = struct {
     usage: types.Usage = .{},
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator) OpenAIStreamState {
+    pub fn init(allocator: std.mem.Allocator) AzureStreamState {
         return .{
             .text_started = false,
             .current_tool_index = null,
@@ -540,24 +572,22 @@ pub const OpenAIStreamState = struct {
         };
     }
 
-    pub fn deinit(self: *OpenAIStreamState) void {
+    pub fn deinit(self: *AzureStreamState) void {
         self.accumulated_content.deinit(self.allocator);
         if (self.model) |m| self.allocator.free(m);
     }
 };
 
-/// Map OpenAI SSE data to MessageEvent
+/// Map Azure SSE data to MessageEvent (reuses OpenAI format)
 pub fn mapSSEToMessageEvent(
     event: sse_parser.SSEEvent,
-    state: *OpenAIStreamState,
+    state: *AzureStreamState,
     allocator: std.mem.Allocator,
 ) !?types.MessageEvent {
-    // OpenAI sends data lines without event type
     const data = event.data;
 
     // Check for [DONE] marker
     if (std.mem.eql(u8, data, "[DONE]")) {
-        // If we already emitted a done event from finish_reason, don't emit another
         if (state.has_emitted_done) return null;
         return types.MessageEvent{
             .done = .{
@@ -580,12 +610,11 @@ pub fn mapSSEToMessageEvent(
 
     const root = parsed.value;
 
-    // Extract model from first chunk for start event
+    // Extract model from first chunk
     if (state.model == null) {
         if (root.object.get("model")) |model_val| {
             if (model_val == .string) {
                 state.model = try allocator.dupe(u8, model_val.string);
-                // Emit start event with model name
                 return types.MessageEvent{
                     .start = .{ .model = try allocator.dupe(u8, model_val.string) },
                 };
@@ -593,8 +622,7 @@ pub fn mapSSEToMessageEvent(
         }
     }
 
-    // Parse usage from streaming chunks (when stream_options.include_usage is true)
-    // The final chunk has usage data and empty choices
+    // Parse usage from streaming chunks
     if (root.object.get("usage")) |usage_val| {
         if (usage_val != .null) {
             if (usage_val.object.get("prompt_tokens")) |pt| {
@@ -613,7 +641,7 @@ pub fn mapSSEToMessageEvent(
     const choice = choices.array.items[0];
     if (choice != .object) return null;
 
-    // Handle finish_reason first (it can come with or without delta)
+    // Handle finish_reason
     if (choice.object.get("finish_reason")) |finish_reason| {
         if (finish_reason == .string) {
             const reason = finish_reason.string;
@@ -648,9 +676,6 @@ pub fn mapSSEToMessageEvent(
 
             if (!state.text_started) {
                 state.text_started = true;
-                // Return text_start, but we also need to emit the first delta
-                // OpenAI combines the first content with the first delta,
-                // so emit text_start here and the caller will get the delta on next call
                 return types.MessageEvent{
                     .text_start = .{ .index = 0 },
                 };
@@ -666,13 +691,12 @@ pub fn mapSSEToMessageEvent(
         }
     }
 
-    // Handle tool calls with proper index tracking
+    // Handle tool calls
     if (delta.object.get("tool_calls")) |tool_calls| {
         if (tool_calls == .array and tool_calls.array.items.len > 0) {
             const tool_call = tool_calls.array.items[0];
             if (tool_call != .object) return null;
 
-            // Get the tool call index from the JSON (OpenAI provides this)
             const tc_index: usize = if (tool_call.object.get("index")) |idx|
                 (if (idx == .integer) @as(usize, @intCast(idx.integer)) else 0)
             else
@@ -685,7 +709,6 @@ pub fn mapSSEToMessageEvent(
 
                 if (name) |n| {
                     if (n == .string) {
-                        // New tool call starting
                         const id = tool_call.object.get("id");
                         const id_str = if (id) |i| (if (i == .string) i.string else "unknown") else "unknown";
 
@@ -717,18 +740,88 @@ pub fn mapSSEToMessageEvent(
 }
 
 // Tests
-test "buildRequestBody - basic message" {
+
+test "buildEndpoint - from resource_name" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-        .base_url = "https://api.openai.com",
-        .params = .{
-            .max_tokens = 1000,
-            .temperature = 0.7,
-        },
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
+    };
+
+    const endpoint = try buildEndpoint(cfg, allocator);
+    defer allocator.free(endpoint);
+
+    try testing.expectEqualStrings(
+        "https://myresource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-01-preview",
+        endpoint,
+    );
+}
+
+test "buildEndpoint - with deployment_name override" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
+        .deployment_name = "my-gpt4o-deployment",
+    };
+
+    const endpoint = try buildEndpoint(cfg, allocator);
+    defer allocator.free(endpoint);
+
+    try testing.expectEqualStrings(
+        "https://myresource.openai.azure.com/openai/deployments/my-gpt4o-deployment/chat/completions?api-version=2024-10-01-preview",
+        endpoint,
+    );
+}
+
+test "buildEndpoint - with custom api_version" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
+        .api_version = "2023-05-15",
+    };
+
+    const endpoint = try buildEndpoint(cfg, allocator);
+    defer allocator.free(endpoint);
+
+    try testing.expect(std.mem.indexOf(u8, endpoint, "api-version=2023-05-15") != null);
+}
+
+test "buildEndpoint - with base_url override" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
+        .base_url = "https://custom.endpoint.com/api",
+    };
+
+    const endpoint = try buildEndpoint(cfg, allocator);
+    defer allocator.free(endpoint);
+
+    try testing.expectEqualStrings("https://custom.endpoint.com/api", endpoint);
+}
+
+test "buildRequestBody - basic message with input format" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
     };
 
     const messages = [_]types.Message{
@@ -744,23 +837,24 @@ test "buildRequestBody - basic message" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-4\"") != null);
+    // Verify Responses API format uses "input" instead of "messages"
+    try testing.expect(std.mem.indexOf(u8, body, "\"input\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hello\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":1000") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.7") != null);
 }
 
-test "buildRequestBody - multiple messages" {
+test "buildRequestBody - GPT-5 quirk without reasoning" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-        .base_url = "https://api.openai.com",
-        .params = .{},
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-5-preview",
+        .params = .{
+            .system_prompt = "You are helpful.",
+        },
     };
 
     const messages = [_]types.Message{
@@ -771,17 +865,35 @@ test "buildRequestBody - multiple messages" {
             },
             .timestamp = 0,
         },
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hi there!" } },
-            },
-            .timestamp = 0,
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    // Should inject juice directive
+    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
+}
+
+test "buildRequestBody - GPT-5 quirk with reasoning enabled" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-5-preview",
+        .reasoning_effort = .medium,
+        .params = .{
+            .system_prompt = "You are helpful.",
         },
+    };
+
+    const messages = [_]types.Message{
         .{
             .role = .user,
             .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "How are you?" } },
+                .{ .text = .{ .text = "Hello" } },
             },
             .timestamp = 0,
         },
@@ -790,24 +902,49 @@ test "buildRequestBody - multiple messages" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"assistant\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hello\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hi there!\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"How are you?\"") != null);
+    // Should NOT inject juice directive when reasoning is configured
+    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") == null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
 }
 
-test "mapSSEToMessageEvent - text_start and text_delta" {
+test "buildRequestBody - session_id for prompt caching" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var state = OpenAIStreamState.init(allocator);
+    const cfg = config.AzureConfig{
+        .api_key = "test-key",
+        .resource_name = "myresource",
+        .model = "gpt-4o",
+        .session_id = "session-123",
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Hello" } },
+            },
+            .timestamp = 0,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-123\"") != null);
+}
+
+test "mapSSEToMessageEvent - text delta" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var state = AzureStreamState.init(allocator);
     defer state.deinit();
 
-    // First chunk should emit start event (model extraction)
+    // First chunk with model
     const event0 = sse_parser.SSEEvent{
         .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
     };
 
     const result0 = try mapSSEToMessageEvent(event0, &state, allocator);
@@ -815,431 +952,32 @@ test "mapSSEToMessageEvent - text_start and text_delta" {
     try testing.expect(result0.? == .start);
     allocator.free(result0.?.start.model);
 
-    // First content delta should emit text_start
+    // First content delta
     const event1 = sse_parser.SSEEvent{
         .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
     };
 
     const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
     try testing.expect(result1 != null);
     try testing.expect(result1.? == .text_start);
-
-    // Second content delta should emit text_delta
-    const event2 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}",
-    };
-
-    const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    defer if (result2) |r| {
-        if (r == .text_delta) allocator.free(r.text_delta.delta);
-    };
-
-    try testing.expect(result2 != null);
-    try testing.expect(result2.? == .text_delta);
-    try testing.expectEqualStrings(" world", result2.?.text_delta.delta);
-}
-
-test "mapSSEToMessageEvent - DONE marker" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    // Pre-seed model so first chunk doesn't emit start event
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    const event = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "[DONE]",
-    };
-
-    const result = try mapSSEToMessageEvent(event, &state, allocator);
-    try testing.expect(result != null);
-    try testing.expect(result.? == .done);
-    try testing.expect(result.?.done.stop_reason == .stop);
 }
 
 test "mapSSEToMessageEvent - finish_reason mapping" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var state = OpenAIStreamState.init(allocator);
+    var state = AzureStreamState.init(allocator);
     defer state.deinit();
-    // Pre-seed model so first chunk doesn't emit start event
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    // Test stop reason
-    const event1 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-    };
-
-    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
-    try testing.expect(result1 != null);
-    try testing.expect(result1.? == .done);
-    try testing.expect(result1.?.done.stop_reason == .stop);
-
-    // Test max_tokens reason
-    state.text_started = false;
-    const event2 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}",
-    };
-
-    const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    try testing.expect(result2 != null);
-    try testing.expect(result2.? == .done);
-    try testing.expect(result2.?.done.stop_reason == .length);
-
-    // Test tool_calls reason
-    state.text_started = false;
-    const event3 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
-    };
-
-    const result3 = try mapSSEToMessageEvent(event3, &state, allocator);
-    try testing.expect(result3 != null);
-    try testing.expect(result3.? == .done);
-    try testing.expect(result3.?.done.stop_reason == .tool_use);
-}
-
-test "mapSSEToMessageEvent - tool calls" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    // Pre-seed model so first chunk doesn't emit start event
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    // Tool call start
-    const event1 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\"}}]},\"finish_reason\":null}]}",
-    };
-
-    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
-    defer if (result1) |r| {
-        if (r == .toolcall_start) {
-            allocator.free(r.toolcall_start.id);
-            allocator.free(r.toolcall_start.name);
-        }
-    };
-
-    try testing.expect(result1 != null);
-    try testing.expect(result1.? == .toolcall_start);
-    try testing.expectEqualStrings("call_123", result1.?.toolcall_start.id);
-    try testing.expectEqualStrings("get_weather", result1.?.toolcall_start.name);
-
-    // Tool arguments delta
-    const event2 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"location\\\":\\\"\"}}]},\"finish_reason\":null}]}",
-    };
-
-    const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    defer if (result2) |r| {
-        if (r == .toolcall_delta) allocator.free(r.toolcall_delta.delta);
-    };
-
-    try testing.expect(result2 != null);
-    try testing.expect(result2.? == .toolcall_delta);
-    try testing.expectEqualStrings("{\"location\":\"", result2.?.toolcall_delta.delta);
-}
-
-test "buildRequestBody - with system prompt" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-        .params = .{
-            .system_prompt = "You are a helpful assistant.",
-        },
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello!" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"You are a helpful assistant.\"") != null);
-}
-
-test "buildRequestBody - stream_options included by default" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"stream_options\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
-}
-
-test "buildRequestBody - stop sequences" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const stop_seqs = [_][]const u8{ "STOP", "END" };
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-        .params = .{
-            .stop_sequences = &stop_seqs,
-        },
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"stop\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"STOP\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"END\"") != null);
-}
-
-test "buildRequestBody - tool result message" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "The weather is sunny" } },
-            },
-            .tool_call_id = "call_abc123",
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"tool_call_id\":\"call_abc123\"") != null);
-}
-
-test "buildRequestBody - developer role for reasoning models" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "o3-mini",
-        .params = .{
-            .system_prompt = "You are a helpful assistant.",
-        },
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello!" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") == null);
-}
-
-test "buildRequestBody - max_completion_tokens override" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = "test-key" },
-        .model = "gpt-4",
-        .max_completion_tokens = 8192,
-        .params = .{
-            .max_tokens = 1000,
-        },
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":8192") != null);
-    // Should NOT contain the fallback value
-    try testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":1000") == null);
-}
-
-test "mapSSEToMessageEvent - content_filter finish reason" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    state.model = try allocator.dupe(u8, "gpt-4");
+    state.model = try allocator.dupe(u8, "gpt-4o");
 
     const event = sse_parser.SSEEvent{
         .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}",
+        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
     };
 
     const result = try mapSSEToMessageEvent(event, &state, allocator);
     try testing.expect(result != null);
     try testing.expect(result.? == .done);
-    try testing.expect(result.?.done.stop_reason == .content_filter);
-}
-
-test "mapSSEToMessageEvent - usage from streaming chunk" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    // Final usage chunk (empty choices, usage populated)
-    const event = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}",
-    };
-
-    const result = try mapSSEToMessageEvent(event, &state, allocator);
-    // Empty choices returns null, but usage should be accumulated in state
-    try testing.expect(result == null);
-    try testing.expectEqual(@as(u64, 10), state.usage.input_tokens);
-    try testing.expectEqual(@as(u64, 20), state.usage.output_tokens);
-}
-
-test "mapSSEToMessageEvent - tool call with index" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    // Tool call with index=1 (second parallel tool call)
-    const event = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_456\",\"function\":{\"name\":\"search\"}}]},\"finish_reason\":null}]}",
-    };
-
-    const result = try mapSSEToMessageEvent(event, &state, allocator);
-    defer if (result) |r| {
-        if (r == .toolcall_start) {
-            allocator.free(r.toolcall_start.id);
-            allocator.free(r.toolcall_start.name);
-        }
-    };
-
-    try testing.expect(result != null);
-    try testing.expect(result.? == .toolcall_start);
-    try testing.expectEqual(@as(usize, 1), result.?.toolcall_start.index);
-    try testing.expectEqualStrings("call_456", result.?.toolcall_start.id);
-    try testing.expectEqualStrings("search", result.?.toolcall_start.name);
-}
-
-test "mapSSEToMessageEvent - model extraction from first chunk" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-
-    const event = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"id\":\"chatcmpl-123\",\"model\":\"gpt-4o-2024-08-06\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
-    };
-
-    const result = try mapSSEToMessageEvent(event, &state, allocator);
-    try testing.expect(result != null);
-    try testing.expect(result.? == .start);
-
-    // The start event should have the model name
-    try testing.expectEqualStrings("gpt-4o-2024-08-06", result.?.start.model);
-    allocator.free(result.?.start.model);
-
-    // State should also have the model captured
-    try testing.expectEqualStrings("gpt-4o-2024-08-06", state.model.?);
-}
-
-test "mapSSEToMessageEvent - done not duplicated after finish_reason" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = OpenAIStreamState.init(allocator);
-    defer state.deinit();
-    state.model = try allocator.dupe(u8, "gpt-4");
-
-    // finish_reason chunk
-    const event1 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
-    };
-
-    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
-    try testing.expect(result1 != null);
-    try testing.expect(result1.? == .done);
-
-    // [DONE] should NOT emit another done event
-    const event2 = sse_parser.SSEEvent{
-        .event_type = null,
-        .data = "[DONE]",
-    };
-
-    const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    try testing.expect(result2 == null);
+    try testing.expect(result.?.done.stop_reason == .stop);
 }

@@ -28,7 +28,7 @@ pub const Provider = struct {
         return self.stream_fn(self.context, messages, allocator);
     }
 
-    pub fn deinit(self: *Provider, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const Provider, allocator: std.mem.Allocator) void {
         if (self.deinit_fn) |f| {
             f(self.context, allocator);
         }
@@ -64,7 +64,7 @@ pub const Registry = struct {
 
     pub fn unregister(self: *Registry, id: []const u8) !void {
         if (self.providers.fetchRemove(id)) |kv| {
-            var provider = kv.value;
+            const provider = kv.value;
             provider.deinit(self.allocator);
         }
     }

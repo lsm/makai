@@ -105,35 +105,37 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 
     const uri = try std.Uri.parse(url);
 
-    var header_buffer: [4096]u8 = undefined;
-    var request = try client.open(.POST, uri, .{
-        .server_header_buffer = &header_buffer,
-    });
-    defer request.deinit();
-
-    request.transfer_encoding = .chunked;
-
-    try request.headers.append("x-api-key", ctx.config.auth.api_key);
-    try request.headers.append("anthropic-version", ctx.config.api_version);
-    try request.headers.append("content-type", "application/json");
+    // Build headers
+    var headers: std.ArrayList(std.http.Header) = .{};
+    defer headers.deinit(ctx.allocator);
+    try headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.config.auth.api_key });
+    try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
+    try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
 
     // Apply custom headers
-    if (ctx.config.custom_headers) |headers| {
-        for (headers) |h| {
-            request.headers.append(h.name, h.value) catch {};
+    if (ctx.config.custom_headers) |custom| {
+        for (custom) |h| {
+            headers.append(ctx.allocator, .{ .name = h.name, .value = h.value }) catch {};
         }
     }
 
-    try request.send();
-    try request.writeAll(ctx.request_body);
-    try request.finish();
+    var request = try client.request(.POST, uri, .{
+        .extra_headers = headers.items,
+    });
+    defer request.deinit();
 
-    try request.wait();
+    request.transfer_encoding = .{ .content_length = ctx.request_body.len };
 
-    if (request.response.status != .ok) {
-        const error_body = try request.reader().readAllAlloc(ctx.allocator, 8192);
+    try request.sendBodyComplete(ctx.request_body);
+
+    var header_buffer: [4096]u8 = undefined;
+    var response = try request.receiveHead(&header_buffer);
+
+    if (response.head.status != .ok) {
+        var buffer: [4096]u8 = undefined;
+        const error_body = try response.reader(&buffer).*.allocRemaining(ctx.allocator, std.io.Limit.limited(8192));
         defer ctx.allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(request.response.status), error_body });
+        const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         ctx.stream.completeWithError(err_msg);
         return;
     }
@@ -141,8 +143,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var parser = sse_parser.SSEParser.init(ctx.allocator);
     defer parser.deinit();
 
+    var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
-    var accumulated_content = std.ArrayList(types.ContentBlock).init(ctx.allocator);
+    var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
     defer {
         for (accumulated_content.items) |block| {
             switch (block) {
@@ -159,14 +162,14 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 },
             }
         }
-        accumulated_content.deinit();
+        accumulated_content.deinit(ctx.allocator);
     }
 
     var signatures = std.AutoHashMap(usize, std.ArrayList(u8)).init(ctx.allocator);
     defer {
         var it = signatures.valueIterator();
         while (it.next()) |list| {
-            list.deinit();
+            list.deinit(ctx.allocator);
         }
         signatures.deinit();
     }
@@ -186,7 +189,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
             }
         }
 
-        const bytes_read = try request.reader().read(&buffer);
+        const bytes_read = try response.reader(&transfer_buffer).*.readSliceShort(&buffer);
         if (bytes_read == 0) break;
 
         const events = try parser.feed(buffer[0..bytes_read]);
@@ -212,9 +215,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                                         const idx: usize = @intCast(@as(u64, @bitCast(index_val.integer)));
                                         const entry = try signatures.getOrPut(idx);
                                         if (!entry.found_existing) {
-                                            entry.value_ptr.* = std.ArrayList(u8).init(ctx.allocator);
+                                            entry.value_ptr.* = .{};
                                         }
-                                        try entry.value_ptr.appendSlice(sig_val.string);
+                                        try entry.value_ptr.appendSlice(ctx.allocator, sig_val.string);
                                     }
                                 }
                             }
@@ -237,7 +240,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         stop_reason = d.stop_reason;
                     },
                     .text_start, .thinking_start, .toolcall_start => {
-                        try accumulated_content.append(switch (evt) {
+                        try accumulated_content.append(ctx.allocator, switch (evt) {
                             .text_start => types.ContentBlock{ .text = .{ .text = "" } },
                             .thinking_start => types.ContentBlock{ .thinking = .{ .thinking = "" } },
                             .toolcall_start => |tc| types.ContentBlock{ .tool_use = .{
@@ -267,6 +270,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                                     tu.input_json = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_json, delta.delta });
                                     if (old_json.len > 0) ctx.allocator.free(old_json);
                                 },
+                                .image => {},
                             }
                         }
                     },

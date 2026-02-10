@@ -24,6 +24,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-zig-
 
-      - name: Run tests
+      - name: Run unit tests
         working-directory: zig
         run: zig build test
+
+      - name: Run E2E tests (will skip without credentials)
+        working-directory: zig
+        run: zig build test-e2e
+        continue-on-error: true

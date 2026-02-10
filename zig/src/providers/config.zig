@@ -141,6 +141,27 @@ pub const OllamaConfig = struct {
     cancel_token: ?CancelToken = null,
 };
 
+/// Azure OpenAI-specific configuration
+pub const AzureConfig = struct {
+    api_key: []const u8,
+    resource_name: []const u8, // myresource -> myresource.openai.azure.com
+    deployment_name: ?[]const u8 = null, // Override model ID
+    api_version: []const u8 = "2024-10-01-preview", // Default
+    base_url: ?[]const u8 = null, // Override full URL
+    model: []const u8 = "gpt-4o", // Used as deployment name if deployment_name is null
+    params: RequestParams = .{},
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    max_completion_tokens: ?u32 = null,
+    max_reasoning_tokens: ?u32 = null,
+    session_id: ?[]const u8 = null, // For prompt caching via prompt_cache_key
+    parallel_tool_calls: ?bool = null,
+    response_format: ?ResponseFormat = null,
+    include_usage: bool = true,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
+};
+
 // Unit tests
 test "AuthConfig basic creation" {
     const auth = AuthConfig{
