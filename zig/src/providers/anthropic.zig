@@ -148,7 +148,29 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer accumulated_content.deinit(ctx.allocator);
+    var content_transferred = false;
+    defer {
+        // Only clean up strings if they weren't transferred to AssistantMessage
+        if (!content_transferred) {
+            for (accumulated_content.items) |block| {
+                switch (block) {
+                    .text => |t| {
+                        if (t.text.len > 0) ctx.allocator.free(@constCast(t.text));
+                    },
+                    .thinking => |th| {
+                        if (th.thinking.len > 0) ctx.allocator.free(@constCast(th.thinking));
+                    },
+                    .tool_use => |tu| {
+                        ctx.allocator.free(@constCast(tu.id));
+                        ctx.allocator.free(@constCast(tu.name));
+                        if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
+                    },
+                    else => {},
+                }
+            }
+        }
+        accumulated_content.deinit(ctx.allocator);
+    }
 
     var signatures = std.AutoHashMap(usize, std.ArrayList(u8)).init(ctx.allocator);
     defer {
@@ -272,6 +294,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 
     const final_content = try ctx.allocator.alloc(types.ContentBlock, accumulated_content.items.len);
     @memcpy(final_content, accumulated_content.items);
+
+    // Mark content as transferred so defer doesn't free the strings
+    content_transferred = true;
 
     // Attach signatures to content blocks
     for (final_content, 0..) |*block, i| {
