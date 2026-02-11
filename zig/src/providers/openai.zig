@@ -162,19 +162,26 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     // OpenAI's index is tool-specific (0, 1, 2...) but accumulated_content
     // can have text blocks first, so tool blocks may be at different positions
     var tool_index_map = std.AutoHashMap(usize, usize).init(ctx.allocator);
+    // Note: We do NOT free accumulated_content strings in this defer.
+    // When stream succeeds, strings are transferred to AssistantMessage via @memcpy.
+    // AssistantMessage.deinit() will free them.
+    // This defer only runs on error paths (cancellation, stream errors).
+    var content_transferred = false;
     defer {
-        // Clean up any allocated strings in accumulated_content before deinit
-        for (accumulated_content.items) |block| {
-            switch (block) {
-                .text => |t| {
-                    if (t.text.len > 0) ctx.allocator.free(@constCast(t.text));
-                },
-                .tool_use => |tu| {
-                    ctx.allocator.free(@constCast(tu.id));
-                    ctx.allocator.free(@constCast(tu.name));
-                    if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
-                },
-                else => {},
+        // Only clean up strings if they weren't transferred to AssistantMessage
+        if (!content_transferred) {
+            for (accumulated_content.items) |block| {
+                switch (block) {
+                    .text => |t| {
+                        if (t.text.len > 0) ctx.allocator.free(@constCast(t.text));
+                    },
+                    .tool_use => |tu| {
+                        ctx.allocator.free(@constCast(tu.id));
+                        ctx.allocator.free(@constCast(tu.name));
+                        if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
+                    },
+                    else => {},
+                }
             }
         }
         accumulated_content.deinit(ctx.allocator);
@@ -257,6 +264,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     // Build final result
     const final_content = try ctx.allocator.alloc(types.ContentBlock, accumulated_content.items.len);
     @memcpy(final_content, accumulated_content.items);
+
+    // Mark content as transferred so defer doesn't free the strings
+    content_transferred = true;
 
     const result = types.AssistantMessage{
         .content = final_content,
