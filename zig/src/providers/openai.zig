@@ -156,24 +156,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer {
-        for (accumulated_content.items) |block| {
-            switch (block) {
-                .text => |t| if (t.text.len > 0) ctx.allocator.free(@constCast(t.text)),
-                .tool_use => |tu| {
-                    ctx.allocator.free(tu.id);
-                    ctx.allocator.free(tu.name);
-                    if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
-                },
-                .thinking => |th| if (th.thinking.len > 0) ctx.allocator.free(@constCast(th.thinking)),
-                .image => |img| {
-                    ctx.allocator.free(img.media_type);
-                    ctx.allocator.free(img.data);
-                },
-            }
-        }
-        accumulated_content.deinit(ctx.allocator);
-    }
+    defer accumulated_content.deinit(ctx.allocator);
 
     // Get the reader once before the loop
     const reader = response.reader(&transfer_buffer);
@@ -1245,4 +1228,35 @@ test "mapSSEToMessageEvent - done not duplicated after finish_reason" {
 
     const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
     try testing.expect(result2 == null);
+}
+
+test "AssistantMessage.deinit - reproduces segfault with empty string literals" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // This test reproduces the segfault that happens in the OpenAI E2E tests
+    // The bug: when text_start is emitted but NO text_delta follows, the empty
+    // string literal "" from line 201 gets copied into the final AssistantMessage,
+    // and then deinit() at types.zig:120 tries to free it unconditionally.
+
+    // Scenario: Model emits text_start but then stops before any text_delta
+    // This can happen with reasoning models or when the response is cut short
+
+    // Build a text block with empty string literal (line 201 in openai.zig)
+    const final_content = try allocator.alloc(types.ContentBlock, 1);
+    final_content[0] = types.ContentBlock{ .text = .{ .text = "" } };
+
+    var result = types.AssistantMessage{
+        .content = final_content,
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = try allocator.dupe(u8, "gpt-4o-mini"),
+        .timestamp = 0,
+    };
+
+    // This WILL segfault because:
+    // 1. text_block.text = "" (string literal, not heap-allocated)
+    // 2. types.zig:120 calls allocator.free(text_block.text) unconditionally
+    // 3. The allocator tries to free a compile-time constant address
+    result.deinit(allocator);
 }

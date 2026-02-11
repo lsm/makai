@@ -148,24 +148,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer {
-        for (accumulated_content.items) |block| {
-            switch (block) {
-                .text => |t| if (t.text.len > 0) ctx.allocator.free(@constCast(t.text)),
-                .tool_use => |tu| {
-                    ctx.allocator.free(tu.id);
-                    ctx.allocator.free(tu.name);
-                    if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
-                },
-                .thinking => |th| if (th.thinking.len > 0) ctx.allocator.free(@constCast(th.thinking)),
-                .image => |img| {
-                    ctx.allocator.free(img.media_type);
-                    ctx.allocator.free(img.data);
-                },
-            }
-        }
-        accumulated_content.deinit(ctx.allocator);
-    }
+    defer accumulated_content.deinit(ctx.allocator);
 
     // Get the reader once before the loop
     const reader = response.reader(&transfer_buffer);

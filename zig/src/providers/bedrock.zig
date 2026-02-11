@@ -204,24 +204,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 /// Parse Bedrock event stream (custom format, not SSE)
 fn parseBedrockEventStream(reader: anytype, ctx: *StreamThreadContext) !void {
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer {
-        for (accumulated_content.items) |block| {
-            switch (block) {
-                .text => |t| ctx.allocator.free(t.text),
-                .tool_use => |tu| {
-                    ctx.allocator.free(tu.id);
-                    ctx.allocator.free(tu.name);
-                    ctx.allocator.free(tu.input_json);
-                },
-                .thinking => |th| ctx.allocator.free(th.thinking),
-                .image => |img| {
-                    ctx.allocator.free(img.media_type);
-                    ctx.allocator.free(img.data);
-                },
-            }
-        }
-        accumulated_content.deinit(ctx.allocator);
-    }
+    defer accumulated_content.deinit(ctx.allocator);
 
     var signatures = std.AutoHashMap(usize, std.ArrayList(u8)).init(ctx.allocator);
     defer {
