@@ -213,21 +213,7 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
 
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer {
-        for (accumulated_content.items) |block| {
-            switch (block) {
-                .text => |t| ctx.allocator.free(t.text),
-                .tool_use => |tu| {
-                    ctx.allocator.free(tu.id);
-                    ctx.allocator.free(tu.name);
-                    ctx.allocator.free(tu.input_json);
-                },
-                .thinking => |th| ctx.allocator.free(th.thinking),
-                .image => {},
-            }
-        }
-        accumulated_content.deinit(ctx.allocator);
-    }
+    defer accumulated_content.deinit(ctx.allocator);
 
     var thought_signatures = std.AutoHashMap(usize, []u8).init(ctx.allocator);
     defer {
