@@ -124,6 +124,22 @@ pub const OpenAIConfig = struct {
     cancel_token: ?CancelToken = null,
 };
 
+/// OpenAI Responses API-specific configuration
+pub const OpenAIResponsesConfig = struct {
+    auth: AuthConfig,
+    model: []const u8 = "o3-mini",
+    base_url: []const u8 = "https://api.openai.com",
+    params: RequestParams = .{},
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    reasoning_summary: ?[]const u8 = null, // null, "auto", "concise", "detailed"
+    include_encrypted_reasoning: bool = false,
+    max_output_tokens: ?u32 = null,
+    parallel_tool_calls: ?bool = null,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
+};
+
 /// Ollama-specific configuration
 pub const OllamaConfig = struct {
     model: []const u8 = "llama3.2",
@@ -659,4 +675,35 @@ test "existing configs still work with defaults" {
 
     const ollama = OllamaConfig{};
     try std.testing.expectEqual(RetryConfig{}, ollama.retry_config);
+}
+
+test "OpenAIResponsesConfig default values" {
+    const config = OpenAIResponsesConfig{
+        .auth = .{ .api_key = "sk-test" },
+    };
+    try std.testing.expectEqualStrings("o3-mini", config.model);
+    try std.testing.expectEqualStrings("https://api.openai.com", config.base_url);
+    try std.testing.expect(config.reasoning_effort == null);
+    try std.testing.expect(config.reasoning_summary == null);
+    try std.testing.expect(!config.include_encrypted_reasoning);
+}
+
+test "OpenAIResponsesConfig with reasoning" {
+    const config = OpenAIResponsesConfig{
+        .auth = .{ .api_key = "sk-test" },
+        .reasoning_effort = .high,
+        .reasoning_summary = "concise",
+        .include_encrypted_reasoning = true,
+    };
+    try std.testing.expect(config.reasoning_effort.? == .high);
+    try std.testing.expectEqualStrings("concise", config.reasoning_summary.?);
+    try std.testing.expect(config.include_encrypted_reasoning);
+}
+
+test "OpenAIResponsesConfig with max_output_tokens" {
+    const config = OpenAIResponsesConfig{
+        .auth = .{ .api_key = "sk-test" },
+        .max_output_tokens = 16000,
+    };
+    try std.testing.expectEqual(@as(u32, 16000), config.max_output_tokens.?);
 }
