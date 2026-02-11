@@ -158,7 +158,28 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
-    defer accumulated_content.deinit(ctx.allocator);
+    // Track tool call index to accumulated_content position mapping
+    // OpenAI's index is tool-specific (0, 1, 2...) but accumulated_content
+    // can have text blocks first, so tool blocks may be at different positions
+    var tool_index_map = std.AutoHashMap(usize, usize).init(ctx.allocator);
+    defer {
+        // Clean up any allocated strings in accumulated_content before deinit
+        for (accumulated_content.items) |block| {
+            switch (block) {
+                .text => |t| {
+                    if (t.text.len > 0) ctx.allocator.free(@constCast(t.text));
+                },
+                .tool_use => |tu| {
+                    ctx.allocator.free(@constCast(tu.id));
+                    ctx.allocator.free(@constCast(tu.name));
+                    if (tu.input_json.len > 0) ctx.allocator.free(@constCast(tu.input_json));
+                },
+                else => {},
+            }
+        }
+        accumulated_content.deinit(ctx.allocator);
+        tool_index_map.deinit();
+    }
 
     // Get the reader once before the loop
     const reader = response.reader(&transfer_buffer);
@@ -200,23 +221,28 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         }
                     },
                     .toolcall_start => |tc| {
+                        const content_index = accumulated_content.items.len;
                         try accumulated_content.append(ctx.allocator, types.ContentBlock{ .tool_use = .{
                             .id = try ctx.allocator.dupe(u8, tc.id),
                             .name = try ctx.allocator.dupe(u8, tc.name),
                             .input_json = &[_]u8{},
                         } });
+                        // Map OpenAI's tool index to the actual content block position
+                        try tool_index_map.put(tc.index, content_index);
                     },
                     .toolcall_delta => |delta| {
-                        // Find the right tool call block by index
-                        if (delta.index < accumulated_content.items.len) {
-                            const block = &accumulated_content.items[delta.index];
-                            switch (block.*) {
-                                .tool_use => |*tu| {
-                                    const old_json = tu.input_json;
-                                    tu.input_json = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_json, delta.delta });
-                                    if (old_json.len > 0) ctx.allocator.free(@constCast(old_json));
-                                },
-                                else => {},
+                        // Look up the actual content block index using the tool_index_map
+                        if (tool_index_map.get(delta.index)) |content_idx| {
+                            if (content_idx < accumulated_content.items.len) {
+                                const block = &accumulated_content.items[content_idx];
+                                switch (block.*) {
+                                    .tool_use => |*tu| {
+                                        const old_json = tu.input_json;
+                                        tu.input_json = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_json, delta.delta });
+                                        if (old_json.len > 0) ctx.allocator.free(@constCast(old_json));
+                                    },
+                                    else => {},
+                                }
                             }
                         }
                     },
