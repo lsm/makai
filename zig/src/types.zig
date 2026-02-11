@@ -108,6 +108,44 @@ pub const AssistantMessage = struct {
     stop_reason: StopReason,
     model: []const u8,
     timestamp: i64,
+
+    pub fn deinit(self: *AssistantMessage, allocator: std.mem.Allocator) void {
+        // Free the model string
+        allocator.free(self.model);
+
+        // Free all strings within each ContentBlock
+        for (self.content) |block| {
+            switch (block) {
+                .text => |text_block| {
+                    allocator.free(text_block.text);
+                    if (text_block.signature) |sig| {
+                        allocator.free(sig);
+                    }
+                },
+                .tool_use => |tool_block| {
+                    allocator.free(tool_block.id);
+                    allocator.free(tool_block.name);
+                    allocator.free(tool_block.input_json);
+                    if (tool_block.thought_signature) |sig| {
+                        allocator.free(sig);
+                    }
+                },
+                .thinking => |thinking_block| {
+                    allocator.free(thinking_block.thinking);
+                    if (thinking_block.signature) |sig| {
+                        allocator.free(sig);
+                    }
+                },
+                .image => |image_block| {
+                    allocator.free(image_block.media_type);
+                    allocator.free(image_block.data);
+                },
+            }
+        }
+
+        // Free the content array itself
+        allocator.free(self.content);
+    }
 };
 
 // Event structures for streaming
