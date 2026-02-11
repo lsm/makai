@@ -66,6 +66,23 @@ pub fn shouldSkipProvider(allocator: std.mem.Allocator, provider_name: []const u
     return true;
 }
 
+/// Free allocated strings in a MessageEvent
+pub fn freeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) void {
+    switch (event) {
+        .start => |s| allocator.free(s.model),
+        .text_delta => |d| allocator.free(d.delta),
+        .thinking_delta => |d| allocator.free(d.delta),
+        .toolcall_start => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+        },
+        .toolcall_delta => |d| allocator.free(d.delta),
+        .toolcall_end => |e| allocator.free(e.input_json),
+        .@"error" => |e| allocator.free(e.message),
+        else => {},
+    }
+}
+
 /// Event accumulator for tracking streaming events
 pub const EventAccumulator = struct {
     events_seen: usize = 0,
@@ -137,6 +154,9 @@ pub const EventAccumulator = struct {
             },
             else => {},
         }
+
+        // Free the event's allocated strings after processing
+        freeEvent(event, self.allocator);
     }
 };
 

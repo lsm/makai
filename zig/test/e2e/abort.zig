@@ -44,7 +44,8 @@ test "abort: anthropic cancellation" {
     // Let some events flow
     var count: usize = 0;
     while (count < 3) {
-        if (stream.poll()) |_| {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
             count += 1;
         } else {
             if (stream.completed.load(.acquire)) break;
@@ -96,7 +97,8 @@ test "abort: openai cancellation" {
     // Let some events flow
     var count: usize = 0;
     while (count < 3) {
-        if (stream.poll()) |_| {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
             count += 1;
         } else {
             if (stream.completed.load(.acquire)) break;
@@ -189,7 +191,8 @@ test "abort: multiple cancellation calls" {
     // Let some events flow
     var count: usize = 0;
     while (count < 2) {
-        if (stream.poll()) |_| {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
             count += 1;
         } else {
             if (stream.completed.load(.acquire)) break;

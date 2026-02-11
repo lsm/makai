@@ -266,7 +266,8 @@ test "openai: abort mid-stream" {
     const max_events = 5;
 
     while (true) {
-        if (stream.poll()) |_| {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
             event_count += 1;
             if (event_count >= max_events) {
                 cancel_token.cancel();
@@ -315,7 +316,9 @@ test "openai: usage tracking" {
     }
 
     while (!stream.completed.load(.acquire)) {
-        _ = stream.poll();
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
