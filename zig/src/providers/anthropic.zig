@@ -180,6 +180,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var model_owned: ?[]u8 = null;
     defer if (model_owned) |m| ctx.allocator.free(m);
 
+    // Get the reader once before the loop
+    const reader = response.reader(&transfer_buffer);
+
     while (true) {
         // Check cancellation between chunks
         if (ctx.config.cancel_token) |token| {
@@ -189,7 +192,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
             }
         }
 
-        const bytes_read = try response.reader(&transfer_buffer).*.readSliceShort(&buffer);
+        const bytes_read = try reader.*.readSliceShort(&buffer);
         if (bytes_read == 0) break;
 
         const events = try parser.feed(buffer[0..bytes_read]);
