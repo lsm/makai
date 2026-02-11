@@ -29,7 +29,22 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            _ = self;
+            if (self.result) |*result| {
+                // Only call deinit if R has a deinit method
+                // Use comptime to check if R is a type that can have decls
+                const has_deinit = comptime blk: {
+                    const info = @typeInfo(R);
+                    switch (info) {
+                        .@"struct", .@"union", .@"enum", .@"opaque" => {
+                            break :blk @hasDecl(R, "deinit");
+                        },
+                        else => break :blk false,
+                    }
+                };
+                if (has_deinit) {
+                    result.deinit(self.allocator);
+                }
+            }
         }
 
         pub fn push(self: *Self, event: T) !void {
@@ -244,11 +259,13 @@ test "AssistantMessageStream basic usage" {
     try std.testing.expect(event != null);
     try std.testing.expect(std.meta.activeTag(event.?) == .start);
 
+    // Allocate model string to avoid "Invalid free" when deinit is called
+    const model_str = try std.testing.allocator.dupe(u8, "test-model");
     const result = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
         .usage = types.Usage{},
         .stop_reason = .stop,
-        .model = "test-model",
+        .model = model_str,
         .timestamp = 0,
     };
     stream.complete(result);

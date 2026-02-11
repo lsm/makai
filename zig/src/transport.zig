@@ -760,11 +760,14 @@ test "forwardStream and receiveStream round-trip" {
 
     try source_stream.push(.{ .start = .{ .model = "test-model" } });
     try source_stream.push(.{ .text_delta = .{ .index = 0, .delta = "Hi" } });
+
+    // Allocate model string to avoid "Invalid free" when deinit is called
+    const model_str = try allocator.dupe(u8, "test-model");
     source_stream.complete(.{
         .content = &[_]types.ContentBlock{},
         .usage = .{ .output_tokens = 5 },
         .stop_reason = .stop,
-        .model = "test-model",
+        .model = model_str,
         .timestamp = 42,
     });
 
@@ -826,9 +829,6 @@ test "forwardStream and receiveStream round-trip" {
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("test-model", result.?.model);
     try std.testing.expectEqual(@as(u64, 5), result.?.usage.output_tokens);
-    // Free deserialized result strings
-    allocator.free(result.?.model);
-    allocator.free(result.?.content);
 }
 
 test "serialize and deserialize text block with signature" {
