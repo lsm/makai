@@ -10,7 +10,12 @@ const event_stream = @import("event_stream");
 const provider_mod = @import("provider");
 const anthropic = @import("anthropic");
 const openai = @import("openai");
+const openai_responses = @import("openai_responses");
 const ollama = @import("ollama");
+const azure = @import("azure");
+const google = @import("google");
+const google_vertex = @import("google_vertex");
+const bedrock = @import("bedrock");
 
 /// Default thinking budgets per ThinkingLevel (in tokens).
 pub const ThinkingBudgets = struct {
@@ -49,6 +54,20 @@ pub const SimpleStreamOptions = struct {
     // Provider-specific (passed through when applicable)
     cache_retention: config.CacheRetention = .none,
     response_format: ?config.ResponseFormat = null,
+
+    // Azure-specific
+    resource_name: ?[]const u8 = null,
+    deployment_name: ?[]const u8 = null,
+
+    // AWS Bedrock-specific
+    aws_access_key_id: ?[]const u8 = null,
+    aws_secret_access_key: ?[]const u8 = null,
+    aws_session_token: ?[]const u8 = null,
+    aws_region: ?[]const u8 = null,
+
+    // Google Vertex-specific
+    google_project_id: ?[]const u8 = null,
+    google_location: ?[]const u8 = null,
 
     // Stream control
     cancel_token: ?config.CancelToken = null,
@@ -180,6 +199,42 @@ pub fn streamSimple(
             const p = try openai.createProvider(cfg, allocator);
             return p.stream(messages, allocator);
         },
+        .openai_responses => {
+            const api_key = options.api_key orelse return error.MissingApiKey;
+            const params = buildRequestParams(options, mdl);
+
+            // Map unified reasoning to OpenAI effort and summary
+            var reasoning_effort: ?config.OpenAIReasoningEffort = null;
+            var include_encrypted_reasoning: bool = false;
+            if (options.reasoning) |level| {
+                reasoning_effort = mapToOpenAIEffort(level);
+                include_encrypted_reasoning = true;
+            }
+
+            // For Responses API, use max_output_tokens
+            var max_output_tokens: ?u32 = null;
+            if (mdl.reasoning and options.reasoning != null) {
+                max_output_tokens = params.max_tokens;
+            }
+
+            const cfg = config.OpenAIResponsesConfig{
+                .auth = .{ .api_key = api_key, .org_id = options.org_id },
+                .model = mdl.id,
+                .base_url = options.base_url orelse if (mdl.base_url) |url| url else "https://api.openai.com",
+                .params = params,
+                .reasoning_effort = reasoning_effort,
+                .reasoning_summary = null,
+                .include_encrypted_reasoning = include_encrypted_reasoning,
+                .max_output_tokens = max_output_tokens,
+                .response_format = options.response_format,
+                .custom_headers = options.custom_headers,
+                .retry_config = options.retry_config,
+                .cancel_token = options.cancel_token,
+            };
+
+            const p = try openai_responses.createProvider(cfg, allocator);
+            return p.stream(messages, allocator);
+        },
         .ollama => {
             const params = buildRequestParams(options, mdl);
 
@@ -193,6 +248,107 @@ pub fn streamSimple(
             };
 
             const p = try ollama.createProvider(cfg, allocator);
+            return p.stream(messages, allocator);
+        },
+        .azure => {
+            const api_key = options.api_key orelse return error.MissingApiKey;
+            const resource_name = options.resource_name orelse return error.MissingApiKey;
+            const params = buildRequestParams(options, mdl);
+
+            // Map unified reasoning to OpenAI effort (same as openai)
+            var reasoning_effort: ?config.OpenAIReasoningEffort = null;
+            if (options.reasoning) |level| {
+                reasoning_effort = mapToOpenAIEffort(level);
+            }
+
+            // For reasoning models, use max_completion_tokens
+            var max_completion_tokens: ?u32 = null;
+            if (mdl.reasoning and options.reasoning != null) {
+                max_completion_tokens = params.max_tokens;
+            }
+
+            const cfg = config.AzureConfig{
+                .api_key = api_key,
+                .resource_name = resource_name,
+                .deployment_name = options.deployment_name,
+                .model = mdl.id,
+                .base_url = options.base_url,
+                .params = params,
+                .reasoning_effort = reasoning_effort,
+                .max_completion_tokens = max_completion_tokens,
+                .response_format = options.response_format,
+                .custom_headers = options.custom_headers,
+                .retry_config = options.retry_config,
+                .cancel_token = options.cancel_token,
+            };
+
+            const p = try azure.createProvider(cfg, allocator);
+            return p.stream(messages, allocator);
+        },
+        .google => {
+            const api_key = options.api_key orelse return error.MissingApiKey;
+            var params = buildRequestParams(options, mdl);
+
+            // Map unified reasoning to Google ThinkingConfig
+            var thinking_cfg: ?google.ThinkingConfig = null;
+            if (options.reasoning) |level| {
+                const budget = getBudget(level, options.thinking_budgets);
+                thinking_cfg = google.ThinkingConfig{
+                    .enabled = true,
+                    .budget_tokens = @intCast(budget),
+                };
+                params.max_tokens = adjustMaxTokensForThinking(params.max_tokens, budget, mdl.max_tokens);
+            }
+
+            const cfg = google.GoogleConfig{
+                .allocator = allocator,
+                .api_key = api_key,
+                .model_id = mdl.id,
+                .base_url = options.base_url,
+                .params = params,
+                .thinking = thinking_cfg,
+                .custom_headers = options.custom_headers,
+                .retry_config = options.retry_config,
+                .cancel_token = options.cancel_token,
+            };
+
+            const p = try google.createProvider(cfg, allocator);
+            return p.stream(messages, allocator);
+        },
+        .bedrock => {
+            const access_key_id = options.aws_access_key_id orelse return error.MissingApiKey;
+            const secret_access_key = options.aws_secret_access_key orelse return error.MissingApiKey;
+            var params = buildRequestParams(options, mdl);
+
+            // Map unified reasoning to Bedrock ThinkingConfig
+            var thinking_cfg: ?bedrock.BedrockThinkingConfig = null;
+            if (options.reasoning) |level| {
+                const budget = getBudget(level, options.thinking_budgets);
+                thinking_cfg = bedrock.BedrockThinkingConfig{
+                    .mode = .enabled,
+                    .budget_tokens = budget,
+                };
+                params.max_tokens = adjustMaxTokensForThinking(params.max_tokens, budget, mdl.max_tokens);
+            }
+
+            const cfg = bedrock.BedrockConfig{
+                .auth = .{
+                    .access_key_id = access_key_id,
+                    .secret_access_key = secret_access_key,
+                    .session_token = options.aws_session_token,
+                },
+                .model = mdl.id,
+                .region = options.aws_region orelse "us-east-1",
+                .base_url = options.base_url,
+                .params = params,
+                .thinking_config = thinking_cfg,
+                .cache_retention = options.cache_retention,
+                .custom_headers = options.custom_headers,
+                .retry_config = options.retry_config,
+                .cancel_token = options.cancel_token,
+            };
+
+            const p = try bedrock.createProvider(cfg, allocator);
             return p.stream(messages, allocator);
         },
     }

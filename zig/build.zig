@@ -61,6 +61,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    _ = b.createModule(.{
+        .root_source_file = b.path("src/transform_messages.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "model", .module = model_mod },
+        },
+    });
+
     const sse_parser_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/sse_parser.zig"),
         .target = target,
@@ -71,6 +81,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/utils/retry.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    _ = b.createModule(.{
+        .root_source_file = b.path("src/utils/tokens.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+        },
     });
 
     _ = b.createModule(.{
@@ -162,6 +181,20 @@ pub fn build(b: *std.Build) void {
 
     const openai_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/openai.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "provider", .module = provider_mod },
+            .{ .name = "config", .module = config_mod },
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+        },
+    });
+
+    const openai_responses_mod = b.createModule(.{
+        .root_source_file = b.path("src/providers/openai_responses.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -268,10 +301,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "provider", .module = provider_mod },
             .{ .name = "anthropic", .module = anthropic_mod },
             .{ .name = "openai", .module = openai_mod },
+            .{ .name = "openai_responses", .module = openai_responses_mod },
             .{ .name = "ollama", .module = ollama_mod },
             .{ .name = "azure", .module = azure_mod },
             .{ .name = "google", .module = google_mod },
             .{ .name = "google_vertex", .module = google_vertex_mod },
+            .{ .name = "bedrock", .module = bedrock_mod },
         },
     });
 
@@ -369,6 +404,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const transform_messages_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/transform_messages.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+                .{ .name = "model", .module = model_mod },
+            },
+        }),
+    });
+
     const sse_parser_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/providers/sse_parser.zig"),
@@ -382,6 +429,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/utils/retry.zig"),
             .target = target,
             .optimize = optimize,
+        }),
+    });
+
+    const tokens_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/tokens.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+            },
         }),
     });
 
@@ -423,6 +481,22 @@ pub fn build(b: *std.Build) void {
     const openai_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/providers/openai.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "provider", .module = provider_mod },
+                .{ .name = "config", .module = config_mod },
+                .{ .name = "sse_parser", .module = sse_parser_mod },
+                .{ .name = "json_writer", .module = json_writer_mod },
+            },
+        }),
+    });
+
+    const openai_responses_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/providers/openai_responses.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -580,8 +654,12 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "provider", .module = provider_mod },
                 .{ .name = "anthropic", .module = anthropic_mod },
                 .{ .name = "openai", .module = openai_mod },
+                .{ .name = "openai_responses", .module = openai_responses_mod },
                 .{ .name = "ollama", .module = ollama_mod },
                 .{ .name = "azure", .module = azure_mod },
+                .{ .name = "google", .module = google_mod },
+                .{ .name = "google_vertex", .module = google_vertex_mod },
+                .{ .name = "bedrock", .module = bedrock_mod },
             },
         }),
     });
@@ -820,12 +898,15 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(json_writer_test).step);
     test_step.dependOn(&b.addRunArtifact(config_test).step);
     test_step.dependOn(&b.addRunArtifact(model_test).step);
+    test_step.dependOn(&b.addRunArtifact(transform_messages_test).step);
     test_step.dependOn(&b.addRunArtifact(sse_parser_test).step);
     test_step.dependOn(&b.addRunArtifact(retry_test).step);
+    test_step.dependOn(&b.addRunArtifact(tokens_test).step);
     test_step.dependOn(&b.addRunArtifact(aws_sigv4_test).step);
     test_step.dependOn(&b.addRunArtifact(http_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_test).step);
+    test_step.dependOn(&b.addRunArtifact(openai_responses_test).step);
     test_step.dependOn(&b.addRunArtifact(ollama_test).step);
     test_step.dependOn(&b.addRunArtifact(azure_test).step);
     test_step.dependOn(&b.addRunArtifact(google_shared_test).step);

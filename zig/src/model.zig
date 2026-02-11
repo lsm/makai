@@ -1,7 +1,7 @@
 const std = @import("std");
 const types = @import("types");
 
-pub const ApiType = enum { anthropic, openai, ollama, azure, google, bedrock };
+pub const ApiType = enum { anthropic, openai, openai_responses, ollama, azure, google, bedrock };
 pub const InputModality = enum { text, image };
 
 pub const CostPerMillion = struct {
@@ -34,6 +34,40 @@ pub const Model = struct {
             if (m == .image) return true;
         }
         return false;
+    }
+
+    /// Returns the effective context window for this model, accounting for vendor-specific limits.
+    ///
+    /// Known vendor-specific context window limits:
+    ///
+    /// GitHub Copilot (*.githubcopilot.com):
+    ///   - gpt-5-codex: 200k (official: 272k)
+    ///   - gpt-5.1-codex: 200k (official: 272k)
+    ///   - gpt-5.2-codex: 200k (official: 272k)
+    ///   - gpt-5.3-codex: 200k (official: 272k)
+    ///
+    /// Sources:
+    ///   - GitHub Copilot gpt-5-codex documentation
+    ///   - Observed API overflow errors at 200k
+    pub fn getEffectiveContextWindow(self: Model, base_url: ?[]const u8) u32 {
+        // Apply vendor-specific overrides based on base_url domain
+        if (base_url) |url| {
+            // GitHub Copilot limits
+            if (std.mem.indexOf(u8, url, "githubcopilot.com") != null or
+                std.mem.indexOf(u8, url, "api.githubcopilot.com") != null or
+                std.mem.indexOf(u8, url, "api.individual.githubcopilot.com") != null)
+            {
+                // Codex models limited to 200k on Copilot
+                if (std.mem.startsWith(u8, self.id, "gpt-5") and
+                    std.mem.indexOf(u8, self.id, "codex") != null)
+                {
+                    return 200_000;
+                }
+            }
+        }
+
+        // Return official limit
+        return self.context_window;
     }
 };
 
@@ -76,26 +110,26 @@ const known_models = [_]Model{
         .max_tokens = 16_384,
     },
     .{
-        .id = "claude-opus-4-20250514",
-        .name = "Claude Opus 4",
+        .id = "claude-opus-4-6-20250514",
+        .name = "Claude Opus 4.6",
         .api_type = .anthropic,
         .provider = "anthropic",
         .reasoning = true,
         .input_modalities = &text_and_image,
-        .cost = .{ .input = 15.0, .output = 75.0, .cache_read = 1.50, .cache_write = 18.75 },
+        .cost = .{ .input = 5.0, .output = 25.0, .cache_read = 0.50, .cache_write = 6.25 },
         .context_window = 200_000,
         .max_tokens = 32_000,
     },
     .{
-        .id = "claude-haiku-3-5-20241022",
-        .name = "Claude Haiku 3.5",
+        .id = "claude-haiku-4-5-20250201",
+        .name = "Claude Haiku 4.5",
         .api_type = .anthropic,
         .provider = "anthropic",
         .reasoning = false,
         .input_modalities = &text_and_image,
-        .cost = .{ .input = 0.80, .output = 4.0, .cache_read = 0.08, .cache_write = 1.0 },
+        .cost = .{ .input = 1.0, .output = 5.0, .cache_read = 0.10, .cache_write = 1.25 },
         .context_window = 200_000,
-        .max_tokens = 8192,
+        .max_tokens = 64_000,
     },
     // OpenAI models
     .{
@@ -120,38 +154,106 @@ const known_models = [_]Model{
         .context_window = 128_000,
         .max_tokens = 16_384,
     },
+    // GPT-5 series (reasoning models, use Responses API)
     .{
-        .id = "o3",
-        .name = "O3",
-        .api_type = .openai,
-        .provider = "openai",
-        .reasoning = true,
-        .input_modalities = &text_and_image,
-        .cost = .{ .input = 10.0, .output = 40.0, .cache_read = 2.50, .cache_write = 10.0 },
-        .context_window = 200_000,
-        .max_tokens = 100_000,
-    },
-    .{
-        .id = "o3-mini",
-        .name = "O3 Mini",
-        .api_type = .openai,
+        .id = "gpt-5.1",
+        .name = "GPT-5.1",
+        .api_type = .openai_responses,
         .provider = "openai",
         .reasoning = true,
         .input_modalities = &text_only,
-        .cost = .{ .input = 1.10, .output = 4.40, .cache_read = 0.55, .cache_write = 1.10 },
-        .context_window = 200_000,
-        .max_tokens = 100_000,
+        .cost = .{ .input = 1.25, .output = 10.0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 196_000,
+        .max_tokens = 128_000,
     },
     .{
-        .id = "o4-mini",
-        .name = "O4 Mini",
-        .api_type = .openai,
+        .id = "gpt-5.2",
+        .name = "GPT-5.2",
+        .api_type = .openai_responses,
         .provider = "openai",
         .reasoning = true,
-        .input_modalities = &text_and_image,
-        .cost = .{ .input = 1.10, .output = 4.40, .cache_read = 0.55, .cache_write = 1.10 },
-        .context_window = 200_000,
-        .max_tokens = 100_000,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 1750, .output = 14000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 400_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.2-pro",
+        .name = "GPT-5.2 Pro",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 21.0, .output = 168.0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 400_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.3",
+        .name = "GPT-5.3",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 2000, .output = 16000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 400_000,
+        .max_tokens = 128_000,
+    },
+    // GPT-5 Codex series (agentic coding models)
+    .{
+        .id = "gpt-5-codex",
+        .name = "GPT-5 Codex",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 1500, .output = 12000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.1-codex",
+        .name = "GPT-5.1 Codex",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 1.25, .output = 10.0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.1-codex-max",
+        .name = "GPT-5.1 Codex Max",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 2000, .output = 16000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.2-codex",
+        .name = "GPT-5.2 Codex",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 1750, .output = 14000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272_000,
+        .max_tokens = 128_000,
+    },
+    .{
+        .id = "gpt-5.3-codex",
+        .name = "GPT-5.3 Codex",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .reasoning = true,
+        .input_modalities = &text_only,
+        .cost = .{ .input = 2000, .output = 16000, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272_000,
+        .max_tokens = 128_000,
     },
     // Azure OpenAI models (same pricing as OpenAI)
     .{
@@ -195,7 +297,7 @@ const known_models = [_]Model{
         .provider = "google",
         .reasoning = true,
         .input_modalities = &text_and_image,
-        .cost = .{ .input = 1.25, .output = 5.0, .cache_read = 0.3125, .cache_write = 1.5625 },
+        .cost = .{ .input = 1.25, .output = 10.0, .cache_read = 0.3125, .cache_write = 1.5625 },
         .context_window = 1_000_000,
         .max_tokens = 8192,
     },
@@ -269,12 +371,12 @@ const known_models = [_]Model{
     },
     .{
         .id = "anthropic.claude-opus-4-20250514-v1:0",
-        .name = "Claude Opus 4 (Bedrock)",
+        .name = "Claude Opus 4.6 (Bedrock)",
         .api_type = .bedrock,
         .provider = "bedrock",
         .reasoning = true,
         .input_modalities = &text_and_image,
-        .cost = .{ .input = 15.0, .output = 75.0, .cache_read = 1.50, .cache_write = 18.75 },
+        .cost = .{ .input = 5.0, .output = 25.0, .cache_read = 0.50, .cache_write = 6.25 },
         .context_window = 200_000,
         .max_tokens = 32_000,
     },
@@ -349,7 +451,7 @@ test "getModel returns null for unknown" {
 
 test "getModels returns all known models" {
     const models = getModels();
-    try std.testing.expectEqual(@as(usize, 19), models.len);
+    try std.testing.expectEqual(@as(usize, 25), models.len);
 }
 
 test "calculateCost basic" {
@@ -400,7 +502,7 @@ test "CostInfo total" {
 }
 
 test "supportsXhigh" {
-    const opus = getModel("claude-opus-4-20250514").?;
+    const opus = getModel("claude-opus-4-6-20250514").?;
     try std.testing.expect(opus.supportsXhigh());
 
     const sonnet = getModel("claude-sonnet-4-20250514").?;
@@ -409,8 +511,8 @@ test "supportsXhigh" {
     const gpt4o = getModel("gpt-4o").?;
     try std.testing.expect(!gpt4o.supportsXhigh());
 
-    const o3 = getModel("o3").?;
-    try std.testing.expect(!o3.supportsXhigh());
+    const gpt5 = getModel("gpt-5.2").?;
+    try std.testing.expect(!gpt5.supportsXhigh());
 }
 
 test "supportsImages" {
@@ -420,11 +522,11 @@ test "supportsImages" {
     const llama = getModel("llama3.1").?;
     try std.testing.expect(!llama.supportsImages());
 
-    const o3mini = getModel("o3-mini").?;
-    try std.testing.expect(!o3mini.supportsImages());
+    const gpt5 = getModel("gpt-5.2").?;
+    try std.testing.expect(!gpt5.supportsImages());
 
-    const o4mini = getModel("o4-mini").?;
-    try std.testing.expect(o4mini.supportsImages());
+    const gpt5codex = getModel("gpt-5.1-codex").?;
+    try std.testing.expect(!gpt5codex.supportsImages());
 }
 
 test "ModelRegistry custom model" {
@@ -482,4 +584,38 @@ test "Model default values" {
     try std.testing.expectEqual(@as(u32, 128_000), minimal.context_window);
     try std.testing.expectEqual(@as(u32, 4096), minimal.max_tokens);
     try std.testing.expectEqual(@as(?[]const u8, null), minimal.base_url);
+}
+
+test "getEffectiveContextWindow - GitHub Copilot override" {
+    const copilot_model = Model{
+        .id = "gpt-5.2-codex",
+        .name = "GPT-5.2 Codex",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .context_window = 272_000,
+        .max_tokens = 128_000,
+    };
+
+    // Official limit (no base_url)
+    try std.testing.expectEqual(@as(u32, 272_000), copilot_model.getEffectiveContextWindow(null));
+
+    // Official OpenAI endpoint
+    try std.testing.expectEqual(@as(u32, 272_000), copilot_model.getEffectiveContextWindow("https://api.openai.com/v1/responses"));
+
+    // GitHub Copilot endpoint - should apply 200k limit
+    try std.testing.expectEqual(@as(u32, 200_000), copilot_model.getEffectiveContextWindow("https://api.githubcopilot.com/v1/responses"));
+
+    try std.testing.expectEqual(@as(u32, 200_000), copilot_model.getEffectiveContextWindow("https://api.individual.githubcopilot.com/v1/responses"));
+
+    // Non-Codex model should not be affected
+    const non_codex = Model{
+        .id = "gpt-5.2",
+        .name = "GPT-5.2",
+        .api_type = .openai_responses,
+        .provider = "openai",
+        .context_window = 400_000,
+        .max_tokens = 128_000,
+    };
+
+    try std.testing.expectEqual(@as(u32, 400_000), non_codex.getEffectiveContextWindow("https://api.githubcopilot.com/v1/responses"));
 }

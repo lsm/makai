@@ -6,39 +6,39 @@ const config = @import("config");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
-/// Azure OpenAI provider context
-pub const AzureContext = struct {
-    config: config.AzureConfig,
+/// OpenAI Responses provider context
+pub const OpenAIResponsesContext = struct {
+    config: config.OpenAIResponsesConfig,
     allocator: std.mem.Allocator,
 };
 
-/// Create an Azure OpenAI provider
+/// Create an OpenAI Responses provider
 pub fn createProvider(
-    cfg: config.AzureConfig,
+    cfg: config.OpenAIResponsesConfig,
     allocator: std.mem.Allocator,
 ) !provider.Provider {
-    const ctx = try allocator.create(AzureContext);
+    const ctx = try allocator.create(OpenAIResponsesContext);
     ctx.* = .{
         .config = cfg,
         .allocator = allocator,
     };
 
     return provider.Provider{
-        .id = "azure",
-        .name = "Azure OpenAI",
+        .id = "openai-responses",
+        .name = "OpenAI Responses API",
         .context = @ptrCast(ctx),
-        .stream_fn = azureStreamFn,
-        .deinit_fn = azureDeinitFn,
+        .stream_fn = openaiResponsesStreamFn,
+        .deinit_fn = openaiResponsesDeinitFn,
     };
 }
 
 /// Stream function implementation
-fn azureStreamFn(
+fn openaiResponsesStreamFn(
     ctx_ptr: *anyopaque,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) !*event_stream.AssistantMessageStream {
-    const ctx: *AzureContext = @ptrCast(@alignCast(ctx_ptr));
+    const ctx: *OpenAIResponsesContext = @ptrCast(@alignCast(ctx_ptr));
 
     const stream = try allocator.create(event_stream.AssistantMessageStream);
     stream.* = event_stream.AssistantMessageStream.init(allocator);
@@ -61,8 +61,8 @@ fn azureStreamFn(
 }
 
 /// Cleanup function
-fn azureDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
-    const ctx: *AzureContext = @ptrCast(@alignCast(ctx_ptr));
+fn openaiResponsesDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+    const ctx: *OpenAIResponsesContext = @ptrCast(@alignCast(ctx_ptr));
     allocator.destroy(ctx);
 }
 
@@ -70,7 +70,7 @@ fn azureDeinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
 const StreamThreadContext = struct {
     stream: *event_stream.AssistantMessageStream,
     request_body: []u8,
-    config: config.AzureConfig,
+    config: config.OpenAIResponsesConfig,
     allocator: std.mem.Allocator,
 };
 
@@ -100,16 +100,24 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var client = std.http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
 
-    const url = try buildEndpoint(ctx.config, ctx.allocator);
+    const url = try std.fmt.allocPrint(ctx.allocator, "{s}/v1/responses", .{ctx.config.base_url});
     defer ctx.allocator.free(url);
 
     const uri = try std.Uri.parse(url);
 
     // Build headers
+    const auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
+    defer ctx.allocator.free(auth_header);
+
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
-    try headers.append(ctx.allocator, .{ .name = "api-key", .value = ctx.config.api_key });
+    try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header });
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
+
+    // Optional organization header
+    if (ctx.config.auth.org_id) |org_id| {
+        try headers.append(ctx.allocator, .{ .name = "openai-organization", .value = org_id });
+    }
 
     // Apply custom headers
     if (ctx.config.custom_headers) |custom| {
@@ -142,7 +150,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var parser = sse_parser.SSEParser.init(ctx.allocator);
     defer parser.deinit();
 
-    var state = AzureStreamState.init(ctx.allocator);
+    var state = OpenAIResponsesStreamState.init(ctx.allocator);
     defer state.deinit();
 
     var transfer_buffer: [4096]u8 = undefined;
@@ -269,26 +277,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     ctx.stream.complete(result);
 }
 
-/// Build Azure endpoint URL
-pub fn buildEndpoint(cfg: config.AzureConfig, allocator: std.mem.Allocator) ![]u8 {
-    // If base_url provided, use directly
-    if (cfg.base_url) |base| {
-        return try allocator.dupe(u8, base);
-    }
-
-    // Build from resource_name
-    const deployment = cfg.deployment_name orelse cfg.model;
-
-    return try std.fmt.allocPrint(
-        allocator,
-        "https://{s}.openai.azure.com/openai/deployments/{s}/chat/completions?api-version={s}",
-        .{ cfg.resource_name, deployment, cfg.api_version },
-    );
-}
-
-/// Build request body for Azure OpenAI API (OpenAI Responses API format)
+/// Build request body for OpenAI Responses API
 pub fn buildRequestBody(
-    cfg: config.AzureConfig,
+    cfg: config.OpenAIResponsesConfig,
     messages: []const types.Message,
     allocator: std.mem.Allocator,
 ) ![]u8 {
@@ -298,56 +289,21 @@ pub fn buildRequestBody(
     var writer = json_writer.JsonWriter.init(&buffer, allocator);
 
     try writer.beginObject();
+    try writer.writeStringField("model", cfg.model);
     try writer.writeBoolField("stream", true);
 
-    // Stream options for usage tracking
-    if (cfg.include_usage) {
-        try writer.writeKey("stream_options");
-        try writer.beginObject();
-        try writer.writeBoolField("include_usage", true);
-        try writer.endObject();
-    }
-
-    // Write messages array as "input" (Responses API format)
+    // Write input array (Responses API uses "input" instead of "messages")
     try writer.writeKey("input");
     try writer.beginArray();
 
     // Prepend system/developer message if system_prompt is provided
     if (cfg.params.system_prompt) |system| {
         try writer.beginObject();
-        // GPT-5 quirk: inject developer message to disable auto-reasoning
-        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
-        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
-
-        if (needs_juice_injection) {
-            // Inject developer message with juice directive
-            const juice_system = try std.fmt.allocPrint(allocator, "{s}\n\n# Juice: 0 !important", .{system});
-            defer allocator.free(juice_system);
-            try writer.writeStringField("role", "developer");
-            try writer.writeStringField("content", juice_system);
-        } else {
-            // Use "developer" role for reasoning models (o1/o3/o4), "system" for others
-            const system_role = if (std.mem.startsWith(u8, cfg.model, "o1") or
-                std.mem.startsWith(u8, cfg.model, "o3") or
-                std.mem.startsWith(u8, cfg.model, "o4"))
-                "developer"
-            else
-                "system";
-            try writer.writeStringField("role", system_role);
-            try writer.writeStringField("content", system);
-        }
+        // Use "developer" role for reasoning models
+        const system_role = if (cfg.reasoning_effort != null) "developer" else "system";
+        try writer.writeStringField("role", system_role);
+        try writer.writeStringField("content", system);
         try writer.endObject();
-    } else {
-        // No system prompt, but need juice injection for GPT-5
-        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
-        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
-
-        if (needs_juice_injection) {
-            try writer.beginObject();
-            try writer.writeStringField("role", "developer");
-            try writer.writeStringField("content", "# Juice: 0 !important");
-            try writer.endObject();
-        }
     }
 
     for (messages) |msg| {
@@ -384,6 +340,7 @@ pub fn buildRequestBody(
                         try writer.writeStringField("text", text.text);
                     },
                     .tool_use => |tool| {
+                        // OpenAI represents tool use differently in messages
                         try writer.writeStringField("type", "tool_use");
                         try writer.writeStringField("id", tool.id);
                         try writer.writeStringField("name", tool.name);
@@ -396,6 +353,7 @@ pub fn buildRequestBody(
                         try writer.writeStringField("type", "image_url");
                         try writer.writeKey("image_url");
                         try writer.beginObject();
+                        // OpenAI uses data URL format
                         const url = try std.fmt.allocPrint(writer.allocator, "data:{s};base64,{s}", .{ image.media_type, image.data });
                         defer writer.allocator.free(url);
                         try writer.writeStringField("url", url);
@@ -412,16 +370,16 @@ pub fn buildRequestBody(
 
     try writer.endArray();
 
-    // Write max_completion_tokens: explicit config > max_reasoning_tokens > params.max_tokens
-    if (cfg.max_completion_tokens) |mct| {
-        try writer.writeIntField("max_completion_tokens", mct);
-    } else if (cfg.max_reasoning_tokens) |mrt| {
-        try writer.writeIntField("max_completion_tokens", mrt);
+    // max_output_tokens (Responses API uses this instead of max_completion_tokens)
+    if (cfg.max_output_tokens) |mot| {
+        try writer.writeIntField("max_output_tokens", mot);
     } else {
-        try writer.writeIntField("max_completion_tokens", cfg.params.max_tokens);
+        try writer.writeIntField("max_output_tokens", cfg.params.max_tokens);
     }
+
     try writer.writeKey("temperature");
     try writer.writeFloat(cfg.params.temperature);
+
     if (cfg.params.top_p) |top_p| {
         try writer.writeKey("top_p");
         try writer.writeFloat(top_p);
@@ -502,14 +460,31 @@ pub fn buildRequestBody(
         }
     }
 
-    // Reasoning effort for o1/o3 models
+    // Reasoning configuration
     if (cfg.reasoning_effort) |effort| {
+        try writer.writeKey("reasoning");
+        try writer.beginObject();
+
         const effort_str = switch (effort) {
             .low => "low",
             .medium => "medium",
             .high => "high",
         };
-        try writer.writeStringField("reasoning_effort", effort_str);
+        try writer.writeStringField("effort", effort_str);
+
+        if (cfg.reasoning_summary) |summary| {
+            try writer.writeStringField("summary", summary);
+        }
+
+        try writer.endObject();
+
+        // Include encrypted reasoning if requested
+        if (cfg.include_encrypted_reasoning) {
+            try writer.writeKey("include");
+            try writer.beginArray();
+            try writer.writeString("reasoning.encrypted_content");
+            try writer.endArray();
+        }
     }
 
     // Frequency penalty
@@ -539,39 +514,13 @@ pub fn buildRequestBody(
         try writer.writeStringField("user", user);
     }
 
-    // Response format
-    if (cfg.response_format) |response_format| {
-        try writer.writeKey("response_format");
-        try writer.beginObject();
-        switch (response_format) {
-            .text => {
-                try writer.writeStringField("type", "text");
-            },
-            .json_object => {
-                try writer.writeStringField("type", "json_object");
-            },
-            .json_schema => |schema| {
-                try writer.writeStringField("type", "json_schema");
-                try writer.writeKey("json_schema");
-                try writer.buffer.appendSlice(writer.allocator, schema);
-                writer.needs_comma = true;
-            },
-        }
-        try writer.endObject();
-    }
-
-    // Session ID for prompt caching
-    if (cfg.session_id) |session_id| {
-        try writer.writeStringField("prompt_cache_key", session_id);
-    }
-
     try writer.endObject();
 
     return buffer.toOwnedSlice(allocator);
 }
 
-/// Track state across Azure streaming events (Responses API format)
-pub const AzureStreamState = struct {
+/// Track state across OpenAI Responses streaming events
+pub const OpenAIResponsesStreamState = struct {
     current_item_type: ?ItemType = null,
     current_item_index: ?usize = null,
     model: ?[]const u8 = null,
@@ -586,24 +535,24 @@ pub const AzureStreamState = struct {
         function_call,
     };
 
-    pub fn init(allocator: std.mem.Allocator) AzureStreamState {
+    pub fn init(allocator: std.mem.Allocator) OpenAIResponsesStreamState {
         return .{
             .allocator = allocator,
         };
     }
 
-    pub fn deinit(self: *AzureStreamState) void {
+    pub fn deinit(self: *OpenAIResponsesStreamState) void {
         if (self.model) |m| self.allocator.free(m);
     }
 };
 
-/// Map Azure SSE data to MessageEvent (Responses API format)
+/// Map OpenAI Responses SSE data to MessageEvent
 pub fn mapSSEToMessageEvent(
     event: sse_parser.SSEEvent,
-    state: *AzureStreamState,
+    state: *OpenAIResponsesStreamState,
     allocator: std.mem.Allocator,
 ) !?types.MessageEvent {
-    // Azure Responses API sends typed events like OpenAI
+    // Responses API sends typed events
     const event_type = event.event_type orelse return null;
     const data = event.data;
 
@@ -797,88 +746,19 @@ pub fn mapSSEToMessageEvent(
 }
 
 // Tests
-
-test "buildEndpoint - from resource_name" {
+test "buildRequestBody - basic message with reasoning" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
-    };
-
-    const endpoint = try buildEndpoint(cfg, allocator);
-    defer allocator.free(endpoint);
-
-    try testing.expectEqualStrings(
-        "https://myresource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2024-10-01-preview",
-        endpoint,
-    );
-}
-
-test "buildEndpoint - with deployment_name override" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
-        .deployment_name = "my-gpt4o-deployment",
-    };
-
-    const endpoint = try buildEndpoint(cfg, allocator);
-    defer allocator.free(endpoint);
-
-    try testing.expectEqualStrings(
-        "https://myresource.openai.azure.com/openai/deployments/my-gpt4o-deployment/chat/completions?api-version=2024-10-01-preview",
-        endpoint,
-    );
-}
-
-test "buildEndpoint - with custom api_version" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
-        .api_version = "2023-05-15",
-    };
-
-    const endpoint = try buildEndpoint(cfg, allocator);
-    defer allocator.free(endpoint);
-
-    try testing.expect(std.mem.indexOf(u8, endpoint, "api-version=2023-05-15") != null);
-}
-
-test "buildEndpoint - with base_url override" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
-        .base_url = "https://custom.endpoint.com/api",
-    };
-
-    const endpoint = try buildEndpoint(cfg, allocator);
-    defer allocator.free(endpoint);
-
-    try testing.expectEqualStrings("https://custom.endpoint.com/api", endpoint);
-}
-
-test "buildRequestBody - basic message with input format" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
+    const cfg = config.OpenAIResponsesConfig{
+        .auth = .{ .api_key = "test-key" },
+        .model = "o3-mini",
+        .base_url = "https://api.openai.com",
+        .params = .{
+            .max_tokens = 1000,
+            .temperature = 0.7,
+        },
+        .reasoning_effort = .medium,
     };
 
     const messages = [_]types.Message{
@@ -894,31 +774,34 @@ test "buildRequestBody - basic message with input format" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    // Verify Responses API format uses "input" instead of "messages"
-    try testing.expect(std.mem.indexOf(u8, body, "\"input\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"model\":\"o3-mini\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"input\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hello\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_output_tokens\":1000") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.7") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"medium\"") != null);
 }
 
-test "buildRequestBody - GPT-5 quirk without reasoning" {
+test "buildRequestBody - with reasoning summary" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-5-preview",
-        .params = .{
-            .system_prompt = "You are helpful.",
-        },
+    const cfg = config.OpenAIResponsesConfig{
+        .auth = .{ .api_key = "test-key" },
+        .model = "o3-mini",
+        .reasoning_effort = .high,
+        .reasoning_summary = "concise",
+        .params = .{},
     };
 
     const messages = [_]types.Message{
         .{
             .role = .user,
             .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
+                .{ .text = .{ .text = "Test" } },
             },
             .timestamp = 0,
         },
@@ -927,30 +810,28 @@ test "buildRequestBody - GPT-5 quirk without reasoning" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    // Should inject juice directive
-    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"high\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"summary\":\"concise\"") != null);
 }
 
-test "buildRequestBody - GPT-5 quirk with reasoning enabled" {
+test "buildRequestBody - with encrypted reasoning" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-5-preview",
-        .reasoning_effort = .medium,
-        .params = .{
-            .system_prompt = "You are helpful.",
-        },
+    const cfg = config.OpenAIResponsesConfig{
+        .auth = .{ .api_key = "test-key" },
+        .model = "o3-mini",
+        .reasoning_effort = .low,
+        .include_encrypted_reasoning = true,
+        .params = .{},
     };
 
     const messages = [_]types.Message{
         .{
             .role = .user,
             .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
+                .{ .text = .{ .text = "Test" } },
             },
             .timestamp = 0,
         },
@@ -959,76 +840,15 @@ test "buildRequestBody - GPT-5 quirk with reasoning enabled" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    // Should NOT inject juice directive when reasoning is configured
-    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
-}
-
-test "buildRequestBody - session_id for prompt caching" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-4o",
-        .session_id = "session-123",
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    try testing.expect(std.mem.indexOf(u8, body, "\"prompt_cache_key\":\"session-123\"") != null);
-}
-
-test "mapSSEToMessageEvent - text events" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = AzureStreamState.init(allocator);
-    defer state.deinit();
-
-    // message item added (text_start)
-    const event0 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.added",
-        .data = "{\"item\":{\"type\":\"message\",\"id\":\"msg_123\"},\"output_index\":0}",
-    };
-
-    const result0 = try mapSSEToMessageEvent(event0, &state, allocator);
-    try testing.expect(result0 != null);
-    try testing.expect(result0.? == .text_start);
-
-    // text delta
-    const event1 = sse_parser.SSEEvent{
-        .event_type = "response.output_text.delta",
-        .data = "{\"delta\":\"Hello\",\"output_index\":0}",
-    };
-
-    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
-    defer if (result1) |r| {
-        if (r == .text_delta) allocator.free(r.text_delta.delta);
-    };
-
-    try testing.expect(result1 != null);
-    try testing.expect(result1.? == .text_delta);
-    try testing.expectEqualStrings("Hello", result1.?.text_delta.delta);
+    try testing.expect(std.mem.indexOf(u8, body, "\"include\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning.encrypted_content\"") != null);
 }
 
 test "mapSSEToMessageEvent - reasoning events" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var state = AzureStreamState.init(allocator);
+    var state = OpenAIResponsesStreamState.init(allocator);
     defer state.deinit();
 
     // reasoning item added
@@ -1071,7 +891,7 @@ test "mapSSEToMessageEvent - response completed" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var state = AzureStreamState.init(allocator);
+    var state = OpenAIResponsesStreamState.init(allocator);
     defer state.deinit();
 
     const event = sse_parser.SSEEvent{
@@ -1092,7 +912,7 @@ test "mapSSEToMessageEvent - tool call events" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var state = AzureStreamState.init(allocator);
+    var state = OpenAIResponsesStreamState.init(allocator);
     defer state.deinit();
 
     // function_call added
