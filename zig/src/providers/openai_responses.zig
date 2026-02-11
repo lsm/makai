@@ -183,7 +183,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 // Accumulate content for final AssistantMessage
                 switch (evt) {
                     .thinking_start => {
-                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .thinking = .{ .thinking = "" } });
+                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .thinking = .{ .thinking = &[_]u8{} } });
                     },
                     .thinking_delta => |delta| {
                         if (accumulated_content.items.len > 0) {
@@ -200,7 +200,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         }
                     },
                     .text_start => {
-                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = "" } });
+                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = &[_]u8{} } });
                     },
                     .text_delta => |delta| {
                         if (accumulated_content.items.len > 0) {
@@ -220,7 +220,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         try accumulated_content.append(ctx.allocator, types.ContentBlock{ .tool_use = .{
                             .id = try ctx.allocator.dupe(u8, tc.id),
                             .name = try ctx.allocator.dupe(u8, tc.name),
-                            .input_json = "",
+                            .input_json = &[_]u8{},
                         } });
                     },
                     .toolcall_delta => |delta| {

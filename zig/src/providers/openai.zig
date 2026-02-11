@@ -183,7 +183,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 // Accumulate content for final AssistantMessage
                 switch (evt) {
                     .text_start => {
-                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = "" } });
+                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = &[_]u8{} } });
                     },
                     .text_delta => |delta| {
                         if (accumulated_content.items.len > 0) {
@@ -203,7 +203,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         try accumulated_content.append(ctx.allocator, types.ContentBlock{ .tool_use = .{
                             .id = try ctx.allocator.dupe(u8, tc.id),
                             .name = try ctx.allocator.dupe(u8, tc.name),
-                            .input_json = "",
+                            .input_json = &[_]u8{},
                         } });
                     },
                     .toolcall_delta => |delta| {
@@ -1244,9 +1244,9 @@ test "AssistantMessage.deinit - reproduces segfault with empty string literals" 
     // Scenario: Model emits text_start but then stops before any text_delta
     // This can happen with reasoning models or when the response is cut short
 
-    // Build a text block with empty string literal (line 201 in openai.zig)
+    // Build a text block with empty array literal (safe to free)
     const final_content = try allocator.alloc(types.ContentBlock, 1);
-    final_content[0] = types.ContentBlock{ .text = .{ .text = "" } };
+    final_content[0] = types.ContentBlock{ .text = .{ .text = &[_]u8{} } };
 
     var result = types.AssistantMessage{
         .content = final_content,
@@ -1256,9 +1256,9 @@ test "AssistantMessage.deinit - reproduces segfault with empty string literals" 
         .timestamp = 0,
     };
 
-    // This WILL segfault because:
-    // 1. text_block.text = "" (string literal, not heap-allocated)
-    // 2. types.zig:120 calls allocator.free(text_block.text) unconditionally
-    // 3. The allocator tries to free a compile-time constant address
+    // This should NOT segfault because:
+    // 1. text_block.text = &[_]u8{} (empty array, len=0)
+    // 2. types.zig:120 calls allocator.free(text_block.text) which sees len=0 and skips free
+    // 3. No attempt to free read-only memory
     result.deinit(allocator);
 }
