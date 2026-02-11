@@ -383,7 +383,7 @@ fn handleBedrockEvent(
                 try accumulated_content.append(ctx.allocator, types.ContentBlock{ .tool_use = .{
                     .id = id,
                     .name = name,
-                    .input_json = "",
+                    .input_json = &[_]u8{},
                 } });
                 try ctx.stream.push(.{ .toolcall_start = .{
                     .index = accumulated_content.items.len - 1,
@@ -392,7 +392,7 @@ fn handleBedrockEvent(
                 } });
             } else {
                 // Text block
-                try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = "" } });
+                try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = &[_]u8{} } });
                 try ctx.stream.push(.{ .text_start = .{ .index = accumulated_content.items.len - 1 } });
             }
             current_block_index.* = accumulated_content.items.len - 1;
@@ -441,7 +441,7 @@ fn handleBedrockEvent(
                     // Check if thinking block exists
                     var thinking_index = current_block_index.*;
                     if (thinking_index >= accumulated_content.items.len or accumulated_content.items[thinking_index] != .thinking) {
-                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .thinking = .{ .thinking = "" } });
+                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .thinking = .{ .thinking = &[_]u8{} } });
                         thinking_index = accumulated_content.items.len - 1;
                         current_block_index.* = thinking_index;
                         try ctx.stream.push(.{ .thinking_start = .{ .index = thinking_index } });

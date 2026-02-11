@@ -229,12 +229,12 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                     },
                     .text_start, .thinking_start, .toolcall_start => {
                         try accumulated_content.append(ctx.allocator, switch (evt) {
-                            .text_start => types.ContentBlock{ .text = .{ .text = "" } },
-                            .thinking_start => types.ContentBlock{ .thinking = .{ .thinking = "" } },
+                            .text_start => types.ContentBlock{ .text = .{ .text = &[_]u8{} } },
+                            .thinking_start => types.ContentBlock{ .thinking = .{ .thinking = &[_]u8{} } },
                             .toolcall_start => |tc| types.ContentBlock{ .tool_use = .{
                                 .id = try ctx.allocator.dupe(u8, tc.id),
                                 .name = try ctx.allocator.dupe(u8, tc.name),
-                                .input_json = "",
+                                .input_json = &[_]u8{},
                             } },
                             else => unreachable,
                         });

@@ -279,7 +279,7 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
                         if (is_thought) {
                             // Thinking block
                             if (accumulated_content.items.len == 0 or accumulated_content.items[accumulated_content.items.len - 1] != .thinking) {
-                                try accumulated_content.append(ctx.allocator, .{ .thinking = .{ .thinking = "" } });
+                                try accumulated_content.append(ctx.allocator, .{ .thinking = .{ .thinking = &[_]u8{} } });
                                 try ctx.stream.push(.{ .thinking_start = .{ .index = accumulated_content.items.len - 1 } });
                             }
 
@@ -293,7 +293,7 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
                         } else {
                             // Text block
                             if (accumulated_content.items.len == 0 or accumulated_content.items[accumulated_content.items.len - 1] != .text) {
-                                try accumulated_content.append(ctx.allocator, .{ .text = .{ .text = "" } });
+                                try accumulated_content.append(ctx.allocator, .{ .text = .{ .text = &[_]u8{} } });
                                 try ctx.stream.push(.{ .text_start = .{ .index = accumulated_content.items.len - 1 } });
                             }
 
@@ -322,7 +322,7 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
                             .tool_use = .{
                                 .id = tool_id,
                                 .name = try ctx.allocator.dupe(u8, name),
-                                .input_json = "",
+                                .input_json = &[_]u8{},
                             },
                         });
 

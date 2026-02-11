@@ -182,7 +182,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                                 model_owned = try ctx.allocator.dupe(u8, s.model);
                             },
                             .text_start => {
-                                try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = "" } });
+                                try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = &[_]u8{} } });
                             },
                             .text_delta => |delta| {
                                 if (delta.index < accumulated_content.items.len) {
