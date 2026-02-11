@@ -108,6 +108,7 @@ fn streamThread(ctx: *StreamThreadContext) void {
 
     streamImpl(ctx) catch |err| {
         const err_msg = std.fmt.allocPrint(ctx.allocator, "Stream error: {}", .{err}) catch "Unknown stream error";
+        defer if (err_msg.len > 0 and !std.mem.eql(u8, err_msg, "Unknown stream error")) ctx.allocator.free(err_msg);
         ctx.stream.completeWithError(err_msg);
     };
 }
@@ -131,7 +132,10 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     defer ctx.allocator.free(url);
 
     const uri = try std.Uri.parse(url);
-    const host = uri.host.?.raw;
+    const host = switch (uri.host.?) {
+        .raw => |h| h,
+        .percent_encoded => |h| h,
+    };
 
     // Build headers for signing
     var headers = std.StringHashMap([]const u8).init(ctx.allocator);
@@ -141,9 +145,14 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     try headers.put("content-type", "application/json");
 
     // Sign request
+    const path = switch (uri.path) {
+        .raw => |p| p,
+        .percent_encoded => |p| p,
+    };
+
     const signed = try aws_sigv4.signRequest(
         "POST",
-        uri.path.raw,
+        path,
         "",
         headers,
         ctx.request_body,
@@ -193,6 +202,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         const error_body = try response.reader(&buffer).*.allocRemaining(ctx.allocator, std.io.Limit.limited(8192));
         defer ctx.allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
+        defer ctx.allocator.free(err_msg);
         ctx.stream.completeWithError(err_msg);
         return;
     }
