@@ -83,6 +83,7 @@ fn streamThread(ctx: *StreamThreadContext) void {
 
     streamImpl(ctx) catch |err| {
         const err_msg = std.fmt.allocPrint(ctx.allocator, "Stream error: {}", .{err}) catch "Unknown stream error";
+        defer if (err_msg.len > 0 and !std.mem.eql(u8, err_msg, "Unknown stream error")) ctx.allocator.free(err_msg);
         ctx.stream.completeWithError(err_msg);
     };
 }
@@ -143,6 +144,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         const error_body = try response.reader(&buffer).*.allocRemaining(ctx.allocator, std.io.Limit.limited(8192));
         defer ctx.allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(ctx.allocator, "API error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
+        defer ctx.allocator.free(err_msg);
         ctx.stream.completeWithError(err_msg);
         return;
     }
