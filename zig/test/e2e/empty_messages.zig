@@ -44,7 +44,9 @@ test "empty_messages: anthropic handles empty content gracefully" {
     }
 
     while (!stream.completed.load(.acquire)) {
-        _ = stream.poll();
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
@@ -90,7 +92,9 @@ test "empty_messages: openai handles whitespace-only content" {
     }
 
     while (!stream.completed.load(.acquire)) {
-        _ = stream.poll();
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
@@ -179,7 +183,9 @@ test "empty_messages: no messages array" {
     }
 
     while (!stream.completed.load(.acquire)) {
-        _ = stream.poll();
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
