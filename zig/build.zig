@@ -844,7 +844,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_storage_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
 
-    // E2E test step
+    // E2E test step - runs all E2E tests
     const e2e_test_step = b.step("test-e2e", "Run end-to-end integration tests (requires API credentials)");
 
     // Set timeout for E2E tests (60 seconds)
@@ -887,4 +887,26 @@ pub fn build(b: *std.Build) void {
     const e2e_unicode_run = b.addRunArtifact(e2e_unicode_test);
     e2e_unicode_run.step.max_rss = 0;
     e2e_test_step.dependOn(&e2e_unicode_run.step);
+
+    // Individual E2E test steps per provider
+    const e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
+    e2e_anthropic_step.dependOn(&e2e_anthropic_run.step);
+
+    const e2e_openai_step = b.step("test-e2e-openai", "Run OpenAI E2E tests");
+    e2e_openai_step.dependOn(&e2e_openai_run.step);
+
+    const e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E tests");
+    e2e_ollama_step.dependOn(&e2e_ollama_run.step);
+
+    const e2e_azure_step = b.step("test-e2e-azure", "Run Azure E2E tests");
+    e2e_azure_step.dependOn(&e2e_azure_run.step);
+
+    const e2e_google_step = b.step("test-e2e-google", "Run Google E2E tests");
+    e2e_google_step.dependOn(&e2e_google_run.step);
+
+    const e2e_vertex_step = b.step("test-e2e-vertex", "Run Google Vertex E2E tests");
+    e2e_vertex_step.dependOn(&e2e_google_vertex_run.step);
+
+    const e2e_bedrock_step = b.step("test-e2e-bedrock", "Run AWS Bedrock E2E tests");
+    e2e_bedrock_step.dependOn(&e2e_bedrock_run.step);
 }
