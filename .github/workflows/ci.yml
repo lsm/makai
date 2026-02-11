@@ -32,3 +32,5 @@ jobs:
         working-directory: zig
         run: zig build test-e2e
         continue-on-error: true
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
