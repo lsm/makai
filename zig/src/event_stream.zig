@@ -29,6 +29,35 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Drain any remaining events in the ring buffer and free their allocations
+            // This is critical when tests abort mid-stream or complete without polling all events
+            while (self.poll()) |event| {
+                // Free allocated strings in the event based on the event type
+                // We need to check if T is MessageEvent to avoid trying to free non-pointer types
+                const is_message_event = comptime blk: {
+                    if (@hasDecl(types, "MessageEvent")) {
+                        break :blk T == types.MessageEvent;
+                    }
+                    break :blk false;
+                };
+
+                if (is_message_event) {
+                    switch (event) {
+                        .start => |s| self.allocator.free(s.model),
+                        .text_delta => |d| self.allocator.free(d.delta),
+                        .thinking_delta => |d| self.allocator.free(d.delta),
+                        .toolcall_start => |tc| {
+                            self.allocator.free(tc.id);
+                            self.allocator.free(tc.name);
+                        },
+                        .toolcall_delta => |d| self.allocator.free(d.delta),
+                        .toolcall_end => |e| self.allocator.free(e.input_json),
+                        .@"error" => |e| self.allocator.free(e.message),
+                        else => {},
+                    }
+                }
+            }
+
             if (self.result) |*result| {
                 // Only call deinit if R has a deinit method
                 // Use comptime to check if R is a type that can have decls
