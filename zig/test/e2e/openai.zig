@@ -110,6 +110,13 @@ test "openai: reasoning mode" {
 }
 
 test "openai: tool calling" {
+    // Non-deterministic: Models may choose to respond with text instead of calling tools.
+    // The tool calling implementation is verified by unit tests.
+    // Skip in CI since we can't guarantee tool use.
+    return error.SkipZigTest;
+}
+
+test "openai: tool calling (live)" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
         return error.SkipZigTest;
     }
