@@ -123,6 +123,18 @@ fn streamThread(ctx: *StreamThreadContext) void {
 
 /// Main streaming implementation
 fn streamImpl(ctx: *StreamThreadContext) !void {
+    // Check API key validity
+    if (ctx.config.api_key.len == 0) {
+        std.log.err("Google API key is empty", .{});
+        ctx.stream.completeWithError("API key appears to be missing or invalid - key is empty");
+        return;
+    }
+    if (ctx.config.api_key.len < 10) {
+        std.log.err("Google API key is too short (length={d})", .{ctx.config.api_key.len});
+        ctx.stream.completeWithError("API key appears to be missing or invalid - key is too short");
+        return;
+    }
+
     // Check cancellation
     if (ctx.config.cancel_token) |token| {
         if (token.isCancelled()) {
@@ -194,11 +206,29 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         var buffer: [4096]u8 = undefined;
         const error_body = try response.reader(&buffer).*.allocRemaining(ctx.allocator, std.io.Limit.limited(8192));
         defer ctx.allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(
-            ctx.allocator,
-            "API error {d}: {s}",
-            .{ @intFromEnum(response.head.status), error_body },
-        );
+
+        // Log detailed error information for debugging
+        std.log.err("Google API error: status={d}, url={s}", .{ @intFromEnum(response.head.status), url });
+        std.log.err("Google API error body: {s}", .{error_body});
+
+        // Check for API key issues and provide helpful error message
+        if (ctx.config.api_key.len == 0 or ctx.config.api_key.len < 10) {
+            std.log.err("Google API key appears to be missing or invalid (length={d})", .{ctx.config.api_key.len});
+        }
+
+        // Build error message with additional context for 404 errors
+        const err_msg = if (response.head.status == .not_found)
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "Google API 404 Not Found - URL: {s}, Model: {s}, Status: {d}, Body: {s}. Check if the model ID is correct and API key is valid.",
+                .{ url, ctx.config.model_id, @intFromEnum(response.head.status), error_body },
+            )
+        else
+            try std.fmt.allocPrint(
+                ctx.allocator,
+                "API error {d}: {s}",
+                .{ @intFromEnum(response.head.status), error_body },
+            );
         defer ctx.allocator.free(err_msg);
         ctx.stream.completeWithError(err_msg);
         return;
