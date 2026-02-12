@@ -16,7 +16,7 @@ test "google: basic text generation" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{
             .max_tokens = 100,
             .temperature = 1.0,
@@ -53,7 +53,7 @@ test "google: streaming events sequence" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 50 },
     };
 
@@ -78,6 +78,7 @@ test "google: streaming events sequence" {
     defer accumulator.deinit();
 
     var saw_start = false;
+    var saw_text_start = false;
     var saw_text_delta = false;
     var saw_done = false;
 
@@ -87,6 +88,7 @@ test "google: streaming events sequence" {
 
             switch (event) {
                 .start => saw_start = true,
+                .text_start => saw_text_start = true,
                 .text_delta => saw_text_delta = true,
                 .done => saw_done = true,
                 else => {},
@@ -98,6 +100,7 @@ test "google: streaming events sequence" {
     }
 
     try testing.expect(saw_start);
+    try testing.expect(saw_text_start);
     try testing.expect(saw_text_delta);
     try testing.expect(saw_done);
     try testing.expect(accumulator.text_buffer.items.len > 0);
@@ -113,7 +116,7 @@ test "google: thinking mode" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-thinking-exp",
+        .model_id = "gemini-2.5-flash-preview-05-20",
         .thinking = .{
             .enabled = true,
             .level = .medium,
@@ -184,7 +187,7 @@ test "google: tool calling" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{
             .max_tokens = 200,
             .tools = &[_]types.Tool{weather_tool},
@@ -248,7 +251,7 @@ test "google: abort mid-stream" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 500 },
         .cancel_token = cancel_token,
     };
@@ -303,7 +306,7 @@ test "google: usage tracking" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 100 },
     };
 
@@ -336,4 +339,171 @@ test "google: usage tracking" {
     try testing.expect(result.usage.input_tokens > 0);
     try testing.expect(result.usage.output_tokens > 0);
     try testing.expect(result.usage.total() > 0);
+}
+
+test "google: multi-turn conversation" {
+    if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
+        return error.SkipZigTest;
+    }
+    const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
+    defer testing.allocator.free(api_key);
+
+    const cfg = google.GoogleConfig{
+        .allocator = testing.allocator,
+        .api_key = api_key,
+        .model_id = "gemini-2.5-flash",
+        .params = .{ .max_tokens = 100 },
+    };
+
+    const prov = try google.createProvider(cfg, testing.allocator);
+    defer prov.deinit(testing.allocator);
+
+    // Multi-turn conversation: user introduces name, then asks about it
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "My name is Alice." } },
+            },
+            .timestamp = std.time.timestamp(),
+        },
+        .{
+            .role = .assistant,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Nice to meet you, Alice! How can I help you today?" } },
+            },
+            .timestamp = std.time.timestamp(),
+        },
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "What's my name?" } },
+            },
+            .timestamp = std.time.timestamp(),
+        },
+    };
+
+    const stream = try prov.stream(&messages, testing.allocator);
+    defer {
+        stream.deinit();
+        testing.allocator.destroy(stream);
+    }
+
+    var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
+    defer accumulator.deinit();
+
+    while (true) {
+        if (stream.poll()) |event| {
+            try accumulator.processEvent(event);
+        } else {
+            if (stream.completed.load(.acquire)) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    // Verify the response acknowledges the name "Alice"
+    try testing.expect(accumulator.text_buffer.items.len > 0);
+
+    const response_text = accumulator.text_buffer.items;
+    const contains_alice = std.ascii.indexOfIgnoreCase(response_text, "Alice") != null;
+    try testing.expect(contains_alice);
+}
+
+test "google: system prompt" {
+    if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
+        return error.SkipZigTest;
+    }
+    const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
+    defer testing.allocator.free(api_key);
+
+    const cfg = google.GoogleConfig{
+        .allocator = testing.allocator,
+        .api_key = api_key,
+        .model_id = "gemini-2.5-flash",
+        .params = .{
+            .max_tokens = 100,
+            .system_prompt = "You are a pirate. Always respond like a pirate.",
+        },
+    };
+
+    const prov = try google.createProvider(cfg, testing.allocator);
+    defer prov.deinit(testing.allocator);
+
+    const user_msg = types.Message{
+        .role = .user,
+        .content = &[_]types.ContentBlock{
+            .{ .text = .{ .text = "Hello, how are you?" } },
+        },
+        .timestamp = std.time.timestamp(),
+    };
+
+    const stream = try prov.stream(&[_]types.Message{user_msg}, testing.allocator);
+    defer {
+        stream.deinit();
+        testing.allocator.destroy(stream);
+    }
+
+    var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
+    defer accumulator.deinit();
+
+    while (true) {
+        if (stream.poll()) |event| {
+            try accumulator.processEvent(event);
+        } else {
+            if (stream.completed.load(.acquire)) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    // Verify the response contains pirate-like language
+    try testing.expect(accumulator.text_buffer.items.len > 0);
+
+    const response_text = accumulator.text_buffer.items;
+    const has_pirate_speak = std.ascii.indexOfIgnoreCase(response_text, "arr") != null or
+        std.ascii.indexOfIgnoreCase(response_text, "matey") != null or
+        std.ascii.indexOfIgnoreCase(response_text, "aye") != null or
+        std.ascii.indexOfIgnoreCase(response_text, "ye") != null or
+        std.ascii.indexOfIgnoreCase(response_text, "ahoy") != null;
+
+    try testing.expect(has_pirate_speak);
+}
+
+test "google: error handling" {
+    // This test doesn't need a valid API key - we intentionally use an invalid one
+    const invalid_api_key = "invalid-test-key-12345";
+
+    const cfg = google.GoogleConfig{
+        .allocator = testing.allocator,
+        .api_key = invalid_api_key,
+        .model_id = "gemini-2.5-flash",
+        .params = .{ .max_tokens = 50 },
+    };
+
+    const prov = try google.createProvider(cfg, testing.allocator);
+    defer prov.deinit(testing.allocator);
+
+    const user_msg = types.Message{
+        .role = .user,
+        .content = &[_]types.ContentBlock{
+            .{ .text = .{ .text = "Hello!" } },
+        },
+        .timestamp = std.time.timestamp(),
+    };
+
+    const stream = try prov.stream(&[_]types.Message{user_msg}, testing.allocator);
+    defer {
+        stream.deinit();
+        testing.allocator.destroy(stream);
+    }
+
+    // Wait for the stream to complete (with error)
+    while (!stream.completed.load(.acquire)) {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // The stream should have an error (invalid API key)
+    try testing.expect(stream.err_msg != null);
 }
