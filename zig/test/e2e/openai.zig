@@ -131,11 +131,11 @@ test "openai: tool calling" {
 
     const cfg = config.OpenAIConfig{
         .auth = .{ .api_key = api_key },
-        .model = "gpt-4o-mini",
+        .model = "gpt-5-codex",
         .params = .{
             .max_tokens = 200,
             .tools = &[_]types.Tool{weather_tool},
-            .tool_choice = .{ .auto = {} },
+            .tool_choice = .{ .specific = "get_weather" },
         },
     };
 
