@@ -146,17 +146,6 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var client = std.http.Client{ .allocator = ctx.allocator };
     defer client.deinit();
 
-    // Build endpoint URL
-    const base = ctx.config.base_url orelse "https://generativelanguage.googleapis.com";
-    const url = try std.fmt.allocPrint(
-        ctx.allocator,
-        "{s}/v1beta/models/{s}:generateContentStream",
-        .{ base, ctx.config.model_id },
-    );
-    defer ctx.allocator.free(url);
-
-    const uri = try std.Uri.parse(url);
-
     // Build headers
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
@@ -164,6 +153,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     // Auth: check if it's a JSON OAuth token or simple API key
     var auth_header_owned: ?[]u8 = null;
     defer if (auth_header_owned) |h| ctx.allocator.free(h);
+
+    var url: []u8 = undefined;
+    const base = ctx.config.base_url orelse "https://generativelanguage.googleapis.com";
 
     if (std.mem.startsWith(u8, ctx.config.api_key, "{")) {
         // OAuth token format: {"token":"...","projectId":"..."}
@@ -176,10 +168,23 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         defer parsed.deinit();
         auth_header_owned = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{parsed.value.token});
         try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header_owned.? });
+        // OAuth uses URL without query parameter
+        url = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{s}/v1beta/models/{s}:generateContentStream",
+            .{ base, ctx.config.model_id },
+        );
     } else {
-        // Simple API key
-        try headers.append(ctx.allocator, .{ .name = "x-goog-api-key", .value = ctx.config.api_key });
+        // Simple API key - use query parameter
+        url = try std.fmt.allocPrint(
+            ctx.allocator,
+            "{s}/v1beta/models/{s}:generateContentStream?key={s}",
+            .{ base, ctx.config.model_id, ctx.config.api_key },
+        );
     }
+    defer ctx.allocator.free(url);
+
+    const uri = try std.Uri.parse(url);
 
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
 
