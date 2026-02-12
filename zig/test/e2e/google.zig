@@ -47,7 +47,6 @@ test "google: API key validation" {
 
     // Check for authentication errors
     if (stream.err_msg) |err| {
-        defer testing.allocator.free(err);
         if (std.mem.indexOf(u8, err, "401") != null or
             std.mem.indexOf(u8, err, "403") != null or
             std.mem.indexOf(u8, err, "404") != null or
