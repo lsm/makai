@@ -111,87 +111,9 @@ test "openai: reasoning mode" {
 
 test "openai: tool calling" {
     // Non-deterministic: Models may choose to respond with text instead of calling tools.
-    // The tool calling implementation is verified by unit tests.
-    // Skip in CI since we can't guarantee tool use.
+    // The tool calling implementation is verified by unit tests in openai.zig
+    // that mock SSE events with tool_calls data.
     return error.SkipZigTest;
-}
-
-test "openai: tool calling (live)" {
-    // Non-deterministic: Models may choose to respond with text instead of calling tools.
-    // The tool calling implementation is verified by unit tests that mock SSE events.
-    // Run locally with OPENAI_API_KEY if you want to test against live API.
-    return error.SkipZigTest;
-
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
-    defer testing.allocator.free(api_key);
-
-    const weather_tool = types.Tool{
-        .name = "get_weather",
-        .description = "Get current weather for a location",
-        .parameters = &[_]types.ToolParameter{
-            .{
-                .name = "location",
-                .param_type = "string",
-                .description = "City name",
-                .required = true,
-            },
-        },
-    };
-
-    const cfg = config.OpenAIConfig{
-        .auth = .{ .api_key = api_key },
-        .model = "gpt-4o",
-        .params = .{
-            .max_tokens = 200,
-            .tools = &[_]types.Tool{weather_tool},
-            .tool_choice = .{ .any = {} },
-        },
-    };
-
-    const prov = try openai.createProvider(cfg, testing.allocator);
-    defer prov.deinit(testing.allocator);
-
-    const user_msg = types.Message{
-        .role = .user,
-        .content = &[_]types.ContentBlock{
-            .{ .text = .{ .text = "Use the get_weather tool to check the weather in Paris, France." } },
-        },
-        .timestamp = std.time.timestamp(),
-    };
-
-    const stream = try prov.stream(&[_]types.Message{user_msg}, testing.allocator);
-    defer {
-        stream.deinit();
-        testing.allocator.destroy(stream);
-    }
-
-    var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
-    defer accumulator.deinit();
-
-    var saw_tool_call = false;
-
-    while (true) {
-        if (stream.poll()) |event| {
-            try accumulator.processEvent(event);
-
-            switch (event) {
-                .toolcall_start => saw_tool_call = true,
-                else => {},
-            }
-        } else {
-            if (stream.completed.load(.acquire)) break;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-        }
-    }
-
-    try testing.expect(saw_tool_call);
-    try testing.expect(accumulator.tool_calls.items.len > 0);
-
-    const result = stream.result orelse return error.NoResult;
-    try testing.expect(result.stop_reason == .tool_use);
 }
 
 test "openai: abort mid-stream" {
