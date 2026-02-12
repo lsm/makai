@@ -528,7 +528,7 @@ fn buildRequestBody(
     // Tools
     if (cfg.params.tools) |tools| {
         var declarations = try google_shared.convertTools(tools, allocator);
-        defer declarations.deinit(allocator);
+        defer google_shared.deinitFunctionDeclarations(&declarations, allocator);
 
         try writer.writeKey("tools");
         try writer.beginArray();
