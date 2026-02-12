@@ -16,7 +16,7 @@ test "google: API key validation" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 10 },
     };
 
@@ -81,7 +81,7 @@ test "google: basic text generation" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{
             .max_tokens = 100,
             .temperature = 1.0,
@@ -118,7 +118,7 @@ test "google: streaming events sequence" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 50 },
     };
 
@@ -181,7 +181,7 @@ test "google: thinking mode" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash-preview-05-20",
+        .model_id = "gemini-2.0-flash-thinking-exp",
         .thinking = .{
             .enabled = true,
             .level = .medium,
@@ -252,7 +252,7 @@ test "google: tool calling" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{
             .max_tokens = 200,
             .tools = &[_]types.Tool{weather_tool},
@@ -316,7 +316,7 @@ test "google: abort mid-stream" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 500 },
         .cancel_token = cancel_token,
     };
@@ -371,7 +371,7 @@ test "google: usage tracking" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 100 },
     };
 
@@ -416,7 +416,7 @@ test "google: multi-turn conversation" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 100 },
     };
 
@@ -484,7 +484,7 @@ test "google: system prompt" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{
             .max_tokens = 100,
             .system_prompt = "You are a pirate. Always respond like a pirate.",
@@ -543,7 +543,7 @@ test "google: error handling" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = invalid_api_key,
-        .model_id = "gemini-2.5-flash",
+        .model_id = "gemini-2.0-flash-exp",
         .params = .{ .max_tokens = 50 },
     };
 
