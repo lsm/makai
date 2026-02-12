@@ -74,6 +74,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     result.deinit(self.allocator);
                 }
             }
+
+            // Free error message (completeWithError always dupes it)
+            if (self.err_msg) |msg| {
+                self.allocator.free(msg);
+            }
         }
 
         pub fn push(self: *Self, event: T) !void {
@@ -115,7 +120,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            self.err_msg = msg;
+            // Always dupe the message so the stream owns its memory
+            // This allows callers to free their copy immediately after this call
+            // On OOM, store null (losing the error message is better than crashing)
+            self.err_msg = self.allocator.dupe(u8, msg) catch null;
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);
