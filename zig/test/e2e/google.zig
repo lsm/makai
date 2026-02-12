@@ -6,6 +6,72 @@ const test_helpers = @import("test_helpers");
 
 const testing = std.testing;
 
+test "google: API key validation" {
+    if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
+        return error.SkipZigTest;
+    }
+    const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
+    defer testing.allocator.free(api_key);
+
+    const cfg = google.GoogleConfig{
+        .allocator = testing.allocator,
+        .api_key = api_key,
+        .model_id = "gemini-2.5-flash",
+        .params = .{ .max_tokens = 10 },
+    };
+
+    const prov = try google.createProvider(cfg, testing.allocator);
+    defer prov.deinit(testing.allocator);
+
+    const user_msg = types.Message{
+        .role = .user,
+        .content = &[_]types.ContentBlock{
+            .{ .text = .{ .text = "Hi" } },
+        },
+        .timestamp = std.time.timestamp(),
+    };
+
+    const stream = try prov.stream(&[_]types.Message{user_msg}, testing.allocator);
+    defer {
+        stream.deinit();
+        testing.allocator.destroy(stream);
+    }
+
+    // Wait for completion
+    while (!stream.completed.load(.acquire)) {
+        if (stream.poll()) |event| {
+            test_helpers.freeEvent(event, testing.allocator);
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // Check for authentication errors
+    if (stream.err_msg) |err| {
+        defer testing.allocator.free(err);
+        if (std.mem.indexOf(u8, err, "401") != null or
+            std.mem.indexOf(u8, err, "403") != null or
+            std.mem.indexOf(u8, err, "404") != null or
+            std.mem.indexOf(u8, err, "API key") != null or
+            std.mem.indexOf(u8, err, "invalid") != null or
+            std.mem.indexOf(u8, err, "unauthorized") != null)
+        {
+            std.debug.print("\n========================================\n", .{});
+            std.debug.print("Google API key validation failed!\n", .{});
+            std.debug.print("Error: {s}\n", .{err});
+            std.debug.print("\nPlease check that:\n", .{});
+            std.debug.print("  1. GOOGLE_API_KEY environment variable is set correctly\n", .{});
+            std.debug.print("  2. Or ~/.makai/auth.json contains a valid 'google.api_key'\n", .{});
+            std.debug.print("  3. The API key is active and has not expired\n", .{});
+            std.debug.print("  4. The API key has the necessary permissions\n", .{});
+            std.debug.print("========================================\n", .{});
+            return error.InvalidApiKey;
+        }
+        return error.StreamError;
+    }
+
+    // Key is valid - test passed
+}
+
 test "google: basic text generation" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
@@ -469,6 +535,9 @@ test "google: system prompt" {
 }
 
 test "google: error handling" {
+    if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
+        return error.SkipZigTest;
+    }
     // This test doesn't need a valid API key - we intentionally use an invalid one
     const invalid_api_key = "invalid-test-key-12345";
 
