@@ -123,24 +123,68 @@ pub fn convertMessages(
     return contents;
 }
 
+/// Free all nested allocations in FunctionDeclaration array
+pub fn deinitFunctionDeclarations(declarations: *std.ArrayList(FunctionDeclaration), allocator: std.mem.Allocator) void {
+    for (declarations.items) |decl| {
+        if (decl.parameters == .object) {
+            var params_obj = decl.parameters.object;
+            if (params_obj.get("properties")) |props| {
+                if (props == .object) {
+                    var props_obj = props.object;
+                    var props_iter = props_obj.iterator();
+                    while (props_iter.next()) |entry| {
+                        if (entry.value_ptr.* == .object) {
+                            entry.value_ptr.object.deinit();
+                        }
+                    }
+                    props_obj.deinit();
+                }
+            }
+            if (params_obj.get("required")) |req| {
+                if (req == .array) {
+                    allocator.free(req.array.items);
+                }
+            }
+            params_obj.deinit();
+        }
+    }
+    declarations.deinit(allocator);
+}
+
 /// Convert Makai tools to Google FunctionDeclaration format
 pub fn convertTools(
     tools: []const types.Tool,
     allocator: std.mem.Allocator,
 ) !std.ArrayList(FunctionDeclaration) {
     var declarations: std.ArrayList(FunctionDeclaration) = .{};
-    errdefer declarations.deinit(allocator);
+    errdefer deinitFunctionDeclarations(&declarations, allocator);
 
     for (tools) |tool| {
         // Build JSON Schema from ToolParameter array
         var params_obj = std.json.ObjectMap.init(allocator);
+        errdefer params_obj.deinit();
+
         try params_obj.put("type", .{ .string = "object" });
 
         var properties = std.json.ObjectMap.init(allocator);
+        errdefer {
+            // Free any property objects already added before properties was put into params_obj
+            var props_iter = properties.iterator();
+            while (props_iter.next()) |entry| {
+                if (entry.value_ptr.* == .object) {
+                    entry.value_ptr.object.deinit();
+                }
+            }
+            properties.deinit();
+        }
+
         var required_list: std.ArrayList(std.json.Value) = .{};
+        errdefer required_list.deinit(allocator);
 
         for (tool.parameters) |param| {
             var prop = std.json.ObjectMap.init(allocator);
+            errdefer prop.deinit();
+
             try prop.put("type", .{ .string = param.param_type });
             if (param.description) |desc| {
                 try prop.put("description", .{ .string = desc });
@@ -155,8 +199,10 @@ pub fn convertTools(
         try params_obj.put("properties", .{ .object = properties });
 
         // Convert unmanaged ArrayList to managed for JSON
-        var managed_array = std.array_list.Managed(std.json.Value).init(allocator);
         const slice = try required_list.toOwnedSlice(allocator);
+        errdefer allocator.free(slice);
+
+        var managed_array = std.array_list.Managed(std.json.Value).init(allocator);
         managed_array.items = slice;
         managed_array.capacity = slice.len;
         try params_obj.put("required", .{ .array = managed_array });
@@ -355,33 +401,7 @@ test "convertTools basic tool" {
     };
 
     var declarations = try convertTools(&[_]types.Tool{tool}, allocator);
-    defer {
-        for (declarations.items) |decl| {
-            // Free the JSON parameter structure
-            if (decl.parameters == .object) {
-                var params_obj = decl.parameters.object;
-                if (params_obj.get("properties")) |props| {
-                    if (props == .object) {
-                        var props_obj = props.object;
-                        var props_iter = props_obj.iterator();
-                        while (props_iter.next()) |entry| {
-                            if (entry.value_ptr.* == .object) {
-                                entry.value_ptr.object.deinit();
-                            }
-                        }
-                        props_obj.deinit();
-                    }
-                }
-                if (params_obj.get("required")) |req| {
-                    if (req == .array) {
-                        allocator.free(req.array.items);
-                    }
-                }
-                params_obj.deinit();
-            }
-        }
-        declarations.deinit(allocator);
-    }
+    defer deinitFunctionDeclarations(&declarations, allocator);
 
     try std.testing.expectEqual(@as(usize, 1), declarations.items.len);
     try std.testing.expectEqualStrings("search", declarations.items[0].name);
