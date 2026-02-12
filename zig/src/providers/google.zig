@@ -185,7 +185,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     defer ctx.allocator.free(url);
 
     // Debug log for API key (show first 8 chars only for security)
-    std.log.info("Google API request - key prefix: {s}..., key length: {d}, model: {s}", .{
+    std.log.err("Google API request - key prefix: {s}..., key length: {d}, model: {s}", .{
         ctx.config.api_key[0..@min(8, ctx.config.api_key.len)],
         ctx.config.api_key.len,
         ctx.config.model_id,
@@ -197,7 +197,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     else
         try std.fmt.allocPrint(ctx.allocator, "{s}/v1beta/models/{s}:generateContentStream?key=***", .{ base, ctx.config.model_id });
     defer if (!std.mem.startsWith(u8, ctx.config.api_key, "{")) ctx.allocator.free(url_for_log);
-    std.log.info("Google API URL: {s}", .{url_for_log});
+    std.log.err("Google API URL: {s}", .{url_for_log});
 
     const uri = try std.Uri.parse(url);
 
