@@ -241,6 +241,66 @@ test "google: thinking mode" {
     try testing.expect(accumulator.thinking_buffer.items.len > 0);
 }
 
+test "google: gemini-3 thinking level" {
+    if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
+        return error.SkipZigTest;
+    }
+    rateLimitDelay();
+    const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
+    defer testing.allocator.free(api_key);
+
+    // Gemini 3 uses thinkingLevel (.low, .medium, .high), not thinkingBudget
+    const cfg = google.GoogleConfig{
+        .allocator = testing.allocator,
+        .api_key = api_key,
+        .model_id = "gemini-3-flash-preview",
+        .thinking = .{
+            .enabled = true,
+            .level = .medium, // Use thinkingLevel for Gemini 3
+            .include_thoughts = true,
+        },
+        .params = .{ .max_tokens = 300 },
+    };
+
+    const prov = try google.createProvider(cfg, testing.allocator);
+    defer prov.deinit(testing.allocator);
+
+    const user_msg = types.Message{
+        .role = .user,
+        .content = &[_]types.ContentBlock{
+            .{ .text = .{ .text = "What is 15 + 27? Think through it." } },
+        },
+        .timestamp = std.time.timestamp(),
+    };
+
+    const stream = try prov.stream(&[_]types.Message{user_msg}, testing.allocator);
+    defer {
+        stream.deinit();
+        testing.allocator.destroy(stream);
+    }
+
+    var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
+    defer accumulator.deinit();
+
+    while (true) {
+        if (stream.poll()) |event| {
+            try accumulator.processEvent(event);
+        } else {
+            if (stream.completed.load(.acquire)) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    // Gemini 3 may or may not return thinking blocks depending on model state
+    std.debug.print("Gemini 3 thinking test: {} events, {} text chars, {} thinking chars\n", .{
+        accumulator.events_seen,
+        accumulator.text_buffer.items.len,
+        accumulator.thinking_buffer.items.len,
+    });
+    try testing.expect(accumulator.events_seen > 0);
+    try testing.expect(accumulator.text_buffer.items.len > 0);
+}
+
 test "google: tool calling" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
