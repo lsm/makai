@@ -289,20 +289,30 @@ test "AssistantMessageStream basic usage" {
     var stream = AssistantMessageStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    const start_event = types.MessageEvent{ .start = types.StartEvent{ .model = "test-model" } };
+    // The model string MUST be heap-allocated when creating start events
+    // because deinit() will free it when draining unpollled events
+    const model_str = try std.testing.allocator.dupe(u8, "test-model");
+    const start_event = types.MessageEvent{ .start = types.StartEvent{ .model = model_str } };
     try stream.push(start_event);
 
     const event = stream.poll();
     try std.testing.expect(event != null);
     try std.testing.expect(std.meta.activeTag(event.?) == .start);
 
-    // Allocate model string to avoid "Invalid free" when deinit is called
-    const model_str = try std.testing.allocator.dupe(u8, "test-model");
+    // Free the polled event's model string
+    if (event) |evt| {
+        switch (evt) {
+            .start => |s| std.testing.allocator.free(s.model),
+            else => {},
+        }
+    }
+
+    const result_model_str = try std.testing.allocator.dupe(u8, "test-model");
     const result = types.AssistantMessage{
         .content = &[_]types.ContentBlock{},
         .usage = types.Usage{},
         .stop_reason = .stop,
-        .model = model_str,
+        .model = result_model_str,
         .timestamp = 0,
     };
     stream.complete(result);
@@ -311,4 +321,34 @@ test "AssistantMessageStream basic usage" {
     const res = stream.getResult();
     try std.testing.expect(res != null);
     try std.testing.expectEqualStrings("test-model", res.?.model);
+}
+
+test "AssistantMessageStream deinit drains unpollled events" {
+    // This test verifies that deinit() properly frees memory in events
+    // that were pushed but not polled before the stream is destroyed.
+    // The model string MUST be heap-allocated because deinit will free it.
+    var stream = AssistantMessageStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // Heap-allocate the model string - deinit() will free this
+    const model_str = try std.testing.allocator.dupe(u8, "test-model");
+    const start_event = types.MessageEvent{ .start = types.StartEvent{ .model = model_str } };
+    try stream.push(start_event);
+
+    // Do NOT poll the event - deinit() should drain and free it
+    // If model_str was a string literal, deinit would crash with "Invalid free"
+
+    const result_model_str = try std.testing.allocator.dupe(u8, "test-model");
+    const result = types.AssistantMessage{
+        .content = &[_]types.ContentBlock{},
+        .usage = types.Usage{},
+        .stop_reason = .stop,
+        .model = result_model_str,
+        .timestamp = 0,
+    };
+    stream.complete(result);
+
+    // deinit() will:
+    // 1. Poll and free the start event's model string
+    // 2. Call AssistantMessage.deinit() which frees result.model
 }
