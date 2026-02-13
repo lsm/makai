@@ -34,7 +34,7 @@ test "google_vertex: basic text generation" {
         .access_token = token,
         .project_id = project,
         .location = "us-central1",
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{
             .max_tokens = 100,
             .temperature = 1.0,
@@ -75,7 +75,7 @@ test "google_vertex: streaming events sequence" {
         .allocator = testing.allocator,
         .access_token = token,
         .project_id = project,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 50 },
     };
 
@@ -139,7 +139,7 @@ test "google_vertex: thinking mode" {
         .allocator = testing.allocator,
         .access_token = token,
         .project_id = project,
-        .model_id = "gemini-2.0-flash-thinking-exp",
+        .model_id = "gemini-2.5-flash",
         .thinking = .{
             .enabled = true,
             .level = .medium,
@@ -214,7 +214,7 @@ test "google_vertex: tool calling" {
         .allocator = testing.allocator,
         .access_token = token,
         .project_id = project,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{
             .max_tokens = 200,
             .tools = &[_]types.Tool{weather_tool},
@@ -282,7 +282,7 @@ test "google_vertex: abort mid-stream" {
         .allocator = testing.allocator,
         .access_token = token,
         .project_id = project,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 500 },
         .cancel_token = cancel_token,
     };
@@ -341,7 +341,7 @@ test "google_vertex: usage tracking" {
         .allocator = testing.allocator,
         .access_token = token,
         .project_id = project,
-        .model_id = "gemini-2.0-flash-exp",
+        .model_id = "gemini-2.5-flash",
         .params = .{ .max_tokens = 100 },
     };
 
