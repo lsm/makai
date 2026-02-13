@@ -6,6 +6,11 @@ const test_helpers = @import("test_helpers");
 
 const testing = std.testing;
 
+/// Sleep to avoid rate limiting (1 second)
+fn rateLimitDelay() void {
+    std.Thread.sleep(1 * std.time.ns_per_s);
+}
+
 test "google: API key validation" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
@@ -77,6 +82,7 @@ test "google: basic text generation" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -114,6 +120,7 @@ test "google: streaming events sequence" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -177,6 +184,7 @@ test "google: thinking mode" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -237,6 +245,7 @@ test "google: tool calling" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -311,6 +320,7 @@ test "google: abort mid-stream" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -369,6 +379,7 @@ test "google: usage tracking" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -414,6 +425,7 @@ test "google: multi-turn conversation" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
@@ -482,6 +494,7 @@ test "google: system prompt" {
     if (test_helpers.shouldSkipProvider(testing.allocator, "google")) {
         return error.SkipZigTest;
     }
+    rateLimitDelay();
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
