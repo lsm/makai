@@ -250,7 +250,8 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
     defer parser.deinit();
 
     // Emit start event at the beginning of the stream
-    try ctx.stream.push(.{ .start = .{ .model = ctx.config.model_id } });
+    // Must dupe the model string so the event owns its memory and deinit can free it
+    try ctx.stream.push(.{ .start = .{ .model = try ctx.allocator.dupe(u8, ctx.config.model_id) } });
 
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
