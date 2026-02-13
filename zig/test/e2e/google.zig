@@ -183,7 +183,7 @@ test "google: thinking mode" {
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
-        .model_id = "gemini-2.5-flash-preview-05-20",
+        .model_id = "gemini-2.5-flash",
         .thinking = .{
             .enabled = true,
             .level = .medium,
