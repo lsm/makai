@@ -180,13 +180,15 @@ test "google: thinking mode" {
     const api_key = (try test_helpers.getApiKey(testing.allocator, "google")).?;
     defer testing.allocator.free(api_key);
 
+    // Gemini 2.5 Flash uses thinkingBudget (integer), not thinkingLevel
+    // thinkingLevel is for Gemini 3 models only
     const cfg = google.GoogleConfig{
         .allocator = testing.allocator,
         .api_key = api_key,
         .model_id = "gemini-2.5-flash",
         .thinking = .{
             .enabled = true,
-            .level = .medium,
+            .budget_tokens = 8192, // Use thinkingBudget for Gemini 2.5
         },
         .params = .{ .max_tokens = 300 },
     };
