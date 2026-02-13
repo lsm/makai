@@ -891,6 +891,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // test_helpers unit test (validates event cleanup with heap-allocated strings)
+    const test_helpers_test = b.addTest(.{
+        .root_module = test_helpers_mod,
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(types_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
@@ -921,6 +926,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_callback_server_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_anthropic_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_github_copilot_test).step);
+    test_step.dependOn(&b.addRunArtifact(test_helpers_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_google_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_storage_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);

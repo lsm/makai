@@ -250,7 +250,8 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
     defer parser.deinit();
 
     // Emit start event at the beginning of the stream
-    try ctx.stream.push(.{ .start = .{ .model = ctx.config.model_id } });
+    // Must dupe the model string so the event owns its memory and deinit can free it
+    try ctx.stream.push(.{ .start = .{ .model = try ctx.allocator.dupe(u8, ctx.config.model_id) } });
 
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
@@ -280,9 +281,13 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
 
     var thought_signatures = std.AutoHashMap(usize, []u8).init(ctx.allocator);
     defer {
-        var it = thought_signatures.valueIterator();
-        while (it.next()) |sig| {
-            ctx.allocator.free(sig.*);
+        // Only free signatures if content wasn't transferred to AssistantMessage
+        // If transferred, AssistantMessage.deinit() will free them
+        if (!content_transferred) {
+            var it = thought_signatures.valueIterator();
+            while (it.next()) |sig| {
+                ctx.allocator.free(sig.*);
+            }
         }
         thought_signatures.deinit();
     }
