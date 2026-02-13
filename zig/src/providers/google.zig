@@ -392,7 +392,8 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
                         block.tool_use.input_json = args_json;
 
                         try ctx.stream.push(.{ .toolcall_delta = .{ .index = idx, .delta = try ctx.allocator.dupe(u8, args_json) } });
-                        try ctx.stream.push(.{ .toolcall_end = .{ .index = idx, .input_json = args_json } });
+                        const args_json_owned = try ctx.allocator.dupe(u8, args_json);
+                        try ctx.stream.push(.{ .toolcall_end = .{ .index = idx, .input_json = args_json_owned } });
                     } else if (part.get("thoughtSignature")) |sig_val| {
                         if (sig_val == .string) {
                             const sig = try ctx.allocator.dupe(u8, sig_val.string);
