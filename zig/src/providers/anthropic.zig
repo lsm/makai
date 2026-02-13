@@ -74,6 +74,11 @@ const StreamThreadContext = struct {
     allocator: std.mem.Allocator,
 };
 
+/// Check if the API key is an OAuth token
+fn isOAuthToken(api_key: []const u8) bool {
+    return std.mem.indexOf(u8, api_key, "sk-ant-oat") != null;
+}
+
 /// Background thread function
 fn streamThread(ctx: *StreamThreadContext) void {
     defer {
@@ -109,8 +114,22 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     // Build headers
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
-    try headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.config.auth.api_key });
-    try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
+
+    // Check if this is an OAuth token
+    if (isOAuthToken(ctx.config.auth.api_key)) {
+        // OAuth: Bearer auth with Claude Code identity
+        const auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
+        defer ctx.allocator.free(auth_header);
+        try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header });
+        try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
+        try headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" });
+        try headers.append(ctx.allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" });
+        try headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" });
+    } else {
+        // API key auth (existing behavior)
+        try headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.config.auth.api_key });
+        try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
+    }
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
 
     // Apply custom headers
@@ -1094,4 +1113,17 @@ test "buildRequestBody tool result without error" {
     // Should not include is_error if false
     try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Success\"") != null);
+}
+
+test "isOAuthToken detection" {
+    // OAuth tokens contain sk-ant-oat
+    try std.testing.expect(isOAuthToken("sk-ant-oat-abc123"));
+    try std.testing.expect(isOAuthToken("prefix-sk-ant-oat-xyz"));
+    try std.testing.expect(isOAuthToken("sk-ant-oat"));
+
+    // Regular API keys should not be detected as OAuth
+    try std.testing.expect(!isOAuthToken("sk-ant-api03-abc123"));
+    try std.testing.expect(!isOAuthToken("sk-ant-123456"));
+    try std.testing.expect(!isOAuthToken("regular-api-key"));
+    try std.testing.expect(!isOAuthToken(""));
 }
