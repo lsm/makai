@@ -412,8 +412,8 @@ fn handleBedrockEvent(
                 } });
                 try ctx.stream.push(.{ .toolcall_start = .{
                     .index = accumulated_content.items.len - 1,
-                    .id = id,
-                    .name = name,
+                    .id = try ctx.allocator.dupe(u8, id),
+                    .name = try ctx.allocator.dupe(u8, name),
                 } });
             } else {
                 // Text block
