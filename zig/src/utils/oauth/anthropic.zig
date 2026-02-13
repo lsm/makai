@@ -135,15 +135,59 @@ fn exchangeCode(code: []const u8, verifier: []const u8, allocator: std.mem.Alloc
     return try exchangeTokens(body, allocator);
 }
 
-/// Exchange tokens with Anthropic API (mock implementation for testing)
+/// Exchange tokens with Anthropic API
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    _ = body;
-    // Real implementation would make HTTP POST to token_url
-    // For now, return mock data for testing
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    const uri = try std.Uri.parse(token_url);
+
+    var headers: std.ArrayList(std.http.Header) = .{};
+    defer headers.deinit(allocator);
+    try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
+    try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
+
+    var request = try client.request(.POST, uri, .{
+        .extra_headers = headers.items,
+    });
+    defer request.deinit();
+
+    request.transfer_encoding = .{ .content_length = body.len };
+    try request.sendBodyComplete(@constCast(body));
+
+    var header_buffer: [4096]u8 = undefined;
+    var response = try request.receiveHead(&header_buffer);
+
+    if (response.head.status != .ok) {
+        var buffer: [4096]u8 = undefined;
+        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+        defer allocator.free(error_body);
+        const err_msg = try std.fmt.allocPrint(allocator, "Token exchange error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
+        defer allocator.free(err_msg);
+        return error.OAuthFailed;
+    }
+
+    var response_buffer: [8192]u8 = undefined;
+    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+    defer allocator.free(response_body);
+
+    // Parse JSON response
+    const parsed = try std.json.parseFromSlice(
+        struct {
+            access_token: []const u8,
+            refresh_token: []const u8,
+            expires_in: i64,
+        },
+        allocator,
+        response_body,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+
     return .{
-        .access_token = try allocator.dupe(u8, "mock_access_token"),
-        .refresh_token = try allocator.dupe(u8, "mock_refresh_token"),
-        .expires_in = 3600,
+        .access_token = try allocator.dupe(u8, parsed.value.access_token),
+        .refresh_token = try allocator.dupe(u8, parsed.value.refresh_token),
+        .expires_in = parsed.value.expires_in,
     };
 }
 
