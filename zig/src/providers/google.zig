@@ -385,7 +385,8 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
 
                         const idx = accumulated_content.items.len - 1;
                         const name_owned = try ctx.allocator.dupe(u8, name);
-                        try ctx.stream.push(.{ .toolcall_start = .{ .index = idx, .id = tool_id, .name = name_owned } });
+                        const tool_id_for_event = try ctx.allocator.dupe(u8, tool_id);
+                        try ctx.stream.push(.{ .toolcall_start = .{ .index = idx, .id = tool_id_for_event, .name = name_owned } });
 
                         const args_json = try std.json.Stringify.valueAlloc(ctx.allocator, args, .{});
                         const block = &accumulated_content.items[idx];
