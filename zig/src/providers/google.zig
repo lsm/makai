@@ -24,6 +24,7 @@ pub const ThinkingConfig = struct {
     enabled: bool,
     budget_tokens: ?i32 = null, // -1 for dynamic, 0 to disable, >0 for fixed
     level: ?ThinkingLevel = null,
+    include_thoughts: bool = true, // Include thought parts in response (default: true)
 };
 
 pub const ThinkingLevel = enum {
@@ -247,6 +248,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
     var parser = sse_parser.SSEParser.init(ctx.allocator);
     defer parser.deinit();
+
+    // Emit start event at the beginning of the stream
+    try ctx.stream.push(.{ .start = .{ .model = ctx.config.model_id } });
 
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
@@ -544,6 +548,12 @@ fn buildRequestBody(
             } else if (thinking_cfg.budget_tokens) |budget| {
                 // Gemini 2.5: use thinkingBudget
                 try writer.writeIntField("thinkingBudget", budget);
+            }
+
+            // Include thought parts in response
+            if (thinking_cfg.include_thoughts) {
+                try writer.writeKey("includeThoughts");
+                try writer.writeBool(true);
             }
 
             try writer.endObject();
