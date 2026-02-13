@@ -66,6 +66,113 @@ pub fn shouldSkipProvider(allocator: std.mem.Allocator, provider_name: []const u
     return true;
 }
 
+/// GitHub Copilot credentials (requires both copilot_token and github_token)
+pub const GitHubCopilotCredentials = struct {
+    copilot_token: []const u8,
+    github_token: []const u8,
+
+    pub fn deinit(self: *GitHubCopilotCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.copilot_token);
+        allocator.free(self.github_token);
+    }
+};
+
+/// Get GitHub Copilot credentials from environment variable or ~/.makai/auth.json
+pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilotCredentials {
+    // Try environment variable first (COPILOT_TOKEN for CI)
+    if (std.process.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
+        // Check for combined format: "github_token:copilot_token"
+        // Split on the first colon - copilot_token may contain colons (semicolons in the token)
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+            const github_token = token[0..colon_pos];
+            const copilot_token = token[colon_pos + 1 ..];
+            const result = GitHubCopilotCredentials{
+                .copilot_token = try allocator.dupe(u8, copilot_token),
+                .github_token = try allocator.dupe(u8, github_token),
+            };
+            allocator.free(token);
+            return result;
+        } else {
+            // Single token format - use as both
+            // In this case, we pass ownership of token to copilot_token
+            // and dupe for github_token
+            return GitHubCopilotCredentials{
+                .copilot_token = token,
+                .github_token = try allocator.dupe(u8, token),
+            };
+        }
+    } else |_| {
+        // Fall back to auth.json
+        return getGitHubCopilotCredentialsFromAuthFile(allocator);
+    }
+}
+
+/// Read GitHub Copilot credentials from ~/.makai/auth.json
+fn getGitHubCopilotCredentialsFromAuthFile(allocator: std.mem.Allocator) !?GitHubCopilotCredentials {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home_dir);
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
+    defer allocator.free(auth_path);
+
+    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    const providers = root.object.get("providers") orelse return null;
+    if (providers != .object) return null;
+
+    const provider_val = providers.object.get("github_copilot") orelse return null;
+
+    // Support combined format: if the value is a string, parse as "github_token:copilot_token"
+    if (provider_val == .string) {
+        const combined = provider_val.string;
+        // Split on the first colon - copilot_token may contain colons
+        if (std.mem.indexOfScalar(u8, combined, ':')) |colon_pos| {
+            const github_token = combined[0..colon_pos];
+            const copilot_token = combined[colon_pos + 1 ..];
+            return GitHubCopilotCredentials{
+                .copilot_token = try allocator.dupe(u8, copilot_token),
+                .github_token = try allocator.dupe(u8, github_token),
+            };
+        }
+        return null;
+    }
+
+    // Traditional format: object with separate copilot_token and github_token fields
+    if (provider_val != .object) return null;
+
+    const copilot_token_val = provider_val.object.get("copilot_token") orelse return null;
+    if (copilot_token_val != .string) return null;
+
+    const github_token_val = provider_val.object.get("github_token") orelse return null;
+    if (github_token_val != .string) return null;
+
+    return GitHubCopilotCredentials{
+        .copilot_token = try allocator.dupe(u8, copilot_token_val.string),
+        .github_token = try allocator.dupe(u8, github_token_val.string),
+    };
+}
+
+/// Check if GitHub Copilot provider should be skipped (no credentials)
+pub fn shouldSkipGitHubCopilot(allocator: std.mem.Allocator) bool {
+    const creds = getGitHubCopilotCredentials(allocator) catch return true;
+    if (creds) |c| {
+        var mutable_creds = c;
+        mutable_creds.deinit(allocator);
+        return false;
+    }
+    return true;
+}
+
 /// Free allocated strings in a MessageEvent
 pub fn freeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) void {
     switch (event) {
