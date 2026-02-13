@@ -168,17 +168,17 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         defer parsed.deinit();
         auth_header_owned = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{parsed.value.token});
         try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header_owned.? });
-        // OAuth uses URL without query parameter
+        // OAuth uses URL without query parameter (but needs alt=sse for streaming)
         url = try std.fmt.allocPrint(
             ctx.allocator,
-            "{s}/v1beta/models/{s}:generateContentStream",
+            "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse",
             .{ base, ctx.config.model_id },
         );
     } else {
-        // Simple API key - use query parameter
+        // Simple API key - use query parameter with alt=sse for SSE streaming
         url = try std.fmt.allocPrint(
             ctx.allocator,
-            "{s}/v1beta/models/{s}:generateContentStream?key={s}",
+            "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse&key={s}",
             .{ base, ctx.config.model_id, ctx.config.api_key },
         );
     }
