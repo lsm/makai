@@ -254,6 +254,30 @@ fn buildRequestBody(
         try writer.endArray();
     }
 
+    // Thinking config (inside generationConfig per Google API spec)
+    if (cfg.thinking) |thinking_cfg| {
+        if (thinking_cfg.enabled) {
+            try writer.writeKey("thinkingConfig");
+            try writer.beginObject();
+
+            if (thinking_cfg.level) |level| {
+                // Gemini 3: use thinkingLevel
+                const level_str = switch (level) {
+                    .minimal => "MINIMAL",
+                    .low => "LOW",
+                    .medium => "MEDIUM",
+                    .high => "HIGH",
+                };
+                try writer.writeStringField("thinkingLevel", level_str);
+            } else if (thinking_cfg.budget_tokens) |budget| {
+                // Gemini 2.5: use thinkingBudget
+                try writer.writeIntField("thinkingBudget", budget);
+            }
+
+            try writer.endObject();
+        }
+    }
+
     try writer.endObject();
 
     // Tools
@@ -283,28 +307,6 @@ fn buildRequestBody(
             };
             try writer.writeStringField("mode", mode);
             try writer.endObject();
-            try writer.endObject();
-        }
-    }
-
-    // Thinking config
-    if (cfg.thinking) |thinking_cfg| {
-        if (thinking_cfg.enabled) {
-            try writer.writeKey("thinkingConfig");
-            try writer.beginObject();
-
-            if (thinking_cfg.level) |level| {
-                const level_str = switch (level) {
-                    .minimal => "MINIMAL",
-                    .low => "LOW",
-                    .medium => "MEDIUM",
-                    .high => "HIGH",
-                };
-                try writer.writeStringField("thinkingLevel", level_str);
-            } else if (thinking_cfg.budget_tokens) |budget| {
-                try writer.writeIntField("thinkingBudget", budget);
-            }
-
             try writer.endObject();
         }
     }
