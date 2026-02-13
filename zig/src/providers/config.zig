@@ -140,6 +140,20 @@ pub const OpenAIResponsesConfig = struct {
     cancel_token: ?CancelToken = null,
 };
 
+/// GitHub Copilot-specific configuration
+pub const GitHubCopilotConfig = struct {
+    copilot_token: []const u8, // From OAuth flow (includes proxy-ep for base URL)
+    github_token: []const u8, // Refresh token (GitHub access token)
+    model: []const u8 = "gpt-4o",
+    base_url: ?[]const u8 = null, // Parsed from token's proxy-ep, or enterprise URL
+    enabled_models: ?[][]const u8 = null, // Models successfully enabled via policy
+    params: RequestParams = .{},
+    include_usage: bool = true,
+    custom_headers: ?[]const HeaderPair = null,
+    retry_config: RetryConfig = .{},
+    cancel_token: ?CancelToken = null,
+};
+
 /// Ollama-specific configuration
 pub const OllamaConfig = struct {
     model: []const u8 = "llama3.2",
@@ -706,4 +720,29 @@ test "OpenAIResponsesConfig with max_output_tokens" {
         .max_output_tokens = 16000,
     };
     try std.testing.expectEqual(@as(u32, 16000), config.max_output_tokens.?);
+}
+
+test "GitHubCopilotConfig default values" {
+    const config = GitHubCopilotConfig{
+        .copilot_token = "test-copilot-token",
+        .github_token = "test-github-token",
+    };
+    try std.testing.expectEqualStrings("gpt-4o", config.model);
+    try std.testing.expect(config.base_url == null);
+    try std.testing.expect(config.enabled_models == null);
+    try std.testing.expect(config.include_usage);
+}
+
+test "GitHubCopilotConfig with custom values" {
+    const enabled: []const []const u8 = &[_][]const u8{ "gpt-4o", "claude-sonnet-4.5" };
+    const config = GitHubCopilotConfig{
+        .copilot_token = "test-copilot-token",
+        .github_token = "test-github-token",
+        .model = "claude-sonnet-4.5",
+        .base_url = "https://api.individual.githubcopilot.com",
+        .enabled_models = @as([][]const u8, @constCast(enabled)),
+    };
+    try std.testing.expectEqualStrings("claude-sonnet-4.5", config.model);
+    try std.testing.expectEqualStrings("https://api.individual.githubcopilot.com", config.base_url.?);
+    try std.testing.expectEqual(@as(usize, 2), config.enabled_models.?.len);
 }
