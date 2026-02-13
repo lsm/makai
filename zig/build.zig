@@ -289,6 +289,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const github_copilot_mod = b.createModule(.{
+        .root_source_file = b.path("src/providers/github_copilot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "provider", .module = provider_mod },
+            .{ .name = "config", .module = config_mod },
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+        },
+    });
+
     _ = b.createModule(.{
         .root_source_file = b.path("src/simple_stream.zig"),
         .target = target,
@@ -307,6 +321,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "google", .module = google_mod },
             .{ .name = "google_vertex", .module = google_vertex_mod },
             .{ .name = "bedrock", .module = bedrock_mod },
+            .{ .name = "github_copilot", .module = github_copilot_mod },
         },
     });
 
@@ -604,6 +619,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const github_copilot_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/providers/github_copilot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "provider", .module = provider_mod },
+                .{ .name = "config", .module = config_mod },
+                .{ .name = "sse_parser", .module = sse_parser_mod },
+                .{ .name = "json_writer", .module = json_writer_mod },
+            },
+        }),
+    });
+
     const transport_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/transport.zig"),
@@ -660,6 +691,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "google", .module = google_mod },
                 .{ .name = "google_vertex", .module = google_vertex_mod },
                 .{ .name = "bedrock", .module = bedrock_mod },
+                .{ .name = "github_copilot", .module = github_copilot_mod },
             },
         }),
     });
@@ -891,6 +923,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_github_copilot_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/github_copilot.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+                .{ .name = "config", .module = config_mod },
+                .{ .name = "github_copilot", .module = github_copilot_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+            },
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(types_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
@@ -913,6 +959,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(google_test).step);
     test_step.dependOn(&b.addRunArtifact(google_vertex_test).step);
     test_step.dependOn(&b.addRunArtifact(bedrock_test).step);
+    test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(transport_test).step);
     test_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
@@ -969,6 +1016,10 @@ pub fn build(b: *std.Build) void {
     e2e_unicode_run.step.max_rss = 0;
     e2e_test_step.dependOn(&e2e_unicode_run.step);
 
+    const e2e_github_copilot_run = b.addRunArtifact(e2e_github_copilot_test);
+    e2e_github_copilot_run.step.max_rss = 0;
+    e2e_test_step.dependOn(&e2e_github_copilot_run.step);
+
     // Individual E2E test steps per provider
     const e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     e2e_anthropic_step.dependOn(&e2e_anthropic_run.step);
@@ -990,4 +1041,24 @@ pub fn build(b: *std.Build) void {
 
     const e2e_bedrock_step = b.step("test-e2e-bedrock", "Run AWS Bedrock E2E tests");
     e2e_bedrock_step.dependOn(&e2e_bedrock_run.step);
+
+    const e2e_github_copilot_step = b.step("test-e2e-github-copilot", "Run GitHub Copilot E2E tests");
+    e2e_github_copilot_step.dependOn(&e2e_github_copilot_run.step);
+
+    // copilot-login tool
+    const copilot_login_exe = b.addExecutable(.{
+        .name = "copilot-login",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/copilot_login.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "oauth/github_copilot", .module = oauth_github_copilot_mod },
+            },
+        }),
+    });
+
+    const copilot_login_run = b.addRunArtifact(copilot_login_exe);
+    const copilot_login_step = b.step("copilot-login", "Run GitHub Copilot OAuth login flow");
+    copilot_login_step.dependOn(&copilot_login_run.step);
 }
