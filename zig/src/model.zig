@@ -323,6 +323,17 @@ const known_models = [_]Model{
         .context_window = 2_000_000,
         .max_tokens = 16_384,
     },
+    .{
+        .id = "gemini-3-flash-preview",
+        .name = "Gemini 3 Flash (Preview)",
+        .api_type = .google,
+        .provider = "google",
+        .reasoning = true,
+        .input_modalities = &text_and_image,
+        .cost = .{ .input = 0.10, .output = 0.40 },
+        .context_window = 1_000_000,
+        .max_tokens = 8192,
+    },
     // Ollama models (local, zero cost)
     .{
         .id = "llama3.1",
@@ -451,7 +462,7 @@ test "getModel returns null for unknown" {
 
 test "getModels returns all known models" {
     const models = getModels();
-    try std.testing.expectEqual(@as(usize, 25), models.len);
+    try std.testing.expectEqual(@as(usize, 26), models.len);
 }
 
 test "calculateCost basic" {
