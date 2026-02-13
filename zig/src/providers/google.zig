@@ -281,9 +281,13 @@ pub fn parseResponse(ctx: *StreamThreadContext, reader: anytype) !void {
 
     var thought_signatures = std.AutoHashMap(usize, []u8).init(ctx.allocator);
     defer {
-        var it = thought_signatures.valueIterator();
-        while (it.next()) |sig| {
-            ctx.allocator.free(sig.*);
+        // Only free signatures if content wasn't transferred to AssistantMessage
+        // If transferred, AssistantMessage.deinit() will free them
+        if (!content_transferred) {
+            var it = thought_signatures.valueIterator();
+            while (it.next()) |sig| {
+                ctx.allocator.free(sig.*);
+            }
         }
         thought_signatures.deinit();
     }
