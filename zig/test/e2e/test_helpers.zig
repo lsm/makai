@@ -209,7 +209,9 @@ test "EventAccumulator process start event" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    const event = types.MessageEvent{ .start = .{ .model = "test-model" } };
+    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const model_str = try std.testing.allocator.dupe(u8, "test-model");
+    const event = types.MessageEvent{ .start = .{ .model = model_str } };
     try accumulator.processEvent(event);
 
     try std.testing.expectEqual(@as(usize, 1), accumulator.events_seen);
@@ -220,8 +222,12 @@ test "EventAccumulator process text delta" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    const event1 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = "Hello" } };
-    const event2 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = " world" } };
+    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const delta1 = try std.testing.allocator.dupe(u8, "Hello");
+    const delta2 = try std.testing.allocator.dupe(u8, " world");
+
+    const event1 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = delta1 } };
+    const event2 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = delta2 } };
 
     try accumulator.processEvent(event1);
     try accumulator.processEvent(event2);
@@ -234,7 +240,9 @@ test "EventAccumulator process thinking delta" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    const event = types.MessageEvent{ .thinking_delta = .{ .index = 0, .delta = "reasoning..." } };
+    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const delta = try std.testing.allocator.dupe(u8, "reasoning...");
+    const event = types.MessageEvent{ .thinking_delta = .{ .index = 0, .delta = delta } };
     try accumulator.processEvent(event);
 
     try std.testing.expectEqualStrings("reasoning...", accumulator.thinking_buffer.items);
@@ -244,8 +252,13 @@ test "EventAccumulator process tool call" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    const start_event = types.MessageEvent{ .toolcall_start = .{ .index = 0, .id = "call_1", .name = "test_tool" } };
-    const end_event = types.MessageEvent{ .toolcall_end = .{ .index = 0, .input_json = "{\"arg\":\"value\"}" } };
+    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const id = try std.testing.allocator.dupe(u8, "call_1");
+    const name = try std.testing.allocator.dupe(u8, "test_tool");
+    const input_json = try std.testing.allocator.dupe(u8, "{\"arg\":\"value\"}");
+
+    const start_event = types.MessageEvent{ .toolcall_start = .{ .index = 0, .id = id, .name = name } };
+    const end_event = types.MessageEvent{ .toolcall_end = .{ .index = 0, .input_json = input_json } };
 
     try accumulator.processEvent(start_event);
     try accumulator.processEvent(end_event);
