@@ -126,7 +126,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
 
         try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header.? });
         try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
-        try headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" });
+        try headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
         try headers.append(ctx.allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" });
         try headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" });
     } else {
@@ -392,7 +392,24 @@ pub fn buildRequestBody(
     }
 
     if (cfg.params.system_prompt) |system| {
-        try writer.writeStringField("system", system);
+        // For OAuth tokens, we need to override the system prompt with Claude Code identity
+        if (isOAuthToken(cfg.auth.api_key)) {
+            try writer.writeKey("system");
+            try writer.beginArray();
+            // First block: Claude Code identity (required for OAuth to work)
+            try writer.beginObject();
+            try writer.writeStringField("type", "text");
+            try writer.writeStringField("text", "You are Claude Code, Anthropic's official CLI for Claude.");
+            try writer.endObject();
+            // Second block: User's original system prompt
+            try writer.beginObject();
+            try writer.writeStringField("type", "text");
+            try writer.writeStringField("text", system);
+            try writer.endObject();
+            try writer.endArray();
+        } else {
+            try writer.writeStringField("system", system);
+        }
     }
 
     if (cfg.params.tools) |tools| {
@@ -1147,4 +1164,90 @@ test "isOAuthToken detection" {
     try std.testing.expect(!isOAuthToken("sk-ant-123456"));
     try std.testing.expect(!isOAuthToken("regular-api-key"));
     try std.testing.expect(!isOAuthToken(""));
+}
+
+test "buildRequestBody with system prompt uses array format for OAuth tokens" {
+    const allocator = std.testing.allocator;
+
+    const cfg = config.AnthropicConfig{
+        .auth = .{ .api_key = "sk-ant-oat-test-token" },
+        .params = .{
+            .system_prompt = "You are a helpful assistant.",
+        },
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Hello!" } },
+            },
+            .timestamp = 0,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    // Should use array format for system prompt
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[") != null);
+    // Should include Claude Code identity
+    try std.testing.expect(std.mem.indexOf(u8, body, "You are Claude Code, Anthropic's official CLI for Claude.") != null);
+    // Should include user's system prompt as second text block
+    try std.testing.expect(std.mem.indexOf(u8, body, "You are a helpful assistant.") != null);
+    // Should have two text blocks
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"type\":\"text\",\"text\":\"You are Claude Code, Anthropic's official CLI for Claude.\"},{\"type\":\"text\",\"text\":\"You are a helpful assistant.\"}") != null);
+}
+
+test "buildRequestBody with system prompt uses string format for regular API keys" {
+    const allocator = std.testing.allocator;
+
+    const cfg = config.AnthropicConfig{
+        .auth = .{ .api_key = "sk-ant-api03-test-key" },
+        .params = .{
+            .system_prompt = "You are a helpful assistant.",
+        },
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Hello!" } },
+            },
+            .timestamp = 0,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    // Should use string format for system prompt (not array)
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":\"You are a helpful assistant.\"") != null);
+    // Should NOT include Claude Code identity for regular API keys
+    try std.testing.expect(std.mem.indexOf(u8, body, "Claude Code") == null);
+}
+
+test "buildRequestBody without system prompt does not add Claude Code identity" {
+    const allocator = std.testing.allocator;
+
+    const cfg = config.AnthropicConfig{
+        .auth = .{ .api_key = "sk-ant-oat-test-token" },
+    };
+
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &[_]types.ContentBlock{
+                .{ .text = .{ .text = "Hello!" } },
+            },
+            .timestamp = 0,
+        },
+    };
+
+    const body = try buildRequestBody(cfg, &messages, allocator);
+    defer allocator.free(body);
+
+    // Should not include system prompt at all
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\"") == null);
 }

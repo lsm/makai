@@ -7,14 +7,17 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "anthropic: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .params = .{
             .max_tokens = 100,
@@ -43,14 +46,17 @@ test "anthropic: basic text generation" {
 }
 
 test "anthropic: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .params = .{ .max_tokens = 50 },
     };
@@ -105,14 +111,17 @@ test "anthropic: streaming events sequence" {
 }
 
 test "anthropic: thinking mode" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .thinking_level = .low,
         .params = .{ .max_tokens = 200 },
@@ -159,11 +168,14 @@ test "anthropic: thinking mode" {
 }
 
 test "anthropic: tool calling" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     const weather_tool = types.Tool{
         .name = "get_weather",
@@ -179,7 +191,7 @@ test "anthropic: tool calling" {
     };
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .params = .{
             .max_tokens = 200,
@@ -232,17 +244,20 @@ test "anthropic: tool calling" {
 }
 
 test "anthropic: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .params = .{ .max_tokens = 500 },
         .cancel_token = cancel_token,
@@ -290,14 +305,17 @@ test "anthropic: abort mid-stream" {
 }
 
 test "anthropic: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
+    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
         return error.SkipZigTest;
     }
-    const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
-    defer testing.allocator.free(api_key);
+    const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
+    defer {
+        var mutable_cred = cred;
+        mutable_cred.deinit(testing.allocator);
+    }
 
     const cfg = config.AnthropicConfig{
-        .auth = .{ .api_key = api_key },
+        .auth = .{ .api_key = cred.token },
         .model = "claude-3-5-haiku-20241022",
         .params = .{ .max_tokens = 100 },
     };

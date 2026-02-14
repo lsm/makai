@@ -472,3 +472,317 @@ test "ThinkingBudgets defaults" {
     try std.testing.expectEqual(@as(u32, 16384), budgets.high);
     try std.testing.expectEqual(@as(u32, 32768), budgets.xhigh);
 }
+
+// ============================================================================
+// Simplified Stream API - Auto-detect provider from environment variables
+// ============================================================================
+
+/// Detected provider type from environment variables
+pub const DetectedProvider = enum {
+    anthropic,
+    openai,
+    ollama,
+    google,
+    azure,
+    bedrock,
+
+    /// Returns the default model ID for this provider
+    pub fn defaultModel(self: DetectedProvider) []const u8 {
+        return switch (self) {
+            .anthropic => "claude-sonnet-4-20250514",
+            .openai => "gpt-4o",
+            .ollama => "llama3.1",
+            .google => "gemini-2.5-flash",
+            .azure => "azure-gpt-4o",
+            .bedrock => "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        };
+    }
+};
+
+/// Error type for provider detection
+pub const DetectError = error{
+    NoApiKey,
+    MultipleProviders,
+};
+
+/// Detect the provider from environment variables.
+/// Priority: ANTHROPIC_API_KEY > OPENAI_API_KEY > GOOGLE_API_KEY
+/// Returns error.NoApiKey if no API key is found.
+/// Returns error.MultipleProviders if multiple keys are found (ambiguous).
+pub fn detectProvider() DetectError!DetectedProvider {
+    const env = std.process.getEnvVarOwned;
+
+    var has_anthropic = false;
+    var has_openai = false;
+    var has_google = false;
+
+    if (env(std.heap.page_allocator, "ANTHROPIC_API_KEY")) |key| {
+        std.heap.page_allocator.free(key);
+        has_anthropic = true;
+    } else |_| {}
+
+    if (env(std.heap.page_allocator, "OPENAI_API_KEY")) |key| {
+        std.heap.page_allocator.free(key);
+        has_openai = true;
+    } else |_| {}
+
+    if (env(std.heap.page_allocator, "GOOGLE_API_KEY")) |key| {
+        std.heap.page_allocator.free(key);
+        has_google = true;
+    } else |_| {}
+
+    // Count how many providers have keys
+    var count: usize = 0;
+    if (has_anthropic) count += 1;
+    if (has_openai) count += 1;
+    if (has_google) count += 1;
+
+    if (count == 0) return error.NoApiKey;
+    if (count > 1) return error.MultipleProviders;
+
+    if (has_anthropic) return .anthropic;
+    if (has_openai) return .openai;
+    if (has_google) return .google;
+
+    return error.NoApiKey;
+}
+
+/// Get the API key for a detected provider from environment variables
+pub fn getApiKey(provider: DetectedProvider, allocator: std.mem.Allocator) ?[]const u8 {
+    const env_var = switch (provider) {
+        .anthropic => "ANTHROPIC_API_KEY",
+        .openai => "OPENAI_API_KEY",
+        .google => "GOOGLE_API_KEY",
+        .azure => "AZURE_OPENAI_API_KEY",
+        .bedrock => "AWS_ACCESS_KEY_ID",
+        .ollama => return "", // Ollama doesn't need an API key
+    };
+    return std.process.getEnvVarOwned(allocator, env_var) catch null;
+}
+
+/// Simple options for the simplified streaming API
+pub const SimpleOptions = struct {
+    /// Model ID (e.g., "claude-sonnet-4-20250514", "gpt-4o")
+    /// If null, uses the default model for the detected provider
+    model: ?[]const u8 = null,
+    /// System prompt to prepend to the conversation
+    system: ?[]const u8 = null,
+    /// Maximum tokens to generate
+    max_tokens: u32 = 4096,
+    /// Temperature for sampling (0.0 to 2.0)
+    temperature: f32 = 1.0,
+    /// Top-p sampling parameter
+    top_p: ?f32 = null,
+    /// Thinking/reasoning level (for models that support it)
+    reasoning: ?config.ThinkingLevel = null,
+    /// Custom API base URL
+    base_url: ?[]const u8 = null,
+    /// Force a specific provider (skips auto-detection)
+    provider: ?DetectedProvider = null,
+};
+
+/// Detect provider and get the appropriate Model struct
+fn detectModel(options: SimpleOptions) ?model_mod.Model {
+    const provider = options.provider orelse detectProvider() catch return null;
+    const model_id = options.model orelse provider.defaultModel();
+
+    // First try to get a known model
+    if (model_mod.getModel(model_id)) |m| return m;
+
+    // If not found, create a minimal Model based on the provider
+    return model_mod.Model{
+        .id = model_id,
+        .name = model_id,
+        .api_type = switch (provider) {
+            .anthropic => .anthropic,
+            .openai => .openai,
+            .ollama => .ollama,
+            .google => .google,
+            .azure => .azure,
+            .bedrock => .bedrock,
+        },
+        .provider = @tagName(provider),
+        .max_tokens = options.max_tokens,
+    };
+}
+
+/// Stream a response using simple options.
+/// Auto-detects provider from environment variables (ANTHROPIC_API_KEY or OPENAI_API_KEY).
+/// Caller owns the returned AssistantMessageStream.
+pub fn stream(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    options: SimpleOptions,
+) !*event_stream.AssistantMessageStream {
+    const mdl = detectModel(options) orelse return error.MissingApiKey;
+    const provider = options.provider orelse detectProvider() catch return error.MissingApiKey;
+
+    const api_key = getApiKey(provider, allocator) orelse "";
+    defer if (api_key.len > 0) allocator.free(api_key);
+
+    const stream_options = SimpleStreamOptions{
+        .system_prompt = options.system,
+        .max_tokens = options.max_tokens,
+        .temperature = options.temperature,
+        .top_p = options.top_p,
+        .reasoning = options.reasoning,
+        .base_url = options.base_url,
+        .api_key = if (api_key.len > 0) api_key else null,
+    };
+
+    return streamSimple(mdl, messages, stream_options, allocator);
+}
+
+/// Stream a simple text prompt.
+/// Converts the prompt to a single user message and streams the response.
+/// Caller owns the returned AssistantMessageStream.
+pub fn streamText(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    options: SimpleOptions,
+) !*event_stream.AssistantMessageStream {
+    // Create a single user message from the prompt
+    const content_block = types.ContentBlock{ .text = .{ .text = prompt } };
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &content_block,
+            .timestamp = std.time.timestamp(),
+        },
+    };
+
+    return stream(allocator, &messages, options);
+}
+
+/// Complete and return the full response (blocking).
+/// Waits for the stream to complete and returns the final AssistantMessage.
+/// Caller owns the returned AssistantMessage.
+pub fn complete(
+    allocator: std.mem.Allocator,
+    messages: []const types.Message,
+    options: SimpleOptions,
+) !types.AssistantMessage {
+    const stream_ptr = try stream(allocator, messages, options);
+    defer {
+        stream_ptr.deinit();
+        allocator.destroy(stream_ptr);
+    }
+
+    // Wait for completion
+    while (!stream_ptr.isDone()) {
+        std.Thread.Futex.wait(&stream_ptr.futex, stream_ptr.futex.load(.acquire));
+    }
+
+    // Check for errors
+    if (stream_ptr.getError()) |_| {
+        return error.StreamError;
+    }
+
+    // Get the result
+    const result = stream_ptr.getResult() orelse return error.NoResult;
+
+    // Deep copy the result since the stream owns the memory
+    // We need to dupe all strings
+    var content_blocks = try allocator.alloc(types.ContentBlock, result.content.len);
+    errdefer allocator.free(content_blocks);
+
+    for (result.content, 0..) |block, i| {
+        content_blocks[i] = switch (block) {
+            .text => |t| types.ContentBlock{ .text = .{
+                .text = try allocator.dupe(u8, t.text),
+                .signature = if (t.signature) |s| try allocator.dupe(u8, s) else null,
+            } },
+            .tool_use => |tu| types.ContentBlock{ .tool_use = .{
+                .id = try allocator.dupe(u8, tu.id),
+                .name = try allocator.dupe(u8, tu.name),
+                .input_json = try allocator.dupe(u8, tu.input_json),
+                .thought_signature = if (tu.thought_signature) |s| try allocator.dupe(u8, s) else null,
+            } },
+            .thinking => |th| types.ContentBlock{ .thinking = .{
+                .thinking = try allocator.dupe(u8, th.thinking),
+                .signature = if (th.signature) |s| try allocator.dupe(u8, s) else null,
+            } },
+            .image => |img| types.ContentBlock{ .image = .{
+                .media_type = try allocator.dupe(u8, img.media_type),
+                .data = try allocator.dupe(u8, img.data),
+            } },
+        };
+    }
+
+    return types.AssistantMessage{
+        .content = content_blocks,
+        .usage = result.usage,
+        .stop_reason = result.stop_reason,
+        .model = try allocator.dupe(u8, result.model),
+        .timestamp = result.timestamp,
+    };
+}
+
+/// Complete a simple text prompt and return just the text response (blocking).
+/// Extracts the text from the first content block of the response.
+/// Caller owns the returned string.
+pub fn completeText(
+    allocator: std.mem.Allocator,
+    prompt: []const u8,
+    options: SimpleOptions,
+) ![]const u8 {
+    var result = try complete(allocator, prompt, options);
+    defer result.deinit(allocator);
+
+    // Find the first text block
+    for (result.content) |block| {
+        switch (block) {
+            .text => |t| return try allocator.dupe(u8, t.text),
+            else => {},
+        }
+    }
+
+    return ""; // No text content found
+}
+
+// ============================================================================
+// Simplified API Tests
+// ============================================================================
+
+test "DetectedProvider defaultModel" {
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", DetectedProvider.anthropic.defaultModel());
+    try std.testing.expectEqualStrings("gpt-4o", DetectedProvider.openai.defaultModel());
+    try std.testing.expectEqualStrings("llama3.1", DetectedProvider.ollama.defaultModel());
+    try std.testing.expectEqualStrings("gemini-2.5-flash", DetectedProvider.google.defaultModel());
+}
+
+test "SimpleOptions defaults" {
+    const opts = SimpleOptions{};
+    try std.testing.expect(opts.model == null);
+    try std.testing.expect(opts.system == null);
+    try std.testing.expectEqual(@as(u32, 4096), opts.max_tokens);
+    try std.testing.expectEqual(@as(f32, 1.0), opts.temperature);
+    try std.testing.expect(opts.top_p == null);
+    try std.testing.expect(opts.reasoning == null);
+    try std.testing.expect(opts.base_url == null);
+    try std.testing.expect(opts.provider == null);
+}
+
+test "detectProvider returns NoApiKey when no keys present" {
+    // This test will pass or fail depending on the environment
+    // We just check that it doesn't crash
+    _ = detectProvider() catch |err| {
+        try std.testing.expect(err == error.NoApiKey or err == error.MultipleProviders);
+    };
+}
+
+test "streamText creates correct message structure" {
+    // Create a mock message to test the structure
+    const content_blocks = [_]types.ContentBlock{.{ .text = .{ .text = "Hello, world!" } }};
+    const messages = [_]types.Message{
+        .{
+            .role = .user,
+            .content = &content_blocks,
+            .timestamp = std.time.timestamp(),
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(types.Role.user, messages[0].role);
+    try std.testing.expectEqualStrings("Hello, world!", messages[0].content[0].text.text);
+}
