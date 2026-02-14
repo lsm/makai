@@ -775,6 +775,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "types", .module = types_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
     });
 
@@ -942,6 +943,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_anthropic_oauth_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/anthropic_oauth.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+                .{ .name = "config", .module = config_mod },
+                .{ .name = "anthropic", .module = anthropic_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+            },
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(types_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
@@ -1026,6 +1041,10 @@ pub fn build(b: *std.Build) void {
     e2e_github_copilot_run.step.max_rss = 0;
     e2e_test_step.dependOn(&e2e_github_copilot_run.step);
 
+    const e2e_anthropic_oauth_run = b.addRunArtifact(e2e_anthropic_oauth_test);
+    e2e_anthropic_oauth_run.step.max_rss = 0;
+    e2e_test_step.dependOn(&e2e_anthropic_oauth_run.step);
+
     // Individual E2E test steps per provider
     const e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     e2e_anthropic_step.dependOn(&e2e_anthropic_run.step);
@@ -1051,6 +1070,9 @@ pub fn build(b: *std.Build) void {
     const e2e_github_copilot_step = b.step("test-e2e-github-copilot", "Run GitHub Copilot E2E tests");
     e2e_github_copilot_step.dependOn(&e2e_github_copilot_run.step);
 
+    const e2e_anthropic_oauth_step = b.step("test-e2e-anthropic-oauth", "Run Anthropic OAuth E2E tests");
+    e2e_anthropic_oauth_step.dependOn(&e2e_anthropic_oauth_run.step);
+
     // copilot-login tool
     const copilot_login_exe = b.addExecutable(.{
         .name = "copilot-login",
@@ -1067,4 +1089,21 @@ pub fn build(b: *std.Build) void {
     const copilot_login_run = b.addRunArtifact(copilot_login_exe);
     const copilot_login_step = b.step("copilot-login", "Run GitHub Copilot OAuth login flow");
     copilot_login_step.dependOn(&copilot_login_run.step);
+
+    // anthropic-login tool
+    const anthropic_login_exe = b.addExecutable(.{
+        .name = "anthropic-login",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/anthropic_login.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            },
+        }),
+    });
+
+    const anthropic_login_run = b.addRunArtifact(anthropic_login_exe);
+    const anthropic_login_step = b.step("anthropic-login", "Run Anthropic OAuth login flow");
+    anthropic_login_step.dependOn(&anthropic_login_run.step);
 }

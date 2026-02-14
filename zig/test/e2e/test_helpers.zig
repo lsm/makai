@@ -173,6 +173,161 @@ pub fn shouldSkipGitHubCopilot(allocator: std.mem.Allocator) bool {
     return true;
 }
 
+/// Anthropic OAuth credentials (refresh_token:access_token format)
+pub const AnthropicOAuthCredentials = struct {
+    refresh_token: []const u8,
+    access_token: []const u8,
+
+    pub fn deinit(self: *AnthropicOAuthCredentials, allocator: std.mem.Allocator) void {
+        if (self.refresh_token.len > 0) {
+            allocator.free(self.refresh_token);
+        }
+        allocator.free(self.access_token);
+    }
+};
+
+/// Get Anthropic OAuth credentials from environment variable or ~/.makai/auth.json
+pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
+    // Try environment variable first (ANTHROPIC_OAUTH_TOKEN for CI)
+    // Format: "refresh_token:access_token"
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN")) |token| {
+        // Split on the first colon
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+            const refresh_token = token[0..colon_pos];
+            const access_token = token[colon_pos + 1 ..];
+            const result = AnthropicOAuthCredentials{
+                .refresh_token = try allocator.dupe(u8, refresh_token),
+                .access_token = try allocator.dupe(u8, access_token),
+            };
+            allocator.free(token);
+            return result;
+        } else {
+            // Single token format - use as access token only (no refresh token)
+            // This is for backwards compatibility
+            const result = AnthropicOAuthCredentials{
+                .refresh_token = &[_]u8{},
+                .access_token = token,
+            };
+            return result;
+        }
+    } else |_| {
+        // Fall back to auth.json
+        return getAnthropicOAuthCredentialsFromAuthFile(allocator);
+    }
+}
+
+/// Read Anthropic OAuth credentials from ~/.makai/auth.json
+fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home_dir);
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
+    defer allocator.free(auth_path);
+
+    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    const providers = root.object.get("providers") orelse return null;
+    if (providers != .object) return null;
+
+    const provider_val = providers.object.get("anthropic") orelse return null;
+
+    // Support combined format: if the value is a string, parse as "refresh_token:access_token"
+    if (provider_val == .string) {
+        const combined = provider_val.string;
+        if (std.mem.indexOfScalar(u8, combined, ':')) |colon_pos| {
+            const refresh_token = combined[0..colon_pos];
+            const access_token = combined[colon_pos + 1 ..];
+            return AnthropicOAuthCredentials{
+                .refresh_token = try allocator.dupe(u8, refresh_token),
+                .access_token = try allocator.dupe(u8, access_token),
+            };
+        }
+        return null;
+    }
+
+    // Traditional format: object with oauth_token field containing access token
+    if (provider_val != .object) return null;
+
+    const oauth_token_val = provider_val.object.get("oauth_token") orelse return null;
+    if (oauth_token_val != .string) return null;
+
+    // Optional refresh token
+    const refresh_token_val = provider_val.object.get("refresh_token");
+    const refresh_token = if (refresh_token_val) |rv|
+        if (rv == .string) try allocator.dupe(u8, rv.string) else &[_]u8{}
+    else
+        &[_]u8{};
+
+    return AnthropicOAuthCredentials{
+        .refresh_token = refresh_token,
+        .access_token = try allocator.dupe(u8, oauth_token_val.string),
+    };
+}
+
+/// Check if Anthropic OAuth provider should be skipped (no credentials)
+pub fn shouldSkipAnthropicOAuth(allocator: std.mem.Allocator) bool {
+    const creds = getAnthropicOAuthCredentials(allocator) catch return true;
+    if (creds) |c| {
+        var mutable_creds = c;
+        mutable_creds.deinit(allocator);
+        return false;
+    }
+    return true;
+}
+
+/// Anthropic OAuth credentials with fresh access token
+pub const FreshAnthropicCredentials = struct {
+    access_token: []const u8,
+    refresh_token: []const u8,
+
+    pub fn deinit(self: *FreshAnthropicCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.access_token);
+        if (self.refresh_token.len > 0) {
+            allocator.free(self.refresh_token);
+        }
+    }
+};
+
+/// Get Anthropic OAuth credentials with a fresh access token
+/// Uses the refresh token to obtain a fresh access token before running tests
+pub fn getFreshAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?FreshAnthropicCredentials {
+    const oauth_anthropic = @import("oauth/anthropic");
+
+    const creds = (try getAnthropicOAuthCredentials(allocator)) orelse return null;
+    var mutable_creds = creds;
+    defer mutable_creds.deinit(allocator);
+
+    // If we have a refresh token, use it to get a fresh access token
+    if (creds.refresh_token.len > 0) {
+        const fresh_creds = try oauth_anthropic.refreshToken(.{
+            .refresh = creds.refresh_token,
+            .access = creds.access_token,
+            .expires = 0, // Will be set by refresh
+        }, allocator);
+
+        return FreshAnthropicCredentials{
+            .access_token = fresh_creds.access,
+            .refresh_token = fresh_creds.refresh,
+        };
+    }
+
+    // No refresh token available, use the existing access token
+    return FreshAnthropicCredentials{
+        .access_token = try allocator.dupe(u8, creds.access_token),
+        .refresh_token = try allocator.dupe(u8, creds.refresh_token),
+    };
+}
+
 /// Free allocated strings in a MessageEvent
 pub fn freeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) void {
     switch (event) {
