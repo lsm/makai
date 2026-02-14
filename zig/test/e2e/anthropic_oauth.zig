@@ -10,7 +10,7 @@ test "anthropic_oauth: basic text generation" {
     if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
         return error.SkipZigTest;
     }
-    var creds = (try test_helpers.getFreshAnthropicOAuthCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.AnthropicConfig{
@@ -46,7 +46,7 @@ test "anthropic_oauth: streaming events sequence" {
     if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
         return error.SkipZigTest;
     }
-    var creds = (try test_helpers.getFreshAnthropicOAuthCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.AnthropicConfig{
@@ -108,7 +108,7 @@ test "anthropic_oauth: usage tracking" {
     if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
         return error.SkipZigTest;
     }
-    var creds = (try test_helpers.getFreshAnthropicOAuthCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.AnthropicConfig{

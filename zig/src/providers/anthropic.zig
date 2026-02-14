@@ -119,21 +119,10 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var auth_header: ?[]const u8 = null;
     defer if (auth_header) |h| ctx.allocator.free(h);
 
-    // DEBUG: Log OAuth detection and configuration
-    std.log.debug("=== OAuth Debug Info ===", .{});
-    std.log.debug("isOAuthToken: {}", .{isOAuthToken(ctx.config.auth.api_key)});
-    std.log.debug("api_key: {s}", .{ctx.config.auth.api_key});
-    std.log.debug("base_url: {s}", .{ctx.config.base_url});
-    std.log.debug("api_version: {s}", .{ctx.config.api_version});
-
     // Check if this is an OAuth token
     if (isOAuthToken(ctx.config.auth.api_key)) {
         // OAuth: Bearer auth with Claude Code identity
         auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
-
-        // DEBUG: Log the auth header being used
-        std.log.debug("OAuth branch: Using Bearer auth", .{});
-        std.log.debug("Authorization header: {s}", .{auth_header.?});
 
         try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header.? });
         try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
@@ -142,19 +131,10 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         try headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" });
     } else {
         // API key auth (existing behavior)
-        // DEBUG: Log using API key auth
-        std.log.debug("API Key branch: Using x-api-key auth", .{});
-
         try headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.config.auth.api_key });
         try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
     }
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
-
-    // DEBUG: Log all headers being sent
-    std.log.debug("=== Headers being sent ===", .{});
-    for (headers.items) |h| {
-        std.log.debug("  {s}: {s}", .{ h.name, h.value });
-    }
 
     // Apply custom headers
     if (ctx.config.custom_headers) |custom| {
@@ -287,6 +267,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         if (model_owned) |m| ctx.allocator.free(m);
                         model_owned = try ctx.allocator.dupe(u8, s.model);
                         model = model_owned.?;
+                        usage.input_tokens = s.input_tokens;
                         // Note: s.model is NOT freed here because the event is pushed to the stream,
                         // and the stream (or its consumers) take ownership of the event's memory.
                     },
@@ -645,14 +626,24 @@ pub fn mapSSEToMessageEvent(
 
     if (std.mem.eql(u8, event_type, "message_start")) {
         const parsed = try std.json.parseFromSlice(
-            struct { message: struct { model: []const u8 } },
+            struct {
+                message: struct {
+                    model: []const u8,
+                    usage: struct {
+                        input_tokens: u64 = 0,
+                    },
+                },
+            },
             allocator,
             event.data,
             .{ .ignore_unknown_fields = true },
         );
         defer parsed.deinit();
         const model = try allocator.dupe(u8, parsed.value.message.model);
-        return types.MessageEvent{ .start = .{ .model = model } };
+        return types.MessageEvent{ .start = .{
+            .model = model,
+            .input_tokens = parsed.value.message.usage.input_tokens,
+        } };
     }
 
     if (std.mem.eql(u8, event_type, "content_block_start")) {
@@ -858,7 +849,7 @@ test "mapSSEToMessageEvent message_start" {
 
     const event = sse_parser.SSEEvent{
         .event_type = "message_start",
-        .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-5-sonnet-20241022\"}}",
+        .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-5-sonnet-20241022\",\"usage\":{\"input_tokens\":123,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}",
     };
 
     const message_event = try mapSSEToMessageEvent(event, allocator);
@@ -872,6 +863,7 @@ test "mapSSEToMessageEvent message_start" {
     try std.testing.expect(message_event != null);
     try std.testing.expect(std.meta.activeTag(message_event.?) == .start);
     try std.testing.expectEqualStrings("claude-3-5-sonnet-20241022", message_event.?.start.model);
+    try std.testing.expectEqual(@as(u64, 123), message_event.?.start.input_tokens);
 }
 
 test "mapSSEToMessageEvent text_delta" {
