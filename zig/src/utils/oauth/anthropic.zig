@@ -208,12 +208,19 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
+    // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
+    client.initDefaultProxies(allocator) catch |err| blk: {
+        std.debug.print("Warning: Failed to initialize HTTP proxy: {}\n", .{err});
+        break :blk;
+    };
+
     const uri = try std.Uri.parse(token_url);
 
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
+    try headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" });
 
     var request = try client.request(.POST, uri, .{
         .extra_headers = headers.items,
@@ -241,7 +248,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     // First check for error response
     if (std.json.parseFromSlice(
         struct {
-            error: ?[]const u8 = null,
+            @"error": ?[]const u8 = null,
             error_description: ?[]const u8 = null,
         },
         allocator,
@@ -249,7 +256,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         .{ .ignore_unknown_fields = true },
     )) |error_parsed| {
         defer error_parsed.deinit();
-        if (error_parsed.value.error) |err| {
+        if (error_parsed.value.@"error") |err| {
             std.debug.print("OAuth error: {s}", .{err});
             if (error_parsed.value.error_description) |desc| {
                 std.debug.print(" - {s}", .{desc});

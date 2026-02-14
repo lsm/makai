@@ -1,6 +1,116 @@
 const std = @import("std");
 const types = @import("types");
 
+/// Unified Anthropic credential type
+/// OAuth token (from ANTHROPIC_OAUTH_TOKEN) is preferred over API key (from ANTHROPIC_API_KEY)
+pub const AnthropicCredential = struct {
+    token: []const u8,
+    is_oauth: bool,
+
+    pub fn deinit(self: *AnthropicCredential, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+    }
+};
+
+/// Get the best available Anthropic credential with precedence:
+/// 1. ANTHROPIC_OAUTH_TOKEN (highest - OAuth token)
+/// 2. ANTHROPIC_API_KEY (API key)
+/// 3. ~/.makai/auth.json (fallback)
+pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredential {
+    // 1. Try ANTHROPIC_OAUTH_TOKEN first (highest precedence)
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN")) |token| {
+        // OAuth token format: "refresh_token:access_token" or just "access_token"
+        // For the credential, we only need the access token portion
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+            const access_token = try allocator.dupe(u8, token[colon_pos + 1 ..]);
+            allocator.free(token);
+            return AnthropicCredential{
+                .token = access_token,
+                .is_oauth = true,
+            };
+        } else {
+            // Single token format - use as OAuth token
+            return AnthropicCredential{
+                .token = token,
+                .is_oauth = true,
+            };
+        }
+    } else |_| {}
+
+    // 2. Try ANTHROPIC_API_KEY
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
+        return AnthropicCredential{
+            .token = key,
+            .is_oauth = false,
+        };
+    } else |_| {}
+
+    // 3. Fall back to auth.json
+    return getAnthropicCredentialFromAuthFile(allocator);
+}
+
+/// Read Anthropic credential from ~/.makai/auth.json
+/// Checks for oauth_token first, then api_key
+fn getAnthropicCredentialFromAuthFile(allocator: std.mem.Allocator) !?AnthropicCredential {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home_dir);
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
+    defer allocator.free(auth_path);
+
+    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    const providers = root.object.get("providers") orelse return null;
+    if (providers != .object) return null;
+
+    const provider_obj = providers.object.get("anthropic") orelse return null;
+    if (provider_obj != .object) return null;
+
+    // Check for oauth_token first (higher precedence)
+    if (provider_obj.object.get("oauth_token")) |oauth_val| {
+        if (oauth_val == .string) {
+            return AnthropicCredential{
+                .token = try allocator.dupe(u8, oauth_val.string),
+                .is_oauth = true,
+            };
+        }
+    }
+
+    // Fall back to api_key
+    if (provider_obj.object.get("api_key")) |api_key_val| {
+        if (api_key_val == .string) {
+            return AnthropicCredential{
+                .token = try allocator.dupe(u8, api_key_val.string),
+                .is_oauth = false,
+            };
+        }
+    }
+
+    return null;
+}
+
+/// Check if Anthropic provider should be skipped (no credentials)
+/// Uses the unified credential precedence
+pub fn shouldSkipAnthropic(allocator: std.mem.Allocator) bool {
+    const cred = getAnthropicCredential(allocator) catch return true;
+    if (cred) |c| {
+        var mutable_cred = c;
+        mutable_cred.deinit(allocator);
+        return false;
+    }
+    return true;
+}
+
 /// Get API key from environment variable or ~/.makai/auth.json
 pub fn getApiKey(allocator: std.mem.Allocator, provider_name: []const u8) !?[]const u8 {
     // Construct environment variable name (e.g., ANTHROPIC_API_KEY)
@@ -57,7 +167,13 @@ fn getApiKeyFromAuthFile(allocator: std.mem.Allocator, provider_name: []const u8
 }
 
 /// Check if a provider should be skipped (no credentials)
+/// For Anthropic, uses unified credential precedence (OAuth token > API key)
 pub fn shouldSkipProvider(allocator: std.mem.Allocator, provider_name: []const u8) bool {
+    // Special handling for Anthropic - check for OAuth token first
+    if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
+        return shouldSkipAnthropic(allocator);
+    }
+
     const api_key = getApiKey(allocator, provider_name) catch return true;
     if (api_key) |key| {
         allocator.free(key);
