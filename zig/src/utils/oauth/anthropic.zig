@@ -230,7 +230,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         var buffer: [4096]u8 = undefined;
         const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
         defer allocator.free(error_body);
-        _ = try std.fmt.allocPrint(allocator, "Token exchange error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
+        std.debug.print("Token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
         return error.OAuthFailed;
     }
 

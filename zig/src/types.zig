@@ -151,6 +151,7 @@ pub const AssistantMessage = struct {
 // Event structures for streaming
 pub const StartEvent = struct {
     model: []const u8,
+    input_tokens: u64 = 0,
 };
 
 pub const ContentIndexEvent = struct {
