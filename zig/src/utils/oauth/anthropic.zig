@@ -4,7 +4,7 @@ const pkce_mod = @import("pkce");
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const redirect_uri = "https://console.anthropic.com/oauth/code/callback";
 const scopes = "org:create_api_key user:profile user:inference";
-const auth_url_base = "https://console.anthropic.com/oauth/authorize";
+const auth_url_base = "https://claude.ai/oauth/authorize";
 const token_url = "https://console.anthropic.com/v1/oauth/token";
 
 pub const Credentials = struct {
@@ -52,11 +52,12 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     defer allocator.free(manual_input);
 
     // Parse "code#state" format
-    const code = try parseCodeFromManualInput(allocator, manual_input);
-    defer allocator.free(code);
+    const parsed_auth = try parseAuthFromManualInput(allocator, manual_input);
+    defer allocator.free(parsed_auth.code);
+    defer allocator.free(parsed_auth.state);
 
     // 5. Exchange code for tokens
-    const token_response = try exchangeCode(code, pkce.verifier, allocator);
+    const token_response = try exchangeCode(parsed_auth.code, parsed_auth.state, pkce.verifier, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
@@ -72,11 +73,12 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
 /// Refresh Anthropic OAuth token
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
-    // Build request body
-    const body = try std.fmt.allocPrint(allocator,
-        "grant_type=refresh_token&refresh_token={s}&client_id={s}",
-        .{ credentials.refresh, client_id },
-    );
+    // Build JSON request body
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = credentials.refresh,
+    }, .{});
     defer allocator.free(body);
 
     // Make HTTP request (simplified - real implementation would use http.zig)
@@ -98,24 +100,85 @@ pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]cons
     return try allocator.dupe(u8, credentials.access);
 }
 
-/// Parse code from manual input (format: "code#state" or just "code")
-fn parseCodeFromManualInput(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+/// Parsed code and state from manual input
+const ParsedAuth = struct {
+    code: []const u8,
+    state: []const u8,
+};
+
+/// Parse code and state from manual input (format: "code#state" or just "code")
+fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
     // Try to find #code= in URL
     if (std.mem.indexOf(u8, input, "#code=")) |idx| {
         const code_start = idx + 6;
-        const code_end = std.mem.indexOfAny(u8, input[code_start..], "#&") orelse input.len - code_start;
-        return try allocator.dupe(u8, input[code_start .. code_start + code_end]);
+        var code_end = input.len;
+        var state: []const u8 = "";
+
+        // Look for & or # after code
+        if (std.mem.indexOfAny(u8, input[code_start..], "#&")) |end| {
+            code_end = code_start + end;
+        }
+
+        const code = try allocator.dupe(u8, input[code_start..code_end]);
+
+        // Look for state parameter
+        if (std.mem.indexOf(u8, input, "&state=")) |state_idx| {
+            const state_start = state_idx + 7;
+            var state_end = input.len;
+            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+                state_end = state_start + end;
+            }
+            state = try allocator.dupe(u8, input[state_start..state_end]);
+        } else if (std.mem.indexOf(u8, input, "#state=")) |state_idx| {
+            const state_start = state_idx + 7;
+            var state_end = input.len;
+            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+                state_end = state_start + end;
+            }
+            state = try allocator.dupe(u8, input[state_start..state_end]);
+        }
+
+        return .{ .code = code, .state = state };
     }
 
     // Try to find ?code= in URL
     if (std.mem.indexOf(u8, input, "?code=")) |idx| {
         const code_start = idx + 6;
-        const code_end = std.mem.indexOfAny(u8, input[code_start..], "#&") orelse input.len - code_start;
-        return try allocator.dupe(u8, input[code_start .. code_start + code_end]);
+        var code_end = input.len;
+        var state: []const u8 = "";
+
+        // Look for & or # after code
+        if (std.mem.indexOfAny(u8, input[code_start..], "#&")) |end| {
+            code_end = code_start + end;
+        }
+
+        const code = try allocator.dupe(u8, input[code_start..code_end]);
+
+        // Look for state parameter
+        if (std.mem.indexOf(u8, input, "&state=")) |state_idx| {
+            const state_start = state_idx + 7;
+            var state_end = input.len;
+            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+                state_end = state_start + end;
+            }
+            state = try allocator.dupe(u8, input[state_start..state_end]);
+        }
+
+        return .{ .code = code, .state = state };
     }
 
-    // Assume raw code
-    return try allocator.dupe(u8, input);
+    // Assume raw "code#state" format
+    if (std.mem.indexOf(u8, input, "#")) |hash_idx| {
+        const code = try allocator.dupe(u8, input[0..hash_idx]);
+        const state = try allocator.dupe(u8, input[hash_idx + 1 ..]);
+        return .{ .code = code, .state = state };
+    }
+
+    // Just code, no state
+    return .{
+        .code = try allocator.dupe(u8, input),
+        .state = try allocator.dupe(u8, ""),
+    };
 }
 
 const TokenResponse = struct {
@@ -125,11 +188,16 @@ const TokenResponse = struct {
 };
 
 /// Exchange authorization code for tokens
-fn exchangeCode(code: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    const body = try std.fmt.allocPrint(allocator,
-        "grant_type=authorization_code&code={s}&redirect_uri={s}&code_verifier={s}&client_id={s}",
-        .{ code, redirect_uri, verifier, client_id },
-    );
+fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
+    // Build JSON body
+    const body = try std.json.Stringify.valueAlloc(allocator, .{
+        .grant_type = "authorization_code",
+        .client_id = client_id,
+        .code = code,
+        .state = state,
+        .redirect_uri = redirect_uri,
+        .code_verifier = verifier,
+    }, .{});
     defer allocator.free(body);
 
     return try exchangeTokens(body, allocator);
@@ -145,7 +213,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
-    try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
+    try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
 
     var request = try client.request(.POST, uri, .{
         .extra_headers = headers.items,
@@ -162,8 +230,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         var buffer: [4096]u8 = undefined;
         const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
         defer allocator.free(error_body);
-        const err_msg = try std.fmt.allocPrint(allocator, "Token exchange error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
-        defer allocator.free(err_msg);
+        _ = try std.fmt.allocPrint(allocator, "Token exchange error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         return error.OAuthFailed;
     }
 
@@ -191,28 +258,44 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     };
 }
 
-test "parseCodeFromManualInput - hash fragment" {
+test "parseAuthFromManualInput - hash fragment with state" {
     const input = "https://console.anthropic.com/oauth/code/callback#code=abc123&state=xyz";
-    const code = try parseCodeFromManualInput(std.testing.allocator, input);
-    defer std.testing.allocator.free(code);
+    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
+    defer std.testing.allocator.free(auth.code);
+    defer std.testing.allocator.free(auth.state);
 
-    try std.testing.expectEqualStrings("abc123", code);
+    try std.testing.expectEqualStrings("abc123", auth.code);
+    try std.testing.expectEqualStrings("xyz", auth.state);
 }
 
-test "parseCodeFromManualInput - query parameter" {
+test "parseAuthFromManualInput - query parameter with state" {
     const input = "https://console.anthropic.com/oauth/code/callback?code=def456&state=xyz";
-    const code = try parseCodeFromManualInput(std.testing.allocator, input);
-    defer std.testing.allocator.free(code);
+    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
+    defer std.testing.allocator.free(auth.code);
+    defer std.testing.allocator.free(auth.state);
 
-    try std.testing.expectEqualStrings("def456", code);
+    try std.testing.expectEqualStrings("def456", auth.code);
+    try std.testing.expectEqualStrings("xyz", auth.state);
 }
 
-test "parseCodeFromManualInput - raw code" {
-    const input = "ghi789";
-    const code = try parseCodeFromManualInput(std.testing.allocator, input);
-    defer std.testing.allocator.free(code);
+test "parseAuthFromManualInput - raw code#state format" {
+    const input = "ghi789#mystate";
+    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
+    defer std.testing.allocator.free(auth.code);
+    defer std.testing.allocator.free(auth.state);
 
-    try std.testing.expectEqualStrings("ghi789", code);
+    try std.testing.expectEqualStrings("ghi789", auth.code);
+    try std.testing.expectEqualStrings("mystate", auth.state);
+}
+
+test "parseAuthFromManualInput - raw code only" {
+    const input = "ghi789";
+    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
+    defer std.testing.allocator.free(auth.code);
+    defer std.testing.allocator.free(auth.state);
+
+    try std.testing.expectEqualStrings("ghi789", auth.code);
+    try std.testing.expectEqualStrings("", auth.state);
 }
 
 test "getApiKey - returns access token" {
