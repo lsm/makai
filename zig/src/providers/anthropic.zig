@@ -115,22 +115,46 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
 
+    // Allocate auth header outside the if block so it lives until after the request
+    var auth_header: ?[]const u8 = null;
+    defer if (auth_header) |h| ctx.allocator.free(h);
+
+    // DEBUG: Log OAuth detection and configuration
+    std.log.debug("=== OAuth Debug Info ===", .{});
+    std.log.debug("isOAuthToken: {}", .{isOAuthToken(ctx.config.auth.api_key)});
+    std.log.debug("api_key: {s}", .{ctx.config.auth.api_key});
+    std.log.debug("base_url: {s}", .{ctx.config.base_url});
+    std.log.debug("api_version: {s}", .{ctx.config.api_version});
+
     // Check if this is an OAuth token
     if (isOAuthToken(ctx.config.auth.api_key)) {
         // OAuth: Bearer auth with Claude Code identity
-        const auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
-        defer ctx.allocator.free(auth_header);
-        try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header });
+        auth_header = try std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.config.auth.api_key});
+
+        // DEBUG: Log the auth header being used
+        std.log.debug("OAuth branch: Using Bearer auth", .{});
+        std.log.debug("Authorization header: {s}", .{auth_header.?});
+
+        try headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header.? });
         try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
         try headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" });
         try headers.append(ctx.allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" });
         try headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" });
     } else {
         // API key auth (existing behavior)
+        // DEBUG: Log using API key auth
+        std.log.debug("API Key branch: Using x-api-key auth", .{});
+
         try headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.config.auth.api_key });
         try headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = ctx.config.api_version });
     }
     try headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" });
+
+    // DEBUG: Log all headers being sent
+    std.log.debug("=== Headers being sent ===", .{});
+    for (headers.items) |h| {
+        std.log.debug("  {s}: {s}", .{ h.name, h.value });
+    }
 
     // Apply custom headers
     if (ctx.config.custom_headers) |custom| {
@@ -263,6 +287,8 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         if (model_owned) |m| ctx.allocator.free(m);
                         model_owned = try ctx.allocator.dupe(u8, s.model);
                         model = model_owned.?;
+                        // Note: s.model is NOT freed here because the event is pushed to the stream,
+                        // and the stream (or its consumers) take ownership of the event's memory.
                     },
                     .done => |d| {
                         usage = d.usage;
@@ -337,6 +363,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         .model = model_owned orelse try ctx.allocator.dupe(u8, model),
         .timestamp = std.time.timestamp(),
     };
+
+    // Transfer ownership of model_owned to result, so don't free it in defer
+    model_owned = null;
 
     ctx.stream.complete(result);
 }
