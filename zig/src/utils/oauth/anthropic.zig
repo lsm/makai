@@ -3,7 +3,7 @@ const pkce_mod = @import("pkce");
 
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const redirect_uri = "https://console.anthropic.com/oauth/code/callback";
-const scopes = "org:create_api_key user:profile user:inference";
+const scopes = "org:create_api_key%20user:profile%20user:inference";
 const auth_url_base = "https://claude.ai/oauth/authorize";
 const token_url = "https://console.anthropic.com/v1/oauth/token";
 
@@ -238,8 +238,29 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
     defer allocator.free(response_body);
 
+    // First check for error response
+    if (std.json.parseFromSlice(
+        struct {
+            error: ?[]const u8 = null,
+            error_description: ?[]const u8 = null,
+        },
+        allocator,
+        response_body,
+        .{ .ignore_unknown_fields = true },
+    )) |error_parsed| {
+        defer error_parsed.deinit();
+        if (error_parsed.value.error) |err| {
+            std.debug.print("OAuth error: {s}", .{err});
+            if (error_parsed.value.error_description) |desc| {
+                std.debug.print(" - {s}", .{desc});
+            }
+            std.debug.print("\n", .{});
+            return error.OAuthFailed;
+        }
+    } else |_| {}
+
     // Parse JSON response
-    const parsed = try std.json.parseFromSlice(
+    const parsed = std.json.parseFromSlice(
         struct {
             access_token: []const u8,
             refresh_token: []const u8,
@@ -248,7 +269,10 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         allocator,
         response_body,
         .{ .ignore_unknown_fields = true },
-    );
+    ) catch {
+        std.debug.print("Failed to parse JSON response: {s}\n", .{response_body});
+        return error.ParseError;
+    };
     defer parsed.deinit();
 
     return .{
