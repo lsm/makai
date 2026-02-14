@@ -113,7 +113,7 @@ test "anthropic: thinking mode" {
 
     const cfg = config.AnthropicConfig{
         .auth = .{ .api_key = api_key },
-        .model = "claude-3-7-sonnet-20250219",
+        .model = "claude-3-5-haiku-20241022",
         .thinking_level = .low,
         .params = .{ .max_tokens = 200 },
     };
