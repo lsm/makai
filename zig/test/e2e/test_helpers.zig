@@ -12,7 +12,7 @@ pub fn testSuccess(test_name: []const u8) void {
 }
 
 /// Print a test step/progress message (dim color)
-pub fn testStep(format: []const u8, args: anytype) void {
+pub fn testStep(comptime format: []const u8, args: anytype) void {
     std.debug.print("  \x1b[2m" ++ format ++ "\x1b[0m\n", args);
 }
 
