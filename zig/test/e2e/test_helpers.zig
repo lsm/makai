@@ -330,7 +330,31 @@ pub const GitHubCopilotCredentials = struct {
 
 /// Get GitHub Copilot credentials from environment variable or ~/.makai/auth.json
 pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilotCredentials {
-    // Try environment variable first (COPILOT_TOKEN for CI)
+    // Try separate environment variables first (GH_COPILOT_REFRESH and GH_COPILOT_ACCESS)
+    const refresh_result = std.process.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH");
+    const access_result = std.process.getEnvVarOwned(allocator, "GH_COPILOT_ACCESS");
+    
+    if (refresh_result) |refresh_token| {
+        if (access_result) |access_token| {
+            return GitHubCopilotCredentials{
+                .github_token = refresh_token,
+                .copilot_token = access_token,
+            };
+        } else |_| {
+            // Only have refresh token, use it as both (will be refreshed anyway)
+            return GitHubCopilotCredentials{
+                .github_token = refresh_token,
+                .copilot_token = try allocator.dupe(u8, refresh_token),
+            };
+        }
+    } else |_| {
+        // Clean up access token if we got it but not refresh
+        if (access_result) |access_token| {
+            allocator.free(access_token);
+        } else |_| {}
+    }
+    
+    // Try combined format (COPILOT_TOKEN for backward compatibility)
     if (std.process.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
         // Check for combined format: "github_token:copilot_token"
         // Split on the first colon - copilot_token may contain colons (semicolons in the token)
@@ -415,6 +439,19 @@ fn getGitHubCopilotCredentialsFromAuthFile(allocator: std.mem.Allocator) !?GitHu
 
 /// Check if GitHub Copilot provider should be skipped (no credentials)
 pub fn shouldSkipGitHubCopilot(allocator: std.mem.Allocator) bool {
+    // Check for separate env vars first
+    if (std.process.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH")) |token| {
+        allocator.free(token);
+        return false;
+    } else |_| {}
+    
+    // Check combined format
+    if (std.process.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
+        allocator.free(token);
+        return false;
+    } else |_| {}
+    
+    // Fall back to checking credentials file
     const creds = getGitHubCopilotCredentials(allocator) catch return true;
     if (creds) |c| {
         var mutable_creds = c;

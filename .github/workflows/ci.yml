@@ -29,6 +29,8 @@ jobs:
           GOOGLE_VERTEX_PROJECT_ID: ${{ secrets.GOOGLE_VERTEX_PROJECT_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
           COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
         run: |
@@ -38,7 +40,7 @@ jobs:
           echo "has_azure=$([[ -n "$AZURE_OPENAI_API_KEY" && -n "$AZURE_OPENAI_ENDPOINT" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_vertex=$([[ -n "$GOOGLE_VERTEX_PROJECT_ID" && -n "$GOOGLE_APPLICATION_CREDENTIALS" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_bedrock=$([[ -n "$AWS_ACCESS_KEY_ID" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-          echo "has_copilot=$([[ -n "$COPILOT_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_copilot=$([[ -n "$GH_COPILOT_REFRESH" || -n "$COPILOT_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_anthropic_oauth=$([[ -n "$ANTHROPIC_AUTH_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
@@ -288,6 +290,8 @@ jobs:
         working-directory: zig
         run: zig build test-e2e-github-copilot
         env:
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
           COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
 
   e2e-anthropic-oauth:
