@@ -1,6 +1,21 @@
 const std = @import("std");
 const types = @import("types");
 
+/// Print a test start message (cyan color for visibility)
+pub fn testStart(test_name: []const u8) void {
+    std.debug.print("\n\x1b[36m[TEST START]\x1b[0m {s}\n", .{test_name});
+}
+
+/// Print a test success message (green color)
+pub fn testSuccess(test_name: []const u8) void {
+    std.debug.print("\x1b[32m[TEST PASS]\x1b[0m {s}\n", .{test_name});
+}
+
+/// Print a test step/progress message (dim color)
+pub fn testStep(format: []const u8, args: anytype) void {
+    std.debug.print("  \x1b[2m" ++ format ++ "\x1b[0m\n", args);
+}
+
 /// Print a skip message to stderr and return SkipZigTest error if credentials are missing.
 /// Returns successfully (void) if credentials exist, allowing the test to proceed.
 /// This makes skipped tests clearly visible in CI output.
