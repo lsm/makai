@@ -211,7 +211,184 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     try parseBedrockEventStream(response.reader(&transfer_buffer), ctx);
 }
 
-/// Parse Bedrock event stream (custom format, not SSE)
+/// Calculate CRC32 for AWS event-stream
+fn crc32(data: []const u8) u32 {
+    const polynomial: u32 = 0x82F63B78; // CRC-32C polynomial
+    var crc: u32 = 0xFFFFFFFF;
+
+    for (data) |byte| {
+        crc ^= @as(u32, byte);
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            if (crc & 1 != 0) {
+                crc = (crc >> 1) ^ polynomial;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return ~crc;
+}
+
+/// AWS event-stream binary format header
+const EventStreamHeader = struct {
+    name: []const u8,
+    value: HeaderValue,
+};
+
+const HeaderValue = union(enum) {
+    string: []const u8,
+    int64: i64,
+    int32: i32,
+    int16: i16,
+    int8: i8,
+    bool_true: void,
+    bool_false: void,
+    bytes: []const u8,
+    timestamp: i64,
+    uuid: []const u8,
+};
+
+/// Parse AWS event-stream binary format headers
+fn parseHeaders(data: []const u8, allocator: std.mem.Allocator) !struct { headers: []EventStreamHeader, event_type: ?[]const u8, content_type: ?[]const u8 } {
+    var headers_list = std.ArrayList(EventStreamHeader).init(allocator);
+    errdefer {
+        for (headers_list.items) |h| {
+            switch (h.value) {
+                .string => |s| allocator.free(s),
+                .bytes => |b| allocator.free(b),
+                .uuid => |u| allocator.free(u),
+                else => {},
+            }
+        }
+        headers_list.deinit();
+    }
+
+    var offset: usize = 0;
+    var event_type: ?[]const u8 = null;
+    var content_type: ?[]const u8 = null;
+
+    while (offset < data.len) {
+        if (offset + 2 > data.len) break;
+
+        // Header name byte length (1 byte)
+        const name_len = data[offset];
+        offset += 1;
+
+        if (offset + name_len > data.len) break;
+
+        // Header name
+        const name = data[offset .. offset + name_len];
+        offset += name_len;
+
+        // Header type (1 byte)
+        if (offset >= data.len) break;
+        const header_type = data[offset];
+        offset += 1;
+
+        var value: HeaderValue = undefined;
+
+        switch (header_type) {
+            0 => { // bool_true
+                value = .{ .bool_true = {} };
+            },
+            1 => { // bool_false
+                value = .{ .bool_false = {} };
+            },
+            2 => { // int8
+                if (offset + 1 > data.len) break;
+                value = .{ .int8 = @as(i8, @bitCast(data[offset])) };
+                offset += 1;
+            },
+            3 => { // int16
+                if (offset + 2 > data.len) break;
+                const v = std.mem.readInt(u16, data[offset..][0..2], .big);
+                value = .{ .int16 = @as(i16, @bitCast(v)) };
+                offset += 2;
+            },
+            4 => { // int32
+                if (offset + 4 > data.len) break;
+                const v = std.mem.readInt(u32, data[offset..][0..4], .big);
+                value = .{ .int32 = @as(i32, @bitCast(v)) };
+                offset += 4;
+            },
+            5 => { // int64
+                if (offset + 8 > data.len) break;
+                const v = std.mem.readInt(u64, data[offset..][0..8], .big);
+                value = .{ .int64 = @as(i64, @bitCast(v)) };
+                offset += 8;
+            },
+            6 => { // bytes
+                if (offset + 2 > data.len) break;
+                const len = std.mem.readInt(u16, data[offset..][0..2], .big);
+                offset += 2;
+                if (offset + len > data.len) break;
+                const bytes = try allocator.dupe(u8, data[offset..][0..len]);
+                value = .{ .bytes = bytes };
+                offset += len;
+            },
+            7 => { // string
+                if (offset + 2 > data.len) break;
+                const len = std.mem.readInt(u16, data[offset..][0..2], .big);
+                offset += 2;
+                if (offset + len > data.len) break;
+                const str = try allocator.dupe(u8, data[offset..][0..len]);
+                value = .{ .string = str };
+                offset += len;
+
+                // Track special headers
+                if (std.mem.eql(u8, name, ":event-type")) {
+                    event_type = str;
+                } else if (std.mem.eql(u8, name, ":content-type")) {
+                    content_type = str;
+                }
+            },
+            8 => { // timestamp
+                if (offset + 8 > data.len) break;
+                const v = std.mem.readInt(u64, data[offset..][0..8], .big);
+                value = .{ .timestamp = @as(i64, @bitCast(v)) };
+                offset += 8;
+            },
+            9 => { // uuid
+                if (offset + 16 > data.len) break;
+                const uuid = try allocator.dupe(u8, data[offset..][0..16]);
+                value = .{ .uuid = uuid };
+                offset += 16;
+            },
+            else => {
+                // Unknown header type, skip
+                break;
+            },
+        }
+
+        try headers_list.append(.{
+            .name = name,
+            .value = value,
+        });
+    }
+
+    return .{
+        .headers = headers_list.toOwnedSlice(allocator) catch &.{},
+        .event_type = event_type,
+        .content_type = content_type,
+    };
+}
+
+/// Free parsed headers
+fn freeHeaders(headers: []EventStreamHeader, allocator: std.mem.Allocator) void {
+    for (headers) |h| {
+        switch (h.value) {
+            .string => |s| allocator.free(s),
+            .bytes => |b| allocator.free(b),
+            .uuid => |u| allocator.free(u),
+            else => {},
+        }
+    }
+    allocator.free(headers);
+}
+
+/// Parse Bedrock event stream (AWS binary event-stream format)
 fn parseBedrockEventStream(reader: anytype, ctx: *StreamThreadContext) !void {
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
     var content_transferred = false;
@@ -259,7 +436,11 @@ fn parseBedrockEventStream(reader: anytype, ctx: *StreamThreadContext) !void {
     var partial_tool_json: std.ArrayList(u8) = .{};
     defer partial_tool_json.deinit(ctx.allocator);
 
-    var buffer: [8192]u8 = undefined;
+    // Buffer for accumulating partial messages
+    var recv_buffer: std.ArrayList(u8) = .{};
+    defer recv_buffer.deinit(ctx.allocator);
+
+    var read_buffer: [8192]u8 = undefined;
 
     while (true) {
         if (ctx.config.cancel_token) |token| {
@@ -269,77 +450,90 @@ fn parseBedrockEventStream(reader: anytype, ctx: *StreamThreadContext) !void {
             }
         }
 
-        const bytes_read = reader.readSliceShort(&buffer) catch break;
+        const bytes_read = reader.readSliceShort(&read_buffer) catch break;
         if (bytes_read == 0) break;
 
-        const chunk = buffer[0..bytes_read];
+        try recv_buffer.appendSlice(ctx.allocator, read_buffer[0..bytes_read]);
 
-        // Parse event stream format (headers + JSON payload)
-        var i: usize = 0;
-        while (i < chunk.len) {
-            // Skip to next event marker
-            if (chunk[i] != ':') {
-                i += 1;
-                continue;
+        // Process complete messages from buffer
+        while (true) {
+            // Need at least 12 bytes (8 prelude + 4 prelude CRC) to read header
+            if (recv_buffer.items.len < 12) break;
+
+            // Read prelude: total length (4 bytes) + headers length (4 bytes)
+            const total_length = std.mem.readInt(u32, recv_buffer.items[0..4], .big);
+            const headers_length = std.mem.readInt(u32, recv_buffer.items[4..8], .big);
+
+            // Validate minimum message size (prelude 8 + prelude CRC 4 + message CRC 4 = 16)
+            if (total_length < 16) {
+                // Invalid message, clear buffer and try to resync
+                recv_buffer.clearRetainingCapacity();
+                break;
             }
 
-            // Parse event headers
-            var event_type: ?[]const u8 = null;
-            var payload_start: usize = i;
+            // Check if we have the complete message
+            if (recv_buffer.items.len < total_length) break;
 
-            while (i < chunk.len) {
-                if (chunk[i] == '\n') {
-                    if (i + 1 < chunk.len and chunk[i + 1] == '\n') {
-                        payload_start = i + 2;
-                        break;
-                    }
-                }
-
-                // Extract event type from header
-                if (std.mem.indexOf(u8, chunk[i..], ":message-type ")) |offset| {
-                    const start = i + offset + 14;
-                    if (std.mem.indexOf(u8, chunk[start..], "\n")) |end| {
-                        const event_json = chunk[start .. start + end];
-                        const parsed = std.json.parseFromSlice(
-                            struct { event: []const u8 },
-                            ctx.allocator,
-                            event_json,
-                            .{ .ignore_unknown_fields = true },
-                        ) catch {
-                            i += 1;
-                            continue;
-                        };
-                        defer parsed.deinit();
-                        event_type = parsed.value.event;
-                    }
-                }
-
-                i += 1;
+            // Validate prelude CRC (CRC of first 8 bytes)
+            const prelude_crc_read = std.mem.readInt(u32, recv_buffer.items[8..12], .big);
+            const prelude_crc_calc = crc32(recv_buffer.items[0..8]);
+            if (prelude_crc_read != prelude_crc_calc) {
+                // CRC mismatch, skip this message and try to resync
+                recv_buffer.clearRetainingCapacity();
+                break;
             }
 
-            if (event_type == null or payload_start >= chunk.len) {
-                continue;
+            // Validate message CRC (CRC of all bytes except last 4)
+            const message_crc_read = std.mem.readInt(u32, recv_buffer.items[total_length - 4 .. total_length], .big);
+            const message_crc_calc = crc32(recv_buffer.items[0 .. total_length - 4]);
+            if (message_crc_read != message_crc_calc) {
+                // CRC mismatch, skip this message and try to resync
+                recv_buffer.clearRetainingCapacity();
+                break;
             }
 
-            // Find payload end
-            const payload_end = std.mem.indexOf(u8, chunk[payload_start..], "\n\n") orelse chunk.len;
-            const payload = chunk[payload_start .. payload_start + payload_end];
+            // Parse headers (starting at byte 12, length from prelude)
+            const headers_data = recv_buffer.items[12 .. 12 + headers_length];
+            const header_result = parseHeaders(headers_data, ctx.allocator) catch {
+                recv_buffer.clearRetainingCapacity();
+                break;
+            };
+            defer freeHeaders(header_result.headers, ctx.allocator);
 
-            try handleBedrockEvent(
-                event_type.?,
-                payload,
-                &accumulated_content,
-                &signatures,
-                &usage,
-                &stop_reason,
-                &current_block_index,
-                &current_tool_id,
-                &current_tool_name,
-                &partial_tool_json,
-                ctx,
-            );
+            // Extract payload (after headers, before message CRC)
+            const payload_start = 12 + headers_length;
+            const payload_end = total_length - 4;
+            const payload = recv_buffer.items[payload_start..payload_end];
 
-            i = payload_start + payload_end;
+            // Handle the event if we have an event type
+            if (header_result.event_type) |evt_type| {
+                handleBedrockEvent(
+                    evt_type,
+                    payload,
+                    &accumulated_content,
+                    &signatures,
+                    &usage,
+                    &stop_reason,
+                    &current_block_index,
+                    &current_tool_id,
+                    &current_tool_name,
+                    &partial_tool_json,
+                    ctx,
+                ) catch {};
+            }
+
+            // Remove processed message from buffer
+            const remaining = recv_buffer.items[total_length..];
+            const remaining_copy = ctx.allocator.dupe(u8, remaining) catch {
+                recv_buffer.clearRetainingCapacity();
+                break;
+            };
+            recv_buffer.clearRetainingCapacity();
+            recv_buffer.appendSlice(ctx.allocator, remaining_copy) catch {
+                ctx.allocator.free(remaining_copy);
+                break;
+            };
+            ctx.allocator.free(remaining_copy);
         }
     }
 

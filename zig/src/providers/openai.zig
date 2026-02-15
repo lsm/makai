@@ -257,6 +257,50 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 }
 
                 try ctx.stream.push(evt);
+
+                // After emitting text_start, immediately emit the pending text delta
+                if (evt == .text_start) {
+                    if (state.pending_text_delta) |pending| {
+                        const pending_copy = try ctx.allocator.dupe(u8, pending);
+                        ctx.allocator.free(pending);
+                        state.pending_text_delta = null;
+
+                        // Accumulate the pending delta
+                        if (accumulated_content.items.len > 0) {
+                            const last_idx = accumulated_content.items.len - 1;
+                            const block = &accumulated_content.items[last_idx];
+                            switch (block.*) {
+                                .text => |*t| {
+                                    const old_text = t.text;
+                                    t.text = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_text, pending_copy });
+                                    if (old_text.len > 0) ctx.allocator.free(@constCast(old_text));
+                                },
+                                else => {},
+                            }
+                        }
+
+                        try ctx.stream.push(.{
+                            .text_delta = .{
+                                .index = 0,
+                                .delta = pending_copy,
+                            },
+                        });
+                    }
+                }
+
+                // After emitting text_end, check if we need to emit done
+                // (handles the case where finish_reason emitted text_end first)
+                if (evt == .text_end and !state.has_emitted_done) {
+                    if (state.stop_reason) |sr| {
+                        state.has_emitted_done = true;
+                        try ctx.stream.push(.{
+                            .done = .{
+                                .usage = state.usage,
+                                .stop_reason = sr,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
@@ -271,10 +315,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     const result = types.AssistantMessage{
         .content = final_content,
         .usage = state.usage,
-        .stop_reason = if (state.has_emitted_done) (
-            // Use the stop reason from the done event - retrieve from the last pushed event
-            .stop
-        ) else .stop,
+        .stop_reason = state.stop_reason orelse .stop,
         .model = if (state.model) |m| try ctx.allocator.dupe(u8, m) else try ctx.allocator.dupe(u8, ctx.config.model),
         .timestamp = std.time.timestamp(),
     };
@@ -545,26 +586,39 @@ pub fn buildRequestBody(
 /// Track state across OpenAI streaming events
 pub const OpenAIStreamState = struct {
     text_started: bool = false,
+    text_ended: bool = false,
     current_tool_index: ?usize = null,
+    /// Pending first text delta to emit after text_start
+    pending_text_delta: ?[]const u8 = null,
+    /// Track active tool call indices that need end events
+    active_tool_indices: std.ArrayList(usize),
     accumulated_content: std.ArrayList(u8),
     model: ?[]const u8 = null,
     has_emitted_done: bool = false,
+    /// Store stop reason from finish_reason to propagate to final message
+    stop_reason: ?types.StopReason = null,
     usage: types.Usage = .{},
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) OpenAIStreamState {
         return .{
             .text_started = false,
+            .text_ended = false,
             .current_tool_index = null,
-            .accumulated_content = std.ArrayList(u8){},
+            .pending_text_delta = null,
+            .active_tool_indices = .{},
+            .accumulated_content = .{},
             .model = null,
             .has_emitted_done = false,
+            .stop_reason = null,
             .usage = .{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *OpenAIStreamState) void {
+        if (self.pending_text_delta) |d| self.allocator.free(d);
+        self.active_tool_indices.deinit(self.allocator);
         self.accumulated_content.deinit(self.allocator);
         if (self.model) |m| self.allocator.free(m);
     }
@@ -583,10 +637,26 @@ pub fn mapSSEToMessageEvent(
     if (std.mem.eql(u8, data, "[DONE]")) {
         // If we already emitted a done event from finish_reason, don't emit another
         if (state.has_emitted_done) return null;
+
+        // Store stop reason for final message propagation if not already set
+        if (state.stop_reason == null) {
+            state.stop_reason = .stop;
+        }
+
+        // Emit text_end if text was started but not ended
+        // Don't set has_emitted_done yet - done will be emitted next
+        if (state.text_started and !state.text_ended) {
+            state.text_ended = true;
+            return types.MessageEvent{
+                .text_end = .{ .index = 0 },
+            };
+        }
+
+        state.has_emitted_done = true;
         return types.MessageEvent{
             .done = .{
                 .usage = state.usage,
-                .stop_reason = .stop,
+                .stop_reason = state.stop_reason.?,
             },
         };
     }
@@ -652,6 +722,18 @@ pub fn mapSSEToMessageEvent(
             else
                 .stop;
 
+            // Store stop reason for final message propagation
+            state.stop_reason = stop_reason;
+
+            // Emit text_end if text was started but not ended
+            // Don't set has_emitted_done yet - done will be emitted on [DONE]
+            if (state.text_started and !state.text_ended) {
+                state.text_ended = true;
+                return types.MessageEvent{
+                    .text_end = .{ .index = 0 },
+                };
+            }
+
             state.has_emitted_done = true;
             return types.MessageEvent{
                 .done = .{
@@ -672,9 +754,9 @@ pub fn mapSSEToMessageEvent(
 
             if (!state.text_started) {
                 state.text_started = true;
-                // Return text_start, but we also need to emit the first delta
-                // OpenAI combines the first content with the first delta,
-                // so emit text_start here and the caller will get the delta on next call
+                // Store the first text delta to emit after text_start
+                // streamImpl will emit it immediately after text_start
+                state.pending_text_delta = try allocator.dupe(u8, text);
                 return types.MessageEvent{
                     .text_start = .{ .index = 0 },
                 };
@@ -714,6 +796,8 @@ pub fn mapSSEToMessageEvent(
                         const id_str = if (id) |i| (if (i == .string) i.string else "unknown") else "unknown";
 
                         state.current_tool_index = tc_index;
+                        // Track this tool index for emitting end event later
+                        try state.active_tool_indices.append(state.allocator, tc_index);
                         return types.MessageEvent{
                             .toolcall_start = .{
                                 .index = tc_index,
@@ -839,7 +923,7 @@ test "mapSSEToMessageEvent - text_start and text_delta" {
     try testing.expect(result0.? == .start);
     allocator.free(result0.?.start.model);
 
-    // First content delta should emit text_start
+    // First content delta should emit text_start and store pending delta
     const event1 = sse_parser.SSEEvent{
         .event_type = null,
         .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
@@ -848,21 +932,22 @@ test "mapSSEToMessageEvent - text_start and text_delta" {
     const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
     try testing.expect(result1 != null);
     try testing.expect(result1.? == .text_start);
+    // The pending delta "Hello" should be stored for streamImpl to emit
+    try testing.expect(state.pending_text_delta != null);
+    try testing.expectEqualStrings("Hello", state.pending_text_delta.?);
 
-    // Second content delta should emit text_delta
+    // Second content delta should emit text_delta with the current content
     const event2 = sse_parser.SSEEvent{
         .event_type = null,
         .data = "{\"model\":\"gpt-4\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}",
     };
 
     const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    defer if (result2) |r| {
-        if (r == .text_delta) allocator.free(r.text_delta.delta);
-    };
 
     try testing.expect(result2 != null);
     try testing.expect(result2.? == .text_delta);
     try testing.expectEqualStrings(" world", result2.?.text_delta.delta);
+    allocator.free(result2.?.text_delta.delta);
 }
 
 test "mapSSEToMessageEvent - DONE marker" {

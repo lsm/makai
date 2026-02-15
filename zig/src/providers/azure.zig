@@ -150,6 +150,8 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     var transfer_buffer: [4096]u8 = undefined;
     var buffer: [4096]u8 = undefined;
     var accumulated_content: std.ArrayList(types.ContentBlock) = .{};
+    // Track tool call index to accumulated_content position mapping
+    var tool_index_map = std.AutoHashMap(usize, usize).init(ctx.allocator);
     var content_transferred = false;
     defer {
         // Only clean up strings if they weren't transferred to AssistantMessage
@@ -158,9 +160,6 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 switch (block) {
                     .text => |t| {
                         if (t.text.len > 0) ctx.allocator.free(@constCast(t.text));
-                    },
-                    .thinking => |th| {
-                        if (th.thinking.len > 0) ctx.allocator.free(@constCast(th.thinking));
                     },
                     .tool_use => |tu| {
                         ctx.allocator.free(@constCast(tu.id));
@@ -172,6 +171,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
             }
         }
         accumulated_content.deinit(ctx.allocator);
+        tool_index_map.deinit();
     }
 
     // Get the reader once before the loop
@@ -196,23 +196,6 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
             if (message_event) |evt| {
                 // Accumulate content for final AssistantMessage
                 switch (evt) {
-                    .thinking_start => {
-                        try accumulated_content.append(ctx.allocator, types.ContentBlock{ .thinking = .{ .thinking = &[_]u8{} } });
-                    },
-                    .thinking_delta => |delta| {
-                        if (accumulated_content.items.len > 0) {
-                            const last_idx = accumulated_content.items.len - 1;
-                            const block = &accumulated_content.items[last_idx];
-                            switch (block.*) {
-                                .thinking => |*th| {
-                                    const old_thinking = th.thinking;
-                                    th.thinking = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_thinking, delta.delta });
-                                    if (old_thinking.len > 0) ctx.allocator.free(@constCast(old_thinking));
-                                },
-                                else => {},
-                            }
-                        }
-                    },
                     .text_start => {
                         try accumulated_content.append(ctx.allocator, types.ContentBlock{ .text = .{ .text = &[_]u8{} } });
                     },
@@ -231,23 +214,28 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         }
                     },
                     .toolcall_start => |tc| {
+                        const content_index = accumulated_content.items.len;
                         try accumulated_content.append(ctx.allocator, types.ContentBlock{ .tool_use = .{
                             .id = try ctx.allocator.dupe(u8, tc.id),
                             .name = try ctx.allocator.dupe(u8, tc.name),
                             .input_json = &[_]u8{},
                         } });
+                        // Map tool index to the actual content block position
+                        try tool_index_map.put(tc.index, content_index);
                     },
                     .toolcall_delta => |delta| {
-                        // Find the right tool call block by index
-                        if (delta.index < accumulated_content.items.len) {
-                            const block = &accumulated_content.items[delta.index];
-                            switch (block.*) {
-                                .tool_use => |*tu| {
-                                    const old_json = tu.input_json;
-                                    tu.input_json = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_json, delta.delta });
-                                    if (old_json.len > 0) ctx.allocator.free(@constCast(old_json));
-                                },
-                                else => {},
+                        // Look up the actual content block index using the tool_index_map
+                        if (tool_index_map.get(delta.index)) |content_idx| {
+                            if (content_idx < accumulated_content.items.len) {
+                                const block = &accumulated_content.items[content_idx];
+                                switch (block.*) {
+                                    .tool_use => |*tu| {
+                                        const old_json = tu.input_json;
+                                        tu.input_json = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_json, delta.delta });
+                                        if (old_json.len > 0) ctx.allocator.free(@constCast(old_json));
+                                    },
+                                    else => {},
+                                }
                             }
                         }
                     },
@@ -255,6 +243,49 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 }
 
                 try ctx.stream.push(evt);
+
+                // After emitting text_start, immediately emit the pending text delta
+                if (evt == .text_start) {
+                    if (state.pending_text_delta) |pending| {
+                        const pending_copy = try ctx.allocator.dupe(u8, pending);
+                        ctx.allocator.free(pending);
+                        state.pending_text_delta = null;
+
+                        // Accumulate the pending delta
+                        if (accumulated_content.items.len > 0) {
+                            const last_idx = accumulated_content.items.len - 1;
+                            const block = &accumulated_content.items[last_idx];
+                            switch (block.*) {
+                                .text => |*t| {
+                                    const old_text = t.text;
+                                    t.text = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ old_text, pending_copy });
+                                    if (old_text.len > 0) ctx.allocator.free(@constCast(old_text));
+                                },
+                                else => {},
+                            }
+                        }
+
+                        try ctx.stream.push(.{
+                            .text_delta = .{
+                                .index = 0,
+                                .delta = pending_copy,
+                            },
+                        });
+                    }
+                }
+
+                // After emitting text_end, check if we need to emit done
+                if (evt == .text_end and !state.has_emitted_done) {
+                    if (state.stop_reason) |sr| {
+                        state.has_emitted_done = true;
+                        try ctx.stream.push(.{
+                            .done = .{
+                                .usage = state.usage,
+                                .stop_reason = sr,
+                            },
+                        });
+                    }
+                }
             }
         }
     }
@@ -269,9 +300,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
     const result = types.AssistantMessage{
         .content = final_content,
         .usage = state.usage,
-        .stop_reason = if (state.has_emitted_done) (
-            state.stop_reason
-        ) else .stop,
+        .stop_reason = state.stop_reason orelse .stop,
         .model = if (state.model) |m| try ctx.allocator.dupe(u8, m) else try ctx.allocator.dupe(u8, ctx.config.model),
         .timestamp = std.time.timestamp(),
     };
@@ -296,7 +325,7 @@ pub fn buildEndpoint(cfg: config.AzureConfig, allocator: std.mem.Allocator) ![]u
     );
 }
 
-/// Build request body for Azure OpenAI API (OpenAI Responses API format)
+/// Build request body for Azure OpenAI API (Chat Completions API format)
 pub fn buildRequestBody(
     cfg: config.AzureConfig,
     messages: []const types.Message,
@@ -318,46 +347,23 @@ pub fn buildRequestBody(
         try writer.endObject();
     }
 
-    // Write messages array as "input" (Responses API format)
-    try writer.writeKey("input");
+    // Write messages array (Chat Completions API format)
+    try writer.writeKey("messages");
     try writer.beginArray();
 
     // Prepend system/developer message if system_prompt is provided
     if (cfg.params.system_prompt) |system| {
         try writer.beginObject();
-        // GPT-5 quirk: inject developer message to disable auto-reasoning
-        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
-        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
-
-        if (needs_juice_injection) {
-            // Inject developer message with juice directive
-            const juice_system = try std.fmt.allocPrint(allocator, "{s}\n\n# Juice: 0 !important", .{system});
-            defer allocator.free(juice_system);
-            try writer.writeStringField("role", "developer");
-            try writer.writeStringField("content", juice_system);
-        } else {
-            // Use "developer" role for reasoning models (o1/o3/o4), "system" for others
-            const system_role = if (std.mem.startsWith(u8, cfg.model, "o1") or
-                std.mem.startsWith(u8, cfg.model, "o3") or
-                std.mem.startsWith(u8, cfg.model, "o4"))
-                "developer"
-            else
-                "system";
-            try writer.writeStringField("role", system_role);
-            try writer.writeStringField("content", system);
-        }
+        // Use "developer" role for reasoning models (o1/o3/o4), "system" for others
+        const system_role = if (std.mem.startsWith(u8, cfg.model, "o1") or
+            std.mem.startsWith(u8, cfg.model, "o3") or
+            std.mem.startsWith(u8, cfg.model, "o4"))
+            "developer"
+        else
+            "system";
+        try writer.writeStringField("role", system_role);
+        try writer.writeStringField("content", system);
         try writer.endObject();
-    } else {
-        // No system prompt, but need juice injection for GPT-5
-        const is_gpt5 = std.mem.startsWith(u8, cfg.model, "gpt-5");
-        const needs_juice_injection = is_gpt5 and cfg.reasoning_effort == null;
-
-        if (needs_juice_injection) {
-            try writer.beginObject();
-            try writer.writeStringField("role", "developer");
-            try writer.writeStringField("content", "# Juice: 0 !important");
-            try writer.endObject();
-        }
     }
 
     for (messages) |msg| {
@@ -580,42 +586,75 @@ pub fn buildRequestBody(
     return buffer.toOwnedSlice(allocator);
 }
 
-/// Track state across Azure streaming events (Responses API format)
+/// Track state across Azure streaming events (Chat Completions API format)
 pub const AzureStreamState = struct {
-    current_item_type: ?ItemType = null,
-    current_item_index: ?usize = null,
+    text_started: bool = false,
+    text_ended: bool = false,
+    current_tool_index: ?usize = null,
+    /// Pending first text delta to emit after text_start
+    pending_text_delta: ?[]const u8 = null,
     model: ?[]const u8 = null,
     has_emitted_done: bool = false,
-    stop_reason: types.StopReason = .stop,
+    /// Store stop reason from finish_reason to propagate to final message
+    stop_reason: ?types.StopReason = null,
     usage: types.Usage = .{},
     allocator: std.mem.Allocator,
 
-    const ItemType = enum {
-        reasoning,
-        message,
-        function_call,
-    };
-
     pub fn init(allocator: std.mem.Allocator) AzureStreamState {
         return .{
+            .text_started = false,
+            .text_ended = false,
+            .current_tool_index = null,
+            .pending_text_delta = null,
+            .model = null,
+            .has_emitted_done = false,
+            .stop_reason = null,
+            .usage = .{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *AzureStreamState) void {
+        if (self.pending_text_delta) |d| self.allocator.free(d);
         if (self.model) |m| self.allocator.free(m);
     }
 };
 
-/// Map Azure SSE data to MessageEvent (Responses API format)
+/// Map Azure SSE data to MessageEvent (Chat Completions API format)
 pub fn mapSSEToMessageEvent(
     event: sse_parser.SSEEvent,
     state: *AzureStreamState,
     allocator: std.mem.Allocator,
 ) !?types.MessageEvent {
-    // Azure Responses API sends typed events like OpenAI
-    const event_type = event.event_type orelse return null;
+    // Azure Chat Completions API sends data lines without event type (same as OpenAI)
     const data = event.data;
+
+    // Check for [DONE] marker
+    if (std.mem.eql(u8, data, "[DONE]")) {
+        // If we already emitted a done event from finish_reason, don't emit another
+        if (state.has_emitted_done) return null;
+
+        // Store stop reason for final message propagation if not already set
+        if (state.stop_reason == null) {
+            state.stop_reason = .stop;
+        }
+
+        // Emit text_end if text was started but not ended
+        if (state.text_started and !state.text_ended) {
+            state.text_ended = true;
+            return types.MessageEvent{
+                .text_end = .{ .index = 0 },
+            };
+        }
+
+        state.has_emitted_done = true;
+        return types.MessageEvent{
+            .done = .{
+                .usage = state.usage,
+                .stop_reason = state.stop_reason.?,
+            },
+        };
+    }
 
     // Parse JSON data
     const parsed = std.json.parseFromSlice(
@@ -630,177 +669,146 @@ pub fn mapSSEToMessageEvent(
 
     const root = parsed.value;
 
-    // Handle different event types
-    if (std.mem.eql(u8, event_type, "response.output_item.added")) {
-        const item = root.object.get("item") orelse return null;
-        if (item != .object) return null;
+    // Extract model from first chunk for start event
+    if (state.model == null) {
+        if (root.object.get("model")) |model_val| {
+            if (model_val == .string) {
+                state.model = try allocator.dupe(u8, model_val.string);
+                // Emit start event with model name
+                return types.MessageEvent{
+                    .start = .{ .model = try allocator.dupe(u8, model_val.string) },
+                };
+            }
+        }
+    }
 
-        const item_type = item.object.get("type") orelse return null;
-        if (item_type != .string) return null;
+    // Parse usage from streaming chunks (when stream_options.include_usage is true)
+    if (root.object.get("usage")) |usage_val| {
+        if (usage_val != .null) {
+            if (usage_val.object.get("prompt_tokens")) |pt| {
+                if (pt == .integer) state.usage.input_tokens = @intCast(@as(u64, @bitCast(pt.integer)));
+            }
+            if (usage_val.object.get("completion_tokens")) |ct| {
+                if (ct == .integer) state.usage.output_tokens = @intCast(@as(u64, @bitCast(ct.integer)));
+            }
+        }
+    }
 
-        const output_index = root.object.get("output_index");
-        const index: usize = if (output_index) |oi| (if (oi == .integer) @as(usize, @intCast(oi.integer)) else 0) else 0;
+    const choices = root.object.get("choices") orelse return null;
+    if (choices != .array) return null;
+    if (choices.array.items.len == 0) return null;
 
-        if (std.mem.eql(u8, item_type.string, "reasoning")) {
-            state.current_item_type = .reasoning;
-            state.current_item_index = index;
+    const choice = choices.array.items[0];
+    if (choice != .object) return null;
+
+    // Handle finish_reason first (it can come with or without delta)
+    if (choice.object.get("finish_reason")) |finish_reason| {
+        if (finish_reason == .string) {
+            const reason = finish_reason.string;
+            const stop_reason: types.StopReason = if (std.mem.eql(u8, reason, "stop"))
+                .stop
+            else if (std.mem.eql(u8, reason, "length"))
+                .length
+            else if (std.mem.eql(u8, reason, "tool_calls"))
+                .tool_use
+            else if (std.mem.eql(u8, reason, "content_filter"))
+                .content_filter
+            else
+                .stop;
+
+            // Store stop reason for final message propagation
+            state.stop_reason = stop_reason;
+
+            // Emit text_end if text was started but not ended
+            if (state.text_started and !state.text_ended) {
+                state.text_ended = true;
+                return types.MessageEvent{
+                    .text_end = .{ .index = 0 },
+                };
+            }
+
+            state.has_emitted_done = true;
             return types.MessageEvent{
-                .thinking_start = .{ .index = index },
-            };
-        } else if (std.mem.eql(u8, item_type.string, "message")) {
-            state.current_item_type = .message;
-            state.current_item_index = index;
-            return types.MessageEvent{
-                .text_start = .{ .index = index },
-            };
-        } else if (std.mem.eql(u8, item_type.string, "function_call")) {
-            const call_id = item.object.get("call_id");
-            const name = item.object.get("name");
-
-            const call_id_str = if (call_id) |c| (if (c == .string) c.string else "unknown") else "unknown";
-            const name_str = if (name) |n| (if (n == .string) n.string else "unknown") else "unknown";
-
-            state.current_item_type = .function_call;
-            state.current_item_index = index;
-
-            return types.MessageEvent{
-                .toolcall_start = .{
-                    .index = index,
-                    .id = try allocator.dupe(u8, call_id_str),
-                    .name = try allocator.dupe(u8, name_str),
+                .done = .{
+                    .usage = state.usage,
+                    .stop_reason = stop_reason,
                 },
             };
         }
-    } else if (std.mem.eql(u8, event_type, "response.reasoning_summary_text.delta")) {
-        const delta = root.object.get("delta");
-        if (delta == null or delta.? != .string) return null;
+    }
 
-        const output_index = root.object.get("output_index");
-        const index: usize = if (output_index) |oi| (if (oi == .integer) @as(usize, @intCast(oi.integer)) else 0) else 0;
+    const delta = choice.object.get("delta") orelse return null;
+    if (delta != .object) return null;
 
-        return types.MessageEvent{
-            .thinking_delta = .{
-                .index = index,
-                .delta = try allocator.dupe(u8, delta.?.string),
-            },
-        };
-    } else if (std.mem.eql(u8, event_type, "response.output_text.delta")) {
-        const delta = root.object.get("delta");
-        if (delta == null or delta.? != .string) return null;
+    // Handle content delta
+    if (delta.object.get("content")) |content| {
+        if (content == .string) {
+            const text = content.string;
 
-        const output_index = root.object.get("output_index");
-        const index: usize = if (output_index) |oi| (if (oi == .integer) @as(usize, @intCast(oi.integer)) else 0) else 0;
+            if (!state.text_started) {
+                state.text_started = true;
+                // Store the first text delta to emit after text_start
+                state.pending_text_delta = try allocator.dupe(u8, text);
+                return types.MessageEvent{
+                    .text_start = .{ .index = 0 },
+                };
+            }
 
-        return types.MessageEvent{
-            .text_delta = .{
-                .index = index,
-                .delta = try allocator.dupe(u8, delta.?.string),
-            },
-        };
-    } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.delta")) {
-        const delta = root.object.get("delta");
-        if (delta == null or delta.? != .string) return null;
-
-        const output_index = root.object.get("output_index");
-        const index: usize = if (output_index) |oi| (if (oi == .integer) @as(usize, @intCast(oi.integer)) else 0) else 0;
-
-        return types.MessageEvent{
-            .toolcall_delta = .{
-                .index = index,
-                .delta = try allocator.dupe(u8, delta.?.string),
-            },
-        };
-    } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
-        const item = root.object.get("item") orelse return null;
-        if (item != .object) return null;
-
-        const item_type = item.object.get("type") orelse return null;
-        if (item_type != .string) return null;
-
-        const output_index = root.object.get("output_index");
-        const index: usize = if (output_index) |oi| (if (oi == .integer) @as(usize, @intCast(oi.integer)) else 0) else 0;
-
-        if (std.mem.eql(u8, item_type.string, "reasoning")) {
+            const text_copy = try allocator.dupe(u8, text);
             return types.MessageEvent{
-                .thinking_end = .{ .index = index },
-            };
-        } else if (std.mem.eql(u8, item_type.string, "message")) {
-            return types.MessageEvent{
-                .text_end = .{ .index = index },
-            };
-        } else if (std.mem.eql(u8, item_type.string, "function_call")) {
-            const arguments = item.object.get("arguments");
-            const args_str = if (arguments) |a| (if (a == .string) a.string else "{}") else "{}";
-
-            return types.MessageEvent{
-                .toolcall_end = .{
-                    .index = index,
-                    .input_json = try allocator.dupe(u8, args_str),
+                .text_delta = .{
+                    .index = 0,
+                    .delta = text_copy,
                 },
             };
         }
-    } else if (std.mem.eql(u8, event_type, "response.completed")) {
-        const response = root.object.get("response");
-        if (response) |resp| {
-            if (resp == .object) {
-                // Extract usage
-                if (resp.object.get("usage")) |usage_val| {
-                    if (usage_val != .null) {
-                        if (usage_val.object.get("input_tokens")) |it| {
-                            if (it == .integer) state.usage.input_tokens = @intCast(@as(u64, @bitCast(it.integer)));
-                        }
-                        if (usage_val.object.get("output_tokens")) |ot| {
-                            if (ot == .integer) state.usage.output_tokens = @intCast(@as(u64, @bitCast(ot.integer)));
-                        }
-                        // Handle cached tokens from input_tokens_details
-                        if (usage_val.object.get("input_tokens_details")) |details| {
-                            if (details == .object) {
-                                if (details.object.get("cached_tokens")) |ct| {
-                                    if (ct == .integer) {
-                                        const cached = @as(u64, @intCast(@as(u64, @bitCast(ct.integer))));
-                                        state.usage.cache_read_tokens = cached;
-                                        // Subtract cached from input tokens
-                                        if (state.usage.input_tokens >= cached) {
-                                            state.usage.input_tokens -= cached;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+    }
+
+    // Handle tool calls with proper index tracking
+    if (delta.object.get("tool_calls")) |tool_calls| {
+        if (tool_calls == .array and tool_calls.array.items.len > 0) {
+            const tool_call = tool_calls.array.items[0];
+            if (tool_call != .object) return null;
+
+            // Get the tool call index from the JSON
+            const tc_index: usize = if (tool_call.object.get("index")) |idx|
+                (if (idx == .integer) @as(usize, @intCast(idx.integer)) else 0)
+            else
+                0;
+
+            if (tool_call.object.get("function")) |function| {
+                if (function != .object) return null;
+                const name = function.object.get("name");
+                const arguments = function.object.get("arguments");
+
+                if (name) |n| {
+                    if (n == .string) {
+                        // New tool call starting
+                        const id = tool_call.object.get("id");
+                        const id_str = if (id) |i| (if (i == .string) i.string else "unknown") else "unknown";
+
+                        state.current_tool_index = tc_index;
+                        return types.MessageEvent{
+                            .toolcall_start = .{
+                                .index = tc_index,
+                                .id = try allocator.dupe(u8, id_str),
+                                .name = try allocator.dupe(u8, n.string),
+                            },
+                        };
                     }
                 }
-
-                // Extract status and map to stop reason
-                if (resp.object.get("status")) |status_val| {
-                    if (status_val == .string) {
-                        if (std.mem.eql(u8, status_val.string, "completed")) {
-                            state.stop_reason = .stop;
-                        } else if (std.mem.eql(u8, status_val.string, "incomplete")) {
-                            state.stop_reason = .length;
-                        } else if (std.mem.eql(u8, status_val.string, "failed") or std.mem.eql(u8, status_val.string, "cancelled")) {
-                            state.stop_reason = .@"error";
-                        }
+                if (arguments) |args| {
+                    if (args == .string) {
+                        return types.MessageEvent{
+                            .toolcall_delta = .{
+                                .index = tc_index,
+                                .delta = try allocator.dupe(u8, args.string),
+                            },
+                        };
                     }
                 }
             }
         }
-
-        state.has_emitted_done = true;
-        return types.MessageEvent{
-            .done = .{
-                .usage = state.usage,
-                .stop_reason = state.stop_reason,
-            },
-        };
-    } else if (std.mem.eql(u8, event_type, "error") or std.mem.eql(u8, event_type, "response.failed")) {
-        const message = root.object.get("message");
-        const msg_str = if (message) |m| (if (m == .string) m.string else "Unknown error") else "Unknown error";
-
-        return types.MessageEvent{
-            .@"error" = .{
-                .message = try allocator.dupe(u8, msg_str),
-            },
-        };
     }
 
     return null;
@@ -881,7 +889,7 @@ test "buildEndpoint - with base_url override" {
     try testing.expectEqualStrings("https://custom.endpoint.com/api", endpoint);
 }
 
-test "buildRequestBody - basic message with input format" {
+test "buildRequestBody - basic message with messages format" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
@@ -904,21 +912,21 @@ test "buildRequestBody - basic message with input format" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    // Verify Responses API format uses "input" instead of "messages"
-    try testing.expect(std.mem.indexOf(u8, body, "\"input\"") != null);
+    // Verify Chat Completions API format uses "messages"
+    try testing.expect(std.mem.indexOf(u8, body, "\"messages\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"Hello\"") != null);
 }
 
-test "buildRequestBody - GPT-5 quirk without reasoning" {
+test "buildRequestBody - system prompt" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     const cfg = config.AzureConfig{
         .api_key = "test-key",
         .resource_name = "myresource",
-        .model = "gpt-5-preview",
+        .model = "gpt-4o",
         .params = .{
             .system_prompt = "You are helpful.",
         },
@@ -937,41 +945,9 @@ test "buildRequestBody - GPT-5 quirk without reasoning" {
     const body = try buildRequestBody(cfg, &messages, allocator);
     defer allocator.free(body);
 
-    // Should inject juice directive
-    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
-}
-
-test "buildRequestBody - GPT-5 quirk with reasoning enabled" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    const cfg = config.AzureConfig{
-        .api_key = "test-key",
-        .resource_name = "myresource",
-        .model = "gpt-5-preview",
-        .reasoning_effort = .medium,
-        .params = .{
-            .system_prompt = "You are helpful.",
-        },
-    };
-
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
-            .timestamp = 0,
-        },
-    };
-
-    const body = try buildRequestBody(cfg, &messages, allocator);
-    defer allocator.free(body);
-
-    // Should NOT inject juice directive when reasoning is configured
-    try testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
+    // Should have system role
+    try testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"content\":\"You are helpful.\"") != null);
 }
 
 test "buildRequestBody - session_id for prompt caching" {
@@ -1008,107 +984,123 @@ test "mapSSEToMessageEvent - text events" {
     var state = AzureStreamState.init(allocator);
     defer state.deinit();
 
-    // message item added (text_start)
+    // First chunk emits start event (model extraction)
     const event0 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.added",
-        .data = "{\"item\":{\"type\":\"message\",\"id\":\"msg_123\"},\"output_index\":0}",
+        .event_type = null,
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
     };
 
     const result0 = try mapSSEToMessageEvent(event0, &state, allocator);
     try testing.expect(result0 != null);
-    try testing.expect(result0.? == .text_start);
+    try testing.expect(result0.? == .start);
+    allocator.free(result0.?.start.model);
 
-    // text delta
+    // First content delta should emit text_start and store pending delta
     const event1 = sse_parser.SSEEvent{
-        .event_type = "response.output_text.delta",
-        .data = "{\"delta\":\"Hello\",\"output_index\":0}",
-    };
-
-    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
-    defer if (result1) |r| {
-        if (r == .text_delta) allocator.free(r.text_delta.delta);
-    };
-
-    try testing.expect(result1 != null);
-    try testing.expect(result1.? == .text_delta);
-    try testing.expectEqualStrings("Hello", result1.?.text_delta.delta);
-}
-
-test "mapSSEToMessageEvent - reasoning events" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var state = AzureStreamState.init(allocator);
-    defer state.deinit();
-
-    // reasoning item added
-    const event1 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.added",
-        .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_123\"},\"output_index\":0}",
+        .event_type = null,
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
     };
 
     const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
     try testing.expect(result1 != null);
-    try testing.expect(result1.? == .thinking_start);
+    try testing.expect(result1.? == .text_start);
+    // The pending delta "Hello" should be stored
+    try testing.expect(state.pending_text_delta != null);
+    try testing.expectEqualStrings("Hello", state.pending_text_delta.?);
 
-    // reasoning delta
+    // Second content delta should emit text_delta
     const event2 = sse_parser.SSEEvent{
-        .event_type = "response.reasoning_summary_text.delta",
-        .data = "{\"delta\":\"thinking...\",\"item_id\":\"rs_123\",\"output_index\":0}",
+        .event_type = null,
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}",
     };
 
     const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
-    defer if (result2) |r| {
-        if (r == .thinking_delta) allocator.free(r.thinking_delta.delta);
-    };
-
     try testing.expect(result2 != null);
-    try testing.expect(result2.? == .thinking_delta);
-    try testing.expectEqualStrings("thinking...", result2.?.thinking_delta.delta);
-
-    // reasoning done
-    const event3 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.done",
-        .data = "{\"item\":{\"type\":\"reasoning\",\"id\":\"rs_123\"},\"output_index\":0}",
-    };
-
-    const result3 = try mapSSEToMessageEvent(event3, &state, allocator);
-    try testing.expect(result3 != null);
-    try testing.expect(result3.? == .thinking_end);
+    try testing.expect(result2.? == .text_delta);
+    try testing.expectEqualStrings(" world", result2.?.text_delta.delta);
+    allocator.free(result2.?.text_delta.delta);
 }
 
-test "mapSSEToMessageEvent - response completed" {
+test "mapSSEToMessageEvent - DONE marker" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     var state = AzureStreamState.init(allocator);
     defer state.deinit();
+    // Pre-seed model so first chunk doesn't emit start event
+    state.model = try allocator.dupe(u8, "gpt-4o");
 
     const event = sse_parser.SSEEvent{
-        .event_type = "response.completed",
-        .data = "{\"response\":{\"id\":\"resp_123\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50,\"input_tokens_details\":{\"cached_tokens\":20}}}}",
+        .event_type = null,
+        .data = "[DONE]",
     };
 
     const result = try mapSSEToMessageEvent(event, &state, allocator);
     try testing.expect(result != null);
     try testing.expect(result.? == .done);
-    try testing.expectEqual(@as(u64, 80), state.usage.input_tokens); // 100 - 20 cached
-    try testing.expectEqual(@as(u64, 50), state.usage.output_tokens);
-    try testing.expectEqual(@as(u64, 20), state.usage.cache_read_tokens);
     try testing.expect(result.?.done.stop_reason == .stop);
 }
 
-test "mapSSEToMessageEvent - tool call events" {
+test "mapSSEToMessageEvent - finish_reason mapping" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
     var state = AzureStreamState.init(allocator);
     defer state.deinit();
+    // Pre-seed model so first chunk doesn't emit start event
+    state.model = try allocator.dupe(u8, "gpt-4o");
 
-    // function_call added
+    // Test stop reason
     const event1 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.added",
-        .data = "{\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"get_weather\"},\"output_index\":1}",
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+    };
+
+    const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
+    try testing.expect(result1 != null);
+    try testing.expect(result1.? == .done);
+    try testing.expect(result1.?.done.stop_reason == .stop);
+
+    // Test length reason
+    state.has_emitted_done = false;
+    state.text_started = false;
+    const event2 = sse_parser.SSEEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}",
+    };
+
+    const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
+    try testing.expect(result2 != null);
+    try testing.expect(result2.? == .done);
+    try testing.expect(result2.?.done.stop_reason == .length);
+
+    // Test tool_calls reason
+    state.has_emitted_done = false;
+    state.text_started = false;
+    const event3 = sse_parser.SSEEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+    };
+
+    const result3 = try mapSSEToMessageEvent(event3, &state, allocator);
+    try testing.expect(result3 != null);
+    try testing.expect(result3.? == .done);
+    try testing.expect(result3.?.done.stop_reason == .tool_use);
+}
+
+test "mapSSEToMessageEvent - tool calls" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var state = AzureStreamState.init(allocator);
+    defer state.deinit();
+    // Pre-seed model so first chunk doesn't emit start event
+    state.model = try allocator.dupe(u8, "gpt-4o");
+
+    // Tool call start
+    const event1 = sse_parser.SSEEvent{
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"get_weather\"}}]},\"finish_reason\":null}]}",
     };
 
     const result1 = try mapSSEToMessageEvent(event1, &state, allocator);
@@ -1121,13 +1113,13 @@ test "mapSSEToMessageEvent - tool call events" {
 
     try testing.expect(result1 != null);
     try testing.expect(result1.? == .toolcall_start);
-    try testing.expectEqualStrings("call_abc", result1.?.toolcall_start.id);
+    try testing.expectEqualStrings("call_123", result1.?.toolcall_start.id);
     try testing.expectEqualStrings("get_weather", result1.?.toolcall_start.name);
 
-    // arguments delta
+    // Tool arguments delta
     const event2 = sse_parser.SSEEvent{
-        .event_type = "response.function_call_arguments.delta",
-        .data = "{\"delta\":\"{\\\\\\\"location\\\\\\\":\",\"output_index\":1}",
+        .event_type = null,
+        .data = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"location\\\":\\\"\"}}]},\"finish_reason\":null}]}",
     };
 
     const result2 = try mapSSEToMessageEvent(event2, &state, allocator);
@@ -1137,20 +1129,26 @@ test "mapSSEToMessageEvent - tool call events" {
 
     try testing.expect(result2 != null);
     try testing.expect(result2.? == .toolcall_delta);
-    try testing.expectEqualStrings("{\\\"location\\\":", result2.?.toolcall_delta.delta);
+    try testing.expectEqualStrings("{\"location\":\"", result2.?.toolcall_delta.delta);
+}
 
-    // function_call done
-    const event3 = sse_parser.SSEEvent{
-        .event_type = "response.output_item.done",
-        .data = "{\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"get_weather\",\"arguments\":\"{\\\\\\\"location\\\\\\\":\\\\\\\"NYC\\\\\\\"}\"},\"output_index\":1}",
+test "mapSSEToMessageEvent - usage from streaming chunk" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var state = AzureStreamState.init(allocator);
+    defer state.deinit();
+    state.model = try allocator.dupe(u8, "gpt-4o");
+
+    // Final usage chunk (empty choices, usage populated)
+    const event = sse_parser.SSEEvent{
+        .event_type = null,
+        .data = "{\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}",
     };
 
-    const result3 = try mapSSEToMessageEvent(event3, &state, allocator);
-    defer if (result3) |r| {
-        if (r == .toolcall_end) allocator.free(r.toolcall_end.input_json);
-    };
-
-    try testing.expect(result3 != null);
-    try testing.expect(result3.? == .toolcall_end);
-    try testing.expectEqualStrings("{\\\"location\\\":\\\"NYC\\\"}", result3.?.toolcall_end.input_json);
+    const result = try mapSSEToMessageEvent(event, &state, allocator);
+    // Empty choices returns null, but usage should be accumulated in state
+    try testing.expect(result == null);
+    try testing.expectEqual(@as(u64, 10), state.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 20), state.usage.output_tokens);
 }

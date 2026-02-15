@@ -204,6 +204,9 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
         signatures.deinit();
     }
 
+    var event_mapping_state = EventMappingState.init(ctx.allocator);
+    defer event_mapping_state.deinit();
+
     var usage = types.Usage{};
     var stop_reason: types.StopReason = .stop;
     var model: []const u8 = ctx.config.model;
@@ -260,7 +263,7 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 }
             }
 
-            const message_event = try mapSSEToMessageEvent(event, ctx.allocator);
+            const message_event = try mapSSEToMessageEvent(event, ctx.allocator, &event_mapping_state);
             if (message_event) |evt| {
                 switch (evt) {
                     .start => |s| {
@@ -621,10 +624,33 @@ fn writeContentBlocks(writer: *json_writer.JsonWriter, blocks: []const types.Con
     try writer.endArray();
 }
 
+/// Block type tracking for content_block_stop dispatch
+pub const BlockType = enum {
+    text,
+    thinking,
+    tool_use,
+};
+
+/// State for mapping SSE events to MessageEvents
+pub const EventMappingState = struct {
+    block_types: std.AutoHashMap(usize, BlockType),
+
+    pub fn init(allocator: std.mem.Allocator) EventMappingState {
+        return .{
+            .block_types = std.AutoHashMap(usize, BlockType).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *EventMappingState) void {
+        self.block_types.deinit();
+    }
+};
+
 /// Map Anthropic SSE event to MessageEvent
 pub fn mapSSEToMessageEvent(
     event: sse_parser.SSEEvent,
     allocator: std.mem.Allocator,
+    state: ?*EventMappingState,
 ) !?types.MessageEvent {
     const event_type = event.event_type orelse return null;
 
@@ -682,14 +708,23 @@ pub fn mapSSEToMessageEvent(
         );
         defer parsed.deinit();
 
-        const block_type = parsed.value.content_block.type;
+        const block_type_str = parsed.value.content_block.type;
         const index = parsed.value.index;
 
-        if (std.mem.eql(u8, block_type, "text")) {
+        if (std.mem.eql(u8, block_type_str, "text")) {
+            if (state) |s| {
+                try s.block_types.put(index, .text);
+            }
             return types.MessageEvent{ .text_start = .{ .index = index } };
-        } else if (std.mem.eql(u8, block_type, "thinking")) {
+        } else if (std.mem.eql(u8, block_type_str, "thinking")) {
+            if (state) |s| {
+                try s.block_types.put(index, .thinking);
+            }
             return types.MessageEvent{ .thinking_start = .{ .index = index } };
-        } else if (std.mem.eql(u8, block_type, "tool_use")) {
+        } else if (std.mem.eql(u8, block_type_str, "tool_use")) {
+            if (state) |s| {
+                try s.block_types.put(index, .tool_use);
+            }
             const id = try allocator.dupe(u8, parsed.value.content_block.id.?);
             const name = try allocator.dupe(u8, parsed.value.content_block.name.?);
             return types.MessageEvent{ .toolcall_start = .{
@@ -740,7 +775,19 @@ pub fn mapSSEToMessageEvent(
             .{ .ignore_unknown_fields = true },
         );
         defer parsed.deinit();
-        return types.MessageEvent{ .text_end = .{ .index = parsed.value.index } };
+        const index = parsed.value.index;
+
+        // Look up the block type from state, default to text if not found
+        const block_type: BlockType = if (state) |s|
+            s.block_types.get(index) orelse .text
+        else
+            .text;
+
+        return switch (block_type) {
+            .text => types.MessageEvent{ .text_end = .{ .index = index } },
+            .thinking => types.MessageEvent{ .thinking_end = .{ .index = index } },
+            .tool_use => types.MessageEvent{ .toolcall_end = .{ .index = index, .input_json = "" } },
+        };
     }
 
     if (std.mem.eql(u8, event_type, "message_delta")) {
@@ -872,7 +919,7 @@ test "mapSSEToMessageEvent message_start" {
         .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-5-sonnet-20241022\",\"usage\":{\"input_tokens\":123,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
     defer if (message_event) |evt| {
         switch (evt) {
             .start => |s| allocator.free(s.model),
@@ -894,7 +941,7 @@ test "mapSSEToMessageEvent text_delta" {
         .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
     defer if (message_event) |evt| {
         switch (evt) {
             .text_delta => |d| allocator.free(d.delta),
@@ -916,7 +963,7 @@ test "mapSSEToMessageEvent thinking_delta" {
         .data = "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me think...\"}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
     defer if (message_event) |evt| {
         switch (evt) {
             .thinking_delta => |d| allocator.free(d.delta),
@@ -937,7 +984,7 @@ test "mapSSEToMessageEvent toolcall_start" {
         .data = "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"search\"}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
     defer if (message_event) |evt| {
         switch (evt) {
             .toolcall_start => |tc| {
@@ -963,7 +1010,7 @@ test "mapSSEToMessageEvent done" {
         .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":150}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
 
     try std.testing.expect(message_event != null);
     try std.testing.expect(std.meta.activeTag(message_event.?) == .done);
@@ -991,7 +1038,7 @@ test "usage tracking preserves input_tokens from message_start" {
     };
 
     // Parse message_start - this should capture input_tokens
-    const start_msg = try mapSSEToMessageEvent(start_event, std.testing.allocator);
+    const start_msg = try mapSSEToMessageEvent(start_event, std.testing.allocator, null);
     defer if (start_msg) |evt| {
         switch (evt) {
             .start => |s| std.testing.allocator.free(s.model),
@@ -1004,7 +1051,7 @@ test "usage tracking preserves input_tokens from message_start" {
     try std.testing.expectEqual(@as(u64, 123), start_msg.?.start.input_tokens);
 
     // Parse message_delta - this should have output_tokens
-    const delta_msg = try mapSSEToMessageEvent(delta_event, std.testing.allocator);
+    const delta_msg = try mapSSEToMessageEvent(delta_event, std.testing.allocator, null);
 
     try std.testing.expect(delta_msg != null);
     try std.testing.expect(std.meta.activeTag(delta_msg.?) == .done);
@@ -1034,7 +1081,7 @@ test "mapSSEToMessageEvent error" {
         .data = "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Invalid API key\"}}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
     defer if (message_event) |evt| {
         switch (evt) {
             .@"error" => |e| allocator.free(e.message),
@@ -1055,10 +1102,86 @@ test "mapSSEToMessageEvent ping" {
         .data = "{}",
     };
 
-    const message_event = try mapSSEToMessageEvent(event, allocator);
+    const message_event = try mapSSEToMessageEvent(event, allocator, null);
 
     try std.testing.expect(message_event != null);
     try std.testing.expect(std.meta.activeTag(message_event.?) == .ping);
+}
+
+test "mapSSEToMessageEvent content_block_stop dispatches based on tracked block type" {
+    const allocator = std.testing.allocator;
+
+    var state = EventMappingState.init(allocator);
+    defer state.deinit();
+
+    // Test text block: start then stop
+    {
+        const start_event = sse_parser.SSEEvent{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\"}}",
+        };
+        const start_msg = try mapSSEToMessageEvent(start_event, allocator, &state);
+        try std.testing.expect(start_msg != null);
+        try std.testing.expect(std.meta.activeTag(start_msg.?) == .text_start);
+
+        const stop_event = sse_parser.SSEEvent{
+            .event_type = "content_block_stop",
+            .data = "{\"type\":\"content_block_stop\",\"index\":0}",
+        };
+        const stop_msg = try mapSSEToMessageEvent(stop_event, allocator, &state);
+        try std.testing.expect(stop_msg != null);
+        try std.testing.expect(std.meta.activeTag(stop_msg.?) == .text_end);
+        try std.testing.expectEqual(@as(usize, 0), stop_msg.?.text_end.index);
+    }
+
+    // Test thinking block: start then stop
+    {
+        const start_event = sse_parser.SSEEvent{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\"}}",
+        };
+        const start_msg = try mapSSEToMessageEvent(start_event, allocator, &state);
+        try std.testing.expect(start_msg != null);
+        try std.testing.expect(std.meta.activeTag(start_msg.?) == .thinking_start);
+
+        const stop_event = sse_parser.SSEEvent{
+            .event_type = "content_block_stop",
+            .data = "{\"type\":\"content_block_stop\",\"index\":1}",
+        };
+        const stop_msg = try mapSSEToMessageEvent(stop_event, allocator, &state);
+        try std.testing.expect(stop_msg != null);
+        try std.testing.expect(std.meta.activeTag(stop_msg.?) == .thinking_end);
+        try std.testing.expectEqual(@as(usize, 1), stop_msg.?.thinking_end.index);
+    }
+
+    // Test tool_use block: start then stop
+    {
+        const start_event = sse_parser.SSEEvent{
+            .event_type = "content_block_start",
+            .data = "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"test\"}}",
+        };
+        const start_msg = try mapSSEToMessageEvent(start_event, allocator, &state);
+        defer if (start_msg) |evt| {
+            switch (evt) {
+                .toolcall_start => |tc| {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                },
+                else => {},
+            }
+        };
+        try std.testing.expect(start_msg != null);
+        try std.testing.expect(std.meta.activeTag(start_msg.?) == .toolcall_start);
+
+        const stop_event = sse_parser.SSEEvent{
+            .event_type = "content_block_stop",
+            .data = "{\"type\":\"content_block_stop\",\"index\":2}",
+        };
+        const stop_msg = try mapSSEToMessageEvent(stop_event, allocator, &state);
+        try std.testing.expect(stop_msg != null);
+        try std.testing.expect(std.meta.activeTag(stop_msg.?) == .toolcall_end);
+        try std.testing.expectEqual(@as(usize, 2), stop_msg.?.toolcall_end.index);
+    }
 }
 
 test "buildRequestBody with system prompt" {

@@ -8,6 +8,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         const RING_BUFFER_MASK = RING_BUFFER_SIZE - 1;
 
         ring_buffer: [RING_BUFFER_SIZE]T,
+        /// Published flags ensure data is visible before consumers read.
+        /// Each slot has a flag that is set to true after data is written.
+        published: [RING_BUFFER_SIZE]std.atomic.Value(bool),
         head: std.atomic.Value(usize),
         tail: std.atomic.Value(usize),
         result: ?R = null,
@@ -18,8 +21,13 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
+            var published: [RING_BUFFER_SIZE]std.atomic.Value(bool) = undefined;
+            for (&published) |*p| {
+                p.* = std.atomic.Value(bool).init(false);
+            }
             return Self{
                 .ring_buffer = undefined,
+                .published = published,
                 .head = std.atomic.Value(usize).init(0),
                 .tail = std.atomic.Value(usize).init(0),
                 .completed = std.atomic.Value(bool).init(false),
@@ -92,11 +100,17 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     return error.QueueFull;
                 }
 
-                if (self.head.cmpxchgWeak(current_head, next_head, .release, .acquire)) |_| {
+                // Try to claim this slot
+                if (self.head.cmpxchgWeak(current_head, next_head, .acquire, .acquire)) |_| {
                     continue;
                 }
 
+                // We claimed slot at current_head - now write the data
                 self.ring_buffer[current_head] = event;
+
+                // Mark the slot as published with release semantics
+                // This ensures the write above is visible before the flag
+                self.published[current_head].store(true, .release);
 
                 _ = self.futex.fetchAdd(1, .release);
                 std.Thread.Futex.wake(&self.futex, 1);
@@ -141,7 +155,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 return null;
             }
 
+            // Spin-wait for the slot to be published (data visible)
+            // This is safe because push() marks published before waking consumers
+            while (!self.published[current_tail].load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+
             const event = self.ring_buffer[current_tail];
+
+            // Clear published flag for slot reuse and advance tail
+            self.published[current_tail].store(false, .release);
             self.tail.store((current_tail + 1) & RING_BUFFER_MASK, .release);
 
             return event;
@@ -156,7 +179,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             const current_head = self.head.load(.acquire);
 
             while (count < buffer.len and current_tail != current_head) {
+                // Spin-wait for the slot to be published (data visible)
+                while (!self.published[current_tail].load(.acquire)) {
+                    std.Thread.yield() catch {};
+                }
+
                 buffer[count] = self.ring_buffer[current_tail];
+
+                // Clear published flag for slot reuse
+                self.published[current_tail].store(false, .release);
                 current_tail = (current_tail + 1) & RING_BUFFER_MASK;
                 count += 1;
             }
@@ -178,7 +209,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 const current_head = self.head.load(.acquire);
 
                 if (current_tail != current_head) {
+                    // Spin-wait for the slot to be published (data visible)
+                    while (!self.published[current_tail].load(.acquire)) {
+                        std.Thread.yield() catch {};
+                    }
+
                     const event = self.ring_buffer[current_tail];
+
+                    // Clear published flag for slot reuse and advance tail
+                    self.published[current_tail].store(false, .release);
                     self.tail.store((current_tail + 1) & RING_BUFFER_MASK, .release);
                     self.mutex.unlock();
                     return event;
