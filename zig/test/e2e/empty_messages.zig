@@ -8,9 +8,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "empty_messages: anthropic handles empty content gracefully" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -57,9 +55,7 @@ test "empty_messages: anthropic handles empty content gracefully" {
 }
 
 test "empty_messages: openai handles whitespace-only content" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -106,9 +102,7 @@ test "empty_messages: openai handles whitespace-only content" {
 }
 
 test "empty_messages: single character input works" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -154,9 +148,7 @@ test "empty_messages: single character input works" {
 }
 
 test "empty_messages: no messages array" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 

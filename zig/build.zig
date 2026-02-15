@@ -93,6 +93,36 @@ pub fn build(b: *std.Build) void {
     });
 
     _ = b.createModule(.{
+        .root_source_file = b.path("src/utils/tool_utils.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+        },
+    });
+
+    _ = b.createModule(.{
+        .root_source_file = b.path("src/utils/message_transform.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+        },
+    });
+
+    _ = b.createModule(.{
+        .root_source_file = b.path("src/utils/streaming_json.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    _ = b.createModule(.{
+        .root_source_file = b.path("src/utils/provider_caps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    _ = b.createModule(.{
         .root_source_file = b.path("src/providers/http.zig"),
         .target = target,
         .optimize = optimize,
@@ -458,6 +488,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const tool_utils_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/tool_utils.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+            },
+        }),
+    });
+
     const aws_sigv4_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/utils/aws_sigv4.zig"),
@@ -474,6 +515,33 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "xev", .module = xev_mod },
             },
+        }),
+    });
+
+    const message_transform_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/message_transform.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "types", .module = types_mod },
+            },
+        }),
+    });
+
+    const streaming_json_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/streaming_json.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const provider_caps_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/utils/provider_caps.zig"),
+            .target = target,
+            .optimize = optimize,
         }),
     });
 
@@ -968,8 +1036,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(sse_parser_test).step);
     test_step.dependOn(&b.addRunArtifact(retry_test).step);
     test_step.dependOn(&b.addRunArtifact(tokens_test).step);
+    test_step.dependOn(&b.addRunArtifact(tool_utils_test).step);
     test_step.dependOn(&b.addRunArtifact(aws_sigv4_test).step);
     test_step.dependOn(&b.addRunArtifact(http_test).step);
+    test_step.dependOn(&b.addRunArtifact(message_transform_test).step);
+    test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
+    test_step.dependOn(&b.addRunArtifact(provider_caps_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_test).step);

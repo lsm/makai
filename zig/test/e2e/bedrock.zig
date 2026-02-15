@@ -33,8 +33,16 @@ fn freeBedrockAuth(allocator: std.mem.Allocator, auth: bedrock.BedrockAuth) void
 }
 
 test "bedrock: basic text generation" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: basic text generation");
+    defer test_helpers.testSuccess("bedrock: basic text generation");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Creating provider with Claude 3.5 Haiku on Bedrock...", .{});
 
     const cfg = bedrock.BedrockConfig{
         .auth = auth,
@@ -67,8 +75,16 @@ test "bedrock: basic text generation" {
 }
 
 test "bedrock: streaming events sequence" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: streaming events sequence");
+    defer test_helpers.testSuccess("bedrock: streaming events sequence");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing event sequence (start, text_delta, done)...", .{});
 
     const cfg = bedrock.BedrockConfig{
         .auth = auth,
@@ -120,11 +136,20 @@ test "bedrock: streaming events sequence" {
     try testing.expect(saw_text_delta);
     try testing.expect(saw_done);
     try testing.expect(accumulator.text_buffer.items.len > 0);
+    test_helpers.testStep("All expected events received, {} chars of text", .{accumulator.text_buffer.items.len});
 }
 
 test "bedrock: thinking mode" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: thinking mode");
+    defer test_helpers.testSuccess("bedrock: thinking mode");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing extended thinking with mode=adaptive, effort=medium...", .{});
 
     const cfg = bedrock.BedrockConfig{
         .auth = auth,
@@ -174,11 +199,20 @@ test "bedrock: thinking mode" {
 
     try testing.expect(saw_thinking);
     try testing.expect(accumulator.thinking_buffer.items.len > 0);
+    test_helpers.testStep("Thinking events received, {} chars of thinking", .{accumulator.thinking_buffer.items.len});
 }
 
 test "bedrock: tool calling" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: tool calling");
+    defer test_helpers.testSuccess("bedrock: tool calling");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing tool calling with get_weather tool...", .{});
 
     const weather_tool = types.Tool{
         .name = "get_weather",
@@ -241,14 +275,23 @@ test "bedrock: tool calling" {
 
     try testing.expect(saw_tool_call);
     try testing.expect(accumulator.tool_calls.items.len > 0);
+    test_helpers.testStep("Tool call received: {s}", .{accumulator.tool_calls.items[0].name});
 
     const result = stream.result orelse return error.NoResult;
     try testing.expect(result.stop_reason == .tool_use);
 }
 
 test "bedrock: prompt caching" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: prompt caching");
+    defer test_helpers.testSuccess("bedrock: prompt caching");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing prompt caching with cache_retention=short...", .{});
 
     const cfg = bedrock.BedrockConfig{
         .auth = auth,
@@ -285,11 +328,20 @@ test "bedrock: prompt caching" {
 
     // First call should have cache writes
     try testing.expect(result.usage.cache_write_tokens >= 0);
+    test_helpers.testStep("Cache write tokens: {}", .{result.usage.cache_write_tokens});
 }
 
 test "bedrock: abort mid-stream" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: abort mid-stream");
+    defer test_helpers.testSuccess("bedrock: abort mid-stream");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing stream cancellation after 5 events...", .{});
 
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
@@ -339,11 +391,20 @@ test "bedrock: abort mid-stream" {
 
     try testing.expect(event_count >= max_events);
     try testing.expect(cancel_token.isCancelled());
+    test_helpers.testStep("Cancelled after {} events", .{event_count});
 }
 
 test "bedrock: usage tracking" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    test_helpers.testStart("bedrock: usage tracking");
+    defer test_helpers.testSuccess("bedrock: usage tracking");
+
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
+
+    test_helpers.testStep("Testing token usage tracking...", .{});
 
     const cfg = bedrock.BedrockConfig{
         .auth = auth,
@@ -380,4 +441,9 @@ test "bedrock: usage tracking" {
     try testing.expect(result.usage.input_tokens > 0);
     try testing.expect(result.usage.output_tokens > 0);
     try testing.expect(result.usage.total() > 0);
+    test_helpers.testStep("Usage: input={}, output={}, total={}", .{
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total(),
+    });
 }

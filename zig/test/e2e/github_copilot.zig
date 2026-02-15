@@ -7,9 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "github_copilot: basic text generation" {
-    if (test_helpers.shouldSkipGitHubCopilot(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGitHubCopilotTest(testing.allocator);
     var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
@@ -44,9 +42,7 @@ test "github_copilot: basic text generation" {
 }
 
 test "github_copilot: streaming events sequence" {
-    if (test_helpers.shouldSkipGitHubCopilot(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGitHubCopilotTest(testing.allocator);
     var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
@@ -104,9 +100,7 @@ test "github_copilot: streaming events sequence" {
 }
 
 test "github_copilot: usage tracking" {
-    if (test_helpers.shouldSkipGitHubCopilot(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGitHubCopilotTest(testing.allocator);
     var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 

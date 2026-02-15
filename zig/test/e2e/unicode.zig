@@ -8,9 +8,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "unicode: anthropic handles emoji" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -56,9 +54,7 @@ test "unicode: anthropic handles emoji" {
 }
 
 test "unicode: openai handles CJK characters" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -104,9 +100,7 @@ test "unicode: openai handles CJK characters" {
 }
 
 test "unicode: mixed scripts and symbols" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -152,9 +146,7 @@ test "unicode: mixed scripts and symbols" {
 }
 
 test "unicode: zero-width and control characters" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -201,9 +193,7 @@ test "unicode: zero-width and control characters" {
 }
 
 test "unicode: right-to-left text" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 

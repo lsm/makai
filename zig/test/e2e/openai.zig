@@ -7,11 +7,14 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "openai: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    test_helpers.testStart("openai: basic text generation");
+    defer test_helpers.testSuccess("openai: basic text generation");
+
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
+
+    test_helpers.testStep("Creating provider with gpt-4o-mini...", .{});
 
     const cfg = config.OpenAIConfig{
         .auth = .{ .api_key = api_key },
@@ -43,11 +46,14 @@ test "openai: basic text generation" {
 }
 
 test "openai: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    test_helpers.testStart("openai: streaming events sequence");
+    defer test_helpers.testSuccess("openai: streaming events sequence");
+
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
+
+    test_helpers.testStep("Testing event sequence (start, text_delta, done)...", .{});
 
     const cfg = config.OpenAIConfig{
         .auth = .{ .api_key = api_key },
@@ -99,29 +105,37 @@ test "openai: streaming events sequence" {
     try testing.expect(saw_text_delta);
     try testing.expect(saw_done);
     try testing.expect(accumulator.text_buffer.items.len > 0);
+    test_helpers.testStep("All expected events received, {} chars of text", .{accumulator.text_buffer.items.len});
 }
 
 test "openai: reasoning mode" {
+    test_helpers.testStart("openai: reasoning mode");
     // OpenAI's reasoning models (o1, o3, o4) don't emit thinking events in the stream.
     // The extended thinking happens server-side and only the final answer is returned.
     // This is unlike Anthropic Claude which emits thinking_start/thinking_delta events.
     // Skip this test since it will never pass with OpenAI's API.
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: openai: reasoning mode - OpenAI doesn't emit thinking events\n", .{});
     return error.SkipZigTest;
 }
 
 test "openai: tool calling" {
+    test_helpers.testStart("openai: tool calling");
     // Non-deterministic: Models may choose to respond with text instead of calling tools.
     // The tool calling implementation is verified by unit tests in openai.zig
     // that mock SSE events with tool_calls data.
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: openai: tool calling - non-deterministic test\n", .{});
     return error.SkipZigTest;
 }
 
 test "openai: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    test_helpers.testStart("openai: abort mid-stream");
+    defer test_helpers.testSuccess("openai: abort mid-stream");
+
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
+
+    test_helpers.testStep("Testing stream cancellation after 5 events...", .{});
 
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
@@ -171,14 +185,18 @@ test "openai: abort mid-stream" {
 
     try testing.expect(event_count >= max_events);
     try testing.expect(cancel_token.isCancelled());
+    test_helpers.testStep("Cancelled after {} events", .{event_count});
 }
 
 test "openai: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    test_helpers.testStart("openai: usage tracking");
+    defer test_helpers.testSuccess("openai: usage tracking");
+
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
+
+    test_helpers.testStep("Testing token usage tracking...", .{});
 
     const cfg = config.OpenAIConfig{
         .auth = .{ .api_key = api_key },
@@ -215,4 +233,9 @@ test "openai: usage tracking" {
     try testing.expect(result.usage.input_tokens > 0);
     try testing.expect(result.usage.output_tokens > 0);
     try testing.expect(result.usage.total() > 0);
+    test_helpers.testStep("Usage: input={}, output={}, total={}", .{
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.total(),
+    });
 }

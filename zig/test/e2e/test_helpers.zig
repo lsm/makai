@@ -1,6 +1,251 @@
 const std = @import("std");
 const types = @import("types");
 
+/// Print a test start message (cyan color for visibility)
+pub fn testStart(test_name: []const u8) void {
+    std.debug.print("\n\x1b[36m[TEST START]\x1b[0m {s}\n", .{test_name});
+}
+
+/// Print a test success message (green color)
+pub fn testSuccess(test_name: []const u8) void {
+    std.debug.print("\x1b[32m[TEST PASS]\x1b[0m {s}\n", .{test_name});
+}
+
+/// Print a test step/progress message (dim color)
+pub fn testStep(format: []const u8, args: anytype) void {
+    std.debug.print("  \x1b[2m" ++ format ++ "\x1b[0m\n", args);
+}
+
+/// Print a skip message to stderr and return SkipZigTest error if credentials are missing.
+/// Returns successfully (void) if credentials exist, allowing the test to proceed.
+/// This makes skipped tests clearly visible in CI output.
+pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{SkipZigTest}!void {
+    // Check if we should skip (i.e., no credentials available)
+    const should_skip: bool = if (std.ascii.eqlIgnoreCase(provider_name, "anthropic"))
+        shouldSkipAnthropic(allocator)
+    else if (std.ascii.eqlIgnoreCase(provider_name, "github_copilot"))
+        shouldSkipGitHubCopilot(allocator)
+    else
+        shouldSkipProvider(allocator, provider_name);
+
+    // If credentials exist, don't skip - let the test proceed
+    if (!should_skip) return;
+
+    // Print a clear skip message using std.debug.print (prints to stderr)
+    // Include the expected env var name for common providers
+    if (std.ascii.eqlIgnoreCase(provider_name, "openai")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set OPENAI_API_KEY)\n", .{provider_name});
+    } else if (std.ascii.eqlIgnoreCase(provider_name, "google")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set GOOGLE_API_KEY)\n", .{provider_name});
+    } else if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n", .{provider_name});
+    } else {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available\n", .{provider_name});
+    }
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Anthropic tests (unified credential check)
+pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipAnthropic(allocator)) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic' - no credentials available (set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for GitHub Copilot tests
+pub fn skipGitHubCopilotTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipGitHubCopilot(allocator)) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'github_copilot' - no credentials available (set COPILOT_TOKEN)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Azure tests (requires both API key and resource name)
+pub fn skipAzureTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Check for AZURE_OPENAI_API_KEY
+    if (!shouldSkipProvider(allocator, "azure")) {
+        // Has API key, check for AZURE_RESOURCE_NAME or AZURE_OPENAI_ENDPOINT
+        if (std.process.getEnvVarOwned(allocator, "AZURE_OPENAI_ENDPOINT")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+    }
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'azure' - no credentials available (set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT/AZURE_RESOURCE_NAME)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Google tests
+pub fn skipGoogleTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipProvider(allocator, "google")) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google' - no credentials available (set GOOGLE_API_KEY)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Google Vertex tests
+pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Check for GOOGLE_APPLICATION_CREDENTIALS
+    if (!shouldSkipProvider(allocator, "google_vertex")) {
+        // Has credentials, check for GOOGLE_VERTEX_PROJECT_ID
+        if (std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+    }
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google_vertex' - no credentials available (set GOOGLE_VERTEX_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Bedrock tests
+pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {
+        return; // Has credentials, don't skip
+    } else |_| {}
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Ollama tests
+pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Ollama doesn't require credentials, check if server is running
+    // by attempting to connect to the default Ollama endpoint
+    _ = allocator;
+    const OllamaChecker = struct {
+        fn isServerRunning() bool {
+            // Try to connect to Ollama's default endpoint
+            const socket = std.posix.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM,
+                0
+            ) catch return false;
+            defer std.posix.close(socket);
+
+            const addr = std.net.Address.parseIp("127.0.0.1", 11434) catch return false;
+            std.posix.connect(socket, &addr.any, addr.getOsSockLen()) catch return false;
+            return true;
+        }
+    };
+
+    if (OllamaChecker.isServerRunning()) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'ollama' - Ollama server not available (start with: ollama serve)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Anthropic OAuth tests
+pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipAnthropicOAuth(allocator)) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_AUTH_TOKEN)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Unified Anthropic credential type
+/// OAuth token (from ANTHROPIC_AUTH_TOKEN) is preferred over API key (from ANTHROPIC_API_KEY)
+pub const AnthropicCredential = struct {
+    token: []const u8,
+    is_oauth: bool,
+
+    pub fn deinit(self: *AnthropicCredential, allocator: std.mem.Allocator) void {
+        allocator.free(self.token);
+    }
+};
+
+/// Get the best available Anthropic credential with precedence:
+/// 1. ANTHROPIC_AUTH_TOKEN (OAuth token)
+/// 2. ANTHROPIC_API_KEY (API key)
+/// 3. ~/.makai/auth.json (fallback)
+pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredential {
+    // 1. Try ANTHROPIC_AUTH_TOKEN first (OAuth token)
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+        // OAuth token format: "refresh_token:access_token" or just "access_token"
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+            const access_token = try allocator.dupe(u8, token[colon_pos + 1 ..]);
+            allocator.free(token);
+            return AnthropicCredential{
+                .token = access_token,
+                .is_oauth = true,
+            };
+        } else {
+            // Single token format - use as OAuth token
+            return AnthropicCredential{
+                .token = token,
+                .is_oauth = true,
+            };
+        }
+    } else |_| {}
+
+    // 2. Try ANTHROPIC_API_KEY
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
+        return AnthropicCredential{
+            .token = key,
+            .is_oauth = false,
+        };
+    } else |_| {}
+
+    // 3. Fall back to auth.json
+    return getAnthropicCredentialFromAuthFile(allocator);
+}
+
+/// Read Anthropic credential from ~/.makai/auth.json
+/// Checks for oauth_token first, then api_key
+fn getAnthropicCredentialFromAuthFile(allocator: std.mem.Allocator) !?AnthropicCredential {
+    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    defer allocator.free(home_dir);
+
+    const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
+    defer allocator.free(auth_path);
+
+    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    defer allocator.free(content);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+
+    const root = parsed.value;
+    if (root != .object) return null;
+
+    const providers = root.object.get("providers") orelse return null;
+    if (providers != .object) return null;
+
+    const provider_obj = providers.object.get("anthropic") orelse return null;
+    if (provider_obj != .object) return null;
+
+    // Check for oauth_token first (higher precedence)
+    if (provider_obj.object.get("oauth_token")) |oauth_val| {
+        if (oauth_val == .string) {
+            return AnthropicCredential{
+                .token = try allocator.dupe(u8, oauth_val.string),
+                .is_oauth = true,
+            };
+        }
+    }
+
+    // Fall back to api_key
+    if (provider_obj.object.get("api_key")) |api_key_val| {
+        if (api_key_val == .string) {
+            return AnthropicCredential{
+                .token = try allocator.dupe(u8, api_key_val.string),
+                .is_oauth = false,
+            };
+        }
+    }
+
+    return null;
+}
+
+/// Check if Anthropic provider should be skipped (no credentials)
+/// Uses the unified credential precedence
+pub fn shouldSkipAnthropic(allocator: std.mem.Allocator) bool {
+    const cred = getAnthropicCredential(allocator) catch return true;
+    if (cred) |c| {
+        var mutable_cred = c;
+        mutable_cred.deinit(allocator);
+        return false;
+    }
+    return true;
+}
+
 /// Get API key from environment variable or ~/.makai/auth.json
 pub fn getApiKey(allocator: std.mem.Allocator, provider_name: []const u8) !?[]const u8 {
     // Construct environment variable name (e.g., ANTHROPIC_API_KEY)
@@ -57,7 +302,13 @@ fn getApiKeyFromAuthFile(allocator: std.mem.Allocator, provider_name: []const u8
 }
 
 /// Check if a provider should be skipped (no credentials)
+/// For Anthropic, uses unified credential precedence (OAuth token > API key)
 pub fn shouldSkipProvider(allocator: std.mem.Allocator, provider_name: []const u8) bool {
+    // Special handling for Anthropic - check for OAuth token first
+    if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
+        return shouldSkipAnthropic(allocator);
+    }
+
     const api_key = getApiKey(allocator, provider_name) catch return true;
     if (api_key) |key| {
         allocator.free(key);
@@ -188,9 +439,9 @@ pub const AnthropicOAuthCredentials = struct {
 
 /// Get Anthropic OAuth credentials from environment variable or ~/.makai/auth.json
 pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
-    // Try environment variable first (ANTHROPIC_OAUTH_TOKEN for CI)
+    // Try environment variable first (ANTHROPIC_AUTH_TOKEN for OAuth)
     // Format: "refresh_token:access_token"
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN")) |token| {
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // Split on the first colon
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
             const refresh_token = token[0..colon_pos];
