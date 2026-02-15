@@ -9,12 +9,24 @@ const testing = std.testing;
 test "ollama: basic text generation" {
     try test_helpers.skipOllamaTest(testing.allocator);
 
+    const creds = (try test_helpers.getOllamaCredentials(testing.allocator)).?;
+    defer {
+        var mutable_creds = creds;
+        mutable_creds.deinit(testing.allocator);
+    }
+
+    const auth_header = try std.fmt.allocPrint(testing.allocator, "Bearer {s}", .{creds.api_key});
+    defer testing.allocator.free(auth_header);
+
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
-        .base_url = "http://localhost:11434",
+        .base_url = creds.base_url,
         .params = .{
             .max_tokens = 100,
             .temperature = 1.0,
+        },
+        .custom_headers = &[_]config.HeaderPair{
+            .{ .name = "Authorization", .value = auth_header },
         },
     };
 
@@ -41,9 +53,22 @@ test "ollama: basic text generation" {
 test "ollama: streaming events sequence" {
     try test_helpers.skipOllamaTest(testing.allocator);
 
+    const creds = (try test_helpers.getOllamaCredentials(testing.allocator)).?;
+    defer {
+        var mutable_creds = creds;
+        mutable_creds.deinit(testing.allocator);
+    }
+
+    const auth_header = try std.fmt.allocPrint(testing.allocator, "Bearer {s}", .{creds.api_key});
+    defer testing.allocator.free(auth_header);
+
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
+        .base_url = creds.base_url,
         .params = .{ .max_tokens = 50 },
+        .custom_headers = &[_]config.HeaderPair{
+            .{ .name = "Authorization", .value = auth_header },
+        },
     };
 
     const prov = try ollama.createProvider(cfg, testing.allocator);
@@ -95,6 +120,15 @@ test "ollama: streaming events sequence" {
 test "ollama: tool calling" {
     try test_helpers.skipOllamaTest(testing.allocator);
 
+    const creds = (try test_helpers.getOllamaCredentials(testing.allocator)).?;
+    defer {
+        var mutable_creds = creds;
+        mutable_creds.deinit(testing.allocator);
+    }
+
+    const auth_header = try std.fmt.allocPrint(testing.allocator, "Bearer {s}", .{creds.api_key});
+    defer testing.allocator.free(auth_header);
+
     const weather_tool = types.Tool{
         .name = "get_weather",
         .description = "Get current weather for a location",
@@ -110,10 +144,14 @@ test "ollama: tool calling" {
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
+        .base_url = creds.base_url,
         .params = .{
             .max_tokens = 200,
             .tools = &[_]types.Tool{weather_tool},
             .tool_choice = .{ .auto = {} },
+        },
+        .custom_headers = &[_]config.HeaderPair{
+            .{ .name = "Authorization", .value = auth_header },
         },
     };
 
@@ -155,13 +193,26 @@ test "ollama: tool calling" {
 test "ollama: abort mid-stream" {
     try test_helpers.skipOllamaTest(testing.allocator);
 
+    const creds = (try test_helpers.getOllamaCredentials(testing.allocator)).?;
+    defer {
+        var mutable_creds = creds;
+        mutable_creds.deinit(testing.allocator);
+    }
+
+    const auth_header = try std.fmt.allocPrint(testing.allocator, "Bearer {s}", .{creds.api_key});
+    defer testing.allocator.free(auth_header);
+
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
+        .base_url = creds.base_url,
         .params = .{ .max_tokens = 500 },
         .cancel_token = cancel_token,
+        .custom_headers = &[_]config.HeaderPair{
+            .{ .name = "Authorization", .value = auth_header },
+        },
     };
 
     const prov = try ollama.createProvider(cfg, testing.allocator);
@@ -207,9 +258,22 @@ test "ollama: abort mid-stream" {
 test "ollama: usage tracking" {
     try test_helpers.skipOllamaTest(testing.allocator);
 
+    const creds = (try test_helpers.getOllamaCredentials(testing.allocator)).?;
+    defer {
+        var mutable_creds = creds;
+        mutable_creds.deinit(testing.allocator);
+    }
+
+    const auth_header = try std.fmt.allocPrint(testing.allocator, "Bearer {s}", .{creds.api_key});
+    defer testing.allocator.free(auth_header);
+
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
+        .base_url = creds.base_url,
         .params = .{ .max_tokens = 100 },
+        .custom_headers = &[_]config.HeaderPair{
+            .{ .name = "Authorization", .value = auth_header },
+        },
     };
 
     const prov = try ollama.createProvider(cfg, testing.allocator);

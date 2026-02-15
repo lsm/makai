@@ -106,28 +106,41 @@ pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
 
 /// Print a skip message for Ollama tests
 pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
-    // Ollama doesn't require credentials, check if server is running
-    // by attempting to connect to the default Ollama endpoint
-    _ = allocator;
-    const OllamaChecker = struct {
-        fn isServerRunning() bool {
-            // Try to connect to Ollama's default endpoint
-            const socket = std.posix.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.STREAM,
-                0
-            ) catch return false;
-            defer std.posix.close(socket);
-
-            const addr = std.net.Address.parseIp("127.0.0.1", 11434) catch return false;
-            std.posix.connect(socket, &addr.any, addr.getOsSockLen()) catch return false;
-            return true;
-        }
-    };
-
-    if (OllamaChecker.isServerRunning()) return;
-    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'ollama' - Ollama server not available (start with: ollama serve)\n", .{});
+    // Check for OLLAMA_API_KEY environment variable
+    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |_| {
+        return; // Has API key, don't skip
+    } else |_| {}
+    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'ollama' - OLLAMA_API_KEY not set\n", .{});
     return error.SkipZigTest;
+}
+
+/// Ollama credentials for cloud API access
+pub const OllamaCredentials = struct {
+    api_key: []const u8,
+    base_url: []const u8,
+
+    pub fn deinit(self: *OllamaCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.api_key);
+        allocator.free(self.base_url);
+    }
+};
+
+/// Get Ollama credentials from environment variables
+/// Returns null if OLLAMA_API_KEY is not set
+pub fn getOllamaCredentials(allocator: std.mem.Allocator) !?OllamaCredentials {
+    // Check for OLLAMA_API_KEY
+    const api_key = std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY") catch return null;
+
+    // Get base URL (defaults to Ollama cloud if API key is set)
+    const base_url = if (std.process.getEnvVarOwned(allocator, "OLLAMA_BASE_URL")) |url|
+        url
+    else |_|
+        try allocator.dupe(u8, "https://api.ollama.ai");
+
+    return OllamaCredentials{
+        .api_key = api_key,
+        .base_url = base_url,
+    };
 }
 
 /// Print a skip message for Anthropic OAuth tests
