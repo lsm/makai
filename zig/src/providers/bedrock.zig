@@ -387,7 +387,9 @@ fn handleBedrockEvent(
     ctx: *StreamThreadContext,
 ) !void {
     if (std.mem.eql(u8, event_type, "messageStart")) {
-        try ctx.stream.push(.{ .start = .{ .model = ctx.config.model } });
+        try ctx.stream.push(.{ .start = .{
+            .model = try ctx.allocator.dupe(u8, ctx.config.model),
+        } });
     } else if (std.mem.eql(u8, event_type, "contentBlockStart")) {
         const parsed = std.json.parseFromSlice(
             struct { start: ?struct { toolUse: ?struct { toolUseId: []const u8, name: []const u8 } = null } = null },
