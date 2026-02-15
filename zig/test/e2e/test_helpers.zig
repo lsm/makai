@@ -146,7 +146,7 @@ pub fn getOllamaCredentials(allocator: std.mem.Allocator) !?OllamaCredentials {
 /// Print a skip message for Anthropic OAuth tests
 pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     if (!shouldSkipAnthropicOAuth(allocator)) return;
-    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_AUTH_TOKEN)\n", .{});
+    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_REFRESH_TOKEN+ANTHROPIC_ACCESS_TOKEN or ANTHROPIC_AUTH_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
 
@@ -489,8 +489,31 @@ pub const AnthropicOAuthCredentials = struct {
 
 /// Get Anthropic OAuth credentials from environment variable or ~/.makai/auth.json
 pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
-    // Try environment variable first (ANTHROPIC_AUTH_TOKEN for OAuth)
-    // Format: "refresh_token:access_token"
+    // 1. Try separate environment variables first (ANTHROPIC_REFRESH_TOKEN and ANTHROPIC_ACCESS_TOKEN)
+    const refresh_result = std.process.getEnvVarOwned(allocator, "ANTHROPIC_REFRESH_TOKEN");
+    const access_result = std.process.getEnvVarOwned(allocator, "ANTHROPIC_ACCESS_TOKEN");
+
+    if (refresh_result) |refresh_token| {
+        if (access_result) |access_token| {
+            return AnthropicOAuthCredentials{
+                .refresh_token = refresh_token,
+                .access_token = access_token,
+            };
+        } else |_| {
+            // Only have refresh token, use it as both (will be refreshed anyway)
+            return AnthropicOAuthCredentials{
+                .refresh_token = refresh_token,
+                .access_token = try allocator.dupe(u8, refresh_token),
+            };
+        }
+    } else |_| {
+        // Clean up access token if we got it but not refresh
+        if (access_result) |access_token| {
+            allocator.free(access_token);
+        } else |_| {}
+    }
+
+    // 2. Try combined format (ANTHROPIC_AUTH_TOKEN with "refresh_token:access_token")
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // Split on the first colon
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
@@ -503,7 +526,7 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
             allocator.free(token);
             return result;
         } else {
-            // Single token format - use as access token only (no refresh token)
+            // 3. Single token format - use as access token only (no refresh token)
             // This is for backwards compatibility
             const result = AnthropicOAuthCredentials{
                 .refresh_token = &[_]u8{},
@@ -512,7 +535,7 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
             return result;
         }
     } else |_| {
-        // Fall back to auth.json
+        // 4. Fall back to auth.json
         return getAnthropicOAuthCredentialsFromAuthFile(allocator);
     }
 }
@@ -577,6 +600,24 @@ fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?Anth
 
 /// Check if Anthropic OAuth provider should be skipped (no credentials)
 pub fn shouldSkipAnthropicOAuth(allocator: std.mem.Allocator) bool {
+    // Check for separate env vars first
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_REFRESH_TOKEN")) |token| {
+        allocator.free(token);
+        return false;
+    } else |_| {}
+
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_ACCESS_TOKEN")) |token| {
+        allocator.free(token);
+        return false;
+    } else |_| {}
+
+    // Check combined format
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+        allocator.free(token);
+        return false;
+    } else |_| {}
+
+    // Fall back to checking credentials file
     const creds = getAnthropicOAuthCredentials(allocator) catch return true;
     if (creds) |c| {
         var mutable_creds = c;

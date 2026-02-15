@@ -33,6 +33,8 @@ jobs:
           GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
           COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_REFRESH_TOKEN: ${{ secrets.ANTHROPIC_REFRESH_TOKEN }}
+          ANTHROPIC_ACCESS_TOKEN: ${{ secrets.ANTHROPIC_ACCESS_TOKEN }}
         run: |
           echo "has_anthropic=$([[ -n "$ANTHROPIC_API_KEY" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_openai=$([[ -n "$OPENAI_API_KEY" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
@@ -41,7 +43,7 @@ jobs:
           echo "has_vertex=$([[ -n "$GOOGLE_VERTEX_PROJECT_ID" && -n "$GOOGLE_APPLICATION_CREDENTIALS" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_bedrock=$([[ -n "$AWS_ACCESS_KEY_ID" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_copilot=$([[ -n "$GH_COPILOT_REFRESH" || -n "$COPILOT_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-          echo "has_anthropic_oauth=$([[ -n "$ANTHROPIC_AUTH_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_anthropic_oauth=$([[ -n "$ANTHROPIC_REFRESH_TOKEN" || -n "$ANTHROPIC_ACCESS_TOKEN" || -n "$ANTHROPIC_AUTH_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
     name: Unit Tests
@@ -322,3 +324,5 @@ jobs:
         run: zig build test-e2e-anthropic-oauth
         env:
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          ANTHROPIC_REFRESH_TOKEN: ${{ secrets.ANTHROPIC_REFRESH_TOKEN }}
+          ANTHROPIC_ACCESS_TOKEN: ${{ secrets.ANTHROPIC_ACCESS_TOKEN }}
