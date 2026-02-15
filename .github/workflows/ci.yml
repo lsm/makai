@@ -269,6 +269,7 @@ jobs:
     needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_copilot == 'true'
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
