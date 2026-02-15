@@ -844,6 +844,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "types", .module = types_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "oauth/github_copilot", .module = oauth_github_copilot_mod },
         },
     });
 

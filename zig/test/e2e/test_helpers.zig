@@ -579,6 +579,49 @@ pub fn getFreshAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?FreshAn
     };
 }
 
+/// GitHub Copilot credentials with fresh Copilot token
+pub const FreshGitHubCopilotCredentials = struct {
+    copilot_token: []const u8,
+    github_token: []const u8,
+
+    pub fn deinit(self: *FreshGitHubCopilotCredentials, allocator: std.mem.Allocator) void {
+        allocator.free(self.copilot_token);
+        allocator.free(self.github_token);
+    }
+};
+
+/// Get GitHub Copilot credentials with a fresh Copilot token
+/// Uses the GitHub token (refresh token) to obtain a fresh Copilot token before running tests
+pub fn getFreshGitHubCopilotCredentials(allocator: std.mem.Allocator) !?FreshGitHubCopilotCredentials {
+    const oauth_github_copilot = @import("oauth/github_copilot");
+
+    const creds = (try getGitHubCopilotCredentials(allocator)) orelse return null;
+    var mutable_creds = creds;
+    defer mutable_creds.deinit(allocator);
+
+    // Use GitHub token to get a fresh Copilot token
+    const fresh_creds = try oauth_github_copilot.refreshToken(.{
+        .refresh = creds.github_token, // GitHub access token (long-lived)
+        .access = creds.copilot_token, // Copilot token (may be expired)
+        .expires = 0, // Will be set by refresh
+    }, allocator);
+    defer {
+        allocator.free(fresh_creds.refresh);
+        allocator.free(fresh_creds.access);
+        if (fresh_creds.provider_data) |pd| allocator.free(pd);
+        if (fresh_creds.enabled_models) |models| {
+            for (models) |m| allocator.free(m);
+            allocator.free(models);
+        }
+        if (fresh_creds.base_url) |url| allocator.free(url);
+    }
+
+    return FreshGitHubCopilotCredentials{
+        .copilot_token = try allocator.dupe(u8, fresh_creds.access),
+        .github_token = try allocator.dupe(u8, fresh_creds.refresh),
+    };
+}
+
 /// Free allocated strings in a MessageEvent
 pub fn freeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) void {
     switch (event) {

@@ -8,7 +8,7 @@ const testing = std.testing;
 
 test "github_copilot: basic text generation" {
     try test_helpers.skipGitHubCopilotTest(testing.allocator);
-    var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getFreshGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.GitHubCopilotConfig{
@@ -43,7 +43,7 @@ test "github_copilot: basic text generation" {
 
 test "github_copilot: streaming events sequence" {
     try test_helpers.skipGitHubCopilotTest(testing.allocator);
-    var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getFreshGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.GitHubCopilotConfig{
@@ -101,7 +101,7 @@ test "github_copilot: streaming events sequence" {
 
 test "github_copilot: usage tracking" {
     try test_helpers.skipGitHubCopilotTest(testing.allocator);
-    var creds = (try test_helpers.getGitHubCopilotCredentials(testing.allocator)).?;
+    var creds = (try test_helpers.getFreshGitHubCopilotCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
     const cfg = config.GitHubCopilotConfig{
