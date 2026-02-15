@@ -484,7 +484,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     });
     defer request.deinit();
 
-    request.transfer_encoding = .{ .content_length = 0 };
+    try request.sendBodiless();
 
     var header_buffer: [4096]u8 = undefined;
     var response = try request.receiveHead(&header_buffer);

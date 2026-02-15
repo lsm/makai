@@ -55,7 +55,7 @@ pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
 /// Print a skip message for GitHub Copilot tests
 pub fn skipGitHubCopilotTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     if (!shouldSkipGitHubCopilot(allocator)) return;
-    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'github_copilot' - no credentials available (set COPILOT_TOKEN)\n", .{});
+    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'github_copilot' - no credentials available (set GH_COPILOT_REFRESH/GH_COPILOT_ACCESS or COPILOT_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
 
