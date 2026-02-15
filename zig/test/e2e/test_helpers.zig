@@ -1,6 +1,90 @@
 const std = @import("std");
 const types = @import("types");
 
+/// Print a skip message to stderr and return SkipZigTest error
+/// This makes skipped tests clearly visible in CI output
+pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{SkipZigTest}!noreturn {
+    // Check if we should skip first
+    if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
+        if (!shouldSkipAnthropic(allocator)) return error.SkipZigTest;
+    } else if (std.ascii.eqlIgnoreCase(provider_name, "github_copilot")) {
+        if (!shouldSkipGitHubCopilot(allocator)) return error.SkipZigTest;
+    } else {
+        if (!shouldSkipProvider(allocator, provider_name)) return error.SkipZigTest;
+    }
+
+    // Print a clear skip message using std.debug.print (prints to stderr)
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available\n", .{provider_name});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Anthropic tests (unified credential check)
+pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipAnthropic(allocator)) return error.SkipZigTest;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic' - no credentials available (set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for GitHub Copilot tests
+pub fn skipGitHubCopilotTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipGitHubCopilot(allocator)) return error.SkipZigTest;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'github_copilot' - no credentials available (set COPILOT_TOKEN)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Azure tests (requires both API key and resource name)
+pub fn skipAzureTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipProvider(allocator, "azure")) return error.SkipZigTest;
+    // Also check for AZURE_RESOURCE_NAME
+    if (std.process.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
+        return error.SkipZigTest; // Has both credentials, don't skip
+    } else |_| {}
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'azure' - no credentials available (set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT/AZURE_RESOURCE_NAME)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Google tests
+pub fn skipGoogleTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipProvider(allocator, "google")) return error.SkipZigTest;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google' - no credentials available (set GOOGLE_API_KEY)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Google Vertex tests
+pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipProvider(allocator, "google_vertex")) return error.SkipZigTest;
+    // Also check for GOOGLE_VERTEX_PROJECT_ID
+    if (std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
+        return error.SkipZigTest; // Has both credentials, don't skip
+    } else |_| {}
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google_vertex' - no credentials available (set GOOGLE_VERTEX_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS)\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Bedrock tests
+pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {} else {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    }
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Ollama tests
+pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    // Ollama doesn't require credentials, just check if server is running
+    _ = allocator;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'ollama' - Ollama server not available\n", .{});
+    return error.SkipZigTest;
+}
+
+/// Print a skip message for Anthropic OAuth tests
+pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
+    if (!shouldSkipAnthropicOAuth(allocator)) return error.SkipZigTest;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_OAUTH_TOKEN)\n", .{});
+    return error.SkipZigTest;
+}
+
 /// Unified Anthropic credential type
 /// OAuth token (from ANTHROPIC_OAUTH_TOKEN) is preferred over API key (from ANTHROPIC_API_KEY)
 pub const AnthropicCredential = struct {

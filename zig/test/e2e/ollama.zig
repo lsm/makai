@@ -7,9 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "ollama: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "ollama")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "ollama");
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
@@ -41,9 +39,7 @@ test "ollama: basic text generation" {
 }
 
 test "ollama: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "ollama")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "ollama");
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
@@ -97,9 +93,7 @@ test "ollama: streaming events sequence" {
 }
 
 test "ollama: tool calling" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "ollama")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "ollama");
 
     const weather_tool = types.Tool{
         .name = "get_weather",
@@ -159,9 +153,7 @@ test "ollama: tool calling" {
 }
 
 test "ollama: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "ollama")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "ollama");
 
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
@@ -213,9 +205,7 @@ test "ollama: abort mid-stream" {
 }
 
 test "ollama: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "ollama")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "ollama");
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
