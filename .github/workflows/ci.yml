@@ -5,6 +5,42 @@ on:
   pull_request:
 
 jobs:
+  check-secrets:
+    name: Check Available Secrets
+    runs-on: ubuntu-latest
+    outputs:
+      has_anthropic: ${{ steps.check.outputs.has_anthropic }}
+      has_openai: ${{ steps.check.outputs.has_openai }}
+      has_google: ${{ steps.check.outputs.has_google }}
+      has_azure: ${{ steps.check.outputs.has_azure }}
+      has_vertex: ${{ steps.check.outputs.has_vertex }}
+      has_bedrock: ${{ steps.check.outputs.has_bedrock }}
+      has_copilot: ${{ steps.check.outputs.has_copilot }}
+      has_anthropic_oauth: ${{ steps.check.outputs.has_anthropic_oauth }}
+    steps:
+      - name: Check which secrets are available
+        id: check
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          GOOGLE_VERTEX_PROJECT_ID: ${{ secrets.GOOGLE_VERTEX_PROJECT_ID }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          COPILOT_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+        run: |
+          echo "has_anthropic=$([[ -n "$ANTHROPIC_API_KEY" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_openai=$([[ -n "$OPENAI_API_KEY" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_google=$([[ -n "$GOOGLE_API_KEY" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_azure=$([[ -n "$AZURE_OPENAI_API_KEY" && -n "$AZURE_OPENAI_ENDPOINT" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_vertex=$([[ -n "$GOOGLE_VERTEX_PROJECT_ID" && -n "$GOOGLE_APPLICATION_CREDENTIALS" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_bedrock=$([[ -n "$AWS_ACCESS_KEY_ID" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_copilot=$([[ -n "$COPILOT_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_anthropic_oauth=$([[ -n "$ANTHROPIC_AUTH_TOKEN" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
@@ -31,9 +67,9 @@ jobs:
 
   e2e-anthropic:
     name: E2E - Anthropic
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_anthropic == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -59,9 +95,9 @@ jobs:
 
   e2e-openai:
     name: E2E - OpenAI
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_openai == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -87,9 +123,9 @@ jobs:
 
   e2e-azure:
     name: E2E - Azure
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_azure == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,9 +152,9 @@ jobs:
 
   e2e-google:
     name: E2E - Google
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_google == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -144,9 +180,9 @@ jobs:
 
   e2e-vertex:
     name: E2E - Google Vertex
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_vertex == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -173,9 +209,9 @@ jobs:
 
   e2e-bedrock:
     name: E2E - AWS Bedrock
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_bedrock == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -205,7 +241,6 @@ jobs:
     name: E2E - Ollama
     needs: unit-tests
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -229,9 +264,9 @@ jobs:
 
   e2e-github-copilot:
     name: E2E - GitHub Copilot
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_copilot == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -257,9 +292,9 @@ jobs:
 
   e2e-anthropic-oauth:
     name: E2E - Anthropic OAuth
-    needs: unit-tests
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_anthropic_oauth == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
