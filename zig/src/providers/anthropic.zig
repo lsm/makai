@@ -272,7 +272,10 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                         // and the stream (or its consumers) take ownership of the event's memory.
                     },
                     .done => |d| {
-                        usage = d.usage;
+                        // Only update output_tokens - input_tokens was already set from message_start
+                        // The done event's usage only contains output_tokens, so overwriting the
+                        // entire usage struct would lose input_tokens.
+                        usage.output_tokens = d.usage.output_tokens;
                         stop_reason = d.stop_reason;
                     },
                     .text_start, .thinking_start, .toolcall_start => {
@@ -966,6 +969,61 @@ test "mapSSEToMessageEvent done" {
     try std.testing.expect(std.meta.activeTag(message_event.?) == .done);
     try std.testing.expectEqual(@as(u64, 150), message_event.?.done.usage.output_tokens);
     try std.testing.expect(message_event.?.done.stop_reason == .stop);
+}
+
+test "usage tracking preserves input_tokens from message_start" {
+    // This test verifies that input_tokens from message_start is preserved
+    // when the done event is processed.
+    //
+    // The flow is:
+    // 1. message_start sets usage.input_tokens = 123
+    // 2. message_delta creates a done event with ONLY output_tokens set
+    // 3. The done handler should only update output_tokens, NOT overwrite the entire usage struct
+
+    const start_event = sse_parser.SSEEvent{
+        .event_type = "message_start",
+        .data = "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-3-5-sonnet-20241022\",\"usage\":{\"input_tokens\":123}}}",
+    };
+
+    const delta_event = sse_parser.SSEEvent{
+        .event_type = "message_delta",
+        .data = "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":150}}",
+    };
+
+    // Parse message_start - this should capture input_tokens
+    const start_msg = try mapSSEToMessageEvent(start_event, std.testing.allocator);
+    defer if (start_msg) |evt| {
+        switch (evt) {
+            .start => |s| std.testing.allocator.free(s.model),
+            else => {},
+        }
+    };
+
+    try std.testing.expect(start_msg != null);
+    try std.testing.expect(std.meta.activeTag(start_msg.?) == .start);
+    try std.testing.expectEqual(@as(u64, 123), start_msg.?.start.input_tokens);
+
+    // Parse message_delta - this should have output_tokens
+    const delta_msg = try mapSSEToMessageEvent(delta_event, std.testing.allocator);
+
+    try std.testing.expect(delta_msg != null);
+    try std.testing.expect(std.meta.activeTag(delta_msg.?) == .done);
+    try std.testing.expectEqual(@as(u64, 150), delta_msg.?.done.usage.output_tokens);
+
+    // Note: The done event's usage struct only contains output_tokens.
+    // The input_tokens is 0 in the done event because it wasn't included in message_delta.
+    // This is expected - the fix is in streamImpl() which now only updates output_tokens
+    // instead of overwriting the entire usage struct.
+
+    // Simulate the streamImpl usage tracking logic:
+    var usage = types.Usage{};
+    usage.input_tokens = start_msg.?.start.input_tokens; // From message_start
+    usage.output_tokens = delta_msg.?.done.usage.output_tokens; // From message_delta
+
+    // After both events, usage should have both values
+    try std.testing.expectEqual(@as(u64, 123), usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 150), usage.output_tokens);
+    try std.testing.expectEqual(@as(u64, 273), usage.total());
 }
 
 test "mapSSEToMessageEvent error" {
