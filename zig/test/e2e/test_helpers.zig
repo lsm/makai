@@ -1,17 +1,20 @@
 const std = @import("std");
 const types = @import("types");
 
-/// Print a skip message to stderr and return SkipZigTest error
-/// This makes skipped tests clearly visible in CI output
-pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{SkipZigTest}!noreturn {
-    // Check if we should skip first
-    if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
-        if (!shouldSkipAnthropic(allocator)) return error.SkipZigTest;
-    } else if (std.ascii.eqlIgnoreCase(provider_name, "github_copilot")) {
-        if (!shouldSkipGitHubCopilot(allocator)) return error.SkipZigTest;
-    } else {
-        if (!shouldSkipProvider(allocator, provider_name)) return error.SkipZigTest;
-    }
+/// Print a skip message to stderr and return SkipZigTest error if credentials are missing.
+/// Returns successfully (void) if credentials exist, allowing the test to proceed.
+/// This makes skipped tests clearly visible in CI output.
+pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{SkipZigTest}!void {
+    // Check if we should skip (i.e., no credentials available)
+    const should_skip: bool = if (std.ascii.eqlIgnoreCase(provider_name, "anthropic"))
+        shouldSkipAnthropic(allocator)
+    else if (std.ascii.eqlIgnoreCase(provider_name, "github_copilot"))
+        shouldSkipGitHubCopilot(allocator)
+    else
+        shouldSkipProvider(allocator, provider_name);
+
+    // If credentials exist, don't skip - let the test proceed
+    if (!should_skip) return;
 
     // Print a clear skip message using std.debug.print (prints to stderr)
     // Include the expected env var name for common providers
@@ -28,68 +31,93 @@ pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{S
 }
 
 /// Print a skip message for Anthropic tests (unified credential check)
-pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipAnthropic(allocator)) return error.SkipZigTest;
+pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipAnthropic(allocator)) return;
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic' - no credentials available (set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for GitHub Copilot tests
-pub fn skipGitHubCopilotTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipGitHubCopilot(allocator)) return error.SkipZigTest;
+pub fn skipGitHubCopilotTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipGitHubCopilot(allocator)) return;
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'github_copilot' - no credentials available (set COPILOT_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Azure tests (requires both API key and resource name)
-pub fn skipAzureTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipProvider(allocator, "azure")) return error.SkipZigTest;
-    // Also check for AZURE_RESOURCE_NAME
-    if (std.process.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
-        return error.SkipZigTest; // Has both credentials, don't skip
-    } else |_| {}
+pub fn skipAzureTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Check for AZURE_OPENAI_API_KEY
+    if (!shouldSkipProvider(allocator, "azure")) {
+        // Has API key, check for AZURE_RESOURCE_NAME or AZURE_OPENAI_ENDPOINT
+        if (std.process.getEnvVarOwned(allocator, "AZURE_OPENAI_ENDPOINT")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+        if (std.process.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+    }
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'azure' - no credentials available (set AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT/AZURE_RESOURCE_NAME)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Google tests
-pub fn skipGoogleTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipProvider(allocator, "google")) return error.SkipZigTest;
+pub fn skipGoogleTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipProvider(allocator, "google")) return;
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google' - no credentials available (set GOOGLE_API_KEY)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Google Vertex tests
-pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipProvider(allocator, "google_vertex")) return error.SkipZigTest;
-    // Also check for GOOGLE_VERTEX_PROJECT_ID
-    if (std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
-        return error.SkipZigTest; // Has both credentials, don't skip
-    } else |_| {}
+pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Check for GOOGLE_APPLICATION_CREDENTIALS
+    if (!shouldSkipProvider(allocator, "google_vertex")) {
+        // Has credentials, check for GOOGLE_VERTEX_PROJECT_ID
+        if (std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
+            return; // Has both credentials, don't skip
+        } else |_| {}
+    }
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'google_vertex' - no credentials available (set GOOGLE_VERTEX_PROJECT_ID and GOOGLE_APPLICATION_CREDENTIALS)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Bedrock tests
-pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {} else {
-        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
-        return error.SkipZigTest;
-    }
+pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {
+        return; // Has credentials, don't skip
+    } else |_| {}
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Ollama tests
-pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    // Ollama doesn't require credentials, just check if server is running
+pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    // Ollama doesn't require credentials, check if server is running
+    // by attempting to connect to the default Ollama endpoint
     _ = allocator;
-    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'ollama' - Ollama server not available\n", .{});
+    const OllamaChecker = struct {
+        fn isServerRunning() bool {
+            // Try to connect to Ollama's default endpoint
+            const socket = std.posix.socket(
+                std.posix.AF.INET,
+                std.posix.SOCK.STREAM,
+                0
+            ) catch return false;
+            defer std.posix.close(socket);
+
+            const addr = std.net.Address.parseIp("127.0.0.1", 11434) catch return false;
+            std.posix.connect(socket, &addr.any, addr.getOsSockLen()) catch return false;
+            return true;
+        }
+    };
+
+    if (OllamaChecker.isServerRunning()) return;
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'ollama' - Ollama server not available (start with: ollama serve)\n", .{});
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Anthropic OAuth tests
-pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
-    if (!shouldSkipAnthropicOAuth(allocator)) return error.SkipZigTest;
+pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
+    if (!shouldSkipAnthropicOAuth(allocator)) return;
     std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_AUTH_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
