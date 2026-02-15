@@ -505,15 +505,25 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
     defer allocator.free(response_body);
 
-    // Parse JSON response
-    const parsed = try std.json.parseFromSlice(
+    // Parse JSON response (expected format: {"token": "..."})
+    const parsed = std.json.parseFromSlice(
         struct {
             token: []const u8,
         },
         allocator,
         response_body,
         .{ .ignore_unknown_fields = true },
-    );
+    ) catch {
+        // Some endpoints may return the raw token string directly instead of JSON.
+        // Accept token-like payloads as a fallback.
+        const trimmed = std.mem.trim(u8, response_body, " \r\n\t\"");
+        if (std.mem.indexOf(u8, trimmed, "tid=") != null or
+            std.mem.indexOf(u8, trimmed, "proxy-ep=") != null)
+        {
+            return try allocator.dupe(u8, trimmed);
+        }
+        return error.CopilotTokenFailed;
+    };
     defer parsed.deinit();
 
     return try allocator.dupe(u8, parsed.value.token);
