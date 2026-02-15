@@ -464,7 +464,7 @@ test "google: abort mid-stream" {
     // In both cases, we should have received at least some events.
     try testing.expect(event_count > 0);
 
-    test_helpers.testStep("Received {} events before {}", .{ event_count, if (event_count >= max_events) "cancel" else "completion" });
+    test_helpers.testStep("Received {} events before {s}", .{ event_count, if (event_count >= max_events) "cancel" else "completion" });
 
     // If we cancelled, verify the token is marked as cancelled
     if (event_count >= max_events) {

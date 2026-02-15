@@ -7,7 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "ollama: basic text generation" {
-    try test_helpers.skipTest(testing.allocator, "ollama");
+    try test_helpers.skipOllamaTest(testing.allocator);
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
@@ -39,7 +39,7 @@ test "ollama: basic text generation" {
 }
 
 test "ollama: streaming events sequence" {
-    try test_helpers.skipTest(testing.allocator, "ollama");
+    try test_helpers.skipOllamaTest(testing.allocator);
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
@@ -93,7 +93,7 @@ test "ollama: streaming events sequence" {
 }
 
 test "ollama: tool calling" {
-    try test_helpers.skipTest(testing.allocator, "ollama");
+    try test_helpers.skipOllamaTest(testing.allocator);
 
     const weather_tool = types.Tool{
         .name = "get_weather",
@@ -153,7 +153,7 @@ test "ollama: tool calling" {
 }
 
 test "ollama: abort mid-stream" {
-    try test_helpers.skipTest(testing.allocator, "ollama");
+    try test_helpers.skipOllamaTest(testing.allocator);
 
     var cancelled = std.atomic.Value(bool).init(false);
     const cancel_token = config.CancelToken{ .cancelled = &cancelled };
@@ -205,7 +205,7 @@ test "ollama: abort mid-stream" {
 }
 
 test "ollama: usage tracking" {
-    try test_helpers.skipTest(testing.allocator, "ollama");
+    try test_helpers.skipOllamaTest(testing.allocator);
 
     const cfg = config.OllamaConfig{
         .model = "llama3.2",
