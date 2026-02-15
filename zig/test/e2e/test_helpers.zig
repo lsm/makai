@@ -14,14 +14,23 @@ pub fn skipTest(allocator: std.mem.Allocator, provider_name: []const u8) error{S
     }
 
     // Print a clear skip message using std.debug.print (prints to stderr)
-    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available\n", .{provider_name});
+    // Include the expected env var name for common providers
+    if (std.ascii.eqlIgnoreCase(provider_name, "openai")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set OPENAI_API_KEY)\n", .{provider_name});
+    } else if (std.ascii.eqlIgnoreCase(provider_name, "google")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set GOOGLE_API_KEY)\n", .{provider_name});
+    } else if (std.ascii.eqlIgnoreCase(provider_name, "anthropic")) {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available (set ANTHROPIC_API_KEY, ANTHROPIC_OAUTH_TOKEN, or ANTHROPIC_AUTH_TOKEN)\n", .{provider_name});
+    } else {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for '{s}' - no credentials available\n", .{provider_name});
+    }
     return error.SkipZigTest;
 }
 
 /// Print a skip message for Anthropic tests (unified credential check)
 pub fn skipAnthropicTest(allocator: std.mem.Allocator) error{SkipZigTest}!noreturn {
     if (!shouldSkipAnthropic(allocator)) return error.SkipZigTest;
-    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic' - no credentials available (set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN)\n", .{});
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'anthropic' - no credentials available (set ANTHROPIC_API_KEY, ANTHROPIC_OAUTH_TOKEN, or ANTHROPIC_AUTH_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
 
@@ -98,8 +107,9 @@ pub const AnthropicCredential = struct {
 
 /// Get the best available Anthropic credential with precedence:
 /// 1. ANTHROPIC_OAUTH_TOKEN (highest - OAuth token)
-/// 2. ANTHROPIC_API_KEY (API key)
-/// 3. ~/.makai/auth.json (fallback)
+/// 2. ANTHROPIC_AUTH_TOKEN (alternative OAuth token name used by pi-mono)
+/// 3. ANTHROPIC_API_KEY (API key)
+/// 4. ~/.makai/auth.json (fallback)
 pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredential {
     // 1. Try ANTHROPIC_OAUTH_TOKEN first (highest precedence)
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_OAUTH_TOKEN")) |token| {
@@ -121,7 +131,26 @@ pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredentia
         }
     } else |_| {}
 
-    // 2. Try ANTHROPIC_API_KEY
+    // 2. Try ANTHROPIC_AUTH_TOKEN (alternative name used by pi-mono)
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+        // OAuth token format: "refresh_token:access_token" or just "access_token"
+        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+            const access_token = try allocator.dupe(u8, token[colon_pos + 1 ..]);
+            allocator.free(token);
+            return AnthropicCredential{
+                .token = access_token,
+                .is_oauth = true,
+            };
+        } else {
+            // Single token format - use as OAuth token
+            return AnthropicCredential{
+                .token = token,
+                .is_oauth = true,
+            };
+        }
+    } else |_| {}
+
+    // 3. Try ANTHROPIC_API_KEY
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
         return AnthropicCredential{
             .token = key,
@@ -129,7 +158,7 @@ pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredentia
         };
     } else |_| {}
 
-    // 3. Fall back to auth.json
+    // 4. Fall back to auth.json
     return getAnthropicCredentialFromAuthFile(allocator);
 }
 
