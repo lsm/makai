@@ -281,4 +281,4 @@ jobs:
         working-directory: zig
         run: zig build test-e2e-anthropic-oauth
         env:
-          ANTHROPIC_OAUTH_TOKEN: ${{ secrets.ANTHROPIC_OAUTH_TOKEN }}
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
