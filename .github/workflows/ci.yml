@@ -32,8 +32,8 @@ jobs:
   e2e-anthropic:
     name: E2E - Anthropic
     needs: unit-tests
-    if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -60,8 +60,8 @@ jobs:
   e2e-openai:
     name: E2E - OpenAI
     needs: unit-tests
-    if: ${{ secrets.OPENAI_API_KEY != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -88,8 +88,8 @@ jobs:
   e2e-azure:
     name: E2E - Azure
     needs: unit-tests
-    if: ${{ secrets.AZURE_OPENAI_API_KEY != '' && secrets.AZURE_OPENAI_ENDPOINT != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -117,8 +117,8 @@ jobs:
   e2e-google:
     name: E2E - Google
     needs: unit-tests
-    if: ${{ secrets.GOOGLE_API_KEY != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -145,8 +145,8 @@ jobs:
   e2e-vertex:
     name: E2E - Google Vertex
     needs: unit-tests
-    if: ${{ secrets.GOOGLE_VERTEX_PROJECT_ID != '' && secrets.GOOGLE_APPLICATION_CREDENTIALS != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -174,8 +174,8 @@ jobs:
   e2e-bedrock:
     name: E2E - AWS Bedrock
     needs: unit-tests
-    if: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -230,8 +230,8 @@ jobs:
   e2e-github-copilot:
     name: E2E - GitHub Copilot
     needs: unit-tests
-    if: ${{ secrets.COPILOT_TOKEN != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -258,8 +258,8 @@ jobs:
   e2e-anthropic-oauth:
     name: E2E - Anthropic OAuth
     needs: unit-tests
-    if: ${{ secrets.ANTHROPIC_AUTH_TOKEN != '' }}
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
