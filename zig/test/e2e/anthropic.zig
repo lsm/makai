@@ -7,9 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "anthropic: basic text generation" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;
@@ -46,9 +44,7 @@ test "anthropic: basic text generation" {
 }
 
 test "anthropic: streaming events sequence" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;
@@ -111,9 +107,7 @@ test "anthropic: streaming events sequence" {
 }
 
 test "anthropic: thinking mode" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;
@@ -168,9 +162,7 @@ test "anthropic: thinking mode" {
 }
 
 test "anthropic: tool calling" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;
@@ -244,9 +236,7 @@ test "anthropic: tool calling" {
 }
 
 test "anthropic: abort mid-stream" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;
@@ -305,9 +295,7 @@ test "anthropic: abort mid-stream" {
 }
 
 test "anthropic: usage tracking" {
-    if (test_helpers.shouldSkipAnthropic(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const cred = (try test_helpers.getAnthropicCredential(testing.allocator)).?;
     defer {
         var mutable_cred = cred;

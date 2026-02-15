@@ -7,9 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "openai: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -43,9 +41,7 @@ test "openai: basic text generation" {
 }
 
 test "openai: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -106,6 +102,7 @@ test "openai: reasoning mode" {
     // The extended thinking happens server-side and only the final answer is returned.
     // This is unlike Anthropic Claude which emits thinking_start/thinking_delta events.
     // Skip this test since it will never pass with OpenAI's API.
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: openai: reasoning mode - OpenAI doesn't emit thinking events\n", .{});
     return error.SkipZigTest;
 }
 
@@ -113,13 +110,12 @@ test "openai: tool calling" {
     // Non-deterministic: Models may choose to respond with text instead of calling tools.
     // The tool calling implementation is verified by unit tests in openai.zig
     // that mock SSE events with tool_calls data.
+    std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: openai: tool calling - non-deterministic test\n", .{});
     return error.SkipZigTest;
 }
 
 test "openai: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -174,9 +170,7 @@ test "openai: abort mid-stream" {
 }
 
 test "openai: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 

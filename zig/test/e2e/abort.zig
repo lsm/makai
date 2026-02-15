@@ -8,9 +8,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "abort: anthropic cancellation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -61,9 +59,7 @@ test "abort: anthropic cancellation" {
 }
 
 test "abort: openai cancellation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 
@@ -114,9 +110,7 @@ test "abort: openai cancellation" {
 }
 
 test "abort: immediate cancellation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "anthropic")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicTest(testing.allocator);
     const api_key = (try test_helpers.getApiKey(testing.allocator, "anthropic")).?;
     defer testing.allocator.free(api_key);
 
@@ -155,9 +149,7 @@ test "abort: immediate cancellation" {
 }
 
 test "abort: multiple cancellation calls" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "openai")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipTest(testing.allocator, "openai");
     const api_key = (try test_helpers.getApiKey(testing.allocator, "openai")).?;
     defer testing.allocator.free(api_key);
 

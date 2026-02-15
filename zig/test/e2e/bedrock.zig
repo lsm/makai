@@ -33,7 +33,10 @@ fn freeBedrockAuth(allocator: std.mem.Allocator, auth: bedrock.BedrockAuth) void
 }
 
 test "bedrock: basic text generation" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const cfg = bedrock.BedrockConfig{
@@ -67,7 +70,10 @@ test "bedrock: basic text generation" {
 }
 
 test "bedrock: streaming events sequence" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const cfg = bedrock.BedrockConfig{
@@ -123,7 +129,10 @@ test "bedrock: streaming events sequence" {
 }
 
 test "bedrock: thinking mode" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const cfg = bedrock.BedrockConfig{
@@ -177,7 +186,10 @@ test "bedrock: thinking mode" {
 }
 
 test "bedrock: tool calling" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const weather_tool = types.Tool{
@@ -247,7 +259,10 @@ test "bedrock: tool calling" {
 }
 
 test "bedrock: prompt caching" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const cfg = bedrock.BedrockConfig{
@@ -288,7 +303,10 @@ test "bedrock: prompt caching" {
 }
 
 test "bedrock: abort mid-stream" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     var cancelled = std.atomic.Value(bool).init(false);
@@ -342,7 +360,10 @@ test "bedrock: abort mid-stream" {
 }
 
 test "bedrock: usage tracking" {
-    const auth = (try getBedrockAuth(testing.allocator)) orelse return error.SkipZigTest;
+    const auth = (try getBedrockAuth(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
+        return error.SkipZigTest;
+    };
     defer freeBedrockAuth(testing.allocator, auth);
 
     const cfg = bedrock.BedrockConfig{

@@ -19,13 +19,14 @@ fn getAzureResource(allocator: std.mem.Allocator) !?[]const u8 {
 }
 
 test "azure: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: basic text generation - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     const cfg = config.AzureConfig{
@@ -59,13 +60,14 @@ test "azure: basic text generation" {
 }
 
 test "azure: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: streaming events sequence - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     const cfg = config.AzureConfig{
@@ -122,13 +124,14 @@ test "azure: streaming events sequence" {
 }
 
 test "azure: reasoning mode" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: reasoning mode - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     const cfg = config.AzureConfig{
@@ -180,13 +183,14 @@ test "azure: reasoning mode" {
 }
 
 test "azure: tool calling" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: tool calling - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     const weather_tool = types.Tool{
@@ -257,13 +261,14 @@ test "azure: tool calling" {
 }
 
 test "azure: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: abort mid-stream - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     var cancelled = std.atomic.Value(bool).init(false);
@@ -318,13 +323,14 @@ test "azure: abort mid-stream" {
 }
 
 test "azure: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "azure")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAzureTest(testing.allocator);
     const api_key = (try getAzureKey(testing.allocator)).?;
     defer testing.allocator.free(api_key);
 
-    const resource = (try getAzureResource(testing.allocator)) orelse return error.SkipZigTest;
+    const resource = (try getAzureResource(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: azure: usage tracking - no AZURE_RESOURCE_NAME\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(resource);
 
     const cfg = config.AzureConfig{

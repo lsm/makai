@@ -20,13 +20,14 @@ fn getVertexProject(allocator: std.mem.Allocator) !?[]const u8 {
 }
 
 test "google_vertex: basic text generation" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: basic text generation - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     const cfg = google_vertex.GoogleVertexConfig{
@@ -62,13 +63,14 @@ test "google_vertex: basic text generation" {
 }
 
 test "google_vertex: streaming events sequence" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: streaming events sequence - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     const cfg = google_vertex.GoogleVertexConfig{
@@ -126,13 +128,14 @@ test "google_vertex: streaming events sequence" {
 }
 
 test "google_vertex: thinking mode" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: thinking mode - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     const cfg = google_vertex.GoogleVertexConfig{
@@ -188,13 +191,14 @@ test "google_vertex: thinking mode" {
 }
 
 test "google_vertex: tool calling" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: tool calling - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     const weather_tool = types.Tool{
@@ -266,13 +270,14 @@ test "google_vertex: tool calling" {
 }
 
 test "google_vertex: abort mid-stream" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: abort mid-stream - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     var cancelled = std.atomic.Value(bool).init(false);
@@ -328,13 +333,14 @@ test "google_vertex: abort mid-stream" {
 }
 
 test "google_vertex: usage tracking" {
-    if (test_helpers.shouldSkipProvider(testing.allocator, "google_vertex")) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipGoogleVertexTest(testing.allocator);
     const token = (try getVertexToken(testing.allocator)).?;
     defer testing.allocator.free(token);
 
-    const project = (try getVertexProject(testing.allocator)) orelse return error.SkipZigTest;
+    const project = (try getVertexProject(testing.allocator)) orelse {
+        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google_vertex: usage tracking - no GOOGLE_VERTEX_PROJECT_ID\n", .{});
+        return error.SkipZigTest;
+    };
     defer testing.allocator.free(project);
 
     const cfg = google_vertex.GoogleVertexConfig{

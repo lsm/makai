@@ -7,9 +7,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 test "anthropic_oauth: basic text generation" {
-    if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicOAuthTest(testing.allocator);
     var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
@@ -43,9 +41,7 @@ test "anthropic_oauth: basic text generation" {
 }
 
 test "anthropic_oauth: streaming events sequence" {
-    if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicOAuthTest(testing.allocator);
     var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
@@ -105,9 +101,7 @@ test "anthropic_oauth: streaming events sequence" {
 }
 
 test "anthropic_oauth: usage tracking" {
-    if (test_helpers.shouldSkipAnthropicOAuth(testing.allocator)) {
-        return error.SkipZigTest;
-    }
+    try test_helpers.skipAnthropicOAuthTest(testing.allocator);
     var creds = (try test_helpers.getAnthropicOAuthCredentials(testing.allocator)).?;
     defer creds.deinit(testing.allocator);
 
