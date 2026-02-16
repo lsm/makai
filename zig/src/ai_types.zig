@@ -175,9 +175,7 @@ pub const AssistantMessage = struct {
             }
         }
         allocator.free(self.content);
-        allocator.free(self.api);
-        allocator.free(self.provider);
-        allocator.free(self.model);
+        // Note: .api, .provider, and .model are borrowed references from Model config, not owned
         if (self.error_message) |e| allocator.free(e);
     }
 };
@@ -293,22 +291,13 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         cloned_count += 1;
     }
 
-    const api = try allocator.dupe(u8, msg.api);
-    errdefer allocator.free(api);
-
-    const provider = try allocator.dupe(u8, msg.provider);
-    errdefer allocator.free(provider);
-
-    const model_id = try allocator.dupe(u8, msg.model);
-    errdefer allocator.free(model_id);
-
     const error_msg = if (msg.error_message) |e| try allocator.dupe(u8, e) else null;
 
     return .{
         .content = content,
-        .api = api,
-        .provider = provider,
-        .model = model_id,
+        .api = msg.api, // Borrowed reference, not owned
+        .provider = msg.provider, // Borrowed reference, not owned
+        .model = msg.model, // Borrowed reference, not owned
         .usage = msg.usage,
         .stop_reason = msg.stop_reason,
         .error_message = error_msg,

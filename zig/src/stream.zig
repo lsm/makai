@@ -84,9 +84,9 @@ fn mockStream(
 
     const result = ai_types.AssistantMessage{
         .content = result_content,
-        .api = try allocator.dupe(u8, "openai-completions"),
-        .provider = try allocator.dupe(u8, "openai"),
-        .model = try allocator.dupe(u8, "gpt-4o"),
+        .api = "openai-completions", // Borrowed reference
+        .provider = "openai", // Borrowed reference
+        .model = "gpt-4o", // Borrowed reference
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = 1,
