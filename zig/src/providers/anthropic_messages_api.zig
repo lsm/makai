@@ -6,10 +6,8 @@ const json_writer = @import("json_writer");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
-    // Check multiple env vars in priority order
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_ACCESS_TOKEN")) |key| return key else |_| {}
     return null;
 }
 
