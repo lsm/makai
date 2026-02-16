@@ -262,9 +262,9 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = ctx.allocator.dupe(u8, ctx.model.api) catch return ctx.stream.completeWithError("oom"),
-        .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch return ctx.stream.completeWithError("oom"),
-        .model = ctx.allocator.dupe(u8, ctx.model.id) catch return ctx.stream.completeWithError("oom"),
+        .api = ctx.model.api,
+        .provider = ctx.model.provider,
+        .model = ctx.model.id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
