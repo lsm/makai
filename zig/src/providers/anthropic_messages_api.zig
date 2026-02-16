@@ -240,6 +240,37 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
             try w.endArray();
             try w.endObject();
+        } else if (m == .tool_result) {
+            // Tool result messages must be serialized as user messages with tool_result content blocks
+            const tr = m.tool_result;
+
+            try w.beginObject();
+            try w.writeStringField("role", "user");
+            try w.writeKey("content");
+            try w.beginArray();
+
+            try w.beginObject();
+            try w.writeStringField("type", "tool_result");
+            try w.writeStringField("tool_use_id", tr.tool_call_id);
+
+            // Serialize content - can be a string or array of content blocks
+            // For simplicity, extract text content and serialize as string
+            var text = std.ArrayList(u8){};
+            defer text.deinit(allocator);
+            for (tr.content) |c| switch (c) {
+                .text => |t| {
+                    if (text.items.len > 0) try text.append(allocator, '\n');
+                    try text.appendSlice(allocator, t.text);
+                },
+                .image => {},
+            };
+
+            try w.writeStringField("content", text.items);
+            try w.writeBoolField("is_error", tr.is_error);
+            try w.endObject();
+
+            try w.endArray();
+            try w.endObject();
         } else if (is_last_user and cache_control != null) {
             // For the last user message with cache_control, use content array format
             var text = std.ArrayList(u8){};
@@ -1085,6 +1116,109 @@ test "buildRequestBody includes ttl for long retention on anthropic url" {
 
     // Verify ttl is included for long retention
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
+}
+
+test "buildRequestBody serializes tool_result as tool_result content block" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "Tool execution result" } },
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "Use the tool" }, .timestamp = 0 } },
+        .{ .assistant = .{ .content = &.{
+            .{ .tool_call = .{ .id = "toolu_123", .name = "bash", .arguments_json = "{\"cmd\": \"ls\"}" } },
+        }, .api = "anthropic-messages", .provider = "anthropic", .model = "claude-3-5-sonnet-20241022", .usage = .{}, .stop_reason = .tool_use, .timestamp = 0 } },
+        .{ .tool_result = .{ .tool_call_id = "toolu_123", .tool_name = "bash", .content = &tool_result_content, .is_error = false, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "You are a helpful assistant.",
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator, false);
+    defer allocator.free(body);
+
+    // Parse to verify structure
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const msg_array = parsed.value.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 3), msg_array.items.len);
+
+    // Tool result message should have role "user"
+    const tool_result_msg = msg_array.items[2];
+    try std.testing.expectEqualStrings("user", tool_result_msg.object.get("role").?.string);
+
+    // Content should be an array
+    const content = tool_result_msg.object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expectEqual(@as(usize, 1), content.array.items.len);
+
+    // Verify tool_result content block structure
+    const tool_result_block = content.array.items[0];
+    try std.testing.expectEqualStrings("tool_result", tool_result_block.object.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_123", tool_result_block.object.get("tool_use_id").?.string);
+    try std.testing.expectEqualStrings("Tool execution result", tool_result_block.object.get("content").?.string);
+    try std.testing.expectEqual(false, tool_result_block.object.get("is_error").?.bool);
+}
+
+test "buildRequestBody serializes tool_result with is_error=true" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "Error: command failed" } },
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{ .tool_call_id = "toolu_456", .tool_name = "bash", .content = &tool_result_content, .is_error = true, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator, false);
+    defer allocator.free(body);
+
+    // Verify is_error is true
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\":true") != null);
 }
 
 test "buildRequestBody adds cache_control to last user message" {

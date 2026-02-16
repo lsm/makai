@@ -59,6 +59,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "function");
                 try w.writeStringField("name", tool.name);
                 try w.writeStringField("description", tool.description);
+                try w.writeBoolField("strict", true);
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
                 try w.endObject();

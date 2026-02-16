@@ -48,6 +48,26 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
+
+    // Add tools if present
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            try w.writeKey("tools");
+            try w.beginArray();
+            for (tools) |tool| {
+                try w.beginObject();
+                try w.writeStringField("type", "function");
+                try w.writeStringField("name", tool.name);
+                try w.writeStringField("description", tool.description);
+                try w.writeBoolField("strict", true);
+                try w.writeKey("parameters");
+                try w.writeRawJson(tool.parameters_schema_json);
+                try w.endObject();
+            }
+            try w.endArray();
+        }
+    }
+
     try w.writeBoolField("stream", true);
     try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
 
@@ -61,20 +81,88 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     }
 
     for (context.messages) |m| {
-        var text = std.ArrayList(u8){};
-        defer text.deinit(allocator);
-        try appendMessageText(m, &text, allocator);
+        switch (m) {
+            .user => |u| {
+                try w.beginObject();
+                try w.writeStringField("type", "message");
+                try w.writeStringField("role", "user");
 
-        const role: []const u8 = switch (m) {
-            .assistant => "assistant",
-            .tool_result => "tool",
-            else => "user",
-        };
-
-        try w.beginObject();
-        try w.writeStringField("role", role);
-        try w.writeStringField("content", text.items);
-        try w.endObject();
+                // Handle content
+                switch (u.content) {
+                    .text => |t| {
+                        try w.writeStringField("content", t);
+                    },
+                    .parts => |parts| {
+                        try w.writeKey("content");
+                        try w.beginArray();
+                        for (parts) |p| {
+                            switch (p) {
+                                .text => |t| {
+                                    try w.beginObject();
+                                    try w.writeStringField("type", "input_text");
+                                    try w.writeStringField("text", t.text);
+                                    try w.endObject();
+                                },
+                                .image => |img| {
+                                    try w.beginObject();
+                                    try w.writeStringField("type", "input_image");
+                                    try w.writeStringField("image_url", img.data);
+                                    try w.endObject();
+                                },
+                            }
+                        }
+                        try w.endArray();
+                    },
+                }
+                try w.endObject();
+            },
+            .assistant => |a| {
+                // Output each content item as appropriate type
+                for (a.content) |c| {
+                    switch (c) {
+                        .text => |t| {
+                            try w.beginObject();
+                            try w.writeStringField("type", "message");
+                            try w.writeStringField("role", "assistant");
+                            try w.writeStringField("content", t.text);
+                            try w.endObject();
+                        },
+                        .thinking => |t| {
+                            // Thinking content - skip or handle as needed
+                            _ = t;
+                        },
+                        .tool_call => |tc| {
+                            // Output as function_call item
+                            try w.beginObject();
+                            try w.writeStringField("type", "function_call");
+                            try w.writeStringField("call_id", tc.id);
+                            try w.writeStringField("name", tc.name);
+                            try w.writeStringField("arguments", tc.arguments_json);
+                            try w.endObject();
+                        },
+                    }
+                }
+            },
+            .tool_result => |tr| {
+                // Output as function_call_output
+                var result_text = std.ArrayList(u8){};
+                defer result_text.deinit(allocator);
+                for (tr.content) |c| {
+                    switch (c) {
+                        .text => |t| {
+                            if (result_text.items.len > 0) try result_text.append(allocator, '\n');
+                            try result_text.appendSlice(allocator, t.text);
+                        },
+                        .image => {},
+                    }
+                }
+                try w.beginObject();
+                try w.writeStringField("type", "function_call_output");
+                try w.writeStringField("call_id", tr.tool_call_id);
+                try w.writeStringField("output", result_text.items);
+                try w.endObject();
+            },
+        }
     }
 
     try w.endArray();

@@ -156,13 +156,19 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                 try w.writeStringField("name", tr.tool_name);
                 try w.writeKey("response");
                 try w.beginObject();
-                // Serialize content parts as the response
+                // Serialize content parts as the response.
+                // To avoid duplicate "result" fields, capture the last text part
+                // and write it once.
+                var last_text: ?[]const u8 = null;
                 for (tr.content) |c| switch (c) {
                     .text => |t| {
-                        try w.writeStringField("result", t.text);
+                        last_text = t.text;
                     },
                     .image => {},
                 };
+                if (last_text) |text| {
+                    try w.writeStringField("result", text);
+                }
                 // Include details_json if present
                 if (tr.details_json) |dj| {
                     try w.writeKey("details");

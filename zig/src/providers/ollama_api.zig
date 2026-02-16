@@ -28,14 +28,7 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
                 if (out.items.len > 0) try out.append(allocator, '\n');
                 try out.appendSlice(allocator, t.thinking);
             },
-            .tool_call => |tc| {
-                if (out.items.len > 0) try out.append(allocator, '\n');
-                try out.appendSlice(allocator, "[TOOL_CALL: ");
-                try out.appendSlice(allocator, tc.name);
-                try out.appendSlice(allocator, "(");
-                try out.appendSlice(allocator, tc.arguments_json);
-                try out.appendSlice(allocator, ")]");
-            },
+            .tool_call => {},
         },
         .tool_result => |tr| for (tr.content) |c| switch (c) {
             .text => |t| {
@@ -81,6 +74,37 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
         try w.beginObject();
         try w.writeStringField("role", role);
         try w.writeStringField("content", text.items);
+
+        // Check for tool_calls on assistant messages
+        if (m == .assistant) {
+            var has_tool_calls = false;
+            for (m.assistant.content) |c| {
+                if (c == .tool_call) {
+                    has_tool_calls = true;
+                    break;
+                }
+            }
+            if (has_tool_calls) {
+                try w.writeKey("tool_calls");
+                try w.beginArray();
+                for (m.assistant.content) |c| {
+                    if (c == .tool_call) {
+                        const tc = c.tool_call;
+                        try w.beginObject();
+                        try w.writeStringField("id", tc.id);
+                        try w.writeStringField("type", "function");
+                        try w.writeKey("function");
+                        try w.beginObject();
+                        try w.writeStringField("name", tc.name);
+                        try w.writeStringField("arguments", tc.arguments_json);
+                        try w.endObject();
+                        try w.endObject();
+                    }
+                }
+                try w.endArray();
+            }
+        }
+
         try w.endObject();
     }
 
