@@ -303,13 +303,13 @@ const CurrentBlock = enum {
     thinking,
 };
 
-/// Create a partial message for events
-fn createPartialMessage(allocator: std.mem.Allocator, model: ai_types.Model) !ai_types.AssistantMessage {
+/// Create a partial message for events (references model strings directly, no allocation)
+fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     return ai_types.AssistantMessage{
         .content = &.{},
-        .api = try allocator.dupe(u8, model.api),
-        .provider = try allocator.dupe(u8, model.provider),
-        .model = try allocator.dupe(u8, model.id),
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = std.time.milliTimestamp(),
@@ -410,10 +410,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_block: CurrentBlock = .none;
 
     // Emit start event
-    const partial_start = createPartialMessage(ctx.allocator, ctx.model) catch {
-        ctx.stream.completeWithError("oom partial");
-        return;
-    };
+    const partial_start = createPartialMessage(ctx.model);
     ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
@@ -452,7 +449,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Close current block if we need to switch
                     if (needs_new_block and current_block != .none) {
-                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+                        const partial = createPartialMessage(ctx.model);
                         switch (current_block) {
                             .text => {
                                 // Store completed text block
@@ -499,7 +496,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     // Start new block if needed
                     if (needs_new_block) {
                         const content_idx = content_blocks.items.len;
-                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+                        const partial = createPartialMessage(ctx.model);
 
                         if (is_thinking) {
                             current_block = .thinking;
@@ -517,7 +514,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
 
                     // Append content and emit delta
-                    const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+                    const partial = createPartialMessage(ctx.model);
                     if (is_thinking) {
                         current_thinking.appendSlice(ctx.allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
@@ -548,7 +545,7 @@ fn runThread(ctx: *ThreadCtx) void {
     if (current_block != .none) {
         switch (current_block) {
             .text => {
-                const partial = createPartialMessage(ctx.allocator, ctx.model) catch null;
+                const partial = createPartialMessage(ctx.model);
                 const text_copy = ctx.allocator.dupe(u8, current_text.items) catch "";
                 const sig_copy = if (current_text_signature.items.len > 0)
                     ctx.allocator.dupe(u8, current_text_signature.items) catch null
@@ -558,16 +555,14 @@ fn runThread(ctx: *ThreadCtx) void {
                     .text = text_copy,
                     .text_signature = sig_copy,
                 } }) catch {};
-                if (partial) |p| {
-                    ctx.stream.push(.{ .text_end = .{
-                        .content_index = content_blocks.items.len - 1,
-                        .content = current_text.items,
-                        .partial = p,
-                    } }) catch {};
-                }
+                ctx.stream.push(.{ .text_end = .{
+                    .content_index = content_blocks.items.len - 1,
+                    .content = current_text.items,
+                    .partial = partial,
+                } }) catch {};
             },
             .thinking => {
-                const partial = createPartialMessage(ctx.allocator, ctx.model) catch null;
+                const partial = createPartialMessage(ctx.model);
                 const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch "";
                 const sig_copy = if (current_thinking_signature.items.len > 0)
                     ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
@@ -577,13 +572,11 @@ fn runThread(ctx: *ThreadCtx) void {
                     .thinking = thinking_copy,
                     .thinking_signature = sig_copy,
                 } }) catch {};
-                if (partial) |p| {
-                    ctx.stream.push(.{ .thinking_end = .{
-                        .content_index = content_blocks.items.len - 1,
-                        .content = current_thinking.items,
-                        .partial = p,
-                    } }) catch {};
-                }
+                ctx.stream.push(.{ .thinking_end = .{
+                    .content_index = content_blocks.items.len - 1,
+                    .content = current_thinking.items,
+                    .partial = partial,
+                } }) catch {};
             },
             .none => {},
         }

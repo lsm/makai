@@ -526,10 +526,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var stop_reason: ai_types.StopReason = .stop;
 
     // Emit start event with partial message
-    const partial_start = createPartialMessage(ctx.allocator, ctx.model) catch {
-        ctx.stream.completeWithError("oom partial");
-        return;
-    };
+    const partial_start = createPartialMessage(ctx.model);
     ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
@@ -566,20 +563,14 @@ fn runThread(ctx: *ThreadCtx) void {
                         .text => {
                             current_text.clearRetainingCapacity();
                             // Emit text_start event
-                            const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
-                                ctx.stream.completeWithError("oom partial");
-                                return;
-                            };
+                            const partial = createPartialMessage(ctx.model);
                             ctx.stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .thinking => {
                             current_thinking.clearRetainingCapacity();
                             current_thinking_signature.clearRetainingCapacity();
                             // Emit thinking_start event
-                            const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
-                                ctx.stream.completeWithError("oom partial");
-                                return;
-                            };
+                            const partial = createPartialMessage(ctx.model);
                             ctx.stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .tool_use => {
@@ -591,10 +582,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 },
                 .content_block_delta => |cbd| {
                     if (block_map.get(cbd.index)) |block_info| {
-                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
-                            ctx.stream.completeWithError("oom partial");
-                            return;
-                        };
+                        const partial = createPartialMessage(ctx.model);
 
                         switch (cbd.delta) {
                             .text => |txt| {
@@ -616,10 +604,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 },
                 .content_block_stop => |cbs| {
                     if (block_map.get(cbs.index)) |block_info| {
-                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
-                            ctx.stream.completeWithError("oom partial");
-                            return;
-                        };
+                        const partial = createPartialMessage(ctx.model);
 
                         switch (block_info.content_type) {
                             .text => {
@@ -709,12 +694,12 @@ fn runThread(ctx: *ThreadCtx) void {
     ctx.stream.complete(out);
 }
 
-fn createPartialMessage(allocator: std.mem.Allocator, model: ai_types.Model) !ai_types.AssistantMessage {
+fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
     return ai_types.AssistantMessage{
         .content = &.{},
-        .api = try allocator.dupe(u8, model.api),
-        .provider = try allocator.dupe(u8, model.provider),
-        .model = try allocator.dupe(u8, model.id),
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = std.time.milliTimestamp(),
