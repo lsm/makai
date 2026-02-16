@@ -3,6 +3,7 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
+const tool_call_tracker = @import("tool_call_tracker");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
@@ -130,7 +131,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
-    try w.writeIntField("max_tokens", options.max_tokens orelse model.max_tokens);
+    const default_max = @min(model.max_tokens / 3, 32000);
+    try w.writeIntField("max_tokens", options.max_tokens orelse default_max);
     try w.writeBoolField("stream", true);
 
     if (options.temperature) |t| {
@@ -362,7 +364,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 const ParseResult = union(enum) {
     none: void,
     message_start: struct { input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64 },
-    content_block_start: struct { index: usize, block_type: ContentType },
+    content_block_start: struct {
+        index: usize,
+        block_type: ContentType,
+        tool_id: []const u8 = "", // Only for tool_use
+        tool_name: []const u8 = "", // Only for tool_use
+    },
     content_block_delta: struct { index: usize, delta: ContentDelta },
     content_block_stop: struct { index: usize },
     message_delta: struct { stop_reason: ai_types.StopReason, output_tokens: u64 },
@@ -437,6 +444,23 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
             .tool_use
         else
             return .{ .none = {} };
+
+        // For tool_use, extract id and name
+        if (block_type == .tool_use) {
+            var tool_id: []const u8 = "";
+            var tool_name: []const u8 = "";
+            if (content_block.object.get("id")) |id_val| {
+                if (id_val == .string) tool_id = id_val.string;
+            }
+            if (content_block.object.get("name")) |name_val| {
+                if (name_val == .string) tool_name = name_val.string;
+            }
+            // Dupe the strings since they come from temporary JSON parse buffer
+            const duped_id = try allocator.dupe(u8, tool_id);
+            errdefer allocator.free(duped_id);
+            const duped_name = try allocator.dupe(u8, tool_name);
+            return .{ .content_block_start = .{ .index = index, .block_type = block_type, .tool_id = duped_id, .tool_name = duped_name } };
+        }
 
         return .{ .content_block_start = .{ .index = index, .block_type = block_type } };
     }
@@ -699,6 +723,10 @@ fn runThread(ctx: *ThreadCtx) void {
     var block_map = std.AutoHashMap(usize, BlockInfo).init(allocator);
     defer block_map.deinit();
 
+    // Track tool calls during streaming
+    var tc_tracker = tool_call_tracker.ToolCallTracker.init(allocator);
+    defer tc_tracker.deinit();
+
     // Accumulate content for final message
     var content_blocks = std.ArrayList(ai_types.AssistantContent){};
     defer content_blocks.deinit(allocator);
@@ -750,6 +778,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     usage.output = ms.output_tokens;
                     usage.cache_read = ms.cache_read;
                     usage.cache_write = ms.cache_write;
+                    usage.calculateCost(model.cost);
                 },
                 .content_block_start => |cbs| {
                     const content_idx = content_blocks.items.len;
@@ -770,7 +799,15 @@ fn runThread(ctx: *ThreadCtx) void {
                             stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .tool_use => {
-                            // Tool use handling - for now, skip event emission
+                            _ = tc_tracker.startCall(cbs.index, content_idx, cbs.tool_id, cbs.tool_name) catch {};
+                            // Free the duped strings from parseAnthropicEventType
+                            allocator.free(cbs.tool_id);
+                            allocator.free(cbs.tool_name);
+
+                            stream.push(.{ .toolcall_start = .{
+                                .content_index = content_idx,
+                                .partial = createPartialMessage(model),
+                            }}) catch {};
                         },
                     }
 
@@ -792,8 +829,16 @@ fn runThread(ctx: *ThreadCtx) void {
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
                             },
-                            .input_json => |_| {
-                                // Tool use JSON delta - not emitting for now
+                            .input_json => |json_delta| {
+                                tc_tracker.appendDelta(cbd.index, json_delta) catch {};
+
+                                if (tc_tracker.getContentIndex(cbd.index)) |content_idx| {
+                                    stream.push(.{ .toolcall_delta = .{
+                                        .content_index = content_idx,
+                                        .delta = json_delta,
+                                        .partial = createPartialMessage(model),
+                                    }}) catch {};
+                                }
                             },
                         }
                     }
@@ -838,7 +883,15 @@ fn runThread(ctx: *ThreadCtx) void {
                                 stream.push(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } }) catch {};
                             },
                             .tool_use => {
-                                // Tool use end handling - not implemented yet
+                                if (tc_tracker.completeCall(cbs.index, allocator)) |tool_call| {
+                                    content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {};
+
+                                    stream.push(.{ .toolcall_end = .{
+                                        .content_index = content_blocks.items.len - 1,
+                                        .tool_call = tool_call,
+                                        .partial = createPartialMessage(model),
+                                    }}) catch {};
+                                }
                             },
                         }
                     }
@@ -846,6 +899,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .message_delta => |md| {
                     stop_reason = md.stop_reason;
                     usage.output = md.output_tokens;
+                    usage.calculateCost(model.cost);
                 },
                 .message_stop => {},
             }
@@ -853,6 +907,7 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
+    usage.calculateCost(model.cost);
 
     // If no content blocks were collected but we have text, create a text block
     if (content_blocks.items.len == 0 and current_text.items.len > 0) {
@@ -1273,4 +1328,22 @@ test "buildRequestBody adds cache_control to last user message" {
     try std.testing.expect(last_content == .array);
     const last_block = last_content.array.items[0];
     try std.testing.expect(last_block.object.get("cache_control") != null);
+}
+
+test "parseAnthropicEventType extracts tool_use id and name" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01A","name":"bash"}}
+    ;
+
+    const result = try parseAnthropicEventType(data, allocator);
+
+    try std.testing.expectEqual(ParseResult.ContentType.tool_use, result.content_block_start.block_type);
+    try std.testing.expectEqual(@as(usize, 0), result.content_block_start.index);
+    try std.testing.expectEqualStrings("toolu_01A", result.content_block_start.tool_id);
+    try std.testing.expectEqualStrings("bash", result.content_block_start.tool_name);
+
+    // Free the duped strings
+    allocator.free(result.content_block_start.tool_id);
+    allocator.free(result.content_block_start.tool_name);
 }
