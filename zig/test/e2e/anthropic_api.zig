@@ -17,7 +17,7 @@ test "anthropic e2e: messages api (cheap model)" {
     };
     defer testing.allocator.free(key);
 
-    const model_id = envOwned(testing.allocator, "ANTHROPIC_MODEL") orelse try testing.allocator.dupe(u8, "claude-3-5-haiku-20241022");
+    const model_id = envOwned(testing.allocator, "ANTHROPIC_MODEL") orelse try testing.allocator.dupe(u8, "claude-haiku-4-5");
     defer testing.allocator.free(model_id);
 
     var registry = api_registry.ApiRegistry.init(testing.allocator);
