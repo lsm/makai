@@ -336,57 +336,82 @@ const ThreadCtx = struct {
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer {
-        ctx.allocator.free(ctx.api_key);
-        ctx.allocator.free(ctx.body);
-        ctx.allocator.free(ctx.base_url);
-        ctx.allocator.destroy(ctx);
-    }
+    // Save values from ctx that we need after freeing ctx
+    const allocator = ctx.allocator;
+    const stream = ctx.stream;
+    const model = ctx.model;
+    const api_key = ctx.api_key;
+    const body = ctx.body;
+    const base_url = ctx.base_url;
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
     const url = std.fmt.allocPrint(
-        ctx.allocator,
+        allocator,
         "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse&key={s}",
-        .{ ctx.base_url, ctx.model.id, ctx.api_key },
+        .{ base_url, model.id, api_key },
     ) catch {
-        ctx.stream.completeWithError("oom url");
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom url");
         return;
     };
-    defer ctx.allocator.free(url);
+    defer allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
-        ctx.stream.completeWithError("invalid URL");
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("invalid URL");
         return;
     };
 
     const headers = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
 
     var req = client.request(.POST, uri, .{ .extra_headers = &headers }) catch {
-        ctx.stream.completeWithError("request failed");
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("request failed");
         return;
     };
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = ctx.body.len };
-    req.sendBodyComplete(ctx.body) catch {
-        ctx.stream.completeWithError("send failed");
+    req.transfer_encoding = .{ .content_length = body.len };
+    req.sendBodyComplete(body) catch {
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("send failed");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&head_buf) catch {
-        ctx.stream.completeWithError("receive failed");
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("receive failed");
         return;
     };
 
     if (response.head.status != .ok) {
-        ctx.stream.completeWithError("google request failed");
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("google request failed");
         return;
     }
 
-    var parser = sse_parser.SSEParser.init(ctx.allocator);
+    var parser = sse_parser.SSEParser.init(allocator);
     defer parser.deinit();
 
     var transfer_buf: [4096]u8 = undefined;
@@ -395,40 +420,48 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // Content block accumulators
     var content_blocks = std.ArrayList(ai_types.AssistantContent){};
-    defer content_blocks.deinit(ctx.allocator);
+    defer content_blocks.deinit(allocator);
     var current_text = std.ArrayList(u8){};
-    defer current_text.deinit(ctx.allocator);
+    defer current_text.deinit(allocator);
     var current_thinking = std.ArrayList(u8){};
-    defer current_thinking.deinit(ctx.allocator);
+    defer current_thinking.deinit(allocator);
     var current_thinking_signature = std.ArrayList(u8){};
-    defer current_thinking_signature.deinit(ctx.allocator);
+    defer current_thinking_signature.deinit(allocator);
     var current_text_signature = std.ArrayList(u8){};
-    defer current_text_signature.deinit(ctx.allocator);
+    defer current_text_signature.deinit(allocator);
 
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: CurrentBlock = .none;
 
     // Emit start event
-    const partial_start = createPartialMessage(ctx.model);
-    ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
+    const partial_start = createPartialMessage(model);
+    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
-            ctx.stream.completeWithError("read failed");
+            allocator.free(base_url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("read failed");
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            ctx.stream.completeWithError("parse failed");
+            allocator.free(base_url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("parse failed");
             return;
         };
 
         for (events) |ev| {
-            const result = parseGoogleEventExtended(ev.data, ctx.allocator);
+            const result = parseGoogleEventExtended(ev.data, allocator);
             if (result) |*res| {
-                defer deinitGoogleParseResult(res, ctx.allocator);
+                defer deinitGoogleParseResult(res, allocator);
 
                 // Update usage
                 if (res.usage.input > 0) usage.input = res.usage.input;
@@ -449,20 +482,20 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Close current block if we need to switch
                     if (needs_new_block and current_block != .none) {
-                        const partial = createPartialMessage(ctx.model);
+                        const partial = createPartialMessage(model);
                         switch (current_block) {
                             .text => {
                                 // Store completed text block
-                                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch continue;
+                                const text_copy = allocator.dupe(u8, current_text.items) catch continue;
                                 const sig_copy = if (current_text_signature.items.len > 0)
-                                    ctx.allocator.dupe(u8, current_text_signature.items) catch null
+                                    allocator.dupe(u8, current_text_signature.items) catch null
                                 else
                                     null;
-                                content_blocks.append(ctx.allocator, .{ .text = .{
+                                content_blocks.append(allocator, .{ .text = .{
                                     .text = text_copy,
                                     .text_signature = sig_copy,
                                 } }) catch {};
-                                ctx.stream.push(.{ .text_end = .{
+                                stream.push(.{ .text_end = .{
                                     .content_index = content_blocks.items.len - 1,
                                     .content = current_text.items,
                                     .partial = partial,
@@ -472,16 +505,16 @@ fn runThread(ctx: *ThreadCtx) void {
                             },
                             .thinking => {
                                 // Store completed thinking block
-                                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch continue;
+                                const thinking_copy = allocator.dupe(u8, current_thinking.items) catch continue;
                                 const sig_copy = if (current_thinking_signature.items.len > 0)
-                                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                                    allocator.dupe(u8, current_thinking_signature.items) catch null
                                 else
                                     null;
-                                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                                content_blocks.append(allocator, .{ .thinking = .{
                                     .thinking = thinking_copy,
                                     .thinking_signature = sig_copy,
                                 } }) catch {};
-                                ctx.stream.push(.{ .thinking_end = .{
+                                stream.push(.{ .thinking_end = .{
                                     .content_index = content_blocks.items.len - 1,
                                     .content = current_thinking.items,
                                     .partial = partial,
@@ -496,17 +529,17 @@ fn runThread(ctx: *ThreadCtx) void {
                     // Start new block if needed
                     if (needs_new_block) {
                         const content_idx = content_blocks.items.len;
-                        const partial = createPartialMessage(ctx.model);
+                        const partial = createPartialMessage(model);
 
                         if (is_thinking) {
                             current_block = .thinking;
-                            ctx.stream.push(.{ .thinking_start = .{
+                            stream.push(.{ .thinking_start = .{
                                 .content_index = content_idx,
                                 .partial = partial,
                             } }) catch {};
                         } else {
                             current_block = .text;
-                            ctx.stream.push(.{ .text_start = .{
+                            stream.push(.{ .text_start = .{
                                 .content_index = content_idx,
                                 .partial = partial,
                             } }) catch {};
@@ -514,23 +547,23 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
 
                     // Append content and emit delta
-                    const partial = createPartialMessage(ctx.model);
+                    const partial = createPartialMessage(model);
                     if (is_thinking) {
-                        current_thinking.appendSlice(ctx.allocator, part.text) catch {};
+                        current_thinking.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
-                            current_thinking_signature.appendSlice(ctx.allocator, sig) catch {};
+                            current_thinking_signature.appendSlice(allocator, sig) catch {};
                         }
-                        ctx.stream.push(.{ .thinking_delta = .{
+                        stream.push(.{ .thinking_delta = .{
                             .content_index = content_blocks.items.len,
                             .delta = part.text,
                             .partial = partial,
                         } }) catch {};
                     } else {
-                        current_text.appendSlice(ctx.allocator, part.text) catch {};
+                        current_text.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
-                            current_text_signature.appendSlice(ctx.allocator, sig) catch {};
+                            current_text_signature.appendSlice(allocator, sig) catch {};
                         }
-                        ctx.stream.push(.{ .text_delta = .{
+                        stream.push(.{ .text_delta = .{
                             .content_index = content_blocks.items.len,
                             .delta = part.text,
                             .partial = partial,
@@ -545,34 +578,34 @@ fn runThread(ctx: *ThreadCtx) void {
     if (current_block != .none) {
         switch (current_block) {
             .text => {
-                const partial = createPartialMessage(ctx.model);
-                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch "";
+                const partial = createPartialMessage(model);
+                const text_copy = allocator.dupe(u8, current_text.items) catch "";
                 const sig_copy = if (current_text_signature.items.len > 0)
-                    ctx.allocator.dupe(u8, current_text_signature.items) catch null
+                    allocator.dupe(u8, current_text_signature.items) catch null
                 else
                     null;
-                content_blocks.append(ctx.allocator, .{ .text = .{
+                content_blocks.append(allocator, .{ .text = .{
                     .text = text_copy,
                     .text_signature = sig_copy,
                 } }) catch {};
-                ctx.stream.push(.{ .text_end = .{
+                stream.push(.{ .text_end = .{
                     .content_index = content_blocks.items.len - 1,
                     .content = current_text.items,
                     .partial = partial,
                 } }) catch {};
             },
             .thinking => {
-                const partial = createPartialMessage(ctx.model);
-                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch "";
+                const partial = createPartialMessage(model);
+                const thinking_copy = allocator.dupe(u8, current_thinking.items) catch "";
                 const sig_copy = if (current_thinking_signature.items.len > 0)
-                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                    allocator.dupe(u8, current_thinking_signature.items) catch null
                 else
                     null;
-                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                content_blocks.append(allocator, .{ .thinking = .{
                     .thinking = thinking_copy,
                     .thinking_signature = sig_copy,
                 } }) catch {};
-                ctx.stream.push(.{ .thinking_end = .{
+                stream.push(.{ .thinking_end = .{
                     .content_index = content_blocks.items.len - 1,
                     .content = current_thinking.items,
                     .partial = partial,
@@ -586,26 +619,37 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // If no content blocks were collected, add an empty text block
     if (content_blocks.items.len == 0) {
-        content_blocks.append(ctx.allocator, .{ .text = .{ .text = "" } }) catch {};
+        content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
     }
 
-    const content_slice = content_blocks.toOwnedSlice(ctx.allocator) catch {
-        ctx.stream.completeWithError("oom content");
+    const content_slice = content_blocks.toOwnedSlice(allocator) catch {
+        allocator.free(base_url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom content");
         return;
     };
 
     const out = ai_types.AssistantMessage{
         .content = content_slice,
-        .api = ctx.model.api,
-        .provider = ctx.model.provider,
-        .model = ctx.model.id,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
     };
 
-    ctx.stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
-    ctx.stream.complete(out);
+    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+
+    // Free ctx allocations before completing
+    allocator.free(base_url);
+    allocator.free(api_key);
+    allocator.free(body);
+    allocator.destroy(ctx);
+
+    stream.complete(out);
 }
 
 pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {

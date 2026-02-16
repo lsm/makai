@@ -395,111 +395,160 @@ const ThreadCtx = struct {
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer {
-        ctx.allocator.free(ctx.request_body);
-        ctx.allocator.free(ctx.api_key);
-        ctx.allocator.destroy(ctx);
-    }
+    // Save values from ctx that we need after freeing ctx
+    const allocator = ctx.allocator;
+    const stream = ctx.stream;
+    const model = ctx.model;
+    const api_key = ctx.api_key;
+    const request_body = ctx.request_body;
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(ctx.allocator, "{s}/v1/messages", .{ctx.model.base_url}) catch {
-        ctx.stream.completeWithError("oom building url");
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/messages", .{model.base_url}) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom building url");
         return;
     };
-    defer ctx.allocator.free(url);
+    defer allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
-        ctx.stream.completeWithError("invalid anthropic URL");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("invalid anthropic URL");
         return;
     };
 
-    const is_oauth = isOAuthToken(ctx.api_key);
+    const is_oauth = isOAuthToken(api_key);
 
     // Allocate auth header for OAuth tokens (needs to persist until after request)
     var auth_header: ?[]u8 = null;
-    defer if (auth_header) |h| ctx.allocator.free(h);
+    defer if (auth_header) |h| allocator.free(h);
 
     var headers: std.ArrayList(std.http.Header) = .{};
-    defer headers.deinit(ctx.allocator);
+    defer headers.deinit(allocator);
 
     // OAuth tokens use Authorization: Bearer, API keys use x-api-key
     if (is_oauth) {
-        auth_header = std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.api_key}) catch {
-            ctx.stream.completeWithError("oom auth header");
+        auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom auth header");
             return;
         };
-        headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header.? }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "authorization", .value = auth_header.? }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
         // OAuth-specific headers (mimic Claude Code)
-        headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
-        headers.append(ctx.allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
-        headers.append(ctx.allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
-        headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "x-app", .value = "cli" }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
     } else {
-        headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.api_key }) catch {
-            ctx.stream.completeWithError("oom headers");
+        headers.append(allocator, .{ .name = "x-api-key", .value = api_key }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
             return;
         };
     }
 
-    headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = "2023-06-01" }) catch {
-        ctx.stream.completeWithError("oom headers");
+    headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
         return;
     };
-    headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" }) catch {
-        ctx.stream.completeWithError("oom headers");
+    headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
         return;
     };
 
     var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        ctx.stream.completeWithError("request open failed");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("request open failed");
         return;
     };
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = ctx.request_body.len };
-    req.sendBodyComplete(ctx.request_body) catch {
-        ctx.stream.completeWithError("request send failed");
+    req.transfer_encoding = .{ .content_length = request_body.len };
+    req.sendBodyComplete(request_body) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("request send failed");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&head_buf) catch {
-        ctx.stream.completeWithError("response failed");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("response failed");
         return;
     };
 
     if (response.head.status != .ok) {
         const status_code = @intFromEnum(response.head.status);
-        const err = std.fmt.allocPrint(ctx.allocator, "anthropic request failed: HTTP {d}{s}", .{
+        const err = std.fmt.allocPrint(allocator, "anthropic request failed: HTTP {d}{s}", .{
             status_code,
             if (status_code == 401) " (check ANTHROPIC_API_KEY is valid)" else "",
         }) catch {
-            ctx.stream.completeWithError("anthropic request failed");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("anthropic request failed");
             return;
         };
-        defer ctx.allocator.free(err);
-        ctx.stream.completeWithError(err);
+        defer allocator.free(err);
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError(err);
         return;
     }
 
-    var parser = sse_parser.SSEParser.init(ctx.allocator);
+    var parser = sse_parser.SSEParser.init(allocator);
     defer parser.deinit();
 
     var transfer_buf: [4096]u8 = undefined;
@@ -511,41 +560,50 @@ fn runThread(ctx: *ThreadCtx) void {
         content_type: ParseResult.ContentType,
         content_index: usize, // index in our content array
     };
-    var block_map = std.AutoHashMap(usize, BlockInfo).init(ctx.allocator);
+    var block_map = std.AutoHashMap(usize, BlockInfo).init(allocator);
     defer block_map.deinit();
 
     // Accumulate content for final message
     var content_blocks = std.ArrayList(ai_types.AssistantContent){};
-    defer content_blocks.deinit(ctx.allocator);
+    defer content_blocks.deinit(allocator);
     var current_text = std.ArrayList(u8){};
-    defer current_text.deinit(ctx.allocator);
+    defer current_text.deinit(allocator);
     var current_thinking = std.ArrayList(u8){};
-    defer current_thinking.deinit(ctx.allocator);
+    defer current_thinking.deinit(allocator);
     var current_thinking_signature = std.ArrayList(u8){};
-    defer current_thinking_signature.deinit(ctx.allocator);
+    defer current_thinking_signature.deinit(allocator);
 
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
     // Emit start event with partial message
-    const partial_start = createPartialMessage(ctx.model);
-    ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
+    const partial_start = createPartialMessage(model);
+    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
-            ctx.stream.completeWithError("read error");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("read error");
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            ctx.stream.completeWithError("sse parse error");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("sse parse error");
             return;
         };
 
         for (events) |ev| {
-            const result = parseAnthropicEventType(ev.data, ctx.allocator) catch {
-                ctx.stream.completeWithError("event parse error");
+            const result = parseAnthropicEventType(ev.data, allocator) catch {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("event parse error");
                 return;
             };
 
@@ -565,15 +623,15 @@ fn runThread(ctx: *ThreadCtx) void {
                         .text => {
                             current_text.clearRetainingCapacity();
                             // Emit text_start event
-                            const partial = createPartialMessage(ctx.model);
-                            ctx.stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                            const partial = createPartialMessage(model);
+                            stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .thinking => {
                             current_thinking.clearRetainingCapacity();
                             current_thinking_signature.clearRetainingCapacity();
                             // Emit thinking_start event
-                            const partial = createPartialMessage(ctx.model);
-                            ctx.stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                            const partial = createPartialMessage(model);
+                            stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
                         },
                         .tool_use => {
                             // Tool use handling - for now, skip event emission
@@ -584,19 +642,19 @@ fn runThread(ctx: *ThreadCtx) void {
                 },
                 .content_block_delta => |cbd| {
                     if (block_map.get(cbd.index)) |block_info| {
-                        const partial = createPartialMessage(ctx.model);
+                        const partial = createPartialMessage(model);
 
                         switch (cbd.delta) {
                             .text => |txt| {
-                                current_text.appendSlice(ctx.allocator, txt) catch {};
-                                ctx.stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
+                                current_text.appendSlice(allocator, txt) catch {};
+                                stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
                             },
                             .thinking => |thk| {
-                                current_thinking.appendSlice(ctx.allocator, thk) catch {};
-                                ctx.stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
+                                current_thinking.appendSlice(allocator, thk) catch {};
+                                stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
                             },
                             .signature => |sig| {
-                                current_thinking_signature.appendSlice(ctx.allocator, sig) catch {};
+                                current_thinking_signature.appendSlice(allocator, sig) catch {};
                             },
                             .input_json => |_| {
                                 // Tool use JSON delta - not emitting for now
@@ -606,36 +664,42 @@ fn runThread(ctx: *ThreadCtx) void {
                 },
                 .content_block_stop => |cbs| {
                     if (block_map.get(cbs.index)) |block_info| {
-                        const partial = createPartialMessage(ctx.model);
+                        const partial = createPartialMessage(model);
 
                         switch (block_info.content_type) {
                             .text => {
                                 // Store the completed text block
-                                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch {
-                                    ctx.stream.completeWithError("oom text");
+                                const text_copy = allocator.dupe(u8, current_text.items) catch {
+                                    allocator.free(api_key);
+                                    allocator.free(request_body);
+                                    allocator.destroy(ctx);
+                                    stream.completeWithError("oom text");
                                     return;
                                 };
-                                content_blocks.append(ctx.allocator, .{ .text = .{ .text = text_copy } }) catch {};
+                                content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
 
-                                ctx.stream.push(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } }) catch {};
+                                stream.push(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } }) catch {};
                             },
                             .thinking => {
                                 // Store the completed thinking block
-                                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch {
-                                    ctx.stream.completeWithError("oom thinking");
+                                const thinking_copy = allocator.dupe(u8, current_thinking.items) catch {
+                                    allocator.free(api_key);
+                                    allocator.free(request_body);
+                                    allocator.destroy(ctx);
+                                    stream.completeWithError("oom thinking");
                                     return;
                                 };
                                 const sig_copy = if (current_thinking_signature.items.len > 0)
-                                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                                    allocator.dupe(u8, current_thinking_signature.items) catch null
                                 else
                                     null;
 
-                                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                                content_blocks.append(allocator, .{ .thinking = .{
                                     .thinking = thinking_copy,
                                     .thinking_signature = sig_copy,
                                 } }) catch {};
 
-                                ctx.stream.push(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } }) catch {};
+                                stream.push(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } }) catch {};
                             },
                             .tool_use => {
                                 // Tool use end handling - not implemented yet
@@ -656,35 +720,50 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // If no content blocks were collected but we have text, create a text block
     if (content_blocks.items.len == 0 and current_text.items.len > 0) {
-        const text_copy = ctx.allocator.dupe(u8, current_text.items) catch {
-            ctx.stream.completeWithError("oom text");
+        const text_copy = allocator.dupe(u8, current_text.items) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom text");
             return;
         };
-        content_blocks.append(ctx.allocator, .{ .text = .{ .text = text_copy } }) catch {};
+        content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
     }
 
     // If still no content, add an empty text block
     if (content_blocks.items.len == 0) {
-        content_blocks.append(ctx.allocator, .{ .text = .{ .text = "" } }) catch {};
+        content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
     }
 
-    const content_slice = content_blocks.toOwnedSlice(ctx.allocator) catch {
-        ctx.stream.completeWithError("oom content");
+    const content_slice = content_blocks.toOwnedSlice(allocator) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom content");
         return;
     };
 
     const out = ai_types.AssistantMessage{
         .content = content_slice,
-        .api = ctx.allocator.dupe(u8, ctx.model.api) catch {
-            ctx.stream.completeWithError("oom");
+        .api = allocator.dupe(u8, model.api) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom");
             return;
         },
-        .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch {
-            ctx.stream.completeWithError("oom");
+        .provider = allocator.dupe(u8, model.provider) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom");
             return;
         },
-        .model = ctx.allocator.dupe(u8, ctx.model.id) catch {
-            ctx.stream.completeWithError("oom");
+        .model = allocator.dupe(u8, model.id) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom");
             return;
         },
         .usage = usage,
@@ -692,8 +771,14 @@ fn runThread(ctx: *ThreadCtx) void {
         .timestamp = std.time.milliTimestamp(),
     };
 
-    ctx.stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
-    ctx.stream.complete(out);
+    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+
+    // Free ctx allocations before completing
+    allocator.free(api_key);
+    allocator.free(request_body);
+    allocator.destroy(ctx);
+
+    stream.complete(out);
 }
 
 fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {

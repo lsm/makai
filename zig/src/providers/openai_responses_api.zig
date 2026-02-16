@@ -132,61 +132,108 @@ const ThreadCtx = struct {
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer {
-        ctx.allocator.free(ctx.body);
-        ctx.allocator.free(ctx.api_key);
-        ctx.allocator.destroy(ctx);
-    }
+    // Save values from ctx that we need after freeing ctx
+    const allocator = ctx.allocator;
+    const stream = ctx.stream;
+    const model = ctx.model;
+    const api_key = ctx.api_key;
+    const body = ctx.body;
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(ctx.allocator, "{s}/v1/responses", .{ctx.model.base_url}) catch {
-        ctx.stream.completeWithError("oom url");
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/responses", .{model.base_url}) catch {
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom url");
         return;
     };
-    defer ctx.allocator.free(url);
 
-    const auth = std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.api_key}) catch {
-        ctx.stream.completeWithError("oom auth");
+    const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom auth");
         return;
     };
-    defer ctx.allocator.free(auth);
 
     const uri = std.Uri.parse(url) catch {
-        ctx.stream.completeWithError("invalid URL");
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("invalid URL");
         return;
     };
 
     var headers: std.ArrayList(std.http.Header) = .{};
-    defer headers.deinit(ctx.allocator);
-    headers.append(ctx.allocator, .{ .name = "authorization", .value = auth }) catch return ctx.stream.completeWithError("oom headers");
-    headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" }) catch return ctx.stream.completeWithError("oom headers");
+    defer headers.deinit(allocator);
+    headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
+        return;
+    };
+    headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
+        return;
+    };
 
     var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        ctx.stream.completeWithError("request failed");
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("request failed");
         return;
     };
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = ctx.body.len };
-    req.sendBodyComplete(ctx.body) catch {
-        ctx.stream.completeWithError("send failed");
+    req.transfer_encoding = .{ .content_length = body.len };
+    req.sendBodyComplete(body) catch {
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("send failed");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&head_buf) catch {
-        ctx.stream.completeWithError("receive failed");
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("receive failed");
         return;
     };
 
     if (response.head.status != .ok) {
-        ctx.stream.completeWithError("responses request failed");
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("responses request failed");
         return;
     }
 
-    var parser = sse_parser.SSEParser.init(ctx.allocator);
+    var parser = sse_parser.SSEParser.init(allocator);
     defer parser.deinit();
 
     var transfer_buf: [4096]u8 = undefined;
@@ -194,25 +241,40 @@ fn runThread(ctx: *ThreadCtx) void {
     const reader = response.reader(&transfer_buf);
 
     var text = std.ArrayList(u8){};
-    defer text.deinit(ctx.allocator);
+    defer text.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
-            ctx.stream.completeWithError("read failed");
+            allocator.free(auth);
+            allocator.free(url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("read failed");
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            ctx.stream.completeWithError("parse failed");
+            allocator.free(auth);
+            allocator.free(url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("parse failed");
             return;
         };
 
         for (events) |ev| {
-            parseResponseEvent(ev.data, &text, &usage, &stop_reason, ctx.allocator) catch {
-                ctx.stream.completeWithError("event parse failed");
+            parseResponseEvent(ev.data, &text, &usage, &stop_reason, allocator) catch {
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("event parse failed");
                 return;
             };
         }
@@ -220,27 +282,44 @@ fn runThread(ctx: *ThreadCtx) void {
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
 
-    var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
-        ctx.stream.completeWithError("oom result");
+    var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom result");
         return;
     };
-    content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
-        ctx.allocator.free(content);
-        ctx.stream.completeWithError("oom text");
+    content[0] = .{ .text = .{ .text = allocator.dupe(u8, text.items) catch {
+        allocator.free(content);
+        allocator.free(auth);
+        allocator.free(url);
+        allocator.free(api_key);
+        allocator.free(body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom text");
         return;
     } } };
 
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = ctx.model.api,
-        .provider = ctx.model.provider,
-        .model = ctx.model.id,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
     };
 
-    ctx.stream.complete(out);
+    // Free ctx allocations before completing
+    allocator.free(auth);
+    allocator.free(url);
+    allocator.free(api_key);
+    allocator.free(body);
+    allocator.destroy(ctx);
+
+    stream.complete(out);
 }
 
 pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {

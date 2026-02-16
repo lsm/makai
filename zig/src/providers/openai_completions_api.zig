@@ -252,104 +252,142 @@ fn parseChunk(
 }
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer {
-        ctx.allocator.free(ctx.request_body);
-        ctx.allocator.free(ctx.api_key);
-        ctx.allocator.destroy(ctx);
-    }
+    // Save values from ctx that we need after freeing ctx
+    const allocator = ctx.allocator;
+    const stream = ctx.stream;
+    const model = ctx.model;
+    const api_key = ctx.api_key;
+    const request_body = ctx.request_body;
+    const context = ctx.context;
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(ctx.allocator, "{s}/v1/chat/completions", .{ctx.model.base_url}) catch {
-        ctx.stream.completeWithError("oom building url");
+    const url = std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{model.base_url}) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom building url");
         return;
     };
-    defer ctx.allocator.free(url);
+    defer allocator.free(url);
 
-    const auth = std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.api_key}) catch {
-        ctx.stream.completeWithError("oom building auth header");
+    const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom building auth header");
         return;
     };
-    defer ctx.allocator.free(auth);
+    defer allocator.free(auth);
 
     const uri = std.Uri.parse(url) catch {
-        ctx.stream.completeWithError("invalid provider URL");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("invalid provider URL");
         return;
     };
 
     var headers: std.ArrayList(std.http.Header) = .{};
-    defer headers.deinit(ctx.allocator);
-    headers.append(ctx.allocator, .{ .name = "authorization", .value = auth }) catch {
-        ctx.stream.completeWithError("oom headers");
+    defer headers.deinit(allocator);
+    headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
         return;
     };
-    headers.append(ctx.allocator, .{ .name = "content-type", .value = "application/json" }) catch {
-        ctx.stream.completeWithError("oom headers");
+    headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
         return;
     };
-    headers.append(ctx.allocator, .{ .name = "accept", .value = "text/event-stream" }) catch {
-        ctx.stream.completeWithError("oom headers");
+    headers.append(allocator, .{ .name = "accept", .value = "text/event-stream" }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom headers");
         return;
     };
 
     // Add GitHub Copilot dynamic headers if provider is github-copilot
-    if (std.mem.eql(u8, ctx.model.provider, "github-copilot")) {
-        const has_images = github_copilot.hasCopilotVisionInput(ctx.context.messages);
+    if (std.mem.eql(u8, model.provider, "github-copilot")) {
+        const has_images = github_copilot.hasCopilotVisionInput(context.messages);
         const copilot_headers = github_copilot.buildCopilotDynamicHeaders(
-            ctx.context.messages,
+            context.messages,
             has_images,
-            ctx.allocator,
+            allocator,
         ) catch {
-            ctx.stream.completeWithError("oom copilot headers");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom copilot headers");
             return;
         };
-        defer ctx.allocator.free(copilot_headers);
+        defer allocator.free(copilot_headers);
 
         for (copilot_headers) |h| {
-            headers.append(ctx.allocator, h) catch {
-                ctx.stream.completeWithError("oom headers");
+            headers.append(allocator, h) catch {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("oom headers");
                 return;
             };
         }
     }
 
     var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        ctx.stream.completeWithError("failed to open request");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("failed to open request");
         return;
     };
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = ctx.request_body.len };
+    req.transfer_encoding = .{ .content_length = request_body.len };
 
-    req.sendBodyComplete(ctx.request_body) catch {
-        ctx.stream.completeWithError("failed to send request");
+    req.sendBodyComplete(request_body) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("failed to send request");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
     var response = req.receiveHead(&head_buf) catch {
-        ctx.stream.completeWithError("failed to receive response");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("failed to receive response");
         return;
     };
 
     if (response.head.status != .ok) {
-        ctx.stream.completeWithError("openai request failed");
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("openai request failed");
         return;
     }
 
-    var parser = sse_parser.SSEParser.init(ctx.allocator);
+    var parser = sse_parser.SSEParser.init(allocator);
     defer parser.deinit();
 
     var text = std.ArrayList(u8){};
-    defer text.deinit(ctx.allocator);
+    defer text.deinit(allocator);
     var thinking = std.ArrayList(u8){};
-    defer thinking.deinit(ctx.allocator);
+    defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
-    defer if (reasoning_signature) |sig| ctx.allocator.free(sig);
+    defer if (reasoning_signature) |sig| allocator.free(sig);
 
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
@@ -357,19 +395,28 @@ fn runThread(ctx: *ThreadCtx) void {
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
-            ctx.stream.completeWithError("read error");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("read error");
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            ctx.stream.completeWithError("sse parse error");
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("sse parse error");
             return;
         };
 
         for (events) |ev| {
-            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, ctx.allocator) catch {
-                ctx.stream.completeWithError("json parse error");
+            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, allocator) catch {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("json parse error");
                 return;
             };
         }
@@ -386,47 +433,62 @@ fn runThread(ctx: *ThreadCtx) void {
     if (content_count_final == 0) {
         // No content - create empty text block with borrowed empty string reference
         // Using a static empty string avoids an unnecessary allocation for the empty case
-        var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
-            ctx.stream.completeWithError("oom building result");
+        var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom building result");
             return;
         };
         content[0] = .{ .text = .{ .text = "" } };
         const out = ai_types.AssistantMessage{
             .content = content,
-            .api = ctx.model.api,
-            .provider = ctx.model.provider,
-            .model = ctx.model.id,
+            .api = model.api,
+            .provider = model.provider,
+            .model = model.id,
             .usage = usage,
             .stop_reason = stop_reason,
             .timestamp = std.time.milliTimestamp(),
         };
-        ctx.stream.complete(out);
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.complete(out);
         return;
     }
 
-    var content = ctx.allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
-        ctx.stream.completeWithError("oom building result");
+    var content = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.completeWithError("oom building result");
         return;
     };
     var idx: usize = 0;
 
     if (has_thinking) {
         content[idx] = .{ .thinking = .{
-            .thinking = ctx.allocator.dupe(u8, thinking.items) catch {
-                ctx.allocator.free(content);
-                ctx.stream.completeWithError("oom building thinking");
+            .thinking = allocator.dupe(u8, thinking.items) catch {
+                allocator.free(content);
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("oom building thinking");
                 return;
             },
-            .thinking_signature = if (reasoning_signature) |sig| ctx.allocator.dupe(u8, sig) catch {
+            .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
                 // Free previously allocated content
                 for (content[0..idx]) |*block| {
                     switch (block.*) {
-                        .thinking => |t| ctx.allocator.free(t.thinking),
+                        .thinking => |t| allocator.free(t.thinking),
                         else => {},
                     }
                 }
-                ctx.allocator.free(content);
-                ctx.stream.completeWithError("oom building signature");
+                allocator.free(content);
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("oom building signature");
                 return;
             } else null,
         } };
@@ -434,34 +496,40 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     if (has_text) {
-        content[idx] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
+        content[idx] = .{ .text = .{ .text = allocator.dupe(u8, text.items) catch {
             // Free previously allocated content
             for (content[0..idx]) |*block| {
                 switch (block.*) {
                     .thinking => |t| {
-                        ctx.allocator.free(t.thinking);
-                        if (t.thinking_signature) |sig| ctx.allocator.free(sig);
+                        allocator.free(t.thinking);
+                        if (t.thinking_signature) |sig| allocator.free(sig);
                     },
                     else => {},
                 }
             }
-            ctx.allocator.free(content);
-            ctx.stream.completeWithError("oom building text");
+            allocator.free(content);
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom building text");
             return;
         } } };
     }
 
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = ctx.model.api,
-        .provider = ctx.model.provider,
-        .model = ctx.model.id,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
     };
 
-    ctx.stream.complete(out);
+    allocator.free(api_key);
+    allocator.free(request_body);
+    allocator.destroy(ctx);
+    stream.complete(out);
 }
 
 pub fn streamOpenAICompletions(
