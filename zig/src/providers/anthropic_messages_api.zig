@@ -5,6 +5,10 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
+    // Check ANTHROPIC_AUTH_TOKEN first (new standard), then ANTHROPIC_API_KEY (legacy)
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+        return token;
+    } else |_| {}
     return std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
 }
 

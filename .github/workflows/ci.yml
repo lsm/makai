@@ -18,6 +18,7 @@ jobs:
       - name: Check which secrets are available
         id: check
         env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -25,7 +26,7 @@ jobs:
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
-          echo "has_anthropic=$([[ -n \"$ANTHROPIC_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_anthropic=$([[ -n \"$ANTHROPIC_AUTH_TOKEN\" || -n \"$ANTHROPIC_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_openai=$([[ -n \"$OPENAI_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_google=$([[ -n \"$GOOGLE_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_azure=$([[ -n \"$AZURE_OPENAI_API_KEY\" && -n \"$AZURE_OPENAI_ENDPOINT\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
@@ -75,6 +76,7 @@ jobs:
         working-directory: zig
         run: zig build test-e2e-anthropic
         env:
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_MODEL: claude-3-5-haiku-latest
 
