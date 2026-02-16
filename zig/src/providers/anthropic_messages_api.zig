@@ -886,9 +886,17 @@ fn runThread(ctx: *ThreadCtx) void {
                                 if (tc_tracker.completeCall(cbs.index, allocator)) |tool_call| {
                                     content_blocks.append(allocator, .{ .tool_call = tool_call }) catch {};
 
+                                    // Dupe the tool_call for the event so it owns its own memory
+                                    const event_tc = ai_types.ToolCall{
+                                        .id = allocator.dupe(u8, tool_call.id) catch tool_call.id,
+                                        .name = allocator.dupe(u8, tool_call.name) catch tool_call.name,
+                                        .arguments_json = if (tool_call.arguments_json.len > 0) allocator.dupe(u8, tool_call.arguments_json) catch tool_call.arguments_json else "",
+                                        .thought_signature = if (tool_call.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
+                                    };
+
                                     stream.push(.{ .toolcall_end = .{
                                         .content_index = content_blocks.items.len - 1,
-                                        .tool_call = tool_call,
+                                        .tool_call = event_tc,
                                         .partial = createPartialMessage(model),
                                     }}) catch {};
                                 }

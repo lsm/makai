@@ -860,10 +860,17 @@ fn runThread(ctx: *ThreadCtx) void {
                                 continue;
                             };
 
+                            // Dupe the tool_call for the event so it owns its own memory
+                            const event_tc = ai_types.ToolCall{
+                                .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
+                                .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
+                                .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
+                            };
+
                             // Emit toolcall_end with the ToolCall struct
                             stream.push(.{ .toolcall_end = .{
                                 .content_index = content_idx,
-                                .tool_call = tool_call_struct,
+                                .tool_call = event_tc,
                                 .partial = createPartialMessage(model),
                             } }) catch {};
                         },

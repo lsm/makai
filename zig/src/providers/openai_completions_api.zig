@@ -786,11 +786,21 @@ fn runThread(ctx: *ThreadCtx) void {
         if (tool_call_tracker_instance.completeCall(api_idx, allocator)) |tc| {
             content[idx] = .{ .tool_call = tc };
 
+            // Dupe the tool_call for the event so it owns its own memory
+            // The content array's tool_call is owned by the final message,
+            // and the event's tool_call needs its own copies for proper cleanup
+            const event_tc = ai_types.ToolCall{
+                .id = allocator.dupe(u8, tc.id) catch tc.id,
+                .name = allocator.dupe(u8, tc.name) catch tc.name,
+                .arguments_json = if (tc.arguments_json.len > 0) allocator.dupe(u8, tc.arguments_json) catch tc.arguments_json else "",
+                .thought_signature = if (tc.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
+            };
+
             // Emit toolcall_end event
             _ = stream.push(.{
                 .toolcall_end = .{
                     .content_index = idx,
-                    .tool_call = tc,
+                    .tool_call = event_tc,
                     .partial = .{
                         .content = content[0..idx],
                         .api = model.api,
