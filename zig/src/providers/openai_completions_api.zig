@@ -384,16 +384,13 @@ fn runThread(ctx: *ThreadCtx) void {
     const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0);
 
     if (content_count_final == 0) {
-        // No content - create empty text block
+        // No content - create empty text block with borrowed empty string reference
+        // Using a static empty string avoids an unnecessary allocation for the empty case
         var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
             ctx.stream.completeWithError("oom building result");
             return;
         };
-        content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, "") catch {
-            ctx.allocator.free(content);
-            ctx.stream.completeWithError("oom building text");
-            return;
-        } } };
+        content[0] = .{ .text = .{ .text = "" } };
         const out = ai_types.AssistantMessage{
             .content = content,
             .api = ctx.model.api,

@@ -159,17 +159,20 @@ pub const AssistantMessage = struct {
         for (self.content) |block| {
             switch (block) {
                 .text => |t| {
-                    allocator.free(t.text);
+                    // Only free non-empty text - empty slices may be static string literals
+                    if (t.text.len > 0) allocator.free(t.text);
                     if (t.text_signature) |s| allocator.free(s);
                 },
                 .thinking => |t| {
-                    allocator.free(t.thinking);
+                    // Only free non-empty thinking - empty slices may be static
+                    if (t.thinking.len > 0) allocator.free(t.thinking);
                     if (t.thinking_signature) |s| allocator.free(s);
                 },
                 .tool_call => |tc| {
                     allocator.free(tc.id);
                     allocator.free(tc.name);
-                    allocator.free(tc.arguments_json);
+                    // Only free non-empty arguments_json - empty slices may be static
+                    if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
                     if (tc.thought_signature) |s| allocator.free(s);
                 },
             }
