@@ -254,11 +254,13 @@ fn runThread(ctx: *ThreadCtx) void {
         ctx.stream.completeWithError("oom result");
         return;
     };
-    content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
+    // Use static empty string for empty content to avoid allocation
+    const text_owned = if (text.items.len == 0) "" else ctx.allocator.dupe(u8, text.items) catch {
         ctx.allocator.free(content);
         ctx.stream.completeWithError("oom text");
         return;
-    } } };
+    };
+    content[0] = .{ .text = .{ .text = text_owned } };
 
     const out = ai_types.AssistantMessage{
         .content = content,
