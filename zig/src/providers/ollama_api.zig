@@ -276,9 +276,9 @@ pub fn streamOllama(
 ) !*ai_types.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
-    // Note: Ollama doesn't use API keys in HTTP headers. Cloud models authenticate
-    // via `ollama signin` which stores credentials locally. We keep api_key support
-    // for potential future use or custom deployments.
+    // Ollama supports two modes:
+    // 1. Local server (localhost:11434) - default, no auth required
+    // 2. Cloud API (ollama.com) - requires OLLAMA_API_KEY via Authorization header
     const api_key: ?[]u8 = blk: {
         if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
         if (env(allocator, "OLLAMA_API_KEY")) |k| break :blk @constCast(k);
@@ -286,13 +286,12 @@ pub fn streamOllama(
     };
     errdefer if (api_key) |k| allocator.free(k);
 
-    // Ollama always uses localhost by default, even for cloud models.
-    // Cloud models (e.g., gpt-oss:120b-cloud) use localhost which offloads to
-    // Ollama's cloud service after authentication via `ollama signin`.
-    // There is no public API at https://api.ollama.ai.
     const base_url = blk: {
         if (model.base_url.len > 0) break :blk try allocator.dupe(u8, model.base_url);
         if (env(allocator, "OLLAMA_BASE_URL")) |v| break :blk @constCast(v);
+        // When API key is present, use cloud endpoint (https://ollama.com)
+        if (api_key != null) break :blk try allocator.dupe(u8, "https://ollama.com");
+        // Otherwise use local server
         break :blk try allocator.dupe(u8, "http://127.0.0.1:11434");
     };
     errdefer allocator.free(base_url);

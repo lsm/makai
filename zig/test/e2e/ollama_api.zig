@@ -10,30 +10,45 @@ fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
 
-fn isOllamaAvailable(allocator: std.mem.Allocator) bool {
-    // Check if Ollama server is running by attempting to connect
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    const uri = std.Uri.parse("http://127.0.0.1:11434/api/tags") catch return false;
-
-    var req = client.request(.GET, uri, .{}) catch return false;
-    defer req.deinit();
-
-    req.transfer_encoding = .{ .content_length = 0 };
-    req.sendBodyComplete(&.{}) catch return false;
-
-    var head_buf: [1024]u8 = undefined;
-    const response = req.receiveHead(&head_buf) catch return false;
-
-    return response.head.status == .ok;
-}
-
 test "ollama e2e: basic text generation (new api)" {
-    // Check if Ollama server is actually running (required for local Ollama API)
-    if (!isOllamaAvailable(testing.allocator)) {
-        std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: ollama server not running at localhost:11434\n", .{});
-        return error.SkipZigTest;
+    // Ollama can run in two modes:
+    // 1. Cloud API (ollama.com) - requires OLLAMA_API_KEY
+    // 2. Local server (localhost:11434) - no auth required
+    const api_key = getEnvOwned(testing.allocator, "OLLAMA_API_KEY");
+    defer if (api_key) |k| testing.allocator.free(k);
+
+    // Skip if no API key and local server isn't running
+    if (api_key == null) {
+        var client = std.http.Client{ .allocator = testing.allocator };
+        defer client.deinit();
+
+        const uri = std.Uri.parse("http://127.0.0.1:11434/api/tags") catch {
+            std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: no OLLAMA_API_KEY and localhost:11434 not available\n", .{});
+            return error.SkipZigTest;
+        };
+
+        var req = client.request(.GET, uri, .{}) catch {
+            std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: no OLLAMA_API_KEY and localhost:11434 not responding\n", .{});
+            return error.SkipZigTest;
+        };
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = 0 };
+        req.sendBodyComplete(&.{}) catch {
+            std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: ollama local server not responding\n", .{});
+            return error.SkipZigTest;
+        };
+
+        var head_buf: [1024]u8 = undefined;
+        const response = req.receiveHead(&head_buf) catch {
+            std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: ollama local server not available\n", .{});
+            return error.SkipZigTest;
+        };
+
+        if (response.head.status != .ok) {
+            std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: ollama local server not healthy\n", .{});
+            return error.SkipZigTest;
+        }
     }
 
     const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "llama3.2:1b");
@@ -67,6 +82,7 @@ test "ollama e2e: basic text generation (new api)" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{
+        .api_key = api_key,
         .max_tokens = 48,
         .temperature = 0.0,
     }, testing.allocator);
