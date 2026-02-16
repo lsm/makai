@@ -14,7 +14,7 @@ test "github_copilot: basic text generation" {
     const cfg = config.GitHubCopilotConfig{
         .copilot_token = creds.copilot_token,
         .github_token = creds.github_token,
-        .model = "gpt-4o",
+        .model = "gpt-5-mini",
         .params = .{
             .max_tokens = 100,
             .temperature = 1.0,
@@ -49,7 +49,7 @@ test "github_copilot: streaming events sequence" {
     const cfg = config.GitHubCopilotConfig{
         .copilot_token = creds.copilot_token,
         .github_token = creds.github_token,
-        .model = "gpt-4o",
+        .model = "gpt-5-mini",
         .params = .{ .max_tokens = 50 },
     };
 
@@ -107,7 +107,7 @@ test "github_copilot: usage tracking" {
     const cfg = config.GitHubCopilotConfig{
         .copilot_token = creds.copilot_token,
         .github_token = creds.github_token,
-        .model = "gpt-4o",
+        .model = "gpt-5-mini",
         .params = .{ .max_tokens = 100 },
     };
 
