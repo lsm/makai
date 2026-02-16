@@ -71,9 +71,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     if (info == .@"union") {
                         switch (event) {
                             inline .text_delta, .thinking_delta, .toolcall_delta => |d| {
-                                if (@hasField(@TypeOf(d), "delta")) {
-                                    self.allocator.free(d.delta);
-                                }
+                                // Don't free delta - it's a slice into provider-managed buffers
+                                // that are freed when the provider thread exits
+                                _ = d;
                             },
                             .toolcall_end => |e| {
                                 if (@hasField(@TypeOf(e), "tool_call")) {

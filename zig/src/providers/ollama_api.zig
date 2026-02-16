@@ -74,10 +74,60 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
         try w.beginObject();
         try w.writeStringField("role", role);
         try w.writeStringField("content", text.items);
+
+        // Check for tool_calls on assistant messages
+        if (m == .assistant) {
+            var has_tool_calls = false;
+            for (m.assistant.content) |c| {
+                if (c == .tool_call) {
+                    has_tool_calls = true;
+                    break;
+                }
+            }
+            if (has_tool_calls) {
+                try w.writeKey("tool_calls");
+                try w.beginArray();
+                for (m.assistant.content) |c| {
+                    if (c == .tool_call) {
+                        const tc = c.tool_call;
+                        try w.beginObject();
+                        try w.writeStringField("id", tc.id);
+                        try w.writeStringField("type", "function");
+                        try w.writeKey("function");
+                        try w.beginObject();
+                        try w.writeStringField("name", tc.name);
+                        try w.writeStringField("arguments", tc.arguments_json);
+                        try w.endObject();
+                        try w.endObject();
+                    }
+                }
+                try w.endArray();
+            }
+        }
+
         try w.endObject();
     }
 
     try w.endArray();
+
+    // Add tools if provided (OpenAI-compatible format)
+    if (context.tools) |tools| {
+        try w.writeKey("tools");
+        try w.beginArray();
+        for (tools) |tool| {
+            try w.beginObject();
+            try w.writeStringField("type", "function");
+            try w.writeKey("function");
+            try w.beginObject();
+            try w.writeStringField("name", tool.name);
+            try w.writeStringField("description", tool.description);
+            try w.writeKey("parameters");
+            try w.writeRawJson(tool.parameters_schema_json);
+            try w.endObject();
+            try w.endObject();
+        }
+        try w.endArray();
+    }
 
     try w.writeKey("options");
     try w.beginObject();

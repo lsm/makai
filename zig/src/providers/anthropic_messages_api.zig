@@ -6,8 +6,9 @@ const json_writer = @import("json_writer");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
+    // Check ANTHROPIC_AUTH_TOKEN first (OAuth), then ANTHROPIC_API_KEY
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
+    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
     return null;
 }
 
@@ -106,7 +107,20 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
     }
 }
 
-fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator) ![]u8 {
+/// Check if an assistant message contains tool_use blocks
+fn hasToolUse(msg: ai_types.Message) bool {
+    switch (msg) {
+        .assistant => |a| {
+            for (a.content) |c| {
+                if (c == .tool_call) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator, is_oauth: bool) ![]u8 {
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
@@ -125,14 +139,21 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // System prompt as array of content blocks with cache_control
+    // For OAuth, prepend Claude Code identity to system prompt
     if (context.system_prompt) |sp| {
         try w.writeKey("system");
         try w.beginArray();
 
-        // System prompt block with cache_control
         try w.beginObject();
         try w.writeStringField("type", "text");
-        try w.writeStringField("text", sp);
+        if (is_oauth) {
+            // Prepend Claude Code identity for OAuth
+            const full_prompt = try std.fmt.allocPrint(allocator, "You are Claude Code, Anthropic's official CLI for Claude.\n\n{s}", .{sp});
+            defer allocator.free(full_prompt);
+            try w.writeStringField("text", full_prompt);
+        } else {
+            try w.writeStringField("text", sp);
+        }
         if (cache_control) |cc| {
             try w.writeKey("cache_control");
             try w.beginObject();
@@ -144,6 +165,24 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         }
         try w.endObject();
 
+        try w.endArray();
+    } else if (is_oauth) {
+        // OAuth requires at least the identity even without custom system prompt
+        try w.writeKey("system");
+        try w.beginArray();
+        try w.beginObject();
+        try w.writeStringField("type", "text");
+        try w.writeStringField("text", "You are Claude Code, Anthropic's official CLI for Claude.");
+        if (cache_control) |cc| {
+            try w.writeKey("cache_control");
+            try w.beginObject();
+            try w.writeStringField("type", "ephemeral");
+            if (cc.has_ttl) {
+                try w.writeStringField("ttl", "1h");
+            }
+            try w.endObject();
+        }
+        try w.endObject();
         try w.endArray();
     }
 
@@ -159,10 +198,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeKey("messages");
     try w.beginArray();
     for (context.messages, 0..) |m, msg_idx| {
-        var text = std.ArrayList(u8){};
-        defer text.deinit(allocator);
-        try appendMessageText(m, &text, allocator);
-
         const role: []const u8 = switch (m) {
             .assistant => "assistant",
             else => "user",
@@ -170,8 +205,79 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
         const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
 
-        // For the last user message with cache_control, use content array format
-        if (is_last_user and cache_control != null) {
+        // Handle assistant messages with tool_use blocks specially
+        if (m == .assistant and hasToolUse(m)) {
+            try w.beginObject();
+            try w.writeStringField("role", role);
+            try w.writeKey("content");
+            try w.beginArray();
+
+            // Serialize each content block
+            for (m.assistant.content) |c| {
+                switch (c) {
+                    .text => |t| {
+                        try w.beginObject();
+                        try w.writeStringField("type", "text");
+                        try w.writeStringField("text", t.text);
+                        try w.endObject();
+                    },
+                    .thinking => |t| {
+                        try w.beginObject();
+                        try w.writeStringField("type", "thinking");
+                        try w.writeStringField("thinking", t.thinking);
+                        try w.endObject();
+                    },
+                    .tool_call => |tc| {
+                        try w.beginObject();
+                        try w.writeStringField("type", "tool_use");
+                        try w.writeStringField("id", tc.id);
+                        try w.writeStringField("name", tc.name);
+                        try w.writeKey("input");
+                        try w.writeRawJson(tc.arguments_json);
+                        try w.endObject();
+                    },
+                }
+            }
+
+            try w.endArray();
+            try w.endObject();
+        } else if (m == .tool_result) {
+            // Tool result messages must be serialized as user messages with tool_result content blocks
+            const tr = m.tool_result;
+
+            try w.beginObject();
+            try w.writeStringField("role", "user");
+            try w.writeKey("content");
+            try w.beginArray();
+
+            try w.beginObject();
+            try w.writeStringField("type", "tool_result");
+            try w.writeStringField("tool_use_id", tr.tool_call_id);
+
+            // Serialize content - can be a string or array of content blocks
+            // For simplicity, extract text content and serialize as string
+            var text = std.ArrayList(u8){};
+            defer text.deinit(allocator);
+            for (tr.content) |c| switch (c) {
+                .text => |t| {
+                    if (text.items.len > 0) try text.append(allocator, '\n');
+                    try text.appendSlice(allocator, t.text);
+                },
+                .image => {},
+            };
+
+            try w.writeStringField("content", text.items);
+            try w.writeBoolField("is_error", tr.is_error);
+            try w.endObject();
+
+            try w.endArray();
+            try w.endObject();
+        } else if (is_last_user and cache_control != null) {
+            // For the last user message with cache_control, use content array format
+            var text = std.ArrayList(u8){};
+            defer text.deinit(allocator);
+            try appendMessageText(m, &text, allocator);
+
             try w.beginObject();
             try w.writeStringField("role", role);
             try w.writeKey("content");
@@ -193,6 +299,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.endArray();
             try w.endObject();
         } else {
+            // Standard message serialization
+            var text = std.ArrayList(u8){};
+            defer text.deinit(allocator);
+            try appendMessageText(m, &text, allocator);
+
             try w.beginObject();
             try w.writeStringField("role", role);
             try w.writeStringField("content", text.items);
@@ -200,6 +311,23 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         }
     }
     try w.endArray();
+
+    // Serialize tools if present
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            try w.writeKey("tools");
+            try w.beginArray();
+            for (tools) |tool| {
+                try w.beginObject();
+                try w.writeStringField("name", tool.name);
+                try w.writeStringField("description", tool.description);
+                try w.writeKey("input_schema");
+                try w.writeRawJson(tool.parameters_schema_json);
+                try w.endObject();
+            }
+            try w.endArray();
+        }
+    }
 
     // Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
     if (options.thinking_enabled) {
@@ -448,7 +576,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         // OAuth-specific headers (mimic Claude Code)
-        headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" }) catch {
+        headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" }) catch {
             allocator.free(api_key);
             allocator.free(request_body);
             allocator.destroy(ctx);
@@ -478,6 +606,14 @@ fn runThread(ctx: *ThreadCtx) void {
         };
     } else {
         headers.append(allocator, .{ .name = "x-api-key", .value = api_key }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("oom headers");
+            return;
+        };
+        // Add beta headers for fine-grained tool streaming and interleaved thinking
+        headers.append(allocator, .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" }) catch {
             allocator.free(api_key);
             allocator.free(request_body);
             allocator.destroy(ctx);
@@ -769,6 +905,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
+        .owned_strings = true, // Strings were duped above
     };
 
     stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
@@ -809,7 +946,8 @@ pub fn streamAnthropicMessages(
     };
     errdefer allocator.free(api_key);
 
-    const body = try buildRequestBody(model, context, o, allocator);
+    const is_oauth = isOAuthToken(api_key);
+    const body = try buildRequestBody(model, context, o, allocator, is_oauth);
     errdefer allocator.free(body);
 
     const s = try allocator.create(ai_types.AssistantMessageEventStream);
@@ -936,7 +1074,7 @@ test "buildRequestBody includes cache_control in system prompt" {
         .cache_retention = .short,
     };
 
-    const body = try buildRequestBody(model, context, options, allocator);
+    const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
     // Verify system prompt is an array with cache_control
@@ -975,11 +1113,114 @@ test "buildRequestBody includes ttl for long retention on anthropic url" {
         .cache_retention = .long,
     };
 
-    const body = try buildRequestBody(model, context, options, allocator);
+    const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
     // Verify ttl is included for long retention
     try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
+}
+
+test "buildRequestBody serializes tool_result as tool_result content block" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "Tool execution result" } },
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "Use the tool" }, .timestamp = 0 } },
+        .{ .assistant = .{ .content = &.{
+            .{ .tool_call = .{ .id = "toolu_123", .name = "bash", .arguments_json = "{\"cmd\": \"ls\"}" } },
+        }, .api = "anthropic-messages", .provider = "anthropic", .model = "claude-3-5-sonnet-20241022", .usage = .{}, .stop_reason = .tool_use, .timestamp = 0 } },
+        .{ .tool_result = .{ .tool_call_id = "toolu_123", .tool_name = "bash", .content = &tool_result_content, .is_error = false, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "You are a helpful assistant.",
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator, false);
+    defer allocator.free(body);
+
+    // Parse to verify structure
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const msg_array = parsed.value.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 3), msg_array.items.len);
+
+    // Tool result message should have role "user"
+    const tool_result_msg = msg_array.items[2];
+    try std.testing.expectEqualStrings("user", tool_result_msg.object.get("role").?.string);
+
+    // Content should be an array
+    const content = tool_result_msg.object.get("content").?;
+    try std.testing.expect(content == .array);
+    try std.testing.expectEqual(@as(usize, 1), content.array.items.len);
+
+    // Verify tool_result content block structure
+    const tool_result_block = content.array.items[0];
+    try std.testing.expectEqualStrings("tool_result", tool_result_block.object.get("type").?.string);
+    try std.testing.expectEqualStrings("toolu_123", tool_result_block.object.get("tool_use_id").?.string);
+    try std.testing.expectEqualStrings("Tool execution result", tool_result_block.object.get("content").?.string);
+    try std.testing.expectEqual(false, tool_result_block.object.get("is_error").?.bool);
+}
+
+test "buildRequestBody serializes tool_result with is_error=true" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "Error: command failed" } },
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{ .tool_call_id = "toolu_456", .tool_name = "bash", .content = &tool_result_content, .is_error = true, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator, false);
+    defer allocator.free(body);
+
+    // Verify is_error is true
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\":true") != null);
 }
 
 test "buildRequestBody adds cache_control to last user message" {
@@ -1014,7 +1255,7 @@ test "buildRequestBody adds cache_control to last user message" {
         .cache_retention = .short,
     };
 
-    const body = try buildRequestBody(model, context, options, allocator);
+    const body = try buildRequestBody(model, context, options, allocator, false);
     defer allocator.free(body);
 
     // Parse to verify structure
