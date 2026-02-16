@@ -547,27 +547,38 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
 
                     // Append content and emit delta
+                    // NOTE: We must dupe part.text for the event delta because:
+                    // 1. deinitGoogleParseResult() frees part.text
+                    // 2. EventStream.deinit() also frees event deltas
+                    // Using the same pointer would cause a double-free.
+                    // The ArrayList appendSlice keeps the content for final message.
                     const partial = createPartialMessage(model);
                     if (is_thinking) {
                         current_thinking.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
                             current_thinking_signature.appendSlice(allocator, sig) catch {};
                         }
+                        const delta_copy = allocator.dupe(u8, part.text) catch continue;
                         stream.push(.{ .thinking_delta = .{
                             .content_index = content_blocks.items.len,
-                            .delta = part.text,
+                            .delta = delta_copy,
                             .partial = partial,
-                        } }) catch {};
+                        } }) catch {
+                            allocator.free(delta_copy);
+                        };
                     } else {
                         current_text.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
                             current_text_signature.appendSlice(allocator, sig) catch {};
                         }
+                        const delta_copy = allocator.dupe(u8, part.text) catch continue;
                         stream.push(.{ .text_delta = .{
                             .content_index = content_blocks.items.len,
-                            .delta = part.text,
+                            .delta = delta_copy,
                             .partial = partial,
-                        } }) catch {};
+                        } }) catch {
+                            allocator.free(delta_copy);
+                        };
                     }
                 }
             }
