@@ -55,31 +55,28 @@ jobs:
         working-directory: zig
         run: zig build test
 
-  # Anthropic E2E disabled: OAuth tokens not supported by Messages API
-  # Requires actual API key from console.anthropic.com/settings/keys
-  # OAuth tokens (CLAUDE_CODE_OAUTH_TOKEN) only work for interactive sessions, not API
-  # e2e-anthropic:
-  #   name: E2E - Anthropic
-  #   needs: [unit-tests, check-secrets]
-  #   if: needs.check-secrets.outputs.has_anthropic == 'true'
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: mlugg/setup-zig@v2
-  #       with:
-  #         version: 0.15.2
-  #     - uses: actions/cache@v4
-  #       with:
-  #         path: ~/.cache/zig
-  #         key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-  #         restore-keys: |
-  #           ${{ runner.os }}-zig-
-  #     - name: Run Anthropic E2E tests
-  #       working-directory: zig
-  #       run: zig build test-e2e-anthropic
-  #       env:
-  #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-  #         ANTHROPIC_MODEL: claude-3-5-haiku-latest
+  e2e-anthropic:
+    name: E2E - Anthropic
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_anthropic == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Anthropic E2E tests
+        working-directory: zig
+        run: zig build test-e2e-anthropic
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-3-5-haiku-20241022
 
   e2e-openai:
     name: E2E - OpenAI

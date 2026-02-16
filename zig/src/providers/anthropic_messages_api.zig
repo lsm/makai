@@ -5,9 +5,12 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    // Note: Only API keys work (x-api-key header), not OAuth tokens
-    // OAuth tokens fail with "OAuth authentication is currently not supported"
+    // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
     return std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null;
+}
+
+fn isOAuthToken(key: []const u8) bool {
+    return std.mem.indexOf(u8, key, "sk-ant-oat") != null;
 }
 
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -166,23 +169,54 @@ fn runThread(ctx: *ThreadCtx) void {
     };
     defer ctx.allocator.free(url);
 
-    const auth = std.fmt.allocPrint(ctx.allocator, "{s}", .{ctx.api_key}) catch {
-        ctx.stream.completeWithError("oom auth");
-        return;
-    };
-    defer ctx.allocator.free(auth);
-
     const uri = std.Uri.parse(url) catch {
         ctx.stream.completeWithError("invalid anthropic URL");
         return;
     };
 
+    const is_oauth = isOAuthToken(ctx.api_key);
+
+    // Allocate auth header for OAuth tokens (needs to persist until after request)
+    var auth_header: ?[]u8 = null;
+    defer if (auth_header) |h| ctx.allocator.free(h);
+
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(ctx.allocator);
-    headers.append(ctx.allocator, .{ .name = "x-api-key", .value = auth }) catch {
-        ctx.stream.completeWithError("oom headers");
-        return;
-    };
+
+    // OAuth tokens use Authorization: Bearer, API keys use x-api-key
+    if (is_oauth) {
+        auth_header = std.fmt.allocPrint(ctx.allocator, "Bearer {s}", .{ctx.api_key}) catch {
+            ctx.stream.completeWithError("oom auth header");
+            return;
+        };
+        headers.append(ctx.allocator, .{ .name = "authorization", .value = auth_header.? }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+        // OAuth-specific headers (mimic Claude Code)
+        headers.append(ctx.allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+        headers.append(ctx.allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+        headers.append(ctx.allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+        headers.append(ctx.allocator, .{ .name = "x-app", .value = "cli" }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+    } else {
+        headers.append(ctx.allocator, .{ .name = "x-api-key", .value = ctx.api_key }) catch {
+            ctx.stream.completeWithError("oom headers");
+            return;
+        };
+    }
+
     headers.append(ctx.allocator, .{ .name = "anthropic-version", .value = "2023-06-01" }) catch {
         ctx.stream.completeWithError("oom headers");
         return;
@@ -214,7 +248,7 @@ fn runThread(ctx: *ThreadCtx) void {
         const status_code = @intFromEnum(response.head.status);
         const err = std.fmt.allocPrint(ctx.allocator, "anthropic request failed: HTTP {d}{s}", .{
             status_code,
-            if (status_code == 401) " (check ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY is valid)" else "",
+            if (status_code == 401) " (check ANTHROPIC_API_KEY is valid)" else "",
         }) catch {
             ctx.stream.completeWithError("anthropic request failed");
             return;
