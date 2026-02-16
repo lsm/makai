@@ -13,7 +13,6 @@ jobs:
       has_openai: ${{ steps.check.outputs.has_openai }}
       has_google: ${{ steps.check.outputs.has_google }}
       has_azure: ${{ steps.check.outputs.has_azure }}
-      has_ollama: ${{ steps.check.outputs.has_ollama }}
     steps:
       - name: Check which secrets are available
         id: check
@@ -23,13 +22,11 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "has_anthropic=$([[ -n \"$ANTHROPIC_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_openai=$([[ -n \"$OPENAI_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_google=$([[ -n \"$GOOGLE_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_azure=$([[ -n \"$AZURE_OPENAI_API_KEY\" && -n \"$AZURE_OPENAI_ENDPOINT\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-          echo "has_ollama=$([[ -n \"$OLLAMA_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
     name: Unit Tests
@@ -149,25 +146,28 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_MODEL: gemini-2.5-flash
 
-  e2e-ollama:
-    name: E2E - Ollama
-    needs: [unit-tests, check-secrets]
-    if: needs.check-secrets.outputs.has_ollama == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
-      - name: Run Ollama E2E tests
-        working-directory: zig
-        run: zig build test-e2e-ollama
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: llama3.2:1b
+  # Ollama E2E temporarily disabled: llama3.2:1b not available in cloud (HTTP 404)
+  # Need to identify which small/cheap models are available via Ollama cloud API
+  # Cloud endpoint works correctly (https://ollama.com) but requires cloud-available model
+  # e2e-ollama:
+  #   name: E2E - Ollama
+  #   needs: [unit-tests, check-secrets]
+  #   if: needs.check-secrets.outputs.has_ollama == 'true'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: mlugg/setup-zig@v2
+  #       with:
+  #         version: 0.15.2
+  #     - uses: actions/cache@v4
+  #       with:
+  #         path: ~/.cache/zig
+  #         key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+  #         restore-keys: |
+  #           ${{ runner.os }}-zig-
+  #     - name: Run Ollama E2E tests
+  #       working-directory: zig
+  #       run: zig build test-e2e-ollama
+  #       env:
+  #         OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+  #         OLLAMA_MODEL: llama3.2:1b
