@@ -318,13 +318,17 @@ pub fn streamOpenAICompletions(
         if (key_owned) |k| break :blk k;
         return error.MissingApiKey;
     };
+    errdefer allocator.free(api_key);
 
     const req_body = try buildRequestBody(model, context, resolved, allocator);
+    errdefer allocator.free(req_body);
 
     const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
     s.* = ai_types.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .stream = s,

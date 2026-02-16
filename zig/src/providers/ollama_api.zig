@@ -281,6 +281,7 @@ pub fn streamOllama(
         if (env(allocator, "OLLAMA_API_KEY")) |k| break :blk @constCast(k);
         break :blk null;
     };
+    errdefer if (api_key) |k| allocator.free(k);
 
     const base_url = blk: {
         if (model.base_url.len > 0) break :blk try allocator.dupe(u8, model.base_url);
@@ -288,13 +289,17 @@ pub fn streamOllama(
         if (api_key != null) break :blk try allocator.dupe(u8, "https://api.ollama.ai");
         break :blk try allocator.dupe(u8, "http://127.0.0.1:11434");
     };
+    errdefer allocator.free(base_url);
 
     const body = try buildBody(model, context, o, allocator);
+    errdefer allocator.free(body);
 
     const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
     s.* = ai_types.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .stream = s,
