@@ -330,3 +330,99 @@ test "cloneAssistantMessage deep copies text content" {
     try std.testing.expectEqualStrings("hello", cloned.content[0].text.text);
     try std.testing.expectEqualStrings("openai", cloned.provider);
 }
+
+test "AssistantMessageEventStream deinit drains unpolled events" {
+    // This test verifies that deinit() properly frees memory in events
+    // that were pushed but not polled before the stream is destroyed.
+    // This is especially important for the Google Generative API provider
+    // which uses AssistantMessageEventStream with heap-allocated delta strings.
+    var stream = AssistantMessageEventStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // Create a text_delta event with heap-allocated delta string
+    // This simulates what the Google provider does
+    const delta_str = try std.testing.allocator.dupe(u8, "test delta content");
+    const partial = AssistantMessage{
+        .content = &.{},
+        .api = "google-generative-ai",
+        .provider = "google",
+        .model = "gemini-2.5-flash",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = AssistantMessageEvent{
+        .text_delta = .{
+            .content_index = 0,
+            .delta = delta_str,
+            .partial = partial,
+        },
+    };
+    try stream.push(event);
+
+    // Do NOT poll - deinit should drain and free delta_str
+
+    // Complete with an empty result
+    const result = AssistantMessage{
+        .content = &.{},
+        .api = "google-generative-ai",
+        .provider = "google",
+        .model = "gemini-2.5-flash",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    stream.complete(result);
+
+    // deinit() is called by defer above
+    // delta_str should be freed by the deinit logic
+}
+
+test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
+    // This test verifies that toolcall_end events with ToolCall allocations
+    // are properly freed when not polled before deinit
+    var stream = AssistantMessageEventStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    const tool_id = try std.testing.allocator.dupe(u8, "tool-123");
+    const tool_name = try std.testing.allocator.dupe(u8, "bash");
+    const args_json = try std.testing.allocator.dupe(u8, "{\"cmd\": \"ls\"}");
+    const partial = AssistantMessage{
+        .content = &.{},
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    const event = AssistantMessageEvent{
+        .toolcall_end = .{
+            .content_index = 0,
+            .tool_call = .{
+                .id = tool_id,
+                .name = tool_name,
+                .arguments_json = args_json,
+            },
+            .partial = partial,
+        },
+    };
+    try stream.push(event);
+
+    // Do NOT poll - deinit should drain and free tool_id, tool_name, args_json
+
+    const result = AssistantMessage{
+        .content = &.{},
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    stream.complete(result);
+
+    // deinit() is called by defer above
+    // tool_id, tool_name, args_json should be freed by the deinit logic
+}

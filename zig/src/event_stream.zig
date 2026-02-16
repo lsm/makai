@@ -49,7 +49,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     break :blk false;
                 };
 
-                if (is_message_event) {
+                if (comptime is_message_event) {
                     switch (event) {
                         .start => |s| self.allocator.free(s.model),
                         .text_delta => |d| self.allocator.free(d.delta),
@@ -62,6 +62,35 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                         .toolcall_end => |e| self.allocator.free(e.input_json),
                         .@"error" => |e| self.allocator.free(e.message),
                         else => {},
+                    }
+                } else {
+                    // Handle events that have delta/content fields with heap-allocated strings
+                    // This handles ai_types.AssistantMessageEvent and similar types
+                    // Use comptime introspection to check for field existence
+                    const info = @typeInfo(T);
+                    if (info == .@"union") {
+                        switch (event) {
+                            inline .text_delta, .thinking_delta, .toolcall_delta => |d| {
+                                if (@hasField(@TypeOf(d), "delta")) {
+                                    self.allocator.free(d.delta);
+                                }
+                            },
+                            .toolcall_end => |e| {
+                                if (@hasField(@TypeOf(e), "tool_call")) {
+                                    self.allocator.free(e.tool_call.id);
+                                    self.allocator.free(e.tool_call.name);
+                                    if (e.tool_call.arguments_json.len > 0) {
+                                        self.allocator.free(e.tool_call.arguments_json);
+                                    }
+                                    if (@hasField(@TypeOf(e.tool_call), "thought_signature")) {
+                                        if (e.tool_call.thought_signature) |sig| {
+                                            self.allocator.free(sig);
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        }
                     }
                 }
             }
