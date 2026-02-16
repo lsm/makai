@@ -6,6 +6,24 @@ const config = @import("config");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
+/// Free allocated strings in a MessageEvent
+/// Used when an event is created but cannot be pushed to the stream
+fn freeEventAllocations(event: types.MessageEvent, allocator: std.mem.Allocator) void {
+    switch (event) {
+        .start => |s| allocator.free(s.model),
+        .text_delta => |d| allocator.free(d.delta),
+        .thinking_delta => |d| allocator.free(d.delta),
+        .toolcall_start => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+        },
+        .toolcall_delta => |d| allocator.free(d.delta),
+        .toolcall_end => |e| allocator.free(e.input_json),
+        .@"error" => |e| allocator.free(e.message),
+        else => {},
+    }
+}
+
 /// GitHub Copilot provider context
 pub const GitHubCopilotContext = struct {
     config: config.GitHubCopilotConfig,
@@ -47,14 +65,24 @@ fn copilotStreamFn(
     const ctx: *GitHubCopilotContext = @ptrCast(@alignCast(ctx_ptr));
 
     const stream = try allocator.create(event_stream.AssistantMessageStream);
+    errdefer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
     stream.* = event_stream.AssistantMessageStream.init(allocator);
 
     const request_body = try buildRequestBody(ctx.config, messages, allocator);
+    errdefer allocator.free(request_body);
 
     const thread_ctx = try allocator.create(StreamThreadContext);
+    errdefer allocator.destroy(thread_ctx);
+
+    const duped_body = try allocator.dupe(u8, request_body);
+    errdefer allocator.free(duped_body);
+
     thread_ctx.* = .{
         .stream = stream,
-        .request_body = try allocator.dupe(u8, request_body),
+        .request_body = duped_body,
         .config = ctx.config,
         .allocator = allocator,
     };
@@ -257,7 +285,11 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                     else => {},
                 }
 
-                try ctx.stream.push(evt);
+                ctx.stream.push(evt) catch {
+                    // If push fails, free the event's allocations to prevent memory leak
+                    freeEventAllocations(evt, ctx.allocator);
+                    return error.StreamPushFailed;
+                };
             }
         }
     }
