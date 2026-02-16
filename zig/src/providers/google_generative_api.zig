@@ -618,38 +618,36 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
 
                     // Append content and emit delta
-                    // NOTE: We must dupe part.text for the event delta because:
-                    // 1. deinitGoogleParseResult() frees part.text
-                    // 2. EventStream.deinit() also frees event deltas
-                    // Using the same pointer would cause a double-free.
-                    // The ArrayList appendSlice keeps the content for final message.
+                    // Use slices from the ArrayList buffer directly (like Anthropic does).
+                    // The ArrayList is freed when the thread exits, and EventStream.deinit()
+                    // knows not to free delta slices.
                     const partial = createPartialMessage(model);
                     if (is_thinking) {
+                        const prev_len = current_thinking.items.len;
                         current_thinking.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
                             current_thinking_signature.appendSlice(allocator, sig) catch {};
                         }
-                        const delta_copy = allocator.dupe(u8, part.text) catch continue;
+                        // Use the newly appended portion for the delta
+                        const delta = current_thinking.items[prev_len..];
                         stream.push(.{ .thinking_delta = .{
                             .content_index = content_blocks.items.len,
-                            .delta = delta_copy,
+                            .delta = delta,
                             .partial = partial,
-                        } }) catch {
-                            allocator.free(delta_copy);
-                        };
+                        } }) catch {};
                     } else {
+                        const prev_len = current_text.items.len;
                         current_text.appendSlice(allocator, part.text) catch {};
                         if (part.thought_signature) |sig| {
                             current_text_signature.appendSlice(allocator, sig) catch {};
                         }
-                        const delta_copy = allocator.dupe(u8, part.text) catch continue;
+                        // Use the newly appended portion for the delta
+                        const delta = current_text.items[prev_len..];
                         stream.push(.{ .text_delta = .{
                             .content_index = content_blocks.items.len,
-                            .delta = delta_copy,
+                            .delta = delta,
                             .partial = partial,
-                        } }) catch {
-                            allocator.free(delta_copy);
-                        };
+                        } }) catch {};
                     }
                 }
             }
