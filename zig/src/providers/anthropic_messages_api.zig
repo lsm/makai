@@ -213,7 +213,11 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     if (response.head.status != .ok) {
-        const err = std.fmt.allocPrint(ctx.allocator, "anthropic request failed: HTTP {d}", .{@intFromEnum(response.head.status)}) catch {
+        const status_code = @intFromEnum(response.head.status);
+        const err = std.fmt.allocPrint(ctx.allocator, "anthropic request failed: HTTP {d}{s}", .{
+            status_code,
+            if (status_code == 401) " (check ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY is valid)" else "",
+        }) catch {
             ctx.stream.completeWithError("anthropic request failed");
             return;
         };
