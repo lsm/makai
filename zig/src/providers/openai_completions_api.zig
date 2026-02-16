@@ -772,3 +772,77 @@ test "buildRequestBody with assistant message containing tool_calls" {
     try std.testing.expect(std.mem.indexOf(u8, body, "bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "ls -la") != null);
 }
+
+test "parseChunk does not leak memory with reasoning content" {
+    const allocator = std.testing.allocator;
+
+    var text = std.ArrayList(u8){};
+    defer text.deinit(allocator);
+    var thinking = std.ArrayList(u8){};
+    defer thinking.deinit(allocator);
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: BlockType = .none;
+    var reasoning_signature: ?[]const u8 = null;
+    defer if (reasoning_signature) |sig| allocator.free(sig);
+
+    // Simulate a chunk with reasoning_content (like DeepSeek responses)
+    const chunk_data =
+        \\{"choices":[{"delta":{"reasoning_content":"Let me think about this..."}}]}
+    ;
+
+    try parseChunk(
+        chunk_data,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), text.items.len);
+    try std.testing.expect(thinking.items.len > 0);
+    try std.testing.expectEqualStrings("reasoning_content", reasoning_signature.?);
+    try std.testing.expectEqual(BlockType.thinking, current_block);
+}
+
+test "parseChunk handles multiple chunks without leaking" {
+    const allocator = std.testing.allocator;
+
+    var text = std.ArrayList(u8){};
+    defer text.deinit(allocator);
+    var thinking = std.ArrayList(u8){};
+    defer thinking.deinit(allocator);
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: BlockType = .none;
+    var reasoning_signature: ?[]const u8 = null;
+    defer if (reasoning_signature) |sig| allocator.free(sig);
+
+    const chunks = [_][]const u8{
+        \\{"choices":[{"delta":{"reasoning_content":"First"}}]}
+        ,
+        \\{"choices":[{"delta":{"reasoning_content":" Second"}}]}
+        ,
+        \\{"choices":[{"delta":{"content":"Final text"}}]}
+        ,
+    };
+
+    for (chunks) |chunk| {
+        try parseChunk(
+            chunk,
+            &text,
+            &thinking,
+            &usage,
+            &stop_reason,
+            &current_block,
+            &reasoning_signature,
+            allocator,
+        );
+    }
+
+    try std.testing.expectEqualStrings("Final text", text.items);
+    try std.testing.expectEqualStrings("First Second", thinking.items);
+}
