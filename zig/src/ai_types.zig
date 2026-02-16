@@ -240,7 +240,29 @@ pub const AssistantMessageEventStream = event_stream.EventStream(AssistantMessag
 
 pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage) !AssistantMessage {
     var content = try allocator.alloc(AssistantContent, msg.content.len);
-    errdefer allocator.free(content);
+    var cloned_count: usize = 0;
+    errdefer {
+        // Free any successfully cloned content blocks on error
+        for (content[0..cloned_count]) |block| {
+            switch (block) {
+                .text => |t| {
+                    allocator.free(t.text);
+                    if (t.text_signature) |s| allocator.free(s);
+                },
+                .thinking => |t| {
+                    allocator.free(t.thinking);
+                    if (t.thinking_signature) |s| allocator.free(s);
+                },
+                .tool_call => |tc| {
+                    allocator.free(tc.id);
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments_json);
+                    if (tc.thought_signature) |s| allocator.free(s);
+                },
+            }
+        }
+        allocator.free(content);
+    }
 
     for (msg.content, 0..) |block, i| {
         content[i] = switch (block) {
@@ -259,16 +281,28 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
                 .thought_signature = if (tc.thought_signature) |s| try allocator.dupe(u8, s) else null,
             } },
         };
+        cloned_count += 1;
     }
+
+    const api = try allocator.dupe(u8, msg.api);
+    errdefer allocator.free(api);
+
+    const provider = try allocator.dupe(u8, msg.provider);
+    errdefer allocator.free(provider);
+
+    const model_id = try allocator.dupe(u8, msg.model);
+    errdefer allocator.free(model_id);
+
+    const error_msg = if (msg.error_message) |e| try allocator.dupe(u8, e) else null;
 
     return .{
         .content = content,
-        .api = try allocator.dupe(u8, msg.api),
-        .provider = try allocator.dupe(u8, msg.provider),
-        .model = try allocator.dupe(u8, msg.model),
+        .api = api,
+        .provider = provider,
+        .model = model_id,
         .usage = msg.usage,
         .stop_reason = msg.stop_reason,
-        .error_message = if (msg.error_message) |e| try allocator.dupe(u8, e) else null,
+        .error_message = error_msg,
         .timestamp = msg.timestamp,
     };
 }
