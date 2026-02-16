@@ -6,6 +6,24 @@ const config = @import("config");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
+/// Free allocated strings in a MessageEvent
+/// Used when an event is created but cannot be pushed to the stream
+fn freeEventAllocations(event: types.MessageEvent, allocator: std.mem.Allocator) void {
+    switch (event) {
+        .start => |s| allocator.free(s.model),
+        .text_delta => |d| allocator.free(d.delta),
+        .thinking_delta => |d| allocator.free(d.delta),
+        .toolcall_start => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+        },
+        .toolcall_delta => |d| allocator.free(d.delta),
+        .toolcall_end => |e| if (e.input_json.len > 0) allocator.free(e.input_json),
+        .@"error" => |e| allocator.free(e.message),
+        else => {},
+    }
+}
+
 /// Anthropic provider context
 pub const AnthropicContext = struct {
     config: config.AnthropicConfig,
@@ -319,7 +337,11 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                     else => {},
                 }
 
-                try ctx.stream.push(evt);
+                ctx.stream.push(evt) catch {
+                    // If push fails, free the event's allocations to prevent memory leak
+                    freeEventAllocations(evt, ctx.allocator);
+                    return error.StreamPushFailed;
+                };
             }
         }
     }

@@ -6,6 +6,24 @@ const config = @import("config");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
+/// Free allocated strings in a MessageEvent
+/// Used when an event is created but cannot be pushed to the stream
+fn freeEventAllocations(event: types.MessageEvent, allocator: std.mem.Allocator) void {
+    switch (event) {
+        .start => |s| allocator.free(s.model),
+        .text_delta => |d| allocator.free(d.delta),
+        .thinking_delta => |d| allocator.free(d.delta),
+        .toolcall_start => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+        },
+        .toolcall_delta => |d| allocator.free(d.delta),
+        .toolcall_end => |e| allocator.free(e.input_json),
+        .@"error" => |e| allocator.free(e.message),
+        else => {},
+    }
+}
+
 /// OpenAI provider context
 pub const OpenAIContext = struct {
     config: config.OpenAIConfig,
@@ -256,7 +274,11 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                     else => {},
                 }
 
-                try ctx.stream.push(evt);
+                ctx.stream.push(evt) catch {
+                    // If push fails, free the event's allocations to prevent memory leak
+                    freeEventAllocations(evt, ctx.allocator);
+                    return error.StreamPushFailed;
+                };
 
                 // After emitting text_start, immediately emit the pending text delta
                 if (evt == .text_start) {
@@ -279,12 +301,16 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                             }
                         }
 
-                        try ctx.stream.push(.{
+                        ctx.stream.push(.{
                             .text_delta = .{
                                 .index = 0,
                                 .delta = pending_copy,
                             },
-                        });
+                        }) catch {
+                            // If push fails, free the pending_copy to prevent memory leak
+                            ctx.allocator.free(pending_copy);
+                            return error.StreamPushFailed;
+                        };
                     }
                 }
 
@@ -293,12 +319,15 @@ fn streamImpl(ctx: *StreamThreadContext) !void {
                 if (evt == .text_end and !state.has_emitted_done) {
                     if (state.stop_reason) |sr| {
                         state.has_emitted_done = true;
-                        try ctx.stream.push(.{
+                        ctx.stream.push(.{
                             .done = .{
                                 .usage = state.usage,
                                 .stop_reason = sr,
                             },
-                        });
+                        }) catch {
+                            // done event has no allocations, but return error for consistency
+                            return error.StreamPushFailed;
+                        };
                     }
                 }
             }
