@@ -293,13 +293,17 @@ pub fn streamAnthropicMessages(
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
     };
+    errdefer allocator.free(api_key);
 
     const body = try buildRequestBody(model, context, o, allocator);
+    errdefer allocator.free(body);
 
     const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
     s.* = ai_types.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .stream = s,

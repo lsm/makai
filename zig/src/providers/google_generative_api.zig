@@ -267,6 +267,7 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
         if (e) |k| break :blk @constCast(k);
         return error.MissingApiKey;
     };
+    errdefer allocator.free(api_key);
 
     const base_url: []u8 = blk: {
         if (model.base_url.len > 0) break :blk try allocator.dupe(u8, model.base_url);
@@ -274,13 +275,17 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
         if (e) |v| break :blk @constCast(v);
         break :blk try allocator.dupe(u8, "https://generativelanguage.googleapis.com");
     };
+    errdefer allocator.free(base_url);
 
     const body = try buildBody(context, o, model, allocator);
+    errdefer allocator.free(body);
 
     const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    errdefer allocator.destroy(s);
     s.* = ai_types.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
+    errdefer allocator.destroy(ctx);
     ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .base_url = base_url };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
