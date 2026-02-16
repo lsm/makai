@@ -1,4 +1,5 @@
 const std = @import("std");
+const ai_types = @import("ai_types");
 
 // GitHub OAuth configuration
 pub const client_id = "Iv1.b507a08c87ecfe98";
@@ -292,6 +293,70 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
 /// Get API key from credentials (access token IS the API key)
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
+}
+
+/// Infer the X-Initiator header value based on the last message role.
+/// Copilot expects "agent" when the last message is from the assistant (follow-up),
+/// and "user" otherwise.
+pub fn inferCopilotInitiator(messages: []const ai_types.Message) []const u8 {
+    if (messages.len == 0) return "user";
+    const last = messages[messages.len - 1];
+    return switch (last) {
+        .assistant => "agent",
+        else => "user",
+    };
+}
+
+/// Check if any message contains image content for Copilot-Vision-Request header.
+pub fn hasCopilotVisionInput(messages: []const ai_types.Message) bool {
+    for (messages) |msg| {
+        switch (msg) {
+            .user => |u| switch (u.content) {
+                .parts => |parts| {
+                    for (parts) |p| {
+                        if (p == .image) return true;
+                    }
+                },
+                else => {},
+            },
+            .tool_result => |tr| {
+                for (tr.content) |c| {
+                    if (c == .image) return true;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Build dynamic Copilot headers based on messages and image presence.
+/// Caller owns the returned slice and must free it with allocator.free().
+pub fn buildCopilotDynamicHeaders(
+    messages: []const ai_types.Message,
+    has_images: bool,
+    allocator: std.mem.Allocator,
+) ![]std.http.Header {
+    var headers = try std.ArrayList(std.http.Header).initCapacity(allocator, 3);
+    errdefer headers.deinit(allocator);
+
+    try headers.append(allocator, .{
+        .name = "X-Initiator",
+        .value = inferCopilotInitiator(messages),
+    });
+    try headers.append(allocator, .{
+        .name = "Openai-Intent",
+        .value = "conversation-edits",
+    });
+
+    if (has_images) {
+        try headers.append(allocator, .{
+            .name = "Copilot-Vision-Request",
+            .value = "true",
+        });
+    }
+
+    return headers.toOwnedSlice(allocator);
 }
 
 const DeviceCodeResponse = struct {
@@ -602,4 +667,118 @@ test "startDeviceFlow - returns valid response (integration test, requires netwo
     try std.testing.expect(response.user_code.len > 0);
     try std.testing.expect(response.expires_in > 0);
     try std.testing.expect(response.interval > 0);
+}
+
+test "inferCopilotInitiator - returns user for empty messages" {
+    const testing = std.testing;
+    const messages: []const ai_types.Message = &[_]ai_types.Message{};
+    try testing.expectEqualStrings("user", inferCopilotInitiator(messages));
+}
+
+test "inferCopilotInitiator - returns user when last message is user" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+    };
+    try testing.expectEqualStrings("user", inferCopilotInitiator(&messages));
+}
+
+test "inferCopilotInitiator - returns agent when last message is assistant" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+        .{ .assistant = .{
+            .content = &[_]ai_types.AssistantContent{.{ .text = .{ .text = "hi" } }},
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+        } },
+    };
+    try testing.expectEqualStrings("agent", inferCopilotInitiator(&messages));
+}
+
+test "inferCopilotInitiator - returns user when last message is tool_result" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "1",
+            .tool_name = "test",
+            .content = &[_]ai_types.UserContentPart{.{ .text = .{ .text = "result" } }},
+            .is_error = false,
+            .timestamp = 0,
+        } },
+    };
+    try testing.expectEqualStrings("user", inferCopilotInitiator(&messages));
+}
+
+test "hasCopilotVisionInput - returns false for text-only user message" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+    };
+    try testing.expect(!hasCopilotVisionInput(&messages));
+}
+
+test "hasCopilotVisionInput - returns true for user message with image" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .parts = &[_]ai_types.UserContentPart{
+            .{ .text = .{ .text = "look at this" } },
+            .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
+        } }, .timestamp = 0 } },
+    };
+    try testing.expect(hasCopilotVisionInput(&messages));
+}
+
+test "hasCopilotVisionInput - returns true for tool_result with image" {
+    const testing = std.testing;
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{
+            .tool_call_id = "1",
+            .tool_name = "test",
+            .content = &[_]ai_types.UserContentPart{
+                .{ .image = .{ .data = "base64data", .mime_type = "image/png" } },
+            },
+            .is_error = false,
+            .timestamp = 0,
+        } },
+    };
+    try testing.expect(hasCopilotVisionInput(&messages));
+}
+
+test "buildCopilotDynamicHeaders - includes X-Initiator and Openai-Intent" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+    };
+
+    const headers = try buildCopilotDynamicHeaders(&messages, false, allocator);
+    defer allocator.free(headers);
+
+    try testing.expectEqual(@as(usize, 2), headers.len);
+    try testing.expectEqualStrings("X-Initiator", headers[0].name);
+    try testing.expectEqualStrings("user", headers[0].value);
+    try testing.expectEqualStrings("Openai-Intent", headers[1].name);
+    try testing.expectEqualStrings("conversation-edits", headers[1].value);
+}
+
+test "buildCopilotDynamicHeaders - includes Copilot-Vision-Request when has_images" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+    };
+
+    const headers = try buildCopilotDynamicHeaders(&messages, true, allocator);
+    defer allocator.free(headers);
+
+    try testing.expectEqual(@as(usize, 3), headers.len);
+    try testing.expectEqualStrings("Copilot-Vision-Request", headers[2].name);
+    try testing.expectEqualStrings("true", headers[2].value);
 }

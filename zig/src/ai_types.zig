@@ -59,6 +59,15 @@ pub const StreamOptions = struct {
     cancel_token: ?CancelToken = null,
     on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
+    /// Enable extended thinking. For Opus 4.6+: uses adaptive thinking.
+    /// For older models: uses budget-based thinking with thinking_budget_tokens.
+    thinking_enabled: bool = false,
+    /// Token budget for extended thinking (older models only).
+    thinking_budget_tokens: ?u32 = null,
+    /// Effort level for adaptive thinking (Opus 4.6+ only). Values: "low", "medium", "high", "max".
+    thinking_effort: ?[]const u8 = null,
+    /// Reasoning effort level for OpenAI-compatible endpoints. Values: "minimal", "low", "medium", "high", "xhigh".
+    reasoning_effort: ?[]const u8 = null,
 };
 
 pub const SimpleStreamOptions = struct {

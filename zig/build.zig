@@ -50,6 +50,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const github_copilot_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/github_copilot.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
     const openai_completions_api_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/openai_completions_api.zig"),
         .target = target,
@@ -59,6 +68,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "github_copilot", .module = github_copilot_mod },
         },
     });
 
@@ -190,6 +200,8 @@ pub fn build(b: *std.Build) void {
 
     const register_builtins_test = b.addTest(.{ .root_module = register_builtins_mod });
 
+    const github_copilot_test = b.addTest(.{ .root_module = github_copilot_mod });
+
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
     const openai_responses_api_test = b.addTest(.{ .root_module = openai_responses_api_mod });
@@ -274,6 +286,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(api_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(stream_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
+    test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);

@@ -13,6 +13,64 @@ fn isOAuthToken(key: []const u8) bool {
     return std.mem.indexOf(u8, key, "sk-ant-oat") != null;
 }
 
+/// Result of cache control resolution
+const CacheControlResult = struct {
+    retention: ai_types.CacheRetention,
+    /// If non-null, contains the cache_control object to add
+    has_ttl: bool,
+};
+
+/// Resolve cache retention and determine cache_control settings
+fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention) ?CacheControlResult {
+    const retention = cache_retention orelse .short;
+    if (retention == .none) return null;
+
+    // Only add ttl for "long" retention on api.anthropic.com
+    const has_ttl = retention == .long and std.mem.indexOf(u8, base_url, "api.anthropic.com") != null;
+
+    return .{
+        .retention = retention,
+        .has_ttl = has_ttl,
+    };
+}
+
+/// Check if a model supports adaptive thinking (Opus 4.6+)
+fn supportsAdaptiveThinking(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "opus-4-6") != null or
+           std.mem.indexOf(u8, model_id, "opus-4.6") != null;
+}
+
+/// Map ThinkingLevel to Anthropic effort levels for adaptive thinking
+fn mapThinkingLevelToEffort(level: ai_types.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .minimal => "low",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "max",
+    };
+}
+
+/// Get default thinking budget tokens for a thinking level (older models)
+fn getDefaultThinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets) u32 {
+    if (budgets) |b| {
+        return switch (level) {
+            .minimal => b.minimal orelse 256,
+            .low => b.low orelse 512,
+            .medium => b.medium orelse 1024,
+            .high => b.high orelse 2048,
+            .xhigh => 4096,
+        };
+    }
+    return switch (level) {
+        .minimal => 256,
+        .low => 512,
+        .medium => 1024,
+        .high => 2048,
+        .xhigh => 4096,
+    };
+}
+
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (msg) {
         .user => |u| switch (u.content) {
@@ -50,6 +108,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
+    // Resolve cache control settings
+    const cache_control = getCacheControl(model.base_url, options.cache_retention);
+
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
@@ -61,13 +122,41 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.writeFloat(t);
     }
 
+    // System prompt as array of content blocks with cache_control
     if (context.system_prompt) |sp| {
-        try w.writeStringField("system", sp);
+        try w.writeKey("system");
+        try w.beginArray();
+
+        // System prompt block with cache_control
+        try w.beginObject();
+        try w.writeStringField("type", "text");
+        try w.writeStringField("text", sp);
+        if (cache_control) |cc| {
+            try w.writeKey("cache_control");
+            try w.beginObject();
+            try w.writeStringField("type", "ephemeral");
+            if (cc.has_ttl) {
+                try w.writeStringField("ttl", "1h");
+            }
+            try w.endObject();
+        }
+        try w.endObject();
+
+        try w.endArray();
+    }
+
+    // Find the last user message index for cache_control placement
+    var last_user_idx: ?usize = null;
+    for (context.messages, 0..) |m, i| {
+        switch (m) {
+            .user => last_user_idx = i,
+            else => {},
+        }
     }
 
     try w.writeKey("messages");
     try w.beginArray();
-    for (context.messages) |m| {
+    for (context.messages, 0..) |m, msg_idx| {
         var text = std.ArrayList(u8){};
         defer text.deinit(allocator);
         try appendMessageText(m, &text, allocator);
@@ -77,59 +166,201 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             else => "user",
         };
 
-        try w.beginObject();
-        try w.writeStringField("role", role);
-        try w.writeStringField("content", text.items);
-        try w.endObject();
+        const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
+
+        // For the last user message with cache_control, use content array format
+        if (is_last_user and cache_control != null) {
+            try w.beginObject();
+            try w.writeStringField("role", role);
+            try w.writeKey("content");
+            try w.beginArray();
+
+            // Text block with cache_control
+            try w.beginObject();
+            try w.writeStringField("type", "text");
+            try w.writeStringField("text", text.items);
+            try w.writeKey("cache_control");
+            try w.beginObject();
+            try w.writeStringField("type", "ephemeral");
+            if (cache_control.?.has_ttl) {
+                try w.writeStringField("ttl", "1h");
+            }
+            try w.endObject();
+            try w.endObject();
+
+            try w.endArray();
+            try w.endObject();
+        } else {
+            try w.beginObject();
+            try w.writeStringField("role", role);
+            try w.writeStringField("content", text.items);
+            try w.endObject();
+        }
     }
     try w.endArray();
+
+    // Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
+    if (options.thinking_enabled) {
+        if (supportsAdaptiveThinking(model.id)) {
+            // Adaptive thinking: Claude decides when and how much to think
+            try w.writeKey("thinking");
+            try w.beginObject();
+            try w.writeStringField("type", "adaptive");
+            try w.endObject();
+
+            if (options.thinking_effort) |effort| {
+                try w.writeKey("output_config");
+                try w.beginObject();
+                try w.writeStringField("effort", effort);
+                try w.endObject();
+            }
+        } else {
+            // Budget-based thinking for older models
+            try w.writeKey("thinking");
+            try w.beginObject();
+            try w.writeStringField("type", "enabled");
+            try w.writeIntField("budget_tokens", options.thinking_budget_tokens orelse 1024);
+            try w.endObject();
+        }
+    }
 
     try w.endObject();
     return buf.toOwnedSlice(allocator);
 }
 
-fn parseAnthropicEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_types.Usage, stop_reason: *ai_types.StopReason, allocator: std.mem.Allocator) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+/// Result type for parsing an Anthropic SSE event
+const ParseResult = union(enum) {
+    none: void,
+    message_start: struct { input_tokens: u64, output_tokens: u64, cache_read: u64, cache_write: u64 },
+    content_block_start: struct { index: usize, block_type: ContentType },
+    content_block_delta: struct { index: usize, delta: ContentDelta },
+    content_block_stop: struct { index: usize },
+    message_delta: struct { stop_reason: ai_types.StopReason, output_tokens: u64 },
+    message_stop: void,
+
+    const ContentType = enum { text, thinking, tool_use };
+    const ContentDelta = union(enum) {
+        text: []const u8,
+        thinking: []const u8,
+        signature: []const u8,
+        input_json: []const u8,
+    };
+};
+
+fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !ParseResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return .{ .none = {} };
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) return .{ .none = {} };
     const obj = parsed.value.object;
 
-    const type_val = obj.get("type") orelse return;
-    if (type_val != .string) return;
+    const type_val = obj.get("type") orelse return .{ .none = {} };
+    if (type_val != .string) return .{ .none = {} };
 
     if (std.mem.eql(u8, type_val.string, "message_start")) {
-        const msg_val = obj.get("message") orelse return;
-        if (msg_val != .object) return;
-        const usage_val = msg_val.object.get("usage") orelse return;
-        if (usage_val != .object) return;
+        const msg_val = obj.get("message") orelse return .{ .none = {} };
+        if (msg_val != .object) return .{ .none = {} };
+        const usage_val = msg_val.object.get("usage") orelse return .{ .none = {} };
+        if (usage_val != .object) return .{ .none = {} };
+
+        var input_tokens: u64 = 0;
+        var output_tokens: u64 = 0;
+        var cache_read: u64 = 0;
+        var cache_write: u64 = 0;
 
         if (usage_val.object.get("input_tokens")) |v| {
-            if (v == .integer) usage.input = @intCast(v.integer);
+            if (v == .integer) input_tokens = @intCast(v.integer);
         }
         if (usage_val.object.get("output_tokens")) |v| {
-            if (v == .integer) usage.output = @intCast(v.integer);
+            if (v == .integer) output_tokens = @intCast(v.integer);
         }
-        return;
+        if (usage_val.object.get("cache_read_input_tokens")) |v| {
+            if (v == .integer) cache_read = @intCast(v.integer);
+        }
+        if (usage_val.object.get("cache_creation_input_tokens")) |v| {
+            if (v == .integer) cache_write = @intCast(v.integer);
+        }
+
+        return .{ .message_start = .{
+            .input_tokens = input_tokens,
+            .output_tokens = output_tokens,
+            .cache_read = cache_read,
+            .cache_write = cache_write,
+        } };
+    }
+
+    if (std.mem.eql(u8, type_val.string, "content_block_start")) {
+        const index_val = obj.get("index") orelse return .{ .none = {} };
+        if (index_val != .integer) return .{ .none = {} };
+        const index: usize = @intCast(index_val.integer);
+
+        const content_block = obj.get("content_block") orelse return .{ .none = {} };
+        if (content_block != .object) return .{ .none = {} };
+        const cb_type = content_block.object.get("type") orelse return .{ .none = {} };
+        if (cb_type != .string) return .{ .none = {} };
+
+        const block_type: ParseResult.ContentType = if (std.mem.eql(u8, cb_type.string, "text"))
+            .text
+        else if (std.mem.eql(u8, cb_type.string, "thinking"))
+            .thinking
+        else if (std.mem.eql(u8, cb_type.string, "tool_use"))
+            .tool_use
+        else
+            return .{ .none = {} };
+
+        return .{ .content_block_start = .{ .index = index, .block_type = block_type } };
     }
 
     if (std.mem.eql(u8, type_val.string, "content_block_delta")) {
-        const delta_val = obj.get("delta") orelse return;
-        if (delta_val != .object) return;
-        if (delta_val.object.get("text")) |v| {
-            if (v == .string) try text.appendSlice(allocator, v.string);
+        const index_val = obj.get("index") orelse return .{ .none = {} };
+        if (index_val != .integer) return .{ .none = {} };
+        const index: usize = @intCast(index_val.integer);
+
+        const delta_val = obj.get("delta") orelse return .{ .none = {} };
+        if (delta_val != .object) return .{ .none = {} };
+
+        const delta_type = delta_val.object.get("type") orelse return .{ .none = {} };
+        if (delta_type != .string) return .{ .none = {} };
+
+        if (std.mem.eql(u8, delta_type.string, "text_delta")) {
+            if (delta_val.object.get("text")) |v| {
+                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .text = v.string } } };
+            }
+        } else if (std.mem.eql(u8, delta_type.string, "thinking_delta")) {
+            if (delta_val.object.get("thinking")) |v| {
+                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .thinking = v.string } } };
+            }
+        } else if (std.mem.eql(u8, delta_type.string, "signature_delta")) {
+            if (delta_val.object.get("signature")) |v| {
+                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .signature = v.string } } };
+            }
+        } else if (std.mem.eql(u8, delta_type.string, "input_json_delta")) {
+            if (delta_val.object.get("partial_json")) |v| {
+                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .input_json = v.string } } };
+            }
         }
-        return;
+
+        return .{ .none = {} };
+    }
+
+    if (std.mem.eql(u8, type_val.string, "content_block_stop")) {
+        const index_val = obj.get("index") orelse return .{ .none = {} };
+        if (index_val != .integer) return .{ .none = {} };
+        const index: usize = @intCast(index_val.integer);
+        return .{ .content_block_stop = .{ .index = index } };
     }
 
     if (std.mem.eql(u8, type_val.string, "message_delta")) {
+        var stop_reason: ai_types.StopReason = .stop;
+        var output_tokens: u64 = 0;
+
         if (obj.get("delta")) |delta_val| {
             if (delta_val == .object) {
                 if (delta_val.object.get("stop_reason")) |sr| {
                     if (sr == .string) {
-                        if (std.mem.eql(u8, sr.string, "max_tokens")) stop_reason.* = .length
-                        else if (std.mem.eql(u8, sr.string, "tool_use")) stop_reason.* = .tool_use
-                        else stop_reason.* = .stop;
+                        if (std.mem.eql(u8, sr.string, "max_tokens")) stop_reason = .length
+                        else if (std.mem.eql(u8, sr.string, "tool_use")) stop_reason = .tool_use
+                        else stop_reason = .stop;
                     }
                 }
             }
@@ -138,11 +369,19 @@ fn parseAnthropicEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_ty
         if (obj.get("usage")) |usage_val| {
             if (usage_val == .object) {
                 if (usage_val.object.get("output_tokens")) |v| {
-                    if (v == .integer) usage.output = @intCast(v.integer);
+                    if (v == .integer) output_tokens = @intCast(v.integer);
                 }
             }
         }
+
+        return .{ .message_delta = .{ .stop_reason = stop_reason, .output_tokens = output_tokens } };
     }
+
+    if (std.mem.eql(u8, type_val.string, "message_stop")) {
+        return .{ .message_stop = {} };
+    }
+
+    return .{ .none = {} };
 }
 
 const ThreadCtx = struct {
@@ -265,10 +504,33 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
-    var text = std.ArrayList(u8){};
-    defer text.deinit(ctx.allocator);
+    // Track content blocks by API index
+    const BlockInfo = struct {
+        content_type: ParseResult.ContentType,
+        content_index: usize, // index in our content array
+    };
+    var block_map = std.AutoHashMap(usize, BlockInfo).init(ctx.allocator);
+    defer block_map.deinit();
+
+    // Accumulate content for final message
+    var content_blocks = std.ArrayList(ai_types.AssistantContent){};
+    defer content_blocks.deinit(ctx.allocator);
+    var current_text = std.ArrayList(u8){};
+    defer current_text.deinit(ctx.allocator);
+    var current_thinking = std.ArrayList(u8){};
+    defer current_thinking.deinit(ctx.allocator);
+    var current_thinking_signature = std.ArrayList(u8){};
+    defer current_thinking_signature.deinit(ctx.allocator);
+
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
+
+    // Emit start event with partial message
+    const partial_start = createPartialMessage(ctx.allocator, ctx.model) catch {
+        ctx.stream.completeWithError("oom partial");
+        return;
+    };
+    ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
@@ -283,27 +545,149 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            parseAnthropicEvent(ev.data, &text, &usage, &stop_reason, ctx.allocator) catch {
+            const result = parseAnthropicEventType(ev.data, ctx.allocator) catch {
                 ctx.stream.completeWithError("event parse error");
                 return;
             };
+
+            switch (result) {
+                .none => {},
+                .message_start => |ms| {
+                    usage.input = ms.input_tokens;
+                    usage.output = ms.output_tokens;
+                    usage.cache_read = ms.cache_read;
+                    usage.cache_write = ms.cache_write;
+                },
+                .content_block_start => |cbs| {
+                    const content_idx = content_blocks.items.len;
+
+                    // Initialize accumulators based on block type
+                    switch (cbs.block_type) {
+                        .text => {
+                            current_text.clearRetainingCapacity();
+                            // Emit text_start event
+                            const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
+                                ctx.stream.completeWithError("oom partial");
+                                return;
+                            };
+                            ctx.stream.push(.{ .text_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                        },
+                        .thinking => {
+                            current_thinking.clearRetainingCapacity();
+                            current_thinking_signature.clearRetainingCapacity();
+                            // Emit thinking_start event
+                            const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
+                                ctx.stream.completeWithError("oom partial");
+                                return;
+                            };
+                            ctx.stream.push(.{ .thinking_start = .{ .content_index = content_idx, .partial = partial } }) catch {};
+                        },
+                        .tool_use => {
+                            // Tool use handling - for now, skip event emission
+                        },
+                    }
+
+                    block_map.put(cbs.index, .{ .content_type = cbs.block_type, .content_index = content_idx }) catch {};
+                },
+                .content_block_delta => |cbd| {
+                    if (block_map.get(cbd.index)) |block_info| {
+                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
+                            ctx.stream.completeWithError("oom partial");
+                            return;
+                        };
+
+                        switch (cbd.delta) {
+                            .text => |txt| {
+                                current_text.appendSlice(ctx.allocator, txt) catch {};
+                                ctx.stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
+                            },
+                            .thinking => |thk| {
+                                current_thinking.appendSlice(ctx.allocator, thk) catch {};
+                                ctx.stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
+                            },
+                            .signature => |sig| {
+                                current_thinking_signature.appendSlice(ctx.allocator, sig) catch {};
+                            },
+                            .input_json => |_| {
+                                // Tool use JSON delta - not emitting for now
+                            },
+                        }
+                    }
+                },
+                .content_block_stop => |cbs| {
+                    if (block_map.get(cbs.index)) |block_info| {
+                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch {
+                            ctx.stream.completeWithError("oom partial");
+                            return;
+                        };
+
+                        switch (block_info.content_type) {
+                            .text => {
+                                // Store the completed text block
+                                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch {
+                                    ctx.stream.completeWithError("oom text");
+                                    return;
+                                };
+                                content_blocks.append(ctx.allocator, .{ .text = .{ .text = text_copy } }) catch {};
+
+                                ctx.stream.push(.{ .text_end = .{ .content_index = block_info.content_index, .content = current_text.items, .partial = partial } }) catch {};
+                            },
+                            .thinking => {
+                                // Store the completed thinking block
+                                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch {
+                                    ctx.stream.completeWithError("oom thinking");
+                                    return;
+                                };
+                                const sig_copy = if (current_thinking_signature.items.len > 0)
+                                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                                else
+                                    null;
+
+                                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                                    .thinking = thinking_copy,
+                                    .thinking_signature = sig_copy,
+                                } }) catch {};
+
+                                ctx.stream.push(.{ .thinking_end = .{ .content_index = block_info.content_index, .content = current_thinking.items, .partial = partial } }) catch {};
+                            },
+                            .tool_use => {
+                                // Tool use end handling - not implemented yet
+                            },
+                        }
+                    }
+                },
+                .message_delta => |md| {
+                    stop_reason = md.stop_reason;
+                    usage.output = md.output_tokens;
+                },
+                .message_stop => {},
+            }
         }
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
 
-    var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
-        ctx.stream.completeWithError("oom result");
+    // If no content blocks were collected but we have text, create a text block
+    if (content_blocks.items.len == 0 and current_text.items.len > 0) {
+        const text_copy = ctx.allocator.dupe(u8, current_text.items) catch {
+            ctx.stream.completeWithError("oom text");
+            return;
+        };
+        content_blocks.append(ctx.allocator, .{ .text = .{ .text = text_copy } }) catch {};
+    }
+
+    // If still no content, add an empty text block
+    if (content_blocks.items.len == 0) {
+        content_blocks.append(ctx.allocator, .{ .text = .{ .text = "" } }) catch {};
+    }
+
+    const content_slice = content_blocks.toOwnedSlice(ctx.allocator) catch {
+        ctx.stream.completeWithError("oom content");
         return;
     };
-    content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
-        ctx.allocator.free(content);
-        ctx.stream.completeWithError("oom text");
-        return;
-    } } };
 
     const out = ai_types.AssistantMessage{
-        .content = content,
+        .content = content_slice,
         .api = ctx.allocator.dupe(u8, ctx.model.api) catch {
             ctx.stream.completeWithError("oom");
             return;
@@ -321,7 +705,20 @@ fn runThread(ctx: *ThreadCtx) void {
         .timestamp = std.time.milliTimestamp(),
     };
 
+    ctx.stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
     ctx.stream.complete(out);
+}
+
+fn createPartialMessage(allocator: std.mem.Allocator, model: ai_types.Model) !ai_types.AssistantMessage {
+    return ai_types.AssistantMessage{
+        .content = &.{},
+        .api = try allocator.dupe(u8, model.api),
+        .provider = try allocator.dupe(u8, model.provider),
+        .model = try allocator.dupe(u8, model.id),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    };
 }
 
 pub fn streamAnthropicMessages(
@@ -369,6 +766,23 @@ pub fn streamSimpleAnthropicMessages(
     allocator: std.mem.Allocator,
 ) !*ai_types.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
+
+    // Build thinking options based on reasoning level and model capabilities
+    var thinking_enabled: bool = false;
+    var thinking_budget_tokens: ?u32 = null;
+    var thinking_effort: ?[]const u8 = null;
+
+    if (o.reasoning) |level| {
+        thinking_enabled = true;
+        if (supportsAdaptiveThinking(model.id)) {
+            // Adaptive thinking: use effort level
+            thinking_effort = mapThinkingLevelToEffort(level);
+        } else {
+            // Budget-based thinking for older models
+            thinking_budget_tokens = getDefaultThinkingBudget(level, o.thinking_budgets);
+        }
+    }
+
     return streamAnthropicMessages(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
@@ -380,6 +794,9 @@ pub fn streamSimpleAnthropicMessages(
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
+        .thinking_enabled = thinking_enabled,
+        .thinking_budget_tokens = thinking_budget_tokens,
+        .thinking_effort = thinking_effort,
     }, allocator);
 }
 
@@ -389,4 +806,158 @@ pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry)
         .stream = streamAnthropicMessages,
         .stream_simple = streamSimpleAnthropicMessages,
     }, null);
+}
+
+test "getCacheControl returns null for none retention" {
+    const result = getCacheControl("https://api.anthropic.com", .none);
+    try std.testing.expect(result == null);
+}
+
+test "getCacheControl returns short retention without ttl for non-anthropic url" {
+    const result = getCacheControl("https://custom.api.com", .short);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(ai_types.CacheRetention.short, result.?.retention);
+    try std.testing.expectEqual(false, result.?.has_ttl);
+}
+
+test "getCacheControl returns long retention with ttl for anthropic url" {
+    const result = getCacheControl("https://api.anthropic.com", .long);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
+    try std.testing.expectEqual(true, result.?.has_ttl);
+}
+
+test "getCacheControl returns long retention without ttl for non-anthropic url" {
+    const result = getCacheControl("https://custom.api.com", .long);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
+    try std.testing.expectEqual(false, result.?.has_ttl);
+}
+
+test "buildRequestBody includes cache_control in system prompt" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "Hello" }, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "You are a helpful assistant.",
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+        .cache_retention = .short,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    // Verify system prompt is an array with cache_control
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"ttl\"") == null); // short retention, no ttl
+}
+
+test "buildRequestBody includes ttl for long retention on anthropic url" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "Hello" }, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "You are a helpful assistant.",
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+        .cache_retention = .long,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    // Verify ttl is included for long retention
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
+}
+
+test "buildRequestBody adds cache_control to last user message" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "claude-3-5-sonnet-20241022",
+        .name = "Claude 3.5 Sonnet",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.3, .cache_write = 3.75 },
+        .context_window = 200000,
+        .max_tokens = 8192,
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "First message" }, .timestamp = 0 } },
+        .{ .assistant = .{ .content = &.{.{ .text = .{ .text = "Response" } }}, .api = "anthropic-messages", .provider = "anthropic", .model = "claude-3-5-sonnet-20241022", .usage = .{}, .stop_reason = .stop, .timestamp = 0 } },
+        .{ .user = .{ .content = .{ .text = "Last message" }, .timestamp = 0 } },
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "You are a helpful assistant.",
+        .messages = &messages,
+    };
+
+    const options = ai_types.StreamOptions{
+        .max_tokens = 1024,
+        .cache_retention = .short,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    // Parse to verify structure
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+
+    const msg_array = parsed.value.object.get("messages").?.array;
+    try std.testing.expectEqual(@as(usize, 3), msg_array.items.len);
+
+    // First user message should be string content
+    try std.testing.expect(msg_array.items[0].object.get("content").? == .string);
+
+    // Last user message should be array content with cache_control
+    const last_content = msg_array.items[2].object.get("content").?;
+    try std.testing.expect(last_content == .array);
+    const last_block = last_content.array.items[0];
+    try std.testing.expect(last_block.object.get("cache_control") != null);
 }

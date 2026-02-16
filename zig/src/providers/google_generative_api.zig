@@ -8,6 +8,73 @@ fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
 
+// Model detection helpers
+fn isGemini3ProModel(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "3-pro") != null;
+}
+
+fn isGemini3FlashModel(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "3-flash") != null;
+}
+
+fn isGemini25ProModel(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "2.5-pro") != null;
+}
+
+fn isGemini25FlashModel(model_id: []const u8) bool {
+    return std.mem.indexOf(u8, model_id, "2.5-flash") != null;
+}
+
+/// Map ThinkingLevel to Google thinking level string (for Gemini 3)
+fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model) []const u8 {
+    if (isGemini3ProModel(model.id)) {
+        return switch (level) {
+            .minimal, .low => "LOW",
+            .medium, .high, .xhigh => "HIGH",
+        };
+    }
+    // Gemini 3 Flash supports MINIMAL, LOW, MEDIUM, HIGH
+    return switch (level) {
+        .minimal => "MINIMAL",
+        .low => "LOW",
+        .medium => "MEDIUM",
+        .high, .xhigh => "HIGH",
+    };
+}
+
+/// Get default thinking budget for Gemini 2.5 models
+fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets, model_id: []const u8) i32 {
+    if (budgets) |b| {
+        return switch (level) {
+            .minimal => if (b.minimal) |v| @intCast(v) else -1,
+            .low => if (b.low) |v| @intCast(v) else -1,
+            .medium => if (b.medium) |v| @intCast(v) else -1,
+            .high => if (b.high) |v| @intCast(v) else -1,
+            .xhigh => -1,
+        };
+    }
+
+    if (isGemini25ProModel(model_id)) {
+        return switch (level) {
+            .minimal => 128,
+            .low => 2048,
+            .medium => 8192,
+            .high, .xhigh => 32768,
+        };
+    }
+
+    if (isGemini25FlashModel(model_id)) {
+        return switch (level) {
+            .minimal => 128,
+            .low => 2048,
+            .medium => 8192,
+            .high, .xhigh => 24576,
+        };
+    }
+
+    return -1;
+}
+
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     switch (msg) {
         .user => |u| switch (u.content) {
@@ -93,21 +160,65 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     }
     try w.endObject();
 
+    // Add thinkingConfig if thinking is enabled and model supports reasoning
+    if (options.thinking_enabled and model.reasoning) {
+        try w.writeKey("thinkingConfig");
+        try w.beginObject();
+        try w.writeBoolField("includeThoughts", true);
+
+        // Gemini 3 uses thinkingLevel, Gemini 2.5 uses thinkingBudget
+        if (options.thinking_effort) |effort| {
+            // Effort was provided directly (string like "LOW", "HIGH", etc.)
+            try w.writeStringField("thinkingLevel", effort);
+        } else if (options.thinking_budget_tokens) |budget| {
+            try w.writeIntField("thinkingBudget", budget);
+        }
+        try w.endObject();
+    }
+
     try w.endObject();
     return buf.toOwnedSlice(allocator);
 }
 
-fn parseGoogleEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_types.Usage, allocator: std.mem.Allocator) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return;
+/// Parsed part from a Google response
+const ParsedPart = struct {
+    text: []const u8,
+    is_thinking: bool,
+    thought_signature: ?[]const u8,
+};
+
+/// Parse result from a Google SSE event
+const GoogleParseResult = struct {
+    parts: []const ParsedPart,
+    usage: ai_types.Usage,
+    finish_reason: ?[]const u8,
+};
+
+/// Parse a Google SSE event and extract parts with thinking info
+fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?GoogleParseResult {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) return null;
     const obj = parsed.value.object;
+
+    var parts_list = std.ArrayList(ParsedPart){};
+    defer parts_list.deinit(allocator);
+
+    var usage = ai_types.Usage{};
+    var finish_reason: ?[]const u8 = null;
 
     if (obj.get("candidates")) |cands| {
         if (cands == .array and cands.array.items.len > 0) {
             const c = cands.array.items[0];
             if (c == .object) {
+                // Get finish reason
+                if (c.object.get("finishReason")) |fr| {
+                    if (fr == .string) {
+                        finish_reason = allocator.dupe(u8, fr.string) catch null;
+                    }
+                }
+
                 if (c.object.get("content")) |content| {
                     if (content == .object) {
                         if (content.object.get("parts")) |parts| {
@@ -115,7 +226,30 @@ fn parseGoogleEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_types
                                 for (parts.array.items) |p| {
                                     if (p == .object) {
                                         if (p.object.get("text")) |t| {
-                                            if (t == .string) try text.appendSlice(allocator, t.string);
+                                            if (t == .string and t.string.len > 0) {
+                                                // Check if this is a thinking part
+                                                const is_thinking = blk: {
+                                                    if (p.object.get("thought")) |thought| {
+                                                        if (thought == .bool and thought.bool) break :blk true;
+                                                    }
+                                                    break :blk false;
+                                                };
+
+                                                const sig = if (p.object.get("thoughtSignature")) |s| blk: {
+                                                    if (s == .string) break :blk allocator.dupe(u8, s.string) catch null;
+                                                    break :blk null;
+                                                } else null;
+
+                                                const text_copy = allocator.dupe(u8, t.string) catch continue;
+                                                parts_list.append(allocator, .{
+                                                    .text = text_copy,
+                                                    .is_thinking = is_thinking,
+                                                    .thought_signature = sig,
+                                                }) catch {
+                                                    allocator.free(text_copy);
+                                                    continue;
+                                                };
+                                            }
                                         }
                                     }
                                 }
@@ -135,11 +269,61 @@ fn parseGoogleEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_types
             if (u.object.get("candidatesTokenCount")) |v| {
                 if (v == .integer) usage.output = @intCast(v.integer);
             }
+            if (u.object.get("thoughtsTokenCount")) |v| {
+                // Include thinking tokens in output count
+                if (v == .integer) usage.output += @as(u64, @intCast(v.integer));
+            }
             if (u.object.get("totalTokenCount")) |v| {
                 if (v == .integer) usage.total_tokens = @intCast(v.integer);
             }
         }
     }
+
+    const parts_slice = parts_list.toOwnedSlice(allocator) catch return null;
+    return .{
+        .parts = parts_slice,
+        .usage = usage,
+        .finish_reason = finish_reason,
+    };
+}
+
+fn deinitGoogleParseResult(result: *const GoogleParseResult, allocator: std.mem.Allocator) void {
+    for (result.parts) |part| {
+        allocator.free(part.text);
+        if (part.thought_signature) |sig| allocator.free(sig);
+    }
+    allocator.free(result.parts);
+    if (result.finish_reason) |fr| allocator.free(fr);
+}
+
+/// Current block type being streamed
+const CurrentBlock = enum {
+    none,
+    text,
+    thinking,
+};
+
+/// Create a partial message for events
+fn createPartialMessage(allocator: std.mem.Allocator, model: ai_types.Model) !ai_types.AssistantMessage {
+    return ai_types.AssistantMessage{
+        .content = &.{},
+        .api = try allocator.dupe(u8, model.api),
+        .provider = try allocator.dupe(u8, model.provider),
+        .model = try allocator.dupe(u8, model.id),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    };
+}
+
+/// Map Google finish reason to StopReason
+fn mapFinishReason(reason: ?[]const u8) ai_types.StopReason {
+    if (reason) |r| {
+        if (std.mem.eql(u8, r, "STOP")) return .stop;
+        if (std.mem.eql(u8, r, "MAX_TOKENS")) return .length;
+        return .@"error";
+    }
+    return .stop;
 }
 
 const ThreadCtx = struct {
@@ -209,9 +393,28 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
-    var text = std.ArrayList(u8){};
-    defer text.deinit(ctx.allocator);
+    // Content block accumulators
+    var content_blocks = std.ArrayList(ai_types.AssistantContent){};
+    defer content_blocks.deinit(ctx.allocator);
+    var current_text = std.ArrayList(u8){};
+    defer current_text.deinit(ctx.allocator);
+    var current_thinking = std.ArrayList(u8){};
+    defer current_thinking.deinit(ctx.allocator);
+    var current_thinking_signature = std.ArrayList(u8){};
+    defer current_thinking_signature.deinit(ctx.allocator);
+    var current_text_signature = std.ArrayList(u8){};
+    defer current_text_signature.deinit(ctx.allocator);
+
     var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: CurrentBlock = .none;
+
+    // Emit start event
+    const partial_start = createPartialMessage(ctx.allocator, ctx.model) catch {
+        ctx.stream.completeWithError("oom partial");
+        return;
+    };
+    ctx.stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
@@ -226,35 +429,189 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            parseGoogleEvent(ev.data, &text, &usage, ctx.allocator) catch {
-                ctx.stream.completeWithError("event parse failed");
-                return;
-            };
+            const result = parseGoogleEventExtended(ev.data, ctx.allocator);
+            if (result) |*res| {
+                defer deinitGoogleParseResult(res, ctx.allocator);
+
+                // Update usage
+                if (res.usage.input > 0) usage.input = res.usage.input;
+                if (res.usage.output > 0) usage.output = res.usage.output;
+                if (res.usage.total_tokens > 0) usage.total_tokens = res.usage.total_tokens;
+
+                // Update finish reason if provided
+                if (res.finish_reason) |fr| {
+                    stop_reason = mapFinishReason(fr);
+                }
+
+                // Process each part
+                for (res.parts) |part| {
+                    const is_thinking = part.is_thinking;
+                    const needs_new_block = current_block == .none or
+                        (is_thinking and current_block != .thinking) or
+                        (!is_thinking and current_block != .text);
+
+                    // Close current block if we need to switch
+                    if (needs_new_block and current_block != .none) {
+                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+                        switch (current_block) {
+                            .text => {
+                                // Store completed text block
+                                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch continue;
+                                const sig_copy = if (current_text_signature.items.len > 0)
+                                    ctx.allocator.dupe(u8, current_text_signature.items) catch null
+                                else
+                                    null;
+                                content_blocks.append(ctx.allocator, .{ .text = .{
+                                    .text = text_copy,
+                                    .text_signature = sig_copy,
+                                } }) catch {};
+                                ctx.stream.push(.{ .text_end = .{
+                                    .content_index = content_blocks.items.len - 1,
+                                    .content = current_text.items,
+                                    .partial = partial,
+                                } }) catch {};
+                                current_text.clearRetainingCapacity();
+                                current_text_signature.clearRetainingCapacity();
+                            },
+                            .thinking => {
+                                // Store completed thinking block
+                                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch continue;
+                                const sig_copy = if (current_thinking_signature.items.len > 0)
+                                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                                else
+                                    null;
+                                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                                    .thinking = thinking_copy,
+                                    .thinking_signature = sig_copy,
+                                } }) catch {};
+                                ctx.stream.push(.{ .thinking_end = .{
+                                    .content_index = content_blocks.items.len - 1,
+                                    .content = current_thinking.items,
+                                    .partial = partial,
+                                } }) catch {};
+                                current_thinking.clearRetainingCapacity();
+                                current_thinking_signature.clearRetainingCapacity();
+                            },
+                            .none => {},
+                        }
+                    }
+
+                    // Start new block if needed
+                    if (needs_new_block) {
+                        const content_idx = content_blocks.items.len;
+                        const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+
+                        if (is_thinking) {
+                            current_block = .thinking;
+                            ctx.stream.push(.{ .thinking_start = .{
+                                .content_index = content_idx,
+                                .partial = partial,
+                            } }) catch {};
+                        } else {
+                            current_block = .text;
+                            ctx.stream.push(.{ .text_start = .{
+                                .content_index = content_idx,
+                                .partial = partial,
+                            } }) catch {};
+                        }
+                    }
+
+                    // Append content and emit delta
+                    const partial = createPartialMessage(ctx.allocator, ctx.model) catch continue;
+                    if (is_thinking) {
+                        current_thinking.appendSlice(ctx.allocator, part.text) catch {};
+                        if (part.thought_signature) |sig| {
+                            current_thinking_signature.appendSlice(ctx.allocator, sig) catch {};
+                        }
+                        ctx.stream.push(.{ .thinking_delta = .{
+                            .content_index = content_blocks.items.len,
+                            .delta = part.text,
+                            .partial = partial,
+                        } }) catch {};
+                    } else {
+                        current_text.appendSlice(ctx.allocator, part.text) catch {};
+                        if (part.thought_signature) |sig| {
+                            current_text_signature.appendSlice(ctx.allocator, sig) catch {};
+                        }
+                        ctx.stream.push(.{ .text_delta = .{
+                            .content_index = content_blocks.items.len,
+                            .delta = part.text,
+                            .partial = partial,
+                        } }) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    // Close final block if open
+    if (current_block != .none) {
+        switch (current_block) {
+            .text => {
+                const partial = createPartialMessage(ctx.allocator, ctx.model) catch null;
+                const text_copy = ctx.allocator.dupe(u8, current_text.items) catch "";
+                const sig_copy = if (current_text_signature.items.len > 0)
+                    ctx.allocator.dupe(u8, current_text_signature.items) catch null
+                else
+                    null;
+                content_blocks.append(ctx.allocator, .{ .text = .{
+                    .text = text_copy,
+                    .text_signature = sig_copy,
+                } }) catch {};
+                if (partial) |p| {
+                    ctx.stream.push(.{ .text_end = .{
+                        .content_index = content_blocks.items.len - 1,
+                        .content = current_text.items,
+                        .partial = p,
+                    } }) catch {};
+                }
+            },
+            .thinking => {
+                const partial = createPartialMessage(ctx.allocator, ctx.model) catch null;
+                const thinking_copy = ctx.allocator.dupe(u8, current_thinking.items) catch "";
+                const sig_copy = if (current_thinking_signature.items.len > 0)
+                    ctx.allocator.dupe(u8, current_thinking_signature.items) catch null
+                else
+                    null;
+                content_blocks.append(ctx.allocator, .{ .thinking = .{
+                    .thinking = thinking_copy,
+                    .thinking_signature = sig_copy,
+                } }) catch {};
+                if (partial) |p| {
+                    ctx.stream.push(.{ .thinking_end = .{
+                        .content_index = content_blocks.items.len - 1,
+                        .content = current_thinking.items,
+                        .partial = p,
+                    } }) catch {};
+                }
+            },
+            .none => {},
         }
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
 
-    var content = ctx.allocator.alloc(ai_types.AssistantContent, 1) catch {
-        ctx.stream.completeWithError("oom result");
+    // If no content blocks were collected, add an empty text block
+    if (content_blocks.items.len == 0) {
+        content_blocks.append(ctx.allocator, .{ .text = .{ .text = "" } }) catch {};
+    }
+
+    const content_slice = content_blocks.toOwnedSlice(ctx.allocator) catch {
+        ctx.stream.completeWithError("oom content");
         return;
     };
-    content[0] = .{ .text = .{ .text = ctx.allocator.dupe(u8, text.items) catch {
-        ctx.allocator.free(content);
-        ctx.stream.completeWithError("oom text");
-        return;
-    } } };
 
     const out = ai_types.AssistantMessage{
-        .content = content,
+        .content = content_slice,
         .api = ctx.allocator.dupe(u8, ctx.model.api) catch return ctx.stream.completeWithError("oom"),
         .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch return ctx.stream.completeWithError("oom"),
         .model = ctx.allocator.dupe(u8, ctx.model.id) catch return ctx.stream.completeWithError("oom"),
         .usage = usage,
-        .stop_reason = .stop,
+        .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
     };
 
+    ctx.stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
     ctx.stream.complete(out);
 }
 
@@ -295,6 +652,29 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
 
 pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
+
+    // Build thinking options based on reasoning level and model capabilities
+    var thinking_enabled: bool = false;
+    var thinking_budget_tokens: ?u32 = null;
+    var thinking_effort: ?[]const u8 = null;
+
+    if (o.reasoning) |level| {
+        if (model.reasoning) {
+            thinking_enabled = true;
+
+            if (isGemini3ProModel(model.id) or isGemini3FlashModel(model.id)) {
+                // Gemini 3 uses thinkingLevel
+                thinking_effort = getGemini3ThinkingLevel(level, model);
+            } else {
+                // Gemini 2.5 uses thinkingBudget
+                const budget = getGoogleBudget(level, o.thinking_budgets, model.id);
+                if (budget > 0) {
+                    thinking_budget_tokens = @intCast(budget);
+                }
+            }
+        }
+    }
+
     return streamGoogleGenerativeAI(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
@@ -306,6 +686,9 @@ pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.C
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
+        .thinking_enabled = thinking_enabled,
+        .thinking_budget_tokens = thinking_budget_tokens,
+        .thinking_effort = thinking_effort,
     }, allocator);
 }
 
