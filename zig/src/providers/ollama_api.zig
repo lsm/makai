@@ -196,7 +196,12 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     if (response.head.status != .ok) {
-        ctx.stream.completeWithError("ollama request failed");
+        const err = std.fmt.allocPrint(ctx.allocator, "ollama request failed: HTTP {d}", .{@intFromEnum(response.head.status)}) catch {
+            ctx.stream.completeWithError("ollama request failed");
+            return;
+        };
+        defer ctx.allocator.free(err);
+        ctx.stream.completeWithError(err);
         return;
     }
 
