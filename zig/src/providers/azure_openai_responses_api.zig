@@ -324,6 +324,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
+        .owned_strings = true, // Strings were duped above
     };
 
     ctx.stream.complete(out);

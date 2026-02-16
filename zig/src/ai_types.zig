@@ -164,6 +164,8 @@ pub const AssistantMessage = struct {
     stop_reason: StopReason,
     error_message: ?[]const u8 = null,
     timestamp: i64,
+    /// If true, api/provider/model strings are owned and will be freed in deinit
+    owned_strings: bool = false,
 
     pub fn deinit(self: *AssistantMessage, allocator: std.mem.Allocator) void {
         for (self.content) |block| {
@@ -188,7 +190,12 @@ pub const AssistantMessage = struct {
             }
         }
         allocator.free(self.content);
-        // Note: .api, .provider, and .model are borrowed references from Model config, not owned
+        // Free duped string fields only if owned (providers set owned_strings=true when duping)
+        if (self.owned_strings) {
+            allocator.free(self.api);
+            allocator.free(self.provider);
+            allocator.free(self.model);
+        }
         if (self.error_message) |e| allocator.free(e);
     }
 };
