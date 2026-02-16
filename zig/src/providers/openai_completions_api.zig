@@ -396,21 +396,9 @@ fn runThread(ctx: *ThreadCtx) void {
         } } };
         const out = ai_types.AssistantMessage{
             .content = content,
-            .api = ctx.allocator.dupe(u8, ctx.model.api) catch {
-                ctx.allocator.free(content);
-                ctx.stream.completeWithError("oom");
-                return;
-            },
-            .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch {
-                ctx.allocator.free(content);
-                ctx.stream.completeWithError("oom");
-                return;
-            },
-            .model = ctx.allocator.dupe(u8, ctx.model.id) catch {
-                ctx.allocator.free(content);
-                ctx.stream.completeWithError("oom");
-                return;
-            },
+            .api = ctx.model.api,
+            .provider = ctx.model.provider,
+            .model = ctx.model.id,
             .usage = usage,
             .stop_reason = stop_reason,
             .timestamp = std.time.milliTimestamp(),
@@ -468,18 +456,9 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = ctx.allocator.dupe(u8, ctx.model.api) catch {
-            ctx.stream.completeWithError("oom");
-            return;
-        },
-        .provider = ctx.allocator.dupe(u8, ctx.model.provider) catch {
-            ctx.stream.completeWithError("oom");
-            return;
-        },
-        .model = ctx.allocator.dupe(u8, ctx.model.id) catch {
-            ctx.stream.completeWithError("oom");
-            return;
-        },
+        .api = ctx.model.api,
+        .provider = ctx.model.provider,
+        .model = ctx.model.id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
