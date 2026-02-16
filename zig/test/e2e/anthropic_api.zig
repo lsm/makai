@@ -11,10 +11,8 @@ fn envOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
 }
 
 test "anthropic e2e: messages api (cheap model)" {
-    // Check ANTHROPIC_AUTH_TOKEN first (new standard), then ANTHROPIC_API_KEY (legacy)
-    const key = envOwned(testing.allocator, "ANTHROPIC_AUTH_TOKEN") orelse 
-                envOwned(testing.allocator, "ANTHROPIC_API_KEY") orelse {
-        std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: anthropic e2e requires ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY\n", .{});
+    const key = envOwned(testing.allocator, "ANTHROPIC_API_KEY") orelse {
+        std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: anthropic e2e requires ANTHROPIC_API_KEY (OAuth tokens not supported)\n", .{});
         return error.SkipZigTest;
     };
     defer testing.allocator.free(key);
