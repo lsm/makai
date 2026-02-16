@@ -146,7 +146,7 @@ pub fn getOllamaCredentials(allocator: std.mem.Allocator) !?OllamaCredentials {
 /// Print a skip message for Anthropic OAuth tests
 pub fn skipAnthropicOAuthTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     if (!shouldSkipAnthropicOAuth(allocator)) return;
-    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_REFRESH_TOKEN+ANTHROPIC_ACCESS_TOKEN or ANTHROPIC_AUTH_TOKEN)\n", .{});
+    std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'anthropic_oauth' - no OAuth credentials available (set ANTHROPIC_AUTH_TOKEN)\n", .{});
     return error.SkipZigTest;
 }
 
@@ -489,31 +489,7 @@ pub const AnthropicOAuthCredentials = struct {
 
 /// Get Anthropic OAuth credentials from environment variable or ~/.makai/auth.json
 pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
-    // 1. Try separate environment variables first (ANTHROPIC_REFRESH_TOKEN and ANTHROPIC_ACCESS_TOKEN)
-    const refresh_result = std.process.getEnvVarOwned(allocator, "ANTHROPIC_REFRESH_TOKEN");
-    const access_result = std.process.getEnvVarOwned(allocator, "ANTHROPIC_ACCESS_TOKEN");
-
-    if (refresh_result) |refresh_token| {
-        if (access_result) |access_token| {
-            return AnthropicOAuthCredentials{
-                .refresh_token = refresh_token,
-                .access_token = access_token,
-            };
-        } else |_| {
-            // Only have refresh token, use it as both (will be refreshed anyway)
-            return AnthropicOAuthCredentials{
-                .refresh_token = refresh_token,
-                .access_token = try allocator.dupe(u8, refresh_token),
-            };
-        }
-    } else |_| {
-        // Clean up access token if we got it but not refresh
-        if (access_result) |access_token| {
-            allocator.free(access_token);
-        } else |_| {}
-    }
-
-    // 2. Try combined format (ANTHROPIC_AUTH_TOKEN with "refresh_token:access_token")
+    // 1. Try ANTHROPIC_AUTH_TOKEN (combined format: "refresh_token:access_token" or single token)
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // Split on the first colon
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
@@ -526,8 +502,7 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
             allocator.free(token);
             return result;
         } else {
-            // 3. Single token format - use as access token only (no refresh token)
-            // This is for backwards compatibility
+            // Single token format - use as access token only (no refresh token)
             const result = AnthropicOAuthCredentials{
                 .refresh_token = &[_]u8{},
                 .access_token = token,
@@ -535,7 +510,7 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
             return result;
         }
     } else |_| {
-        // 4. Fall back to auth.json
+        // 2. Fall back to auth.json
         return getAnthropicOAuthCredentialsFromAuthFile(allocator);
     }
 }
@@ -600,18 +575,7 @@ fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?Anth
 
 /// Check if Anthropic OAuth provider should be skipped (no credentials)
 pub fn shouldSkipAnthropicOAuth(allocator: std.mem.Allocator) bool {
-    // Check for separate env vars first
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_REFRESH_TOKEN")) |token| {
-        allocator.free(token);
-        return false;
-    } else |_| {}
-
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_ACCESS_TOKEN")) |token| {
-        allocator.free(token);
-        return false;
-    } else |_| {}
-
-    // Check combined format
+    // Check for ANTHROPIC_AUTH_TOKEN
     if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         allocator.free(token);
         return false;
