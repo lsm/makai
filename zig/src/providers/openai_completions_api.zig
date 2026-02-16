@@ -4,6 +4,7 @@ const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const github_copilot = @import("github_copilot");
+const tool_call_tracker = @import("tool_call_tracker");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
@@ -173,6 +174,11 @@ fn buildRequestBody(
             try w.endArray();
         }
     }
+    // Privacy: don't store requests for OpenAI training
+    // Only add for OpenAI endpoints (not third-party compatible APIs)
+    if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) {
+        try w.writeBoolField("store", false);
+    }
     try w.endObject();
 
     return buf.toOwnedSlice(allocator);
@@ -192,6 +198,23 @@ const BlockType = enum {
     none,
     text,
     thinking,
+    tool_call,
+};
+
+/// Tool call event parsed from delta, to be processed after parseChunk returns
+/// All strings are owned and must be freed with deinit.
+const ToolCallEvent = struct {
+    api_index: usize,
+    is_start: bool, // true if this is a start event (has id)
+    id: ?[]const u8,
+    name: ?[]const u8,
+    arguments_delta: ?[]const u8,
+
+    fn deinit(self: *ToolCallEvent, allocator: std.mem.Allocator) void {
+        if (self.id) |id| allocator.free(id);
+        if (self.name) |name| allocator.free(name);
+        if (self.arguments_delta) |delta| allocator.free(delta);
+    }
 };
 
 /// Reasoning field names to check (in priority order)
@@ -217,6 +240,7 @@ fn parseChunk(
     stop_reason: *ai_types.StopReason,
     current_block: *BlockType,
     reasoning_signature: *?[]const u8,
+    tool_call_events: *std.ArrayList(ToolCallEvent),
     allocator: std.mem.Allocator,
 ) !void {
     if (std.mem.eql(u8, data, "[DONE]")) return;
@@ -286,8 +310,75 @@ fn parseChunk(
 
         if (ch.object.get("delta")) |d| {
             if (d == .object) {
-                // Check for reasoning content first (priority over text)
-                if (findReasoningField(d.object)) |reasoning| {
+                // Check for tool_calls first (priority over reasoning and text)
+                if (d.object.get("tool_calls")) |tool_calls| {
+                    if (tool_calls == .array) {
+                        for (tool_calls.array.items) |tc| {
+                            if (tc == .object) {
+                                const tc_index: usize = if (tc.object.get("index")) |idx|
+                                    if (idx == .integer) @intCast(idx.integer) else 0
+                                else
+                                    0;
+
+                                const tc_id = tc.object.get("id");
+                                const tc_func = tc.object.get("function");
+
+                                // If has id, it's a new tool call start
+                                if (tc_id) |id| {
+                                    if (id == .string and id.string.len > 0) {
+                                        current_block.* = .tool_call;
+                                        // Get name from function object
+                                        var name_str: []const u8 = "";
+                                        if (tc_func) |f| {
+                                            if (f == .object) {
+                                                if (f.object.get("name")) |n| {
+                                                    if (n == .string) {
+                                                        name_str = n.string;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Dupe the strings since parsed JSON will be freed
+                                        const duped_id = try allocator.dupe(u8, id.string);
+                                        const duped_name = try allocator.dupe(u8, name_str);
+
+                                        // Add start event
+                                        try tool_call_events.append(allocator, .{
+                                            .api_index = tc_index,
+                                            .is_start = true,
+                                            .id = duped_id,
+                                            .name = duped_name,
+                                            .arguments_delta = null,
+                                        });
+                                    }
+                                }
+
+                                // Append arguments delta (can come with or without id)
+                                if (tc_func) |f| {
+                                    if (f == .object) {
+                                        if (f.object.get("arguments")) |args| {
+                                            if (args == .string and args.string.len > 0) {
+                                                current_block.* = .tool_call;
+                                                // Dupe the string since parsed JSON will be freed
+                                                const duped_args = try allocator.dupe(u8, args.string);
+                                                // Add delta event
+                                                try tool_call_events.append(allocator, .{
+                                                    .api_index = tc_index,
+                                                    .is_start = false,
+                                                    .id = null,
+                                                    .name = null,
+                                                    .arguments_delta = duped_args,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (findReasoningField(d.object)) |reasoning| {
+                    // Check for reasoning content (priority over text)
                     // Track which field reasoning came from (for round-trip)
                     if (reasoning_signature.* == null) {
                         reasoning_signature.* = try allocator.dupe(u8, reasoning.field);
@@ -444,9 +535,37 @@ fn runThread(ctx: *ThreadCtx) void {
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
 
+    // Tool call tracking
+    var tool_call_tracker_instance = tool_call_tracker.ToolCallTracker.init(allocator);
+    defer tool_call_tracker_instance.deinit();
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer {
+        for (tool_call_events.items) |*tce| {
+            @constCast(tce).deinit(allocator);
+        }
+        tool_call_events.deinit(allocator);
+    }
+    var next_content_index: usize = 0;
+    var tool_call_count: usize = 0;
+
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
+
+    // Emit start event
+    _ = stream.push(.{
+        .start = .{
+            .partial = .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = std.time.milliTimestamp(),
+            },
+        },
+    }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
@@ -467,23 +586,113 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, allocator) catch {
+            // Free any previous tool call events
+            for (tool_call_events.items) |*tce| {
+                @constCast(tce).deinit(allocator);
+            }
+            tool_call_events.clearRetainingCapacity();
+            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, allocator) catch {
                 allocator.free(api_key);
                 allocator.free(request_body);
                 allocator.destroy(ctx);
                 stream.completeWithError("json parse error");
                 return;
             };
+
+            // Process tool call events
+            for (tool_call_events.items) |tce| {
+                if (tce.is_start) {
+                    // Start a new tool call
+                    const content_index = next_content_index;
+                    const id = tce.id orelse "";
+                    const name = tce.name orelse "";
+                    _ = tool_call_tracker_instance.startCall(tce.api_index, content_index, id, name) catch {
+                        allocator.free(api_key);
+                        allocator.free(request_body);
+                        allocator.destroy(ctx);
+                        stream.completeWithError("oom tool call start");
+                        return;
+                    };
+                    next_content_index += 1;
+                    tool_call_count += 1;
+
+                    // Emit toolcall_start event
+                    _ = stream.push(.{
+                        .toolcall_start = .{
+                            .content_index = content_index,
+                            .partial = .{
+                                .content = &.{},
+                                .api = model.api,
+                                .provider = model.provider,
+                                .model = model.id,
+                                .usage = usage,
+                                .stop_reason = stop_reason,
+                                .timestamp = std.time.milliTimestamp(),
+                            },
+                        },
+                    }) catch {};
+                } else if (tce.arguments_delta) |delta| {
+                    // Append arguments delta
+                    tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
+                        allocator.free(api_key);
+                        allocator.free(request_body);
+                        allocator.destroy(ctx);
+                        stream.completeWithError("oom tool call delta");
+                        return;
+                    };
+
+                    // Emit toolcall_delta event
+                    if (tool_call_tracker_instance.getContentIndex(tce.api_index)) |content_index| {
+                        _ = stream.push(.{
+                            .toolcall_delta = .{
+                                .content_index = content_index,
+                                .delta = delta,
+                                .partial = .{
+                                    .content = &.{},
+                                    .api = model.api,
+                                    .provider = model.provider,
+                                    .model = model.id,
+                                    .usage = usage,
+                                    .stop_reason = stop_reason,
+                                    .timestamp = std.time.milliTimestamp(),
+                                },
+                            },
+                        }) catch {};
+                    }
+                }
+            }
         }
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+    usage.calculateCost(model.cost);
 
-    // Build content blocks - thinking first if present, then text
+    // Complete all tool calls and emit toolcall_end events
+    // We need to complete tool calls in content_index order
+    var api_indices = std.ArrayList(usize){};
+    defer api_indices.deinit(allocator);
+    api_indices.ensureTotalCapacity(allocator, tool_call_tracker_instance.count()) catch {};
+
+    // Collect all api indices
+    var tc_iter = tool_call_tracker_instance.calls.iterator();
+    while (tc_iter.next()) |entry| {
+        api_indices.append(allocator, entry.key_ptr.*) catch {};
+    }
+
+    // Sort by content_index for consistent ordering
+    std.mem.sort(usize, api_indices.items, tool_call_tracker_instance, struct {
+        fn lessThan(tracker: tool_call_tracker.ToolCallTracker, a: usize, b: usize) bool {
+            const a_idx = tracker.getContentIndex(a) orelse 0;
+            const b_idx = tracker.getContentIndex(b) orelse 0;
+            return a_idx < b_idx;
+        }
+    }.lessThan);
+
+    // Build content blocks - thinking first if present, then text, then tool calls
     const has_thinking = thinking.items.len > 0;
     const has_text = text.items.len > 0;
     const content_count: usize = if (has_thinking) 1 else 0;
-    const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0);
+    const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0) + tool_call_count;
 
     if (content_count_final == 0) {
         // No content - create empty text block with borrowed empty string reference
@@ -569,6 +778,43 @@ fn runThread(ctx: *ThreadCtx) void {
             stream.completeWithError("oom building text");
             return;
         } } };
+        idx += 1;
+    }
+
+    // Complete tool calls and add to content, emit toolcall_end events
+    for (api_indices.items) |api_idx| {
+        if (tool_call_tracker_instance.completeCall(api_idx, allocator)) |tc| {
+            content[idx] = .{ .tool_call = tc };
+
+            // Dupe the tool_call for the event so it owns its own memory
+            // The content array's tool_call is owned by the final message,
+            // and the event's tool_call needs its own copies for proper cleanup
+            const event_tc = ai_types.ToolCall{
+                .id = allocator.dupe(u8, tc.id) catch tc.id,
+                .name = allocator.dupe(u8, tc.name) catch tc.name,
+                .arguments_json = if (tc.arguments_json.len > 0) allocator.dupe(u8, tc.arguments_json) catch tc.arguments_json else "",
+                .thought_signature = if (tc.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
+            };
+
+            // Emit toolcall_end event
+            _ = stream.push(.{
+                .toolcall_end = .{
+                    .content_index = idx,
+                    .tool_call = event_tc,
+                    .partial = .{
+                        .content = content[0..idx],
+                        .api = model.api,
+                        .provider = model.provider,
+                        .model = model.id,
+                        .usage = usage,
+                        .stop_reason = stop_reason,
+                        .timestamp = std.time.milliTimestamp(),
+                    },
+                },
+            }) catch {};
+
+            idx += 1;
+        }
     }
 
     const out = ai_types.AssistantMessage{
@@ -785,6 +1031,8 @@ test "parseChunk does not leak memory with reasoning content" {
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer tool_call_events.deinit(allocator);
 
     // Simulate a chunk with reasoning_content (like DeepSeek responses)
     const chunk_data =
@@ -799,6 +1047,7 @@ test "parseChunk does not leak memory with reasoning content" {
         &stop_reason,
         &current_block,
         &reasoning_signature,
+        &tool_call_events,
         allocator,
     );
 
@@ -820,6 +1069,8 @@ test "parseChunk handles multiple chunks without leaking" {
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer tool_call_events.deinit(allocator);
 
     const chunks = [_][]const u8{
         \\{"choices":[{"delta":{"reasoning_content":"First"}}]}
@@ -839,10 +1090,205 @@ test "parseChunk handles multiple chunks without leaking" {
             &stop_reason,
             &current_block,
             &reasoning_signature,
+            &tool_call_events,
             allocator,
         );
     }
 
     try std.testing.expectEqualStrings("Final text", text.items);
     try std.testing.expectEqualStrings("First Second", thinking.items);
+}
+
+test "parseChunk handles tool_calls without leaking" {
+    const allocator = std.testing.allocator;
+
+    var text = std.ArrayList(u8){};
+    defer text.deinit(allocator);
+    var thinking = std.ArrayList(u8){};
+    defer thinking.deinit(allocator);
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: BlockType = .none;
+    var reasoning_signature: ?[]const u8 = null;
+    defer if (reasoning_signature) |sig| allocator.free(sig);
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer {
+        for (tool_call_events.items) |*tce| {
+            @constCast(tce).deinit(allocator);
+        }
+        tool_call_events.deinit(allocator);
+    }
+
+    // Simulate tool call start chunk
+    const chunk1 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"bash","arguments":""}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk1,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    try std.testing.expect(tool_call_events.items[0].is_start);
+    try std.testing.expectEqual(@as(usize, 0), tool_call_events.items[0].api_index);
+    try std.testing.expectEqualStrings("call_abc123", tool_call_events.items[0].id.?);
+    try std.testing.expectEqualStrings("bash", tool_call_events.items[0].name.?);
+
+    // Free events before clearing
+    for (tool_call_events.items) |*tce| {
+        @constCast(tce).deinit(allocator);
+    }
+    tool_call_events.clearRetainingCapacity();
+
+    // Simulate tool call arguments delta chunk
+    const chunk2 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\": \"ls\""}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk2,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    try std.testing.expect(!tool_call_events.items[0].is_start);
+    try std.testing.expectEqual(@as(usize, 0), tool_call_events.items[0].api_index);
+    try std.testing.expectEqualStrings("{\"cmd\": \"ls\"", tool_call_events.items[0].arguments_delta.?);
+
+    // Free events before clearing
+    for (tool_call_events.items) |*tce| {
+        @constCast(tce).deinit(allocator);
+    }
+    tool_call_events.clearRetainingCapacity();
+
+    // Simulate finish_reason for tool_calls
+    const chunk3 =
+        \\{"choices":[{"finish_reason":"tool_calls"}]}
+    ;
+
+    try parseChunk(
+        chunk3,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, stop_reason);
+}
+
+test "parseChunk handles multiple tool_calls" {
+    const allocator = std.testing.allocator;
+
+    var text = std.ArrayList(u8){};
+    defer text.deinit(allocator);
+    var thinking = std.ArrayList(u8){};
+    defer thinking.deinit(allocator);
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: BlockType = .none;
+    var reasoning_signature: ?[]const u8 = null;
+    defer if (reasoning_signature) |sig| allocator.free(sig);
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer {
+        for (tool_call_events.items) |*tce| {
+            @constCast(tce).deinit(allocator);
+        }
+        tool_call_events.deinit(allocator);
+    }
+
+    // Start first tool call
+    const chunk1 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_001","type":"function","function":{"name":"read","arguments":""}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk1,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    try std.testing.expect(tool_call_events.items[0].is_start);
+    try std.testing.expectEqualStrings("call_001", tool_call_events.items[0].id.?);
+
+    // Free events before clearing
+    for (tool_call_events.items) |*tce| {
+        @constCast(tce).deinit(allocator);
+    }
+    tool_call_events.clearRetainingCapacity();
+
+    // Start second tool call
+    const chunk2 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_002","type":"function","function":{"name":"write","arguments":""}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk2,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    try std.testing.expect(tool_call_events.items[0].is_start);
+    try std.testing.expectEqualStrings("call_002", tool_call_events.items[0].id.?);
+    try std.testing.expectEqualStrings("write", tool_call_events.items[0].name.?);
+
+    // Free events before clearing
+    for (tool_call_events.items) |*tce| {
+        @constCast(tce).deinit(allocator);
+    }
+    tool_call_events.clearRetainingCapacity();
+
+    // Delta for first tool call
+    const chunk3 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk3,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    try std.testing.expect(!tool_call_events.items[0].is_start);
+    try std.testing.expectEqual(@as(usize, 0), tool_call_events.items[0].api_index);
 }

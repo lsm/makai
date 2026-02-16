@@ -32,12 +32,28 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const streaming_json_mod = b.createModule(.{
+        .root_source_file = b.path("src/streaming_json.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("src/ai_types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "event_stream", .module = event_stream_mod },
+        },
+    });
+
+    const tool_call_tracker_mod = b.createModule(.{
+        .root_source_file = b.path("src/tool_call_tracker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "streaming_json", .module = streaming_json_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
         },
     });
 
@@ -69,6 +85,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "github_copilot", .module = github_copilot_mod },
+            .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
         },
     });
 
@@ -81,6 +98,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
         },
     });
 
@@ -93,6 +111,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
         },
     });
 
@@ -168,6 +187,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const streaming_json_test = b.addTest(.{ .root_module = streaming_json_mod });
+
     const ai_types_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ai_types.zig"),
@@ -176,6 +197,8 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "event_stream", .module = event_stream_mod }},
         }),
     });
+
+    const tool_call_tracker_test = b.addTest(.{ .root_module = tool_call_tracker_mod });
 
     const api_registry_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -282,7 +305,9 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(types_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
+    test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
     test_step.dependOn(&b.addRunArtifact(api_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(stream_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);

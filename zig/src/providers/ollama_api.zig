@@ -142,37 +142,167 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     return buf.toOwnedSlice(allocator);
 }
 
-fn parseLine(line: []const u8, text: *std.ArrayList(u8), usage: *ai_types.Usage, stop_reason: *ai_types.StopReason, allocator: std.mem.Allocator) !void {
-    if (line.len == 0) return;
+/// Parsed tool call from Ollama response
+const ParsedToolCall = struct {
+    name: []const u8,
+    arguments_json: []const u8,
+};
 
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return;
+/// Parse result from an Ollama response line
+const OllamaParseResult = struct {
+    text: ?[]const u8 = null,
+    tool_calls: []const ParsedToolCall = &.{},
+    usage: ai_types.Usage = .{},
+    done_reason: ?[]const u8 = null,
+
+    fn deinit(self: *const OllamaParseResult, allocator: std.mem.Allocator) void {
+        if (self.text) |t| allocator.free(t);
+        for (self.tool_calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+        }
+        allocator.free(self.tool_calls);
+        if (self.done_reason) |dr| allocator.free(dr);
+    }
+};
+
+/// Stringify a std.json.Value to a buffer (helper for tool call arguments)
+fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    switch (value) {
+        .null => try buf.appendSlice(allocator, "null"),
+        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
+        .integer => |i| {
+            var num_buf: [32]u8 = undefined;
+            const str = std.fmt.bufPrint(&num_buf, "{}", .{i}) catch return;
+            try buf.appendSlice(allocator, str);
+        },
+        .float => |f| {
+            var num_buf: [64]u8 = undefined;
+            const str = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch return;
+            try buf.appendSlice(allocator, str);
+        },
+        .number_string => |s| try buf.appendSlice(allocator, s),
+        .string => |s| {
+            try buf.append(allocator, '"');
+            for (s) |c| {
+                switch (c) {
+                    '"' => try buf.appendSlice(allocator, "\\\""),
+                    '\\' => try buf.appendSlice(allocator, "\\\\"),
+                    '\n' => try buf.appendSlice(allocator, "\\n"),
+                    '\r' => try buf.appendSlice(allocator, "\\r"),
+                    '\t' => try buf.appendSlice(allocator, "\\t"),
+                    else => try buf.append(allocator, c),
+                }
+            }
+            try buf.append(allocator, '"');
+        },
+        .array => |arr| {
+            try buf.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.append(allocator, ',');
+                try stringifyJsonValue(item, buf, allocator);
+            }
+            try buf.append(allocator, ']');
+        },
+        .object => |obj| {
+            try buf.append(allocator, '{');
+            var iter = obj.iterator();
+            var first = true;
+            while (iter.next()) |entry| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try stringifyJsonValue(.{ .string = entry.key_ptr.* }, buf, allocator);
+                try buf.append(allocator, ':');
+                try stringifyJsonValue(entry.value_ptr.*, buf, allocator);
+            }
+            try buf.append(allocator, '}');
+        },
+    }
+}
+
+/// Parse an Ollama response line and extract text, tool calls, usage, and done reason
+fn parseLineExtended(line: []const u8, allocator: std.mem.Allocator) ?OllamaParseResult {
+    if (line.len == 0) return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
     defer parsed.deinit();
 
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) return null;
     const obj = parsed.value.object;
 
+    var result = OllamaParseResult{};
+
+    // Extract message content and tool calls
     if (obj.get("message")) |m| {
         if (m == .object) {
+            // Extract text content
             if (m.object.get("content")) |c| {
                 if (c == .string and c.string.len > 0) {
-                    try text.appendSlice(allocator, c.string);
+                    result.text = allocator.dupe(u8, c.string) catch return null;
+                }
+            }
+
+            // Extract tool calls
+            if (m.object.get("tool_calls")) |tcs| {
+                if (tcs == .array) {
+                    var tool_calls_list = std.ArrayList(ParsedToolCall){};
+                    defer tool_calls_list.deinit(allocator);
+
+                    for (tcs.array.items) |tc| {
+                        if (tc == .object) {
+                            if (tc.object.get("function")) |func| {
+                                if (func == .object) {
+                                    const name = if (func.object.get("name")) |n|
+                                        if (n == .string) n.string else ""
+                                    else "";
+
+                                    // Stringify arguments object to JSON
+                                    const args_json = if (func.object.get("arguments")) |args| blk: {
+                                        var buf = std.ArrayList(u8){};
+                                        stringifyJsonValue(args, &buf, allocator) catch break :blk "";
+                                        break :blk buf.toOwnedSlice(allocator) catch "";
+                                    } else "{}";
+
+                                    const name_copy = allocator.dupe(u8, name) catch {
+                                        allocator.free(args_json);
+                                        continue;
+                                    };
+
+                                    tool_calls_list.append(allocator, .{
+                                        .name = name_copy,
+                                        .arguments_json = args_json,
+                                    }) catch {
+                                        allocator.free(name_copy);
+                                        allocator.free(args_json);
+                                        continue;
+                                    };
+                                }
+                            }
+                        }
+                    }
+
+                    result.tool_calls = tool_calls_list.toOwnedSlice(allocator) catch return null;
                 }
             }
         }
     }
 
+    // Extract usage
     if (obj.get("prompt_eval_count")) |v| {
-        if (v == .integer) usage.input = @intCast(v.integer);
+        if (v == .integer) result.usage.input = @intCast(v.integer);
     }
     if (obj.get("eval_count")) |v| {
-        if (v == .integer) usage.output = @intCast(v.integer);
+        if (v == .integer) result.usage.output = @intCast(v.integer);
     }
 
+    // Extract done reason
     if (obj.get("done_reason")) |dr| {
         if (dr == .string) {
-            if (std.mem.eql(u8, dr.string, "length")) stop_reason.* = .length else stop_reason.* = .stop;
+            result.done_reason = allocator.dupe(u8, dr.string) catch null;
         }
     }
+
+    return result;
 }
 
 const ThreadCtx = struct {
@@ -183,6 +313,19 @@ const ThreadCtx = struct {
     api_key: ?[]u8,
     body: []u8,
 };
+
+/// Create a partial message for events (references model strings directly, no allocation)
+fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
+    return ai_types.AssistantMessage{
+        .content = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    };
+}
 
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
@@ -294,11 +437,20 @@ fn runThread(ctx: *ThreadCtx) void {
     var line = std.ArrayList(u8){};
     defer line.deinit(allocator);
 
-    var text = std.ArrayList(u8){};
-    defer text.deinit(allocator);
+    // Content block accumulators
+    var content_blocks = std.ArrayList(ai_types.AssistantContent){};
+    defer content_blocks.deinit(allocator);
+    var current_text = std.ArrayList(u8){};
+    defer current_text.deinit(allocator);
 
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
+    var tool_call_counter: usize = 0;
+    var has_tool_calls = false;
+
+    // Emit start event
+    const partial_start = createPartialMessage(model);
+    stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
         const n = reader.*.readSliceShort(&read_buf) catch {
@@ -313,14 +465,139 @@ fn runThread(ctx: *ThreadCtx) void {
 
         for (read_buf[0..n]) |ch| {
             if (ch == '\n') {
-                parseLine(line.items, &text, &usage, &stop_reason, allocator) catch {
-                    allocator.free(base_url);
-                    if (api_key) |k| allocator.free(k);
-                    allocator.free(body);
-                    allocator.destroy(ctx);
-                    stream.completeWithError("parse failed");
-                    return;
-                };
+                if (parseLineExtended(line.items, allocator)) |*result| {
+                    defer result.deinit(allocator);
+
+                    // Update usage
+                    if (result.usage.input > 0) usage.input = result.usage.input;
+                    if (result.usage.output > 0) usage.output = result.usage.output;
+
+                    // Update stop reason
+                    if (result.done_reason) |dr| {
+                        if (std.mem.eql(u8, dr, "length")) {
+                            stop_reason = .length;
+                        } else if (std.mem.eql(u8, dr, "stop")) {
+                            stop_reason = .stop;
+                        }
+                    }
+
+                    // Process text content
+                    if (result.text) |text_content| {
+                        const prev_len = current_text.items.len;
+                        current_text.appendSlice(allocator, text_content) catch {};
+
+                        // Emit text_start if this is the first text
+                        if (prev_len == 0 and current_text.items.len > 0) {
+                            const partial = createPartialMessage(model);
+                            stream.push(.{ .text_start = .{
+                                .content_index = content_blocks.items.len,
+                                .partial = partial,
+                            } }) catch {};
+                        }
+
+                        // Emit text_delta with the newly appended content
+                        if (current_text.items.len > prev_len) {
+                            const delta = current_text.items[prev_len..];
+                            const partial = createPartialMessage(model);
+                            stream.push(.{ .text_delta = .{
+                                .content_index = content_blocks.items.len,
+                                .delta = delta,
+                                .partial = partial,
+                            } }) catch {};
+                        }
+                    }
+
+                    // Process tool calls
+                    for (result.tool_calls) |tc| {
+                        has_tool_calls = true;
+
+                        // Close text block if we have accumulated text
+                        if (current_text.items.len > 0) {
+                            const text_copy = allocator.dupe(u8, current_text.items) catch continue;
+                            content_blocks.append(allocator, .{ .text = .{
+                                .text = text_copy,
+                            } }) catch {
+                                allocator.free(text_copy);
+                                continue;
+                            };
+                            const partial = createPartialMessage(model);
+                            stream.push(.{ .text_end = .{
+                                .content_index = content_blocks.items.len - 1,
+                                .content = current_text.items,
+                                .partial = partial,
+                            } }) catch {};
+                            current_text.clearRetainingCapacity();
+                        }
+
+                        // Generate unique ID for the tool call
+                        tool_call_counter += 1;
+                        const timestamp = std.time.milliTimestamp();
+                        const tool_id = std.fmt.allocPrint(
+                            allocator,
+                            "{s}_{}_{}",
+                            .{ tc.name, timestamp, tool_call_counter },
+                        ) catch continue;
+
+                        const tool_name = allocator.dupe(u8, tc.name) catch {
+                            allocator.free(tool_id);
+                            continue;
+                        };
+                        const tool_args = allocator.dupe(u8, tc.arguments_json) catch {
+                            allocator.free(tool_id);
+                            allocator.free(tool_name);
+                            continue;
+                        };
+
+                        const content_idx = content_blocks.items.len;
+
+                        // Emit toolcall_start
+                        stream.push(.{ .toolcall_start = .{
+                            .content_index = content_idx,
+                            .partial = createPartialMessage(model),
+                        } }) catch {
+                            allocator.free(tool_id);
+                            allocator.free(tool_name);
+                            allocator.free(tool_args);
+                            continue;
+                        };
+
+                        // Emit toolcall_delta with args_json
+                        stream.push(.{ .toolcall_delta = .{
+                            .content_index = content_idx,
+                            .delta = tool_args,
+                            .partial = createPartialMessage(model),
+                        } }) catch {};
+
+                        // Build the ToolCall struct for storage and toolcall_end
+                        const tool_call_struct = ai_types.ToolCall{
+                            .id = tool_id,
+                            .name = tool_name,
+                            .arguments_json = tool_args,
+                        };
+
+                        // Store the tool call in content_blocks
+                        content_blocks.append(allocator, .{ .tool_call = tool_call_struct }) catch {
+                            allocator.free(tool_id);
+                            allocator.free(tool_name);
+                            allocator.free(tool_args);
+                            continue;
+                        };
+
+                        // Dupe the tool_call for the event so it owns its own memory
+                        const event_tc = ai_types.ToolCall{
+                            .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
+                            .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
+                            .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
+                        };
+
+                        // Emit toolcall_end with the ToolCall struct
+                        stream.push(.{ .toolcall_end = .{
+                            .content_index = content_idx,
+                            .tool_call = event_tc,
+                            .partial = createPartialMessage(model),
+                        } }) catch {};
+                    }
+                }
                 line.clearRetainingCapacity();
             } else {
                 line.append(allocator, ch) catch {
@@ -335,41 +612,181 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
+    // Process any remaining content in the line buffer
     if (line.items.len > 0) {
-        parseLine(line.items, &text, &usage, &stop_reason, allocator) catch {
-            allocator.free(base_url);
-            if (api_key) |k| allocator.free(k);
-            allocator.free(body);
-            allocator.destroy(ctx);
-            stream.completeWithError("parse failed");
-            return;
-        };
+        if (parseLineExtended(line.items, allocator)) |*result| {
+            defer result.deinit(allocator);
+
+            // Update usage
+            if (result.usage.input > 0) usage.input = result.usage.input;
+            if (result.usage.output > 0) usage.output = result.usage.output;
+
+            // Update stop reason
+            if (result.done_reason) |dr| {
+                if (std.mem.eql(u8, dr, "length")) {
+                    stop_reason = .length;
+                } else if (std.mem.eql(u8, dr, "stop")) {
+                    stop_reason = .stop;
+                }
+            }
+
+            // Process text content
+            if (result.text) |text_content| {
+                const prev_len = current_text.items.len;
+                current_text.appendSlice(allocator, text_content) catch {};
+
+                // Emit text_start if this is the first text
+                if (prev_len == 0 and current_text.items.len > 0) {
+                    const partial = createPartialMessage(model);
+                    stream.push(.{ .text_start = .{
+                        .content_index = content_blocks.items.len,
+                        .partial = partial,
+                    } }) catch {};
+                }
+
+                // Emit text_delta with the newly appended content
+                if (current_text.items.len > prev_len) {
+                    const delta = current_text.items[prev_len..];
+                    const partial = createPartialMessage(model);
+                    stream.push(.{ .text_delta = .{
+                        .content_index = content_blocks.items.len,
+                        .delta = delta,
+                        .partial = partial,
+                    } }) catch {};
+                }
+            }
+
+            // Process tool calls
+            for (result.tool_calls) |tc| {
+                has_tool_calls = true;
+
+                // Close text block if we have accumulated text
+                if (current_text.items.len > 0) {
+                    const text_copy = allocator.dupe(u8, current_text.items) catch continue;
+                    content_blocks.append(allocator, .{ .text = .{
+                        .text = text_copy,
+                    } }) catch {
+                        allocator.free(text_copy);
+                        continue;
+                    };
+                    const partial = createPartialMessage(model);
+                    stream.push(.{ .text_end = .{
+                        .content_index = content_blocks.items.len - 1,
+                        .content = current_text.items,
+                        .partial = partial,
+                    } }) catch {};
+                    current_text.clearRetainingCapacity();
+                }
+
+                // Generate unique ID for the tool call
+                tool_call_counter += 1;
+                const timestamp = std.time.milliTimestamp();
+                const tool_id = std.fmt.allocPrint(
+                    allocator,
+                    "{s}_{}_{}",
+                    .{ tc.name, timestamp, tool_call_counter },
+                ) catch continue;
+
+                const tool_name = allocator.dupe(u8, tc.name) catch {
+                    allocator.free(tool_id);
+                    continue;
+                };
+                const tool_args = allocator.dupe(u8, tc.arguments_json) catch {
+                    allocator.free(tool_id);
+                    allocator.free(tool_name);
+                    continue;
+                };
+
+                const content_idx = content_blocks.items.len;
+
+                // Emit toolcall_start
+                stream.push(.{ .toolcall_start = .{
+                    .content_index = content_idx,
+                    .partial = createPartialMessage(model),
+                } }) catch {
+                    allocator.free(tool_id);
+                    allocator.free(tool_name);
+                    allocator.free(tool_args);
+                    continue;
+                };
+
+                // Emit toolcall_delta with args_json
+                stream.push(.{ .toolcall_delta = .{
+                    .content_index = content_idx,
+                    .delta = tool_args,
+                    .partial = createPartialMessage(model),
+                } }) catch {};
+
+                // Build the ToolCall struct for storage and toolcall_end
+                const tool_call_struct = ai_types.ToolCall{
+                    .id = tool_id,
+                    .name = tool_name,
+                    .arguments_json = tool_args,
+                };
+
+                // Store the tool call in content_blocks
+                content_blocks.append(allocator, .{ .tool_call = tool_call_struct }) catch {
+                    allocator.free(tool_id);
+                    allocator.free(tool_name);
+                    allocator.free(tool_args);
+                    continue;
+                };
+
+                // Dupe the tool_call for the event so it owns its own memory
+                const event_tc = ai_types.ToolCall{
+                    .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
+                    .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
+                    .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
+                };
+
+                // Emit toolcall_end with the ToolCall struct
+                stream.push(.{ .toolcall_end = .{
+                    .content_index = content_idx,
+                    .tool_call = event_tc,
+                    .partial = createPartialMessage(model),
+                } }) catch {};
+            }
+        }
+    }
+
+    // Close final text block if we have accumulated text
+    if (current_text.items.len > 0) {
+        const text_copy = allocator.dupe(u8, current_text.items) catch "";
+        content_blocks.append(allocator, .{ .text = .{
+            .text = text_copy,
+        } }) catch {};
+        const partial = createPartialMessage(model);
+        stream.push(.{ .text_end = .{
+            .content_index = content_blocks.items.len - 1,
+            .content = current_text.items,
+            .partial = partial,
+        } }) catch {};
+    }
+
+    // Set stop_reason to tool_use if we have tool calls
+    if (has_tool_calls) {
+        stop_reason = .tool_use;
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
+    usage.calculateCost(model.cost);
 
-    var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
+    // If no content blocks were collected, add an empty text block
+    if (content_blocks.items.len == 0) {
+        content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
+    }
+
+    const content_slice = content_blocks.toOwnedSlice(allocator) catch {
         allocator.free(base_url);
         if (api_key) |k| allocator.free(k);
         allocator.free(body);
         allocator.destroy(ctx);
-        stream.completeWithError("oom result");
+        stream.completeWithError("oom content");
         return;
     };
-    // Use static empty string for empty content to avoid allocation
-    const text_owned = if (text.items.len == 0) "" else allocator.dupe(u8, text.items) catch {
-        allocator.free(content);
-        allocator.free(base_url);
-        if (api_key) |k| allocator.free(k);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("oom text");
-        return;
-    };
-    content[0] = .{ .text = .{ .text = text_owned } };
 
     const out = ai_types.AssistantMessage{
-        .content = content,
+        .content = content_slice,
         .api = model.api,
         .provider = model.provider,
         .model = model.id,
@@ -377,6 +794,8 @@ fn runThread(ctx: *ThreadCtx) void {
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
     };
+
+    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
 
     // Free ctx allocations before completing
     allocator.free(base_url);
@@ -499,21 +918,154 @@ test "buildBody includes model stream options and messages" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"hello\"") != null);
 }
 
-test "parseLine accumulates text usage and stop reason" {
-    var text = std.ArrayList(u8){};
-    defer text.deinit(std.testing.allocator);
+test "parseLineExtended - text content" {
+    const allocator = std.testing.allocator;
+    const line = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello world\"},\"done\":false}";
 
-    var usage = ai_types.Usage{};
-    var stop_reason: ai_types.StopReason = .stop;
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
 
-    const line1 = "{\"message\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"done\":false}";
-    const line2 = "{\"message\":{\"role\":\"assistant\",\"content\":\" world\"},\"done\":true,\"prompt_eval_count\":3,\"eval_count\":2,\"done_reason\":\"length\"}";
+    try std.testing.expect(result.text != null);
+    try std.testing.expectEqualStrings("Hello world", result.text.?);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+}
 
-    try parseLine(line1, &text, &usage, &stop_reason, std.testing.allocator);
-    try parseLine(line2, &text, &usage, &stop_reason, std.testing.allocator);
+test "parseLineExtended - usage and done reason" {
+    const allocator = std.testing.allocator;
+    const line = "{\"message\":{\"role\":\"assistant\",\"content\":\"test\"},\"done\":true,\"prompt_eval_count\":10,\"eval_count\":5,\"done_reason\":\"length\"}";
 
-    try std.testing.expectEqualStrings("Hello world", text.items);
-    try std.testing.expectEqual(@as(u64, 3), usage.input);
-    try std.testing.expectEqual(@as(u64, 2), usage.output);
-    try std.testing.expectEqual(ai_types.StopReason.length, stop_reason);
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.text != null);
+    try std.testing.expectEqualStrings("test", result.text.?);
+    try std.testing.expectEqual(@as(u64, 10), result.usage.input);
+    try std.testing.expectEqual(@as(u64, 5), result.usage.output);
+    try std.testing.expect(result.done_reason != null);
+    try std.testing.expectEqualStrings("length", result.done_reason.?);
+}
+
+test "parseLineExtended - tool call with arguments" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"bash","arguments":{"cmd":"ls -la"}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.text == null);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+
+    const tc = result.tool_calls[0];
+    try std.testing.expectEqualStrings("bash", tc.name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls -la\"}", tc.arguments_json);
+}
+
+test "parseLineExtended - multiple tool calls" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"bash","arguments":{"cmd":"ls"}}},{"function":{"name":"read_file","arguments":{"path":"test.txt"}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), result.tool_calls.len);
+
+    try std.testing.expectEqualStrings("bash", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", result.tool_calls[0].arguments_json);
+
+    try std.testing.expectEqualStrings("read_file", result.tool_calls[1].name);
+    try std.testing.expectEqualStrings("{\"path\":\"test.txt\"}", result.tool_calls[1].arguments_json);
+}
+
+test "parseLineExtended - tool call with empty arguments" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"no_args","arguments":{}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+
+    const tc = result.tool_calls[0];
+    try std.testing.expectEqualStrings("no_args", tc.name);
+    try std.testing.expectEqualStrings("{}", tc.arguments_json);
+}
+
+test "parseLineExtended - mixed text and tool calls" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"Let me help you.","tool_calls":[{"function":{"name":"search","arguments":{"query":"test"}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.text != null);
+    try std.testing.expectEqualStrings("Let me help you.", result.text.?);
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("search", result.tool_calls[0].name);
+}
+
+test "parseLineExtended - tool call with nested arguments" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"execute","arguments":{"options":{"verbose":true,"timeout":30},"command":"echo hello"}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+
+    const tc = result.tool_calls[0];
+    try std.testing.expectEqualStrings("execute", tc.name);
+    // Verify nested structure is preserved
+    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"options\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"verbose\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"command\":\"echo hello\"") != null);
+}
+
+test "parseLineExtended - tool call with array arguments" {
+    const allocator = std.testing.allocator;
+    const line =
+        \\{"model":"llama3.2","message":{"role":"assistant","content":"","tool_calls":[{"function":{"name":"multi_cmd","arguments":{"commands":["ls","pwd","whoami"]}}}]},"done":true}
+    ;
+
+    var result = parseLineExtended(line, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+
+    const tc = result.tool_calls[0];
+    try std.testing.expectEqualStrings("multi_cmd", tc.name);
+    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "[\"ls\",\"pwd\",\"whoami\"]") != null);
 }

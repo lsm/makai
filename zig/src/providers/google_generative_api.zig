@@ -252,10 +252,17 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
 }
 
 /// Parsed part from a Google response
-const ParsedPart = struct {
-    text: []const u8,
-    is_thinking: bool,
-    thought_signature: ?[]const u8,
+const ParsedPart = union(enum) {
+    text: struct {
+        text: []const u8,
+        is_thinking: bool,
+        thought_signature: ?[]const u8,
+    },
+    tool_call: struct {
+        id: ?[]const u8, // May be null, will generate if so
+        name: []const u8,
+        args_json: []const u8, // JSON stringified args
+    },
 };
 
 /// Parse result from a Google SSE event
@@ -264,6 +271,60 @@ const GoogleParseResult = struct {
     usage: ai_types.Usage,
     finish_reason: ?[]const u8,
 };
+
+/// Stringify a std.json.Value to a buffer (helper for functionCall args)
+fn stringifyJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    switch (value) {
+        .null => try buf.appendSlice(allocator, "null"),
+        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
+        .integer => |i| {
+            var num_buf: [32]u8 = undefined;
+            const str = std.fmt.bufPrint(&num_buf, "{}", .{i}) catch return;
+            try buf.appendSlice(allocator, str);
+        },
+        .float => |f| {
+            var num_buf: [64]u8 = undefined;
+            const str = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch return;
+            try buf.appendSlice(allocator, str);
+        },
+        .number_string => |s| try buf.appendSlice(allocator, s),
+        .string => |s| {
+            try buf.append(allocator, '"');
+            for (s) |c| {
+                switch (c) {
+                    '"' => try buf.appendSlice(allocator, "\\\""),
+                    '\\' => try buf.appendSlice(allocator, "\\\\"),
+                    '\n' => try buf.appendSlice(allocator, "\\n"),
+                    '\r' => try buf.appendSlice(allocator, "\\r"),
+                    '\t' => try buf.appendSlice(allocator, "\\t"),
+                    else => try buf.append(allocator, c),
+                }
+            }
+            try buf.append(allocator, '"');
+        },
+        .array => |arr| {
+            try buf.append(allocator, '[');
+            for (arr.items, 0..) |item, i| {
+                if (i > 0) try buf.append(allocator, ',');
+                try stringifyJsonValue(item, buf, allocator);
+            }
+            try buf.append(allocator, ']');
+        },
+        .object => |obj| {
+            try buf.append(allocator, '{');
+            var iter = obj.iterator();
+            var first = true;
+            while (iter.next()) |entry| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                try stringifyJsonValue(.{ .string = entry.key_ptr.* }, buf, allocator);
+                try buf.append(allocator, ':');
+                try stringifyJsonValue(entry.value_ptr.*, buf, allocator);
+            }
+            try buf.append(allocator, '}');
+        },
+    }
+}
 
 /// Parse a Google SSE event and extract parts with thinking info
 fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?GoogleParseResult {
@@ -296,6 +357,7 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                             if (parts == .array) {
                                 for (parts.array.items) |p| {
                                     if (p == .object) {
+                                        // Check for text part first
                                         if (p.object.get("text")) |t| {
                                             if (t == .string and t.string.len > 0) {
                                                 // Check if this is a thinking part
@@ -312,12 +374,44 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                 } else null;
 
                                                 const text_copy = allocator.dupe(u8, t.string) catch continue;
-                                                parts_list.append(allocator, .{
+                                                parts_list.append(allocator, .{ .text = .{
                                                     .text = text_copy,
                                                     .is_thinking = is_thinking,
                                                     .thought_signature = sig,
-                                                }) catch {
+                                                }}) catch {
                                                     allocator.free(text_copy);
+                                                    if (sig) |s| allocator.free(s);
+                                                    continue;
+                                                };
+                                            }
+                                        } else if (p.object.get("functionCall")) |fc| {
+                                            // Handle functionCall part
+                                            if (fc == .object) {
+                                                const name = if (fc.object.get("name")) |n|
+                                                    if (n == .string) n.string else ""
+                                                else "";
+
+                                                // Get or generate ID (may be null)
+                                                const id = if (fc.object.get("id")) |i|
+                                                    if (i == .string) allocator.dupe(u8, i.string) catch null else null
+                                                else null;
+
+                                                // Stringify args to JSON
+                                                const args_json = if (fc.object.get("args")) |args| blk: {
+                                                    var buf = std.ArrayList(u8){};
+                                                    stringifyJsonValue(args, &buf, allocator) catch break :blk "";
+                                                    break :blk buf.toOwnedSlice(allocator) catch "";
+                                                } else "";
+
+                                                const name_copy = allocator.dupe(u8, name) catch continue;
+                                                parts_list.append(allocator, .{ .tool_call = .{
+                                                    .id = id,
+                                                    .name = name_copy,
+                                                    .args_json = args_json,
+                                                }}) catch {
+                                                    allocator.free(name_copy);
+                                                    if (id) |i| allocator.free(i);
+                                                    allocator.free(args_json);
                                                     continue;
                                                 };
                                             }
@@ -360,8 +454,17 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
 
 fn deinitGoogleParseResult(result: *const GoogleParseResult, allocator: std.mem.Allocator) void {
     for (result.parts) |part| {
-        allocator.free(part.text);
-        if (part.thought_signature) |sig| allocator.free(sig);
+        switch (part) {
+            .text => |t| {
+                allocator.free(t.text);
+                if (t.thought_signature) |sig| allocator.free(sig);
+            },
+            .tool_call => |tc| {
+                if (tc.id) |id| allocator.free(id);
+                allocator.free(tc.name);
+                allocator.free(tc.args_json);
+            },
+        }
     }
     allocator.free(result.parts);
     if (result.finish_reason) |fr| allocator.free(fr);
@@ -504,6 +607,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: CurrentBlock = .none;
+    var tool_call_counter: usize = 0;
 
     // Emit start event
     const partial_start = createPartialMessage(model);
@@ -546,108 +650,230 @@ fn runThread(ctx: *ThreadCtx) void {
 
                 // Process each part
                 for (res.parts) |part| {
-                    const is_thinking = part.is_thinking;
-                    const needs_new_block = current_block == .none or
-                        (is_thinking and current_block != .thinking) or
-                        (!is_thinking and current_block != .text);
+                    switch (part) {
+                        .text => |text_part| {
+                            const is_thinking = text_part.is_thinking;
+                            const needs_new_block = current_block == .none or
+                                (is_thinking and current_block != .thinking) or
+                                (!is_thinking and current_block != .text);
 
-                    // Close current block if we need to switch
-                    if (needs_new_block and current_block != .none) {
-                        const partial = createPartialMessage(model);
-                        switch (current_block) {
-                            .text => {
-                                // Store completed text block
-                                const text_copy = allocator.dupe(u8, current_text.items) catch continue;
-                                const sig_copy = if (current_text_signature.items.len > 0)
-                                    allocator.dupe(u8, current_text_signature.items) catch null
-                                else
-                                    null;
-                                content_blocks.append(allocator, .{ .text = .{
-                                    .text = text_copy,
-                                    .text_signature = sig_copy,
-                                } }) catch {};
-                                stream.push(.{ .text_end = .{
-                                    .content_index = content_blocks.items.len - 1,
-                                    .content = current_text.items,
+                            // Close current block if we need to switch
+                            if (needs_new_block and current_block != .none) {
+                                const partial = createPartialMessage(model);
+                                switch (current_block) {
+                                    .text => {
+                                        // Store completed text block
+                                        const text_copy = allocator.dupe(u8, current_text.items) catch continue;
+                                        const sig_copy = if (current_text_signature.items.len > 0)
+                                            allocator.dupe(u8, current_text_signature.items) catch null
+                                        else
+                                            null;
+                                        content_blocks.append(allocator, .{ .text = .{
+                                            .text = text_copy,
+                                            .text_signature = sig_copy,
+                                        } }) catch {};
+                                        stream.push(.{ .text_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .content = current_text.items,
+                                            .partial = partial,
+                                        } }) catch {};
+                                        current_text.clearRetainingCapacity();
+                                        current_text_signature.clearRetainingCapacity();
+                                    },
+                                    .thinking => {
+                                        // Store completed thinking block
+                                        const thinking_copy = allocator.dupe(u8, current_thinking.items) catch continue;
+                                        const sig_copy = if (current_thinking_signature.items.len > 0)
+                                            allocator.dupe(u8, current_thinking_signature.items) catch null
+                                        else
+                                            null;
+                                        content_blocks.append(allocator, .{ .thinking = .{
+                                            .thinking = thinking_copy,
+                                            .thinking_signature = sig_copy,
+                                        } }) catch {};
+                                        stream.push(.{ .thinking_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .content = current_thinking.items,
+                                            .partial = partial,
+                                        } }) catch {};
+                                        current_thinking.clearRetainingCapacity();
+                                        current_thinking_signature.clearRetainingCapacity();
+                                    },
+                                    .none => {},
+                                }
+                            }
+
+                            // Start new block if needed
+                            if (needs_new_block) {
+                                const content_idx = content_blocks.items.len;
+                                const partial = createPartialMessage(model);
+
+                                if (is_thinking) {
+                                    current_block = .thinking;
+                                    stream.push(.{ .thinking_start = .{
+                                        .content_index = content_idx,
+                                        .partial = partial,
+                                    } }) catch {};
+                                } else {
+                                    current_block = .text;
+                                    stream.push(.{ .text_start = .{
+                                        .content_index = content_idx,
+                                        .partial = partial,
+                                    } }) catch {};
+                                }
+                            }
+
+                            // Append content and emit delta
+                            // Use slices from the ArrayList buffer directly (like Anthropic does).
+                            // The ArrayList is freed when the thread exits, and EventStream.deinit()
+                            // knows not to free delta slices.
+                            const partial = createPartialMessage(model);
+                            if (is_thinking) {
+                                const prev_len = current_thinking.items.len;
+                                current_thinking.appendSlice(allocator, text_part.text) catch {};
+                                if (text_part.thought_signature) |sig| {
+                                    current_thinking_signature.appendSlice(allocator, sig) catch {};
+                                }
+                                // Use the newly appended portion for the delta
+                                const delta = current_thinking.items[prev_len..];
+                                stream.push(.{ .thinking_delta = .{
+                                    .content_index = content_blocks.items.len,
+                                    .delta = delta,
                                     .partial = partial,
                                 } }) catch {};
-                                current_text.clearRetainingCapacity();
-                                current_text_signature.clearRetainingCapacity();
-                            },
-                            .thinking => {
-                                // Store completed thinking block
-                                const thinking_copy = allocator.dupe(u8, current_thinking.items) catch continue;
-                                const sig_copy = if (current_thinking_signature.items.len > 0)
-                                    allocator.dupe(u8, current_thinking_signature.items) catch null
-                                else
-                                    null;
-                                content_blocks.append(allocator, .{ .thinking = .{
-                                    .thinking = thinking_copy,
-                                    .thinking_signature = sig_copy,
-                                } }) catch {};
-                                stream.push(.{ .thinking_end = .{
-                                    .content_index = content_blocks.items.len - 1,
-                                    .content = current_thinking.items,
+                            } else {
+                                const prev_len = current_text.items.len;
+                                current_text.appendSlice(allocator, text_part.text) catch {};
+                                if (text_part.thought_signature) |sig| {
+                                    current_text_signature.appendSlice(allocator, sig) catch {};
+                                }
+                                // Use the newly appended portion for the delta
+                                const delta = current_text.items[prev_len..];
+                                stream.push(.{ .text_delta = .{
+                                    .content_index = content_blocks.items.len,
+                                    .delta = delta,
                                     .partial = partial,
                                 } }) catch {};
-                                current_thinking.clearRetainingCapacity();
-                                current_thinking_signature.clearRetainingCapacity();
-                            },
-                            .none => {},
-                        }
-                    }
+                            }
+                        },
+                        .tool_call => |tc| {
+                            // Close current text/thinking block if open
+                            if (current_block != .none) {
+                                const partial = createPartialMessage(model);
+                                switch (current_block) {
+                                    .text => {
+                                        const text_copy = allocator.dupe(u8, current_text.items) catch "";
+                                        const sig_copy = if (current_text_signature.items.len > 0)
+                                            allocator.dupe(u8, current_text_signature.items) catch null
+                                        else
+                                            null;
+                                        content_blocks.append(allocator, .{ .text = .{
+                                            .text = text_copy,
+                                            .text_signature = sig_copy,
+                                        } }) catch {};
+                                        stream.push(.{ .text_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .content = current_text.items,
+                                            .partial = partial,
+                                        } }) catch {};
+                                        current_text.clearRetainingCapacity();
+                                        current_text_signature.clearRetainingCapacity();
+                                    },
+                                    .thinking => {
+                                        const thinking_copy = allocator.dupe(u8, current_thinking.items) catch "";
+                                        const sig_copy = if (current_thinking_signature.items.len > 0)
+                                            allocator.dupe(u8, current_thinking_signature.items) catch null
+                                        else
+                                            null;
+                                        content_blocks.append(allocator, .{ .thinking = .{
+                                            .thinking = thinking_copy,
+                                            .thinking_signature = sig_copy,
+                                        } }) catch {};
+                                        stream.push(.{ .thinking_end = .{
+                                            .content_index = content_blocks.items.len - 1,
+                                            .content = current_thinking.items,
+                                            .partial = partial,
+                                        } }) catch {};
+                                        current_thinking.clearRetainingCapacity();
+                                        current_thinking_signature.clearRetainingCapacity();
+                                    },
+                                    .none => {},
+                                }
+                                current_block = .none;
+                            }
 
-                    // Start new block if needed
-                    if (needs_new_block) {
-                        const content_idx = content_blocks.items.len;
-                        const partial = createPartialMessage(model);
+                            // Generate unique ID if not provided
+                            const tool_id = if (tc.id) |id|
+                                allocator.dupe(u8, id) catch continue
+                            else blk: {
+                                tool_call_counter += 1;
+                                const timestamp = std.time.milliTimestamp();
+                                break :blk std.fmt.allocPrint(
+                                    allocator,
+                                    "{s}_{}_{}",
+                                    .{ tc.name, timestamp, tool_call_counter },
+                                ) catch continue;
+                            };
 
-                        if (is_thinking) {
-                            current_block = .thinking;
-                            stream.push(.{ .thinking_start = .{
+                            const tool_name = allocator.dupe(u8, tc.name) catch {
+                                allocator.free(tool_id);
+                                continue;
+                            };
+                            const tool_args = allocator.dupe(u8, tc.args_json) catch {
+                                allocator.free(tool_id);
+                                allocator.free(tool_name);
+                                continue;
+                            };
+
+                            const content_idx = content_blocks.items.len;
+
+                            // Emit toolcall_start
+                            stream.push(.{ .toolcall_start = .{
                                 .content_index = content_idx,
-                                .partial = partial,
-                            } }) catch {};
-                        } else {
-                            current_block = .text;
-                            stream.push(.{ .text_start = .{
-                                .content_index = content_idx,
-                                .partial = partial,
-                            } }) catch {};
-                        }
-                    }
+                                .partial = createPartialMessage(model),
+                            } }) catch {
+                                allocator.free(tool_id);
+                                allocator.free(tool_name);
+                                allocator.free(tool_args);
+                                continue;
+                            };
 
-                    // Append content and emit delta
-                    // Use slices from the ArrayList buffer directly (like Anthropic does).
-                    // The ArrayList is freed when the thread exits, and EventStream.deinit()
-                    // knows not to free delta slices.
-                    const partial = createPartialMessage(model);
-                    if (is_thinking) {
-                        const prev_len = current_thinking.items.len;
-                        current_thinking.appendSlice(allocator, part.text) catch {};
-                        if (part.thought_signature) |sig| {
-                            current_thinking_signature.appendSlice(allocator, sig) catch {};
-                        }
-                        // Use the newly appended portion for the delta
-                        const delta = current_thinking.items[prev_len..];
-                        stream.push(.{ .thinking_delta = .{
-                            .content_index = content_blocks.items.len,
-                            .delta = delta,
-                            .partial = partial,
-                        } }) catch {};
-                    } else {
-                        const prev_len = current_text.items.len;
-                        current_text.appendSlice(allocator, part.text) catch {};
-                        if (part.thought_signature) |sig| {
-                            current_text_signature.appendSlice(allocator, sig) catch {};
-                        }
-                        // Use the newly appended portion for the delta
-                        const delta = current_text.items[prev_len..];
-                        stream.push(.{ .text_delta = .{
-                            .content_index = content_blocks.items.len,
-                            .delta = delta,
-                            .partial = partial,
-                        } }) catch {};
+                            // Emit toolcall_delta with args_json
+                            stream.push(.{ .toolcall_delta = .{
+                                .content_index = content_idx,
+                                .delta = tool_args,
+                                .partial = createPartialMessage(model),
+                            } }) catch {};
+
+                            // Build the ToolCall struct for storage and toolcall_end
+                            const tool_call_struct = ai_types.ToolCall{
+                                .id = tool_id,
+                                .name = tool_name,
+                                .arguments_json = tool_args,
+                            };
+
+                            // Store the tool call in content_blocks
+                            content_blocks.append(allocator, .{ .tool_call = tool_call_struct }) catch {
+                                allocator.free(tool_id);
+                                allocator.free(tool_name);
+                                allocator.free(tool_args);
+                                continue;
+                            };
+
+                            // Dupe the tool_call for the event so it owns its own memory
+                            const event_tc = ai_types.ToolCall{
+                                .id = allocator.dupe(u8, tool_call_struct.id) catch tool_call_struct.id,
+                                .name = allocator.dupe(u8, tool_call_struct.name) catch tool_call_struct.name,
+                                .arguments_json = if (tool_call_struct.arguments_json.len > 0) allocator.dupe(u8, tool_call_struct.arguments_json) catch tool_call_struct.arguments_json else "",
+                            };
+
+                            // Emit toolcall_end with the ToolCall struct
+                            stream.push(.{ .toolcall_end = .{
+                                .content_index = content_idx,
+                                .tool_call = event_tc,
+                                .partial = createPartialMessage(model),
+                            } }) catch {};
+                        },
                     }
                 }
             }
@@ -696,6 +922,7 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
+    usage.calculateCost(model.cost);
 
     // If no content blocks were collected, add an empty text block
     if (content_blocks.items.len == 0) {
@@ -823,4 +1050,136 @@ pub fn registerGoogleGeminiCliApiProvider(registry: *api_registry.ApiRegistry) !
         .stream = streamGoogleGenerativeAI,
         .stream_simple = streamSimpleGoogleGenerativeAI,
     }, null);
+}
+
+test "parseGoogleEventExtended - text part" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"text":"Hello world"}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqualStrings("Hello world", result.parts[0].text.text);
+    try std.testing.expectEqual(false, result.parts[0].text.is_thinking);
+}
+
+test "parseGoogleEventExtended - thinking part" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"text":"Thinking...","thought":true,"thoughtSignature":"sig123"}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqualStrings("Thinking...", result.parts[0].text.text);
+    try std.testing.expectEqual(true, result.parts[0].text.is_thinking);
+    if (result.parts[0].text.thought_signature) |sig| {
+        try std.testing.expectEqualStrings("sig123", sig);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
+test "parseGoogleEventExtended - functionCall part" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash","args":{"cmd":"ls -la"}}}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.tool_call);
+
+    const tc = result.parts[0].tool_call;
+    try std.testing.expect(tc.id == null); // No ID provided
+    try std.testing.expectEqualStrings("bash", tc.name);
+    try std.testing.expectEqualStrings("{\"cmd\":\"ls -la\"}", tc.args_json);
+}
+
+test "parseGoogleEventExtended - functionCall with id" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_123","name":"get_weather","args":{"city":"Tokyo"}}}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.tool_call);
+
+    const tc = result.parts[0].tool_call;
+    if (tc.id) |id| {
+        try std.testing.expectEqualStrings("call_123", id);
+    } else {
+        try std.testing.expect(false);
+    }
+    try std.testing.expectEqualStrings("get_weather", tc.name);
+    try std.testing.expectEqualStrings("{\"city\":\"Tokyo\"}", tc.args_json);
+}
+
+test "parseGoogleEventExtended - mixed parts" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"text":"Let me help you."},{"functionCall":{"name":"search","args":{"query":"test"}}},{"text":"Done."}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), result.parts.len);
+
+    // First part is text
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.text);
+    try std.testing.expectEqualStrings("Let me help you.", result.parts[0].text.text);
+
+    // Second part is tool_call
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[1]), ParsedPart.tool_call);
+    try std.testing.expectEqualStrings("search", result.parts[1].tool_call.name);
+
+    // Third part is text
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[2]), ParsedPart.text);
+    try std.testing.expectEqualStrings("Done.", result.parts[2].text.text);
+}
+
+test "parseGoogleEventExtended - functionCall with empty args" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"no_args_func","args":{}}}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.tool_call);
+
+    const tc = result.parts[0].tool_call;
+    try std.testing.expectEqualStrings("no_args_func", tc.name);
+    try std.testing.expectEqualStrings("{}", tc.args_json);
 }
