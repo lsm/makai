@@ -10,15 +10,15 @@ fn envOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
 
-fn waitResultOrSkip(stream: *ai_types.AssistantMessageEventStream) !ai_types.AssistantMessage {
+fn waitResultOrFail(stream: *ai_types.AssistantMessageEventStream) !ai_types.AssistantMessage {
     while (!stream.isDone()) {
         _ = stream.poll();
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
     if (stream.getError()) |err| {
-        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: openai e2e stream error: {s}\n", .{err});
-        return error.SkipZigTest;
+        std.debug.print("\nTest FAILED: openai e2e stream error: {s}\n", .{err});
+        return error.TestFailed;
     }
 
     return ai_types.cloneAssistantMessage(testing.allocator, stream.getResult() orelse return error.NoResult);
@@ -60,7 +60,7 @@ test "openai e2e: chat completions (cheap model)" {
         testing.allocator.destroy(stream);
     }
 
-    var result = try waitResultOrSkip(stream);
+    var result = try waitResultOrFail(stream);
     defer ai_types.deinitAssistantMessageOwned(testing.allocator, &result);
 
     try testing.expect(result.content.len > 0);
@@ -106,7 +106,7 @@ test "openai e2e: responses api (cheap model)" {
         testing.allocator.destroy(stream);
     }
 
-    var result = try waitResultOrSkip(stream);
+    var result = try waitResultOrFail(stream);
     defer ai_types.deinitAssistantMessageOwned(testing.allocator, &result);
 
     try testing.expect(result.content.len > 0);

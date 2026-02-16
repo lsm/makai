@@ -1,3 +1,7 @@
 {
-  "disabledMcpjsonServers": []
+  "disabledMcpjsonServers": [],
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
 }

@@ -52,8 +52,8 @@ test "google e2e: generative ai (cheap model)" {
     }
 
     if (stream.getError()) |err| {
-        std.debug.print("\n\x1b[33mSKIPPED\x1b[0m: google e2e stream error: {s}\n", .{err});
-        return error.SkipZigTest;
+        std.debug.print("\nTest FAILED: google e2e stream error: {s}\n", .{err});
+        return error.TestFailed;
     }
 
     const result = stream.getResult() orelse return error.NoResult;
