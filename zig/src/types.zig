@@ -117,7 +117,8 @@ pub const AssistantMessage = struct {
         for (self.content) |block| {
             switch (block) {
                 .text => |text_block| {
-                    allocator.free(text_block.text);
+                    // Only free non-empty text - empty slices may be static
+                    if (text_block.text.len > 0) allocator.free(text_block.text);
                     if (text_block.signature) |sig| {
                         allocator.free(sig);
                     }
@@ -125,13 +126,15 @@ pub const AssistantMessage = struct {
                 .tool_use => |tool_block| {
                     allocator.free(tool_block.id);
                     allocator.free(tool_block.name);
-                    allocator.free(tool_block.input_json);
+                    // Only free non-empty input_json - empty slices may be static
+                    if (tool_block.input_json.len > 0) allocator.free(tool_block.input_json);
                     if (tool_block.thought_signature) |sig| {
                         allocator.free(sig);
                     }
                 },
                 .thinking => |thinking_block| {
-                    allocator.free(thinking_block.thinking);
+                    // Only free non-empty thinking - empty slices may be static
+                    if (thinking_block.thinking.len > 0) allocator.free(thinking_block.thinking);
                     if (thinking_block.signature) |sig| {
                         allocator.free(sig);
                     }
