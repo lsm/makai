@@ -197,6 +197,62 @@ pub fn build(b: *std.Build) void {
     const google_generative_api_test = b.addTest(.{ .root_module = google_generative_api_mod });
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
 
+    const e2e_anthropic_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/anthropic_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+            },
+        }),
+    });
+
+    const e2e_openai_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/openai_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+            },
+        }),
+    });
+
+    const e2e_azure_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/azure_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+            },
+        }),
+    });
+
+    const e2e_google_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/google_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+            },
+        }),
+    });
+
     const e2e_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/e2e/ollama_api.zig"),
@@ -225,9 +281,25 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
 
-    const test_e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E test");
+    const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
+    test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
+
+    const test_e2e_openai_step = b.step("test-e2e-openai", "Run OpenAI E2E tests");
+    test_e2e_openai_step.dependOn(&b.addRunArtifact(e2e_openai_test).step);
+
+    const test_e2e_azure_step = b.step("test-e2e-azure", "Run Azure E2E tests");
+    test_e2e_azure_step.dependOn(&b.addRunArtifact(e2e_azure_test).step);
+
+    const test_e2e_google_step = b.step("test-e2e-google", "Run Google E2E tests");
+    test_e2e_google_step.dependOn(&b.addRunArtifact(e2e_google_test).step);
+
+    const test_e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E tests");
     test_e2e_ollama_step.dependOn(&b.addRunArtifact(e2e_ollama_test).step);
 
     const test_e2e_step = b.step("test-e2e", "Run E2E tests");
+    test_e2e_step.dependOn(test_e2e_anthropic_step);
+    test_e2e_step.dependOn(test_e2e_openai_step);
+    test_e2e_step.dependOn(test_e2e_azure_step);
+    test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
 }

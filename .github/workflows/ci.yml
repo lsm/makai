@@ -9,13 +9,26 @@ jobs:
     name: Check Available Secrets
     runs-on: ubuntu-latest
     outputs:
+      has_anthropic: ${{ steps.check.outputs.has_anthropic }}
+      has_openai: ${{ steps.check.outputs.has_openai }}
+      has_google: ${{ steps.check.outputs.has_google }}
+      has_azure: ${{ steps.check.outputs.has_azure }}
       has_ollama: ${{ steps.check.outputs.has_ollama }}
     steps:
       - name: Check which secrets are available
         id: check
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
+          echo "has_anthropic=$([[ -n \"$ANTHROPIC_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_openai=$([[ -n \"$OPENAI_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_google=$([[ -n \"$GOOGLE_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_azure=$([[ -n \"$AZURE_OPENAI_API_KEY\" && -n \"$AZURE_OPENAI_ENDPOINT\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_ollama=$([[ -n \"$OLLAMA_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
@@ -42,32 +55,119 @@ jobs:
         working-directory: zig
         run: zig build test
 
+  e2e-anthropic:
+    name: E2E - Anthropic
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_anthropic == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Anthropic E2E tests
+        working-directory: zig
+        run: zig build test-e2e-anthropic
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: claude-3-5-haiku-latest
+
+  e2e-openai:
+    name: E2E - OpenAI
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_openai == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run OpenAI E2E tests
+        working-directory: zig
+        run: zig build test-e2e-openai
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+          OPENAI_RESPONSES_MODEL: gpt-4o-mini
+
+  e2e-azure:
+    name: E2E - Azure
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_azure == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Azure E2E tests
+        working-directory: zig
+        run: zig build test-e2e-azure
+        env:
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_MODEL: gpt-4o-mini
+
+  e2e-google:
+    name: E2E - Google
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_google == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Google E2E tests
+        working-directory: zig
+        run: zig build test-e2e-google
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_MODEL: gemini-2.5-flash
+
   e2e-ollama:
     name: E2E - Ollama
     needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_ollama == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
-
-      - name: Cache Zig
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: ~/.cache/zig
           key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
           restore-keys: |
             ${{ runner.os }}-zig-
-
       - name: Run Ollama E2E tests
         working-directory: zig
         run: zig build test-e2e-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          # Override this in repo/organization variables if needed.
           OLLAMA_MODEL: llama3.2:1b
