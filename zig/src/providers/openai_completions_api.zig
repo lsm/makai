@@ -87,6 +87,37 @@ fn writeMessagesArray(
             else => {},
         }
         try writer.writeStringField("content", text_buf.items);
+
+        // Check for tool_calls on assistant messages
+        if (msg == .assistant) {
+            var has_tool_calls = false;
+            for (msg.assistant.content) |c| {
+                if (c == .tool_call) {
+                    has_tool_calls = true;
+                    break;
+                }
+            }
+            if (has_tool_calls) {
+                try writer.writeKey("tool_calls");
+                try writer.beginArray();
+                for (msg.assistant.content) |c| {
+                    if (c == .tool_call) {
+                        const tc = c.tool_call;
+                        try writer.beginObject();
+                        try writer.writeStringField("id", tc.id);
+                        try writer.writeStringField("type", "function");
+                        try writer.writeKey("function");
+                        try writer.beginObject();
+                        try writer.writeStringField("name", tc.name);
+                        try writer.writeStringField("arguments", tc.arguments_json);
+                        try writer.endObject();
+                        try writer.endObject();
+                    }
+                }
+                try writer.endArray();
+            }
+        }
+
         try writer.endObject();
     }
 
@@ -107,6 +138,10 @@ fn buildRequestBody(
     try w.writeStringField("model", model.id);
     try writeMessagesArray(&w, context, allocator);
     try w.writeBoolField("stream", true);
+    try w.writeKey("stream_options");
+    try w.beginObject();
+    try w.writeBoolField("include_usage", true);
+    try w.endObject();
     try w.writeIntField("max_tokens", options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
         try w.writeKey("temperature");
@@ -116,6 +151,26 @@ fn buildRequestBody(
     if (options.reasoning_effort) |effort| {
         if (model.reasoning) {
             try w.writeStringField("reasoning_effort", effort);
+        }
+    }
+    // Add tools if present
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            try w.writeKey("tools");
+            try w.beginArray();
+            for (tools) |tool| {
+                try w.beginObject();
+                try w.writeStringField("type", "function");
+                try w.writeKey("function");
+                try w.beginObject();
+                try w.writeStringField("name", tool.name);
+                try w.writeStringField("description", tool.description);
+                try w.writeKey("parameters");
+                try w.writeRawJson(tool.parameters_schema_json);
+                try w.endObject();
+                try w.endObject();
+            }
+            try w.endArray();
         }
     }
     try w.endObject();
@@ -611,4 +666,109 @@ pub fn registerOpenAICompletionsApiProvider(registry: *api_registry.ApiRegistry)
         .stream = streamOpenAICompletions,
         .stream_simple = streamSimpleOpenAICompletions,
     }, null);
+}
+
+test "buildRequestBody includes stream_options and tools without memory leak" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const tool = ai_types.Tool{
+        .name = "test_tool",
+        .description = "A test tool",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"arg\":{\"type\":\"string\"}}}",
+    };
+
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{
+            .id = "call_123",
+            .name = "test_tool",
+            .arguments_json = "{\"arg\":\"value\"}",
+        } },
+    };
+
+    const assistant_msg = ai_types.Message{ .assistant = .{
+        .content = &assistant_content,
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o-mini",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.timestamp(),
+    } };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{assistant_msg},
+        .tools = &[_]ai_types.Tool{tool},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Verify the body contains expected fields
+    try std.testing.expect(std.mem.indexOf(u8, body, "stream_options") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "include_usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "test_tool") != null);
+}
+
+test "buildRequestBody with assistant message containing tool_calls" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "Let me help you with that." } },
+        .{ .tool_call = .{
+            .id = "call_456",
+            .name = "bash",
+            .arguments_json = "{\"cmd\":\"ls -la\"}",
+        } },
+    };
+
+    const assistant_msg = ai_types.Message{ .assistant = .{
+        .content = &assistant_content,
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o-mini",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.timestamp(),
+    } };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{assistant_msg},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Verify the body contains tool_calls
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "call_456") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "bash") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ls -la") != null);
 }

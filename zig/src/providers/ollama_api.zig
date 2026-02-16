@@ -28,7 +28,14 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
                 if (out.items.len > 0) try out.append(allocator, '\n');
                 try out.appendSlice(allocator, t.thinking);
             },
-            .tool_call => {},
+            .tool_call => |tc| {
+                if (out.items.len > 0) try out.append(allocator, '\n');
+                try out.appendSlice(allocator, "[TOOL_CALL: ");
+                try out.appendSlice(allocator, tc.name);
+                try out.appendSlice(allocator, "(");
+                try out.appendSlice(allocator, tc.arguments_json);
+                try out.appendSlice(allocator, ")]");
+            },
         },
         .tool_result => |tr| for (tr.content) |c| switch (c) {
             .text => |t| {
@@ -78,6 +85,25 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     }
 
     try w.endArray();
+
+    // Add tools if provided (OpenAI-compatible format)
+    if (context.tools) |tools| {
+        try w.writeKey("tools");
+        try w.beginArray();
+        for (tools) |tool| {
+            try w.beginObject();
+            try w.writeStringField("type", "function");
+            try w.writeKey("function");
+            try w.beginObject();
+            try w.writeStringField("name", tool.name);
+            try w.writeStringField("description", tool.description);
+            try w.writeKey("parameters");
+            try w.writeRawJson(tool.parameters_schema_json);
+            try w.endObject();
+            try w.endObject();
+        }
+        try w.endArray();
+    }
 
     try w.writeKey("options");
     try w.beginObject();

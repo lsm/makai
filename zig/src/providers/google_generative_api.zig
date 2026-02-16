@@ -75,39 +75,6 @@ fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBud
     return -1;
 }
 
-fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
-    switch (msg) {
-        .user => |u| switch (u.content) {
-            .text => |t| try out.appendSlice(allocator, t),
-            .parts => |parts| for (parts) |p| switch (p) {
-                .text => |t| {
-                    if (out.items.len > 0) try out.append(allocator, '\n');
-                    try out.appendSlice(allocator, t.text);
-                },
-                .image => {},
-            },
-        },
-        .assistant => |a| for (a.content) |c| switch (c) {
-            .text => |t| {
-                if (out.items.len > 0) try out.append(allocator, '\n');
-                try out.appendSlice(allocator, t.text);
-            },
-            .thinking => |t| {
-                if (out.items.len > 0) try out.append(allocator, '\n');
-                try out.appendSlice(allocator, t.thinking);
-            },
-            .tool_call => {},
-        },
-        .tool_result => |tr| for (tr.content) |c| switch (c) {
-            .text => |t| {
-                if (out.items.len > 0) try out.append(allocator, '\n');
-                try out.appendSlice(allocator, t.text);
-            },
-            .image => {},
-        },
-    }
-}
-
 fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: ai_types.Model, allocator: std.mem.Allocator) ![]u8 {
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
@@ -118,10 +85,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     try w.writeKey("contents");
     try w.beginArray();
     for (context.messages) |m| {
-        var text = std.ArrayList(u8){};
-        defer text.deinit(allocator);
-        try appendMessageText(m, &text, allocator);
-
         const role: []const u8 = switch (m) {
             .assistant => "model",
             else => "user",
@@ -131,9 +94,89 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         try w.writeStringField("role", role);
         try w.writeKey("parts");
         try w.beginArray();
-        try w.beginObject();
-        try w.writeStringField("text", text.items);
-        try w.endObject();
+
+        switch (m) {
+            .user => |u| switch (u.content) {
+                .text => |t| {
+                    try w.beginObject();
+                    try w.writeStringField("text", t);
+                    try w.endObject();
+                },
+                .parts => |parts| {
+                    for (parts) |p| switch (p) {
+                        .text => |t| {
+                            try w.beginObject();
+                            try w.writeStringField("text", t.text);
+                            try w.endObject();
+                        },
+                        .image => |img| {
+                            try w.beginObject();
+                            try w.writeKey("inlineData");
+                            try w.beginObject();
+                            try w.writeStringField("mimeType", img.mime_type);
+                            try w.writeStringField("data", img.data);
+                            try w.endObject();
+                            try w.endObject();
+                        },
+                    };
+                },
+            },
+            .assistant => |a| {
+                for (a.content) |c| switch (c) {
+                    .text => |t| {
+                        if (t.text.len > 0) {
+                            try w.beginObject();
+                            try w.writeStringField("text", t.text);
+                            try w.endObject();
+                        }
+                    },
+                    .thinking => |t| {
+                        if (t.thinking.len > 0) {
+                            try w.beginObject();
+                            try w.writeStringField("text", t.thinking);
+                            try w.endObject();
+                        }
+                    },
+                    .tool_call => |tc| {
+                        try w.beginObject();
+                        try w.writeKey("functionCall");
+                        try w.beginObject();
+                        try w.writeStringField("name", tc.name);
+                        try w.writeKey("args");
+                        try w.writeRawJson(tc.arguments_json);
+                        try w.endObject();
+                        try w.endObject();
+                    },
+                };
+            },
+            .tool_result => |tr| {
+                try w.beginObject();
+                try w.writeKey("functionResponse");
+                try w.beginObject();
+                try w.writeStringField("name", tr.tool_name);
+                try w.writeKey("response");
+                try w.beginObject();
+                // Serialize content parts as the response
+                for (tr.content) |c| switch (c) {
+                    .text => |t| {
+                        try w.writeStringField("result", t.text);
+                    },
+                    .image => {},
+                };
+                // Include details_json if present
+                if (tr.details_json) |dj| {
+                    try w.writeKey("details");
+                    try w.writeRawJson(dj);
+                }
+                if (tr.is_error) {
+                    try w.writeBoolField("error", true);
+                }
+                try w.endObject();
+                try w.endObject();
+                try w.endObject();
+            },
+        }
+
         try w.endArray();
         try w.endObject();
     }
@@ -159,6 +202,28 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         try w.writeFloat(t);
     }
     try w.endObject();
+
+    // Add tools if present (Google uses functionDeclarations inside a tools array)
+    if (context.tools) |tools| {
+        if (tools.len > 0) {
+            try w.writeKey("tools");
+            try w.beginArray();
+            try w.beginObject();
+            try w.writeKey("functionDeclarations");
+            try w.beginArray();
+            for (tools) |tool| {
+                try w.beginObject();
+                try w.writeStringField("name", tool.name);
+                try w.writeStringField("description", tool.description);
+                try w.writeKey("parameters");
+                try w.writeRawJson(tool.parameters_schema_json);
+                try w.endObject();
+            }
+            try w.endArray();
+            try w.endObject();
+            try w.endArray();
+        }
+    }
 
     // Add thinkingConfig if thinking is enabled and model supports reasoning
     if (options.thinking_enabled and model.reasoning) {

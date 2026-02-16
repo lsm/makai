@@ -86,6 +86,14 @@ pub const JsonWriter = struct {
         self.needs_comma = true;
     }
 
+    /// Write pre-serialized JSON directly without escaping.
+    /// Useful for embedding already-serialized JSON strings (e.g., schema definitions).
+    pub fn writeRawJson(self: *JsonWriter, json_string: []const u8) !void {
+        try self.writeCommaIfNeeded();
+        try self.buffer.appendSlice(self.allocator, json_string);
+        self.needs_comma = true;
+    }
+
     // Combined key:value for convenience
     pub fn writeStringField(self: *JsonWriter, key: []const u8, value: []const u8) !void {
         try self.writeKey(key);
@@ -242,4 +250,27 @@ test "float values" {
     // Float formatting may vary slightly, so just check structure
     try std.testing.expect(std.mem.startsWith(u8, result, "{\"temperature\":0.7"));
     try std.testing.expect(std.mem.endsWith(u8, result, "}"));
+}
+
+test "writeRawJson embeds pre-serialized JSON" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8){};
+    defer buffer.deinit(allocator);
+
+    var writer = JsonWriter.init(&buffer, allocator);
+
+    // Simulate embedding a pre-serialized schema
+    const schema_json = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}";
+
+    try writer.beginObject();
+    try writer.writeKey("name");
+    try writer.writeString("my_tool");
+    try writer.writeKey("parameters");
+    try writer.writeRawJson(schema_json);
+    try writer.endObject();
+
+    const result = getResult(&writer);
+    const expected = "{\"name\":\"my_tool\",\"parameters\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}}}}";
+
+    try std.testing.expectEqualStrings(expected, result);
 }

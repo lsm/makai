@@ -138,6 +138,16 @@ pub const Usage = struct {
     cache_write: u64 = 0,
     total_tokens: u64 = 0,
     cost: UsageCost = .{},
+
+    /// Calculate dollar costs from token usage using the model's pricing rates.
+    /// Prices are per 1 million tokens.
+    pub fn calculateCost(self: *Usage, model_cost: Cost) void {
+        self.cost.input = (@as(f64, @floatFromInt(self.input)) / 1_000_000.0) * model_cost.input;
+        self.cost.output = (@as(f64, @floatFromInt(self.output)) / 1_000_000.0) * model_cost.output;
+        self.cost.cache_read = (@as(f64, @floatFromInt(self.cache_read)) / 1_000_000.0) * model_cost.cache_read;
+        self.cost.cache_write = (@as(f64, @floatFromInt(self.cache_write)) / 1_000_000.0) * model_cost.cache_write;
+        self.cost.total = self.cost.input + self.cost.output + self.cost.cache_read + self.cost.cache_write;
+    }
 };
 
 pub const UserMessage = struct {
@@ -425,4 +435,28 @@ test "AssistantMessageEventStream deinit drains unpolled toolcall_end events" {
 
     // deinit() is called by defer above
     // tool_id, tool_name, args_json should be freed by the deinit logic
+}
+
+test "Usage.calculateCost computes correct dollar costs" {
+    var usage = Usage{
+        .input = 1_000_000,
+        .output = 500_000,
+        .cache_read = 200_000,
+        .cache_write = 100_000,
+    };
+
+    const model_cost = Cost{
+        .input = 3.0,
+        .output = 15.0,
+        .cache_read = 0.30,
+        .cache_write = 3.75,
+    };
+
+    usage.calculateCost(model_cost);
+
+    try std.testing.expectApproxEqAbs(3.0, usage.cost.input, 0.0001);
+    try std.testing.expectApproxEqAbs(7.5, usage.cost.output, 0.0001);
+    try std.testing.expectApproxEqAbs(0.06, usage.cost.cache_read, 0.0001);
+    try std.testing.expectApproxEqAbs(0.375, usage.cost.cache_write, 0.0001);
+    try std.testing.expectApproxEqAbs(10.935, usage.cost.total, 0.0001);
 }
