@@ -51,7 +51,8 @@ test "ollama e2e: basic text generation (new api)" {
         }
     }
 
-    const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "llama3.2:1b");
+    // Use ministral-3:3b as default - it's the smallest Ollama cloud model (~4.67GB)
+    const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "ministral-3:3b");
     defer testing.allocator.free(model_id);
 
     const base_url = getEnvOwned(testing.allocator, "OLLAMA_BASE_URL") orelse try testing.allocator.dupe(u8, "");
