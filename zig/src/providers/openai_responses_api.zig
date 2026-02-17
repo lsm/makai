@@ -72,6 +72,28 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeBoolField("stream", true);
     try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
 
+    // Add reasoning parameters for reasoning models (o1, o3, etc.)
+    if (model.reasoning) {
+        try w.writeKey("reasoning");
+        try w.beginObject();
+        if (options.reasoning_effort) |effort| {
+            try w.writeStringField("effort", effort);
+        } else {
+            try w.writeStringField("effort", "medium"); // default
+        }
+        if (options.reasoning_summary) |summary| {
+            try w.writeStringField("summary", summary);
+        } else {
+            try w.writeStringField("summary", "auto"); // default
+        }
+        try w.endObject();
+
+        try w.writeKey("include");
+        try w.beginArray();
+        try w.writeString("reasoning.encrypted_content");
+        try w.endArray();
+    }
+
     // Privacy: don't store requests for OpenAI training
     if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) {
         try w.writeBoolField("store", false);
@@ -98,7 +120,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     if (context.system_prompt) |sp| {
         try w.beginObject();
-        try w.writeStringField("role", "system");
+        const system_role: []const u8 = if (model.reasoning) "developer" else "system";
+        try w.writeStringField("role", system_role);
         try w.writeStringField("content", sp);
         try w.endObject();
     }
@@ -996,6 +1019,17 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     return s;
 }
 
+/// Convert ThinkingLevel enum to reasoning_effort string
+fn thinkingLevelToString(level: ai_types.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .minimal => "minimal",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
 pub fn streamSimpleOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
     return streamOpenAIResponses(model, context, .{
@@ -1009,6 +1043,8 @@ pub fn streamSimpleOpenAIResponses(model: ai_types.Model, context: ai_types.Cont
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
+        .reasoning_effort = if (o.reasoning) |r| thinkingLevelToString(r) else null,
+        .reasoning_summary = o.reasoning_summary,
     }, allocator);
 }
 

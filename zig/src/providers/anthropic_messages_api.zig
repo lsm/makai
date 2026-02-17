@@ -199,13 +199,77 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     try w.writeKey("messages");
     try w.beginArray();
-    for (context.messages, 0..) |m, msg_idx| {
+    var msg_idx: usize = 0;
+    while (msg_idx < context.messages.len) {
+        const m = context.messages[msg_idx];
+
+        const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
+
+        // Group consecutive tool_result messages into a single user message
+        if (m == .tool_result) {
+            try w.beginObject();
+            try w.writeStringField("role", "user");
+            try w.writeKey("content");
+            try w.beginArray();
+
+            // Collect ALL consecutive tool_results
+            while (msg_idx < context.messages.len and context.messages[msg_idx] == .tool_result) {
+                const tr = context.messages[msg_idx].tool_result;
+
+                try w.beginObject();
+                try w.writeStringField("type", "tool_result");
+                try w.writeStringField("tool_use_id", tr.tool_call_id);
+
+                // Serialize content - can be text, images, or array of content blocks
+                if (tr.content.len == 1 and tr.content[0] == .text) {
+                    // Single text: serialize as string for simplicity
+                    try w.writeStringField("content", tr.content[0].text.text);
+                } else if (tr.content.len > 1 or (tr.content.len > 0 and tr.content[0] == .image)) {
+                    // Multiple parts or image: serialize as array
+                    try w.writeKey("content");
+                    try w.beginArray();
+                    for (tr.content) |c| {
+                        switch (c) {
+                            .text => |t| {
+                                try w.beginObject();
+                                try w.writeStringField("type", "text");
+                                try w.writeStringField("text", t.text);
+                                try w.endObject();
+                            },
+                            .image => |img| {
+                                try w.beginObject();
+                                try w.writeStringField("type", "image");
+                                try w.writeKey("source");
+                                try w.beginObject();
+                                try w.writeStringField("type", "base64");
+                                try w.writeStringField("media_type", img.mime_type);
+                                try w.writeStringField("data", img.data);
+                                try w.endObject();
+                                try w.endObject();
+                            },
+                        }
+                    }
+                    try w.endArray();
+                } else {
+                    // Empty content
+                    try w.writeStringField("content", "");
+                }
+
+                try w.writeBoolField("is_error", tr.is_error);
+                try w.endObject();
+
+                msg_idx += 1;
+            }
+
+            try w.endArray();
+            try w.endObject();
+            continue; // Already incremented msg_idx
+        }
+
         const role: []const u8 = switch (m) {
             .assistant => "assistant",
             else => "user",
         };
-
-        const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
 
         // Handle assistant messages with tool_use blocks specially
         if (m == .assistant and hasToolUse(m)) {
@@ -224,10 +288,19 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         try w.endObject();
                     },
                     .thinking => |t| {
-                        try w.beginObject();
-                        try w.writeStringField("type", "thinking");
-                        try w.writeStringField("thinking", t.thinking);
-                        try w.endObject();
+                        // If signature is missing (aborted stream), convert to text
+                        if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
+                            try w.beginObject();
+                            try w.writeStringField("type", "text");
+                            try w.writeStringField("text", t.thinking);
+                            try w.endObject();
+                        } else {
+                            try w.beginObject();
+                            try w.writeStringField("type", "thinking");
+                            try w.writeStringField("thinking", t.thinking);
+                            try w.writeStringField("signature", t.thinking_signature.?);
+                            try w.endObject();
+                        }
                     },
                     .tool_call => |tc| {
                         try w.beginObject();
@@ -243,74 +316,149 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
             try w.endArray();
             try w.endObject();
-        } else if (m == .tool_result) {
-            // Tool result messages must be serialized as user messages with tool_result content blocks
-            const tr = m.tool_result;
-
-            try w.beginObject();
-            try w.writeStringField("role", "user");
-            try w.writeKey("content");
-            try w.beginArray();
-
-            try w.beginObject();
-            try w.writeStringField("type", "tool_result");
-            try w.writeStringField("tool_use_id", tr.tool_call_id);
-
-            // Serialize content - can be a string or array of content blocks
-            // For simplicity, extract text content and serialize as string
-            var text = std.ArrayList(u8){};
-            defer text.deinit(allocator);
-            for (tr.content) |c| switch (c) {
-                .text => |t| {
-                    if (text.items.len > 0) try text.append(allocator, '\n');
-                    try text.appendSlice(allocator, t.text);
-                },
-                .image => {},
-            };
-
-            try w.writeStringField("content", text.items);
-            try w.writeBoolField("is_error", tr.is_error);
-            try w.endObject();
-
-            try w.endArray();
-            try w.endObject();
         } else if (is_last_user and cache_control != null) {
             // For the last user message with cache_control, use content array format
-            var text = std.ArrayList(u8){};
-            defer text.deinit(allocator);
-            try appendMessageText(m, &text, allocator);
-
             try w.beginObject();
             try w.writeStringField("role", role);
             try w.writeKey("content");
             try w.beginArray();
 
-            // Text block with cache_control
-            try w.beginObject();
-            try w.writeStringField("type", "text");
-            try w.writeStringField("text", text.items);
-            try w.writeKey("cache_control");
-            try w.beginObject();
-            try w.writeStringField("type", "ephemeral");
-            if (cache_control.?.has_ttl) {
-                try w.writeStringField("ttl", "1h");
+            // Serialize user message content (text and images)
+            switch (m.user.content) {
+                .text => |t| {
+                    // Text block with cache_control
+                    try w.beginObject();
+                    try w.writeStringField("type", "text");
+                    try w.writeStringField("text", t);
+                    try w.writeKey("cache_control");
+                    try w.beginObject();
+                    try w.writeStringField("type", "ephemeral");
+                    if (cache_control.?.has_ttl) {
+                        try w.writeStringField("ttl", "1h");
+                    }
+                    try w.endObject();
+                    try w.endObject();
+                },
+                .parts => |parts| {
+                    for (parts, 0..) |p, i| {
+                        switch (p) {
+                            .text => |t| {
+                                try w.beginObject();
+                                try w.writeStringField("type", "text");
+                                try w.writeStringField("text", t.text);
+                                // Add cache_control only to the last block
+                                if (i == parts.len - 1) {
+                                    try w.writeKey("cache_control");
+                                    try w.beginObject();
+                                    try w.writeStringField("type", "ephemeral");
+                                    if (cache_control.?.has_ttl) {
+                                        try w.writeStringField("ttl", "1h");
+                                    }
+                                    try w.endObject();
+                                }
+                                try w.endObject();
+                            },
+                            .image => |img| {
+                                try w.beginObject();
+                                try w.writeStringField("type", "image");
+                                try w.writeKey("source");
+                                try w.beginObject();
+                                try w.writeStringField("type", "base64");
+                                try w.writeStringField("media_type", img.mime_type);
+                                try w.writeStringField("data", img.data);
+                                try w.endObject();
+                                try w.endObject();
+                            },
+                        }
+                    }
+                },
             }
-            try w.endObject();
-            try w.endObject();
 
             try w.endArray();
             try w.endObject();
         } else {
-            // Standard message serialization
-            var text = std.ArrayList(u8){};
-            defer text.deinit(allocator);
-            try appendMessageText(m, &text, allocator);
+            // Standard message serialization with image support
+            switch (m) {
+                .user => |u| {
+                    try w.beginObject();
+                    try w.writeStringField("role", role);
 
-            try w.beginObject();
-            try w.writeStringField("role", role);
-            try w.writeStringField("content", text.items);
-            try w.endObject();
+                    switch (u.content) {
+                        .text => |t| {
+                            try w.writeStringField("content", t);
+                        },
+                        .parts => |parts| {
+                            try w.writeKey("content");
+                            try w.beginArray();
+                            for (parts) |p| {
+                                switch (p) {
+                                    .text => |t| {
+                                        try w.beginObject();
+                                        try w.writeStringField("type", "text");
+                                        try w.writeStringField("text", t.text);
+                                        try w.endObject();
+                                    },
+                                    .image => |img| {
+                                        try w.beginObject();
+                                        try w.writeStringField("type", "image");
+                                        try w.writeKey("source");
+                                        try w.beginObject();
+                                        try w.writeStringField("type", "base64");
+                                        try w.writeStringField("media_type", img.mime_type);
+                                        try w.writeStringField("data", img.data);
+                                        try w.endObject();
+                                        try w.endObject();
+                                    },
+                                }
+                            }
+                            try w.endArray();
+                        },
+                    }
+
+                    try w.endObject();
+                },
+                .assistant => |a| {
+                    try w.beginObject();
+                    try w.writeStringField("role", role);
+
+                    // Serialize assistant content blocks
+                    try w.writeKey("content");
+                    try w.beginArray();
+                    for (a.content) |c| {
+                        switch (c) {
+                            .text => |t| {
+                                try w.beginObject();
+                                try w.writeStringField("type", "text");
+                                try w.writeStringField("text", t.text);
+                                try w.endObject();
+                            },
+                            .thinking => |t| {
+                                // If signature is missing (aborted stream), convert to text
+                                if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
+                                    try w.beginObject();
+                                    try w.writeStringField("type", "text");
+                                    try w.writeStringField("text", t.thinking);
+                                    try w.endObject();
+                                } else {
+                                    try w.beginObject();
+                                    try w.writeStringField("type", "thinking");
+                                    try w.writeStringField("thinking", t.thinking);
+                                    try w.writeStringField("signature", t.thinking_signature.?);
+                                    try w.endObject();
+                                }
+                            },
+                            .tool_call => {},
+                        }
+                    }
+                    try w.endArray();
+
+                    try w.endObject();
+                },
+                .tool_result => unreachable, // Handled above
+            }
         }
+
+        msg_idx += 1;
     }
     try w.endArray();
 
@@ -328,6 +476,45 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.endObject();
             }
             try w.endArray();
+        }
+    }
+
+    // Serialize tool_choice if present
+    if (options.tool_choice) |tc| {
+        try w.writeKey("tool_choice");
+        switch (tc) {
+            .auto => {
+                try w.beginObject();
+                try w.writeStringField("type", "auto");
+                try w.endObject();
+            },
+            .none => {
+                try w.beginObject();
+                try w.writeStringField("type", "none");
+                try w.endObject();
+            },
+            .required => {
+                try w.beginObject();
+                try w.writeStringField("type", "any");
+                try w.endObject();
+            },
+            .function => |name| {
+                try w.beginObject();
+                try w.writeStringField("type", "tool");
+                try w.writeKey("name");
+                try w.writeString(name);
+                try w.endObject();
+            },
+        }
+    }
+
+    // Serialize metadata.user_id if present
+    if (options.metadata) |meta| {
+        if (meta.user_id) |user_id| {
+            try w.writeKey("metadata");
+            try w.beginObject();
+            try w.writeStringField("user_id", user_id);
+            try w.endObject();
         }
     }
 

@@ -48,6 +48,17 @@ pub const CancelToken = struct {
     }
 };
 
+pub const Metadata = struct {
+    user_id: ?[]const u8 = null,
+};
+
+pub const ToolChoice = union(enum) {
+    auto: void,
+    none: void,
+    required: void,
+    function: []const u8, // function name
+};
+
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
@@ -68,6 +79,14 @@ pub const StreamOptions = struct {
     thinking_effort: ?[]const u8 = null,
     /// Reasoning effort level for OpenAI-compatible endpoints. Values: "minimal", "low", "medium", "high", "xhigh".
     reasoning_effort: ?[]const u8 = null,
+    /// Reasoning summary format: "auto" | "concise" | "detailed"
+    reasoning_summary: ?[]const u8 = null,
+    /// Whether to include encrypted reasoning content
+    include_reasoning_encrypted: bool = false,
+    /// Metadata for the request
+    metadata: ?Metadata = null,
+    /// Tool choice behavior
+    tool_choice: ?ToolChoice = null,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -83,6 +102,7 @@ pub const SimpleStreamOptions = struct {
     on_payload_ctx: ?*anyopaque = null,
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
+    reasoning_summary: ?[]const u8 = null,
 };
 
 pub const TextContent = struct {

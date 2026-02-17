@@ -75,6 +75,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const provider_caps_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/provider_caps.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const openai_completions_api_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/openai_completions_api.zig"),
         .target = target,
@@ -86,6 +92,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "github_copilot", .module = github_copilot_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
+            .{ .name = "provider_caps", .module = provider_caps_mod },
         },
     });
 

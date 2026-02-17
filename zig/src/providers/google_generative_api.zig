@@ -25,6 +25,19 @@ fn isGemini25FlashModel(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "2.5-flash") != null;
 }
 
+/// Check if a thought signature is valid base64
+fn isValidThoughtSignature(sig: ?[]const u8) bool {
+    if (sig == null) return false;
+    if (sig.?.len == 0) return false;
+    // Check it's valid base64 characters
+    for (sig.?) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '/' and c != '=') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Map ThinkingLevel to Google thinking level string (for Gemini 3)
 fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model) []const u8 {
     if (isGemini3ProModel(model.id)) {
@@ -228,6 +241,28 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
             try w.endArray();
             try w.endObject();
             try w.endArray();
+
+            // Add tool_config if tool_choice is specified
+            if (options.tool_choice) |tc| {
+                try w.writeKey("tool_config");
+                try w.beginObject();
+                try w.writeKey("function_calling_config");
+                try w.beginObject();
+                switch (tc) {
+                    .auto => try w.writeStringField("mode", "AUTO"),
+                    .none => try w.writeStringField("mode", "NONE"),
+                    .required => try w.writeStringField("mode", "ANY"),
+                    .function => |name| {
+                        try w.writeStringField("mode", "ANY");
+                        try w.writeKey("allowed_function_names");
+                        try w.beginArray();
+                        try w.writeString(name);
+                        try w.endArray();
+                    },
+                }
+                try w.endObject();
+                try w.endObject();
+            }
         }
     }
 
@@ -262,6 +297,7 @@ const ParsedPart = union(enum) {
         id: ?[]const u8, // May be null, will generate if so
         name: []const u8,
         args_json: []const u8, // JSON stringified args
+        thought_signature: ?[]const u8 = null, // For Gemini 3 thinking tool calls
     },
 };
 
@@ -396,6 +432,12 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                     if (i == .string) allocator.dupe(u8, i.string) catch null else null
                                                 else null;
 
+                                                // Get thought signature if present (for Gemini 3 thinking tool calls)
+                                                const sig = if (p.object.get("thoughtSignature")) |s| blk: {
+                                                    if (s == .string) break :blk allocator.dupe(u8, s.string) catch null;
+                                                    break :blk null;
+                                                } else null;
+
                                                 // Stringify args to JSON
                                                 const args_json = if (fc.object.get("args")) |args| blk: {
                                                     var buf = std.ArrayList(u8){};
@@ -403,15 +445,20 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                     break :blk buf.toOwnedSlice(allocator) catch "";
                                                 } else "";
 
-                                                const name_copy = allocator.dupe(u8, name) catch continue;
+                                                const name_copy = allocator.dupe(u8, name) catch {
+                                                    if (sig) |ss| allocator.free(ss);
+                                                    continue;
+                                                };
                                                 parts_list.append(allocator, .{ .tool_call = .{
                                                     .id = id,
                                                     .name = name_copy,
                                                     .args_json = args_json,
+                                                    .thought_signature = sig,
                                                 }}) catch {
                                                     allocator.free(name_copy);
                                                     if (id) |i| allocator.free(i);
                                                     allocator.free(args_json);
+                                                    if (sig) |ss| allocator.free(ss);
                                                     continue;
                                                 };
                                             }
@@ -463,6 +510,7 @@ fn deinitGoogleParseResult(result: *const GoogleParseResult, allocator: std.mem.
                 if (tc.id) |id| allocator.free(id);
                 allocator.free(tc.name);
                 allocator.free(tc.args_json);
+                if (tc.thought_signature) |sig| allocator.free(sig);
             },
         }
     }
@@ -507,6 +555,7 @@ const ThreadCtx = struct {
     api_key: []u8,
     body: []u8,
     base_url: []u8,
+    thinking_enabled: bool,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -517,6 +566,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const api_key = ctx.api_key;
     const body = ctx.body;
     const base_url = ctx.base_url;
+    const thinking_enabled = ctx.thinking_enabled;
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -802,6 +852,19 @@ fn runThread(ctx: *ThreadCtx) void {
                                 current_block = .none;
                             }
 
+                            // For Gemini 3 with thinking enabled, validate thought signature
+                            // If thinking is enabled for a Gemini 3 model and the tool call lacks
+                            // a valid thought signature, log a warning but still process the tool call.
+                            // The API may still accept it, but this could indicate an issue.
+                            const is_gemini3 = isGemini3ProModel(model.id) or isGemini3FlashModel(model.id);
+                            if (is_gemini3 and thinking_enabled) {
+                                if (!isValidThoughtSignature(tc.thought_signature)) {
+                                    // Unsigned tool call in thinking mode - still process it
+                                    // but this may indicate the thinking was truncated or missing
+                                    std.log.debug("Gemini 3 tool call without valid thought signature: {s}", .{tc.name});
+                                }
+                            }
+
                             // Generate unique ID if not provided
                             const tool_id = if (tc.id) |id|
                                 allocator.dupe(u8, id) catch continue
@@ -987,7 +1050,7 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .base_url = base_url };
+    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .base_url = base_url, .thinking_enabled = o.thinking_enabled };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();
@@ -1182,4 +1245,45 @@ test "parseGoogleEventExtended - functionCall with empty args" {
     const tc = result.parts[0].tool_call;
     try std.testing.expectEqualStrings("no_args_func", tc.name);
     try std.testing.expectEqualStrings("{}", tc.args_json);
+}
+
+test "isValidThoughtSignature - valid base64" {
+    // Valid base64 strings
+    try std.testing.expect(isValidThoughtSignature("SGVsbG8gV29ybGQ="));
+    try std.testing.expect(isValidThoughtSignature("YWJjMTIz"));
+    try std.testing.expect(isValidThoughtSignature("AAA+BBB/CCC=="));
+    try std.testing.expect(isValidThoughtSignature("validBase64String123"));
+
+    // Invalid cases
+    try std.testing.expect(!isValidThoughtSignature(null));
+    try std.testing.expect(!isValidThoughtSignature(""));
+    try std.testing.expect(!isValidThoughtSignature("invalid!chars"));
+    try std.testing.expect(!isValidThoughtSignature("has spaces"));
+    try std.testing.expect(!isValidThoughtSignature("has\nnewline"));
+}
+
+test "parseGoogleEventExtended - functionCall with thoughtSignature" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"content":{"parts":[{"functionCall":{"name":"test_func","args":{"x":1}},"thoughtSignature":"c2lnbmF0dXJlMTIz"}]}}]}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.parts.len);
+    try std.testing.expectEqual(std.meta.activeTag(result.parts[0]), ParsedPart.tool_call);
+
+    const tc = result.parts[0].tool_call;
+    try std.testing.expectEqualStrings("test_func", tc.name);
+    try std.testing.expectEqualStrings("{\"x\":1}", tc.args_json);
+
+    if (tc.thought_signature) |sig| {
+        try std.testing.expectEqualStrings("c2lnbmF0dXJlMTIz", sig);
+    } else {
+        try std.testing.expect(false);
+    }
 }
