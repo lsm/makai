@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
@@ -265,7 +266,6 @@ fn writeMessagesArray(
                         try writer.beginObject();
                         try writer.writeStringField("type", "ephemeral");
                         try writer.endObject();
-                        try writer.endObject();
                         try writer.endArray();
                     } else {
                         try writer.writeStringField("content", sanitized);
@@ -478,7 +478,6 @@ fn writeMessagesArray(
                         try writer.writeStringField("name", tc.name);
                         try writer.writeStringField("arguments", tc.arguments_json);
                         try writer.endObject();
-                        try writer.endObject();
                     },
                     else => {},
                 };
@@ -619,7 +618,6 @@ fn writeImageUrlPart(writer: *json_writer.JsonWriter, img: ai_types.ImageContent
     try writer.buffer.append(allocator, '"');
     writer.needs_comma = true;
     try writer.endObject();
-    try writer.endObject();
 }
 
 fn buildRequestBody(
@@ -693,7 +691,6 @@ fn buildRequestBody(
                     try w.writeBoolField("strict", true);
                 }
                 try w.endObject();
-                try w.endObject();
             }
             try w.endArray();
 
@@ -710,7 +707,6 @@ fn buildRequestBody(
                         try w.writeKey("function");
                         try w.beginObject();
                         try w.writeStringField("name", name);
-                        try w.endObject();
                         try w.endObject();
                     },
                 }
@@ -729,7 +725,7 @@ fn buildRequestBody(
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     api_key: []const u8,
     request_body: []u8,
@@ -1671,7 +1667,7 @@ pub fn streamOpenAICompletions(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const resolved = options orelse ai_types.StreamOptions{};
 
     var key_owned: ?[]const u8 = null;
@@ -1686,9 +1682,9 @@ pub fn streamOpenAICompletions(
     const req_body = try buildRequestBody(model, context, resolved, allocator);
     errdefer allocator.free(req_body);
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -1727,7 +1723,7 @@ pub fn streamSimpleOpenAICompletions(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
     return streamOpenAICompletions(model, context, .{
         .temperature = o.temperature,

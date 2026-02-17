@@ -83,6 +83,169 @@ pub const StdioReceiver = struct {
     }
 };
 
+// --- Async implementations ---
+
+pub const AsyncStdioSender = struct {
+    file: std.fs.File,
+
+    pub fn init() AsyncStdioSender {
+        return .{ .file = std.io.getStdOut() };
+    }
+
+    pub fn initWithFile(file: std.fs.File) AsyncStdioSender {
+        return .{ .file = file };
+    }
+
+    pub fn sender(self: *AsyncStdioSender) transport.AsyncSender {
+        return .{
+            .context = @ptrCast(self),
+            .write_fn = writeFn,
+        };
+    }
+
+    fn writeFn(ctx: *anyopaque, data: []const u8) !void {
+        const self: *AsyncStdioSender = @ptrCast(@alignCast(ctx));
+        try self.file.writeAll(data);
+        try self.file.writeAll("\n");
+    }
+};
+
+pub const AsyncStdioReceiver = struct {
+    file: std.fs.File,
+
+    const Self = @This();
+
+    pub fn init() Self {
+        return .{ .file = std.io.getStdIn() };
+    }
+
+    pub fn initWithFile(file: std.fs.File) Self {
+        return .{ .file = file };
+    }
+
+    pub fn receiver(self: *Self) transport.AsyncReceiver {
+        return .{
+            .context = @ptrCast(self),
+            .receive_stream_fn = receiveStreamFn,
+            .read_fn = readFn,
+        };
+    }
+
+    const ProducerContext = struct {
+        stream: *transport.ByteStream,
+        file: std.fs.File,
+        allocator: std.mem.Allocator,
+        leftover: std.ArrayList(u8),
+        read_buf: [4096]u8 = undefined,
+    };
+
+    fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const stream = try allocator.create(transport.ByteStream);
+        stream.* = transport.ByteStream.init(allocator);
+
+        const thread_ctx = try allocator.create(ProducerContext);
+        thread_ctx.* = .{
+            .stream = stream,
+            .file = self.file,
+            .allocator = allocator,
+            .leftover = std.ArrayList(u8).init(allocator),
+        };
+
+        const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
+        thread.detach();
+
+        return stream;
+    }
+
+    fn producerThread(ctx: *ProducerContext) void {
+        defer {
+            ctx.leftover.deinit();
+            ctx.stream.markThreadDone();
+            ctx.allocator.destroy(ctx);
+        }
+
+        while (true) {
+            // Check for complete line in leftover
+            if (std.mem.indexOfScalar(u8, ctx.leftover.items, '\n')) |nl_pos| {
+                const line = ctx.leftover.items[0..nl_pos];
+                const chunk = transport.ByteChunk{
+                    .data = ctx.allocator.dupe(u8, line) catch {
+                        ctx.stream.completeWithError("Out of memory");
+                        return;
+                    },
+                    .owned = true,
+                };
+                ctx.stream.push(chunk) catch {
+                    ctx.stream.completeWithError("Stream queue full");
+                    return;
+                };
+                // Remove consumed bytes
+                const remaining = ctx.leftover.items[nl_pos + 1 ..];
+                std.mem.copyForwards(u8, ctx.leftover.items[0..remaining.len], remaining);
+                ctx.leftover.shrinkRetainingCapacity(remaining.len);
+                continue;
+            }
+
+            // Read more data
+            const bytes_read = ctx.file.read(&ctx.read_buf) catch {
+                ctx.stream.completeWithError("Read error");
+                return;
+            };
+
+            if (bytes_read == 0) {
+                // EOF - send any remaining data
+                if (ctx.leftover.items.len > 0) {
+                    const chunk = transport.ByteChunk{
+                        .data = ctx.allocator.dupe(u8, ctx.leftover.items) catch {
+                            ctx.stream.completeWithError("Out of memory");
+                            return;
+                        },
+                        .owned = true,
+                    };
+                    ctx.stream.push(chunk) catch {};
+                }
+                ctx.stream.complete({});
+                return;
+            }
+
+            ctx.leftover.appendSlice(ctx.read_buf[0..bytes_read]) catch {
+                ctx.stream.completeWithError("Out of memory");
+                return;
+            };
+        }
+    }
+
+    // Keep backward-compatible blocking read
+    fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        var leftover = std.ArrayList(u8).init(allocator);
+        defer leftover.deinit();
+        var read_buf: [4096]u8 = undefined;
+
+        while (true) {
+            // Check for complete line
+            if (std.mem.indexOfScalar(u8, leftover.items, '\n')) |nl_pos| {
+                const line = try allocator.dupe(u8, leftover.items[0..nl_pos]);
+                return line;
+            }
+
+            // Read more data
+            const bytes_read = self.file.read(&read_buf) catch return null;
+            if (bytes_read == 0) {
+                // EOF - return remaining data if any
+                if (leftover.items.len > 0) {
+                    return try allocator.dupe(u8, leftover.items);
+                }
+                return null;
+            }
+
+            try leftover.appendSlice(read_buf[0..bytes_read]);
+        }
+    }
+};
+
 // Tests
 
 test "StdioSender and StdioReceiver round-trip via pipe" {

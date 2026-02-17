@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
@@ -216,7 +217,7 @@ fn parseEvent(data: []const u8, text: *std.ArrayList(u8), usage: *ai_types.Usage
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     api_key: []u8,
     base_url: []u8,
@@ -372,7 +373,7 @@ fn runThread(ctx: *ThreadCtx) void {
     ctx.stream.complete(out);
 }
 
-pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
+pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
@@ -396,9 +397,9 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     const body = try buildBody(model, context, o, allocator);
     errdefer allocator.free(body);
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -409,7 +410,7 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     return s;
 }
 
-pub fn streamSimpleAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
+pub fn streamSimpleAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
     return streamAzureOpenAIResponses(model, context, .{
         .temperature = o.temperature,

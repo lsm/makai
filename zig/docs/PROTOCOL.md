@@ -12,6 +12,7 @@
 8. [Error Handling](#8-error-handling)
 9. [Extension Mechanisms](#9-extension-mechanisms)
 10. [Examples](#10-examples)
+11. [Security](#11-security)
 
 ---
 
@@ -23,8 +24,7 @@ The Makai Wire Protocol provides a standardized communication format for AI stre
 
 - Enable bidirectional streaming of AI requests and responses
 - Support multiple transport layers (stdio, WebSocket, gRPC, SSE, etc.)
-- Optimize bandwidth for proxy scenarios by eliminating redundant partial message data
-- Handle message fragmentation and reassembly
+- Optimize bandwidth for proxy scenarios with `include_partial` flag
 - Support cancellation and abort operations
 - Be extensible for future agent loop events
 
@@ -34,7 +34,14 @@ The Makai Wire Protocol provides a standardized communication format for AI stre
 MAKAI/1.0.0
 ```
 
-Version negotiation is performed during connection establishment via the `protocol_version` field in the initial handshake.
+Version negotiation is handled at the transport layer:
+
+| Transport | Negotiation Method |
+|-----------|-------------------|
+| WebSocket | Subprotocol: `Sec-WebSocket-Protocol: makai.v1` |
+| HTTP | Header: `X-Makai-Version: 1.0.0` |
+| gRPC | Metadata key: `makai-version` |
+| stdio | Initial handshake line: `MAKAI/1.0.0` |
 
 ### 1.3 Terminology
 
@@ -43,7 +50,7 @@ Version negotiation is performed during connection establishment via the `protoc
 - **Stream**: A logical bidirectional channel for request/response pairs
 - **Event**: An atomic message within a stream (e.g., text delta, tool call)
 - **Partial Message**: The cumulative state of an assistant message being built
-- **Proxy Mode**: Bandwidth-optimized mode where partial messages are reconstructed client-side
+- **include_partial**: Flag to include per-block partial state in events
 
 ---
 
@@ -55,10 +62,10 @@ The protocol defines message semantics independently of the transport. Transport
 
 ### 2.2 Bandwidth Optimized
 
-Two encoding modes are supported:
+The `include_partial` flag controls partial message data in events:
 
-1. **Full Mode**: Events include the complete `partial` message state (for local communication)
-2. **Proxy Mode**: Events omit `partial` messages; clients reconstruct state locally (for remote/proxy communication)
+1. **include_partial: false** (default): Events omit partial; client reconstructs locally (bandwidth optimized)
+2. **include_partial: true**: Events include per-block partial state (simpler client logic)
 
 ### 2.3 Streaming First
 
@@ -134,8 +141,11 @@ All messages are wrapped in an envelope:
 ```json
 {
   "type": "<message_type>",
-  "request_id": "<uuid>",
+  "stream_id": "<stable-uuid>",
+  "message_id": "<unique-uuid>",
+  "sequence": <u32>,
   "timestamp": <unix_ms>,
+  "in_reply_to": "<correlated_message_id>",
   "payload": { ... }
 }
 ```
@@ -143,72 +153,61 @@ All messages are wrapped in an envelope:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `type` | string | Yes | Message type discriminator |
-| `request_id` | string (UUID) | Yes | Correlation ID for request/response pairing |
+| `stream_id` | string (UUID) | Yes | Stable identifier for stream lifecycle |
+| `message_id` | string (UUID) | Yes | Unique identifier for each envelope |
+| `sequence` | integer | **Yes** | Sequence number for ordering (required, starts at 1) |
 | `timestamp` | integer | No | Unix timestamp in milliseconds |
+| `in_reply_to` | string | No | Correlates response to original message (for ack/nack) |
 | `payload` | object | Yes | Type-specific message content |
-| `encoding` | string | No | "full" or "proxy" (default: "full") |
-| `sequence` | integer | No | Sequence number for ordering (when fragmentation is used) |
-| `fragment` | object | No | Fragment metadata when message is split |
+| `include_partial` | boolean | No | Include per-block partial state (default: false) |
 
-### 4.2 Fragmentation
+**Note**: Message fragmentation is handled by the transport layer. The protocol does not include fragmentation fields.
 
-Large messages may be fragmented. When `fragment` is present:
+### 4.2 Encoding Modes
 
-```json
-{
-  "type": "...",
-  "request_id": "...",
-  "fragment": {
-    "index": 0,
-    "total": 3,
-    "id": "<fragment-uuid>"
-  },
-  "payload": { ... partial content ... }
-}
-```
+#### include_partial: false (Default - Bandwidth Optimized)
 
-Fragments are reassembled by concatenating payloads in order. The `fragment.id` groups fragments belonging to the same logical message.
-
-### 4.3 Encoding Modes
-
-#### Full Mode (Default)
-
-Events include the complete `partial` message:
+Events omit full `partial` message; client reconstructs:
 
 ```json
 {
   "type": "text_delta",
-  "request_id": "req-123",
-  "payload": {
-    "content_index": 0,
-    "delta": "Hello",
-    "partial": {
-      "role": "assistant",
-      "content": [{ "type": "text", "text": "Hello" }],
-      "usage": { "input": 100, "output": 5 },
-      "stop_reason": null,
-      "model": "claude-3-opus",
-      "timestamp": 1234567890
-    }
-  }
-}
-```
-
-#### Proxy Mode (Bandwidth Optimized)
-
-Events omit `partial`; client reconstructs:
-
-```json
-{
-  "type": "text_delta",
-  "request_id": "req-123",
-  "encoding": "proxy",
+  "stream_id": "stream-123",
+  "message_id": "msg-456",
+  "sequence": 3,
   "payload": {
     "content_index": 0,
     "delta": "Hello"
   }
 }
 ```
+
+#### include_partial: true (Per-Block Partial)
+
+Events include lightweight per-block partial state:
+
+```json
+{
+  "type": "text_delta",
+  "stream_id": "stream-123",
+  "message_id": "msg-456",
+  "sequence": 3,
+  "include_partial": true,
+  "payload": {
+    "content_index": 0,
+    "delta": " world",
+    "partial": {
+      "current_text": "Hello world"
+    }
+  }
+}
+```
+
+The `partial` object in events with `include_partial: true` contains only the relevant partial state for that content block type:
+
+- **Text events**: `{ "current_text": "accumulated text" }`
+- **Thinking events**: `{ "current_thinking": "accumulated thinking" }`
+- **Tool call events**: `{ "current_arguments_json": "{\"partial\":..." }`
 
 ---
 
@@ -221,9 +220,14 @@ Events omit `partial`; client reconstructs:
 Each message is a single line ending with `\n`:
 
 ```
-{"type":"stream_request","request_id":"req-1","payload":{...}}\n
-{"type":"start","request_id":"req-1","payload":{...}}\n
-{"type":"text_delta","request_id":"req-1","payload":{...}}\n
+{"type":"stream_request","stream_id":"stream-1","message_id":"msg-1","sequence":1,"payload":{...}}\n
+{"type":"start","stream_id":"stream-1","message_id":"msg-2","sequence":2,"payload":{...}}\n
+{"type":"text_delta","stream_id":"stream-1","message_id":"msg-3","sequence":3,"payload":{...}}\n
+```
+
+**Version Negotiation**: Initial handshake line before any messages:
+```
+MAKAI/1.0.0\n
 ```
 
 **Implementation Notes**:
@@ -238,10 +242,10 @@ Each message is a single line ending with `\n`:
 
 ```
 event: message
-data: {"type":"start","request_id":"req-1","payload":{...}}
+data: {"type":"start","stream_id":"stream-1","message_id":"msg-1","sequence":1,"payload":{...}}
 
 event: message
-data: {"type":"text_delta","request_id":"req-1","payload":{...}}
+data: {"type":"text_delta","stream_id":"stream-1","message_id":"msg-2","sequence":2,"payload":{...}}
 
 ```
 
@@ -249,6 +253,8 @@ data: {"type":"text_delta","request_id":"req-1","payload":{...}}
 - `message`: Regular event
 - `control`: Control message
 - `error`: Error message
+
+**Version Negotiation**: HTTP header `X-Makai-Version: 1.0.0`
 
 **Implementation Notes**:
 - Standard SSE parsing rules apply
@@ -267,9 +273,11 @@ Each frame contains a single JSON message. Binary frames are reserved for future
 ```
 Client -> Server: WebSocket handshake with Sec-WebSocket-Protocol: makai.v1
 Server -> Client: Accept with selected protocol
-Client -> Server: {"type":"stream_request", ...}
+Client -> Server: {"type":"stream_request", "stream_id":"...", ...}
 Server -> Client: {"type":"start", ...} (multiple frames)
 ```
+
+**Version Negotiation**: Subprotocol `Sec-WebSocket-Protocol: makai.v1`
 
 **Ping/Pong**:
 - Use native WebSocket ping/pong frames for keepalive
@@ -294,24 +302,22 @@ service MakaiService {
 
 message Envelope {
   string type = 1;
-  string request_id = 2;
-  int64 timestamp = 3;
-  bytes payload = 4;  // JSON-encoded
-  string encoding = 5;
-
-  message Fragment {
-    uint32 index = 1;
-    uint32 total = 2;
-    string id = 3;
-  }
-  Fragment fragment = 6;
+  string stream_id = 2;
+  string message_id = 3;
+  uint32 sequence = 4;
+  int64 timestamp = 5;
+  string in_reply_to = 6;
+  bytes payload = 7;  // JSON-encoded
+  bool include_partial = 8;
 }
 ```
+
+**Version Negotiation**: gRPC metadata key `makai-version: 1.0.0`
 
 **Implementation Notes**:
 - Payload is JSON-encoded for consistency with other transports
 - Binary protobuf payload encoding may be added as an extension
-- Use gRPC metadata for authentication and protocol version
+- Use gRPC metadata for authentication
 
 ### 5.5 HTTP/2 Transport
 
@@ -327,7 +333,6 @@ message Envelope {
 Content-Type: application/json
 Accept: text/event-stream
 X-Makai-Version: 1.0.0
-X-Makai-Encoding: proxy
 ```
 
 ---
@@ -336,7 +341,7 @@ X-Makai-Encoding: proxy
 
 ### 6.1 Common Types
 
-#### ContentBlock (Full Mode)
+#### ContentBlock (include_partial: true)
 
 ```json
 {
@@ -427,8 +432,11 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "stream_request" },
-    "request_id": { "type": "string", "format": "uuid" },
+    "stream_id": { "type": "string", "format": "uuid" },
+    "message_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
     "timestamp": { "type": "integer" },
+    "include_partial": { "type": "boolean" },
     "payload": {
       "type": "object",
       "properties": {
@@ -439,7 +447,7 @@ X-Makai-Encoding: proxy
       "required": ["model", "context"]
     }
   },
-  "required": ["type", "request_id", "payload"]
+  "required": ["type", "stream_id", "message_id", "sequence", "payload"]
 }
 ```
 
@@ -491,7 +499,7 @@ X-Makai-Encoding: proxy
   "properties": {
     "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
     "max_tokens": { "type": "integer", "minimum": 1 },
-    "api_key": { "type": "string" },
+    "include_partial": { "type": "boolean" },
     "cache_retention": { "enum": ["none", "short", "long"] },
     "session_id": { "type": "string" },
     "thinking_enabled": { "type": "boolean" },
@@ -511,6 +519,8 @@ X-Makai-Encoding: proxy
 }
 ```
 
+**Note**: API keys are NOT included in StreamOptions. They are passed via transport headers only (see Section 11).
+
 #### AbortRequest
 
 ```json
@@ -518,57 +528,93 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "abort_request" },
-    "request_id": { "type": "string", "format": "uuid" },
+    "stream_id": { "type": "string", "format": "uuid" },
+    "message_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
     "payload": {
       "type": "object",
       "properties": {
-        "target_request_id": { "type": "string", "format": "uuid" },
+        "target_stream_id": { "type": "string", "format": "uuid" },
         "reason": { "type": "string" }
       },
-      "required": ["target_request_id"]
+      "required": ["target_stream_id"]
     }
   },
-  "required": ["type", "request_id", "payload"]
+  "required": ["type", "stream_id", "message_id", "sequence", "payload"]
 }
 ```
 
-### 6.3 Event Messages (Full Mode)
+### 6.3 Event Messages
 
 #### StartEvent
+
+When `include_partial: false`, the start event includes model and initial token info:
 
 ```json
 {
   "type": "object",
   "properties": {
     "type": { "const": "start" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
         "model": { "type": "string" },
-        "input_tokens": { "type": "integer" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "input_tokens": { "type": "integer" }
       },
-      "required": ["model", "partial"]
+      "required": ["model"]
     }
   }
 }
 ```
 
-#### TextDeltaEvent
+#### TextDeltaEvent (include_partial: false)
 
 ```json
 {
   "type": "object",
   "properties": {
     "type": { "const": "text_delta" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "delta": { "type": "string" }
+      },
+      "required": ["content_index", "delta"]
+    }
+  }
+}
+```
+
+#### TextDeltaEvent (include_partial: true)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "text_delta" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "include_partial": { "const": true },
     "payload": {
       "type": "object",
       "properties": {
         "content_index": { "type": "integer", "minimum": 0 },
         "delta": { "type": "string" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "partial": {
+          "type": "object",
+          "properties": {
+            "current_text": { "type": "string" }
+          },
+          "required": ["current_text"]
+        }
       },
       "required": ["content_index", "delta", "partial"]
     }
@@ -576,20 +622,29 @@ X-Makai-Encoding: proxy
 }
 ```
 
-#### ThinkingDeltaEvent
+#### ThinkingDeltaEvent (include_partial: true)
 
 ```json
 {
   "type": "object",
   "properties": {
     "type": { "const": "thinking_delta" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "include_partial": { "const": true },
     "payload": {
       "type": "object",
       "properties": {
         "content_index": { "type": "integer", "minimum": 0 },
         "delta": { "type": "string" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "partial": {
+          "type": "object",
+          "properties": {
+            "current_thinking": { "type": "string" }
+          },
+          "required": ["current_thinking"]
+        }
       },
       "required": ["content_index", "delta", "partial"]
     }
@@ -604,35 +659,45 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "toolcall_start" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
         "content_index": { "type": "integer", "minimum": 0 },
         "id": { "type": "string" },
-        "name": { "type": "string" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "name": { "type": "string" }
       },
-      "required": ["content_index", "id", "name", "partial"]
+      "required": ["content_index", "id", "name"]
     }
   }
 }
 ```
 
-#### ToolCallDeltaEvent
+#### ToolCallDeltaEvent (include_partial: true)
 
 ```json
 {
   "type": "object",
   "properties": {
     "type": { "const": "toolcall_delta" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "include_partial": { "const": true },
     "payload": {
       "type": "object",
       "properties": {
         "content_index": { "type": "integer", "minimum": 0 },
         "delta": { "type": "string" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "partial": {
+          "type": "object",
+          "properties": {
+            "current_arguments_json": { "type": "string" }
+          },
+          "required": ["current_arguments_json"]
+        }
       },
       "required": ["content_index", "delta", "partial"]
     }
@@ -647,15 +712,16 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "toolcall_end" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
         "content_index": { "type": "integer", "minimum": 0 },
-        "tool_call": { "$ref": "#/$defs/ToolCall" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
+        "tool_call": { "$ref": "#/$defs/ToolCall" }
       },
-      "required": ["content_index", "tool_call", "partial"]
+      "required": ["content_index", "tool_call"]
     }
   }
 }
@@ -668,7 +734,9 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "done" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
@@ -688,137 +756,15 @@ X-Makai-Encoding: proxy
   "type": "object",
   "properties": {
     "type": { "const": "error" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
         "reason": { "enum": ["error", "aborted"] },
         "error_message": { "type": "string" },
         "error_code": { "type": "string" },
-        "usage": { "$ref": "#/$defs/Usage" },
-        "partial": { "$ref": "#/$defs/AssistantMessage" }
-      },
-      "required": ["reason"]
-    }
-  }
-}
-```
-
-### 6.4 Proxy Mode Events (Bandwidth Optimized)
-
-In proxy mode, events omit the `partial` field. The client reconstructs state locally.
-
-#### ProxyStartEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "start" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {}
-  }
-}
-```
-
-#### ProxyTextDeltaEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "text_delta" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "content_index": { "type": "integer" },
-        "delta": { "type": "string" }
-      },
-      "required": ["content_index", "delta"]
-    }
-  }
-}
-```
-
-#### ProxyTextEndEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "text_end" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "content_index": { "type": "integer" },
-        "content_signature": { "type": "string" }
-      },
-      "required": ["content_index"]
-    }
-  }
-}
-```
-
-#### ProxyToolCallStartEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "toolcall_start" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "content_index": { "type": "integer" },
-        "id": { "type": "string" },
-        "name": { "type": "string" }
-      },
-      "required": ["content_index", "id", "name"]
-    }
-  }
-}
-```
-
-#### ProxyToolCallEndEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "toolcall_end" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "content_index": { "type": "integer" }
-      },
-      "required": ["content_index"]
-    }
-  }
-}
-```
-
-#### ProxyDoneEvent
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "done" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "reason": { "enum": ["stop", "length", "tool_use"] },
         "usage": { "$ref": "#/$defs/Usage" }
       },
       "required": ["reason", "usage"]
@@ -827,29 +773,9 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
 }
 ```
 
-#### ProxyErrorEvent
+**Note**: `usage` is REQUIRED in error events to allow proper token accounting.
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "type": { "const": "error" },
-    "request_id": { "type": "string" },
-    "encoding": { "const": "proxy" },
-    "payload": {
-      "type": "object",
-      "properties": {
-        "reason": { "enum": ["aborted", "error"] },
-        "error_message": { "type": "string" },
-        "usage": { "$ref": "#/$defs/Usage" }
-      },
-      "required": ["reason", "usage"]
-    }
-  }
-}
-```
-
-### 6.5 Control Messages
+### 6.4 Control Messages
 
 #### AckControl
 
@@ -858,7 +784,10 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
   "type": "object",
   "properties": {
     "type": { "const": "ack" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "in_reply_to": { "type": "string" },
     "payload": {
       "type": "object",
       "properties": {
@@ -877,7 +806,10 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
   "type": "object",
   "properties": {
     "type": { "const": "nack" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "in_reply_to": { "type": "string" },
     "payload": {
       "type": "object",
       "properties": {
@@ -898,7 +830,9 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
   "type": "object",
   "properties": {
     "type": { "const": "ping" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {}
   }
 }
@@ -911,7 +845,10 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
   "type": "object",
   "properties": {
     "type": { "const": "pong" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "in_reply_to": { "type": "string" },
     "payload": {
       "type": "object",
       "properties": {
@@ -930,7 +867,9 @@ In proxy mode, events omit the `partial` field. The client reconstructs state lo
   "type": "object",
   "properties": {
     "type": { "const": "goodbye" },
-    "request_id": { "type": "string" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
     "payload": {
       "type": "object",
       "properties": {
@@ -962,66 +901,73 @@ Client                                      Server
   |                                           |
 ```
 
-### 7.2 Version Negotiation
+### 7.2 Version Negotiation (Transport Layer)
 
-The client includes `protocol_version` in the first message:
+Version negotiation happens at the transport layer, not in the protocol messages:
 
-```json
-{
-  "type": "stream_request",
-  "request_id": "req-001",
-  "protocol_version": "1.0.0",
-  "payload": { ... }
-}
+**WebSocket**:
+```
+Client: Sec-WebSocket-Protocol: makai.v1
+Server: Sec-WebSocket-Protocol: makai.v1 (in response)
 ```
 
-If the server does not support the version, it responds with:
-
-```json
-{
-  "type": "nack",
-  "request_id": "resp-001",
-  "payload": {
-    "rejected_id": "req-001",
-    "reason": "Unsupported protocol version",
-    "error_code": "VERSION_MISMATCH",
-    "supported_versions": ["0.9.0"]
-  }
-}
+**HTTP**:
 ```
+Client: X-Makai-Version: 1.0.0
+Server: X-Makai-Version: 1.0.0 (in response)
+```
+
+**gRPC**:
+```
+Client: metadata: makai-version=1.0.0
+```
+
+**stdio**:
+```
+Initial line: MAKAI/1.0.0
+```
+
+If version mismatch, server responds with Nack containing supported versions.
 
 ### 7.3 Streaming Flow
 
 ```
 Client                                            Server
   |                                                 |
-  |---- StreamRequest (request_id: A) ------------>|
+  |---- StreamRequest (stream_id: A) ------------->|
+  |      (message_id: msg-1, sequence: 1)           |
   |                                                 |
-  |<--- StartEvent (request_id: A) ----------------|
-  |<--- TextStartEvent (request_id: A) ------------|
-  |<--- TextDeltaEvent (request_id: A) ------------|
-  |<--- TextDeltaEvent (request_id: A) ------------|
+  |<--- StartEvent (stream_id: A) -----------------|
+  |      (message_id: msg-2, sequence: 2)           |
+  |<--- TextStartEvent (stream_id: A) -------------|
+  |      (message_id: msg-3, sequence: 3)           |
+  |<--- TextDeltaEvent (stream_id: A) -------------|
+  |      (message_id: msg-4, sequence: 4)           |
+  |<--- TextDeltaEvent (stream_id: A) -------------|
+  |      (message_id: msg-5, sequence: 5)           |
   |---- AbortRequest (target: A) ----------------->|  <-- Optional abort
+  |      (message_id: msg-6, sequence: 6)           |
   |<--- ErrorEvent (reason: aborted) --------------|
+  |      (message_id: msg-7, sequence: 7)           |
   |                                                 |
 ```
 
 ### 7.4 Concurrent Streams
 
-Multiple streams may be multiplexed using distinct `request_id` values:
+Multiple streams are multiplexed using distinct `stream_id` values:
 
 ```
 Client                                            Server
   |                                                 |
-  |---- StreamRequest (request_id: A) ------------>|
-  |---- StreamRequest (request_id: B) ------------>|
+  |---- StreamRequest (stream_id: A) ------------->|
+  |---- StreamRequest (stream_id: B) ------------->|
   |                                                 |
-  |<--- TextDeltaEvent (request_id: A) ------------|
-  |<--- TextDeltaEvent (request_id: B) ------------|  <-- Interleaved
-  |<--- TextDeltaEvent (request_id: A) ------------|
-  |<--- DoneEvent (request_id: A) -----------------|
-  |<--- TextDeltaEvent (request_id: B) ------------|
-  |<--- DoneEvent (request_id: B) -----------------|
+  |<--- TextDeltaEvent (stream_id: A) -------------|
+  |<--- TextDeltaEvent (stream_id: B) -------------|  <-- Interleaved
+  |<--- TextDeltaEvent (stream_id: A) -------------|
+  |<--- DoneEvent (stream_id: A) ------------------|
+  |<--- TextDeltaEvent (stream_id: B) -------------|
+  |<--- DoneEvent (stream_id: B) ------------------|
 ```
 
 ### 7.5 Graceful Shutdown
@@ -1048,9 +994,9 @@ Client                                            Server
 | `INVALID_MESSAGE` | Protocol | Malformed message |
 | `UNKNOWN_TYPE` | Protocol | Unknown message type |
 | `MISSING_FIELD` | Protocol | Required field missing |
-| `INVALID_REQUEST_ID` | Protocol | Request ID format invalid |
+| `INVALID_STREAM_ID` | Protocol | Stream ID format invalid |
 | `STREAM_NOT_FOUND` | Stream | Target stream does not exist |
-| `STREAM_ALREADY_EXISTS` | Stream | Duplicate request ID |
+| `STREAM_ALREADY_EXISTS` | Stream | Duplicate stream ID |
 | `PROVIDER_ERROR` | Provider | Upstream provider error |
 | `RATE_LIMITED` | Provider | Rate limit exceeded |
 | `AUTHENTICATION_FAILED` | Auth | Invalid credentials |
@@ -1058,13 +1004,18 @@ Client                                            Server
 | `CONTEXT_TOO_LARGE` | Context | Context exceeds limits |
 | `MODEL_NOT_FOUND` | Model | Requested model unavailable |
 | `INTERNAL_ERROR` | Server | Internal server error |
+| `TIMEOUT` | Transport | Operation timed out |
+| `CONNECTION_RESET` | Transport | Connection was reset |
+| `BACKPRESSURE` | Transport | Backpressure limit exceeded |
 
 ### 8.2 Error Event Payload
 
 ```json
 {
   "type": "error",
-  "request_id": "req-123",
+  "stream_id": "stream-123",
+  "message_id": "msg-456",
+  "sequence": 10,
   "payload": {
     "reason": "error",
     "error_code": "RATE_LIMITED",
@@ -1078,11 +1029,14 @@ Client                                            Server
 }
 ```
 
+**Note**: `usage` is REQUIRED to allow proper token accounting even when errors occur.
+
 ### 8.3 Recovery Strategies
 
 1. **Transient Errors**: Client should retry with exponential backoff
 2. **Permanent Errors**: Client should not retry; fix the request
 3. **Stream Errors**: Stream is terminated; check `reason` field
+4. **Transport Errors**: Re-establish connection and retry
 
 ---
 
@@ -1095,11 +1049,12 @@ Messages may include additional fields with `x_` prefix:
 ```json
 {
   "type": "text_delta",
-  "request_id": "req-123",
+  "stream_id": "stream-123",
+  "message_id": "msg-456",
+  "sequence": 3,
   "payload": {
     "content_index": 0,
     "delta": "Hello",
-    "partial": { ... },
     "x_sentiment": "positive"
   }
 }
@@ -1138,13 +1093,15 @@ Reserved event types for agentic workflows:
 
 ## 10. Examples
 
-### 10.1 Basic Text Streaming (Full Mode)
+### 10.1 Basic Text Streaming (include_partial: false)
 
 **Request:**
 ```json
 {
   "type": "stream_request",
-  "request_id": "550e8400-e29b-41d4-a716-446655440001",
+  "stream_id": "550e8400-e29b-41d4-a716-446655440001",
+  "message_id": "550e8400-e29b-41d4-a716-446655440001",
+  "sequence": 1,
   "timestamp": 1708234567890,
   "payload": {
     "model": {
@@ -1175,29 +1132,31 @@ Reserved event types for agentic workflows:
 
 **Response Events:**
 ```json
-{"type":"start","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"model":"claude-3-opus-20240229","input_tokens":15,"partial":{"role":"assistant","content":[],"usage":{"input":15,"output":0},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567895}}}
+{"type":"start","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-001","sequence":2,"payload":{"model":"claude-3-opus-20240229","input_tokens":15}}
 
-{"type":"text_start","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"content_index":0,"partial":{"role":"assistant","content":[{"type":"text","text":""}],"usage":{"input":15,"output":0},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567895}}}
+{"type":"text_start","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-002","sequence":3,"payload":{"content_index":0}}
 
-{"type":"text_delta","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"content_index":0,"delta":"2 + 2","partial":{"role":"assistant","content":[{"type":"text","text":"2 + 2"}],"usage":{"input":15,"output":3},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567900}}}
+{"type":"text_delta","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-003","sequence":4,"payload":{"content_index":0,"delta":"2 + 2"}}
 
-{"type":"text_delta","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"content_index":0,"delta":" equals ","partial":{"role":"assistant","content":[{"type":"text","text":"2 + 2 equals "}],"usage":{"input":15,"output":10},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567905}}}
+{"type":"text_delta","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-004","sequence":5,"payload":{"content_index":0,"delta":" equals "}}
 
-{"type":"text_delta","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"content_index":0,"delta":"4.","partial":{"role":"assistant","content":[{"type":"text","text":"2 + 2 equals 4."}],"usage":{"input":15,"output":12},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567910}}}
+{"type":"text_delta","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-005","sequence":6,"payload":{"content_index":0,"delta":"4."}}
 
-{"type":"text_end","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"content_index":0,"partial":{"role":"assistant","content":[{"type":"text","text":"2 + 2 equals 4."}],"usage":{"input":15,"output":12},"stop_reason":null,"model":"claude-3-opus-20240229","timestamp":1708234567915}}}
+{"type":"text_end","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-006","sequence":7,"payload":{"content_index":0}}
 
-{"type":"done","request_id":"550e8400-e29b-41d4-a716-446655440001","payload":{"reason":"stop","message":{"role":"assistant","content":[{"type":"text","text":"2 + 2 equals 4."}],"usage":{"input":15,"output":12,"total_tokens":27},"stop_reason":"stop","model":"claude-3-opus-20240229","timestamp":1708234567920}}}
+{"type":"done","stream_id":"550e8400-e29b-41d4-a716-446655440001","message_id":"msg-007","sequence":8,"payload":{"reason":"stop","message":{"role":"assistant","content":[{"type":"text","text":"2 + 2 equals 4."}],"usage":{"input":15,"output":12,"total_tokens":27},"stop_reason":"stop","model":"claude-3-opus-20240229","timestamp":1708234567920}}}
 ```
 
-### 10.2 Tool Call Streaming (Proxy Mode)
+### 10.2 Tool Call Streaming (include_partial: true)
 
 **Request:**
 ```json
 {
   "type": "stream_request",
-  "request_id": "550e8400-e29b-41d4-a716-446655440002",
-  "encoding": "proxy",
+  "stream_id": "550e8400-e29b-41d4-a716-446655440002",
+  "message_id": "550e8400-e29b-41d4-a716-446655440002",
+  "sequence": 1,
+  "include_partial": true,
   "payload": {
     "model": {
       "id": "gpt-4o",
@@ -1230,31 +1189,31 @@ Reserved event types for agentic workflows:
 }
 ```
 
-**Response Events (Proxy Mode - No Partial):**
+**Response Events (with include_partial: true):**
 ```json
-{"type":"start","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{}}
+{"type":"start","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-001","sequence":2,"payload":{"model":"gpt-4o","input_tokens":45}}
 
-{"type":"toolcall_start","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"content_index":0,"id":"call_abc123","name":"get_weather"}}
+{"type":"toolcall_start","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-002","sequence":3,"payload":{"content_index":0,"id":"call_abc123","name":"get_weather"}}
 
-{"type":"toolcall_delta","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"content_index":0,"delta":"{\"loca"}}
+{"type":"toolcall_delta","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-003","sequence":4,"include_partial":true,"payload":{"content_index":0,"delta":"{\"loca","partial":{"current_arguments_json":"{\"loca"}}}
 
-{"type":"toolcall_delta","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"content_index":0,"delta":"tion\":"}}
+{"type":"toolcall_delta","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-004","sequence":5,"include_partial":true,"payload":{"content_index":0,"delta":"tion\":","partial":{"current_arguments_json":"{\"location\":"}}}
 
-{"type":"toolcall_delta","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"content_index":0,"delta":"\"Tokyo\"}"}
+{"type":"toolcall_delta","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-005","sequence":6,"include_partial":true,"payload":{"content_index":0,"delta":"\"Tokyo\"}","partial":{"current_arguments_json":"{\"location\":\"Tokyo\"}"}}}
 
-{"type":"toolcall_end","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"content_index":0}}
+{"type":"toolcall_end","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-006","sequence":7,"payload":{"content_index":0,"tool_call":{"id":"call_abc123","name":"get_weather","arguments_json":"{\"location\":\"Tokyo\"}"}}}
 
-{"type":"done","request_id":"550e8400-e29b-41d4-a716-446655440002","encoding":"proxy","payload":{"reason":"tool_use","usage":{"input":45,"output":18,"total_tokens":63}}}
+{"type":"done","stream_id":"550e8400-e29b-41d4-a716-446655440002","message_id":"msg-007","sequence":8,"payload":{"reason":"tool_use","message":{"role":"assistant","content":[{"type":"tool_call","id":"call_abc123","name":"get_weather","arguments_json":"{\"location\":\"Tokyo\"}"}],"usage":{"input":45,"output":18,"total_tokens":63},"stop_reason":"tool_use","model":"gpt-4o","timestamp":1708234567920}}}
 ```
 
-**Client-Side Reconstruction:**
+**Client-Side Reconstruction (without include_partial):**
 ```javascript
 // Client maintains partial message state
 let partial = {
   role: "assistant",
   content: [],
   usage: { input: 0, output: 0 },
-  stopReason: "stop",
+  stopReason: null,
   model: "gpt-4o",
   timestamp: Date.now()
 };
@@ -1280,9 +1239,11 @@ partial.usage = event.payload.usage;
 ```json
 {
   "type": "stream_request",
-  "request_id": "550e8400-e29b-41d4-a716-446655440003",
+  "stream_id": "550e8400-e29b-41d4-a716-446655440003",
+  "message_id": "550e8400-e29b-41d4-a716-446655440003",
+  "sequence": 1,
   "payload": {
-    "model": { "id": "claude-3-opus-20240229", ... },
+    "model": { "id": "claude-3-opus-20240229" },
     "context": { "messages": [...] }
   }
 }
@@ -1292,9 +1253,12 @@ partial.usage = event.payload.usage;
 ```json
 {
   "type": "abort_request",
-  "request_id": "550e8400-e29b-41d4-a716-446655440099",
+  "stream_id": "550e8400-e29b-41d4-a716-446655440099",
+  "message_id": "550e8400-e29b-41d4-a716-446655440099",
+  "sequence": 5,
+  "in_reply_to": "550e8400-e29b-41d4-a716-446655440003",
   "payload": {
-    "target_request_id": "550e8400-e29b-41d4-a716-446655440003",
+    "target_stream_id": "550e8400-e29b-41d4-a716-446655440003",
     "reason": "User cancelled"
   }
 }
@@ -1302,9 +1266,9 @@ partial.usage = event.payload.usage;
 
 **Response:**
 ```json
-{"type":"ack","request_id":"550e8400-e29b-41d4-a716-446655440099","payload":{"acknowledged_id":"550e8400-e29b-41d4-a716-446655440099"}}
+{"type":"ack","stream_id":"550e8400-e29b-41d4-a716-446655440099","message_id":"msg-ack-001","sequence":6,"in_reply_to":"550e8400-e29b-41d4-a716-446655440099","payload":{"acknowledged_id":"550e8400-e29b-41d4-a716-446655440099"}}
 
-{"type":"error","request_id":"550e8400-e29b-41d4-a716-446655440003","payload":{"reason":"aborted","error_message":"User cancelled","usage":{"input":100,"output":50}}}
+{"type":"error","stream_id":"550e8400-e29b-41d4-a716-446655440003","message_id":"msg-err-001","sequence":7,"payload":{"reason":"aborted","error_message":"User cancelled","usage":{"input":100,"output":50}}}
 ```
 
 ### 10.4 WebSocket Full Session
@@ -1316,22 +1280,22 @@ Client                                                    Server
   |<-- 101 Switching Protocols ----------------------------|
   |                                                         |
   |--- Text Frame ----------------------------------------->|
-  |    {"type":"stream_request","request_id":"A",...}       |
+  |    {"type":"stream_request","stream_id":"A",...}        |
   |                                                         |
   |<-- Text Frame ------------------------------------------|
-  |    {"type":"ack","payload":{"acknowledged_id":"A"}}     |
+  |    {"type":"ack","in_reply_to":"msg-1",...}             |
   |                                                         |
   |<-- Text Frame ------------------------------------------|
-  |    {"type":"start","request_id":"A",...}                |
+  |    {"type":"start","stream_id":"A",...}                 |
   |                                                         |
   |<-- Text Frame ------------------------------------------|
-  |    {"type":"text_delta","request_id":"A",...}           |
+  |    {"type":"text_delta","stream_id":"A",...}            |
   |                                                         |
   |--- Ping Frame ----------------------------------------->| (WS-level)
   |<-- Pong Frame ------------------------------------------|
   |                                                         |
   |<-- Text Frame ------------------------------------------|
-  |    {"type":"done","request_id":"A",...}                 |
+  |    {"type":"done","stream_id":"A",...}                  |
   |                                                         |
   |--- Text Frame ----------------------------------------->|
   |    {"type":"goodbye","payload":{}}                      |
@@ -1348,37 +1312,88 @@ Client                                                    Server
 
 **Input (stdin):**
 ```
-{"type":"stream_request","request_id":"req-001","payload":{"model":{...},"context":{...}}}
+MAKAI/1.0.0
+{"type":"stream_request","stream_id":"stream-001","message_id":"msg-001","sequence":1,"payload":{"model":{...},"context":{...}}}
 ```
 
 **Output (stdout):**
 ```
-{"type":"ack","request_id":"ack-001","payload":{"acknowledged_id":"req-001"}}
-{"type":"start","request_id":"req-001","payload":{"model":"...","partial":{...}}}
-{"type":"text_delta","request_id":"req-001","payload":{"content_index":0,"delta":"Hello","partial":{...}}}
-{"type":"text_delta","request_id":"req-001","payload":{"content_index":0,"delta":" world","partial":{...}}}
-{"type":"text_end","request_id":"req-001","payload":{"content_index":0,"partial":{...}}}
-{"type":"done","request_id":"req-001","payload":{"reason":"stop","message":{...}}}
+MAKAI/1.0.0
+{"type":"ack","stream_id":"stream-001","message_id":"msg-ack-001","sequence":2,"in_reply_to":"msg-001","payload":{"acknowledged_id":"msg-001"}}
+{"type":"start","stream_id":"stream-001","message_id":"msg-002","sequence":3,"payload":{"model":"...","input_tokens":15}}
+{"type":"text_delta","stream_id":"stream-001","message_id":"msg-003","sequence":4,"payload":{"content_index":0,"delta":"Hello"}}
+{"type":"text_delta","stream_id":"stream-001","message_id":"msg-004","sequence":5,"payload":{"content_index":0,"delta":" world"}}
+{"type":"text_end","stream_id":"stream-001","message_id":"msg-005","sequence":6,"payload":{"content_index":0}}
+{"type":"done","stream_id":"stream-001","message_id":"msg-006","sequence":7,"payload":{"reason":"stop","message":{...}}}
 ```
+
+---
+
+## 11. Security
+
+### 11.1 API Key Handling
+
+API keys must NEVER be transmitted in protocol messages. They are passed exclusively via transport-level mechanisms:
+
+| Transport | API Key Method |
+|-----------|---------------|
+| WebSocket | `Authorization: Bearer <key>` header in handshake |
+| HTTP | `Authorization: Bearer <key>` header |
+| gRPC | `authorization` metadata |
+| stdio | Environment variable or configuration file |
+
+**Implementation Note**: The `StreamOptions.api_key` field has been removed from the protocol. All implementations must use transport headers.
+
+### 11.2 Log Redaction
+
+Implementations should redact sensitive information in logs:
+
+1. **API Keys**: Redact any field named `api_key`, `authorization`, or containing `secret`, `token`, or `key`
+2. **Content**: Optionally redact message content in debug logs
+3. **PII**: Consider redacting personally identifiable information
+
+Example log redaction:
+```
+// Before: Authorization: Bearer sk-ant-api03-xxxxx...
+// After:  Authorization: Bearer [REDACTED]
+```
+
+### 11.3 Transport Security Requirements
+
+| Transport | Minimum Security |
+|-----------|-----------------|
+| WebSocket | TLS (wss://) required in production |
+| HTTP | TLS (https://) required in production |
+| gRPC | TLS required in production |
+| stdio | Local process isolation; no network exposure |
+
+### 11.4 Authentication
+
+The protocol does not define authentication mechanisms. Authentication is handled at the transport layer:
+
+1. **Bearer Token**: Standard `Authorization: Bearer <token>` header
+2. **mTLS**: Mutual TLS for server and client authentication
+3. **API Gateway**: Authentication handled by intermediary
 
 ---
 
 ## Appendix A: Type Mappings to Zig Implementation
 
-| Protocol Type | Zig Type (types.zig) | Zig Type (ai_types.zig) |
-|--------------|---------------------|------------------------|
-| ContentBlock | types.ContentBlock | ai_types.AssistantContent |
-| Usage | types.Usage | ai_types.Usage |
-| StopReason | types.StopReason | ai_types.StopReason |
-| MessageEvent | types.MessageEvent | ai_types.AssistantMessageEvent |
-| AssistantMessage | types.AssistantMessage | ai_types.AssistantMessage |
+| Protocol Type | Zig Type (ai_types.zig) |
+|--------------|------------------------|
+| ContentBlock | ai_types.AssistantContent |
+| Usage | ai_types.Usage |
+| StopReason | ai_types.StopReason |
+| MessageEvent | ai_types.AssistantMessageEvent |
+| AssistantMessage | ai_types.AssistantMessage |
 
 ---
 
 ## Appendix B: Transport Implementation Reference
 
-| Transport | Zig Module | Key Functions |
-|-----------|-----------|---------------|
+| Transport | Zig Module | Key Types/Functions |
+|-----------|-----------|---------------------|
+| Core | `transport.zig` | `ByteChunk`, `ByteStream`, `AsyncSender`, `AsyncReceiver` |
 | Stdio | `transports/stdio.zig` | `StdioSender.sender()`, `StdioReceiver.receiver()` |
 | SSE | `transports/sse.zig` | `SseSender.sender()`, `SseReceiver.receiver()` |
-| Core | `transport.zig` | `forwardStream()`, `receiveStream()`, `serializeEvent()`, `deserialize()` |
+| Bridge | `transport.zig` | `forwardStream()`, `receiveStream()`, `spawnReceiver()` |

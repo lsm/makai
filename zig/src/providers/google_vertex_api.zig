@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
@@ -223,7 +224,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                             try w.writeStringField("mimeType", img.mime_type);
                             try w.writeStringField("data", img.data);
                             try w.endObject();
-                            try w.endObject();
                         },
                     };
                 },
@@ -297,8 +297,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                     try w.writeBoolField("error", true);
                 }
                 try w.endObject();
-                try w.endObject();
-                try w.endObject();
             },
         }
 
@@ -366,7 +364,6 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         try w.endArray();
                     },
                 }
-                try w.endObject();
                 try w.endObject();
             }
         }
@@ -646,7 +643,7 @@ fn mapFinishReason(reason: ?[]const u8) ai_types.StopReason {
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     api_key: []u8,
     body: []u8,
@@ -1269,7 +1266,7 @@ pub fn streamGoogleVertex(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) VertexError!*ai_types.AssistantMessageEventStream {
+) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
     // Resolve project and location from environment
@@ -1306,7 +1303,7 @@ pub fn streamGoogleVertex(
     };
     errdefer allocator.free(body);
 
-    const s = allocator.create(ai_types.AssistantMessageEventStream) catch {
+    const s = allocator.create(event_stream.AssistantMessageEventStream) catch {
         allocator.free(project);
         allocator.free(location);
         allocator.free(api_key);
@@ -1314,7 +1311,7 @@ pub fn streamGoogleVertex(
         return error.InvalidConfiguration;
     };
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = allocator.create(ThreadCtx) catch {
         allocator.free(project);
@@ -1357,7 +1354,7 @@ pub fn streamSimpleGoogleVertex(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) VertexError!*ai_types.AssistantMessageEventStream {
+) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
 
     // Build thinking options based on reasoning level and model capabilities

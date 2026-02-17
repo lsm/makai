@@ -106,6 +106,164 @@ pub const SseReceiver = struct {
     }
 };
 
+// --- Async implementations ---
+
+/// Async SSE Sender — writes events in Server-Sent Events wire format.
+pub const AsyncSseSender = struct {
+    file: std.fs.File,
+
+    pub fn init(file: std.fs.File) AsyncSseSender {
+        return .{ .file = file };
+    }
+
+    pub fn sender(self: *AsyncSseSender) transport.AsyncSender {
+        return .{
+            .context = @ptrCast(self),
+            .write_fn = writeFn,
+        };
+    }
+
+    fn writeFn(ctx: *anyopaque, data: []const u8) !void {
+        const self: *AsyncSseSender = @ptrCast(@alignCast(ctx));
+        try self.file.writeAll("data: ");
+        try self.file.writeAll(data);
+        try self.file.writeAll("\n\n");
+    }
+};
+
+/// Async SSE Receiver — produces ByteStream with parsed SSE data payloads.
+pub const AsyncSseReceiver = struct {
+    file: std.fs.File,
+
+    const Self = @This();
+
+    pub fn init(file: std.fs.File) Self {
+        return .{ .file = file };
+    }
+
+    pub fn receiver(self: *Self) transport.AsyncReceiver {
+        return .{
+            .context = @ptrCast(self),
+            .receive_stream_fn = receiveStreamFn,
+            .read_fn = readFn,
+        };
+    }
+
+    const ProducerContext = struct {
+        stream: *transport.ByteStream,
+        file: std.fs.File,
+        allocator: std.mem.Allocator,
+        parser: sse_parser.SSEParser,
+        read_buf: [4096]u8 = undefined,
+    };
+
+    fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+
+        const stream = try allocator.create(transport.ByteStream);
+        stream.* = transport.ByteStream.init(allocator);
+
+        const thread_ctx = try allocator.create(ProducerContext);
+        thread_ctx.* = .{
+            .stream = stream,
+            .file = self.file,
+            .allocator = allocator,
+            .parser = sse_parser.SSEParser.init(allocator),
+        };
+
+        const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
+        thread.detach();
+
+        return stream;
+    }
+
+    fn producerThread(ctx: *ProducerContext) void {
+        defer {
+            ctx.parser.deinit();
+            ctx.stream.markThreadDone();
+            ctx.allocator.destroy(ctx);
+        }
+
+        while (true) {
+            // Read more bytes from the source
+            const bytes_read = ctx.file.read(&ctx.read_buf) catch {
+                ctx.stream.completeWithError("Read error");
+                return;
+            };
+
+            if (bytes_read == 0) {
+                // EOF
+                ctx.stream.complete({});
+                return;
+            }
+
+            // Feed to parser
+            const events = ctx.parser.feed(ctx.read_buf[0..bytes_read]) catch {
+                ctx.stream.completeWithError("SSE parse error");
+                return;
+            };
+
+            // Push each event as a ByteChunk
+            for (events) |event| {
+                const data = ctx.allocator.dupe(u8, event.data) catch {
+                    ctx.stream.completeWithError("Out of memory");
+                    return;
+                };
+                const chunk = transport.ByteChunk{
+                    .data = data,
+                    .owned = true,
+                };
+                ctx.stream.push(chunk) catch {
+                    ctx.stream.completeWithError("Stream queue full");
+                    return;
+                };
+            }
+        }
+    }
+
+    // Keep backward-compatible blocking read
+    fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        var parser = sse_parser.SSEParser.init(allocator);
+        defer parser.deinit();
+        var read_buf: [4096]u8 = undefined;
+        var pending = std.ArrayList([]u8).init(allocator);
+        defer {
+            for (pending.items) |item| {
+                allocator.free(item);
+            }
+            pending.deinit(allocator);
+        }
+        var pending_index: usize = 0;
+
+        while (true) {
+            // Drain any pending events
+            if (pending_index < pending.items.len) {
+                const data = pending.items[pending_index];
+                pending_index += 1;
+                return data; // Transfer ownership
+            }
+
+            // All pending consumed — clear for next batch
+            pending.clearRetainingCapacity();
+            pending_index = 0;
+
+            // Read more bytes from the source
+            const bytes_read = self.file.read(&read_buf) catch return null;
+            if (bytes_read == 0) return null; // EOF
+
+            // Feed to parser
+            const events = try parser.feed(read_buf[0..bytes_read]);
+
+            // Dupe the data strings
+            for (events) |event| {
+                const duped = try allocator.dupe(u8, event.data);
+                try pending.append(allocator, duped);
+            }
+        }
+    }
+};
+
 // Tests
 
 test "SseSender writes SSE format" {
@@ -175,18 +333,31 @@ test "SseSender and SseReceiver round-trip with transport" {
     var sse_sender = SseSender.init(write_file);
     var s = sse_sender.sender();
 
+    const ai_types = @import("ai_types");
+    const empty_partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
     const event_json = try transport.serializeEvent(
-        .{ .text_delta = .{ .index = 0, .delta = "Hello" } },
+        .{ .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = empty_partial } },
         allocator,
     );
     defer allocator.free(event_json);
     try s.write(event_json);
 
     const result_json = try transport.serializeResult(.{
-        .content = &[_]@import("types").ContentBlock{},
+        .content = &[_]ai_types.AssistantContent{},
         .usage = .{},
         .stop_reason = .stop,
         .model = "test",
+        .api = "test-api",
+        .provider = "test-provider",
         .timestamp = 1,
     }, allocator);
     defer allocator.free(result_json);
@@ -212,6 +383,5 @@ test "SseSender and SseReceiver round-trip with transport" {
     defer allocator.free(line2.?);
     const msg2 = try transport.deserialize(line2.?, allocator);
     try std.testing.expect(msg2 == .result);
-    allocator.free(msg2.result.model);
-    allocator.free(msg2.result.content);
+    msg2.result.deinit(allocator);
 }

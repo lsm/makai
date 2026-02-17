@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
@@ -376,7 +377,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 try w.writeStringField("media_type", img.mime_type);
                                 try w.writeStringField("data", img.data);
                                 try w.endObject();
-                                try w.endObject();
                             },
                         }
                     }
@@ -472,7 +472,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         try w.writeStringField("media_type", img.mime_type);
                         try w.writeStringField("data", img.data);
                         try w.endObject();
-                        try w.endObject();
                     },
                 }
             }
@@ -506,7 +505,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     if (cache_control.?.has_ttl) {
                         try w.writeStringField("ttl", "1h");
                     }
-                    try w.endObject();
                     try w.endObject();
                 },
                 .parts => |parts| {
@@ -543,7 +541,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 try w.writeStringField("type", "base64");
                                 try w.writeStringField("media_type", img.mime_type);
                                 try w.writeStringField("data", img.data);
-                                try w.endObject();
                                 try w.endObject();
                             },
                         }
@@ -597,7 +594,6 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                         try w.writeStringField("type", "base64");
                                         try w.writeStringField("media_type", img.mime_type);
                                         try w.writeStringField("data", img.data);
-                                        try w.endObject();
                                         try w.endObject();
                                     },
                                 }
@@ -940,7 +936,7 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     api_key: []u8,
     request_body: []u8,
@@ -1617,7 +1613,7 @@ pub fn streamAnthropicMessages(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
@@ -1632,9 +1628,9 @@ pub fn streamAnthropicMessages(
     const body = try buildRequestBody(model, context, o, allocator, is_oauth);
     errdefer allocator.free(body);
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -1661,7 +1657,7 @@ pub fn streamSimpleAnthropicMessages(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
 
     // Build thinking options based on reasoning level and model capabilities

@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types");
+const ai_types = @import("ai_types");
 
 pub fn EventStream(comptime T: type, comptime R: type) type {
     return struct {
@@ -46,31 +46,55 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             // This is critical when tests abort mid-stream or complete without polling all events
             while (self.poll()) |event| {
                 // Free allocated strings in the event based on the event type
-                // We need to check if T is MessageEvent to avoid trying to free non-pointer types
-                const is_message_event = comptime blk: {
-                    if (@hasDecl(types, "MessageEvent")) {
-                        break :blk T == types.MessageEvent;
+                // We need to check if T is AssistantMessageEvent to avoid trying to free non-pointer types
+                const is_assistant_message_event = comptime blk: {
+                    if (@hasDecl(ai_types, "AssistantMessageEvent")) {
+                        break :blk T == ai_types.AssistantMessageEvent;
                     }
                     break :blk false;
                 };
 
-                if (comptime is_message_event) {
+                if (comptime is_assistant_message_event) {
                     switch (event) {
-                        .start => |s| self.allocator.free(s.model),
-                        .text_delta => |d| self.allocator.free(d.delta),
-                        .thinking_delta => |d| self.allocator.free(d.delta),
-                        .toolcall_start => |tc| {
-                            self.allocator.free(tc.id);
-                            self.allocator.free(tc.name);
+                        .start => |_| {
+                            // Partial message is typically a snapshot without owned memory
+                            // No cleanup needed
                         },
-                        .toolcall_delta => |d| self.allocator.free(d.delta),
-                        .toolcall_end => |e| self.allocator.free(e.input_json),
-                        .@"error" => |e| self.allocator.free(e.message),
+                        .text_delta => |_| {
+                            // Delta is a slice into provider-managed buffers
+                            // Partial is a snapshot without owned memory
+                        },
+                        .thinking_delta => |_| {
+                            // Delta is a slice into provider-managed buffers
+                            // Partial is a snapshot without owned memory
+                        },
+                        .toolcall_start => |_| {
+                            // Partial is a snapshot without owned memory
+                        },
+                        .toolcall_delta => |_| {
+                            // Delta is provider-managed
+                            // Partial is a snapshot without owned memory
+                        },
+                        .toolcall_end => |e| {
+                            // Free tool_call fields if they were allocated
+                            // Note: tool_call fields may point to provider buffers
+                            // Only free if we know they were heap-allocated
+                            _ = e;
+                        },
+                        .done => |d| {
+                            // The message in done event may have owned memory
+                            var mutable_msg = d.message;
+                            mutable_msg.deinit(self.allocator);
+                        },
+                        .@"error" => |e| {
+                            // The err message may have owned memory
+                            var mutable_err = e.err;
+                            mutable_err.deinit(self.allocator);
+                        },
                         else => {},
                     }
                 } else {
                     // Handle events that have delta/content fields with heap-allocated strings
-                    // This handles ai_types.AssistantMessageEvent and similar types
                     // Use comptime introspection to check for field existence
                     const info = @typeInfo(T);
                     if (info == .@"union") {
@@ -80,19 +104,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                                 // that are freed when the provider thread exits
                                 _ = d;
                             },
-                            .toolcall_end => |e| {
-                                if (@hasField(@TypeOf(e), "tool_call")) {
-                                    self.allocator.free(e.tool_call.id);
-                                    self.allocator.free(e.tool_call.name);
-                                    if (e.tool_call.arguments_json.len > 0) {
-                                        self.allocator.free(e.tool_call.arguments_json);
-                                    }
-                                    if (@hasField(@TypeOf(e.tool_call), "thought_signature")) {
-                                        if (e.tool_call.thought_signature) |sig| {
-                                            self.allocator.free(sig);
-                                        }
-                                    }
-                                }
+                            .toolcall_end => |_| {
+                                // Tool call cleanup if needed
                             },
                             else => {},
                         }
@@ -319,7 +332,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
     };
 }
 
-pub const AssistantMessageStream = EventStream(types.MessageEvent, types.AssistantMessage);
+pub const AssistantMessageStream = EventStream(ai_types.AssistantMessageEvent, ai_types.AssistantMessage);
+
+/// Alias for AssistantMessageStream (same type, different name for clarity)
+pub const AssistantMessageEventStream = AssistantMessageStream;
 
 // Tests
 test "EventStream push and poll" {
@@ -392,30 +408,31 @@ test "AssistantMessageStream basic usage" {
     var stream = AssistantMessageStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // The model string MUST be heap-allocated when creating start events
-    // because deinit() will free it when draining unpollled events
-    const model_str = try std.testing.allocator.dupe(u8, "test-model");
-    const start_event = types.MessageEvent{ .start = types.StartEvent{ .model = model_str } };
+    // Create a partial message for the start event
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const start_event = ai_types.AssistantMessageEvent{ .start = .{ .partial = partial } };
     try stream.push(start_event);
 
     const event = stream.poll();
     try std.testing.expect(event != null);
     try std.testing.expect(std.meta.activeTag(event.?) == .start);
 
-    // Free the polled event's model string
-    if (event) |evt| {
-        switch (evt) {
-            .start => |s| std.testing.allocator.free(s.model),
-            else => {},
-        }
-    }
-
-    const result_model_str = try std.testing.allocator.dupe(u8, "test-model");
-    const result = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .usage = types.Usage{},
+    // Complete with a result
+    const result = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
         .stop_reason = .stop,
-        .model = result_model_str,
         .timestamp = 0,
     };
     stream.complete(result);
@@ -429,29 +446,34 @@ test "AssistantMessageStream basic usage" {
 test "AssistantMessageStream deinit drains unpollled events" {
     // This test verifies that deinit() properly frees memory in events
     // that were pushed but not polled before the stream is destroyed.
-    // The model string MUST be heap-allocated because deinit will free it.
     var stream = AssistantMessageStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Heap-allocate the model string - deinit() will free this
-    const model_str = try std.testing.allocator.dupe(u8, "test-model");
-    const start_event = types.MessageEvent{ .start = types.StartEvent{ .model = model_str } };
+    // Create a start event - partial message has no heap allocations
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const start_event = ai_types.AssistantMessageEvent{ .start = .{ .partial = partial } };
     try stream.push(start_event);
 
     // Do NOT poll the event - deinit() should drain and free it
-    // If model_str was a string literal, deinit would crash with "Invalid free"
 
-    const result_model_str = try std.testing.allocator.dupe(u8, "test-model");
-    const result = types.AssistantMessage{
-        .content = &[_]types.ContentBlock{},
-        .usage = types.Usage{},
+    const result = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
         .stop_reason = .stop,
-        .model = result_model_str,
         .timestamp = 0,
     };
     stream.complete(result);
 
-    // deinit() will:
-    // 1. Poll and free the start event's model string
-    // 2. Call AssistantMessage.deinit() which frees result.model
+    // deinit() will drain events and clean up
 }

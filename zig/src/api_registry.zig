@@ -1,19 +1,20 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 
 pub const ApiStreamFunction = *const fn (
     model: ai_types.Model,
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) anyerror!*ai_types.AssistantMessageEventStream;
+) anyerror!*event_stream.AssistantMessageEventStream;
 
 pub const ApiStreamSimpleFunction = *const fn (
     model: ai_types.Model,
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) anyerror!*ai_types.AssistantMessageEventStream;
+) anyerror!*event_stream.AssistantMessageEventStream;
 
 pub const ApiProvider = struct {
     api: []const u8,
@@ -104,12 +105,12 @@ fn mockStream(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = model;
     _ = context;
     _ = options;
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
     return s;
 }
 
@@ -118,12 +119,12 @@ fn mockStreamSimple(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = model;
     _ = context;
     _ = options;
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
     return s;
 }
 
