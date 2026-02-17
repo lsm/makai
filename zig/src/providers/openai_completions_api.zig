@@ -350,6 +350,7 @@ fn writeMessagesArray(
                 .tool_call => {
                     has_tool_calls = true;
                 },
+                .image => {},
             };
 
             // Skip empty assistant messages (no content and no tool_calls)
@@ -737,6 +738,7 @@ const ThreadCtx = struct {
     on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
     retry_config: ?ai_types.RetryConfig = null,
+    ping_interval_ms: ?u64 = null,
 };
 
 /// Current block type being parsed
@@ -1336,6 +1338,10 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
+    // Ping tracking
+    var last_ping_time: i64 = 0;
+    const ping_interval = ctx.ping_interval_ms orelse 0;
+
     // Emit start event
     _ = stream.push(.{
         .start = .{
@@ -1352,6 +1358,15 @@ fn runThread(ctx: *ThreadCtx) void {
     }) catch {};
 
     while (true) {
+        // Emit ping if interval is configured
+        if (ping_interval > 0) {
+            const now = std.time.milliTimestamp();
+            if (now - last_ping_time >= ping_interval) {
+                stream.push(.{ .ping = {} }) catch {};
+                last_ping_time = now;
+            }
+        }
+
         // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
@@ -1688,6 +1703,7 @@ pub fn streamOpenAICompletions(
         .on_payload_fn = resolved.on_payload_fn,
         .on_payload_ctx = resolved.on_payload_ctx,
         .retry_config = resolved.retry,
+        .ping_interval_ms = resolved.ping_interval_ms,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
