@@ -377,6 +377,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 try w.writeStringField("media_type", img.mime_type);
                                 try w.writeStringField("data", img.data);
                                 try w.endObject();
+                                try w.endObject();
                             },
                         }
                     }
@@ -472,6 +473,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         try w.writeStringField("media_type", img.mime_type);
                         try w.writeStringField("data", img.data);
                         try w.endObject();
+                        try w.endObject();
                     },
                 }
             }
@@ -505,6 +507,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     if (cache_control.?.has_ttl) {
                         try w.writeStringField("ttl", "1h");
                     }
+                    try w.endObject();
                     try w.endObject();
                 },
                 .parts => |parts| {
@@ -541,6 +544,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 try w.writeStringField("type", "base64");
                                 try w.writeStringField("media_type", img.mime_type);
                                 try w.writeStringField("data", img.data);
+                                try w.endObject();
                                 try w.endObject();
                             },
                         }

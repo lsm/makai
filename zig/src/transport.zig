@@ -339,10 +339,22 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .done => |d| {
             try w.writeStringField("type", "done");
             try w.writeStringField("reason", @tagName(d.reason));
+            try w.writeStringField("stop_reason", @tagName(d.message.stop_reason));
+            try w.writeStringField("model", d.message.model);
+            try w.writeStringField("api", d.message.api);
+            try w.writeStringField("provider", d.message.provider);
+            try w.writeIntField("timestamp", d.message.timestamp);
             try w.writeIntField("input", d.message.usage.input);
             try w.writeIntField("output", d.message.usage.output);
             try w.writeIntField("cache_read", d.message.usage.cache_read);
             try w.writeIntField("cache_write", d.message.usage.cache_write);
+
+            try w.writeKey("content");
+            try w.beginArray();
+            for (d.message.content) |block| {
+                try serializeAssistantContent(&w, block);
+            }
+            try w.endArray();
         },
         .@"error" => |e| {
             try w.writeStringField("type", "error");
@@ -579,12 +591,18 @@ fn parseAssistantMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {
-    const content_array = obj.get("content").?.array;
-    var content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
-    errdefer allocator.free(content);
+    // Content field is optional - done events don't include it
+    var content: []ai_types.AssistantContent = &.{};
+    if (obj.get("content")) |content_val| {
+        if (content_val == .array) {
+            const content_array = content_val.array;
+            content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
+            errdefer allocator.free(content);
 
-    for (content_array.items, 0..) |item, i| {
-        content[i] = try parseAssistantContent(item.object, allocator);
+            for (content_array.items, 0..) |item, i| {
+                content[i] = try parseAssistantContent(item.object, allocator);
+            }
+        }
     }
 
     return .{

@@ -286,6 +286,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
         },
     });
 

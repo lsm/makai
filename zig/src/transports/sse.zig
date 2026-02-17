@@ -383,5 +383,6 @@ test "SseSender and SseReceiver round-trip with transport" {
     defer allocator.free(line2.?);
     const msg2 = try transport.deserialize(line2.?, allocator);
     try std.testing.expect(msg2 == .result);
-    msg2.result.deinit(allocator);
+    var mutable_result = msg2.result;
+    mutable_result.deinit(allocator);
 }
