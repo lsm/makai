@@ -98,6 +98,8 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     tool_name: ?[]const u8 = null,
     is_error: bool = false,
+    /// Stop reason for assistant messages (used for filtering aborted/error messages)
+    stop_reason: ?StopReason = null,
     timestamp: i64,
 };
 

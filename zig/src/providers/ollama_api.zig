@@ -75,6 +75,50 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
         try w.writeStringField("role", role);
         try w.writeStringField("content", text.items);
 
+        // Check for images on user messages (Ollama format: images array on message)
+        if (m == .user) {
+            const user = m.user;
+            if (user.content == .parts) {
+                var has_images = false;
+                for (user.content.parts) |p| {
+                    if (p == .image) {
+                        has_images = true;
+                        break;
+                    }
+                }
+                if (has_images) {
+                    try w.writeKey("images");
+                    try w.beginArray();
+                    for (user.content.parts) |p| switch (p) {
+                        .image => |img| try w.writeString(img.data),
+                        else => {},
+                    };
+                    try w.endArray();
+                }
+            }
+        }
+
+        // Check for images on tool_result messages (Ollama format: images array on message)
+        if (m == .tool_result) {
+            const tr = m.tool_result;
+            var has_images = false;
+            for (tr.content) |c| {
+                if (c == .image) {
+                    has_images = true;
+                    break;
+                }
+            }
+            if (has_images) {
+                try w.writeKey("images");
+                try w.beginArray();
+                for (tr.content) |c| switch (c) {
+                    .image => |img| try w.writeString(img.data),
+                    else => {},
+                };
+                try w.endArray();
+            }
+        }
+
         // Check for tool_calls on assistant messages
         if (m == .assistant) {
             var has_tool_calls = false;
@@ -916,6 +960,84 @@ test "buildBody includes model stream options and messages" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.2") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"hello\"") != null);
+}
+
+test "buildBody includes images array for user message with image parts" {
+    const model = ai_types.Model{
+        .id = "llama3.2-vision",
+        .name = "Llama 3.2 Vision",
+        .api = "ollama",
+        .provider = "ollama",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{ "text", "image" },
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 131_072,
+        .max_tokens = 64,
+    };
+
+    const parts = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "What is in this image?" } },
+        .{ .image = .{ .data = "iVBORw0KGgoAAAANSUhEUgAAAAE", .mime_type = "image/png" } },
+    };
+
+    const msg = ai_types.Message{ .user = .{
+        .content = .{ .parts = &parts },
+        .timestamp = 1,
+    } };
+
+    const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{msg} };
+
+    const body = try buildBody(model, ctx, .{}, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+
+    // Verify the images array is present with the base64 data
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"images\":[\"iVBORw0KGgoAAAANSUhEUgAAAAE\"]") != null);
+    // Verify text content is also present
+    try std.testing.expect(std.mem.indexOf(u8, body, "What is in this image?") != null);
+}
+
+test "buildBody includes images array for tool_result with image" {
+    const model = ai_types.Model{
+        .id = "llama3.2-vision",
+        .name = "Llama 3.2 Vision",
+        .api = "ollama",
+        .provider = "ollama",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{ "text", "image" },
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 131_072,
+        .max_tokens = 64,
+    };
+
+    const tool_result_parts = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "Here is the screenshot" } },
+        .{ .image = .{ .data = "screenshotaBCD123", .mime_type = "image/png" } },
+    };
+
+    const messages = [_]ai_types.Message{
+        .{ .user = .{ .content = .{ .text = "Take a screenshot" }, .timestamp = 0 } },
+        .{ .tool_result = .{
+            .tool_call_id = "tool_123",
+            .tool_name = "screenshot",
+            .content = &tool_result_parts,
+            .is_error = false,
+            .timestamp = 1,
+        } },
+    };
+
+    const ctx = ai_types.Context{ .messages = &messages };
+
+    const body = try buildBody(model, ctx, .{}, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+
+    // Verify the tool message has the images array
+    // Note: Ollama doesn't use tool_call_id for tool results, just role: "tool"
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"images\":[\"screenshotaBCD123\"]") != null);
+    // Verify text content is present
+    try std.testing.expect(std.mem.indexOf(u8, body, "Here is the screenshot") != null);
 }
 
 test "parseLineExtended - text content" {

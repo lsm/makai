@@ -5,6 +5,7 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const github_copilot = @import("github_copilot");
 const tool_call_tracker = @import("tool_call_tracker");
+const provider_caps = @import("provider_caps");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
@@ -55,26 +56,49 @@ fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
     }
 }
 
+/// Check if we're using OpenRouter with an Anthropic model
+fn isOpenRouterAnthropic(model: ai_types.Model) bool {
+    if (model.base_url.len == 0) return false;
+    if (std.mem.indexOf(u8, model.base_url, "openrouter") == null) return false;
+    if (!std.mem.startsWith(u8, model.id, "anthropic/")) return false;
+    return true;
+}
+
 fn writeMessagesArray(
     writer: *json_writer.JsonWriter,
     context: ai_types.Context,
+    model: ai_types.Model,
     allocator: std.mem.Allocator,
 ) !void {
+    const caps = provider_caps.detectCapabilities(model.base_url);
+
+    // Find the last user message index for cache_control (OpenRouter + Anthropic)
+    const should_add_cache_control = isOpenRouterAnthropic(model);
+    var last_user_msg_idx: ?usize = null;
+    if (should_add_cache_control) {
+        var idx: usize = 0;
+        for (context.messages) |msg| {
+            if (msg == .user) {
+                last_user_msg_idx = idx;
+            }
+            idx += 1;
+        }
+    }
+
     try writer.writeKey("messages");
     try writer.beginArray();
 
     if (context.system_prompt) |sp| {
         try writer.beginObject();
-        try writer.writeStringField("role", "system");
+        // Use developer role for reasoning models on OpenAI native
+        const use_developer = model.reasoning and caps.supports_developer_role;
+        const system_role: []const u8 = if (use_developer) "developer" else "system";
+        try writer.writeStringField("role", system_role);
         try writer.writeStringField("content", sp);
         try writer.endObject();
     }
 
-    for (context.messages) |msg| {
-        var text_buf = std.ArrayList(u8){};
-        defer text_buf.deinit(allocator);
-        try appendTextContent(msg, &text_buf, allocator);
-
+    for (context.messages, 0..) |msg, msg_idx| {
         const role: []const u8 = switch (msg) {
             .user => "user",
             .assistant => "assistant",
@@ -87,7 +111,107 @@ fn writeMessagesArray(
             .tool_result => |tr| try writer.writeStringField("tool_call_id", tr.tool_call_id),
             else => {},
         }
-        try writer.writeStringField("content", text_buf.items);
+
+        // Handle user messages - use array format if images are present
+        // Also add cache_control for the last user message when using OpenRouter + Anthropic
+        const is_last_user_msg = should_add_cache_control and last_user_msg_idx != null and msg_idx == last_user_msg_idx.?;
+
+        switch (msg) {
+            .user => |u| {
+                switch (u.content) {
+                    .text => |t| {
+                        if (is_last_user_msg) {
+                            // Use array content format to add cache_control
+                            try writer.writeKey("content");
+                            try writer.beginArray();
+                            try writer.beginObject();
+                            try writer.writeStringField("type", "text");
+                            try writer.writeStringField("text", t);
+                            try writer.writeKey("cache_control");
+                            try writer.beginObject();
+                            try writer.writeStringField("type", "ephemeral");
+                            try writer.endObject();
+                            try writer.endObject();
+                            try writer.endArray();
+                        } else {
+                            try writer.writeStringField("content", t);
+                        }
+                    },
+                    .parts => |parts| {
+                        // Check if any parts are images
+                        var has_images = false;
+                        for (parts) |p| {
+                            if (p == .image) {
+                                has_images = true;
+                                break;
+                            }
+                        }
+
+                        if (has_images or is_last_user_msg) {
+                            // Use array content format for multimodal or when adding cache_control
+                            try writer.writeKey("content");
+                            try writer.beginArray();
+                            for (parts, 0..) |p, part_idx| {
+                                const is_last_part = part_idx == parts.len - 1;
+                                switch (p) {
+                                    .text => |t| {
+                                        try writer.beginObject();
+                                        try writer.writeStringField("type", "text");
+                                        try writer.writeStringField("text", t.text);
+                                        // Add cache_control to the last text part of the last user message
+                                        if (is_last_user_msg and is_last_part) {
+                                            try writer.writeKey("cache_control");
+                                            try writer.beginObject();
+                                            try writer.writeStringField("type", "ephemeral");
+                                            try writer.endObject();
+                                        }
+                                        try writer.endObject();
+                                    },
+                                    .image => |img| {
+                                        try writer.beginObject();
+                                        try writer.writeStringField("type", "image_url");
+                                        try writer.writeKey("image_url");
+                                        try writer.beginObject();
+                                        // Build data URL: "data:{mime_type};base64,{data}"
+                                        try writer.writeKey("url");
+                                        try writer.buffer.appendSlice(allocator, "\"data:");
+                                        try writer.buffer.appendSlice(allocator, img.mime_type);
+                                        try writer.buffer.appendSlice(allocator, ";base64,");
+                                        try writer.buffer.appendSlice(allocator, img.data);
+                                        try writer.buffer.append(allocator, '"');
+                                        writer.needs_comma = true;
+                                        try writer.endObject();
+                                        try writer.endObject();
+                                    },
+                                }
+                            }
+                            try writer.endArray();
+                        } else {
+                            // Text-only parts: concatenate as simple string
+                            var text_buf = std.ArrayList(u8){};
+                            defer text_buf.deinit(allocator);
+                            for (parts) |p| {
+                                switch (p) {
+                                    .text => |t| {
+                                        if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
+                                        try text_buf.appendSlice(allocator, t.text);
+                                    },
+                                    .image => {},
+                                }
+                            }
+                            try writer.writeStringField("content", text_buf.items);
+                        }
+                    },
+                }
+            },
+            else => {
+                // For assistant and tool_result messages, use text extraction
+                var text_buf = std.ArrayList(u8){};
+                defer text_buf.deinit(allocator);
+                try appendTextContent(msg, &text_buf, allocator);
+                try writer.writeStringField("content", text_buf.items);
+            },
+        }
 
         // Check for tool_calls on assistant messages
         if (msg == .assistant) {
@@ -134,16 +258,19 @@ fn buildRequestBody(
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
+    const caps = provider_caps.detectCapabilities(model.base_url);
+
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
-    try writeMessagesArray(&w, context, allocator);
+    try writeMessagesArray(&w, context, model, allocator);
     try w.writeBoolField("stream", true);
     try w.writeKey("stream_options");
     try w.beginObject();
     try w.writeBoolField("include_usage", true);
     try w.endObject();
-    try w.writeIntField("max_tokens", options.max_tokens orelse model.max_tokens);
+    // Use max_completion_tokens for OpenAI native, max_tokens for others (Mistral/Chutes)
+    try w.writeIntField(caps.max_tokens_field, options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
         try w.writeKey("temperature");
         try w.writeFloat(t);
@@ -172,6 +299,25 @@ fn buildRequestBody(
                 try w.endObject();
             }
             try w.endArray();
+
+            // Add tool_choice if specified
+            if (options.tool_choice) |tc| {
+                try w.writeKey("tool_choice");
+                switch (tc) {
+                    .auto => try w.writeString("auto"),
+                    .none => try w.writeString("none"),
+                    .required => try w.writeString("required"),
+                    .function => |name| {
+                        try w.beginObject();
+                        try w.writeStringField("type", "function");
+                        try w.writeKey("function");
+                        try w.beginObject();
+                        try w.writeStringField("name", name);
+                        try w.endObject();
+                        try w.endObject();
+                    },
+                }
+            }
         }
     }
     // Privacy: don't store requests for OpenAI training
@@ -1291,4 +1437,116 @@ test "parseChunk handles multiple tool_calls" {
     try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
     try std.testing.expect(!tool_call_events.items[0].is_start);
     try std.testing.expectEqual(@as(usize, 0), tool_call_events.items[0].api_index);
+}
+
+test "isOpenRouterAnthropic detection" {
+    // OpenRouter with Anthropic model
+    const model1 = ai_types.Model{
+        .id = "anthropic/claude-3-opus",
+        .name = "Claude 3 Opus",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200_000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(isOpenRouterAnthropic(model1));
+
+    // OpenRouter with non-Anthropic model
+    const model2 = ai_types.Model{
+        .id = "openai/gpt-4o",
+        .name = "GPT-4o",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(!isOpenRouterAnthropic(model2));
+
+    // OpenAI native (not OpenRouter)
+    const model3 = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+    try std.testing.expect(!isOpenRouterAnthropic(model3));
+}
+
+test "buildRequestBody adds cache_control for OpenRouter Anthropic models" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "anthropic/claude-3-opus",
+        .name = "Claude 3 Opus",
+        .api = "openai-completions",
+        .provider = "openrouter",
+        .base_url = "https://openrouter.ai/api/v1",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200_000,
+        .max_tokens = 100,
+    };
+
+    const user_msg1 = ai_types.Message{ .user = .{ .content = .{ .text = "First message" }, .timestamp = std.time.timestamp() } };
+    const user_msg2 = ai_types.Message{ .user = .{ .content = .{ .text = "Second message" }, .timestamp = std.time.timestamp() } };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{ user_msg1, user_msg2 },
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Verify cache_control is added to the last user message
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "ephemeral") != null);
+
+    // The body should contain array content format for the last user message
+    // Verify structure contains the expected format
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"text\"") != null);
+}
+
+test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const user_msg = ai_types.Message{ .user = .{ .content = .{ .text = "Hello" }, .timestamp = std.time.timestamp() } };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{user_msg},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Verify cache_control is NOT added for non-OpenRouter
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
 }

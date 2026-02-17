@@ -38,6 +38,24 @@ pub const ProviderCapabilities = struct {
 
     /// Provider type for compatibility
     provider_type: ProviderType = .unknown,
+
+    /// Whether this provider supports the "developer" role for system prompts (OpenAI o-series)
+    supports_developer_role: bool = false,
+
+    /// Which field name to use for max tokens: "max_tokens" or "max_completion_tokens"
+    max_tokens_field: []const u8 = "max_tokens",
+
+    /// Format for thinking/reasoning when serialized
+    thinking_format: enum { openai, zai, qwen } = .openai,
+
+    /// Whether to convert thinking blocks to text for this provider
+    requires_thinking_as_text: bool = false,
+
+    /// Whether to insert synthetic assistant after tool results
+    requires_assistant_after_tool: bool = false,
+
+    /// Whether tool results require a name field
+    requires_tool_result_name: bool = false,
 };
 
 /// Check if URL is GitHub Copilot
@@ -74,6 +92,24 @@ pub fn isZai(base_url: ?[]const u8) bool {
 pub fn isOpenRouter(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
     return std.mem.indexOf(u8, url, "openrouter.ai") != null;
+}
+
+/// Check if URL is Chutes
+pub fn isChutes(base_url: ?[]const u8) bool {
+    const url = base_url orelse return false;
+    return std.mem.indexOf(u8, url, "chutes.ai") != null;
+}
+
+/// Check if URL is Qwen
+pub fn isQwen(base_url: ?[]const u8) bool {
+    const url = base_url orelse return false;
+    return std.mem.indexOf(u8, url, "dashscope") != null or std.mem.indexOf(u8, url, "qwen") != null;
+}
+
+/// Check if URL is DeepSeek
+pub fn isDeepSeek(base_url: ?[]const u8) bool {
+    const url = base_url orelse return false;
+    return std.mem.indexOf(u8, url, "api.deepseek.com") != null;
 }
 
 /// Check if URL is OpenAI native
@@ -124,13 +160,23 @@ pub fn detectCapabilities(base_url: ?[]const u8) ProviderCapabilities {
             .function_calling = true,
             .provider_type = .anthropic,
         },
-        .openai_native => .{
-            .extended_thinking = true,
-            .prompt_caching = true,
-            .vision = true,
-            .function_calling = true,
-            .supports_reasoning_effort = true,
-            .provider_type = .openai_native,
+        .openai_native => capabilities: {
+            var caps: ProviderCapabilities = .{
+                .extended_thinking = true,
+                .prompt_caching = true,
+                .vision = true,
+                .function_calling = true,
+                .supports_reasoning_effort = true,
+                .provider_type = .openai_native,
+                .supports_developer_role = true,
+                .max_tokens_field = "max_completion_tokens",
+            };
+            if (base_url) |url| {
+                if (isZai(url)) {
+                    caps.thinking_format = .zai;
+                }
+            }
+            break :capabilities caps;
         },
         .openai_compatible => capabilities: {
             var caps: ProviderCapabilities = .{
@@ -140,6 +186,18 @@ pub fn detectCapabilities(base_url: ?[]const u8) ProviderCapabilities {
             };
             if (base_url) |url| {
                 caps.requires_mistral_tool_ids = isMistral(url);
+                if (isMistral(url) or isChutes(url)) {
+                    caps.max_tokens_field = "max_tokens";
+                }
+                if (isZai(url)) {
+                    caps.thinking_format = .zai;
+                }
+                if (isQwen(url)) {
+                    caps.thinking_format = .qwen;
+                }
+                if (isDeepSeek(url)) {
+                    caps.requires_thinking_as_text = true;
+                }
             }
             break :capabilities caps;
         },
