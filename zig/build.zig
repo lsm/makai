@@ -383,6 +383,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
                 .{ .name = "test_helpers", .module = test_helpers_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
             },
         }),
     });
