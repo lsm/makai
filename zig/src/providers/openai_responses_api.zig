@@ -4,6 +4,8 @@ const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const tool_call_tracker = @import("tool_call_tracker");
+const sanitize = @import("sanitize");
+const retry_util = @import("retry");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
@@ -443,6 +445,9 @@ const ThreadCtx = struct {
     api_key: []u8,
     body: []u8,
     service_tier: ?ai_types.ServiceTier,
+    cancel_token: ?ai_types.CancelToken = null,
+    on_payload_fn: ?*const fn (on_ctx: ?*anyopaque, payload_json: []const u8) void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -453,6 +458,25 @@ fn runThread(ctx: *ThreadCtx) void {
     const api_key = ctx.api_key;
     const body = ctx.body;
     const service_tier = ctx.service_tier;
+    const cancel_token = ctx.cancel_token;
+    const on_payload_fn = ctx.on_payload_fn;
+    const on_payload_ctx = ctx.on_payload_ctx;
+
+    // Invoke on_payload callback before sending
+    if (on_payload_fn) |cb| {
+        cb(on_payload_ctx, body);
+    }
+
+    // Check cancellation before sending
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -610,6 +634,19 @@ fn runThread(ctx: *ThreadCtx) void {
     }) catch {};
 
     while (true) {
+        // Check cancellation during streaming
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             allocator.free(auth);
             allocator.free(url);
@@ -1049,7 +1086,17 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .service_tier = o.service_tier };
+    ctx.* = .{
+        .allocator = allocator,
+        .stream = s,
+        .model = model,
+        .api_key = api_key,
+        .body = body,
+        .service_tier = o.service_tier,
+        .cancel_token = o.cancel_token,
+        .on_payload_fn = o.on_payload_fn,
+        .on_payload_ctx = o.on_payload_ctx,
+    };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();

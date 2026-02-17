@@ -4,6 +4,8 @@ const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const tool_call_tracker = @import("tool_call_tracker");
+const sanitize = @import("sanitize");
+const retry_util = @import("retry");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
@@ -731,6 +733,9 @@ const ThreadCtx = struct {
     model: ai_types.Model,
     api_key: []u8,
     request_body: []u8,
+    cancel_token: ?ai_types.CancelToken = null,
+    on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -740,6 +745,25 @@ fn runThread(ctx: *ThreadCtx) void {
     const model = ctx.model;
     const api_key = ctx.api_key;
     const request_body = ctx.request_body;
+    const cancel_token = ctx.cancel_token;
+    const on_payload_fn = ctx.on_payload_fn;
+    const on_payload_ctx = ctx.on_payload_ctx;
+
+    // Invoke on_payload callback before sending
+    if (on_payload_fn) |cb| {
+        cb(on_payload_ctx, request_body);
+    }
+
+    // Check cancellation before sending
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -932,6 +956,17 @@ fn runThread(ctx: *ThreadCtx) void {
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
+        // Check cancellation during streaming
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             allocator.free(api_key);
             allocator.free(request_body);
@@ -1212,6 +1247,9 @@ pub fn streamAnthropicMessages(
         .model = model,
         .api_key = api_key,
         .request_body = body,
+        .cancel_token = o.cancel_token,
+        .on_payload_fn = o.on_payload_fn,
+        .on_payload_ctx = o.on_payload_ctx,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});

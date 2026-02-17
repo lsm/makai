@@ -6,6 +6,8 @@ const json_writer = @import("json_writer");
 const github_copilot = @import("github_copilot");
 const tool_call_tracker = @import("tool_call_tracker");
 const provider_caps = @import("provider_caps");
+const sanitize = @import("sanitize");
+const retry = @import("retry");
 
 /// Merged compatibility options from model-level config and detected capabilities
 const MergedCompat = struct {
@@ -119,6 +121,7 @@ fn writeMessagesArray(
     allocator: std.mem.Allocator,
 ) !void {
     const merged = mergeCompat(model);
+    const is_github_copilot = std.mem.eql(u8, model.provider, "github-copilot");
 
     // Find the last user message index for cache_control (OpenRouter + Anthropic)
     const should_add_cache_control = isOpenRouterAnthropic(model);
@@ -146,136 +149,228 @@ fn writeMessagesArray(
         try writer.endObject();
     }
 
-    for (context.messages, 0..) |msg, msg_idx| {
-        const role: []const u8 = switch (msg) {
-            .user => "user",
-            .assistant => "assistant",
-            .tool_result => "tool",
-        };
+    var msg_idx: usize = 0;
+    var prev_role: []const u8 = "";
+    while (msg_idx < context.messages.len) : (msg_idx += 1) {
+        const msg = context.messages[msg_idx];
 
-        try writer.beginObject();
-        try writer.writeStringField("role", role);
-        switch (msg) {
-            .tool_result => |tr| try writer.writeStringField("tool_call_id", tr.tool_call_id),
-            else => {},
+        // Handle user messages
+        if (msg == .user) {
+            const u = msg.user;
+            const is_last_user_msg = should_add_cache_control and last_user_msg_idx != null and msg_idx == last_user_msg_idx.?;
+
+            try writer.beginObject();
+            try writer.writeStringField("role", "user");
+
+            switch (u.content) {
+                .text => |t| {
+                    if (is_last_user_msg) {
+                        try writer.writeKey("content");
+                        try writer.beginArray();
+                        try writer.beginObject();
+                        try writer.writeStringField("type", "text");
+                        try writer.writeStringField("text", t);
+                        try writer.writeKey("cache_control");
+                        try writer.beginObject();
+                        try writer.writeStringField("type", "ephemeral");
+                        try writer.endObject();
+                        try writer.endObject();
+                        try writer.endArray();
+                    } else {
+                        try writer.writeStringField("content", t);
+                    }
+                },
+                .parts => |parts| {
+                    var has_images = false;
+                    for (parts) |p| {
+                        if (p == .image) {
+                            has_images = true;
+                            break;
+                        }
+                    }
+
+                    if (has_images or is_last_user_msg) {
+                        try writer.writeKey("content");
+                        try writer.beginArray();
+                        for (parts, 0..) |p, part_idx| {
+                            const is_last_part = part_idx == parts.len - 1;
+                            switch (p) {
+                                .text => |t| {
+                                    try writer.beginObject();
+                                    try writer.writeStringField("type", "text");
+                                    try writer.writeStringField("text", t.text);
+                                    if (is_last_user_msg and is_last_part) {
+                                        try writer.writeKey("cache_control");
+                                        try writer.beginObject();
+                                        try writer.writeStringField("type", "ephemeral");
+                                        try writer.endObject();
+                                    }
+                                    try writer.endObject();
+                                },
+                                .image => |img| {
+                                    try writeImageUrlPart(writer, img, allocator);
+                                },
+                            }
+                        }
+                        try writer.endArray();
+                    } else {
+                        var text_buf = std.ArrayList(u8){};
+                        defer text_buf.deinit(allocator);
+                        for (parts) |p| {
+                            switch (p) {
+                                .text => |t| {
+                                    if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
+                                    try text_buf.appendSlice(allocator, t.text);
+                                },
+                                .image => {},
+                            }
+                        }
+                        try writer.writeStringField("content", text_buf.items);
+                    }
+                },
+            }
+            try writer.endObject();
+            prev_role = "user";
+            continue;
         }
 
-        // Handle user messages - use array format if images are present
-        // Also add cache_control for the last user message when using OpenRouter + Anthropic
-        const is_last_user_msg = should_add_cache_control and last_user_msg_idx != null and msg_idx == last_user_msg_idx.?;
+        // Handle assistant messages - proper structured serialization
+        if (msg == .assistant) {
+            const a = msg.assistant;
 
-        switch (msg) {
-            .user => |u| {
-                switch (u.content) {
-                    .text => |t| {
-                        if (is_last_user_msg) {
-                            // Use array content format to add cache_control
-                            try writer.writeKey("content");
-                            try writer.beginArray();
+            // Collect text, thinking, and tool_call blocks
+            var has_text = false;
+            var has_thinking = false;
+            var has_tool_calls = false;
+            for (a.content) |c| switch (c) {
+                .text => |t| {
+                    if (t.text.len > 0 and std.mem.trim(u8, t.text, " \t\r\n").len > 0) has_text = true;
+                },
+                .thinking => |t| {
+                    if (t.thinking.len > 0 and std.mem.trim(u8, t.thinking, " \t\r\n").len > 0) has_thinking = true;
+                },
+                .tool_call => {
+                    has_tool_calls = true;
+                },
+            };
+
+            // Skip empty assistant messages (no content and no tool_calls)
+            // Mistral explicitly requires "either content or tool_calls, but not none"
+            if (!has_text and !has_thinking and !has_tool_calls) continue;
+
+            try writer.beginObject();
+            try writer.writeStringField("role", "assistant");
+
+            // Serialize content - text blocks as array of {type: "text", text: ...}
+            if (has_text) {
+                if (is_github_copilot) {
+                    // GitHub Copilot requires content as a flat string
+                    var text_buf = std.ArrayList(u8){};
+                    defer text_buf.deinit(allocator);
+                    for (a.content) |c| switch (c) {
+                        .text => |t| {
+                            if (t.text.len > 0 and std.mem.trim(u8, t.text, " \t\r\n").len > 0) {
+                                if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "");
+                                try text_buf.appendSlice(allocator, t.text);
+                            }
+                        },
+                        else => {},
+                    };
+                    try writer.writeStringField("content", text_buf.items);
+                } else {
+                    try writer.writeKey("content");
+                    try writer.beginArray();
+                    // If thinking needs to be prepended as text (for DeepSeek etc.)
+                    if (has_thinking and merged.requires_thinking_as_text) {
+                        for (a.content) |c| switch (c) {
+                            .thinking => |t| {
+                                if (t.thinking.len > 0 and std.mem.trim(u8, t.thinking, " \t\r\n").len > 0) {
+                                    try writer.beginObject();
+                                    try writer.writeStringField("type", "text");
+                                    try writer.writeStringField("text", t.thinking);
+                                    try writer.endObject();
+                                }
+                            },
+                            else => {},
+                        };
+                    }
+                    for (a.content) |c| switch (c) {
+                        .text => |t| {
+                            if (t.text.len > 0 and std.mem.trim(u8, t.text, " \t\r\n").len > 0) {
+                                try writer.beginObject();
+                                try writer.writeStringField("type", "text");
+                                try writer.writeStringField("text", t.text);
+                                try writer.endObject();
+                            }
+                        },
+                        else => {},
+                    };
+                    try writer.endArray();
+                }
+            } else if (merged.requires_thinking_as_text and has_thinking) {
+                // Only thinking content, converted to text
+                try writer.writeKey("content");
+                try writer.beginArray();
+                for (a.content) |c| switch (c) {
+                    .thinking => |t| {
+                        if (t.thinking.len > 0 and std.mem.trim(u8, t.thinking, " \t\r\n").len > 0) {
                             try writer.beginObject();
                             try writer.writeStringField("type", "text");
-                            try writer.writeStringField("text", t);
-                            try writer.writeKey("cache_control");
-                            try writer.beginObject();
-                            try writer.writeStringField("type", "ephemeral");
+                            try writer.writeStringField("text", t.thinking);
                             try writer.endObject();
-                            try writer.endObject();
-                            try writer.endArray();
-                        } else {
-                            try writer.writeStringField("content", t);
                         }
                     },
-                    .parts => |parts| {
-                        // Check if any parts are images
-                        var has_images = false;
-                        for (parts) |p| {
-                            if (p == .image) {
-                                has_images = true;
-                                break;
-                            }
-                        }
-
-                        if (has_images or is_last_user_msg) {
-                            // Use array content format for multimodal or when adding cache_control
-                            try writer.writeKey("content");
-                            try writer.beginArray();
-                            for (parts, 0..) |p, part_idx| {
-                                const is_last_part = part_idx == parts.len - 1;
-                                switch (p) {
-                                    .text => |t| {
-                                        try writer.beginObject();
-                                        try writer.writeStringField("type", "text");
-                                        try writer.writeStringField("text", t.text);
-                                        // Add cache_control to the last text part of the last user message
-                                        if (is_last_user_msg and is_last_part) {
-                                            try writer.writeKey("cache_control");
-                                            try writer.beginObject();
-                                            try writer.writeStringField("type", "ephemeral");
-                                            try writer.endObject();
-                                        }
-                                        try writer.endObject();
-                                    },
-                                    .image => |img| {
-                                        try writer.beginObject();
-                                        try writer.writeStringField("type", "image_url");
-                                        try writer.writeKey("image_url");
-                                        try writer.beginObject();
-                                        // Build data URL: "data:{mime_type};base64,{data}"
-                                        try writer.writeKey("url");
-                                        try writer.buffer.appendSlice(allocator, "\"data:");
-                                        try writer.buffer.appendSlice(allocator, img.mime_type);
-                                        try writer.buffer.appendSlice(allocator, ";base64,");
-                                        try writer.buffer.appendSlice(allocator, img.data);
-                                        try writer.buffer.append(allocator, '"');
-                                        writer.needs_comma = true;
-                                        try writer.endObject();
-                                        try writer.endObject();
-                                    },
-                                }
-                            }
-                            try writer.endArray();
-                        } else {
-                            // Text-only parts: concatenate as simple string
-                            var text_buf = std.ArrayList(u8){};
-                            defer text_buf.deinit(allocator);
-                            for (parts) |p| {
-                                switch (p) {
-                                    .text => |t| {
-                                        if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
-                                        try text_buf.appendSlice(allocator, t.text);
-                                    },
-                                    .image => {},
-                                }
-                            }
-                            try writer.writeStringField("content", text_buf.items);
-                        }
-                    },
-                }
-            },
-            else => {
-                // For assistant and tool_result messages, use text extraction
-                var text_buf = std.ArrayList(u8){};
-                defer text_buf.deinit(allocator);
-                try appendTextContent(msg, &text_buf, allocator);
-                try writer.writeStringField("content", text_buf.items);
-            },
-        }
-
-        // Check for tool_calls on assistant messages
-        if (msg == .assistant) {
-            var has_tool_calls = false;
-            for (msg.assistant.content) |c| {
-                if (c == .tool_call) {
-                    has_tool_calls = true;
-                    break;
+                    else => {},
+                };
+                try writer.endArray();
+            } else {
+                // No text content - null or empty based on compat
+                if (merged.requires_thinking_as_text) {
+                    try writer.writeStringField("content", "");
+                } else {
+                    try writer.writeKey("content");
+                    try writer.writeNull();
                 }
             }
+
+            // Serialize thinking as reasoning_content field (separate from content)
+            // Only if not already converted to text above
+            if (has_thinking and !merged.requires_thinking_as_text) {
+                // Use the signature from the first thinking block for round-trip
+                var reasoning_field: []const u8 = "reasoning_content";
+                for (a.content) |c| switch (c) {
+                    .thinking => |t| {
+                        if (t.thinking_signature) |sig| {
+                            if (sig.len > 0) reasoning_field = sig;
+                        }
+                        break;
+                    },
+                    else => {},
+                };
+
+                // Collect all thinking text
+                var thinking_buf = std.ArrayList(u8){};
+                defer thinking_buf.deinit(allocator);
+                for (a.content) |c| switch (c) {
+                    .thinking => |t| {
+                        if (t.thinking.len > 0 and std.mem.trim(u8, t.thinking, " \t\r\n").len > 0) {
+                            if (thinking_buf.items.len > 0) try thinking_buf.append(allocator, '\n');
+                            try thinking_buf.appendSlice(allocator, t.thinking);
+                        }
+                    },
+                    else => {},
+                };
+                if (thinking_buf.items.len > 0) {
+                    try writer.writeStringField(reasoning_field, thinking_buf.items);
+                }
+            }
+
+            // Serialize tool_calls
             if (has_tool_calls) {
                 try writer.writeKey("tool_calls");
                 try writer.beginArray();
-                for (msg.assistant.content) |c| {
-                    if (c == .tool_call) {
-                        const tc = c.tool_call;
+                for (a.content) |c| switch (c) {
+                    .tool_call => |tc| {
                         try writer.beginObject();
                         try writer.writeStringField("id", tc.id);
                         try writer.writeStringField("type", "function");
@@ -285,16 +380,123 @@ fn writeMessagesArray(
                         try writer.writeStringField("arguments", tc.arguments_json);
                         try writer.endObject();
                         try writer.endObject();
-                    }
-                }
+                    },
+                    else => {},
+                };
                 try writer.endArray();
             }
+
+            try writer.endObject();
+            prev_role = "assistant";
+            continue;
         }
 
-        try writer.endObject();
+        // Handle tool_result messages - group consecutive ones, extract images
+        if (msg == .tool_result) {
+            // Collect image blocks from all consecutive tool results
+            var image_blocks = std.ArrayList(ai_types.UserContentPart){};
+            defer image_blocks.deinit(allocator);
+
+            // Process consecutive tool_result messages
+            while (msg_idx < context.messages.len and context.messages[msg_idx] == .tool_result) {
+                const tr = context.messages[msg_idx].tool_result;
+
+                // Insert synthetic assistant message if required (Mistral compat)
+                if (merged.requires_assistant_after_tool_result and std.mem.eql(u8, prev_role, "tool")) {
+                    try writer.beginObject();
+                    try writer.writeStringField("role", "assistant");
+                    try writer.writeStringField("content", "");
+                    try writer.endObject();
+                }
+
+                // Extract text content
+                var text_buf = std.ArrayList(u8){};
+                defer text_buf.deinit(allocator);
+                var has_images = false;
+                for (tr.content) |c| switch (c) {
+                    .text => |t| {
+                        if (text_buf.items.len > 0) try text_buf.append(allocator, '\n');
+                        try text_buf.appendSlice(allocator, t.text);
+                    },
+                    .image => {
+                        has_images = true;
+                    },
+                };
+
+                // Write tool result message
+                try writer.beginObject();
+                try writer.writeStringField("role", "tool");
+                try writer.writeStringField("tool_call_id", tr.tool_call_id);
+                if (merged.requires_tool_result_name) {
+                    try writer.writeStringField("name", tr.tool_name);
+                }
+                const content_str = if (text_buf.items.len > 0) text_buf.items else if (has_images) "(see attached image)" else "";
+                try writer.writeStringField("content", content_str);
+                try writer.endObject();
+                prev_role = "tool";
+
+                // Collect images for separate user message
+                if (has_images) {
+                    for (tr.content) |c| switch (c) {
+                        .image => |img| {
+                            try image_blocks.append(allocator, .{ .image = img });
+                        },
+                        else => {},
+                    };
+                }
+
+                msg_idx += 1;
+            }
+            // Back up one since the outer while will increment
+            msg_idx -= 1;
+
+            // If we collected images, send them as a separate user message
+            if (image_blocks.items.len > 0) {
+                // May need synthetic assistant before user message
+                if (merged.requires_assistant_after_tool_result) {
+                    try writer.beginObject();
+                    try writer.writeStringField("role", "assistant");
+                    try writer.writeStringField("content", "");
+                    try writer.endObject();
+                }
+
+                try writer.beginObject();
+                try writer.writeStringField("role", "user");
+                try writer.writeKey("content");
+                try writer.beginArray();
+                for (image_blocks.items) |img_part| switch (img_part) {
+                    .image => |img| {
+                        try writeImageUrlPart(writer, img, allocator);
+                    },
+                    else => {},
+                };
+                try writer.endArray();
+                try writer.endObject();
+                prev_role = "user";
+            }
+
+            continue;
+        }
     }
 
     try writer.endArray();
+}
+
+/// Write an image_url content part
+fn writeImageUrlPart(writer: *json_writer.JsonWriter, img: ai_types.ImageContent, allocator: std.mem.Allocator) !void {
+    try writer.beginObject();
+    try writer.writeStringField("type", "image_url");
+    try writer.writeKey("image_url");
+    try writer.beginObject();
+    try writer.writeKey("url");
+    try writer.buffer.appendSlice(allocator, "\"data:");
+    try writer.buffer.appendSlice(allocator, img.mime_type);
+    try writer.buffer.appendSlice(allocator, ";base64,");
+    try writer.buffer.appendSlice(allocator, img.data);
+    try writer.buffer.append(allocator, '"');
+    writer.needs_comma = true;
+    try writer.endObject();
+    try writer.endObject();
 }
 
 fn buildRequestBody(
@@ -392,6 +594,9 @@ const ThreadCtx = struct {
     api_key: []const u8,
     request_body: []u8,
     context: ai_types.Context,
+    cancel_token: ?ai_types.CancelToken = null,
+    on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 /// Current block type being parsed
@@ -606,6 +811,25 @@ fn runThread(ctx: *ThreadCtx) void {
     const api_key = ctx.api_key;
     const request_body = ctx.request_body;
     const context = ctx.context;
+    const cancel_token = ctx.cancel_token;
+    const on_payload_fn = ctx.on_payload_fn;
+    const on_payload_ctx = ctx.on_payload_ctx;
+
+    // Invoke on_payload callback before sending
+    if (on_payload_fn) |cb| {
+        cb(on_payload_ctx, request_body);
+    }
+
+    // Check cancellation before sending
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -769,6 +993,17 @@ fn runThread(ctx: *ThreadCtx) void {
     }) catch {};
 
     while (true) {
+        // Check cancellation during streaming
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             allocator.free(api_key);
             allocator.free(request_body);
@@ -1067,6 +1302,9 @@ pub fn streamOpenAICompletions(
         .api_key = @constCast(api_key),
         .request_body = req_body,
         .context = context,
+        .cancel_token = resolved.cancel_token,
+        .on_payload_fn = resolved.on_payload_fn,
+        .on_payload_ctx = resolved.on_payload_ctx,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});

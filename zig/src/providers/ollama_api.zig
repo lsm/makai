@@ -2,6 +2,8 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const json_writer = @import("json_writer");
+const sanitize = @import("sanitize");
+const retry_util = @import("retry");
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
@@ -356,6 +358,9 @@ const ThreadCtx = struct {
     base_url: []u8,
     api_key: ?[]u8,
     body: []u8,
+    cancel_token: ?ai_types.CancelToken = null,
+    on_payload_fn: ?*const fn (on_ctx: ?*anyopaque, payload_json: []const u8) void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 /// Create a partial message for events (references model strings directly, no allocation)
@@ -379,6 +384,26 @@ fn runThread(ctx: *ThreadCtx) void {
     const base_url = ctx.base_url;
     const api_key = ctx.api_key;
     const body = ctx.body;
+    const cancel_token = ctx.cancel_token;
+    const on_payload_fn = ctx.on_payload_fn;
+    const on_payload_ctx = ctx.on_payload_ctx;
+
+    // Invoke on_payload callback before sending
+    if (on_payload_fn) |cb| {
+        cb(on_payload_ctx, body);
+    }
+
+    // Check cancellation before sending
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(base_url);
+            if (api_key) |k| allocator.free(k);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -497,6 +522,18 @@ fn runThread(ctx: *ThreadCtx) void {
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
+        // Check cancellation during streaming
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(base_url);
+                if (api_key) |k| allocator.free(k);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             allocator.free(base_url);
             if (api_key) |k| allocator.free(k);
@@ -894,6 +931,9 @@ pub fn streamOllama(
         .base_url = base_url,
         .api_key = api_key,
         .body = body,
+        .cancel_token = o.cancel_token,
+        .on_payload_fn = o.on_payload_fn,
+        .on_payload_ctx = o.on_payload_ctx,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
