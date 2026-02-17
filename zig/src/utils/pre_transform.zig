@@ -141,6 +141,10 @@ pub const TransformResult = struct {
                         if (tc.arguments_json.len > 0) self.allocator.free(tc.arguments_json);
                         if (tc.thought_signature) |s| self.allocator.free(s);
                     },
+                    .image => |img| {
+                        self.allocator.free(img.data);
+                        self.allocator.free(img.mime_type);
+                    },
                 }
             }
             self.allocator.free(content);
@@ -331,6 +335,12 @@ pub fn preTransform(
 
                             // Track pending tool calls
                             try pending_tool_calls.append(allocator, .{ .id = normalized_id, .name = normalized_name });
+                        },
+                        .image => |img| {
+                            try new_content.append(allocator, .{ .image = .{
+                                .data = try allocator.dupe(u8, img.data),
+                                .mime_type = try allocator.dupe(u8, img.mime_type),
+                            } });
                         },
                     }
                 }

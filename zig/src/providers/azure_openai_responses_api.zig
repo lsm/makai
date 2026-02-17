@@ -140,6 +140,7 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                             try w.writeStringField("arguments", tc.arguments_json);
                             try w.endObject();
                         },
+                        .image => {},
                     }
                 }
             },
@@ -220,6 +221,7 @@ const ThreadCtx = struct {
     api_key: []u8,
     base_url: []u8,
     body: []u8,
+    ping_interval_ms: ?u64 = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -296,7 +298,20 @@ fn runThread(ctx: *ThreadCtx) void {
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
+    // Ping tracking
+    var last_ping_time: i64 = 0;
+    const ping_interval = ctx.ping_interval_ms orelse 0;
+
     while (true) {
+        // Emit ping if interval is configured
+        if (ping_interval > 0) {
+            const now = std.time.milliTimestamp();
+            if (now - last_ping_time >= ping_interval) {
+                ctx.stream.push(.{ .ping = {} }) catch {};
+                last_ping_time = now;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             ctx.stream.markThreadDone();
             ctx.stream.completeWithError("read failed");
@@ -387,7 +402,7 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .base_url = base_url, .body = body };
+    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .base_url = base_url, .body = body, .ping_interval_ms = o.ping_interval_ms };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();

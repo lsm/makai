@@ -463,6 +463,17 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         try w.writeRawJson(tc.arguments_json);
                         try w.endObject();
                     },
+                    .image => |img| {
+                        try w.beginObject();
+                        try w.writeStringField("type", "image");
+                        try w.writeKey("source");
+                        try w.beginObject();
+                        try w.writeStringField("type", "base64");
+                        try w.writeStringField("media_type", img.mime_type);
+                        try w.writeStringField("data", img.data);
+                        try w.endObject();
+                        try w.endObject();
+                    },
                 }
             }
 
@@ -649,6 +660,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 }
                             },
                             .tool_call => {},
+                            .image => {},
                         }
                     }
                     try w.endArray();
@@ -936,6 +948,7 @@ const ThreadCtx = struct {
     on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
     retry: ?ai_types.RetryConfig = null,
+    ping_interval_ms: ?u64 = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -1310,11 +1323,24 @@ fn runThread(ctx: *ThreadCtx) void {
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
+    // Ping tracking
+    var last_ping_time: i64 = 0;
+    const ping_interval = ctx.ping_interval_ms orelse 0;
+
     // Emit start event with partial message
     const partial_start = createPartialMessage(model);
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
+        // Emit ping if interval is configured
+        if (ping_interval > 0) {
+            const now = std.time.milliTimestamp();
+            if (now - last_ping_time >= ping_interval) {
+                stream.push(.{ .ping = {} }) catch {};
+                last_ping_time = now;
+            }
+        }
+
         // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
@@ -1622,6 +1648,7 @@ pub fn streamAnthropicMessages(
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
         .retry = o.retry,
+        .ping_interval_ms = o.ping_interval_ms,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});

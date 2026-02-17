@@ -105,6 +105,8 @@ pub const StreamOptions = struct {
     tool_choice: ?ToolChoice = null,
     /// HTTP connection timeout in milliseconds (default: 30s)
     http_timeout_ms: ?u64 = 30_000,
+    /// Ping interval in milliseconds for streaming keepalive
+    ping_interval_ms: ?u64 = null,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -151,6 +153,7 @@ pub const AssistantContent = union(enum) {
     text: TextContent,
     thinking: ThinkingContent,
     tool_call: ToolCall,
+    image: ImageContent,
 };
 
 pub const UserContentPart = union(enum) {
@@ -226,6 +229,10 @@ pub const AssistantMessage = struct {
                     // Only free non-empty arguments_json - empty slices may be static
                     if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
                     if (tc.thought_signature) |s| allocator.free(s);
+                },
+                .image => |img| {
+                    allocator.free(img.data);
+                    allocator.free(img.mime_type);
                 },
             }
         }
@@ -332,6 +339,7 @@ pub const AssistantMessageEvent = union(enum) {
     toolcall_end: struct { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
     done: struct { reason: StopReason, message: AssistantMessage },
     @"error": struct { reason: StopReason, err: AssistantMessage },
+    ping: void,
 };
 
 pub const AssistantMessageEventStream = event_stream.EventStream(AssistantMessageEvent, AssistantMessage);
@@ -357,6 +365,10 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
                     allocator.free(tc.arguments_json);
                     if (tc.thought_signature) |s| allocator.free(s);
                 },
+                .image => |img| {
+                    allocator.free(img.data);
+                    allocator.free(img.mime_type);
+                },
             }
         }
         allocator.free(content);
@@ -377,6 +389,10 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
                 .name = try allocator.dupe(u8, tc.name),
                 .arguments_json = try allocator.dupe(u8, tc.arguments_json),
                 .thought_signature = if (tc.thought_signature) |s| try allocator.dupe(u8, s) else null,
+            } },
+            .image => |img| .{ .image = .{
+                .data = try allocator.dupe(u8, img.data),
+                .mime_type = try allocator.dupe(u8, img.mime_type),
             } },
         };
         cloned_count += 1;

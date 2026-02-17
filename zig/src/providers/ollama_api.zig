@@ -98,6 +98,7 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
                 try out.appendSlice(allocator, t.thinking);
             },
             .tool_call => {},
+            .image => {},
         },
         .tool_result => |tr| for (tr.content) |c| switch (c) {
             .text => |t| {
@@ -467,6 +468,7 @@ const ThreadCtx = struct {
     on_payload_fn: ?*const fn (on_ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
     retry_config: ?ai_types.RetryConfig = null,
+    ping_interval_ms: ?u64 = null,
 };
 
 /// Create a partial message for events (references model strings directly, no allocation)
@@ -783,11 +785,24 @@ fn runThread(ctx: *ThreadCtx) void {
     var tool_call_counter: usize = 0;
     var has_tool_calls = false;
 
+    // Ping tracking
+    var last_ping_time: i64 = 0;
+    const ping_interval = ctx.ping_interval_ms orelse 0;
+
     // Emit start event
     const partial_start = createPartialMessage(model);
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
+        // Emit ping if interval is configured
+        if (ping_interval > 0) {
+            const now = std.time.milliTimestamp();
+            if (now - last_ping_time >= ping_interval) {
+                stream.push(.{ .ping = {} }) catch {};
+                last_ping_time = now;
+            }
+        }
+
         // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
@@ -1206,6 +1221,7 @@ pub fn streamOllama(
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
         .retry_config = o.retry,
+        .ping_interval_ms = o.ping_interval_ms,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
