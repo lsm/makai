@@ -217,6 +217,11 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         if (t.text.len > 0) {
                             try w.beginObject();
                             try w.writeStringField("text", t.text);
+                            if (t.text_signature) |sig| {
+                                if (sig.len > 0) {
+                                    try w.writeStringField("thoughtSignature", sig);
+                                }
+                            }
                             try w.endObject();
                         }
                     },
@@ -224,6 +229,12 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         if (t.thinking.len > 0) {
                             try w.beginObject();
                             try w.writeStringField("text", t.thinking);
+                            try w.writeBoolField("thought", true);
+                            if (t.thinking_signature) |sig| {
+                                if (sig.len > 0) {
+                                    try w.writeStringField("thoughtSignature", sig);
+                                }
+                            }
                             try w.endObject();
                         }
                     },
@@ -235,6 +246,11 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         try w.writeKey("args");
                         try w.writeRawJson(tc.arguments_json);
                         try w.endObject();
+                        if (tc.thought_signature) |sig| {
+                            if (sig.len > 0) {
+                                try w.writeStringField("thoughtSignature", sig);
+                            }
+                        }
                         try w.endObject();
                     },
                 };

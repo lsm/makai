@@ -3,6 +3,8 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
+const sanitize = @import("sanitize");
+const retry_util = @import("retry");
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
@@ -140,6 +142,12 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         if (t.text.len > 0) {
                             try w.beginObject();
                             try w.writeStringField("text", t.text);
+                            // Preserve thoughtSignature on text parts for round-trip
+                            if (t.text_signature) |sig| {
+                                if (sig.len > 0) {
+                                    try w.writeStringField("thoughtSignature", sig);
+                                }
+                            }
                             try w.endObject();
                         }
                     },
@@ -147,6 +155,13 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         if (t.thinking.len > 0) {
                             try w.beginObject();
                             try w.writeStringField("text", t.thinking);
+                            try w.writeBoolField("thought", true);
+                            // Preserve thoughtSignature for round-trip
+                            if (t.thinking_signature) |sig| {
+                                if (sig.len > 0) {
+                                    try w.writeStringField("thoughtSignature", sig);
+                                }
+                            }
                             try w.endObject();
                         }
                     },
@@ -158,6 +173,12 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         try w.writeKey("args");
                         try w.writeRawJson(tc.arguments_json);
                         try w.endObject();
+                        // Preserve thoughtSignature on tool calls for round-trip
+                        if (tc.thought_signature) |sig| {
+                            if (sig.len > 0) {
+                                try w.writeStringField("thoughtSignature", sig);
+                            }
+                        }
                         try w.endObject();
                     },
                 };
@@ -556,6 +577,9 @@ const ThreadCtx = struct {
     body: []u8,
     base_url: []u8,
     thinking_enabled: bool,
+    cancel_token: ?ai_types.CancelToken = null,
+    on_payload_fn: ?*const fn (on_ctx: ?*anyopaque, payload_json: []const u8) void = null,
+    on_payload_ctx: ?*anyopaque = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -567,6 +591,26 @@ fn runThread(ctx: *ThreadCtx) void {
     const body = ctx.body;
     const base_url = ctx.base_url;
     const thinking_enabled = ctx.thinking_enabled;
+    const cancel_token = ctx.cancel_token;
+    const on_payload_fn = ctx.on_payload_fn;
+    const on_payload_ctx = ctx.on_payload_ctx;
+
+    // Invoke on_payload callback before sending
+    if (on_payload_fn) |cb| {
+        cb(on_payload_ctx, body);
+    }
+
+    // Check cancellation before sending
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(base_url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -664,6 +708,18 @@ fn runThread(ctx: *ThreadCtx) void {
     stream.push(.{ .start = .{ .partial = partial_start } }) catch {};
 
     while (true) {
+        // Check cancellation during streaming
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(base_url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
         const n = reader.*.readSliceShort(&read_buf) catch {
             allocator.free(base_url);
             allocator.free(api_key);
@@ -1050,7 +1106,18 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .base_url = base_url, .thinking_enabled = o.thinking_enabled };
+    ctx.* = .{
+        .allocator = allocator,
+        .stream = s,
+        .model = model,
+        .api_key = api_key,
+        .body = body,
+        .base_url = base_url,
+        .thinking_enabled = o.thinking_enabled,
+        .cancel_token = o.cancel_token,
+        .on_payload_fn = o.on_payload_fn,
+        .on_payload_ctx = o.on_payload_ctx,
+    };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();
