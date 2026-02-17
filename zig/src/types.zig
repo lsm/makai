@@ -46,6 +46,19 @@ pub const ImageBlock = struct {
     data: []const u8, // base64 encoded
 };
 
+// Tool result content - supports text or images in tool results
+pub const ToolResultContent = union(enum) {
+    text: []const u8,
+    image: ImageBlock,
+};
+
+// Tool result block - represents a tool/function call result
+pub const ToolResultBlock = struct {
+    tool_call_id: []const u8,
+    content: []const ToolResultContent, // Supports text and images
+    is_error: bool = false,
+};
+
 // ContentBlock - tagged union
 pub const ContentBlock = union(enum) {
     text: TextBlock,
@@ -360,4 +373,58 @@ test "Message defaults backward compatible" {
     try std.testing.expect(msg.tool_name == null);
     try std.testing.expect(!msg.is_error);
     try std.testing.expect(msg.tool_call_id == null);
+}
+
+test "ToolResultContent text variant" {
+    const content = ToolResultContent{ .text = "Tool executed successfully" };
+    try std.testing.expect(std.meta.activeTag(content) == .text);
+    try std.testing.expectEqualStrings("Tool executed successfully", content.text);
+}
+
+test "ToolResultContent image variant" {
+    const content = ToolResultContent{ .image = ImageBlock{
+        .media_type = "image/png",
+        .data = "iVBORw0KGgo=",
+    } };
+    try std.testing.expect(std.meta.activeTag(content) == .image);
+    try std.testing.expectEqualStrings("image/png", content.image.media_type);
+}
+
+test "ToolResultBlock with text content" {
+    const result = ToolResultBlock{
+        .tool_call_id = "call_123",
+        .content = &[_]ToolResultContent{
+            ToolResultContent{ .text = "Result text" },
+        },
+        .is_error = false,
+    };
+    try std.testing.expectEqualStrings("call_123", result.tool_call_id);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+}
+
+test "ToolResultBlock with mixed content" {
+    const contents = [_]ToolResultContent{
+        ToolResultContent{ .text = "Here is the screenshot:" },
+        ToolResultContent{ .image = ImageBlock{ .media_type = "image/png", .data = "abc123" } },
+    };
+    const result = ToolResultBlock{
+        .tool_call_id = "call_456",
+        .content = &contents,
+        .is_error = false,
+    };
+    try std.testing.expectEqual(@as(usize, 2), result.content.len);
+    try std.testing.expect(std.meta.activeTag(result.content[0]) == .text);
+    try std.testing.expect(std.meta.activeTag(result.content[1]) == .image);
+}
+
+test "ToolResultBlock error case" {
+    const result = ToolResultBlock{
+        .tool_call_id = "call_789",
+        .content = &[_]ToolResultContent{
+            ToolResultContent{ .text = "Error: File not found" },
+        },
+        .is_error = true,
+    };
+    try std.testing.expect(result.is_error);
 }
