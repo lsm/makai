@@ -682,6 +682,7 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(ctx);
+        stream.markThreadDone();
         stream.completeWithError("oom url");
         return;
     };
@@ -693,6 +694,7 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(ctx);
+        stream.markThreadDone();
         stream.completeWithError("invalid URL");
         return;
     };
@@ -731,6 +733,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(api_key);
                 allocator.free(body);
                 allocator.destroy(ctx);
+                stream.markThreadDone();
                 stream.completeWithError("request failed");
                 return;
             }
@@ -739,6 +742,7 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(api_key);
             allocator.free(body);
             allocator.destroy(ctx);
+            stream.markThreadDone();
             stream.completeWithError("request failed");
             return;
         };
@@ -758,6 +762,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(api_key);
                 allocator.free(body);
                 allocator.destroy(ctx);
+                stream.markThreadDone();
                 stream.completeWithError("send failed");
                 return;
             }
@@ -766,6 +771,7 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(api_key);
             allocator.free(body);
             allocator.destroy(ctx);
+            stream.markThreadDone();
             stream.completeWithError("send failed");
             return;
         };
@@ -783,6 +789,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(api_key);
                 allocator.free(body);
                 allocator.destroy(ctx);
+                stream.markThreadDone();
                 stream.completeWithError("receive failed");
                 return;
             }
@@ -791,6 +798,7 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(api_key);
             allocator.free(body);
             allocator.destroy(ctx);
+            stream.markThreadDone();
             stream.completeWithError("receive failed");
             return;
         };
@@ -851,6 +859,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(api_key);
                 allocator.free(body);
                 allocator.destroy(ctx);
+                stream.markThreadDone();
                 stream.completeWithError("vertex request failed");
                 return;
             }
@@ -870,6 +879,7 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(ctx);
+        stream.markThreadDone();
         stream.completeWithError("vertex request failed");
         return;
     }
@@ -908,6 +918,7 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(api_key);
             allocator.free(body);
             allocator.destroy(ctx);
+            stream.markThreadDone();
             stream.completeWithError("read failed");
             return;
         };
@@ -919,6 +930,7 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(api_key);
             allocator.free(body);
             allocator.destroy(ctx);
+            stream.markThreadDone();
             stream.completeWithError("parse failed");
             return;
         };
@@ -1210,6 +1222,7 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(ctx);
+        stream.markThreadDone();
         stream.completeWithError("oom content");
         return;
     };
@@ -1232,6 +1245,7 @@ fn runThread(ctx: *ThreadCtx) void {
     allocator.free(body);
     allocator.destroy(ctx);
 
+    stream.markThreadDone();
     stream.complete(out);
 }
 

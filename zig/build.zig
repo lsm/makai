@@ -111,6 +111,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const test_helpers_mod = b.createModule(.{
+        .root_source_file = b.path("test/e2e/test_helpers.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "types", .module = types_mod },
+            .{ .name = "retry", .module = retry_mod },
+        },
+    });
+
     const oauth_pkce_mod = b.createModule(.{
         .root_source_file = b.path("src/oauth/pkce.zig"),
         .target = target,
@@ -336,6 +346,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
             },
         }),
     });
@@ -350,6 +361,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
             },
         }),
     });
@@ -364,6 +376,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
             },
         }),
     });
@@ -378,6 +391,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
             },
         }),
     });
@@ -392,6 +406,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
             },
         }),
     });

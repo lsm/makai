@@ -92,7 +92,11 @@ test "anthropic: streaming events sequence" {
     var saw_text_delta = false;
     var saw_done = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -159,7 +163,11 @@ test "anthropic: thinking mode" {
 
     var saw_thinking = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -236,7 +244,11 @@ test "anthropic: tool calling" {
 
     var saw_tool_call = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -301,7 +313,11 @@ test "anthropic: abort mid-stream" {
     var event_count: usize = 0;
     const max_events = 5;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
             event_count += 1;
@@ -359,7 +375,11 @@ test "anthropic: usage tracking" {
         testing.allocator.destroy(stream);
     }
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.completed.load(.acquire)) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
         }

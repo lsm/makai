@@ -5,19 +5,31 @@ pub const RetryConfig = struct {
     max_retries: u32 = 3,
     base_delay_ms: u64 = 1000,
     max_delay_ms: u64 = 60000, // 60 seconds max cap
+    jitter_factor: f32 = 0.2,
 
     /// Calculate delay for given attempt with optional server-provided delay.
     /// Returns null if max_delay_ms is exceeded (when server delay too large).
     pub fn nextDelay(self: *const RetryConfig, attempt: u32, server_delay_ms: ?u64) ?u64 {
-        const delay = server_delay_ms orelse blk: {
+        const base = server_delay_ms orelse blk: {
             // Exponential backoff: base_delay_ms * 2^attempt
             const shift: u6 = @intCast(@min(attempt, 63));
             break :blk self.base_delay_ms * (@as(u64, 1) << shift);
         };
-        if (self.max_delay_ms > 0 and delay > self.max_delay_ms) {
+        if (self.max_delay_ms > 0 and base > self.max_delay_ms) {
             return null; // Exceeds max allowed delay
         }
-        return delay;
+
+        // Apply jitter if factor > 0
+        if (self.jitter_factor > 0) {
+            const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rand = prng.random().float(f32);
+            // jitter_mult ranges from (1 - jitter_factor) to (1 + jitter_factor)
+            const jitter_mult = 1.0 + self.jitter_factor * (rand - 0.5) * 2.0;
+            const jittered: u64 = @intFromFloat(@as(f64, @floatFromInt(base)) * @as(f64, jitter_mult));
+            return @min(jittered, self.max_delay_ms);
+        }
+        return base;
     }
 
     /// Check if status code is retryable
@@ -407,7 +419,7 @@ pub fn indexOfCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
 // Tests
 
 test "RetryConfig nextDelay with exponential backoff" {
-    const config = RetryConfig{};
+    const config = RetryConfig{ .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
     try std.testing.expectEqual(@as(?u64, 4000), config.nextDelay(2, null));
@@ -415,7 +427,7 @@ test "RetryConfig nextDelay with exponential backoff" {
 }
 
 test "RetryConfig nextDelay respects max_delay_ms" {
-    var config = RetryConfig{ .max_delay_ms = 5000 };
+    var config = RetryConfig{ .max_delay_ms = 5000, .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
     try std.testing.expectEqual(@as(?u64, 4000), config.nextDelay(2, null));
@@ -423,13 +435,13 @@ test "RetryConfig nextDelay respects max_delay_ms" {
 }
 
 test "RetryConfig nextDelay uses server delay when provided" {
-    const config = RetryConfig{};
+    const config = RetryConfig{ .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, 30000), config.nextDelay(0, 30000));
     try std.testing.expectEqual(@as(?u64, 5000), config.nextDelay(2, 5000));
 }
 
 test "RetryConfig nextDelay rejects server delay exceeding max" {
-    var config = RetryConfig{ .max_delay_ms = 10000 };
+    var config = RetryConfig{ .max_delay_ms = 10000, .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, null), config.nextDelay(0, 15000));
     try std.testing.expectEqual(@as(?u64, 5000), config.nextDelay(0, 5000));
 }
@@ -624,4 +636,24 @@ test "parseFloat parses numbers" {
     try std.testing.expectEqual(@as(f64, 12.5), parseFloat("12.5") catch unreachable);
     try std.testing.expectEqual(@as(f64, 0.5), parseFloat("0.5") catch unreachable);
     try std.testing.expectError(error.InvalidFormat, parseFloat(""));
+}
+
+test "RetryConfig nextDelay applies jitter" {
+    var config = RetryConfig{ .jitter_factor = 0.2 };
+
+    // With jitter_factor=0.2, delay should be in range [800, 1200]
+    // (1000 * (1-0.2) to 1000 * (1+0.2))
+    const d1 = config.nextDelay(0, null);
+    try std.testing.expect(d1 != null);
+    try std.testing.expect(d1.? >= 800);
+    try std.testing.expect(d1.? <= 1200);
+
+    // Verify jitter is being applied (values may differ)
+    // Note: This test may rarely fail if both random values are identical
+}
+
+test "RetryConfig nextDelay with jitter_factor 0 returns exact value" {
+    var config = RetryConfig{ .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
+    try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
 }

@@ -1,5 +1,77 @@
 const std = @import("std");
 const types = @import("types");
+const retry = @import("retry");
+
+/// Default E2E test timeout (60 seconds)
+pub const DEFAULT_E2E_TIMEOUT_MS: u64 = 60_000;
+
+/// Create a deadline timestamp from now + timeout_ms
+pub fn createDeadline(timeout_ms: u64) i64 {
+    return std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+}
+
+/// Check if deadline has passed
+pub fn isDeadlineExceeded(deadline: i64) bool {
+    return std.time.milliTimestamp() > deadline;
+}
+
+/// Wait for stream completion with timeout
+/// Returns error.TimeoutExceeded if deadline passes
+pub fn waitForStreamCompletion(stream: anytype, timeout_ms: u64) !void {
+    const deadline = createDeadline(timeout_ms);
+    while (!stream.completed.load(.acquire)) {
+        if (isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+}
+
+pub const RetryTestConfig = struct {
+    max_retries: u32 = 3,
+    base_delay_ms: u64 = 1000,
+};
+
+/// Run a test function with retries on transient errors
+pub fn runWithRetries(
+    comptime test_fn: fn (std.mem.Allocator) anyerror!void,
+    allocator: std.mem.Allocator,
+    config: RetryTestConfig,
+) !void {
+    const retryable_errors = [_]anyerror{
+        error.TimeoutExceeded,
+        error.ConnectionRefused,
+        error.NetworkUnreachable,
+        error.StreamError,
+    };
+
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        test_fn(allocator) catch |err| {
+            // Check if retryable
+            const is_retryable = blk: {
+                for (retryable_errors) |re| {
+                    if (err == re) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (is_retryable and attempt < config.max_retries) {
+                // Use exponential backoff for delay
+                const shift: u6 = @intCast(@min(attempt, 10));
+                const delay: u64 = config.base_delay_ms * (@as(u64, 1) << shift);
+                const capped_delay = @min(delay, 30000); // Cap at 30s
+                std.debug.print("\n  Retry {}/{} after {}ms (error: {})\n", .{
+                    attempt + 1, config.max_retries, capped_delay, err
+                });
+                std.Thread.sleep(capped_delay * std.time.ns_per_ms);
+                continue;
+            }
+            return err;
+        };
+        return;
+    }
+}
 
 /// Print a test start message (cyan color for visibility)
 pub fn testStart(test_name: []const u8) void {
@@ -780,13 +852,17 @@ pub fn basicTextGeneration(
     var accumulator = EventAccumulator.init(allocator);
     defer accumulator.deinit();
 
-    // Poll events
+    // Poll events with timeout
+    const deadline = createDeadline(DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
         } else {
             if (stream.completed.load(.acquire)) {
                 break;
+            }
+            if (isDeadlineExceeded(deadline)) {
+                return error.TimeoutExceeded;
             }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }

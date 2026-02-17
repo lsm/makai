@@ -85,6 +85,7 @@ test "openai: streaming events sequence" {
     var saw_text_delta = false;
     var saw_done = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
@@ -97,6 +98,9 @@ test "openai: streaming events sequence" {
             }
         } else {
             if (stream.completed.load(.acquire)) break;
+            if (test_helpers.isDeadlineExceeded(deadline)) {
+                return error.TimeoutExceeded;
+            }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
@@ -167,6 +171,7 @@ test "openai: abort mid-stream" {
     var event_count: usize = 0;
     const max_events = 5;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
@@ -177,6 +182,9 @@ test "openai: abort mid-stream" {
             }
         } else {
             if (stream.completed.load(.acquire)) break;
+            if (test_helpers.isDeadlineExceeded(deadline)) {
+                return error.TimeoutExceeded;
+            }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
@@ -221,7 +229,11 @@ test "openai: usage tracking" {
         testing.allocator.destroy(stream);
     }
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.completed.load(.acquire)) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
         }
