@@ -1018,6 +1018,9 @@ fn runThread(ctx: *ThreadCtx) void {
     var response: std.http.Client.Response = undefined;
     var head_buf: [4096]u8 = undefined;
     var retry_attempt: u8 = 0;
+    var req: std.http.Client.Request = undefined;
+    var req_initialized = false;
+    defer if (req_initialized) req.deinit();
 
     while (true) {
         // Check cancellation before each attempt
@@ -1031,7 +1034,13 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+        // Deinit previous request if this is a retry
+        if (req_initialized) {
+            req.deinit();
+            req_initialized = false;
+        }
+
+        req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1052,14 +1061,13 @@ fn runThread(ctx: *ThreadCtx) void {
             stream.completeWithError("failed to open request");
             return;
         };
-        defer req.deinit();
+        req_initialized = true;
 
         req.transfer_encoding = .{ .content_length = request_body.len };
 
         req.sendBodyComplete(request_body) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
-                req.deinit();
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
@@ -1082,7 +1090,6 @@ fn runThread(ctx: *ThreadCtx) void {
         response = req.receiveHead(&head_buf) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
-                req.deinit();
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
                 if (retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                     retry_attempt += 1;
