@@ -7,6 +7,54 @@ const github_copilot = @import("github_copilot");
 const tool_call_tracker = @import("tool_call_tracker");
 const provider_caps = @import("provider_caps");
 
+/// Merged compatibility options from model-level config and detected capabilities
+const MergedCompat = struct {
+    supports_store: bool,
+    supports_developer_role: bool,
+    supports_reasoning_effort: bool,
+    supports_usage_in_streaming: bool,
+    max_tokens_field: []const u8,
+    requires_tool_result_name: bool,
+    requires_assistant_after_tool_result: bool,
+    requires_thinking_as_text: bool,
+    requires_mistral_tool_ids: bool,
+    thinking_format: enum { openai, zai, qwen },
+    supports_strict_mode: bool,
+};
+
+/// Merge model-level compat options with detected provider capabilities
+/// Model-level options take precedence over detected capabilities
+fn mergeCompat(model: ai_types.Model) MergedCompat {
+    const caps = provider_caps.detectCapabilities(model.base_url);
+    const compat = model.compat;
+    const is_openai_native = std.mem.indexOf(u8, model.base_url, "openai.com") != null;
+
+    return .{
+        .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
+        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse caps.supports_developer_role else caps.supports_developer_role,
+        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse caps.supports_reasoning_effort else caps.supports_reasoning_effort,
+        .supports_usage_in_streaming = if (compat) |c| c.supports_usage_in_streaming orelse true else true,
+        .max_tokens_field = if (compat) |c| switch (c.max_tokens_field) {
+            .max_completion_tokens => "max_completion_tokens",
+            .max_tokens => "max_tokens",
+        } else caps.max_tokens_field,
+        .requires_tool_result_name = if (compat) |c| c.requires_tool_result_name orelse caps.requires_tool_result_name else caps.requires_tool_result_name,
+        .requires_assistant_after_tool_result = if (compat) |c| c.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool else caps.requires_assistant_after_tool,
+        .requires_thinking_as_text = if (compat) |c| c.requires_thinking_as_text orelse caps.requires_thinking_as_text else caps.requires_thinking_as_text,
+        .requires_mistral_tool_ids = if (compat) |c| c.requires_mistral_tool_ids orelse caps.requires_mistral_tool_ids else caps.requires_mistral_tool_ids,
+        .thinking_format = if (compat) |c| switch (c.thinking_format) {
+            .openai => .openai,
+            .zai => .zai,
+            .qwen => .qwen,
+        } else switch (caps.thinking_format) {
+            .openai => .openai,
+            .zai => .zai,
+            .qwen => .qwen,
+        },
+        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse true else true,
+    };
+}
+
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
@@ -70,7 +118,7 @@ fn writeMessagesArray(
     model: ai_types.Model,
     allocator: std.mem.Allocator,
 ) !void {
-    const caps = provider_caps.detectCapabilities(model.base_url);
+    const merged = mergeCompat(model);
 
     // Find the last user message index for cache_control (OpenRouter + Anthropic)
     const should_add_cache_control = isOpenRouterAnthropic(model);
@@ -90,8 +138,8 @@ fn writeMessagesArray(
 
     if (context.system_prompt) |sp| {
         try writer.beginObject();
-        // Use developer role for reasoning models on OpenAI native
-        const use_developer = model.reasoning and caps.supports_developer_role;
+        // Use developer role for reasoning models on providers that support it
+        const use_developer = model.reasoning and merged.supports_developer_role;
         const system_role: []const u8 = if (use_developer) "developer" else "system";
         try writer.writeStringField("role", system_role);
         try writer.writeStringField("content", sp);
@@ -258,26 +306,29 @@ fn buildRequestBody(
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
-    const caps = provider_caps.detectCapabilities(model.base_url);
+    const merged = mergeCompat(model);
 
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
     try writeMessagesArray(&w, context, model, allocator);
     try w.writeBoolField("stream", true);
-    try w.writeKey("stream_options");
-    try w.beginObject();
-    try w.writeBoolField("include_usage", true);
-    try w.endObject();
-    // Use max_completion_tokens for OpenAI native, max_tokens for others (Mistral/Chutes)
-    try w.writeIntField(caps.max_tokens_field, options.max_tokens orelse model.max_tokens);
+    // Only include stream_options if provider supports usage in streaming
+    if (merged.supports_usage_in_streaming) {
+        try w.writeKey("stream_options");
+        try w.beginObject();
+        try w.writeBoolField("include_usage", true);
+        try w.endObject();
+    }
+    // Use appropriate max tokens field based on provider
+    try w.writeIntField(merged.max_tokens_field, options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
         try w.writeKey("temperature");
         try w.writeFloat(t);
     }
-    // Add reasoning_effort for OpenAI-compatible endpoints that support it
+    // Add reasoning_effort for providers that support it
     if (options.reasoning_effort) |effort| {
-        if (model.reasoning) {
+        if (model.reasoning and merged.supports_reasoning_effort) {
             try w.writeStringField("reasoning_effort", effort);
         }
     }
@@ -295,6 +346,10 @@ fn buildRequestBody(
                 try w.writeStringField("description", tool.description);
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
+                // Add strict mode if supported
+                if (merged.supports_strict_mode) {
+                    try w.writeBoolField("strict", true);
+                }
                 try w.endObject();
                 try w.endObject();
             }
@@ -321,8 +376,8 @@ fn buildRequestBody(
         }
     }
     // Privacy: don't store requests for OpenAI training
-    // Only add for OpenAI endpoints (not third-party compatible APIs)
-    if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) {
+    // Only add for providers that support the store field
+    if (merged.supports_store) {
         try w.writeBoolField("store", false);
     }
     try w.endObject();
@@ -1549,4 +1604,220 @@ test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" 
 
     // Verify cache_control is NOT added for non-OpenRouter
     try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+
+test "mergeCompat uses model-level compat options over detected capabilities" {
+    // Model with explicit compat options that override detected capabilities
+    const model = ai_types.Model{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "custom",
+        .base_url = "https://api.openai.com", // Would normally detect supports_store=true
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_store = false, // Override detected capability
+            .supports_reasoning_effort = false,
+            .max_tokens_field = .max_tokens, // Override default
+            .supports_strict_mode = false,
+        },
+    };
+
+    const merged = mergeCompat(model);
+
+    // Model-level compat should take precedence
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+    try std.testing.expect(!merged.supports_strict_mode);
+}
+
+test "mergeCompat falls back to detected capabilities when model compat is null" {
+    const model = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        // No compat field - should use detected capabilities
+    };
+
+    const merged = mergeCompat(model);
+
+    // Should use detected capabilities for OpenAI native
+    try std.testing.expect(merged.supports_store);
+    try std.testing.expect(merged.supports_developer_role);
+    try std.testing.expect(merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_completion_tokens", merged.max_tokens_field);
+}
+
+test "buildRequestBody uses max_tokens field from compat options" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "mistral-large",
+        .name = "Mistral Large",
+        .api = "openai-completions",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .max_tokens_field = .max_tokens, // Mistral uses max_tokens
+            .supports_store = false,
+        },
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 50 }, allocator);
+    defer allocator.free(body);
+
+    // Should use max_tokens, not max_completion_tokens
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+    // Should not include store field
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\"") == null);
+}
+
+test "buildRequestBody adds strict mode when supported" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_strict_mode = true,
+        },
+    };
+
+    const tool = ai_types.Tool{
+        .name = "test_tool",
+        .description = "A test tool",
+        .parameters_schema_json = "{\"type\":\"object\"}",
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+        .tools = &[_]ai_types.Tool{tool},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Should include strict: true in tool definition
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"strict\":true") != null);
+}
+
+test "buildRequestBody omits strict mode when not supported" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "custom",
+        .base_url = "https://api.custom.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_strict_mode = false,
+        },
+    };
+
+    const tool = ai_types.Tool{
+        .name = "test_tool",
+        .description = "A test tool",
+        .parameters_schema_json = "{\"type\":\"object\"}",
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+        .tools = &[_]ai_types.Tool{tool},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Should NOT include strict field
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"strict\"") == null);
+}
+
+test "buildRequestBody adds store: false for OpenAI native" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Should include store: false
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\":false") != null);
+}
+
+test "buildRequestBody omits store field for non-OpenAI providers" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "mistral-large",
+        .name = "Mistral Large",
+        .api = "openai-completions",
+        .provider = "mistral",
+        .base_url = "https://api.mistral.ai",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Should NOT include store field for Mistral
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\"") == null);
 }
