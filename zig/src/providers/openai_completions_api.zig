@@ -482,6 +482,30 @@ fn writeMessagesArray(
                     else => {},
                 };
                 try writer.endArray();
+
+                // Serialize reasoning_details for tool calls with thought_signature
+                // This is for OpenAI encrypted reasoning round-trip
+                var has_reasoning_details = false;
+                for (a.content) |c| {
+                    if (c == .tool_call and c.tool_call.thought_signature != null) {
+                        has_reasoning_details = true;
+                        break;
+                    }
+                }
+                if (has_reasoning_details) {
+                    try writer.writeKey("reasoning_details");
+                    try writer.beginArray();
+                    for (a.content) |c| {
+                        if (c == .tool_call) {
+                            if (c.tool_call.thought_signature) |sig| {
+                                // The thought_signature is already a JSON-serialized reasoning_detail object
+                                // Just write it directly as raw JSON
+                                try writer.writeRawJson(sig);
+                            }
+                        }
+                    }
+                    try writer.endArray();
+                }
             }
 
             try writer.endObject();
@@ -739,6 +763,20 @@ const ToolCallEvent = struct {
     }
 };
 
+/// Reasoning detail event parsed from delta.reasoning_details
+/// Used for OpenAI encrypted reasoning round-trip.
+/// All strings are owned and must be freed with deinit.
+const ReasoningDetailEvent = struct {
+    tool_call_id: []const u8,
+    /// JSON-serialized reasoning_detail object
+    detail_json: []const u8,
+
+    fn deinit(self: *ReasoningDetailEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.detail_json);
+    }
+};
+
 /// Reasoning field names to check (in priority order)
 const reasoning_fields: []const []const u8 = &.{ "reasoning_content", "reasoning", "reasoning_text" };
 
@@ -763,6 +801,7 @@ fn parseChunk(
     current_block: *BlockType,
     reasoning_signature: *?[]const u8,
     tool_call_events: *std.ArrayList(ToolCallEvent),
+    reasoning_detail_events: *std.ArrayList(ReasoningDetailEvent),
     allocator: std.mem.Allocator,
 ) !void {
     if (std.mem.eql(u8, data, "[DONE]")) return;
@@ -912,6 +951,45 @@ fn parseChunk(
                     if (c == .string and c.string.len > 0) {
                         current_block.* = .text;
                         try text.appendSlice(allocator, c.string);
+                    }
+                }
+
+                // Parse reasoning_details for encrypted reasoning round-trip (OpenAI)
+                // Each detail with type="reasoning.encrypted" and matching tool_call id
+                // stores the serialized JSON as thought_signature on the tool call
+                if (d.object.get("reasoning_details")) |rd| {
+                    if (rd == .array) {
+                        for (rd.array.items) |detail| {
+                            if (detail == .object) {
+                                const detail_type = detail.object.get("type");
+                                const detail_id = detail.object.get("id");
+                                const detail_data = detail.object.get("data");
+
+                                if (detail_type) |t| {
+                                    if (t == .string and std.mem.eql(u8, t.string, "reasoning.encrypted")) {
+                                        if (detail_id) |id| {
+                                            if (id == .string and id.string.len > 0) {
+                                                if (detail_data) |dat| {
+                                                    if (dat == .string and dat.string.len > 0) {
+                                                        // Serialize the detail object back to JSON
+                                                        var detail_buf = std.ArrayList(u8){};
+                                                        defer detail_buf.deinit(allocator);
+                                                        detail_buf.writer(allocator).print("{{\"type\":\"reasoning.encrypted\",\"id\":\"{s}\",\"data\":\"{s}\"}}", .{ id.string, dat.string }) catch return;
+                                                        const detail_json = try allocator.dupe(u8, detail_buf.items);
+                                                        const tool_call_id = try allocator.dupe(u8, id.string);
+
+                                                        try reasoning_detail_events.append(allocator, .{
+                                                            .tool_call_id = tool_call_id,
+                                                            .detail_json = detail_json,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1151,16 +1229,18 @@ fn runThread(ctx: *ThreadCtx) void {
             // Calculate delay - prefer server-provided delay
             var delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header
-            var retry_after_iter = response.head.iterateHeaders();
-            while (retry_after_iter.next()) |header| {
-                if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
-                    if (retry.extractRetryDelayFromHeader(header.value)) |server_delay| {
-                        if (server_delay <= max_delay_ms) {
-                            delay = server_delay;
+            // Check Retry-After header (only if headers contain valid \r\n separator)
+            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+                var retry_after_iter = response.head.iterateHeaders();
+                while (retry_after_iter.next()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                        if (retry.extractRetryDelayFromHeader(header.value)) |server_delay| {
+                            if (server_delay <= max_delay_ms) {
+                                delay = server_delay;
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
             }
 
@@ -1226,6 +1306,13 @@ fn runThread(ctx: *ThreadCtx) void {
         }
         tool_call_events.deinit(allocator);
     }
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
     var next_content_index: usize = 0;
     var tool_call_count: usize = 0;
 
@@ -1283,13 +1370,23 @@ fn runThread(ctx: *ThreadCtx) void {
                 @constCast(tce).deinit(allocator);
             }
             tool_call_events.clearRetainingCapacity();
-            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, allocator) catch {
+            // Free any previous reasoning detail events
+            for (reasoning_detail_events.items) |*rde| {
+                @constCast(rde).deinit(allocator);
+            }
+            reasoning_detail_events.clearRetainingCapacity();
+            parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, &reasoning_detail_events, allocator) catch {
                 allocator.free(api_key);
                 allocator.free(request_body);
                 allocator.destroy(ctx);
                 stream.completeWithError("json parse error");
                 return;
             };
+
+            // Process reasoning detail events - set thought_signature on matching tool calls
+            for (reasoning_detail_events.items) |rde| {
+                tool_call_tracker_instance.setThoughtSignatureById(rde.tool_call_id, rde.detail_json) catch {};
+            }
 
             // Process tool call events
             for (tool_call_events.items) |tce| {
@@ -1729,6 +1826,13 @@ test "parseChunk does not leak memory with reasoning content" {
     defer if (reasoning_signature) |sig| allocator.free(sig);
     var tool_call_events = std.ArrayList(ToolCallEvent){};
     defer tool_call_events.deinit(allocator);
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
 
     // Simulate a chunk with reasoning_content (like DeepSeek responses)
     const chunk_data =
@@ -1744,6 +1848,7 @@ test "parseChunk does not leak memory with reasoning content" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1767,6 +1872,13 @@ test "parseChunk handles multiple chunks without leaking" {
     defer if (reasoning_signature) |sig| allocator.free(sig);
     var tool_call_events = std.ArrayList(ToolCallEvent){};
     defer tool_call_events.deinit(allocator);
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
 
     const chunks = [_][]const u8{
         \\{"choices":[{"delta":{"reasoning_content":"First"}}]}
@@ -1787,6 +1899,7 @@ test "parseChunk handles multiple chunks without leaking" {
             &current_block,
             &reasoning_signature,
             &tool_call_events,
+            &reasoning_detail_events,
             allocator,
         );
     }
@@ -1814,6 +1927,13 @@ test "parseChunk handles tool_calls without leaking" {
         }
         tool_call_events.deinit(allocator);
     }
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
 
     // Simulate tool call start chunk
     const chunk1 =
@@ -1829,6 +1949,7 @@ test "parseChunk handles tool_calls without leaking" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1858,6 +1979,7 @@ test "parseChunk handles tool_calls without leaking" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1886,6 +2008,7 @@ test "parseChunk handles tool_calls without leaking" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1911,6 +2034,13 @@ test "parseChunk handles multiple tool_calls" {
         }
         tool_call_events.deinit(allocator);
     }
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
 
     // Start first tool call
     const chunk1 =
@@ -1926,6 +2056,7 @@ test "parseChunk handles multiple tool_calls" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1953,6 +2084,7 @@ test "parseChunk handles multiple tool_calls" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -1981,6 +2113,7 @@ test "parseChunk handles multiple tool_calls" {
         &current_block,
         &reasoning_signature,
         &tool_call_events,
+        &reasoning_detail_events,
         allocator,
     );
 
@@ -2315,4 +2448,143 @@ test "buildRequestBody omits store field for non-OpenAI providers" {
 
     // Should NOT include store field for Mistral
     try std.testing.expect(std.mem.indexOf(u8, body, "\"store\"") == null);
+}
+
+test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" {
+    const allocator = std.testing.allocator;
+
+    var text = std.ArrayList(u8){};
+    defer text.deinit(allocator);
+    var thinking = std.ArrayList(u8){};
+    defer thinking.deinit(allocator);
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+    var current_block: BlockType = .none;
+    var reasoning_signature: ?[]const u8 = null;
+    defer if (reasoning_signature) |sig| allocator.free(sig);
+    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    defer {
+        for (tool_call_events.items) |*tce| {
+            @constCast(tce).deinit(allocator);
+        }
+        tool_call_events.deinit(allocator);
+    }
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    defer {
+        for (reasoning_detail_events.items) |*rde| {
+            @constCast(rde).deinit(allocator);
+        }
+        reasoning_detail_events.deinit(allocator);
+    }
+
+    // First, start a tool call
+    const chunk1 =
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc123","type":"function","function":{"name":"bash","arguments":""}}]}}]}
+    ;
+
+    try parseChunk(
+        chunk1,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        &reasoning_detail_events,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), tool_call_events.items.len);
+    for (tool_call_events.items) |*tce| {
+        @constCast(tce).deinit(allocator);
+    }
+    tool_call_events.clearRetainingCapacity();
+
+    // Now send reasoning_details with encrypted reasoning
+    const chunk2 =
+        \\{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.encrypted","id":"call_abc123","data":"encrypted_data_here"}]}}]}
+    ;
+
+    try parseChunk(
+        chunk2,
+        &text,
+        &thinking,
+        &usage,
+        &stop_reason,
+        &current_block,
+        &reasoning_signature,
+        &tool_call_events,
+        &reasoning_detail_events,
+        allocator,
+    );
+
+    // Should have extracted the reasoning_detail event
+    try std.testing.expectEqual(@as(usize, 1), reasoning_detail_events.items.len);
+    try std.testing.expectEqualStrings("call_abc123", reasoning_detail_events.items[0].tool_call_id);
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "reasoning.encrypted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "call_abc123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "encrypted_data_here") != null);
+}
+
+test "buildRequestBody includes reasoning_details for tool calls with thought_signature" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "o1",
+        .name = "O1",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200_000,
+        .max_tokens = 100,
+    };
+
+    // Assistant message with tool call that has thought_signature
+    const tool_call_id = try allocator.dupe(u8, "call_abc123");
+    defer allocator.free(tool_call_id);
+    const tool_call_name = try allocator.dupe(u8, "bash");
+    defer allocator.free(tool_call_name);
+    const tool_call_args = try allocator.dupe(u8, "{\"cmd\":\"ls\"}");
+    defer allocator.free(tool_call_args);
+    const thought_sig = try allocator.dupe(u8, "{\"type\":\"reasoning.encrypted\",\"id\":\"call_abc123\",\"data\":\"encrypted\"}");
+    defer allocator.free(thought_sig);
+
+    const assistant_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    defer allocator.free(assistant_content);
+    assistant_content[0] = .{
+        .tool_call = .{
+            .id = tool_call_id,
+            .name = tool_call_name,
+            .arguments_json = tool_call_args,
+            .thought_signature = thought_sig,
+        },
+    };
+
+    const assistant_msg = ai_types.Message{
+        .assistant = .{
+            .content = assistant_content,
+            .api = "openai-completions",
+            .provider = "openai",
+            .model = "o1",
+            .usage = .{},
+            .stop_reason = .tool_use,
+            .timestamp = std.time.timestamp(),
+        },
+    };
+
+    const ctx = ai_types.Context{
+        .messages = &[_]ai_types.Message{assistant_msg},
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100 }, allocator);
+    defer allocator.free(body);
+
+    // Should include reasoning_details array
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_details") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning.encrypted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "call_abc123") != null);
 }

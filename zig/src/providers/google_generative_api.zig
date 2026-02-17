@@ -877,16 +877,18 @@ fn runThread(ctx: *ThreadCtx) void {
             // Calculate delay - prefer server-provided delay
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
-            // Check Retry-After header
-            var retry_after_iter = response.head.iterateHeaders();
-            while (retry_after_iter.next()) |header| {
-                if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
-                    if (retry_util.extractRetryDelayFromHeader(header.value)) |server_delay| {
-                        if (server_delay <= max_delay_ms) {
-                            delay = server_delay;
+            // Check Retry-After header (only if headers contain valid \r\n separator)
+            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+                var retry_after_iter = response.head.iterateHeaders();
+                while (retry_after_iter.next()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                        if (retry_util.extractRetryDelayFromHeader(header.value)) |server_delay| {
+                            if (server_delay <= max_delay_ms) {
+                                delay = server_delay;
+                            }
                         }
+                        break;
                     }
-                    break;
                 }
             }
 

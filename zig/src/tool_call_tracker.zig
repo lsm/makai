@@ -19,6 +19,8 @@ pub const ToolCallTracker = struct {
         name: []const u8,
         /// Accumulated JSON arguments
         json_accumulator: streaming_json.StreamingJsonAccumulator,
+        /// Encrypted reasoning detail for round-trip (OpenAI reasoning_details)
+        thought_signature: ?[]const u8 = null,
     };
 
     const Self = @This();
@@ -36,6 +38,7 @@ pub const ToolCallTracker = struct {
             var call = entry.value_ptr;
             self.allocator.free(call.id);
             self.allocator.free(call.name);
+            if (call.thought_signature) |sig| self.allocator.free(sig);
             call.json_accumulator.deinit();
         }
         self.calls.deinit();
@@ -85,8 +88,24 @@ pub const ToolCallTracker = struct {
         return null;
     }
 
+    /// Set thought_signature on a tool call by its ID.
+    /// Used for OpenAI reasoning_details round-trip.
+    pub fn setThoughtSignatureById(self: *Self, tool_call_id: []const u8, signature: []const u8) !void {
+        var iter = self.calls.iterator();
+        while (iter.next()) |entry| {
+            if (std.mem.eql(u8, entry.value_ptr.id, tool_call_id)) {
+                // Free any existing signature
+                if (entry.value_ptr.thought_signature) |existing| {
+                    self.allocator.free(existing);
+                }
+                entry.value_ptr.thought_signature = try self.allocator.dupe(u8, signature);
+                return;
+            }
+        }
+    }
+
     /// Complete a tool call and return it. Returns null if not found.
-    /// The returned ToolCall owns its strings (id, name, arguments_json are duped).
+    /// The returned ToolCall owns its strings (id, name, arguments_json, thought_signature are duped).
     pub fn completeCall(self: *Self, api_index: usize, allocator: std.mem.Allocator) ?ai_types.ToolCall {
         if (self.calls.fetchRemove(api_index)) |removed| {
             var call = removed.value;
@@ -96,6 +115,7 @@ pub const ToolCallTracker = struct {
                 // On allocation failure, clean up and return null
                 self.allocator.free(call.id);
                 self.allocator.free(call.name);
+                if (call.thought_signature) |sig| self.allocator.free(sig);
                 call.json_accumulator.deinit();
                 return null;
             };
@@ -105,6 +125,7 @@ pub const ToolCallTracker = struct {
                 allocator.free(duped_id);
                 self.allocator.free(call.id);
                 self.allocator.free(call.name);
+                if (call.thought_signature) |sig| self.allocator.free(sig);
                 call.json_accumulator.deinit();
                 return null;
             };
@@ -117,21 +138,39 @@ pub const ToolCallTracker = struct {
                     allocator.free(duped_name);
                     self.allocator.free(call.id);
                     self.allocator.free(call.name);
+                    if (call.thought_signature) |sig| self.allocator.free(sig);
                     call.json_accumulator.deinit();
                     return null;
                 }
             else
                 "";
 
+            // Dupe thought_signature if present
+            const duped_sig = if (call.thought_signature) |sig|
+                allocator.dupe(u8, sig) catch {
+                    allocator.free(duped_id);
+                    allocator.free(duped_name);
+                    if (json_buf.len > 0) allocator.free(duped_json);
+                    self.allocator.free(call.id);
+                    self.allocator.free(call.name);
+                    self.allocator.free(sig);
+                    call.json_accumulator.deinit();
+                    return null;
+                }
+            else
+                null;
+
             // Free the tracker's copy of the strings
             self.allocator.free(call.id);
             self.allocator.free(call.name);
+            if (call.thought_signature) |sig| self.allocator.free(sig);
             call.json_accumulator.deinit();
 
             return ai_types.ToolCall{
                 .id = duped_id,
                 .name = duped_name,
                 .arguments_json = duped_json,
+                .thought_signature = duped_sig,
             };
         }
         return null;
@@ -309,4 +348,63 @@ test "ToolCallTracker - getJsonBuffer returns null for non-existent call" {
     defer tracker.deinit();
 
     try std.testing.expect(tracker.getJsonBuffer(0) == null);
+}
+
+test "ToolCallTracker - setThoughtSignatureById sets signature on matching tool call" {
+    const allocator = std.testing.allocator;
+
+    var tracker = ToolCallTracker.init(allocator);
+    defer tracker.deinit();
+
+    _ = try tracker.startCall(0, 0, "call_abc123", "bash");
+
+    // Set thought_signature by tool call ID
+    try tracker.setThoughtSignatureById("call_abc123", "{\"type\":\"reasoning.encrypted\",\"id\":\"call_abc123\",\"data\":\"test\"}");
+
+    // Complete and verify thought_signature is preserved
+    const tc = tracker.completeCall(0, allocator).?;
+    defer {
+        allocator.free(tc.id);
+        allocator.free(tc.name);
+        allocator.free(tc.arguments_json);
+        if (tc.thought_signature) |sig| allocator.free(sig);
+    }
+
+    try std.testing.expect(tc.thought_signature != null);
+    try std.testing.expect(std.mem.indexOf(u8, tc.thought_signature.?, "reasoning.encrypted") != null);
+}
+
+test "ToolCallTracker - setThoughtSignatureById does nothing for non-existent ID" {
+    const allocator = std.testing.allocator;
+
+    var tracker = ToolCallTracker.init(allocator);
+    defer tracker.deinit();
+
+    _ = try tracker.startCall(0, 0, "call_abc123", "bash");
+
+    // Try to set signature on non-existent tool call ID
+    try tracker.setThoughtSignatureById("nonexistent_id", "{\"type\":\"reasoning.encrypted\"}");
+
+    // Complete and verify thought_signature is still null
+    const tc = tracker.completeCall(0, allocator).?;
+    defer {
+        allocator.free(tc.id);
+        allocator.free(tc.name);
+        allocator.free(tc.arguments_json);
+        if (tc.thought_signature) |sig| allocator.free(sig);
+    }
+
+    try std.testing.expect(tc.thought_signature == null);
+}
+
+test "ToolCallTracker - thought_signature is freed in deinit for incomplete calls" {
+    const allocator = std.testing.allocator;
+
+    var tracker = ToolCallTracker.init(allocator);
+
+    _ = try tracker.startCall(0, 0, "call_abc123", "bash");
+    try tracker.setThoughtSignatureById("call_abc123", "{\"type\":\"reasoning.encrypted\"}");
+
+    // deinit should clean up thought_signature memory without leaks
+    tracker.deinit();
 }
