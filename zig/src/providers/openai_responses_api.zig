@@ -7,6 +7,72 @@ const tool_call_tracker = @import("tool_call_tracker");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 
+/// Check if an assistant message should be skipped (aborted or error)
+fn shouldSkipAssistant(msg: ai_types.Message) bool {
+    switch (msg) {
+        .assistant => |a| {
+            return a.stop_reason == .aborted or a.stop_reason == .@"error";
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Collect all tool call IDs from assistant messages into a hash set
+fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.Message) !std.StringHashMap(void) {
+    var tool_call_ids = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var iter = tool_call_ids.keyIterator();
+        while (iter.next()) |key| {
+            allocator.free(key.*);
+        }
+        tool_call_ids.deinit();
+    }
+
+    for (messages) |msg| {
+        switch (msg) {
+            .assistant => |a| {
+                for (a.content) |c| {
+                    if (c == .tool_call) {
+                        const id_dup = try allocator.dupe(u8, c.tool_call.id);
+                        try tool_call_ids.put(id_dup, {});
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return tool_call_ids;
+}
+
+/// Check if a tool result is orphaned (no matching tool call)
+/// Only returns true if there ARE tool calls in the context but none match this result
+fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringHashMap(void)) bool {
+    // If there are no tool calls at all, don't filter - results might be from prior context
+    if (tool_call_ids.count() == 0) {
+        return false;
+    }
+    switch (msg) {
+        .tool_result => |tr| {
+            if (tr.tool_call_id.len > 0) {
+                return !tool_call_ids.contains(tr.tool_call_id);
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Free a StringHashMap's keys
+fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
+    var iter = map.keyIterator();
+    while (iter.next()) |key| {
+        allocator.free(key.*);
+    }
+    map.deinit();
+}
+
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
@@ -130,11 +196,22 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeKey("input");
     try w.beginArray();
 
+    // Collect tool call IDs for orphaned tool result filtering
+    var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
+    defer freeToolCallIds(allocator, &tool_call_ids);
+
     if (context.system_prompt) |sp| {
         try w.beginObject();
         const system_role: []const u8 = if (model.reasoning) "developer" else "system";
         try w.writeStringField("role", system_role);
-        try w.writeStringField("content", sp);
+        // Sanitize system prompt to remove unpaired surrogates
+        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
+        defer {
+            if (sanitized.ptr != sp.ptr) {
+                allocator.free(@constCast(sanitized));
+            }
+        }
+        try w.writeStringField("content", sanitized);
         try w.endObject();
     }
 
@@ -148,6 +225,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     for (context.messages) |m| {
+        // Skip aborted/error assistant messages
+        if (shouldSkipAssistant(m)) continue;
+
+        // Skip orphaned tool results
+        if (isOrphanedToolResult(m, &tool_call_ids)) continue;
+
         switch (m) {
             .user => |u| {
                 try w.beginObject();
@@ -157,7 +240,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 // Handle content
                 switch (u.content) {
                     .text => |t| {
-                        try w.writeStringField("content", t);
+                        // Sanitize text to remove unpaired surrogates
+                        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
+                        defer {
+                            if (sanitized.ptr != t.ptr) {
+                                allocator.free(@constCast(sanitized));
+                            }
+                        }
+                        try w.writeStringField("content", sanitized);
                     },
                     .parts => |parts| {
                         try w.writeKey("content");
@@ -448,6 +538,7 @@ const ThreadCtx = struct {
     cancel_token: ?ai_types.CancelToken = null,
     on_payload_fn: ?*const fn (on_ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
+    retry_config: ?ai_types.RetryConfig = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -461,6 +552,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const cancel_token = ctx.cancel_token;
     const on_payload_fn = ctx.on_payload_fn;
     const on_payload_ctx = ctx.on_payload_ctx;
+    const retry_opts = ctx.retry_config;
 
     // Invoke on_payload callback before sending
     if (on_payload_fn) |cb| {
@@ -529,39 +621,178 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        allocator.free(auth);
-        allocator.free(url);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("request failed");
-        return;
-    };
-    defer req.deinit();
+    // Retry configuration
+    const MAX_RETRIES: u8 = 3;
+    const BASE_DELAY_MS: u32 = 1000;
+    const max_delay_ms: u32 = if (retry_opts) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
 
-    req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch {
-        allocator.free(auth);
-        allocator.free(url);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("send failed");
-        return;
-    };
-
+    var response: std.http.Client.Response = undefined;
     var head_buf: [4096]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch {
-        allocator.free(auth);
-        allocator.free(url);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("receive failed");
-        return;
-    };
+    var retry_attempt: u8 = 0;
 
+    while (true) {
+        // Check cancellation before each attempt
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
+        var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+            allocator.free(auth);
+            allocator.free(url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request failed");
+            return;
+        };
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = body.len };
+        req.sendBodyComplete(body) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                req.deinit();
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+            allocator.free(auth);
+            allocator.free(url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("send failed");
+            return;
+        };
+
+        response = req.receiveHead(&head_buf) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                req.deinit();
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+            allocator.free(auth);
+            allocator.free(url);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("receive failed");
+            return;
+        };
+
+        if (response.head.status == .ok) {
+            // Success - break out of retry loop
+            break;
+        }
+
+        // Check if status is retryable
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
+
+        if (should_retry) {
+            // Read error body to check for retry delay hints
+            var error_body: [4096]u8 = undefined;
+            const error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
+            const error_text = error_body[0..error_body_len];
+
+            // Check if error body indicates a retryable error
+            const is_retryable_error = retry_util.isRetryableError(error_text);
+
+            // Calculate delay - prefer server-provided delay
+            var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+
+            // Check Retry-After header
+            var retry_after_iter = response.head.iterateHeaders();
+            while (retry_after_iter.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                    if (retry_util.extractRetryDelayFromHeader(header.value)) |server_delay| {
+                        if (server_delay <= max_delay_ms) {
+                            delay = server_delay;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Check body for retry delay
+            if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
+                if (body_delay <= max_delay_ms) {
+                    delay = body_delay;
+                }
+            }
+
+            // If not a retryable error message, don't retry
+            if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
+                break;
+            }
+
+            // Wait before retry
+            if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                // Sleep was cancelled
+                allocator.free(auth);
+                allocator.free(url);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+
+            retry_attempt += 1;
+            continue;
+        }
+
+        // Non-retryable error or max retries reached
+        break;
+    }
+
+    // After retry loop, check final status
     if (response.head.status != .ok) {
         allocator.free(auth);
         allocator.free(url);
@@ -1096,6 +1327,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
+        .retry_config = o.retry,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
