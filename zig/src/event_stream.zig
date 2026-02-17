@@ -82,9 +82,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                             _ = e;
                         },
                         .done => |d| {
-                            // The message in done event may have owned memory
-                            var mutable_msg = d.message;
-                            mutable_msg.deinit(self.allocator);
+                            // The message in done event shares content pointers with self.result.
+                            // Skip freeing here - self.result.deinit() will handle it below.
+                            // This prevents double-free when both done event and result exist.
+                            _ = d;
                         },
                         .@"error" => |e| {
                             // The err message may have owned memory
