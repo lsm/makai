@@ -18,6 +18,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         err_msg: ?[]const u8 = null,
         mutex: std.Thread.Mutex = .{},
         futex: std.atomic.Value(u32),
+        thread_done: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator) Self {
@@ -32,11 +33,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .tail = std.atomic.Value(usize).init(0),
                 .completed = std.atomic.Value(bool).init(false),
                 .futex = std.atomic.Value(u32).init(0),
+                .thread_done = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            // Wait for producer thread to finish before cleanup
+            _ = self.waitForThread(5000);
+
             // Drain any remaining events in the ring buffer and free their allocations
             // This is critical when tests abort mid-stream or complete without polling all events
             while (self.poll()) |event| {
@@ -171,6 +176,36 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
             _ = self.futex.fetchAdd(1, .release);
             std.Thread.Futex.wake(&self.futex, std.math.maxInt(u32));
+        }
+
+        pub fn markThreadDone(self: *Self) void {
+            self.thread_done.store(true, .release);
+            _ = self.futex.fetchAdd(1, .release);
+            std.Thread.Futex.wake(&self.futex, std.math.maxInt(u32));
+        }
+
+        pub fn waitForThread(self: *Self, timeout_ms: u64) bool {
+            const start_time = std.time.nanoTimestamp();
+            const timeout_ns = @as(i128, timeout_ms) * 1_000_000;
+
+            var futex_value = self.futex.load(.acquire);
+
+            while (!self.thread_done.load(.acquire)) {
+                const elapsed = std.time.nanoTimestamp() - start_time;
+                if (elapsed >= timeout_ns) {
+                    return false;
+                }
+
+                const remaining_ns = timeout_ns - elapsed;
+                const remaining_ms = @as(u64, @intCast(@divFloor(remaining_ns, 1_000_000)));
+                const remaining_max_ms = @min(remaining_ms, std.math.maxInt(u32));
+
+                std.Thread.Futex.timedWait(&self.futex, futex_value, remaining_max_ms) catch {};
+
+                futex_value = self.futex.load(.acquire);
+            }
+
+            return true;
         }
 
         pub fn poll(self: *Self) ?T {

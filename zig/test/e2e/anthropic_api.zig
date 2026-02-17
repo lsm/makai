@@ -3,6 +3,7 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
 const stream_mod = @import("stream");
+const test_helpers = @import("test_helpers");
 
 const testing = std.testing;
 
@@ -47,7 +48,11 @@ test "anthropic e2e: messages api (cheap model)" {
         testing.allocator.destroy(stream);
     }
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.isDone()) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         _ = stream.poll();
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }

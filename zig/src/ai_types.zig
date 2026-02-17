@@ -103,6 +103,8 @@ pub const StreamOptions = struct {
     metadata: ?Metadata = null,
     /// Tool choice behavior
     tool_choice: ?ToolChoice = null,
+    /// HTTP connection timeout in milliseconds (default: 30s)
+    http_timeout_ms: ?u64 = 30_000,
 };
 
 pub const SimpleStreamOptions = struct {
@@ -119,6 +121,8 @@ pub const SimpleStreamOptions = struct {
     reasoning: ?ThinkingLevel = null,
     thinking_budgets: ?ThinkingBudgets = null,
     reasoning_summary: ?[]const u8 = null,
+    /// HTTP connection timeout in milliseconds (default: 30s)
+    http_timeout_ms: ?u64 = 30_000,
 };
 
 pub const TextContent = struct {

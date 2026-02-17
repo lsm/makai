@@ -47,8 +47,12 @@ test "google: API key validation" {
 
     test_helpers.testStep("Waiting for stream completion...", .{});
 
-    // Wait for completion
+    // Wait for completion with timeout
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.completed.load(.acquire)) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
         }
@@ -167,7 +171,11 @@ test "google: streaming events sequence" {
     var saw_text_delta = false;
     var saw_done = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -238,7 +246,11 @@ test "google: thinking mode" {
 
     var saw_thinking = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -301,7 +313,11 @@ test "google: gemini-3 thinking level" {
     var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
     defer accumulator.deinit();
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
         } else {
@@ -377,7 +393,11 @@ test "google: tool calling" {
 
     var saw_tool_call = false;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
 
@@ -442,7 +462,11 @@ test "google: abort mid-stream" {
     var event_count: usize = 0;
     const max_events = 5;
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
             event_count += 1;
@@ -507,7 +531,11 @@ test "google: usage tracking" {
         testing.allocator.destroy(stream);
     }
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.completed.load(.acquire)) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             test_helpers.freeEvent(event, testing.allocator);
         }
@@ -581,7 +609,11 @@ test "google: multi-turn conversation" {
     var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
     defer accumulator.deinit();
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
         } else {
@@ -640,7 +672,11 @@ test "google: system prompt" {
     var accumulator = test_helpers.EventAccumulator.init(testing.allocator);
     defer accumulator.deinit();
 
+    const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
+        if (test_helpers.isDeadlineExceeded(deadline)) {
+            return error.TimeoutExceeded;
+        }
         if (stream.poll()) |event| {
             try accumulator.processEvent(event);
         } else {
