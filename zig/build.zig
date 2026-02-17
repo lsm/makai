@@ -96,6 +96,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const sanitize_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/sanitize.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const oauth_pkce_mod = b.createModule(.{
         .root_source_file = b.path("src/oauth/pkce.zig"),
         .target = target,
@@ -114,6 +120,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "github_copilot", .module = github_copilot_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
             .{ .name = "provider_caps", .module = provider_caps_mod },
+            .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "retry", .module = retry_mod },
         },
     });
 
@@ -127,6 +135,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
+            .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "retry", .module = retry_mod },
         },
     });
 
@@ -140,6 +150,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
+            .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "retry", .module = retry_mod },
         },
     });
 
@@ -164,6 +176,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "retry", .module = retry_mod },
         },
     });
 
@@ -175,6 +189,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "retry", .module = retry_mod },
         },
     });
 
@@ -256,6 +272,8 @@ pub fn build(b: *std.Build) void {
     const overflow_test = b.addTest(.{ .root_module = overflow_mod });
 
     const retry_test = b.addTest(.{ .root_module = retry_mod });
+
+    const sanitize_test = b.addTest(.{ .root_module = sanitize_mod });
 
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
@@ -359,6 +377,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(overflow_test).step);
     test_step.dependOn(&b.addRunArtifact(retry_test).step);
+    test_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
