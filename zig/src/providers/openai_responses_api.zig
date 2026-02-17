@@ -99,6 +99,16 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.writeBoolField("store", false);
     }
 
+    // Service tier for OpenAI Responses API
+    if (options.service_tier) |tier| {
+        const tier_str: []const u8 = switch (tier) {
+            .default => "default",
+            .flex => "flex",
+            .priority => "priority",
+        };
+        try w.writeStringField("service_tier", tier_str);
+    }
+
     // Session-based caching
     if (options.session_id) |sid| {
         if (options.cache_retention) |retention| {
@@ -123,6 +133,15 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         const system_role: []const u8 = if (model.reasoning) "developer" else "system";
         try w.writeStringField("role", system_role);
         try w.writeStringField("content", sp);
+        try w.endObject();
+    }
+
+    // GPT-5 "juice" workaround: when reasoning is disabled for GPT-5 models,
+    // inject a developer message to restore model capability
+    if (std.mem.startsWith(u8, model.name, "gpt-5") and !options.reasoning_enabled) {
+        try w.beginObject();
+        try w.writeStringField("role", "developer");
+        try w.writeStringField("content", "# Juice: 0 !important");
         try w.endObject();
     }
 
@@ -423,6 +442,7 @@ const ThreadCtx = struct {
     model: ai_types.Model,
     api_key: []u8,
     body: []u8,
+    service_tier: ?ai_types.ServiceTier,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -432,6 +452,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const model = ctx.model;
     const api_key = ctx.api_key;
     const body = ctx.body;
+    const service_tier = ctx.service_tier;
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -882,7 +903,23 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     if (usage.total_tokens == 0) usage.total_tokens = usage.input + usage.output;
+
+    // Calculate base cost
     usage.calculateCost(model.cost);
+
+    // Apply service tier cost multiplier
+    if (service_tier) |tier| {
+        const tier_multiplier: f64 = switch (tier) {
+            .flex => 0.5, // 50% of base price
+            .priority => 2.0, // 200% of base price
+            .default => 1.0, // 100% base price
+        };
+        usage.cost.input *= tier_multiplier;
+        usage.cost.output *= tier_multiplier;
+        usage.cost.cache_read *= tier_multiplier;
+        usage.cost.cache_write *= tier_multiplier;
+        usage.cost.total *= tier_multiplier;
+    }
 
     // Build content blocks - thinking first if present, then text, then tool calls
     const has_thinking = thinking.items.len > 0;
@@ -1012,7 +1049,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body };
+    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .body = body, .service_tier = o.service_tier };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();
@@ -1279,4 +1316,153 @@ test "parseResponseEventFromValue returns null for unknown event type" {
 
     const result = parseResponseEventFromValue(parsed.value);
     try std.testing.expect(result == null);
+}
+
+test "buildRequestBody includes service_tier when set" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-4o",
+        .name = "gpt-4o",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 2.5, .output = 10.0, .cache_read = 1.25, .cache_write = 2.5 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .service_tier = .flex,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"service_tier\":\"flex\"") != null);
+}
+
+test "buildRequestBody omits service_tier when null" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-4o",
+        .name = "gpt-4o",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 2.5, .output = 10.0, .cache_read = 1.25, .cache_write = 2.5 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{};
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "service_tier") == null);
+}
+
+test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5-turbo",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 5.0, .output = 15.0, .cache_read = 2.5, .cache_write = 5.0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = "You are helpful.",
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
+}
+
+test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5-turbo",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 5.0, .output = 15.0, .cache_read = 2.5, .cache_write = 5.0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = "You are helpful.",
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_enabled = true,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Juice") == null);
+}
+
+test "buildRequestBody omits juice workaround for non-GPT-5 models" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-4o",
+        .name = "gpt-4o",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 2.5, .output = 10.0, .cache_read = 1.25, .cache_write = 2.5 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = "You are helpful.",
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "Juice") == null);
+}
+
+test "ServiceTier enum values are correct" {
+    try std.testing.expectEqual(ai_types.ServiceTier.default, .default);
+    try std.testing.expectEqual(ai_types.ServiceTier.flex, .flex);
+    try std.testing.expectEqual(ai_types.ServiceTier.priority, .priority);
+}
+
+test "ReasoningSummary enum values are correct" {
+    try std.testing.expectEqual(ai_types.ReasoningSummary.auto, .auto);
+    try std.testing.expectEqual(ai_types.ReasoningSummary.concise, .concise);
+    try std.testing.expectEqual(ai_types.ReasoningSummary.detailed, .detailed);
 }

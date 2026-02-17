@@ -14,6 +14,18 @@ pub const KnownApi = enum {
 
 pub const ThinkingLevel = enum { minimal, low, medium, high, xhigh };
 
+pub const ServiceTier = enum {
+    default,
+    flex,
+    priority,
+};
+
+pub const ReasoningSummary = enum {
+    auto,
+    concise,
+    detailed,
+};
+
 pub const ThinkingBudgets = struct {
     minimal: ?u32 = null,
     low: ?u32 = null,
@@ -83,6 +95,10 @@ pub const StreamOptions = struct {
     reasoning_summary: ?[]const u8 = null,
     /// Whether to include encrypted reasoning content
     include_reasoning_encrypted: bool = false,
+    /// Whether reasoning is enabled (for GPT-5 juice workaround)
+    reasoning_enabled: bool = true,
+    /// Service tier for OpenAI Responses API: "default", "flex", "priority"
+    service_tier: ?ServiceTier = null,
     /// Metadata for the request
     metadata: ?Metadata = null,
     /// Tool choice behavior
@@ -254,6 +270,36 @@ pub const Cost = struct {
     cache_write: f64,
 };
 
+pub const OpenAICompatOptions = struct {
+    /// Whether the provider supports the `store` field
+    supports_store: ?bool = null,
+    /// Whether the provider supports the `developer` role (vs `system`)
+    supports_developer_role: ?bool = null,
+    /// Whether the provider supports `reasoning_effort`
+    supports_reasoning_effort: ?bool = null,
+    /// Whether the provider supports usage in streaming
+    supports_usage_in_streaming: ?bool = true,
+    /// Which field to use for max tokens
+    max_tokens_field: enum { max_completion_tokens, max_tokens } = .max_completion_tokens,
+    /// Whether tool results require the `name` field
+    requires_tool_result_name: ?bool = null,
+    /// Whether a user message after tool results requires an assistant message in between
+    requires_assistant_after_tool_result: ?bool = null,
+    /// Whether thinking blocks must be converted to text
+    requires_thinking_as_text: ?bool = null,
+    /// Whether tool call IDs must be normalized to Mistral format
+    requires_mistral_tool_ids: ?bool = null,
+    /// Format for reasoning/thinking parameter
+    thinking_format: enum { openai, zai, qwen } = .openai,
+    /// Whether the provider supports the `strict` field in tool definitions
+    supports_strict_mode: ?bool = true,
+};
+
+pub const RoutingPreferences = struct {
+    only: ?[][]const u8 = null,
+    order: ?[][]const u8 = null,
+};
+
 pub const Model = struct {
     id: []const u8,
     name: []const u8,
@@ -266,6 +312,7 @@ pub const Model = struct {
     context_window: u32,
     max_tokens: u32,
     headers: ?[]const HeaderPair = null,
+    compat: ?OpenAICompatOptions = null,
 };
 
 pub const AssistantMessageEvent = union(enum) {
@@ -490,4 +537,55 @@ test "Usage.calculateCost computes correct dollar costs" {
     try std.testing.expectApproxEqAbs(0.06, usage.cost.cache_read, 0.0001);
     try std.testing.expectApproxEqAbs(0.375, usage.cost.cache_write, 0.0001);
     try std.testing.expectApproxEqAbs(10.935, usage.cost.total, 0.0001);
+}
+
+test "OpenAICompatOptions defaults are correct" {
+    const compat = OpenAICompatOptions{};
+
+    // Check default values
+    try std.testing.expect(compat.supports_store == null);
+    try std.testing.expect(compat.supports_developer_role == null);
+    try std.testing.expect(compat.supports_reasoning_effort == null);
+    // supports_usage_in_streaming defaults to true (not null)
+    try std.testing.expect(compat.supports_usage_in_streaming == true);
+    try std.testing.expectEqual(@as(@TypeOf(compat.max_tokens_field), .max_completion_tokens), compat.max_tokens_field);
+    try std.testing.expect(compat.requires_tool_result_name == null);
+    try std.testing.expect(compat.requires_assistant_after_tool_result == null);
+    try std.testing.expect(compat.requires_thinking_as_text == null);
+    try std.testing.expect(compat.requires_mistral_tool_ids == null);
+    try std.testing.expectEqual(@as(@TypeOf(compat.thinking_format), .openai), compat.thinking_format);
+    // supports_strict_mode defaults to true (not null)
+    try std.testing.expect(compat.supports_strict_mode == true);
+}
+
+test "Model with compat options" {
+    const model = Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "openai-completions",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+        .compat = .{
+            .supports_store = false,
+            .max_tokens_field = .max_tokens,
+            .thinking_format = .zai,
+        },
+    };
+
+    try std.testing.expect(model.compat != null);
+    try std.testing.expect(!model.compat.?.supports_store.?);
+    try std.testing.expectEqual(@as(@TypeOf(model.compat.?.max_tokens_field), .max_tokens), model.compat.?.max_tokens_field);
+    try std.testing.expectEqual(@as(@TypeOf(model.compat.?.thinking_format), .zai), model.compat.?.thinking_format);
+}
+
+test "RoutingPreferences defaults are correct" {
+    const prefs = RoutingPreferences{};
+
+    try std.testing.expect(prefs.only == null);
+    try std.testing.expect(prefs.order == null);
 }
