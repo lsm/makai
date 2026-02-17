@@ -865,7 +865,10 @@ fn runThread(ctx: *ThreadCtx) void {
         if (should_retry) {
             // Read error body to check for retry delay hints
             var error_body: [4096]u8 = undefined;
-            const error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
+            var error_body_len: usize = 0;
+            if (response.head.content_length) |_| {
+                error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
+            }
             const error_text = error_body[0..error_body_len];
 
             // Check if error body indicates a retryable error
