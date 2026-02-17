@@ -4,6 +4,7 @@ const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const retry_util = @import("retry");
+const pre_transform = @import("pre_transform");
 
 /// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
@@ -40,11 +41,11 @@ fn resolveProject(options: ?VertexOptions, allocator: std.mem.Allocator) VertexE
         }
     }
 
-    if (env(allocator, "GOOGLE_CLOUD_PROJECT")) |p| {
+    if (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_PROJECT") catch null) |p| {
         return p;
     }
 
-    if (env(allocator, "GCLOUD_PROJECT")) |p| {
+    if (std.process.getEnvVarOwned(allocator, "GCLOUD_PROJECT") catch null) |p| {
         return p;
     }
 
@@ -60,7 +61,7 @@ fn resolveLocation(options: ?VertexOptions, allocator: std.mem.Allocator) Vertex
         }
     }
 
-    if (env(allocator, "GOOGLE_CLOUD_LOCATION")) |l| {
+    if (std.process.getEnvVarOwned(allocator, "GOOGLE_CLOUD_LOCATION") catch null) |l| {
         return l;
     }
 
@@ -170,12 +171,27 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
+    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
+    // synthetic tool results for orphaned calls, aborted message filtering
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = model.api,
+        .target_provider = model.provider,
+        .target_model_id = model.id,
+        .max_tool_id_len = 64, // Google Vertex max tool call ID length
+        .insert_synthetic_results = true,
+        .tools = context.tools,
+    });
+    defer transformed.deinit();
+
+    var tx_context = context;
+    tx_context.messages = transformed.messages;
+
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
 
     try w.writeKey("contents");
     try w.beginArray();
-    for (context.messages) |m| {
+    for (tx_context.messages) |m| {
         const role: []const u8 = switch (m) {
             .assistant => "model",
             else => "user",
@@ -1373,8 +1389,10 @@ test "resolveProject - from environment" {
     // Test without options (depends on env vars being set or not)
     // This should return error.MissingProjectId if no env vars are set
     const result2 = resolveProject(null, allocator);
-    if (result2) |p| {
-        allocator.free(p);
+    if (result2) |maybe_p| {
+        if (maybe_p) |p| {
+            allocator.free(p);
+        }
     } else |_| {
         // Expected if no env vars set
     }
@@ -1392,8 +1410,10 @@ test "resolveLocation - from environment" {
 
     // Test without options
     const result2 = resolveLocation(null, allocator);
-    if (result2) |l| {
-        allocator.free(l);
+    if (result2) |maybe_l| {
+        if (maybe_l) |l| {
+            allocator.free(l);
+        }
     } else |_| {
         // Expected if GOOGLE_CLOUD_LOCATION not set
     }

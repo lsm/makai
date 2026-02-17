@@ -8,6 +8,7 @@ const tool_call_tracker = @import("tool_call_tracker");
 const provider_caps = @import("provider_caps");
 const sanitize = @import("sanitize");
 const retry = @import("retry");
+const pre_transform = @import("pre_transform");
 
 /// Merged compatibility options from model-level config and detected capabilities
 const MergedCompat = struct {
@@ -607,10 +608,27 @@ fn buildRequestBody(
 
     const merged = mergeCompat(model);
 
+    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
+    // synthetic tool results for orphaned calls, aborted message filtering
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = model.api,
+        .target_provider = model.provider,
+        .target_model_id = model.id,
+        .max_tool_id_len = if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .mistral_tool_ids = merged.requires_mistral_tool_ids,
+        .insert_synthetic_results = true,
+        .tools = context.tools,
+    });
+    defer transformed.deinit();
+
+    // Build context with transformed messages
+    var tx_context = context;
+    tx_context.messages = transformed.messages;
+
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
-    try writeMessagesArray(&w, context, model, allocator);
+    try writeMessagesArray(&w, tx_context, model, allocator);
     try w.writeBoolField("stream", true);
     // Only include stream_options if provider supports usage in streaming
     if (merged.supports_usage_in_streaming) {

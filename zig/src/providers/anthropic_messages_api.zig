@@ -6,6 +6,7 @@ const json_writer = @import("json_writer");
 const tool_call_tracker = @import("tool_call_tracker");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
+const pre_transform = @import("pre_transform");
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
@@ -193,6 +194,23 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
+    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
+    // synthetic tool results for orphaned calls, aborted message filtering
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = model.api,
+        .target_provider = model.provider,
+        .target_model_id = model.id,
+        .max_tool_id_len = 64, // Anthropic max tool ID length
+        .insert_synthetic_results = true,
+        .tools = context.tools,
+        .is_oauth = is_oauth,
+    });
+    defer transformed.deinit();
+
+    // Use transformed messages
+    var tx_context = context;
+    tx_context.messages = transformed.messages;
+
     // Resolve cache control settings
     const cache_control = getCacheControl(model.base_url, options.cache_retention);
 
@@ -270,13 +288,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.endArray();
     }
 
-    // Collect tool call IDs from assistant messages for orphaned tool result filtering
-    var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
+    // Collect tool call IDs from transformed messages for any remaining filtering
+    var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    // Find the last user message index for cache_control placement (skip filtered messages)
+    // Find the last user message index for cache_control placement
     var last_user_idx: ?usize = null;
-    for (context.messages, 0..) |m, i| {
+    for (tx_context.messages, 0..) |m, i| {
         switch (m) {
             .user => last_user_idx = i,
             else => {},
@@ -286,8 +304,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeKey("messages");
     try w.beginArray();
     var msg_idx: usize = 0;
-    while (msg_idx < context.messages.len) {
-        const m = context.messages[msg_idx];
+    while (msg_idx < tx_context.messages.len) {
+        const m = tx_context.messages[msg_idx];
 
         // Skip aborted/error assistant messages
         if (shouldSkipAssistant(m)) {
@@ -311,8 +329,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.beginArray();
 
             // Collect ALL consecutive tool_results
-            while (msg_idx < context.messages.len and context.messages[msg_idx] == .tool_result) {
-                const tr = context.messages[msg_idx].tool_result;
+            while (msg_idx < tx_context.messages.len and tx_context.messages[msg_idx] == .tool_result) {
+                const tr = tx_context.messages[msg_idx].tool_result;
 
                 try w.beginObject();
                 try w.writeStringField("type", "tool_result");

@@ -5,6 +5,7 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
+const pre_transform = @import("pre_transform");
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -160,16 +161,31 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
 
+    // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
+    // synthetic tool results for orphaned calls, aborted message filtering
+    var transformed = try pre_transform.preTransform(allocator, context.messages, .{
+        .target_api = model.api,
+        .target_provider = model.provider,
+        .target_model_id = model.id,
+        .max_tool_id_len = 64, // Google max tool call ID length
+        .insert_synthetic_results = true,
+        .tools = context.tools,
+    });
+    defer transformed.deinit();
+
+    var tx_context = context;
+    tx_context.messages = transformed.messages;
+
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
 
-    // Collect tool call IDs for orphaned tool result filtering
-    var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
+    // Collect tool call IDs for any remaining filtering
+    var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
     try w.writeKey("contents");
     try w.beginArray();
-    for (context.messages) |m| {
+    for (tx_context.messages) |m| {
         // Skip aborted/error assistant messages
         if (shouldSkipAssistant(m)) continue;
 
