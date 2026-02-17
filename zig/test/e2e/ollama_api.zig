@@ -97,6 +97,9 @@ test "ollama e2e: basic text generation (new api)" {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
+    // Allow detached provider thread to complete deferred cleanup
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: ollama e2e stream error: {s}\n", .{err});
         return error.TestFailed;

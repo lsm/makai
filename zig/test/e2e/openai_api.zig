@@ -16,6 +16,9 @@ fn waitResultOrFail(stream: *ai_types.AssistantMessageEventStream) !ai_types.Ass
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
+    // Small delay to allow detached provider thread to fully exit and free resources
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: openai e2e stream error: {s}\n", .{err});
         return error.TestFailed;
