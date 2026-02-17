@@ -14,11 +14,6 @@ All build commands run from the `zig/` directory. Requires Zig 0.13.0+.
 cd zig
 zig build test          # Run all unit tests (27 modules: 22 unit + 5 e2e)
 zig build run           # Run the demo application
-zig build bench         # Run core benchmarks (ReleaseFast)
-zig build fiber-bench   # Fiber vs thread benchmarks
-zig build xev-bench     # libxev vs ZIO vs threads benchmarks
-zig build mt-xev-bench  # Multi-threaded libxev benchmarks
-zig build shared-bench  # ZIO shared runtime benchmarks
 ```
 
 There is no single-test command. Tests are inline in each `.zig` file using Zig's built-in `test` blocks, and `zig build test` runs all modules.
