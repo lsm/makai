@@ -759,13 +759,11 @@ fn runThread(ctx: *ThreadCtx) void {
         const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
 
         if (should_retry) {
-            // Read error body to check for retry delay hints
-            var error_body: [4096]u8 = undefined;
-            var error_body_len: usize = 0;
-            if (response.head.content_length) |_| {
-                error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
-            }
-            const error_text = error_body[0..error_body_len];
+            // Note: We skip reading the error body here because the response state machine
+            // may not be in a valid state for body reading (e.g., after a redirect or when
+            // the connection has been reset). The error body is only used for optional retry
+            // delay hints, so we rely on status code and Retry-After header instead.
+            const error_text: []const u8 = &.{};
 
             // Check if error body indicates a retryable error
             const is_retryable_error = retry_util.isRetryableError(error_text);
