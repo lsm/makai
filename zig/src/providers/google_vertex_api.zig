@@ -3,6 +3,7 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
+const retry_util = @import("retry");
 
 /// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
@@ -636,6 +637,7 @@ const ThreadCtx = struct {
     project: []u8,
     location: []u8,
     thinking_enabled: bool,
+    retry_config: ?ai_types.RetryConfig = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -647,6 +649,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const project = ctx.project;
     const location = ctx.location;
     const thinking_enabled = ctx.thinking_enabled;
+    const retry_opts = ctx.retry_config;
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -680,39 +683,168 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const headers = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
 
-    var req = client.request(.POST, uri, .{ .extra_headers = &headers }) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("request failed");
-        return;
-    };
-    defer req.deinit();
+    // Retry configuration
+    const MAX_RETRIES: u8 = 3;
+    const BASE_DELAY_MS: u32 = 1000;
+    const max_delay_ms: u32 = if (retry_opts) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
 
-    req.transfer_encoding = .{ .content_length = body.len };
-    req.sendBodyComplete(body) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("send failed");
-        return;
-    };
-
+    var response: std.http.Client.Response = undefined;
     var head_buf: [4096]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
-        stream.completeWithError("receive failed");
-        return;
-    };
+    var retry_attempt: u8 = 0;
+    var req: std.http.Client.Request = undefined;
+    var req_initialized = false;
+    defer if (req_initialized) req.deinit();
 
+    while (true) {
+        // Deinit previous request if this is a retry
+        if (req_initialized) {
+            req.deinit();
+            req_initialized = false;
+        }
+
+        req = client.request(.POST, uri, .{ .extra_headers = &headers }) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                allocator.free(project);
+                allocator.free(location);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request failed");
+                return;
+            }
+            allocator.free(project);
+            allocator.free(location);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request failed");
+            return;
+        };
+        req_initialized = true;
+
+        req.transfer_encoding = .{ .content_length = body.len };
+        req.sendBodyComplete(body) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                allocator.free(project);
+                allocator.free(location);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("send failed");
+                return;
+            }
+            allocator.free(project);
+            allocator.free(location);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("send failed");
+            return;
+        };
+
+        response = req.receiveHead(&head_buf) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                allocator.free(project);
+                allocator.free(location);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("receive failed");
+                return;
+            }
+            allocator.free(project);
+            allocator.free(location);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.completeWithError("receive failed");
+            return;
+        };
+
+        if (response.head.status == .ok) {
+            // Success - break out of retry loop
+            break;
+        }
+
+        // Check if status is retryable
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
+
+        if (should_retry) {
+            // Read error body to check for retry delay hints
+            var error_body: [4096]u8 = undefined;
+            const error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
+            const error_text = error_body[0..error_body_len];
+
+            // Check if error body indicates a retryable error
+            const is_retryable_error = retry_util.isRetryableError(error_text);
+
+            // Calculate delay - prefer server-provided delay
+            var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+
+            // Check Retry-After header
+            var retry_after_iter = response.head.iterateHeaders();
+            while (retry_after_iter.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                    if (retry_util.extractRetryDelayFromHeader(header.value)) |server_delay| {
+                        if (server_delay <= max_delay_ms) {
+                            delay = server_delay;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Check body for retry delay
+            if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
+                if (body_delay <= max_delay_ms) {
+                    delay = body_delay;
+                }
+            }
+
+            // If not a retryable error message, don't retry
+            if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
+                break;
+            }
+
+            // Wait before retry
+            if (!retry_util.sleepMs(delay, null)) {
+                allocator.free(project);
+                allocator.free(location);
+                allocator.free(api_key);
+                allocator.free(body);
+                allocator.destroy(ctx);
+                stream.completeWithError("vertex request failed");
+                return;
+            }
+
+            retry_attempt += 1;
+            continue;
+        }
+
+        // Non-retryable error or max retries reached
+        break;
+    }
+
+    // After retry loop, check final status
     if (response.head.status != .ok) {
         allocator.free(project);
         allocator.free(location);
@@ -1155,6 +1287,7 @@ pub fn streamGoogleVertex(
         .project = project,
         .location = location,
         .thinking_enabled = o.thinking_enabled,
+        .retry_config = o.retry,
     };
 
     const th = std.Thread.spawn(.{}, runThread, .{ctx}) catch {

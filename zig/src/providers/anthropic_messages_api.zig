@@ -123,6 +123,72 @@ fn hasToolUse(msg: ai_types.Message) bool {
     return false;
 }
 
+/// Check if an assistant message should be skipped (aborted or error)
+fn shouldSkipAssistant(msg: ai_types.Message) bool {
+    switch (msg) {
+        .assistant => |a| {
+            return a.stop_reason == .aborted or a.stop_reason == .@"error";
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Collect all tool call IDs from assistant messages into a hash set
+fn collectToolCallIds(allocator: std.mem.Allocator, messages: []const ai_types.Message) !std.StringHashMap(void) {
+    var tool_call_ids = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var iter = tool_call_ids.keyIterator();
+        while (iter.next()) |key| {
+            allocator.free(key.*);
+        }
+        tool_call_ids.deinit();
+    }
+
+    for (messages) |msg| {
+        switch (msg) {
+            .assistant => |a| {
+                for (a.content) |c| {
+                    if (c == .tool_call) {
+                        const id_dup = try allocator.dupe(u8, c.tool_call.id);
+                        try tool_call_ids.put(id_dup, {});
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return tool_call_ids;
+}
+
+/// Check if a tool result is orphaned (no matching tool call)
+/// Only returns true if there ARE tool calls in the context but none match this result
+fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringHashMap(void)) bool {
+    // If there are no tool calls at all, don't filter - results might be from prior context
+    if (tool_call_ids.count() == 0) {
+        return false;
+    }
+    switch (msg) {
+        .tool_result => |tr| {
+            if (tr.tool_call_id.len > 0) {
+                return !tool_call_ids.contains(tr.tool_call_id);
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+/// Free a StringHashMap's keys
+fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
+    var iter = map.keyIterator();
+    while (iter.next()) |key| {
+        allocator.free(key.*);
+    }
+    map.deinit();
+}
+
 fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator, is_oauth: bool) ![]u8 {
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
@@ -154,9 +220,23 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             // Prepend Claude Code identity for OAuth
             const full_prompt = try std.fmt.allocPrint(allocator, "You are Claude Code, Anthropic's official CLI for Claude.\n\n{s}", .{sp});
             defer allocator.free(full_prompt);
-            try w.writeStringField("text", full_prompt);
+            // Sanitize system prompt
+            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, full_prompt);
+            defer {
+                if (sanitized.ptr != full_prompt.ptr) {
+                    allocator.free(@constCast(sanitized));
+                }
+            }
+            try w.writeStringField("text", sanitized);
         } else {
-            try w.writeStringField("text", sp);
+            // Sanitize system prompt
+            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
+            defer {
+                if (sanitized.ptr != sp.ptr) {
+                    allocator.free(@constCast(sanitized));
+                }
+            }
+            try w.writeStringField("text", sanitized);
         }
         if (cache_control) |cc| {
             try w.writeKey("cache_control");
@@ -190,7 +270,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         try w.endArray();
     }
 
-    // Find the last user message index for cache_control placement
+    // Collect tool call IDs from assistant messages for orphaned tool result filtering
+    var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
+    defer freeToolCallIds(allocator, &tool_call_ids);
+
+    // Find the last user message index for cache_control placement (skip filtered messages)
     var last_user_idx: ?usize = null;
     for (context.messages, 0..) |m, i| {
         switch (m) {
@@ -204,6 +288,18 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var msg_idx: usize = 0;
     while (msg_idx < context.messages.len) {
         const m = context.messages[msg_idx];
+
+        // Skip aborted/error assistant messages
+        if (shouldSkipAssistant(m)) {
+            msg_idx += 1;
+            continue;
+        }
+
+        // Skip orphaned tool results (no matching tool call)
+        if (isOrphanedToolResult(m, &tool_call_ids)) {
+            msg_idx += 1;
+            continue;
+        }
 
         const is_last_user = last_user_idx != null and msg_idx == last_user_idx.?;
 
@@ -225,7 +321,15 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 // Serialize content - can be text, images, or array of content blocks
                 if (tr.content.len == 1 and tr.content[0] == .text) {
                     // Single text: serialize as string for simplicity
-                    try w.writeStringField("content", tr.content[0].text.text);
+                    // Sanitize text to remove unpaired surrogates
+                    const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, tr.content[0].text.text);
+                    defer {
+                        // Only free if a new allocation was made
+                        if (sanitized.ptr != tr.content[0].text.text.ptr) {
+                            allocator.free(@constCast(sanitized));
+                        }
+                    }
+                    try w.writeStringField("content", sanitized);
                 } else if (tr.content.len > 1 or (tr.content.len > 0 and tr.content[0] == .image)) {
                     // Multiple parts or image: serialize as array
                     try w.writeKey("content");
@@ -235,7 +339,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                try w.writeStringField("text", t.text);
+                                // Sanitize text to remove unpaired surrogates
+                                const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
+                                defer {
+                                    if (sanitized.ptr != t.text.ptr) {
+                                        allocator.free(@constCast(sanitized));
+                                    }
+                                }
+                                try w.writeStringField("text", sanitized);
                                 try w.endObject();
                             },
                             .image => |img| {
@@ -286,7 +397,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     .text => |t| {
                         try w.beginObject();
                         try w.writeStringField("type", "text");
-                        try w.writeStringField("text", t.text);
+                        // Sanitize text to remove unpaired surrogates
+                        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
+                        defer {
+                            if (sanitized.ptr != t.text.ptr) {
+                                allocator.free(@constCast(sanitized));
+                            }
+                        }
+                        try w.writeStringField("text", sanitized);
                         try w.endObject();
                     },
                     .thinking => |t| {
@@ -294,12 +412,26 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                         if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
                             try w.beginObject();
                             try w.writeStringField("type", "text");
-                            try w.writeStringField("text", t.thinking);
+                            // Sanitize thinking text
+                            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
+                            defer {
+                                if (sanitized.ptr != t.thinking.ptr) {
+                                    allocator.free(@constCast(sanitized));
+                                }
+                            }
+                            try w.writeStringField("text", sanitized);
                             try w.endObject();
                         } else {
                             try w.beginObject();
                             try w.writeStringField("type", "thinking");
-                            try w.writeStringField("thinking", t.thinking);
+                            // Sanitize thinking text
+                            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
+                            defer {
+                                if (sanitized.ptr != t.thinking.ptr) {
+                                    allocator.free(@constCast(sanitized));
+                                }
+                            }
+                            try w.writeStringField("thinking", sanitized);
                             try w.writeStringField("signature", t.thinking_signature.?);
                             try w.endObject();
                         }
@@ -331,7 +463,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                     // Text block with cache_control
                     try w.beginObject();
                     try w.writeStringField("type", "text");
-                    try w.writeStringField("text", t);
+                    // Sanitize text to remove unpaired surrogates
+                    const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
+                    defer {
+                        if (sanitized.ptr != t.ptr) {
+                            allocator.free(@constCast(sanitized));
+                        }
+                    }
+                    try w.writeStringField("text", sanitized);
                     try w.writeKey("cache_control");
                     try w.beginObject();
                     try w.writeStringField("type", "ephemeral");
@@ -347,7 +486,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                try w.writeStringField("text", t.text);
+                                // Sanitize text to remove unpaired surrogates
+                                const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
+                                defer {
+                                    if (sanitized.ptr != t.text.ptr) {
+                                        allocator.free(@constCast(sanitized));
+                                    }
+                                }
+                                try w.writeStringField("text", sanitized);
                                 // Add cache_control only to the last block
                                 if (i == parts.len - 1) {
                                     try w.writeKey("cache_control");
@@ -387,7 +533,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
                     switch (u.content) {
                         .text => |t| {
-                            try w.writeStringField("content", t);
+                            // Sanitize text to remove unpaired surrogates
+                            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t);
+                            defer {
+                                if (sanitized.ptr != t.ptr) {
+                                    allocator.free(@constCast(sanitized));
+                                }
+                            }
+                            try w.writeStringField("content", sanitized);
                         },
                         .parts => |parts| {
                             try w.writeKey("content");
@@ -397,7 +550,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                     .text => |t| {
                                         try w.beginObject();
                                         try w.writeStringField("type", "text");
-                                        try w.writeStringField("text", t.text);
+                                        // Sanitize text to remove unpaired surrogates
+                                        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
+                                        defer {
+                                            if (sanitized.ptr != t.text.ptr) {
+                                                allocator.free(@constCast(sanitized));
+                                            }
+                                        }
+                                        try w.writeStringField("text", sanitized);
                                         try w.endObject();
                                     },
                                     .image => |img| {
@@ -431,7 +591,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                             .text => |t| {
                                 try w.beginObject();
                                 try w.writeStringField("type", "text");
-                                try w.writeStringField("text", t.text);
+                                // Sanitize text to remove unpaired surrogates
+                                const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.text);
+                                defer {
+                                    if (sanitized.ptr != t.text.ptr) {
+                                        allocator.free(@constCast(sanitized));
+                                    }
+                                }
+                                try w.writeStringField("text", sanitized);
                                 try w.endObject();
                             },
                             .thinking => |t| {
@@ -439,12 +606,26 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                                 if (t.thinking_signature == null or t.thinking_signature.?.len == 0) {
                                     try w.beginObject();
                                     try w.writeStringField("type", "text");
-                                    try w.writeStringField("text", t.thinking);
+                                    // Sanitize thinking text
+                                    const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
+                                    defer {
+                                        if (sanitized.ptr != t.thinking.ptr) {
+                                            allocator.free(@constCast(sanitized));
+                                        }
+                                    }
+                                    try w.writeStringField("text", sanitized);
                                     try w.endObject();
                                 } else {
                                     try w.beginObject();
                                     try w.writeStringField("type", "thinking");
-                                    try w.writeStringField("thinking", t.thinking);
+                                    // Sanitize thinking text
+                                    const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, t.thinking);
+                                    defer {
+                                        if (sanitized.ptr != t.thinking.ptr) {
+                                            allocator.free(@constCast(sanitized));
+                                        }
+                                    }
+                                    try w.writeStringField("thinking", sanitized);
                                     try w.writeStringField("signature", t.thinking_signature.?);
                                     try w.endObject();
                                 }
@@ -736,6 +917,7 @@ const ThreadCtx = struct {
     cancel_token: ?ai_types.CancelToken = null,
     on_payload_fn: ?*const fn (ctx: ?*anyopaque, payload_json: []const u8) void = null,
     on_payload_ctx: ?*anyopaque = null,
+    retry: ?ai_types.RetryConfig = null,
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -748,6 +930,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const cancel_token = ctx.cancel_token;
     const on_payload_fn = ctx.on_payload_fn;
     const on_payload_ctx = ctx.on_payload_ctx;
+    const retry_options = ctx.retry;
 
     // Invoke on_payload callback before sending
     if (on_payload_fn) |cb| {
@@ -872,50 +1055,183 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
-        stream.completeWithError("request open failed");
-        return;
-    };
-    defer req.deinit();
+    // Retry configuration
+    const MAX_RETRIES: u8 = 3;
+    const BASE_DELAY_MS: u32 = 1000;
+    const max_delay_ms: u32 = if (retry_options) |ro| ro.max_retry_delay_ms orelse 60000 else 60000;
 
-    req.transfer_encoding = .{ .content_length = request_body.len };
-    req.sendBodyComplete(request_body) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
-        stream.completeWithError("request send failed");
-        return;
-    };
-
+    var response: std.http.Client.Response = undefined;
     var head_buf: [4096]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
-        stream.completeWithError("response failed");
-        return;
-    };
+    var retry_attempt: u8 = 0;
+    var last_error: ?[]u8 = null;
+    defer if (last_error) |e| allocator.free(e);
+    var req: std.http.Client.Request = undefined;
+    var req_initialized = false;
+    defer if (req_initialized) req.deinit();
 
-    if (response.head.status != .ok) {
-        const status_code = @intFromEnum(response.head.status);
-        const err = std.fmt.allocPrint(allocator, "anthropic request failed: HTTP {d}{s}", .{
-            status_code,
-            if (status_code == 401) " (check ANTHROPIC_API_KEY is valid)" else "",
-        }) catch {
+    while (true) {
+        // Check cancellation before each attempt
+        if (cancel_token) |ct| {
+            if (ct.isCancelled()) {
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+        }
+
+        // Deinit previous request if this is a retry
+        if (req_initialized) {
+            req.deinit();
+            req_initialized = false;
+        }
+
+        req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
             allocator.free(api_key);
             allocator.free(request_body);
             allocator.destroy(ctx);
-            stream.completeWithError("anthropic request failed");
+            stream.completeWithError("request open failed");
             return;
         };
-        defer allocator.free(err);
+        req_initialized = true;
+
+        req.transfer_encoding = .{ .content_length = request_body.len };
+        req.sendBodyComplete(request_body) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("request send failed");
+            return;
+        };
+
+        response = req.receiveHead(&head_buf) catch {
+            // Network error - check if we should retry
+            if (retry_attempt < MAX_RETRIES) {
+                const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+                if (retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                    retry_attempt += 1;
+                    continue;
+                }
+                // Sleep was cancelled
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.completeWithError("response failed");
+            return;
+        };
+
+        if (response.head.status == .ok) {
+            // Success - break out of retry loop
+            break;
+        }
+
+        // Check if status is retryable
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const should_retry = retry_util.isRetryable(status_code) and retry_attempt < MAX_RETRIES;
+
+        if (should_retry) {
+            // Read error body to check for retry delay hints
+            var error_body: [4096]u8 = undefined;
+            const error_body_len = response.reader(&head_buf).readSliceShort(&error_body) catch 0;
+            const error_text = error_body[0..error_body_len];
+
+            // Check if error body indicates a retryable error
+            const is_retryable_error = retry_util.isRetryableError(error_text);
+
+            // Calculate delay - prefer server-provided delay
+            var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
+
+            // Check Retry-After header
+            var retry_after_iter = response.head.iterateHeaders();
+            while (retry_after_iter.next()) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
+                    if (retry_util.extractRetryDelayFromHeader(header.value)) |server_delay| {
+                        if (server_delay <= max_delay_ms) {
+                            delay = server_delay;
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Check body for retry delay
+            if (retry_util.extractRetryDelayFromBody(error_text)) |body_delay| {
+                if (body_delay <= max_delay_ms) {
+                    delay = body_delay;
+                }
+            }
+
+            // If not a retryable error message, don't retry
+            if (!is_retryable_error and !retry_util.isRetryable(status_code)) {
+                break;
+            }
+
+            // Wait before retry
+            if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
+                // Sleep was cancelled
+                allocator.free(api_key);
+                allocator.free(request_body);
+                allocator.destroy(ctx);
+                stream.completeWithError("request cancelled");
+                return;
+            }
+
+            retry_attempt += 1;
+            continue;
+        }
+
+        // Non-retryable error or max retries reached
+        break;
+    }
+
+    // After retry loop, check final status
+    if (response.head.status != .ok) {
+        const status_code = @intFromEnum(response.head.status);
+        if (last_error) |e| allocator.free(e);
+        last_error = std.fmt.allocPrint(allocator, "anthropic request failed: HTTP {d}{s}", .{
+            status_code,
+            if (status_code == 401) " (check ANTHROPIC_API_KEY is valid)" else "",
+        }) catch null;
+
         allocator.free(api_key);
         allocator.free(request_body);
         allocator.destroy(ctx);
-        stream.completeWithError(err);
+        stream.completeWithError(last_error orelse "anthropic request failed");
         return;
     }
 
@@ -1250,6 +1566,7 @@ pub fn streamAnthropicMessages(
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
+        .retry = o.retry,
     };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
