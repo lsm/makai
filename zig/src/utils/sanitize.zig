@@ -145,6 +145,80 @@ fn decodeCodepoint(bytes: []const u8) ?u21 {
     return null;
 }
 
+/// Check if a UTF-8 string contains any unpaired surrogates.
+/// Returns true if the string needs sanitization.
+pub fn needsSanitization(input: []const u8) bool {
+    var i: usize = 0;
+    var expect_low: bool = false;
+
+    while (i < input.len) {
+        const cp = decodeCodepoint(input[i..]) orelse {
+            i += 1;
+            continue;
+        };
+
+        const seq_len = utf8SeqLen(input[i]) orelse 1;
+
+        if (isHighSurrogate(cp)) {
+            expect_low = true;
+        } else if (isLowSurrogate(cp)) {
+            if (!expect_low) {
+                // Unpaired low surrogate
+                return true;
+            }
+            expect_low = false;
+        } else {
+            if (expect_low) {
+                // Previous high surrogate was unpaired
+                return true;
+            }
+        }
+
+        i += seq_len;
+    }
+
+    // String ends with unpaired high surrogate
+    if (expect_low) {
+        return true;
+    }
+
+    return false;
+}
+
+/// Get the expected sequence length for a UTF-8 lead byte.
+fn utf8SeqLen(byte: u8) ?usize {
+    return if (byte < 0x80)
+        1
+    else if (byte < 0xC0)
+        null // Continuation byte
+    else if (byte < 0xE0)
+        2
+    else if (byte < 0xF0)
+        3
+    else if (byte < 0xF8)
+        4
+    else
+        null;
+}
+
+/// In-place version that returns the original buffer if no sanitization needed.
+/// If unpaired surrogates are found, allocates a new buffer with sanitized content.
+/// Caller owns the returned memory.
+pub fn sanitizeSurrogatesInPlace(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    // First check if sanitization is even needed
+    if (!needsSanitization(text)) {
+        // No unpaired surrogates found - return the original
+        // Note: caller should not free if this returns the original,
+        // but to maintain consistent ownership semantics, we return
+        // a const pointer that the caller should NOT free.
+        // Alternatively, we could dupe here for consistent ownership.
+        return text;
+    }
+
+    // Sanitization needed - allocate and return sanitized copy
+    return sanitizeSurrogates(allocator, text);
+}
+
 /// Encode a surrogate codepoint (0xD800-0xDFFF) as UTF-8 bytes.
 /// Surrogates are encoded as 3-byte sequences: 0xED 0xA0 0x80 - 0xED 0xBF 0xBF
 fn encodeSurrogateUtf8(cp: u21, out: *[3]u8) void {
@@ -372,4 +446,62 @@ test "sanitizeSurrogates preserves valid surrogate pair in ill-formed UTF-8" {
     // The valid surrogate pair (even in ill-formed UTF-8) should be preserved
     // Result should be: "test " + [3 bytes high] + [3 bytes low] + " end"
     try std.testing.expectEqualSlices(u8, input, result);
+}
+
+test "needsSanitization returns false for clean text" {
+    const input = "Hello, World!";
+    try std.testing.expect(!needsSanitization(input));
+}
+
+test "needsSanitization returns false for valid emoji" {
+    const input = "Hello \xF0\x9F\x98\x80 World"; // Grinning face emoji
+    try std.testing.expect(!needsSanitization(input));
+}
+
+test "needsSanitization returns true for lone high surrogate" {
+    var buf: [10]u8 = undefined;
+    encodeSurrogateUtf8(0xD800, buf[0..3]);
+    try std.testing.expect(needsSanitization(buf[0..3]));
+}
+
+test "needsSanitization returns true for lone low surrogate" {
+    var buf: [10]u8 = undefined;
+    encodeSurrogateUtf8(0xDC00, buf[0..3]);
+    try std.testing.expect(needsSanitization(buf[0..3]));
+}
+
+test "sanitizeSurrogatesInPlace returns original when no sanitization needed" {
+    const allocator = std.testing.allocator;
+
+    const input = "Hello, World!";
+    const result = try sanitizeSurrogatesInPlace(allocator, input);
+
+    // Should return the exact same slice (no allocation)
+    try std.testing.expect(result.ptr == input.ptr);
+}
+
+test "sanitizeSurrogatesInPlace allocates when sanitization needed" {
+    const allocator = std.testing.allocator;
+
+    // Build input with lone high surrogate
+    var input_buf: [10]u8 = undefined;
+    var input_len: usize = 0;
+
+    input_buf[input_len] = 'a';
+    input_len += 1;
+
+    encodeSurrogateUtf8(0xD83D, input_buf[input_len..][0..3]);
+    input_len += 3;
+
+    input_buf[input_len] = 'b';
+    input_len += 1;
+
+    const input = input_buf[0..input_len];
+
+    const result = try sanitizeSurrogatesInPlace(allocator, input);
+    defer allocator.free(result);
+
+    // Should be a different allocation
+    try std.testing.expect(result.ptr != input.ptr);
+    try std.testing.expectEqualSlices(u8, "ab", result);
 }

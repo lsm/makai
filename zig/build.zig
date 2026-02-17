@@ -81,6 +81,27 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const overflow_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/overflow.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const retry_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/retry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const oauth_pkce_mod = b.createModule(.{
+        .root_source_file = b.path("src/oauth/pkce.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const openai_completions_api_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/openai_completions_api.zig"),
         .target = target,
@@ -232,12 +253,29 @@ pub fn build(b: *std.Build) void {
 
     const github_copilot_test = b.addTest(.{ .root_module = github_copilot_mod });
 
+    const overflow_test = b.addTest(.{ .root_module = overflow_mod });
+
+    const retry_test = b.addTest(.{ .root_module = retry_mod });
+
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
     const openai_responses_api_test = b.addTest(.{ .root_module = openai_responses_api_mod });
     const azure_openai_responses_api_test = b.addTest(.{ .root_module = azure_openai_responses_api_mod });
     const google_generative_api_test = b.addTest(.{ .root_module = google_generative_api_mod });
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
+
+    const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
+
+    const oauth_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/oauth/mod.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pkce", .module = oauth_pkce_mod },
+            },
+        }),
+    });
 
     const e2e_anthropic_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -319,12 +357,16 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(stream_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
+    test_step.dependOn(&b.addRunArtifact(overflow_test).step);
+    test_step.dependOn(&b.addRunArtifact(retry_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
     test_step.dependOn(&b.addRunArtifact(azure_openai_responses_api_test).step);
     test_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
