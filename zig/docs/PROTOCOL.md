@@ -13,6 +13,7 @@
 9. [Extension Mechanisms](#9-extension-mechanisms)
 10. [Examples](#10-examples)
 11. [Security](#11-security)
+12. [Memory Ownership](#12-memory-ownership)
 
 ---
 
@@ -97,7 +98,6 @@ Envelope
 ```
 Request
   |-- stream_request      - Initiate a streaming AI request
-  |-- complete_request    - Request non-streaming completion
   |-- abort_request       - Cancel an in-flight request
 
 Event
@@ -116,19 +116,22 @@ Event
   |-- image_end           - Image completed (future)
   |-- done                - Stream completed successfully
   |-- error               - Stream error
-  |-- ping                - Keepalive
+  |-- keepalive           - Stream-level keepalive
 
 Control
   |-- ack                 - Acknowledgment
   |-- nack                - Negative acknowledgment
-  |-- ping                - Transport keepalive
-  |-- pong                - Keepalive response
+  |-- ping                - Connection-level transport keepalive
+  |-- pong                - Connection-level keepalive response
   |-- goodbye             - Graceful connection close
+  |-- sync_request        - Request full state resync (client->server)
+  |-- sync                - Full partial state resync (server->client)
 
 Response
-  |-- result              - Final assistant message (complete mode)
   |-- stream_error        - Stream-level error
 ```
+
+**Note on Non-Streaming Mode**: The protocol does not include a separate `complete_request` message type. Non-streaming operations can be implemented as streaming with all events buffered until `done` is received. This simplifies the protocol and ensures consistent behavior across all usage patterns.
 
 ---
 
@@ -162,6 +165,31 @@ All messages are wrapped in an envelope:
 | `include_partial` | boolean | No | Include per-block partial state (default: false) |
 
 **Note**: Message fragmentation is handled by the transport layer. The protocol does not include fragmentation fields.
+
+#### 4.1.1 Sequence Scope
+
+The `sequence` field has per-stream scope:
+
+- **Monotonically increasing**: Sequence numbers increment by 1 for each message within a single `stream_id`
+- **Starts at 1**: The first message for any stream has `sequence: 1`
+- **Resets per stream**: Each new `stream_id` starts its own independent sequence counter
+
+This allows clients to detect missing or out-of-order messages on a per-stream basis.
+
+#### 4.1.2 Identifier Semantics
+
+The following rules govern identifier generation and usage:
+
+- **`stream_id`**:
+  - Client generates the `stream_id` for all requests (e.g., in `stream_request`)
+  - Server echoes the same `stream_id` in all response events for that stream
+  - Connection-level messages use the sentinel value `"stream_id": "_connection"`
+
+- **`message_id`**:
+  - The sender of each envelope generates a unique `message_id`
+  - Used for correlation via `in_reply_to` field in acknowledgments
+
+**Connection-level sentinel**: Messages that are not associated with any particular stream (e.g., connection-level control messages) use the reserved `stream_id` value `"_connection"`.
 
 ### 4.2 Encoding Modes
 
@@ -423,6 +451,101 @@ X-Makai-Version: 1.0.0
 }
 ```
 
+#### Tool
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "parameters_schema_json": { "type": "string" }
+  },
+  "required": ["name", "parameters_schema_json"]
+}
+```
+
+#### UserMessage
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "role": { "const": "user" },
+    "content": {
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": { "const": "text" },
+                  "text": { "type": "string" }
+                },
+                "required": ["type", "text"]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": { "const": "image" },
+                  "source": {
+                    "type": "object",
+                    "properties": {
+                      "type": { "type": "string" },
+                      "media_type": { "type": "string" },
+                      "data": { "type": "string" }
+                    }
+                  }
+                },
+                "required": ["type", "source"]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "timestamp": { "type": "integer" }
+  },
+  "required": ["role", "content"]
+}
+```
+
+#### AssistantMessage
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "role": { "const": "assistant" },
+    "content": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ContentBlock" }
+    },
+    "usage": { "$ref": "#/$defs/Usage" },
+    "stop_reason": { "$ref": "#/$defs/StopReason" },
+    "model": { "type": "string" },
+    "timestamp": { "type": "integer" }
+  },
+  "required": ["role", "content", "usage", "stop_reason", "model"]
+}
+```
+
+#### Message
+
+A discriminated union of UserMessage and AssistantMessage for use in Context.messages.
+
+```json
+{
+  "oneOf": [
+    { "$ref": "#/$defs/UserMessage" },
+    { "$ref": "#/$defs/AssistantMessage" }
+  ]
+}
+```
+
 ### 6.2 Request Messages
 
 #### StreamRequest
@@ -546,6 +669,8 @@ X-Makai-Version: 1.0.0
 
 ### 6.3 Event Messages
 
+**include_partial Immutability**: The `include_partial` flag is immutable for the lifetime of a stream. It is set once in the `stream_request` and cannot be changed mid-stream. If a client needs to change the partial inclusion mode, it must start a new stream.
+
 #### StartEvent
 
 When `include_partial: false`, the start event includes model and initial token info:
@@ -617,6 +742,101 @@ When `include_partial: false`, the start event includes model and initial token 
         }
       },
       "required": ["content_index", "delta", "partial"]
+    }
+  }
+}
+```
+
+#### TextEndEvent
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "text_end" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "text": { "type": "string" },
+        "signature": { "type": "string" }
+      },
+      "required": ["content_index"]
+    }
+  }
+}
+```
+
+#### ThinkingStartEvent (include_partial: false)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "thinking_start" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["content_index"]
+    }
+  }
+}
+```
+
+#### ThinkingStartEvent (include_partial: true)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "thinking_start" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "include_partial": { "const": true },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "partial": {
+          "type": "object",
+          "properties": {
+            "current_thinking": { "type": "string" }
+          },
+          "required": ["current_thinking"]
+        }
+      },
+      "required": ["content_index", "partial"]
+    }
+  }
+}
+```
+
+#### ThinkingDeltaEvent (include_partial: false)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "thinking_delta" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "delta": { "type": "string" }
+      },
+      "required": ["content_index", "delta"]
     }
   }
 }
@@ -880,6 +1100,56 @@ When `include_partial: false`, the start event includes model and initial token 
 }
 ```
 
+#### SyncRequestControl
+
+Client sends `sync_request` to request a full state resync from the server. This is useful when the client has lost partial state and needs to reconstruct it.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "sync_request" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "target_stream_id": { "type": "string" }
+      },
+      "required": ["target_stream_id"]
+    }
+  },
+  "required": ["type", "stream_id", "message_id", "sequence", "payload"]
+}
+```
+
+#### SyncControl
+
+Server sends `sync` in response to a `sync_request`, containing the full partial state for the requested stream.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "sync" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "in_reply_to": { "type": "string" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "target_stream_id": { "type": "string" },
+        "partial": { "$ref": "#/$defs/AssistantMessage" }
+      },
+      "required": ["target_stream_id", "partial"]
+    }
+  },
+  "required": ["type", "stream_id", "message_id", "sequence", "in_reply_to", "payload"]
+}
+```
+
 ---
 
 ## 7. Protocol Lifecycle
@@ -1089,6 +1359,15 @@ Reserved event types for agentic workflows:
 { "type": "agent_delegate_result", "payload": { "agent_id": "...", "result": {} } }
 ```
 
+**Bidirectional Agent Loop Communication**:
+
+Agent loop messages are **bidirectional**, inverting the typical client-to-server request model:
+
+- **Server -> Client**: The server (AI agent) can send `tool_request` to the client, asking the client to execute a tool (e.g., file operations, API calls, user interactions).
+- **Client -> Server**: The client sends `tool_result` back to the server with the execution outcome.
+
+This inversion is necessary because in agentic workflows, the AI controls the flow and decides what actions to take. The client becomes the tool executor rather than the request initiator. Implementations must be prepared to handle incoming `tool_request` events at any time during an active agent loop session.
+
 ---
 
 ## 10. Examples
@@ -1271,6 +1550,16 @@ partial.usage = event.payload.usage;
 {"type":"error","stream_id":"550e8400-e29b-41d4-a716-446655440003","message_id":"msg-err-001","sequence":7,"payload":{"reason":"aborted","error_message":"User cancelled","usage":{"input":100,"output":50}}}
 ```
 
+**Abort Invariants**:
+
+The following guarantees apply to abort handling:
+
+1. **Idempotency**: `abort_request` is idempotent. The server MUST acknowledge (via `ack`) even if the target stream has already completed (with `done` or `error`).
+
+2. **Terminal Guarantee**: For any stream, either `error` or `done` is always the final event. No events shall be emitted for a stream after a terminal event.
+
+3. **Race Handling**: Due to network and processing latency, events with `sequence < abort_sequence` may still arrive after the client sends an abort. Clients SHOULD discard any events received after an abort that do not have the terminal `error` or `done` event. The server ensures the final event for an aborted stream is an `error` with `reason: "aborted"`.
+
 ### 10.4 WebSocket Full Session
 
 ```
@@ -1374,6 +1663,35 @@ The protocol does not define authentication mechanisms. Authentication is handle
 1. **Bearer Token**: Standard `Authorization: Bearer <token>` header
 2. **mTLS**: Mutual TLS for server and client authentication
 3. **API Gateway**: Authentication handled by intermediary
+
+---
+
+## 12. Memory Ownership
+
+### 12.1 Ownership Model
+
+All events in the stream follow a clear ownership model to ensure safe async handling without use-after-free:
+
+1. **Events Own Their Strings**: Every event payload owns any string data it contains. Strings are not borrowed from external sources.
+
+2. **Provider String Duplication**: When providers create events, they MUST duplicate any strings that come from external sources (e.g., provider API responses, user input). This ensures events remain valid even after the original source is deallocated.
+
+3. **Protocol Layer Cleanup**: The protocol layer handles cleanup via `event_stream.deinit()`. This releases all resources owned by events in the stream.
+
+### 12.2 Lifecycle Guarantees
+
+| Resource | Owner | Lifetime |
+|----------|-------|----------|
+| Event payload strings | Event | Until `deinit()` called on event/stream |
+| Content block strings | Content block | Same as containing event |
+| Tool call arguments JSON | Tool call event | Same as containing event |
+| Error messages | Error event | Same as containing event |
+
+### 12.3 Implementation Requirements
+
+- **Providers**: Must use `dupe()` or equivalent when creating events from borrowed strings
+- **Protocol Layer**: Must provide `deinit()` method to release all event resources
+- **Consumers**: Must not hold references to event data after `deinit()` is called
 
 ---
 

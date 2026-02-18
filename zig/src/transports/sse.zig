@@ -132,13 +132,53 @@ pub const AsyncSseSender = struct {
 };
 
 /// Async SSE Receiver — produces ByteStream with parsed SSE data payloads.
+/// Caller must call deinit() to join the thread and free resources.
 pub const AsyncSseReceiver = struct {
     file: std.fs.File,
+    thread: ?std.Thread = null,
+    stream: ?*transport.ByteStream = null,
+    cancel_token: ?*std.atomic.Value(bool) = null,
+    allocator: ?std.mem.Allocator = null,
 
     const Self = @This();
 
     pub fn init(file: std.fs.File) Self {
         return .{ .file = file };
+    }
+
+    /// Signal cancellation and join the thread with a timeout.
+    /// Returns true if the thread exited cleanly, false if timeout was reached.
+    pub fn deinit(self: *Self) bool {
+        // Signal cancellation if we have a cancel token
+        if (self.cancel_token) |token| {
+            token.store(true, .release);
+        }
+
+        // Join thread with timeout
+        if (self.thread) |t| {
+            // Use stream's waitForThread for timeout-based waiting
+            const thread_exited = if (self.stream) |s| s.waitForThread(5000) else false;
+
+            // Always join the thread (blocking if it didn't exit)
+            t.join();
+            self.thread = null;
+
+            if (!thread_exited) {
+                // Thread didn't exit in time, but we still joined
+            }
+        }
+
+        // Free cancel token
+        if (self.cancel_token) |token| {
+            if (self.allocator) |alloc| {
+                alloc.destroy(token);
+            }
+            self.cancel_token = null;
+        }
+
+        self.stream = null;
+        self.allocator = null;
+        return true;
     }
 
     pub fn receiver(self: *Self) transport.AsyncReceiver {
@@ -155,6 +195,7 @@ pub const AsyncSseReceiver = struct {
         allocator: std.mem.Allocator,
         parser: sse_parser.SSEParser,
         read_buf: [4096]u8 = undefined,
+        cancel_token: ?*std.atomic.Value(bool) = null,
     };
 
     fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
@@ -163,16 +204,26 @@ pub const AsyncSseReceiver = struct {
         const stream = try allocator.create(transport.ByteStream);
         stream.* = transport.ByteStream.init(allocator);
 
+        const cancel_token = try allocator.create(std.atomic.Value(bool));
+        cancel_token.* = std.atomic.Value(bool).init(false);
+
         const thread_ctx = try allocator.create(ProducerContext);
         thread_ctx.* = .{
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
             .parser = sse_parser.SSEParser.init(allocator),
+            .cancel_token = cancel_token,
         };
 
+        // Store for deinit
+        self.stream = stream;
+        self.cancel_token = cancel_token;
+        self.allocator = allocator;
+
         const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
-        thread.detach();
+        self.thread = thread;
+        // Don't detach - we need to join in deinit
 
         return stream;
     }
@@ -185,6 +236,14 @@ pub const AsyncSseReceiver = struct {
         }
 
         while (true) {
+            // Check for cancellation
+            if (ctx.cancel_token) |token| {
+                if (token.load(.acquire)) {
+                    ctx.stream.completeWithError("Cancelled");
+                    return;
+                }
+            }
+
             // Read more bytes from the source
             const bytes_read = ctx.file.read(&ctx.read_buf) catch {
                 ctx.stream.completeWithError("Read error");

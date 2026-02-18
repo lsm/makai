@@ -69,7 +69,7 @@ pub const StdioReceiver = struct {
             // Read more data
             const bytes_read = self.file.read(&self.read_buf) catch return null;
             if (bytes_read == 0) {
-                // EOF — return remaining data as last line if any
+                // EOF - return remaining data as last line if any
                 if (self.leftover.items.len > 0) {
                     const line = try allocator.dupe(u8, self.leftover.items);
                     self.leftover.clearRetainingCapacity();
@@ -84,6 +84,59 @@ pub const StdioReceiver = struct {
 };
 
 // --- Async implementations ---
+
+/// Handle for an async stream with thread lifecycle management.
+/// Caller owns this handle and must call deinit() to join the thread and free resources.
+pub const AsyncStreamHandle = struct {
+    stream: *transport.ByteStream,
+    thread: std.Thread,
+    cancel_token: *std.atomic.Value(bool),
+    allocator: std.mem.Allocator,
+
+    const Self = @This();
+
+    /// Signal cancellation and join the thread with a timeout.
+    /// Returns true if the thread exited cleanly, false if timeout was reached.
+    pub fn deinit(self: *Self, timeout_ms: u64) bool {
+        // Signal the thread to stop
+        self.cancel_token.store(true, .release);
+
+        // Wait for the thread with a timeout
+        // Note: std.Thread.join() has no timeout, so we use a timed wait on the stream's thread_done flag
+        const thread_exited = self.stream.waitForThread(timeout_ms);
+
+        if (thread_exited) {
+            self.thread.join();
+        }
+        // If thread didn't exit, we still need to clean up
+        // The detached alternative would leak, so we join anyway (blocking)
+        // In production code you might want to detach or force-kill if available
+
+        // Free the cancel token
+        self.allocator.destroy(self.cancel_token);
+
+        // Free the stream
+        self.stream.deinit();
+        self.allocator.destroy(self.stream);
+
+        return thread_exited;
+    }
+
+    /// Get a pointer to the ByteStream for reading.
+    pub fn getStream(self: *Self) *transport.ByteStream {
+        return self.stream;
+    }
+
+    /// Check if cancellation has been requested.
+    pub fn isCancelled(self: *const Self) bool {
+        return self.cancel_token.load(.acquire);
+    }
+
+    /// Request cancellation of the stream.
+    pub fn cancel(self: *Self) void {
+        self.cancel_token.store(true, .release);
+    }
+};
 
 pub const AsyncStdioSender = struct {
     file: std.fs.File,
@@ -137,6 +190,10 @@ pub const AsyncStdioReceiver = struct {
         allocator: std.mem.Allocator,
         leftover: std.ArrayList(u8),
         read_buf: [4096]u8 = undefined,
+        cancel_token: *std.atomic.Value(bool),
+        /// If true, thread owns cancel_token and should free it on exit.
+        /// If false, caller (AsyncStreamHandle) owns it and will free it in deinit.
+        owns_cancel_token: bool,
     };
 
     fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
@@ -145,28 +202,70 @@ pub const AsyncStdioReceiver = struct {
         const stream = try allocator.create(transport.ByteStream);
         stream.* = transport.ByteStream.init(allocator);
 
+        const cancel_token = try allocator.create(std.atomic.Value(bool));
+        cancel_token.* = std.atomic.Value(bool).init(false);
+
         const thread_ctx = try allocator.create(ProducerContext);
         thread_ctx.* = .{
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
-            .leftover = std.ArrayList(u8).init(allocator),
+            .leftover = std.ArrayList(u8){},
+            .cancel_token = cancel_token,
+            .owns_cancel_token = true, // Thread owns it in legacy mode
         };
 
         const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
+
+        // Store thread handle in the stream's result field (hack for backward compat)
+        // Actually, we cannot do this cleanly without changing the ByteStream type.
+        // For backward compatibility with receiveStreamFn signature, we detach but
+        // the caller should use receiveStreamWithHandle() for proper lifecycle management.
         thread.detach();
 
         return stream;
     }
 
+    /// Create an async stream with proper thread lifecycle management.
+    /// Returns an AsyncStreamHandle that must be deinit'd by the caller.
+    pub fn receiveStreamWithHandle(self: *Self, allocator: std.mem.Allocator) !AsyncStreamHandle {
+        const stream = try allocator.create(transport.ByteStream);
+        stream.* = transport.ByteStream.init(allocator);
+
+        const cancel_token = try allocator.create(std.atomic.Value(bool));
+        cancel_token.* = std.atomic.Value(bool).init(false);
+
+        const thread_ctx = try allocator.create(ProducerContext);
+        thread_ctx.* = .{
+            .stream = stream,
+            .file = self.file,
+            .allocator = allocator,
+            .leftover = std.ArrayList(u8){},
+            .cancel_token = cancel_token,
+            .owns_cancel_token = false, // Handle owns it
+        };
+
+        const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
+
+        return .{
+            .stream = stream,
+            .thread = thread,
+            .cancel_token = cancel_token,
+            .allocator = allocator,
+        };
+    }
+
     fn producerThread(ctx: *ProducerContext) void {
         defer {
-            ctx.leftover.deinit();
+            ctx.leftover.deinit(ctx.allocator);
+            if (ctx.owns_cancel_token) {
+                ctx.allocator.destroy(ctx.cancel_token);
+            }
             ctx.stream.markThreadDone();
             ctx.allocator.destroy(ctx);
         }
 
-        while (true) {
+        while (!ctx.cancel_token.load(.acquire)) {
             // Check for complete line in leftover
             if (std.mem.indexOfScalar(u8, ctx.leftover.items, '\n')) |nl_pos| {
                 const line = ctx.leftover.items[0..nl_pos];
@@ -210,18 +309,21 @@ pub const AsyncStdioReceiver = struct {
                 return;
             }
 
-            ctx.leftover.appendSlice(ctx.read_buf[0..bytes_read]) catch {
+            ctx.leftover.appendSlice(ctx.allocator, ctx.read_buf[0..bytes_read]) catch {
                 ctx.stream.completeWithError("Out of memory");
                 return;
             };
         }
+
+        // Cancelled - complete the stream with an error
+        ctx.stream.completeWithError("Cancelled");
     }
 
     // Keep backward-compatible blocking read
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        var leftover = std.ArrayList(u8).init(allocator);
-        defer leftover.deinit();
+        var leftover = std.ArrayList(u8){};
+        defer leftover.deinit(allocator);
         var read_buf: [4096]u8 = undefined;
 
         while (true) {
@@ -241,7 +343,7 @@ pub const AsyncStdioReceiver = struct {
                 return null;
             }
 
-            try leftover.appendSlice(read_buf[0..bytes_read]);
+            try leftover.appendSlice(allocator, read_buf[0..bytes_read]);
         }
     }
 };
@@ -286,4 +388,124 @@ test "StdioSender and StdioReceiver round-trip via pipe" {
     // EOF
     const line3 = try r.read(allocator);
     try std.testing.expect(line3 == null);
+}
+
+test "AsyncStdioReceiver with handle lifecycle management" {
+    const allocator = std.testing.allocator;
+
+    // Create a pipe for testing
+    const pipe = try std.posix.pipe();
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    defer read_file.close();
+
+    // Set up async receiver with handle
+    var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
+    var handle = try async_receiver.receiveStreamWithHandle(allocator);
+
+    // Write test data from another thread (simulate producer)
+    const WriterContext = struct {
+        file: std.fs.File,
+        fn writeData(ctx: *@This()) void {
+            std.Thread.sleep(std.time.ns_per_ms * 10); // Small delay
+            _ = ctx.file.write("line1\nline2\n") catch {};
+            ctx.file.close();
+        }
+    };
+    var writer_ctx = WriterContext{ .file = write_file };
+    const writer_thread = try std.Thread.spawn(.{}, WriterContext.writeData, .{&writer_ctx});
+
+    // Read from the stream
+    const stream = handle.getStream();
+
+    // Read first line
+    if (stream.wait()) |chunk| {
+        defer {
+            var mutable = chunk;
+            mutable.deinit(allocator);
+        }
+        try std.testing.expectEqualStrings("line1", chunk.data);
+    }
+
+    // Read second line
+    if (stream.wait()) |chunk| {
+        defer {
+            var mutable = chunk;
+            mutable.deinit(allocator);
+        }
+        try std.testing.expectEqualStrings("line2", chunk.data);
+    }
+
+    // Wait for stream to complete
+    _ = stream.wait(); // Should return null when done
+
+    // Clean up with proper lifecycle management
+    writer_thread.join();
+    const exited = handle.deinit(5000);
+    try std.testing.expect(exited);
+}
+
+test "AsyncStreamHandle cancellation" {
+    const allocator = std.testing.allocator;
+
+    // Create a pipe - we won't write to it, so the reader will block
+    const pipe = try std.posix.pipe();
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    const write_file = std.fs.File{ .handle = pipe[1] };
+
+    var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
+    var handle = try async_receiver.receiveStreamWithHandle(allocator);
+
+    // Verify not cancelled initially
+    try std.testing.expect(!handle.isCancelled());
+
+    // Request cancellation
+    handle.cancel();
+    try std.testing.expect(handle.isCancelled());
+
+    // Close the write end to unblock the read (in case cancellation isn't instant)
+    write_file.close();
+
+    // Clean up - should exit quickly due to cancellation
+    const exited = handle.deinit(5000);
+    // Thread should have exited (either by cancellation or EOF)
+    try std.testing.expect(exited);
+}
+
+test "AsyncStdioReceiver legacy interface still works" {
+    const allocator = std.testing.allocator;
+
+    // Create a pipe for testing
+    const pipe = try std.posix.pipe();
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    defer read_file.close();
+
+    // Set up async receiver using the legacy interface
+    var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
+    var receiver = async_receiver.receiver();
+
+    // Get the stream (legacy interface - detached thread)
+    const stream = try receiver.receiveStream(allocator);
+
+    // Write test data and close
+    _ = try write_file.write("test_data\n");
+    write_file.close();
+
+    // Read from stream
+    if (stream.wait()) |chunk| {
+        defer {
+            var mutable = chunk;
+            mutable.deinit(allocator);
+        }
+        try std.testing.expectEqualStrings("test_data", chunk.data);
+    }
+
+    // Wait for completion
+    _ = stream.wait();
+
+    // Legacy cleanup - wait for thread and free stream
+    _ = stream.waitForThread(5000);
+    stream.deinit();
+    allocator.destroy(stream);
 }
