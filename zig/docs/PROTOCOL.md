@@ -395,7 +395,7 @@ X-Makai-Version: 1.0.0
     {
       "type": "object",
       "properties": {
-        "type": { "const": "tool_use" },
+        "type": { "const": "tool_call" },
         "id": { "type": "string" },
         "name": { "type": "string" },
         "input_json": { "type": "string" },
@@ -695,6 +695,27 @@ When `include_partial: false`, the start event includes model and initial token 
 }
 ```
 
+#### TextStartEvent
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "text_start" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["content_index"]
+    }
+  }
+}
+```
+
 #### TextDeltaEvent (include_partial: false)
 
 ```json
@@ -872,6 +893,29 @@ When `include_partial: false`, the start event includes model and initial token 
 }
 ```
 
+#### ThinkingEndEvent
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "thinking_end" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "thinking": { "type": "string" },
+        "signature": { "type": "string" }
+      },
+      "required": ["content_index"]
+    }
+  }
+}
+```
+
 #### ToolCallStartEvent
 
 ```json
@@ -890,6 +934,28 @@ When `include_partial: false`, the start event includes model and initial token 
         "name": { "type": "string" }
       },
       "required": ["content_index", "id", "name"]
+    }
+  }
+}
+```
+
+#### ToolCallDeltaEvent (include_partial: false)
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "toolcall_delta" },
+    "stream_id": { "type": "string" },
+    "message_id": { "type": "string" },
+    "sequence": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "content_index": { "type": "integer", "minimum": 0 },
+        "delta": { "type": "string" }
+      },
+      "required": ["content_index", "delta"]
     }
   }
 }
@@ -1035,7 +1101,12 @@ When `include_partial: false`, the start event includes model and initial token 
       "properties": {
         "rejected_id": { "type": "string" },
         "reason": { "type": "string" },
-        "error_code": { "type": "string" }
+        "error_code": { "type": "string" },
+        "supported_versions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "List of protocol versions supported by the server (present when error_code is VERSION_MISMATCH)"
+        }
       },
       "required": ["rejected_id", "reason"]
     }

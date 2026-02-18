@@ -215,7 +215,7 @@ fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEv
         },
         .done => |*d| d.message.deinit(allocator),
         .@"error" => |*e| e.err.deinit(allocator),
-        .start, .text_start, .thinking_start, .toolcall_start, .ping => {},
+        .start, .text_start, .thinking_start, .toolcall_start, .keepalive => {},
     }
 }
 

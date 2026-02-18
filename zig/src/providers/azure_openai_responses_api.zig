@@ -308,7 +308,7 @@ fn runThread(ctx: *ThreadCtx) void {
         if (ping_interval > 0) {
             const now = std.time.milliTimestamp();
             if (now - last_ping_time >= ping_interval) {
-                ctx.stream.push(.{ .ping = {} }) catch {};
+                ctx.stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
             }
         }

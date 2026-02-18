@@ -55,62 +55,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 };
 
                 if (comptime is_assistant_message_event) {
-                    switch (event) {
-                        .start => |_| {
-                            // Partial message is typically a snapshot without owned memory
-                            // No cleanup needed
-                        },
-                        .text_delta => |_| {
-                            // Delta is a slice into provider-managed buffers
-                            // Partial is a snapshot without owned memory
-                        },
-                        .thinking_delta => |_| {
-                            // Delta is a slice into provider-managed buffers
-                            // Partial is a snapshot without owned memory
-                        },
-                        .toolcall_start => |_| {
-                            // Partial is a snapshot without owned memory
-                        },
-                        .toolcall_delta => |_| {
-                            // Delta is provider-managed
-                            // Partial is a snapshot without owned memory
-                        },
-                        .toolcall_end => |e| {
-                            // Free tool_call fields if they were allocated
-                            // Note: tool_call fields may point to provider buffers
-                            // Only free if we know they were heap-allocated
-                            _ = e;
-                        },
-                        .done => |d| {
-                            // The message in done event shares content pointers with self.result.
-                            // Skip freeing here - self.result.deinit() will handle it below.
-                            // This prevents double-free when both done event and result exist.
-                            _ = d;
-                        },
-                        .@"error" => |e| {
-                            // The err message may have owned memory
-                            var mutable_err = e.err;
-                            mutable_err.deinit(self.allocator);
-                        },
-                        else => {},
-                    }
+                    // Per PROTOCOL.md Section 12, events should own their strings.
+                    // Current implementation: events reference strings that may be owned by
+                    // the caller/producer. Callers who poll events are responsible for freeing
+                    // any owned strings. Unpolled events in the drain loop do not have their
+                    // strings freed here - the producer retains ownership and manages cleanup.
+                    // See transport.zig freeEventStrings() for proper cleanup when needed.
+                    _ = event;
                 } else {
-                    // Handle events that have delta/content fields with heap-allocated strings
-                    // Use comptime introspection to check for field existence
-                    const info = @typeInfo(T);
-                    if (info == .@"union") {
-                        switch (event) {
-                            inline .text_delta, .thinking_delta, .toolcall_delta => |d| {
-                                // Don't free delta - it's a slice into provider-managed buffers
-                                // that are freed when the provider thread exits
-                                _ = d;
-                            },
-                            .toolcall_end => |_| {
-                                // Tool call cleanup if needed
-                            },
-                            else => {},
-                        }
-                    }
+                    // Generic event handling for other event types.
+                    _ = event;
                 }
             }
 

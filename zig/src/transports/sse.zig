@@ -176,7 +176,15 @@ pub const AsyncSseReceiver = struct {
             self.cancel_token = null;
         }
 
-        self.stream = null;
+        // Free stream
+        if (self.stream) |s| {
+            s.deinit();
+            if (self.allocator) |alloc| {
+                alloc.destroy(s);
+            }
+            self.stream = null;
+        }
+
         self.allocator = null;
         return true;
     }

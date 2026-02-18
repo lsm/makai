@@ -203,8 +203,8 @@ pub const PartialReconstructor = struct {
                 self.done_received = true;
                 self.stop_reason = e.reason;
             },
-            .ping => {
-                // No state change for ping
+            .keepalive => {
+                // No state change for keepalive
             },
         }
     }

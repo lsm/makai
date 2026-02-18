@@ -126,7 +126,7 @@ pub const PartialState = struct {
                 // Update final usage
                 self.usage = d.message.usage;
             },
-            .text_end, .thinking_end, .@"error", .ping => {},
+            .text_end, .thinking_end, .@"error", .keepalive => {},
         }
     }
 
@@ -247,8 +247,8 @@ pub fn serializeEvent(
             try w.writeStringField("type", "error");
             try w.writeStringField("reason", @tagName(e.reason));
         },
-        .ping => {
-            try w.writeStringField("type", "ping");
+        .keepalive => {
+            try w.writeStringField("type", "keepalive");
         },
     }
 
@@ -552,7 +552,7 @@ test "serializeEvent produces valid JSON" {
         .{ .text_start = .{ .content_index = 0, .partial = partial } },
         .{ .text_delta = .{ .content_index = 0, .delta = "test", .partial = partial } },
         .{ .text_end = .{ .content_index = 0, .content = "test", .partial = partial } },
-        .{ .ping = {} },
+        .{ .keepalive = {} },
     };
 
     const options = SerializationOptions{};

@@ -360,15 +360,21 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
             // Nest message fields under "message" key
             try w.writeKey("message");
             try w.beginObject();
+            try w.writeStringField("role", "assistant");
             try w.writeStringField("stop_reason", @tagName(d.message.stop_reason));
             try w.writeStringField("model", d.message.model);
             try w.writeStringField("api", d.message.api);
             try w.writeStringField("provider", d.message.provider);
             try w.writeIntField("timestamp", d.message.timestamp);
+
+            // Nest usage fields under "usage" key
+            try w.writeKey("usage");
+            try w.beginObject();
             try w.writeIntField("input", d.message.usage.input);
             try w.writeIntField("output", d.message.usage.output);
             try w.writeIntField("cache_read", d.message.usage.cache_read);
             try w.writeIntField("cache_write", d.message.usage.cache_write);
+            try w.endObject();
 
             try w.writeKey("content");
             try w.beginArray();
@@ -381,9 +387,19 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .@"error" => |e| {
             try w.writeStringField("type", "error");
             try w.writeStringField("reason", @tagName(e.reason));
+            if (e.err.error_message) |msg| {
+                try w.writeStringField("error_message", msg);
+            }
+            try w.writeKey("usage");
+            try w.beginObject();
+            try w.writeIntField("input", e.err.usage.input);
+            try w.writeIntField("output", e.err.usage.output);
+            try w.writeIntField("cache_read", e.err.usage.cache_read);
+            try w.writeIntField("cache_write", e.err.usage.cache_write);
+            try w.endObject();
         },
-        .ping => {
-            try w.writeStringField("type", "ping");
+        .keepalive => {
+            try w.writeStringField("type", "keepalive");
         },
     }
 
@@ -564,10 +580,13 @@ pub fn parseAssistantMessageEvent(
         // If id and name are present, create a tool_call block in the partial
         if (obj.get("id")) |id_val| {
             const id = try allocator.dupe(u8, id_val.string);
+            errdefer allocator.free(id);
             const name = try allocator.dupe(u8, obj.get("name").?.string);
+            errdefer allocator.free(name);
 
             // Create a content array with a tool_call block at content_index
             const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+            errdefer allocator.free(content);
             @memset(content, .{ .text = .{ .text = "" } });
             content[content_index] = .{ .tool_call = .{
                 .id = id,
@@ -623,13 +642,32 @@ pub fn parseAssistantMessageEvent(
     if (std.mem.eql(u8, type_str, "error")) {
         var err_msg = empty_partial;
         err_msg.owned_strings = true;
+
+        // Parse optional error_message
+        if (obj.get("error_message")) |em| {
+            err_msg.error_message = try allocator.dupe(u8, em.string);
+        }
+
+        // Parse optional usage object
+        if (obj.get("usage")) |usage_obj| {
+            if (usage_obj == .object) {
+                const u = usage_obj.object;
+                err_msg.usage = .{
+                    .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
+                    .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
+                    .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
+                    .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+                };
+            }
+        }
+
         return .{ .@"error" = .{
             .reason = parseStopReason(obj.get("reason").?.string),
             .err = err_msg,
         } };
     }
-    if (std.mem.eql(u8, type_str, "ping")) {
-        return .{ .ping = {} };
+    if (std.mem.eql(u8, type_str, "keepalive")) {
+        return .{ .keepalive = {} };
     }
 
     return error.UnknownEventType;
@@ -653,6 +691,30 @@ pub fn parseAssistantMessage(
         }
     }
 
+    // Parse usage - support both nested object format and flat fields for backward compatibility
+    var usage: ai_types.Usage = .{};
+    if (obj.get("usage")) |usage_val| {
+        if (usage_val == .object) {
+            const u = usage_val.object;
+            usage = .{
+                .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
+                .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
+                .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
+                .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+            };
+        }
+    } else {
+        // Fall back to flat fields for backward compatibility
+        usage = .{
+            .input = if (obj.get("input")) |v| @intCast(v.integer) else 0,
+            .output = if (obj.get("output")) |v| @intCast(v.integer) else 0,
+            .cache_read = if (obj.get("cache_read")) |v| @intCast(v.integer) else 0,
+            .cache_write = if (obj.get("cache_write")) |v| @intCast(v.integer) else 0,
+        };
+    }
+
+    // Note: role field is optional and ignored (validated as "assistant" if present)
+
     return .{
         .content = content,
         .stop_reason = parseStopReason(obj.get("stop_reason").?.string),
@@ -660,12 +722,7 @@ pub fn parseAssistantMessage(
         .api = try allocator.dupe(u8, obj.get("api").?.string),
         .provider = try allocator.dupe(u8, obj.get("provider").?.string),
         .timestamp = obj.get("timestamp").?.integer,
-        .usage = .{
-            .input = @intCast(obj.get("input").?.integer),
-            .output = @intCast(obj.get("output").?.integer),
-            .cache_read = @intCast(obj.get("cache_read").?.integer),
-            .cache_write = @intCast(obj.get("cache_write").?.integer),
-        },
+        .usage = usage,
         .owned_strings = true,
     };
 }
@@ -902,16 +959,16 @@ test "serialize and deserialize toolcall_end event" {
     allocator.free(msg.event.toolcall_end.tool_call.arguments_json);
 }
 
-test "serialize and deserialize ping event" {
+test "serialize and deserialize keepalive event" {
     const allocator = std.testing.allocator;
-    const event = ai_types.AssistantMessageEvent{ .ping = {} };
+    const event = ai_types.AssistantMessageEvent{ .keepalive = {} };
 
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
-    try std.testing.expect(msg.event == .ping);
+    try std.testing.expect(msg.event == .keepalive);
 }
 
 test "serialize and deserialize error event" {
@@ -921,9 +978,16 @@ test "serialize and deserialize error event" {
         .api = "",
         .provider = "",
         .model = "",
-        .usage = .{},
+        .usage = .{
+            .input = 100,
+            .output = 50,
+            .cache_read = 20,
+            .cache_write = 10,
+        },
         .stop_reason = .@"error",
         .timestamp = 0,
+        .error_message = "API rate limit exceeded",
+        .owned_strings = false,
     };
     const event = ai_types.AssistantMessageEvent{ .@"error" = .{
         .reason = .@"error",
@@ -933,10 +997,28 @@ test "serialize and deserialize error event" {
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
+    // Verify JSON contains the new fields
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_message\":\"API rate limit exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":50") != null);
+
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .@"error");
     try std.testing.expectEqual(ai_types.StopReason.@"error", msg.event.@"error".reason);
+
+    // Verify usage is properly deserialized
+    try std.testing.expectEqual(@as(u64, 100), msg.event.@"error".err.usage.input);
+    try std.testing.expectEqual(@as(u64, 50), msg.event.@"error".err.usage.output);
+    try std.testing.expectEqual(@as(u64, 20), msg.event.@"error".err.usage.cache_read);
+    try std.testing.expectEqual(@as(u64, 10), msg.event.@"error".err.usage.cache_write);
+
+    // Verify error_message is properly deserialized
+    try std.testing.expect(msg.event.@"error".err.error_message != null);
+    try std.testing.expectEqualStrings("API rate limit exceeded", msg.event.@"error".err.error_message.?);
+
+    // Cleanup
+    allocator.free(msg.event.@"error".err.error_message.?);
 }
 
 test "serialize and deserialize result" {

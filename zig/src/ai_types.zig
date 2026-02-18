@@ -339,7 +339,7 @@ pub const AssistantMessageEvent = union(enum) {
     toolcall_end: struct { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
     done: struct { reason: StopReason, message: AssistantMessage },
     @"error": struct { reason: StopReason, err: AssistantMessage },
-    ping: void,
+    keepalive: void,
 };
 
 pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage) !AssistantMessage {
