@@ -98,6 +98,7 @@ Envelope
 ```
 Request
   |-- stream_request      - Initiate a streaming AI request
+  |-- complete_request    - Initiate a non-streaming AI request
   |-- abort_request       - Cancel an in-flight request
 
 Event
@@ -131,7 +132,7 @@ Response
   |-- stream_error        - Stream-level error
 ```
 
-**Note on Non-Streaming Mode**: The protocol includes `complete_request` for non-streaming operations. This returns a single `result` envelope containing the final `AssistantMessage`. For compatibility with streaming-only clients, non-streaming can also be implemented as streaming with all events buffered until `done` is received.
+**Note on Non-Streaming Mode**: The protocol includes `complete_request` for non-streaming operations (see [CompleteRequest schema](#completerequest)). This returns a single `result` envelope containing the final `AssistantMessage`. For compatibility with streaming-only clients, non-streaming can also be implemented as streaming with all events buffered until `done` is received.
 
 ---
 
@@ -189,7 +190,7 @@ The following rules govern identifier generation and usage:
   - The sender of each envelope generates a unique `message_id`
   - Used for correlation via `in_reply_to` field in acknowledgments
 
-**Connection-level sentinel**: Messages that are not associated with any particular stream (e.g., connection-level control messages) use the reserved `stream_id` value `"_connection"`.
+**Connection-level sentinel**: Messages that are not associated with any particular stream (e.g., connection-level control messages) use the reserved nil UUID `00000000-0000-0000-0000-000000000000` as the `stream_id`.
 
 ### 4.2 Encoding Modes
 
@@ -542,9 +543,17 @@ X-Makai-Version: 1.0.0
     "usage": { "$ref": "#/$defs/Usage" },
     "stop_reason": { "$ref": "#/$defs/StopReason" },
     "model": { "type": "string" },
+    "api": {
+      "type": "string",
+      "description": "The API identifier used for this response"
+    },
+    "provider": {
+      "type": "string",
+      "description": "The provider name that handled this request"
+    },
     "timestamp": { "type": "integer" }
   },
-  "required": ["role", "content", "usage", "stop_reason", "model"]
+  "required": ["role", "content", "usage", "stop_reason", "model", "api", "provider"]
 }
 ```
 
@@ -588,6 +597,35 @@ A discriminated union of UserMessage and AssistantMessage for use in Context.mes
   "required": ["type", "stream_id", "message_id", "sequence", "payload"]
 }
 ```
+
+#### CompleteRequest
+
+Request for non-streaming AI completion. Unlike `stream_request`, this returns a single response envelope containing the final `AssistantMessage` without intermediate streaming events.
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "type": { "const": "complete_request" },
+    "stream_id": { "type": "string", "format": "uuid" },
+    "message_id": { "type": "string", "format": "uuid" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "timestamp": { "type": "integer" },
+    "payload": {
+      "type": "object",
+      "properties": {
+        "model": { "$ref": "#/$defs/Model" },
+        "context": { "$ref": "#/$defs/Context" },
+        "options": { "$ref": "#/$defs/StreamOptions" }
+      },
+      "required": ["model", "context"]
+    }
+  },
+  "required": ["type", "stream_id", "message_id", "sequence", "payload"]
+}
+```
+
+**Response**: The server returns a single envelope with `type: "result"` containing the final `AssistantMessage` in the payload.
 
 #### Model
 
@@ -1480,10 +1518,9 @@ This inversion is necessary because in agentic workflows, the AI controls the fl
       "system_prompt": "You are a helpful assistant.",
       "messages": [
         {
-          "user": {
-            "content": { "text": "What is 2+2?" },
-            "timestamp": 1708234567000
-          }
+          "role": "user",
+          "content": "What is 2+2?",
+          "timestamp": 1708234567000
         }
       ]
     },
@@ -1533,10 +1570,9 @@ This inversion is necessary because in agentic workflows, the AI controls the fl
     "context": {
       "messages": [
         {
-          "user": {
-            "content": { "text": "What's the weather in Tokyo?" },
-            "timestamp": 1708234567000
-          }
+          "role": "user",
+          "content": "What's the weather in Tokyo?",
+          "timestamp": 1708234567000
         }
       ],
       "tools": [

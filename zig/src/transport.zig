@@ -867,10 +867,17 @@ pub fn parseAssistantMessage(
         if (content_val == .array) {
             const content_array = content_val.array;
             content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
-            errdefer allocator.free(content);
-
+            var parsed_count: usize = 0;
+            errdefer {
+                // Free any successfully parsed content items before freeing the slice
+                for (content[0..parsed_count]) |c| {
+                    freeAssistantContent(c, allocator);
+                }
+                allocator.free(content);
+            }
             for (content_array.items, 0..) |item, i| {
                 content[i] = try parseAssistantContent(item.object, allocator);
+                parsed_count += 1;
             }
         }
     }
@@ -909,6 +916,30 @@ pub fn parseAssistantMessage(
         .usage = usage,
         .owned_strings = true,
     };
+}
+
+/// Free allocated strings in a single AssistantContent item
+fn freeAssistantContent(content: ai_types.AssistantContent, allocator: std.mem.Allocator) void {
+    switch (content) {
+        .text => |t| {
+            if (t.text.len > 0) allocator.free(t.text);
+            if (t.text_signature) |s| allocator.free(s);
+        },
+        .tool_call => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
+            if (tc.thought_signature) |s| allocator.free(s);
+        },
+        .thinking => |th| {
+            if (th.thinking.len > 0) allocator.free(th.thinking);
+            if (th.thinking_signature) |s| allocator.free(s);
+        },
+        .image => |img| {
+            allocator.free(img.data);
+            allocator.free(img.mime_type);
+        },
+    }
 }
 
 fn parseAssistantContent(

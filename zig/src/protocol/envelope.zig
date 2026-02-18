@@ -618,12 +618,25 @@ fn deserializeStreamRequest(
 ) !protocol_types.StreamRequest {
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
+
+    // Allocate each field separately with errdefer to avoid leaks on OOM
+    const id = try allocator.dupe(u8, model_obj.get("id").?.string);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, model_obj.get("name").?.string);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, model_obj.get("api").?.string);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, model_obj.get("provider").?.string);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string);
+    errdefer allocator.free(base_url);
+
     const model = ai_types.Model{
-        .id = try allocator.dupe(u8, model_obj.get("id").?.string),
-        .name = try allocator.dupe(u8, model_obj.get("name").?.string),
-        .api = try allocator.dupe(u8, model_obj.get("api").?.string),
-        .provider = try allocator.dupe(u8, model_obj.get("provider").?.string),
-        .base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string),
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
         .reasoning = false,
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -661,12 +674,25 @@ fn deserializeCompleteRequest(
 ) !protocol_types.CompleteRequest {
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
+
+    // Allocate each field separately with errdefer to avoid leaks on OOM
+    const id = try allocator.dupe(u8, model_obj.get("id").?.string);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, model_obj.get("name").?.string);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, model_obj.get("api").?.string);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, model_obj.get("provider").?.string);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string);
+    errdefer allocator.free(base_url);
+
     const model = ai_types.Model{
-        .id = try allocator.dupe(u8, model_obj.get("id").?.string),
-        .name = try allocator.dupe(u8, model_obj.get("name").?.string),
-        .api = try allocator.dupe(u8, model_obj.get("api").?.string),
-        .provider = try allocator.dupe(u8, model_obj.get("provider").?.string),
-        .base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string),
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
         .reasoning = false,
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -729,6 +755,7 @@ fn deserializeNack(
     const rejected_id = protocol_types.parseUuid(rejected_id_str) orelse return error.InvalidUuid;
 
     const reason = try allocator.dupe(u8, obj.get("reason").?.string);
+    errdefer allocator.free(reason);
 
     const error_code = if (obj.get("error_code")) |code_val|
         parseErrorCode(code_val.string)
@@ -739,8 +766,14 @@ fn deserializeNack(
     if (obj.get("supported_versions")) |versions_val| {
         const versions_arr = versions_val.array;
         const versions = try allocator.alloc([]const u8, versions_arr.items.len);
+        var allocated_count: usize = 0;
+        errdefer {
+            for (versions[0..allocated_count]) |v| allocator.free(v);
+            allocator.free(versions);
+        }
         for (versions_arr.items, 0..) |item, i| {
             versions[i] = try allocator.dupe(u8, item.string);
+            allocated_count += 1;
         }
         supported_versions = versions;
     }

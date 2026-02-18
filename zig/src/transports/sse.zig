@@ -209,6 +209,9 @@ pub const AsyncSseReceiver = struct {
     fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
         const self: *Self = @ptrCast(@alignCast(ctx));
 
+        // Guard against double-call
+        if (self.stream != null) return error.StreamAlreadyActive;
+
         const stream = try allocator.create(transport.ByteStream);
         stream.* = transport.ByteStream.init(allocator);
 
