@@ -7,6 +7,11 @@ const event_stream = @import("event_stream");
 const transport = @import("transport");
 
 /// Client-side protocol handler for the Makai Wire Protocol
+///
+/// Current Limitation (v1.0): This implementation supports single-stream mode only.
+/// The `current_stream_id` field tracks one active stream at a time. Clients should
+/// wait for a stream to complete (done/error) before starting a new stream.
+/// Full multiplexing support is planned for v2.0.
 pub const ProtocolClient = struct {
     // Declarations must come before fields
     pub const PendingRequest = struct {
@@ -16,7 +21,7 @@ pub const ProtocolClient = struct {
     };
 
     pub const Options = struct {
-        include_partial: bool = true,
+        include_partial: bool = false,
         request_timeout_ms: u64 = 30_000,
     };
 
@@ -35,6 +40,8 @@ pub const ProtocolClient = struct {
     pending_requests: std.AutoHashMap(protocol_types.Uuid, PendingRequest),
 
     /// Current stream ID (if streaming)
+    /// NOTE: v1.0 limitation - only one active stream is supported at a time.
+    /// Full multiplexing with concurrent streams is planned for v2.0.
     current_stream_id: ?protocol_types.Uuid = null,
 
     /// Event stream for consuming events
@@ -187,22 +194,21 @@ pub const ProtocolClient = struct {
         switch (env.payload) {
             .ack => |ack| {
                 // Correlate with pending request
-                if (self.pending_requests.fetchRemove(ack.in_reply_to)) |_| {
+                if (self.pending_requests.fetchRemove(ack.acknowledged_id)) |_| {
                     // Request acknowledged
-                    if (ack.stream_id) |sid| {
-                        self.current_stream_id = sid;
-                    }
+                    // Note: current_stream_id is set from the envelope's stream_id field
+                    self.current_stream_id = env.stream_id;
                 }
             },
             .nack => |nack| {
                 // Mark request as failed
-                _ = self.pending_requests.fetchRemove(nack.in_reply_to);
+                _ = self.pending_requests.fetchRemove(nack.rejected_id);
 
                 // Store error
                 if (self.last_error) |err| {
                     self.allocator.free(err);
                 }
-                self.last_error = try self.allocator.dupe(u8, nack.message);
+                self.last_error = try self.allocator.dupe(u8, nack.reason);
             },
             .event => |evt| {
                 // Push to event stream for polling
@@ -440,8 +446,7 @@ test "processEnvelope handles ack" {
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{
-            .in_reply_to = message_id,
-            .stream_id = stream_id,
+            .acknowledged_id = message_id,
         } },
     };
 
@@ -450,7 +455,7 @@ test "processEnvelope handles ack" {
     // Verify pending request was removed
     try std.testing.expect(!client.pending_requests.contains(message_id));
 
-    // Verify stream_id was set
+    // Verify stream_id was set from envelope
     try std.testing.expect(client.current_stream_id != null);
     try std.testing.expectEqualSlices(u8, &stream_id, &client.current_stream_id.?);
 }
@@ -470,8 +475,8 @@ test "processEnvelope handles nack" {
     });
 
     // Create a nack envelope
-    const nack_msg = try allocator.dupe(u8, "Model not found");
-    // Note: nack_msg ownership is transferred to envelope, will be freed by env.deinit()
+    const nack_reason = try allocator.dupe(u8, "Model not found");
+    // Note: nack_reason ownership is transferred to envelope, will be freed by env.deinit()
 
     var env = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),
@@ -479,9 +484,9 @@ test "processEnvelope handles nack" {
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
-            .in_reply_to = message_id,
+            .rejected_id = message_id,
+            .reason = nack_reason,
             .error_code = .model_not_found,
-            .message = nack_msg,
         } },
     };
 

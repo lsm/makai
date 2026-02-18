@@ -5,7 +5,7 @@ const content_partial = @import("content_partial");
 
 pub const SerializationOptions = struct {
     /// If true, include lightweight partial field in events
-    include_partial: bool = true,
+    include_partial: bool = false,
     /// If true, use lightweight ContentBlockPartial instead of full AssistantMessage
     use_lightweight_partial: bool = true,
 };
@@ -692,7 +692,7 @@ test "processEvent handles multiple blocks" {
 test "SerializationOptions defaults" {
     const opts = SerializationOptions{};
 
-    try std.testing.expect(opts.include_partial == true);
+    try std.testing.expect(opts.include_partial == false);
     try std.testing.expect(opts.use_lightweight_partial == true);
 }
 

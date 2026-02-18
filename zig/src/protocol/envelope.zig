@@ -15,10 +15,15 @@ pub fn serializeEnvelope(
 
     try w.beginObject();
 
-    // Write type field based on payload
+    // Write type field - for events, use the event's type at top level
     try w.writeKey("type");
-    const payload_type = @tagName(envelope.payload);
-    try w.writeString(payload_type);
+    if (envelope.payload == .event) {
+        // For events, serialize the event type at the top level per PROTOCOL.md
+        try w.writeString(@tagName(envelope.payload.event));
+    } else {
+        const payload_type = @tagName(envelope.payload);
+        try w.writeString(payload_type);
+    }
 
     // Write stream_id
     const stream_id_str = try protocol_types.uuidToString(envelope.stream_id, allocator);
@@ -70,11 +75,15 @@ fn serializePayload(
             // Empty payload for ping/pong
         },
         .stream_request => |req| {
-            try w.writeStringField("model_id", req.model.id);
-            try w.writeStringField("model_name", req.model.name);
-            try w.writeStringField("model_api", req.model.api);
-            try w.writeStringField("model_provider", req.model.provider);
+            // Nest model fields inside a "model" object per PROTOCOL.md
+            try w.writeKey("model");
+            try w.beginObject();
+            try w.writeStringField("id", req.model.id);
+            try w.writeStringField("name", req.model.name);
+            try w.writeStringField("api", req.model.api);
+            try w.writeStringField("provider", req.model.provider);
             try w.writeStringField("base_url", req.model.base_url);
+            try w.endObject();
             try w.writeBoolField("include_partial", req.include_partial);
 
             // Serialize context
@@ -88,11 +97,15 @@ fn serializePayload(
             }
         },
         .complete_request => |req| {
-            try w.writeStringField("model_id", req.model.id);
-            try w.writeStringField("model_name", req.model.name);
-            try w.writeStringField("model_api", req.model.api);
-            try w.writeStringField("model_provider", req.model.provider);
+            // Nest model fields inside a "model" object per PROTOCOL.md
+            try w.writeKey("model");
+            try w.beginObject();
+            try w.writeStringField("id", req.model.id);
+            try w.writeStringField("name", req.model.name);
+            try w.writeStringField("api", req.model.api);
+            try w.writeStringField("provider", req.model.provider);
             try w.writeStringField("base_url", req.model.base_url);
+            try w.endObject();
 
             // Serialize context
             try w.writeKey("context");
@@ -113,21 +126,26 @@ fn serializePayload(
             }
         },
         .ack => |ack| {
-            const in_reply_to_str = try protocol_types.uuidToString(ack.in_reply_to, allocator);
-            defer allocator.free(in_reply_to_str);
-            try w.writeStringField("in_reply_to", in_reply_to_str);
-            if (ack.stream_id) |sid| {
-                const sid_str = try protocol_types.uuidToString(sid, allocator);
-                defer allocator.free(sid_str);
-                try w.writeStringField("stream_id", sid_str);
-            }
+            const acknowledged_id_str = try protocol_types.uuidToString(ack.acknowledged_id, allocator);
+            defer allocator.free(acknowledged_id_str);
+            try w.writeStringField("acknowledged_id", acknowledged_id_str);
         },
         .nack => |nack| {
-            const in_reply_to_str = try protocol_types.uuidToString(nack.in_reply_to, allocator);
-            defer allocator.free(in_reply_to_str);
-            try w.writeStringField("in_reply_to", in_reply_to_str);
-            try w.writeStringField("error_code", @tagName(nack.error_code));
-            try w.writeStringField("message", nack.message);
+            const rejected_id_str = try protocol_types.uuidToString(nack.rejected_id, allocator);
+            defer allocator.free(rejected_id_str);
+            try w.writeStringField("rejected_id", rejected_id_str);
+            try w.writeStringField("reason", nack.reason);
+            if (nack.error_code) |code| {
+                try w.writeStringField("error_code", @tagName(code));
+            }
+            if (nack.supported_versions) |versions| {
+                try w.writeKey("supported_versions");
+                try w.beginArray();
+                for (versions) |v| {
+                    try w.writeString(v);
+                }
+                try w.endArray();
+            }
         },
         .event => |event| {
             try serializeEventPayload(w, event, allocator);
@@ -306,9 +324,7 @@ fn serializeStreamOptions(
     if (opts.max_tokens) |max| {
         try w.writeIntField("max_tokens", max);
     }
-    if (opts.api_key) |key| {
-        try w.writeStringField("api_key", key);
-    }
+    // NOTE: api_key is intentionally NOT serialized - must use transport headers
     if (opts.cache_retention) |ret| {
         try w.writeStringField("cache_retention", @tagName(ret));
     }
@@ -552,12 +568,6 @@ fn deserializePayload(
     if (std.mem.eql(u8, type_str, "nack")) {
         return .{ .nack = try deserializeNack(obj, allocator) };
     }
-    if (std.mem.eql(u8, type_str, "event")) {
-        // For event, we need to parse the event type from within the payload
-        const event_type = obj.get("type").?.string;
-        const event = try transport.parseAssistantMessageEvent(event_type, obj, allocator);
-        return .{ .event = event };
-    }
     if (std.mem.eql(u8, type_str, "result")) {
         const result = try transport.parseAssistantMessage(obj, allocator);
         return .{ .result = result };
@@ -566,7 +576,39 @@ fn deserializePayload(
         return .{ .stream_error = try deserializeStreamError(obj, allocator) };
     }
 
+    // Check if type_str is an event type - the type is at top level per PROTOCOL.md
+    if (isEventType(type_str)) {
+        const event = try transport.parseAssistantMessageEvent(type_str, obj, allocator);
+        return .{ .event = event };
+    }
+
     return error.UnknownPayloadType;
+}
+
+/// Check if a string is a known event type
+fn isEventType(type_str: []const u8) bool {
+    const event_types = [_][]const u8{
+        "start",
+        "text_start",
+        "text_delta",
+        "text_end",
+        "thinking_start",
+        "thinking_delta",
+        "thinking_end",
+        "toolcall_start",
+        "toolcall_delta",
+        "toolcall_end",
+        "done",
+        "error",
+        "keepalive",
+    };
+
+    for (event_types) |evt| {
+        if (std.mem.eql(u8, type_str, evt)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// Deserialize stream request
@@ -574,12 +616,14 @@ fn deserializeStreamRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.StreamRequest {
+    // Parse nested model object per PROTOCOL.md
+    const model_obj = obj.get("model").?.object;
     const model = ai_types.Model{
-        .id = try allocator.dupe(u8, obj.get("model_id").?.string),
-        .name = try allocator.dupe(u8, obj.get("model_name").?.string),
-        .api = try allocator.dupe(u8, obj.get("model_api").?.string),
-        .provider = try allocator.dupe(u8, obj.get("model_provider").?.string),
-        .base_url = try allocator.dupe(u8, obj.get("base_url").?.string),
+        .id = try allocator.dupe(u8, model_obj.get("id").?.string),
+        .name = try allocator.dupe(u8, model_obj.get("name").?.string),
+        .api = try allocator.dupe(u8, model_obj.get("api").?.string),
+        .provider = try allocator.dupe(u8, model_obj.get("provider").?.string),
+        .base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string),
         .reasoning = false,
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -595,7 +639,7 @@ fn deserializeStreamRequest(
     const include_partial = if (obj.get("include_partial")) |ip|
         ip.bool
     else
-        true;
+        false;
 
     const options = if (obj.get("options")) |opts_val|
         try deserializeStreamOptions(opts_val.object, allocator)
@@ -615,12 +659,14 @@ fn deserializeCompleteRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.CompleteRequest {
+    // Parse nested model object per PROTOCOL.md
+    const model_obj = obj.get("model").?.object;
     const model = ai_types.Model{
-        .id = try allocator.dupe(u8, obj.get("model_id").?.string),
-        .name = try allocator.dupe(u8, obj.get("model_name").?.string),
-        .api = try allocator.dupe(u8, obj.get("model_api").?.string),
-        .provider = try allocator.dupe(u8, obj.get("model_provider").?.string),
-        .base_url = try allocator.dupe(u8, obj.get("base_url").?.string),
+        .id = try allocator.dupe(u8, model_obj.get("id").?.string),
+        .name = try allocator.dupe(u8, model_obj.get("name").?.string),
+        .api = try allocator.dupe(u8, model_obj.get("api").?.string),
+        .provider = try allocator.dupe(u8, model_obj.get("provider").?.string),
+        .base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string),
         .reasoning = false,
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -666,17 +712,11 @@ fn deserializeAbortRequest(
 
 /// Deserialize ack
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
-    const in_reply_to_str = obj.get("in_reply_to").?.string;
-    const in_reply_to = protocol_types.parseUuid(in_reply_to_str) orelse return error.InvalidUuid;
-
-    const stream_id = if (obj.get("stream_id")) |sid_val|
-        protocol_types.parseUuid(sid_val.string)
-    else
-        null;
+    const acknowledged_id_str = obj.get("acknowledged_id").?.string;
+    const acknowledged_id = protocol_types.parseUuid(acknowledged_id_str) orelse return error.InvalidUuid;
 
     return .{
-        .in_reply_to = in_reply_to,
-        .stream_id = stream_id,
+        .acknowledged_id = acknowledged_id,
     };
 }
 
@@ -685,18 +725,31 @@ fn deserializeNack(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Nack {
-    const in_reply_to_str = obj.get("in_reply_to").?.string;
-    const in_reply_to = protocol_types.parseUuid(in_reply_to_str) orelse return error.InvalidUuid;
+    const rejected_id_str = obj.get("rejected_id").?.string;
+    const rejected_id = protocol_types.parseUuid(rejected_id_str) orelse return error.InvalidUuid;
 
-    const error_code_str = obj.get("error_code").?.string;
-    const error_code = parseErrorCode(error_code_str);
+    const reason = try allocator.dupe(u8, obj.get("reason").?.string);
 
-    const message = try allocator.dupe(u8, obj.get("message").?.string);
+    const error_code = if (obj.get("error_code")) |code_val|
+        parseErrorCode(code_val.string)
+    else
+        null;
+
+    var supported_versions: ?[]const []const u8 = null;
+    if (obj.get("supported_versions")) |versions_val| {
+        const versions_arr = versions_val.array;
+        const versions = try allocator.alloc([]const u8, versions_arr.items.len);
+        for (versions_arr.items, 0..) |item, i| {
+            versions[i] = try allocator.dupe(u8, item.string);
+        }
+        supported_versions = versions;
+    }
 
     return .{
-        .in_reply_to = in_reply_to,
+        .rejected_id = rejected_id,
+        .reason = reason,
         .error_code = error_code,
-        .message = message,
+        .supported_versions = supported_versions,
     };
 }
 
@@ -902,9 +955,7 @@ fn deserializeStreamOptions(
     if (obj.get("max_tokens")) |max| {
         opts.max_tokens = @intCast(max.integer);
     }
-    if (obj.get("api_key")) |key| {
-        opts.api_key = try allocator.dupe(u8, key.string);
-    }
+    // NOTE: api_key is intentionally NOT deserialized - must use transport headers
     if (obj.get("cache_retention")) |ret| {
         opts.cache_retention = parseCacheRetention(ret.string);
     }
@@ -1018,7 +1069,6 @@ pub fn createReply(
 /// Create an ack envelope
 pub fn createAck(
     original: protocol_types.Envelope,
-    stream_id: ?protocol_types.Uuid,
     allocator: std.mem.Allocator,
 ) protocol_types.Envelope {
     _ = allocator;
@@ -1029,8 +1079,7 @@ pub fn createAck(
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{
-            .in_reply_to = original.message_id,
-            .stream_id = stream_id,
+            .acknowledged_id = original.message_id,
         } },
     };
 }
@@ -1038,11 +1087,11 @@ pub fn createAck(
 /// Create a nack envelope
 pub fn createNack(
     original: protocol_types.Envelope,
-    error_code: protocol_types.ErrorCode,
-    message: []const u8,
+    reason: []const u8,
+    error_code: ?protocol_types.ErrorCode,
     allocator: std.mem.Allocator,
 ) !protocol_types.Envelope {
-    const msg_copy = try allocator.dupe(u8, message);
+    const reason_copy = try allocator.dupe(u8, reason);
     return .{
         .stream_id = original.stream_id,
         .message_id = protocol_types.generateUuid(),
@@ -1050,9 +1099,9 @@ pub fn createNack(
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
-            .in_reply_to = original.message_id,
+            .rejected_id = original.message_id,
+            .reason = reason_copy,
             .error_code = error_code,
-            .message = msg_copy,
         } },
     };
 }
@@ -1146,7 +1195,10 @@ test "serializeEnvelope with stream_request payload" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"stream_request\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_id\":\"gpt-4\"") != null);
+    // Check for nested model object format per PROTOCOL.md
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"gpt-4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"GPT-4\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"system_prompt\":\"You are helpful.\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"include_partial\":true") != null);
 
@@ -1211,17 +1263,15 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ping" {
 test "serializeEnvelope and deserializeEnvelope roundtrip with ack" {
     const allocator = std.testing.allocator;
 
-    const reply_to = protocol_types.generateUuid();
-    const stream_id = protocol_types.generateUuid();
+    const acknowledged_id = protocol_types.generateUuid();
 
     const original = protocol_types.Envelope{
-        .stream_id = stream_id,
+        .stream_id = protocol_types.generateUuid(),
         .message_id = protocol_types.generateUuid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{
-            .in_reply_to = reply_to,
-            .stream_id = stream_id,
+            .acknowledged_id = acknowledged_id,
         } },
     };
 
@@ -1232,17 +1282,15 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ack" {
     defer parsed.deinit(allocator);
 
     try std.testing.expect(parsed.payload == .ack);
-    try std.testing.expectEqualSlices(u8, &reply_to, &parsed.payload.ack.in_reply_to);
-    try std.testing.expect(parsed.payload.ack.stream_id != null);
-    try std.testing.expectEqualSlices(u8, &stream_id, &parsed.payload.ack.stream_id.?);
+    try std.testing.expectEqualSlices(u8, &acknowledged_id, &parsed.payload.ack.acknowledged_id);
 }
 
 test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
     const allocator = std.testing.allocator;
 
-    const reply_to = protocol_types.generateUuid();
-    const msg = try allocator.dupe(u8, "Test error message");
-    // Note: msg ownership is transferred to original, will be freed by original.deinit
+    const rejected_id = protocol_types.generateUuid();
+    const reason = try allocator.dupe(u8, "Test error reason");
+    // Note: reason ownership is transferred to original, will be freed by original.deinit
 
     var original = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),
@@ -1250,9 +1298,9 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
-            .in_reply_to = reply_to,
+            .rejected_id = rejected_id,
+            .reason = reason,
             .error_code = .invalid_request,
-            .message = msg,
         } },
     };
 
@@ -1263,9 +1311,9 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
     defer parsed.deinit(allocator);
 
     try std.testing.expect(parsed.payload == .nack);
-    try std.testing.expectEqualSlices(u8, &reply_to, &parsed.payload.nack.in_reply_to);
-    try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, parsed.payload.nack.error_code);
-    try std.testing.expectEqualStrings("Test error message", parsed.payload.nack.message);
+    try std.testing.expectEqualSlices(u8, &rejected_id, &parsed.payload.nack.rejected_id);
+    try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, parsed.payload.nack.error_code.?);
+    try std.testing.expectEqualStrings("Test error reason", parsed.payload.nack.reason);
 
     original.deinit(allocator);
 }
@@ -1321,14 +1369,11 @@ test "createAck creates valid ack" {
         } },
     };
 
-    const new_stream_id = protocol_types.generateUuid();
-    var ack_env = createAck(original, new_stream_id, allocator);
+    var ack_env = createAck(original, allocator);
     defer ack_env.deinit(allocator);
 
     try std.testing.expect(ack_env.payload == .ack);
-    try std.testing.expectEqualSlices(u8, &original.message_id, &ack_env.payload.ack.in_reply_to);
-    try std.testing.expect(ack_env.payload.ack.stream_id != null);
-    try std.testing.expectEqualSlices(u8, &new_stream_id, &ack_env.payload.ack.stream_id.?);
+    try std.testing.expectEqualSlices(u8, &original.message_id, &ack_env.payload.ack.acknowledged_id);
     try std.testing.expect(ack_env.in_reply_to != null);
     try std.testing.expectEqualSlices(u8, &original.message_id, &ack_env.in_reply_to.?);
 }
@@ -1347,13 +1392,13 @@ test "createNack creates valid nack" {
         } },
     };
 
-    var nack_env = try createNack(original, .model_not_found, "Model gpt-5 not found", allocator);
+    var nack_env = try createNack(original, "Model gpt-5 not found", .model_not_found, allocator);
     defer nack_env.deinit(allocator);
 
     try std.testing.expect(nack_env.payload == .nack);
-    try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.payload.nack.in_reply_to);
-    try std.testing.expectEqual(protocol_types.ErrorCode.model_not_found, nack_env.payload.nack.error_code);
-    try std.testing.expectEqualStrings("Model gpt-5 not found", nack_env.payload.nack.message);
+    try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.payload.nack.rejected_id);
+    try std.testing.expectEqual(protocol_types.ErrorCode.model_not_found, nack_env.payload.nack.error_code.?);
+    try std.testing.expectEqualStrings("Model gpt-5 not found", nack_env.payload.nack.reason);
     try std.testing.expect(nack_env.in_reply_to != null);
     try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.in_reply_to.?);
 }

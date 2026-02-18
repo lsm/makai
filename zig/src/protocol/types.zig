@@ -225,7 +225,7 @@ pub const StreamRequest = struct {
     context: ai_types.Context,
     options: ?ai_types.StreamOptions = null,
     /// If true, include lightweight partials in events
-    include_partial: bool = true,
+    include_partial: bool = false,
 
     pub fn deinit(self: *StreamRequest, allocator: std.mem.Allocator) void {
         // Model fields are typically borrowed references, not owned
@@ -258,20 +258,29 @@ pub const AbortRequest = struct {
 
 /// Acknowledgment response
 pub const Ack = struct {
-    /// Echoes back the request's message_id
-    in_reply_to: Uuid,
-    /// The assigned stream_id (for stream_request)
-    stream_id: ?Uuid = null,
+    /// The message_id being acknowledged
+    acknowledged_id: Uuid,
 };
 
 /// Negative acknowledgment response
 pub const Nack = struct {
-    in_reply_to: Uuid,
-    error_code: ErrorCode,
-    message: []const u8,
+    /// The message_id that was rejected
+    rejected_id: Uuid,
+    /// Human-readable reason for rejection
+    reason: []const u8,
+    /// Optional error code
+    error_code: ?ErrorCode = null,
+    /// Optional list of supported protocol versions (for VERSION_MISMATCH)
+    supported_versions: ?[]const []const u8 = null,
 
     pub fn deinit(self: *Nack, allocator: std.mem.Allocator) void {
-        allocator.free(self.message);
+        allocator.free(self.reason);
+        if (self.supported_versions) |versions| {
+            for (versions) |v| {
+                allocator.free(v);
+            }
+            allocator.free(versions);
+        }
     }
 };
 
@@ -397,12 +406,12 @@ test "Envelope with ping payload" {
     envelope.deinit(std.testing.allocator);
 }
 
-test "Nack deinit frees message" {
-    const msg = try std.testing.allocator.dupe(u8, "Test error message");
+test "Nack deinit frees reason and supported_versions" {
+    const reason = try std.testing.allocator.dupe(u8, "Test error reason");
     var nack = Nack{
-        .in_reply_to = generateUuid(),
+        .rejected_id = generateUuid(),
+        .reason = reason,
         .error_code = .invalid_request,
-        .message = msg,
     };
 
     nack.deinit(std.testing.allocator);
@@ -451,6 +460,6 @@ test "Payload deinit handles all variants" {
     pong_payload.deinit(std.testing.allocator);
 
     // Test ack
-    var ack_payload: Payload = .{ .ack = .{ .in_reply_to = generateUuid() } };
+    var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUuid() } };
     ack_payload.deinit(std.testing.allocator);
 }

@@ -131,7 +131,7 @@ Response
   |-- stream_error        - Stream-level error
 ```
 
-**Note on Non-Streaming Mode**: The protocol does not include a separate `complete_request` message type. Non-streaming operations can be implemented as streaming with all events buffered until `done` is received. This simplifies the protocol and ensures consistent behavior across all usage patterns.
+**Note on Non-Streaming Mode**: The protocol includes `complete_request` for non-streaming operations. This returns a single `result` envelope containing the final `AssistantMessage`. For compatibility with streaming-only clients, non-streaming can also be implemented as streaming with all events buffered until `done` is received.
 
 ---
 
@@ -183,7 +183,7 @@ The following rules govern identifier generation and usage:
 - **`stream_id`**:
   - Client generates the `stream_id` for all requests (e.g., in `stream_request`)
   - Server echoes the same `stream_id` in all response events for that stream
-  - Connection-level messages use the sentinel value `"stream_id": "_connection"`
+  - Must be a valid UUID v4 format (36 characters: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
 
 - **`message_id`**:
   - The sender of each envelope generates a unique `message_id`
@@ -310,6 +310,21 @@ Server -> Client: {"type":"start", ...} (multiple frames)
 **Ping/Pong**:
 - Use native WebSocket ping/pong frames for keepalive
 - Protocol-level `ping`/`pong` messages are also supported for application-level heartbeats
+
+#### WebSocket Transport (Beta)
+
+The WebSocket transport is currently in **beta** status. The following limitations apply:
+
+| Limitation | Status | Workaround |
+|------------|--------|------------|
+| TLS (`wss://`) | Not implemented | Use reverse proxy (nginx, Caddy) for TLS termination |
+| Continuation frames | Incomplete | Messages must fit in single frame (<125KB typical) |
+| DNS resolution | Brittle | Use IP addresses for now |
+| Handshake validation | Simplified | Works with compliant servers |
+
+**Production recommendation**: Use a reverse proxy for TLS termination until `wss://` support is added.
+
+These limitations will be addressed in a future release.
 
 ### 5.4 gRPC Transport
 
@@ -1763,6 +1778,36 @@ All events in the stream follow a clear ownership model to ensure safe async han
 - **Providers**: Must use `dupe()` or equivalent when creating events from borrowed strings
 - **Protocol Layer**: Must provide `deinit()` method to release all event resources
 - **Consumers**: Must not hold references to event data after `deinit()` is called
+
+---
+
+## Appendix C: Current Limitations (v1.0)
+
+### Single-Stream Mode
+
+The current v1.0 implementation supports **single active stream per client**. While the protocol specification describes full multiplexing support (Section 7.4), the implementation currently tracks only one stream at a time via `current_stream_id` in the client.
+
+**Implications:**
+- Clients should wait for a stream to complete (via `done` or `error`) before initiating a new stream
+- Concurrent `stream_request` messages may result in undefined behavior
+- Stream IDs are tracked but only one is considered "active" for event processing
+
+### Event Forwarding
+
+The server implementation creates streams and returns acknowledgment (ACK) but **does not yet forward stream events as protocol envelopes**. Event forwarding requires integration with the async runtime infrastructure to:
+
+1. Poll the provider's event stream
+2. Wrap events in protocol envelopes with correct sequence numbers
+3. Transmit envelopes via the transport layer
+
+This is planned for v2.0.
+
+### Planned for v2.0
+
+- Full multiplexing with concurrent stream support
+- Automatic event forwarding from providers to clients
+- Stream state synchronization via `sync_request`/`sync` messages
+- Backpressure management across multiple streams
 
 ---
 

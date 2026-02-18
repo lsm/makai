@@ -1,3 +1,9 @@
+//! WebSocket Transport (Beta)
+//!
+//! This implementation is suitable for development and testing.
+//! Production use requires TLS termination via reverse proxy.
+//! See PROTOCOL.md for current limitations.
+
 const std = @import("std");
 const transport = @import("transport");
 const ai_types = @import("ai_types");
