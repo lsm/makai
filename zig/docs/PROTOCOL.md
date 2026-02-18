@@ -124,9 +124,9 @@ Control
   |-- nack                - Negative acknowledgment
   |-- ping                - Connection-level transport keepalive
   |-- pong                - Connection-level keepalive response
-  |-- goodbye             - Graceful connection close *(planned for v1.1)*
-  |-- sync_request        - Request full state resync *(planned for v1.1)*
-  |-- sync                - Full partial state resync *(planned for v1.1)*
+  |-- goodbye             - Graceful connection close
+  |-- sync_request        - Request full state resync
+  |-- sync                - Full partial state resync
 
 Response
   |-- stream_error        - Stream-level error
@@ -1185,8 +1185,6 @@ When `include_partial: false`, the start event includes model and initial token 
 
 #### PongControl
 
-**Note**: In v1.0, the `pong` response is implemented as a simple `void` type without echo of `ping_id`. The `ping_id` field is documented here for forward compatibility and planned for v1.1.
-
 ```json
 {
   "type": "object",
@@ -1199,9 +1197,9 @@ When `include_partial: false`, the start event includes model and initial token 
     "payload": {
       "type": "object",
       "properties": {
-        "ping_id": { "type": "string", "description": "Echo of ping_id (optional in v1.0, required in v1.1+)" }
+        "ping_id": { "type": "string", "description": "Echo of the ping message_id being responded to" }
       },
-      "required": []
+      "required": ["ping_id"]
     }
   }
 }
@@ -1822,15 +1820,6 @@ All events in the stream follow a clear ownership model to ensure safe async han
 
 ## Appendix C: Current Limitations (v1.0)
 
-### Advanced Control Messages
-
-The following control messages are documented for forward compatibility but **not yet implemented** in v1.0:
-
-- **`goodbye`**: Graceful connection close *(planned for v1.1)*
-- **`sync_request`**: Request full state resync *(planned for v1.1)*
-- **`sync`**: Full partial state resync *(planned for v1.1)*
-- **`pong.payload.ping_id`**: The `pong` response is currently implemented as a simple `void` type without echo of `ping_id`. The schema documents `ping_id` for forward compatibility, but v1.0 implementations should not expect this field.
-
 ### Single-Stream Mode
 
 The current v1.0 implementation supports **single active stream per client**. While the protocol specification describes full multiplexing support (Section 7.4), the implementation currently tracks only one stream at a time via `current_stream_id` in the client.
@@ -1849,10 +1838,6 @@ The server implementation creates streams and returns acknowledgment (ACK) but *
 3. Transmit envelopes via the transport layer
 
 This is planned for v2.0.
-
-### Sequence Validation
-
-**Sequence validation not enforced**: While sequence numbers are tracked for each stream, the server does not reject out-of-order or duplicate messages. This is planned for v2.0 when implementing multiplexing.
 
 ### Planned for v2.0
 

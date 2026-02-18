@@ -71,8 +71,30 @@ fn serializePayload(
     try w.beginObject();
 
     switch (payload) {
-        .ping, .pong => {
-            // Empty payload for ping/pong
+        .ping => {
+            // Empty payload for ping
+        },
+        .pong => |pong| {
+            try w.writeStringField("ping_id", pong.ping_id);
+        },
+        .goodbye => |goodbye| {
+            if (goodbye.reason) |reason| {
+                try w.writeStringField("reason", reason);
+            }
+        },
+        .sync_request => |sync_req| {
+            const target_str = try protocol_types.uuidToString(sync_req.target_stream_id, allocator);
+            defer allocator.free(target_str);
+            try w.writeStringField("target_stream_id", target_str);
+        },
+        .sync => |sync_msg| {
+            const stream_str = try protocol_types.uuidToString(sync_msg.stream_id, allocator);
+            defer allocator.free(stream_str);
+            try w.writeStringField("stream_id", stream_str);
+            try w.writeIntField("sequence", sync_msg.sequence);
+            if (sync_msg.partial) |partial| {
+                try w.writeStringField("partial", partial);
+            }
         },
         .stream_request => |req| {
             // Nest model fields inside a "model" object per PROTOCOL.md
@@ -551,7 +573,16 @@ fn deserializePayload(
         return .ping;
     }
     if (std.mem.eql(u8, type_str, "pong")) {
-        return .pong;
+        return .{ .pong = try deserializePong(obj, allocator) };
+    }
+    if (std.mem.eql(u8, type_str, "goodbye")) {
+        return .{ .goodbye = try deserializeGoodbye(obj, allocator) };
+    }
+    if (std.mem.eql(u8, type_str, "sync_request")) {
+        return .{ .sync_request = try deserializeSyncRequest(obj) };
+    }
+    if (std.mem.eql(u8, type_str, "sync")) {
+        return .{ .sync = try deserializeSync(obj, allocator) };
     }
     if (std.mem.eql(u8, type_str, "stream_request")) {
         return .{ .stream_request = try deserializeStreamRequest(obj, allocator) };
@@ -804,6 +835,58 @@ fn deserializeStreamError(
     };
 }
 
+/// Deserialize pong
+fn deserializePong(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.Pong {
+    const ping_id = try allocator.dupe(u8, obj.get("ping_id").?.string);
+    return .{ .ping_id = ping_id };
+}
+
+/// Deserialize goodbye
+fn deserializeGoodbye(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.Goodbye {
+    const reason = if (obj.get("reason")) |r|
+        try allocator.dupe(u8, r.string)
+    else
+        null;
+
+    return .{ .reason = reason };
+}
+
+/// Deserialize sync_request
+fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
+    const target_str = obj.get("target_stream_id").?.string;
+    const target_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
+
+    return .{ .target_stream_id = target_id };
+}
+
+/// Deserialize sync
+fn deserializeSync(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.Sync {
+    const stream_str = obj.get("stream_id").?.string;
+    const stream_id = protocol_types.parseUuid(stream_str) orelse return error.InvalidUuid;
+
+    const sequence: u64 = @intCast(obj.get("sequence").?.integer);
+
+    const partial = if (obj.get("partial")) |p|
+        try allocator.dupe(u8, p.string)
+    else
+        null;
+
+    return .{
+        .stream_id = stream_id,
+        .sequence = sequence,
+        .partial = partial,
+    };
+}
+
 /// Parse error code from string
 fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "invalid_request")) return .invalid_request;
@@ -814,6 +897,9 @@ fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "stream_not_found")) return .stream_not_found;
     if (std.mem.eql(u8, str, "stream_already_exists")) return .stream_already_exists;
     if (std.mem.eql(u8, str, "version_mismatch")) return .version_mismatch;
+    if (std.mem.eql(u8, str, "invalid_sequence")) return .invalid_sequence;
+    if (std.mem.eql(u8, str, "duplicate_sequence")) return .duplicate_sequence;
+    if (std.mem.eql(u8, str, "sequence_gap")) return .sequence_gap;
     return .internal_error;
 }
 
@@ -1178,12 +1264,15 @@ test "serializeEnvelope with ping payload" {
 test "serializeEnvelope with pong payload" {
     const allocator = std.testing.allocator;
 
-    const envelope = protocol_types.Envelope{
+    const ping_id = try allocator.dupe(u8, "test-ping-123");
+    // Note: ping_id ownership is transferred to envelope, will be freed by envelope.deinit
+
+    var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),
         .message_id = protocol_types.generateUuid(),
         .sequence = 2,
         .timestamp = 1708234567900,
-        .payload = .pong,
+        .payload = .{ .pong = .{ .ping_id = ping_id } },
     };
 
     const json = try serializeEnvelope(envelope, allocator);
@@ -1191,6 +1280,9 @@ test "serializeEnvelope with pong payload" {
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"sequence\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"ping_id\":\"test-ping-123\"") != null);
+
+    envelope.deinit(allocator);
 }
 
 test "serializeEnvelope with stream_request payload" {
@@ -1382,13 +1474,13 @@ test "createReply sets in_reply_to correctly" {
         } },
     };
 
-    var reply = createReply(original, .pong, allocator);
+    var reply = createReply(original, .ping, allocator);
     defer reply.deinit(allocator);
 
     try std.testing.expectEqualSlices(u8, &original.stream_id, &reply.stream_id);
     try std.testing.expectEqualSlices(u8, &original.message_id, &reply.in_reply_to.?);
     try std.testing.expect(reply.sequence == 6);
-    try std.testing.expect(reply.payload == .pong);
+    try std.testing.expect(reply.payload == .ping);
 }
 
 test "createAck creates valid ack" {
@@ -1685,4 +1777,258 @@ test "deserializeEnvelope with complex context frees all memory" {
     try std.testing.expect(envelope.payload.stream_request.context.messages.len == 2);
 
     // deinit will be called by defer - verifies complete cleanup
+}
+
+test "serializeEnvelope with goodbye payload" {
+    const allocator = std.testing.allocator;
+
+    const reason = try allocator.dupe(u8, "Server shutting down");
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 100,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .goodbye = .{ .reason = reason } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"goodbye\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"Server shutting down\"") != null);
+
+    envelope.deinit(allocator);
+}
+
+test "serializeEnvelope with goodbye payload (no reason)" {
+    const allocator = std.testing.allocator;
+
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 100,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .goodbye = .{ .reason = null } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"goodbye\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\"") == null); // reason should not be present
+
+    envelope.deinit(allocator);
+}
+
+test "serializeEnvelope with sync_request payload" {
+    const allocator = std.testing.allocator;
+
+    const target_id = protocol_types.generateUuid();
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 50,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .sync_request = .{ .target_stream_id = target_id } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"sync_request\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"target_stream_id\"") != null);
+
+    envelope.deinit(allocator);
+}
+
+test "serializeEnvelope with sync payload" {
+    const allocator = std.testing.allocator;
+
+    const partial = try allocator.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}");
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 60,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .sync = .{
+            .stream_id = protocol_types.generateUuid(),
+            .sequence = 42,
+            .partial = partial,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"sync\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sequence\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"partial\"") != null);
+
+    envelope.deinit(allocator);
+}
+
+test "deserializeEnvelope with pong payload" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "pong",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 2,
+        \\  "timestamp": 1708234567900,
+        \\  "payload": {
+        \\    "ping_id": "test-ping-456"
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    try std.testing.expect(envelope.payload == .pong);
+    try std.testing.expectEqualStrings("test-ping-456", envelope.payload.pong.ping_id);
+}
+
+test "deserializeEnvelope with goodbye payload" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "goodbye",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 100,
+        \\  "timestamp": 1708234567900,
+        \\  "payload": {
+        \\    "reason": "Server maintenance"
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    try std.testing.expect(envelope.payload == .goodbye);
+    try std.testing.expectEqualStrings("Server maintenance", envelope.payload.goodbye.reason.?);
+}
+
+test "deserializeEnvelope with goodbye payload (no reason)" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "goodbye",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 100,
+        \\  "timestamp": 1708234567900,
+        \\  "payload": {}
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    try std.testing.expect(envelope.payload == .goodbye);
+    try std.testing.expect(envelope.payload.goodbye.reason == null);
+}
+
+test "deserializeEnvelope with sync_request payload" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "sync_request",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 50,
+        \\  "timestamp": 1708234567900,
+        \\  "payload": {
+        \\    "target_stream_id": "abcdef01-2345-6789-abcd-ef0123456789"
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    try std.testing.expect(envelope.payload == .sync_request);
+
+    const expected_target: protocol_types.Uuid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
+    try std.testing.expectEqualSlices(u8, &expected_target, &envelope.payload.sync_request.target_stream_id);
+}
+
+test "deserializeEnvelope with sync payload" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "sync",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 60,
+        \\  "timestamp": 1708234567900,
+        \\  "payload": {
+        \\    "stream_id": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\    "sequence": 42,
+        \\    "partial": "{\"test\": \"data\"}"
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    try std.testing.expect(envelope.payload == .sync);
+    try std.testing.expect(envelope.payload.sync.sequence == 42);
+    try std.testing.expectEqualStrings("{\"test\": \"data\"}", envelope.payload.sync.partial.?);
+}
+
+test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
+    const allocator = std.testing.allocator;
+
+    const ping_id = try allocator.dupe(u8, "roundtrip-ping-id");
+    var original = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 10,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .pong = .{ .ping_id = ping_id } },
+    };
+
+    const json = try serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .pong);
+    try std.testing.expectEqualStrings("roundtrip-ping-id", parsed.payload.pong.ping_id);
+
+    original.deinit(allocator);
+}
+
+test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
+    const allocator = std.testing.allocator;
+
+    const reason = try allocator.dupe(u8, "Graceful shutdown");
+    var original = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 200,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .goodbye = .{ .reason = reason } },
+    };
+
+    const json = try serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .goodbye);
+    try std.testing.expectEqualStrings("Graceful shutdown", parsed.payload.goodbye.reason.?);
+
+    original.deinit(allocator);
 }

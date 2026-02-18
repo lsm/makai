@@ -21,6 +21,37 @@ fn validateSequence(expected: u64, received: u64) SequenceError!void {
     // received == expected is OK
 }
 
+/// Helper to create a NACK for sequence errors
+fn createSequenceNack(
+    allocator: std.mem.Allocator,
+    stream_id: protocol_types.Uuid,
+    message_id: protocol_types.Uuid,
+    err: SequenceError,
+) !protocol_types.Envelope {
+    const reason: []const u8 = switch (err) {
+        error.InvalidSequence => "Invalid sequence number (must be >= 1)",
+        error.DuplicateSequence => "Duplicate sequence number detected",
+        error.SequenceGap => "Sequence gap detected (missing messages)",
+    };
+    const error_code: protocol_types.ErrorCode = switch (err) {
+        error.InvalidSequence => .invalid_sequence,
+        error.DuplicateSequence => .duplicate_sequence,
+        error.SequenceGap => .sequence_gap,
+    };
+    return try envelope.createNack(
+        .{
+            .stream_id = stream_id,
+            .message_id = message_id,
+            .sequence = 0,
+            .timestamp = std.time.milliTimestamp(),
+            .payload = .ping,
+        },
+        reason,
+        error_code,
+        allocator,
+    );
+}
+
 /// Server-side protocol handler for the Makai Wire Protocol
 ///
 /// Current Limitation (v1.0): The server creates streams and returns ACK but does
@@ -92,12 +123,20 @@ pub const ProtocolServer = struct {
     pub fn handleEnvelope(self: *ProtocolServer, env: protocol_types.Envelope) !?protocol_types.Envelope {
         switch (env.payload) {
             .stream_request => |req| {
+                // Validate sequence - client should start at 1 for new streams
+                if (env.sequence != 1) {
+                    return try createSequenceNack(self.allocator, env.stream_id, env.message_id, error.InvalidSequence);
+                }
                 return try handleStreamRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .abort_request => |req| {
-                return try handleAbortRequest(self, req, env.message_id, env.sequence);
+                return try handleAbortRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .complete_request => |req| {
+                // Validate sequence - client should start at 1 for complete requests
+                if (env.sequence != 1) {
+                    return try createSequenceNack(self.allocator, env.stream_id, env.message_id, error.InvalidSequence);
+                }
                 return try handleCompleteRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .ack, .nack, .event, .result, .stream_error => {
@@ -105,11 +144,27 @@ pub const ProtocolServer = struct {
                 return null;
             },
             .ping => {
-                // Respond with pong
-                return envelope.createReply(env, .pong, self.allocator);
+                // Respond with pong containing the ping's message_id as ping_id
+                const ping_id_str = try protocol_types.uuidToString(env.message_id, self.allocator);
+                const pong_payload: protocol_types.Payload = .{ .pong = .{ .ping_id = ping_id_str } };
+                return envelope.createReply(env, pong_payload, self.allocator);
             },
             .pong => {
                 // No response to pong
+                return null;
+            },
+            .goodbye => {
+                // Handle graceful shutdown - no response needed
+                return null;
+            },
+            .sync_request => {
+                // Handle sync request - for now, return not implemented
+                // TODO: Implement full state sync
+                return null;
+            },
+            .sync => {
+                // Handle sync response - for now, ignore
+                // TODO: Implement full state sync
                 return null;
             },
         }
@@ -154,8 +209,7 @@ pub const ProtocolServer = struct {
     }
 
     /// Validates and updates expected sequence for a stream.
-    /// NOTE: Currently not used in request handlers. Planned for v2.0
-    /// when implementing full multiplexing support.
+    /// Used by abort_request to validate incoming sequence numbers.
     fn validateAndUpdateSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid, received: u64) SequenceError!void {
         const expected = self.expected_sequences.get(stream_id) orelse 1;
         try validateSequence(expected, received);
@@ -251,11 +305,11 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
 }
 
 /// Handle abort_request - cancel stream, return ack
-fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
-    // Validate sequence for existing stream
-    if (server.expected_sequences.get(request.target_stream_id)) |expected| {
-        try validateSequence(expected, received_seq);
-    }
+fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+    // Validate sequence for existing stream using validateAndUpdateSequence
+    server.validateAndUpdateSequence(request.target_stream_id, received_seq) catch |err| {
+        return try createSequenceNack(server.allocator, stream_id, in_reply_to, err);
+    };
 
     // Find stream by stream_id
     if (server.active_streams.fetchRemove(request.target_stream_id)) |removed| {
@@ -303,7 +357,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
 
 /// Handle complete_request - get final result
 fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
-    _ = received_seq; // Complete requests are one-shot, no sequence validation needed
+    _ = received_seq; // Sequence validation is done in handleEnvelope
 
     // For complete_request, we use the stream_id from the envelope
     // Since CompleteRequest doesn't have a target_stream_id, we need to find
@@ -480,6 +534,12 @@ test "handleEnvelope returns pong for ping" {
     const response = try server.handleEnvelope(ping_env);
     try std.testing.expect(response != null);
     try std.testing.expect(response.?.payload == .pong);
+
+    // Clean up the response envelope
+    if (response) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
 }
 
 test "handleEnvelope returns nack for stream_request without provider" {
@@ -773,7 +833,7 @@ test "max streams limit enforced" {
     var req2 = protocol_types.Envelope{
         .stream_id = client_stream_id_2,
         .message_id = protocol_types.generateUuid(),
-        .sequence = 2,
+        .sequence = 1, // Each new stream starts at sequence 1
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
             .model = model,
@@ -792,7 +852,7 @@ test "max streams limit enforced" {
     var req3 = protocol_types.Envelope{
         .stream_id = client_stream_id_3,
         .message_id = protocol_types.generateUuid(),
-        .sequence = 3,
+        .sequence = 1, // Each new stream starts at sequence 1
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
             .model = model,
@@ -826,4 +886,252 @@ test "validateSequence rejects duplicate sequence" {
 test "validateSequence rejects sequence gap" {
     try std.testing.expectError(error.SequenceGap, validateSequence(5, 6));
     try std.testing.expectError(error.SequenceGap, validateSequence(5, 10));
+}
+
+test "handleEnvelope rejects stream_request with invalid sequence" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const client_stream_id = protocol_types.generateUuid();
+
+    // Test with sequence = 0 (invalid)
+    const req_seq0 = protocol_types.Envelope{
+        .stream_id = client_stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 0,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+
+    const resp_seq0 = try server.handleEnvelope(req_seq0);
+    try std.testing.expect(resp_seq0 != null);
+    try std.testing.expect(resp_seq0.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.invalid_sequence, resp_seq0.?.payload.nack.error_code.?);
+    if (resp_seq0) |resp| {
+        var mutable_resp = resp;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    // Test with sequence = 2 (should be 1 for new stream)
+    const req_seq2 = protocol_types.Envelope{
+        .stream_id = client_stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 2,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+
+    const resp_seq2 = try server.handleEnvelope(req_seq2);
+    try std.testing.expect(resp_seq2 != null);
+    try std.testing.expect(resp_seq2.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.invalid_sequence, resp_seq2.?.payload.nack.error_code.?);
+    if (resp_seq2) |resp| {
+        var mutable_resp = resp;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+}
+
+test "handleEnvelope rejects complete_request with invalid sequence" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const client_stream_id = protocol_types.generateUuid();
+
+    // Test with sequence = 5 (should be 1 for complete_request)
+    const req = protocol_types.Envelope{
+        .stream_id = client_stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 5,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .complete_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.invalid_sequence, resp.?.payload.nack.error_code.?);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+}
+
+test "handleAbortRequest rejects duplicate sequence" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    // First create a stream with sequence 1
+    var stream_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+
+    const create_response = try server.handleEnvelope(stream_req_env);
+    try std.testing.expect(create_response != null);
+    const stream_id = create_response.?.stream_id;
+    stream_req_env.deinit(std.testing.allocator);
+
+    // Now try to abort with duplicate sequence (should be 2, not 1)
+    const abort_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1, // Duplicate - should be 2
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .abort_request = .{
+            .target_stream_id = stream_id,
+            .reason = null,
+        } },
+    };
+
+    const abort_response = try server.handleEnvelope(abort_env);
+    try std.testing.expect(abort_response != null);
+    try std.testing.expect(abort_response.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.duplicate_sequence, abort_response.?.payload.nack.error_code.?);
+    if (abort_response) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+}
+
+test "handleAbortRequest rejects sequence gap" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    // First create a stream with sequence 1
+    var stream_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+
+    const create_response = try server.handleEnvelope(stream_req_env);
+    try std.testing.expect(create_response != null);
+    const stream_id = create_response.?.stream_id;
+    stream_req_env.deinit(std.testing.allocator);
+
+    // Now try to abort with a sequence gap (should be 2, not 10)
+    const abort_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 10, // Gap - expected 2
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .abort_request = .{
+            .target_stream_id = stream_id,
+            .reason = null,
+        } },
+    };
+
+    const abort_response = try server.handleEnvelope(abort_env);
+    try std.testing.expect(abort_response != null);
+    try std.testing.expect(abort_response.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.sequence_gap, abort_response.?.payload.nack.error_code.?);
+    if (abort_response) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
 }

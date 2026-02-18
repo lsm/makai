@@ -167,7 +167,12 @@ pub const Payload = union(enum) {
 
     // Keepalive
     ping: void,
-    pong: void,
+    pong: Pong,
+
+    // Connection management
+    goodbye: Goodbye,
+    sync_request: SyncRequest,
+    sync: Sync,
 
     pub fn deinit(self: *Payload, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -178,7 +183,10 @@ pub const Payload = union(enum) {
             .event => |*e| deinitEvent(allocator, e),
             .result => |*r| r.deinit(allocator),
             .stream_error => |*err| err.deinit(allocator),
-            .ack, .ping, .pong => {},
+            .pong => |*p| p.deinit(allocator),
+            .goodbye => |*g| g.deinit(allocator),
+            .sync => |*s| s.deinit(allocator),
+            .ack, .ping, .sync_request => {},
         }
     }
 };
@@ -301,6 +309,9 @@ pub const ErrorCode = enum {
     stream_not_found,
     stream_already_exists,
     version_mismatch,
+    invalid_sequence,
+    duplicate_sequence,
+    sequence_gap,
 };
 
 /// Stream error payload
@@ -310,6 +321,40 @@ pub const StreamError = struct {
 
     pub fn deinit(self: *StreamError, allocator: std.mem.Allocator) void {
         allocator.free(self.message);
+    }
+};
+
+/// Pong response - echoes ping_id from the corresponding ping
+pub const Pong = struct {
+    ping_id: []const u8,
+
+    pub fn deinit(self: *Pong, allocator: std.mem.Allocator) void {
+        allocator.free(self.ping_id);
+    }
+};
+
+/// Graceful connection close message
+pub const Goodbye = struct {
+    reason: ?[]const u8 = null,
+
+    pub fn deinit(self: *Goodbye, allocator: std.mem.Allocator) void {
+        if (self.reason) |r| allocator.free(r);
+    }
+};
+
+/// Request full state resync
+pub const SyncRequest = struct {
+    target_stream_id: Uuid,
+};
+
+/// Full partial state resync response
+pub const Sync = struct {
+    stream_id: Uuid,
+    sequence: u64,
+    partial: ?[]const u8 = null, // Serialized partial state
+
+    pub fn deinit(self: *Sync, allocator: std.mem.Allocator) void {
+        if (self.partial) |p| allocator.free(p);
     }
 };
 
@@ -388,10 +433,13 @@ test "ErrorCode enum values match protocol spec" {
         .stream_not_found,
         .stream_already_exists,
         .version_mismatch,
+        .invalid_sequence,
+        .duplicate_sequence,
+        .sequence_gap,
     };
 
-    // Verify enum has exactly 8 values
-    try std.testing.expectEqual(@as(usize, 8), codes.len);
+    // Verify enum has exactly 11 values
+    try std.testing.expectEqual(@as(usize, 11), codes.len);
 
     // Verify each can be instantiated
     inline for (codes) |code| {
@@ -462,13 +510,61 @@ test "Payload deinit handles all variants" {
     var ping_payload: Payload = .ping;
     ping_payload.deinit(std.testing.allocator);
 
-    // Test pong
-    var pong_payload: Payload = .pong;
+    // Test pong with ping_id
+    const ping_id = try std.testing.allocator.dupe(u8, "test-ping-123");
+    var pong_payload: Payload = .{ .pong = .{ .ping_id = ping_id } };
     pong_payload.deinit(std.testing.allocator);
 
     // Test ack
     var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUuid() } };
     ack_payload.deinit(std.testing.allocator);
+}
+
+test "Pong deinit frees ping_id" {
+    const ping_id = try std.testing.allocator.dupe(u8, "test-ping-id");
+    var pong = Pong{ .ping_id = ping_id };
+    pong.deinit(std.testing.allocator);
+    // Should not leak - test passes if no memory leak detected
+}
+
+test "Goodbye deinit frees reason" {
+    const reason = try std.testing.allocator.dupe(u8, "Server shutting down");
+    var goodbye = Goodbye{ .reason = reason };
+    goodbye.deinit(std.testing.allocator);
+    // Should not leak
+}
+
+test "Goodbye deinit handles null reason" {
+    var goodbye = Goodbye{ .reason = null };
+    goodbye.deinit(std.testing.allocator);
+    // Should not crash
+}
+
+test "Sync deinit frees partial" {
+    const partial = try std.testing.allocator.dupe(u8, "{\"partial\": \"state\"}");
+    var sync = Sync{
+        .stream_id = generateUuid(),
+        .sequence = 5,
+        .partial = partial,
+    };
+    sync.deinit(std.testing.allocator);
+    // Should not leak
+}
+
+test "Sync deinit handles null partial" {
+    var sync = Sync{
+        .stream_id = generateUuid(),
+        .sequence = 5,
+        .partial = null,
+    };
+    sync.deinit(std.testing.allocator);
+    // Should not crash
+}
+
+test "SyncRequest has target_stream_id" {
+    const target_id = generateUuid();
+    const sync_req = SyncRequest{ .target_stream_id = target_id };
+    try std.testing.expectEqualSlices(u8, &target_id, &sync_req.target_stream_id);
 }
 
 test "StreamRequest deinit with owned strings frees memory" {
