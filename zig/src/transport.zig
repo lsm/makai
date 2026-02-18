@@ -23,10 +23,32 @@ pub const ByteStream = event_stream.EventStream(ByteChunk, void);
 
 // --- Wire message type ---
 
+/// Control messages as defined in PROTOCOL.md Section 3.2
+pub const ControlMessage = union(enum) {
+    ack: struct {
+        acknowledged_id: []const u8,
+    },
+    nack: struct {
+        rejected_id: []const u8,
+        reason: []const u8,
+        error_code: ?[]const u8 = null,
+    },
+    ping: void,
+    pong: void,
+    goodbye: ?[]const u8, // optional reason
+    sync_request: void,
+    sync: struct {
+        stream_id: []const u8,
+        sequence: u64,
+        partial: ?[]const u8, // JSON snapshot
+    },
+};
+
 pub const MessageOrControl = union(enum) {
     event: ai_types.AssistantMessageEvent,
     result: ai_types.AssistantMessage,
     stream_error: []const u8,
+    control: ControlMessage,
 };
 
 // --- Transport interfaces ---
@@ -162,6 +184,11 @@ pub fn receiveStream(
                 stream.completeWithError(e);
                 return;
             },
+            .control => |ctrl| {
+                // Handle control messages - for now, just free them
+                // Future implementations may handle ping/pong, ack/nack, etc.
+                freeControlStrings(ctrl, allocator);
+            },
         }
     }
     stream.completeWithError("Transport closed unexpectedly");
@@ -169,39 +196,128 @@ pub fn receiveStream(
 
 // --- Async stream bridge functions ---
 
-/// Free allocated strings in an event (used when event is not pushed to stream)
+/// Free all strings owned by an event.
+///
+/// Memory Ownership Model:
+/// - Events own their strings. When an event is created, any string fields
+///   (delta, content, etc.) are deep copies allocated by the caller.
+/// - The `partial` field in streaming events contains a snapshot of the
+///   accumulated message state. If `partial.owned_strings` is true, the
+///   partial owns its content and must be freed.
+/// - Call this function when done with an event to prevent memory leaks.
 fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
     switch (ev) {
         .start => |e| {
-            var mutable = e.partial;
-            mutable.deinit(allocator);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .text_start => |e| {
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
         },
         .text_delta => |e| {
             allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .text_end => |e| {
+            allocator.free(e.content);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .thinking_start => |e| {
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
         },
         .thinking_delta => |e| {
             allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .thinking_end => |e| {
+            allocator.free(e.content);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
         },
         .toolcall_start => |e| {
-            var mutable = e.partial;
-            mutable.deinit(allocator);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
         },
         .toolcall_delta => |e| {
             allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
         },
         .toolcall_end => |e| {
-            allocator.free(e.tool_call.id);
-            allocator.free(e.tool_call.name);
-            allocator.free(e.tool_call.arguments_json);
+            if (e.tool_call.id.len > 0) allocator.free(e.tool_call.id);
+            if (e.tool_call.name.len > 0) allocator.free(e.tool_call.name);
+            if (e.tool_call.arguments_json.len > 0) allocator.free(e.tool_call.arguments_json);
             if (e.tool_call.thought_signature) |sig| {
                 allocator.free(sig);
+            }
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
             }
         },
         .done => |e| {
             var mutable = e.message;
             mutable.deinit(allocator);
         },
-        else => {},
+        .@"error" => |e| {
+            var mutable = e.err;
+            mutable.deinit(allocator);
+        },
+        .keepalive => {},
+    }
+}
+
+/// Free allocated strings in a control message
+fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
+    switch (ctrl) {
+        .ack => |a| allocator.free(a.acknowledged_id),
+        .nack => |n| {
+            allocator.free(n.rejected_id);
+            allocator.free(n.reason);
+            if (n.error_code) |ec| allocator.free(ec);
+        },
+        .goodbye => |g| if (g) |reason| allocator.free(reason),
+        .sync => |s| {
+            allocator.free(s.stream_id);
+            if (s.partial) |p| allocator.free(p);
+        },
+        .ping, .pong, .sync_request => {},
+    }
+}
+
+/// Free allocated strings in a MessageOrControl
+fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
+    switch (msg) {
+        .event => |ev| freeEventStrings(ev, allocator),
+        .result => |r| {
+            var mutable = r;
+            mutable.deinit(allocator);
+        },
+        .stream_error => |e| allocator.free(e),
+        .control => |ctrl| freeControlStrings(ctrl, allocator),
     }
 }
 
@@ -241,6 +357,11 @@ pub fn receiveStreamFromByteStream(
                 msg_stream.completeWithError(err_copy);
                 allocator.free(e);
                 return;
+            },
+            .control => |ctrl| {
+                // Handle control messages - for now, just free them
+                // Future implementations may handle ping/pong, ack/nack, etc.
+                freeControlStrings(ctrl, allocator);
             },
         }
     }
@@ -506,6 +627,69 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     if (std.mem.eql(u8, type_str, "stream_error")) {
         const msg = obj.get("message").?.string;
         return .{ .stream_error = try allocator.dupe(u8, msg) };
+    }
+
+    // Handle control messages
+    if (std.mem.eql(u8, type_str, "ack")) {
+        const acknowledged_id = if (obj.get("acknowledged_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        return .{ .control = .{ .ack = .{ .acknowledged_id = acknowledged_id } } };
+    }
+    if (std.mem.eql(u8, type_str, "nack")) {
+        const rejected_id = if (obj.get("rejected_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        const reason = if (obj.get("reason")) |r|
+            try allocator.dupe(u8, r.string)
+        else
+            return error.MissingField;
+        const error_code = if (obj.get("error_code")) |ec|
+            try allocator.dupe(u8, ec.string)
+        else
+            null;
+        return .{ .control = .{ .nack = .{
+            .rejected_id = rejected_id,
+            .reason = reason,
+            .error_code = error_code,
+        } } };
+    }
+    if (std.mem.eql(u8, type_str, "ping")) {
+        return .{ .control = .ping };
+    }
+    if (std.mem.eql(u8, type_str, "pong")) {
+        return .{ .control = .pong };
+    }
+    if (std.mem.eql(u8, type_str, "goodbye")) {
+        const reason = if (obj.get("reason")) |r|
+            try allocator.dupe(u8, r.string)
+        else
+            null;
+        return .{ .control = .{ .goodbye = reason } };
+    }
+    if (std.mem.eql(u8, type_str, "sync_request")) {
+        return .{ .control = .sync_request };
+    }
+    if (std.mem.eql(u8, type_str, "sync")) {
+        const stream_id = if (obj.get("stream_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        const sequence: u64 = if (obj.get("sequence")) |seq|
+            @intCast(seq.integer)
+        else
+            return error.MissingField;
+        const partial = if (obj.get("partial")) |p|
+            try allocator.dupe(u8, p.string)
+        else
+            null;
+        return .{ .control = .{ .sync = .{
+            .stream_id = stream_id,
+            .sequence = sequence,
+            .partial = partial,
+        } } };
     }
 
     return .{ .event = try parseAssistantMessageEvent(type_str, obj, allocator) };
