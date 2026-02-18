@@ -51,6 +51,12 @@ pub const MessageOrControl = union(enum) {
     control: ControlMessage,
 };
 
+/// Callback type for handling control messages
+/// The callback receives the control message and an optional context pointer.
+/// IMPORTANT: The callback must copy any strings it needs from the control message
+/// before returning, as the strings will be freed after the callback returns.
+pub const ControlMessageCallback = *const fn (ctrl: ControlMessage, ctx: ?*anyopaque) void;
+
 // --- Transport interfaces ---
 
 pub const Sender = struct {
@@ -77,12 +83,23 @@ pub const Receiver = struct {
     read_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8,
     close_fn: ?*const fn (ctx: *anyopaque) void = null,
 
+    /// Optional callback for handling control messages
+    control_callback: ?ControlMessageCallback = null,
+    control_callback_ctx: ?*anyopaque = null,
+
     pub fn read(self: *const Receiver, allocator: std.mem.Allocator) !?[]const u8 {
         return self.read_fn(self.context, allocator);
     }
 
     pub fn close(self: *const Receiver) void {
         if (self.close_fn) |f| f(self.context);
+    }
+
+    /// Set a callback to be invoked when control messages are received.
+    /// The callback receives the control message and the provided context.
+    pub fn setControlCallback(self: *Receiver, callback: ControlMessageCallback, ctx: ?*anyopaque) void {
+        self.control_callback = callback;
+        self.control_callback_ctx = ctx;
     }
 };
 
@@ -166,6 +183,7 @@ pub fn forwardStream(
 }
 
 /// Receive from a Receiver and push into a local stream. Blocks until done.
+/// If receiver.control_callback is set, it will be invoked for control messages.
 pub fn receiveStream(
     receiver: *const Receiver,
     stream: *event_stream.AssistantMessageStream,
@@ -185,8 +203,10 @@ pub fn receiveStream(
                 return;
             },
             .control => |ctrl| {
-                // Handle control messages - for now, just free them
-                // Future implementations may handle ping/pong, ack/nack, etc.
+                // Invoke callback if set, then free strings
+                if (receiver.control_callback) |cb| {
+                    cb(ctrl, receiver.control_callback_ctx);
+                }
                 freeControlStrings(ctrl, allocator);
             },
         }
@@ -254,6 +274,8 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
             }
         },
         .toolcall_start => |e| {
+            if (e.id.len > 0) allocator.free(e.id);
+            if (e.name.len > 0) allocator.free(e.name);
             if (e.partial.owned_strings) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
@@ -322,9 +344,22 @@ fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocat
 }
 
 /// Receive from a ByteStream and push into an AssistantMessageStream
+/// Control messages are discarded. Use receiveStreamFromByteStreamWithControl for control message handling.
 pub fn receiveStreamFromByteStream(
     byte_stream: *ByteStream,
     msg_stream: *event_stream.AssistantMessageStream,
+    allocator: std.mem.Allocator,
+) void {
+    receiveStreamFromByteStreamWithControl(byte_stream, msg_stream, null, null, allocator);
+}
+
+/// Receive from a ByteStream and push into an AssistantMessageStream with control message callback.
+/// If control_callback is provided, it will be invoked for control messages before they are freed.
+pub fn receiveStreamFromByteStreamWithControl(
+    byte_stream: *ByteStream,
+    msg_stream: *event_stream.AssistantMessageStream,
+    control_callback: ?ControlMessageCallback,
+    control_callback_ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
 ) void {
     defer byte_stream.complete({});
@@ -359,8 +394,10 @@ pub fn receiveStreamFromByteStream(
                 return;
             },
             .control => |ctrl| {
-                // Handle control messages - for now, just free them
-                // Future implementations may handle ping/pong, ack/nack, etc.
+                // Invoke callback if set, then free strings
+                if (control_callback) |cb| {
+                    cb(ctrl, control_callback_ctx);
+                }
                 freeControlStrings(ctrl, allocator);
             },
         }
@@ -378,19 +415,40 @@ const ReceiverThreadContext = struct {
     byte_stream: *ByteStream,
     msg_stream: *event_stream.AssistantMessageStream,
     allocator: std.mem.Allocator,
+    control_callback: ?ControlMessageCallback = null,
+    control_callback_ctx: ?*anyopaque = null,
 
     fn run(ctx: *@This()) void {
         defer ctx.allocator.destroy(ctx);
-        receiveStreamFromByteStream(ctx.byte_stream, ctx.msg_stream, ctx.allocator);
+        receiveStreamFromByteStreamWithControl(
+            ctx.byte_stream,
+            ctx.msg_stream,
+            ctx.control_callback,
+            ctx.control_callback_ctx,
+            ctx.allocator,
+        );
         ctx.byte_stream.deinit();
         ctx.allocator.destroy(ctx.byte_stream);
     }
 };
 
 /// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream
+/// Control messages are discarded. Use spawnReceiverWithControl for control message handling.
 pub fn spawnReceiver(
     receiver: *const AsyncReceiver,
     msg_stream: *event_stream.AssistantMessageStream,
+    allocator: std.mem.Allocator,
+) !std.Thread {
+    return spawnReceiverWithControl(receiver, msg_stream, null, null, allocator);
+}
+
+/// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream with control callback.
+/// If control_callback is provided, it will be invoked for control messages.
+pub fn spawnReceiverWithControl(
+    receiver: *const AsyncReceiver,
+    msg_stream: *event_stream.AssistantMessageStream,
+    control_callback: ?ControlMessageCallback,
+    control_callback_ctx: ?*anyopaque,
     allocator: std.mem.Allocator,
 ) !std.Thread {
     const byte_stream = try receiver.receiveStream(allocator);
@@ -400,6 +458,8 @@ pub fn spawnReceiver(
         .byte_stream = byte_stream,
         .msg_stream = msg_stream,
         .allocator = allocator,
+        .control_callback = control_callback,
+        .control_callback_ctx = control_callback_ctx,
     };
 
     return std.Thread.spawn(.{}, ReceiverThreadContext.run, .{ctx});
@@ -448,16 +508,8 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .toolcall_start => |e| {
             try w.writeStringField("type", "toolcall_start");
             try w.writeIntField("content_index", e.content_index);
-            // Extract id and name from the tool_call block in the partial
-            if (e.partial.content.len > e.content_index) {
-                switch (e.partial.content[e.content_index]) {
-                    .tool_call => |tc| {
-                        try w.writeStringField("id", tc.id);
-                        try w.writeStringField("name", tc.name);
-                    },
-                    else => {},
-                }
-            }
+            try w.writeStringField("id", e.id);
+            try w.writeStringField("name", e.name);
         },
         .toolcall_delta => |d| {
             try w.writeStringField("type", "toolcall_delta");
@@ -695,12 +747,103 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     return .{ .event = try parseAssistantMessageEvent(type_str, obj, allocator) };
 }
 
+/// Parse the lightweight partial object from protocol events (include_partial: true)
+/// Returns an AssistantMessage with content populated from the partial fields.
+/// According to PROTOCOL.md:
+/// - Text events: { "current_text": "accumulated text" }
+/// - Thinking events: { "current_thinking": "accumulated thinking" }
+/// - Tool call events: { "current_arguments_json": "..." }
+fn parsePartialFromEvent(
+    partial_obj: ?std.json.Value,
+    content_index: usize,
+    allocator: std.mem.Allocator,
+) !?ai_types.AssistantMessage {
+    if (partial_obj == null or partial_obj.? != .object) return null;
+
+    const obj = partial_obj.?.object;
+
+    // Check for text partial
+    if (obj.get("current_text")) |ct| {
+        const text = try allocator.dupe(u8, ct.string);
+        errdefer allocator.free(text);
+
+        // Create content array with text at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .text = .{ .text = text } };
+
+        return .{
+            .content = content,
+            .api = "",
+            .provider = "",
+            .model = "",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    // Check for thinking partial
+    if (obj.get("current_thinking")) |ct| {
+        const thinking = try allocator.dupe(u8, ct.string);
+        errdefer allocator.free(thinking);
+
+        // Create content array with thinking at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .thinking = .{ .thinking = thinking } };
+
+        return .{
+            .content = content,
+            .api = "",
+            .provider = "",
+            .model = "",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    // Check for tool call arguments partial
+    if (obj.get("current_arguments_json")) |ca| {
+        const args_json = try allocator.dupe(u8, ca.string);
+        errdefer allocator.free(args_json);
+
+        // Create content array with tool_call at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .tool_call = .{
+            .id = "",
+            .name = "",
+            .arguments_json = args_json,
+        } };
+
+        return .{
+            .content = content,
+            .api = "",
+            .provider = "",
+            .model = "",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    return null;
+}
+
 pub fn parseAssistantMessageEvent(
     type_str: []const u8,
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessageEvent {
-    // Create a minimal partial message for events
+    // Create a minimal partial message for events (used when no partial field present)
     const empty_partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
@@ -719,100 +862,166 @@ pub fn parseAssistantMessageEvent(
         return .{ .start = .{ .partial = partial } };
     }
     if (std.mem.eql(u8, type_str, "text_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_start = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
-            .partial = empty_partial,
+            .content_index = content_index,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "text_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_delta = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
-            .partial = empty_partial,
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "text_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_end = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
+            .content_index = content_index,
             .content = "",
-            .partial = empty_partial,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_start = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
-            .partial = empty_partial,
+            .content_index = content_index,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_delta = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
-            .partial = empty_partial,
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_end = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
+            .content_index = content_index,
             .content = "",
-            .partial = empty_partial,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_start")) {
         const content_index: usize = @intCast(obj.get("content_index").?.integer);
 
-        // If id and name are present, create a tool_call block in the partial
-        if (obj.get("id")) |id_val| {
-            const id = try allocator.dupe(u8, id_val.string);
-            errdefer allocator.free(id);
-            const name = try allocator.dupe(u8, obj.get("name").?.string);
-            errdefer allocator.free(name);
+        // Parse id and name - these are now required fields
+        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        errdefer allocator.free(name);
 
-            // Create a content array with a tool_call block at content_index
-            const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
-            errdefer allocator.free(content);
-            @memset(content, .{ .text = .{ .text = "" } });
-            content[content_index] = .{ .tool_call = .{
-                .id = id,
-                .name = name,
-                .arguments_json = "",
-            } };
-
-            var partial = empty_partial;
-            partial.content = content;
-            partial.owned_strings = true;
-            return .{ .toolcall_start = .{
-                .content_index = content_index,
-                .partial = partial,
-            } };
-        }
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
 
         return .{ .toolcall_start = .{
             .content_index = content_index,
-            .partial = empty_partial,
+            .id = id,
+            .name = name,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .toolcall_delta = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
-            .partial = empty_partial,
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
         const thought_signature = if (obj.get("thought_signature")) |sig_val|
             try allocator.dupe(u8, sig_val.string)
         else
             null;
+        errdefer if (thought_signature) |sig| allocator.free(sig);
+
+        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string);
+        errdefer allocator.free(arguments_json);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .toolcall_end = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
+            .content_index = content_index,
             .tool_call = .{
-                .id = try allocator.dupe(u8, obj.get("id").?.string),
-                .name = try allocator.dupe(u8, obj.get("name").?.string),
-                .arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string),
+                .id = id,
+                .name = name,
+                .arguments_json = arguments_json,
                 .thought_signature = thought_signature,
             },
-            .partial = empty_partial,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
@@ -1099,12 +1308,9 @@ test "serialize and deserialize done event" {
 test "serialize and deserialize toolcall_start event with id and name" {
     const allocator = std.testing.allocator;
 
-    // Create a partial with a tool_call block at index 0
-    const content = [_]ai_types.AssistantContent{
-        .{ .tool_call = .{ .id = "toolu_abc", .name = "calculator", .arguments_json = "" } },
-    };
+    // Create a simple partial (empty content is fine, id/name are now in the event directly)
     const partial = ai_types.AssistantMessage{
-        .content = &content,
+        .content = &.{},
         .api = "",
         .provider = "",
         .model = "",
@@ -1114,6 +1320,8 @@ test "serialize and deserialize toolcall_start event with id and name" {
     };
     const event = ai_types.AssistantMessageEvent{ .toolcall_start = .{
         .content_index = 0,
+        .id = "toolu_abc",
+        .name = "calculator",
         .partial = partial,
     } };
 
@@ -1129,14 +1337,13 @@ test "serialize and deserialize toolcall_start event with id and name" {
     try std.testing.expect(msg.event == .toolcall_start);
     try std.testing.expectEqual(@as(usize, 0), msg.event.toolcall_start.content_index);
 
-    // Verify id and name are accessible in the partial's tool_call block
-    try std.testing.expect(msg.event.toolcall_start.partial.content.len > 0);
-    try std.testing.expect(msg.event.toolcall_start.partial.content[0] == .tool_call);
-    try std.testing.expectEqualStrings("toolu_abc", msg.event.toolcall_start.partial.content[0].tool_call.id);
-    try std.testing.expectEqualStrings("calculator", msg.event.toolcall_start.partial.content[0].tool_call.name);
+    // Verify id and name are accessible directly in the event
+    try std.testing.expectEqualStrings("toolu_abc", msg.event.toolcall_start.id);
+    try std.testing.expectEqualStrings("calculator", msg.event.toolcall_start.name);
 
-    var mutable = msg.event.toolcall_start.partial;
-    mutable.deinit(allocator);
+    // Free the duped id and name strings
+    allocator.free(msg.event.toolcall_start.id);
+    allocator.free(msg.event.toolcall_start.name);
 }
 
 test "serialize and deserialize toolcall_end event" {
@@ -1576,3 +1783,241 @@ test "receiveStreamFromByteStream bridge" {
     try std.testing.expect(msg_stream.isDone());
 }
 
+
+// --- Control message callback tests ---
+
+const ControlTestContext = struct {
+    received_ping: bool = false,
+    received_pong: bool = false,
+    ack_count: usize = 0,
+    last_ack_id: []const u8 = "",
+    allocator: std.mem.Allocator,
+
+    fn callback(ctrl: ControlMessage, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        switch (ctrl) {
+            .ping => {
+                self.received_ping = true;
+            },
+            .pong => {
+                self.received_pong = true;
+            },
+            .ack => |a| {
+                self.ack_count += 1;
+                // Free previous allocation if any
+                if (self.last_ack_id.len > 0) {
+                    self.allocator.free(self.last_ack_id);
+                    self.last_ack_id = "";
+                }
+                // Must copy the string since it will be freed after callback returns
+                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id) catch "";
+            },
+            else => {},
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.last_ack_id.len > 0) {
+            self.allocator.free(self.last_ack_id);
+        }
+    }
+};
+
+test "receiveStreamFromByteStreamWithControl invokes callback for ping" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push a ping control message
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expect(test_ctx.received_ping);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl invokes callback for ack with string data" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push an ack control message
+    const ack_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-12345\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), test_ctx.ack_count);
+    try std.testing.expectEqualStrings("msg-12345", test_ctx.last_ack_id);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl handles multiple control messages" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push multiple control messages
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    const ack1_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-1\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack1_json), .owned = true });
+
+    const pong_json = "{\"type\":\"pong\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, pong_json), .owned = true });
+
+    const ack2_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-2\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack2_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expect(test_ctx.received_ping);
+    try std.testing.expect(test_ctx.received_pong);
+    try std.testing.expectEqual(@as(usize, 2), test_ctx.ack_count);
+    try std.testing.expectEqualStrings("msg-2", test_ctx.last_ack_id);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl handles null callback (no-op)" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push a ping control message
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    // Call with null callback - should not crash
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        null,
+        null,
+        allocator,
+    );
+
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "Receiver.setControlCallback stores callback" {
+    var receiver = Receiver{
+        .context = undefined,
+        .read_fn = undefined,
+    };
+
+    var test_ctx = ControlTestContext{ .allocator = std.testing.allocator };
+
+    try std.testing.expect(receiver.control_callback == null);
+    try std.testing.expect(receiver.control_callback_ctx == null);
+
+    receiver.setControlCallback(ControlTestContext.callback, &test_ctx);
+
+    try std.testing.expect(receiver.control_callback != null);
+    try std.testing.expect(receiver.control_callback_ctx != null);
+}

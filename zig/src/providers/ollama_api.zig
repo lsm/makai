@@ -916,6 +916,8 @@ fn runThread(ctx: *ThreadCtx) void {
                         // Emit toolcall_start
                         stream.push(.{ .toolcall_start = .{
                             .content_index = content_idx,
+                            .id = tool_id,
+                            .name = tool_name,
                             .partial = createPartialMessage(model),
                         } }) catch {
                             allocator.free(tool_id);
@@ -1066,6 +1068,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Emit toolcall_start
                 stream.push(.{ .toolcall_start = .{
                     .content_index = content_idx,
+                    .id = tool_id,
+                    .name = tool_name,
                     .partial = createPartialMessage(model),
                 } }) catch {
                     allocator.free(tool_id);

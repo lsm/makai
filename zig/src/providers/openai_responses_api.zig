@@ -1094,6 +1094,8 @@ fn runThread(ctx: *ThreadCtx) void {
                         _ = stream.push(.{
                             .toolcall_start = .{
                                 .content_index = content_index,
+                                .id = compound_id,
+                                .name = name,
                                 .partial = .{
                                     .content = &.{},
                                     .api = model.api,

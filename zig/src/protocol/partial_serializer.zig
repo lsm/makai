@@ -199,6 +199,8 @@ pub fn serializeEvent(
         .toolcall_start => |e| {
             try w.writeStringField("type", "toolcall_start");
             try w.writeIntField("content_index", e.content_index);
+            try w.writeStringField("id", e.id);
+            try w.writeStringField("name", e.name);
         },
         .toolcall_delta => |d| {
             try w.writeStringField("type", "toolcall_delta");
@@ -414,7 +416,7 @@ test "processEvent tracks tool call accumulation" {
     };
 
     // Tool call start
-    const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .partial = partial } };
+    const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .id = "tool-123", .name = "bash", .partial = partial } };
     try state.processEvent(tc_start_event);
 
     // First delta
@@ -626,7 +628,7 @@ test "serializeEvent for toolcall_delta includes partial" {
     };
 
     // Process tool call events
-    const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .partial = partial } };
+    const tc_start_event: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 0, .id = "tool-123", .name = "bash", .partial = partial } };
     try state.processEvent(tc_start_event);
 
     const delta_event: ai_types.AssistantMessageEvent = .{ .toolcall_delta = .{ .content_index = 0, .delta = "{\"cmd\":", .partial = partial } };
@@ -667,7 +669,7 @@ test "processEvent handles multiple blocks" {
     try state.processEvent(text_delta);
 
     // Tool call at index 1
-    const tc_start: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 1, .partial = partial } };
+    const tc_start: ai_types.AssistantMessageEvent = .{ .toolcall_start = .{ .content_index = 1, .id = "tool-456", .name = "search", .partial = partial } };
     try state.processEvent(tc_start);
 
     const tc_delta: ai_types.AssistantMessageEvent = .{ .toolcall_delta = .{ .content_index = 1, .delta = "{}", .partial = partial } };

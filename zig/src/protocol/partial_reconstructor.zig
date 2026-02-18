@@ -143,11 +143,13 @@ pub const PartialReconstructor = struct {
                 self.usage.cache_write += te.partial.usage.cache_write;
             },
             .toolcall_start => |tcs| {
-                // Create tool_call block
+                // Create tool_call block with id/name from the event
                 const json_list = std.ArrayList(u8).initCapacity(self.allocator, 64) catch return error.OutOfMemory;
+                const id_duped = if (tcs.id.len > 0) try self.allocator.dupe(u8, tcs.id) else null;
+                const name_duped = if (tcs.name.len > 0) try self.allocator.dupe(u8, tcs.name) else null;
                 const tc_block = ReconstructedBlock{ .tool_call = .{
-                    .id = null,
-                    .name = null,
+                    .id = id_duped,
+                    .name = name_duped,
                     .json_chunks = json_list,
                 } };
                 try self.content_blocks.put(tcs.content_index, tc_block);
@@ -166,14 +168,14 @@ pub const PartialReconstructor = struct {
                 self.usage.cache_write += tcd.partial.usage.cache_write;
             },
             .toolcall_end => |tce| {
-                // Finalize tool call with id/name from the event
+                // Finalize tool call with id/name from the event (only if not already set)
                 if (self.content_blocks.getPtr(tce.content_index)) |block| {
                     if (block.* == .tool_call) {
-                        // Dupe id and name from the tool_call_end event
-                        if (tce.tool_call.id.len > 0) {
+                        // Only dupe id and name if they weren't set in toolcall_start
+                        if (block.tool_call.id == null and tce.tool_call.id.len > 0) {
                             block.tool_call.id = try self.allocator.dupe(u8, tce.tool_call.id);
                         }
-                        if (tce.tool_call.name.len > 0) {
+                        if (block.tool_call.name == null and tce.tool_call.name.len > 0) {
                             block.tool_call.name = try self.allocator.dupe(u8, tce.tool_call.name);
                         }
                         // Also append any final JSON from arguments_json if present
@@ -458,7 +460,7 @@ test "processEvent accumulates tool call deltas" {
     try recon.processEvent(.{ .start = .{ .partial = partial } });
 
     // Tool call start
-    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 0, .partial = partial } });
+    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 0, .id = "tool-123", .name = "bash", .partial = partial } });
 
     // Tool call deltas (JSON fragments)
     try recon.processEvent(.{ .toolcall_delta = .{ .content_index = 0, .delta = "{\"com", .partial = partial } });
@@ -553,7 +555,7 @@ test "buildMessage includes all content blocks" {
     try recon.processEvent(.{ .text_delta = .{ .content_index = 1, .delta = "Response", .partial = partial } });
 
     // Tool call block (index 2)
-    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 2, .partial = partial } });
+    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 2, .id = "tc-1", .name = "bash", .partial = partial } });
     try recon.processEvent(.{ .toolcall_delta = .{ .content_index = 2, .delta = "{\"cmd\": \"ls\"}", .partial = partial } });
     const tool_call = ai_types.ToolCall{
         .id = "tc-1",
@@ -751,7 +753,7 @@ test "buildMessage with tool_use stop reason" {
     };
 
     try recon.processEvent(.{ .start = .{ .partial = partial } });
-    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 0, .partial = partial } });
+    try recon.processEvent(.{ .toolcall_start = .{ .content_index = 0, .id = "tc-1", .name = "read_file", .partial = partial } });
 
     const tool_call = ai_types.ToolCall{
         .id = "tc-1",

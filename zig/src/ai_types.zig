@@ -482,7 +482,12 @@ pub const AssistantMessageEvent = union(enum) {
     thinking_start: struct { content_index: usize, partial: AssistantMessage },
     thinking_delta: struct { content_index: usize, delta: []const u8, partial: AssistantMessage },
     thinking_end: struct { content_index: usize, content: []const u8, partial: AssistantMessage },
-    toolcall_start: struct { content_index: usize, partial: AssistantMessage },
+    toolcall_start: struct {
+        content_index: usize,
+        id: []const u8,
+        name: []const u8,
+        partial: AssistantMessage,
+    },
     toolcall_delta: struct { content_index: usize, delta: []const u8, partial: AssistantMessage },
     toolcall_end: struct { content_index: usize, tool_call: ToolCall, partial: AssistantMessage },
     done: struct { reason: StopReason, message: AssistantMessage },

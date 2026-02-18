@@ -1411,12 +1411,11 @@ fn runThread(ctx: *ThreadCtx) void {
                         },
                         .tool_use => {
                             _ = tc_tracker.startCall(cbs.index, content_idx, cbs.tool_id, cbs.tool_name) catch {};
-                            // Free the duped strings from parseAnthropicEventType
-                            allocator.free(cbs.tool_id);
-                            allocator.free(cbs.tool_name);
 
                             stream.push(.{ .toolcall_start = .{
                                 .content_index = content_idx,
+                                .id = cbs.tool_id,
+                                .name = cbs.tool_name,
                                 .partial = createPartialMessage(model),
                             }}) catch {};
                         },
