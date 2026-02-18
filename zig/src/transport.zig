@@ -182,6 +182,13 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
         .thinking_delta => |e| {
             allocator.free(e.delta);
         },
+        .toolcall_start => |e| {
+            var mutable = e.partial;
+            mutable.deinit(allocator);
+        },
+        .toolcall_delta => |e| {
+            allocator.free(e.delta);
+        },
         .toolcall_end => |e| {
             allocator.free(e.tool_call.id);
             allocator.free(e.tool_call.name);
@@ -320,6 +327,16 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .toolcall_start => |e| {
             try w.writeStringField("type", "toolcall_start");
             try w.writeIntField("content_index", e.content_index);
+            // Extract id and name from the tool_call block in the partial
+            if (e.partial.content.len > e.content_index) {
+                switch (e.partial.content[e.content_index]) {
+                    .tool_call => |tc| {
+                        try w.writeStringField("id", tc.id);
+                        try w.writeStringField("name", tc.name);
+                    },
+                    else => {},
+                }
+            }
         },
         .toolcall_delta => |d| {
             try w.writeStringField("type", "toolcall_delta");
@@ -339,6 +356,10 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .done => |d| {
             try w.writeStringField("type", "done");
             try w.writeStringField("reason", @tagName(d.reason));
+
+            // Nest message fields under "message" key
+            try w.writeKey("message");
+            try w.beginObject();
             try w.writeStringField("stop_reason", @tagName(d.message.stop_reason));
             try w.writeStringField("model", d.message.model);
             try w.writeStringField("api", d.message.api);
@@ -355,6 +376,7 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
                 try serializeAssistantContent(&w, block);
             }
             try w.endArray();
+            try w.endObject();
         },
         .@"error" => |e| {
             try w.writeStringField("type", "error");
@@ -537,8 +559,33 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // If id and name are present, create a tool_call block in the partial
+        if (obj.get("id")) |id_val| {
+            const id = try allocator.dupe(u8, id_val.string);
+            const name = try allocator.dupe(u8, obj.get("name").?.string);
+
+            // Create a content array with a tool_call block at content_index
+            const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+            @memset(content, .{ .text = .{ .text = "" } });
+            content[content_index] = .{ .tool_call = .{
+                .id = id,
+                .name = name,
+                .arguments_json = "",
+            } };
+
+            var partial = empty_partial;
+            partial.content = content;
+            partial.owned_strings = true;
+            return .{ .toolcall_start = .{
+                .content_index = content_index,
+                .partial = partial,
+            } };
+        }
+
         return .{ .toolcall_start = .{
-            .content_index = @intCast(obj.get("content_index").?.integer),
+            .content_index = content_index,
             .partial = empty_partial,
         } };
     }
@@ -566,7 +613,8 @@ pub fn parseAssistantMessageEvent(
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
-        const message = try parseAssistantMessage(obj, allocator);
+        const message_obj = obj.get("message").?.object;
+        const message = try parseAssistantMessage(message_obj, allocator);
         return .{ .done = .{
             .reason = parseStopReason(obj.get("reason").?.string),
             .message = message,
@@ -774,6 +822,49 @@ test "serialize and deserialize done event" {
     try std.testing.expectEqual(@as(u64, 10), msg.event.done.message.usage.cache_write);
     var mutable_msg = msg.event.done.message;
     mutable_msg.deinit(allocator);
+}
+
+test "serialize and deserialize toolcall_start event with id and name" {
+    const allocator = std.testing.allocator;
+
+    // Create a partial with a tool_call block at index 0
+    const content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{ .id = "toolu_abc", .name = "calculator", .arguments_json = "" } },
+    };
+    const partial = ai_types.AssistantMessage{
+        .content = &content,
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{ .toolcall_start = .{
+        .content_index = 0,
+        .partial = partial,
+    } };
+
+    const json = try serializeEvent(event, allocator);
+    defer allocator.free(json);
+
+    // Verify the serialized JSON contains id and name
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"toolu_abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"calculator\"") != null);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .event);
+    try std.testing.expect(msg.event == .toolcall_start);
+    try std.testing.expectEqual(@as(usize, 0), msg.event.toolcall_start.content_index);
+
+    // Verify id and name are accessible in the partial's tool_call block
+    try std.testing.expect(msg.event.toolcall_start.partial.content.len > 0);
+    try std.testing.expect(msg.event.toolcall_start.partial.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("toolu_abc", msg.event.toolcall_start.partial.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("calculator", msg.event.toolcall_start.partial.content[0].tool_call.name);
+
+    var mutable = msg.event.toolcall_start.partial;
+    mutable.deinit(allocator);
 }
 
 test "serialize and deserialize toolcall_end event" {
