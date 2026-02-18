@@ -256,13 +256,21 @@ pub const AsyncStdioReceiver = struct {
     }
 
     fn producerThread(ctx: *ProducerContext) void {
+        // Save pointers before defer block since we need to call markThreadDone
+        // AFTER freeing ctx (to avoid race with waitForThread)
+        const stream = ctx.stream;
+        const allocator = ctx.allocator;
+        const owns_cancel_token = ctx.owns_cancel_token;
+        const cancel_token = ctx.cancel_token;
+
         defer {
-            ctx.leftover.deinit(ctx.allocator);
-            if (ctx.owns_cancel_token) {
-                ctx.allocator.destroy(ctx.cancel_token);
+            ctx.leftover.deinit(allocator);
+            if (owns_cancel_token) {
+                allocator.destroy(cancel_token);
             }
-            ctx.stream.markThreadDone();
-            ctx.allocator.destroy(ctx);
+            allocator.destroy(ctx);
+            // Mark thread done AFTER all cleanup so waitForThread guarantees memory is freed
+            stream.markThreadDone();
         }
 
         while (!ctx.cancel_token.load(.acquire)) {

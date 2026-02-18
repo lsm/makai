@@ -240,10 +240,16 @@ pub const AsyncSseReceiver = struct {
     }
 
     fn producerThread(ctx: *ProducerContext) void {
+        // Save pointers before defer block since we need to call markThreadDone
+        // AFTER freeing ctx (to avoid race with waitForThread)
+        const stream = ctx.stream;
+        const allocator = ctx.allocator;
+
         defer {
             ctx.parser.deinit();
-            ctx.stream.markThreadDone();
-            ctx.allocator.destroy(ctx);
+            allocator.destroy(ctx);
+            // Mark thread done AFTER all cleanup so waitForThread guarantees memory is freed
+            stream.markThreadDone();
         }
 
         while (true) {
