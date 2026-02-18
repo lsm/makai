@@ -124,9 +124,9 @@ Control
   |-- nack                - Negative acknowledgment
   |-- ping                - Connection-level transport keepalive
   |-- pong                - Connection-level keepalive response
-  |-- goodbye             - Graceful connection close
-  |-- sync_request        - Request full state resync (client->server)
-  |-- sync                - Full partial state resync (server->client)
+  |-- goodbye             - Graceful connection close *(planned for v1.1)*
+  |-- sync_request        - Request full state resync *(planned for v1.1)*
+  |-- sync                - Full partial state resync *(planned for v1.1)*
 
 Response
   |-- stream_error        - Stream-level error
@@ -163,7 +163,6 @@ All messages are wrapped in an envelope:
 | `timestamp` | integer | No | Unix timestamp in milliseconds |
 | `in_reply_to` | string | No | Correlates response to original message (for ack/nack) |
 | `payload` | object | Yes | Type-specific message content |
-| `include_partial` | boolean | No | Include per-block partial state (default: false) |
 
 **Note**: Message fragmentation is handled by the transport layer. The protocol does not include fragmentation fields.
 
@@ -583,13 +582,16 @@ A discriminated union of UserMessage and AssistantMessage for use in Context.mes
     "message_id": { "type": "string", "format": "uuid" },
     "sequence": { "type": "integer", "minimum": 1 },
     "timestamp": { "type": "integer" },
-    "include_partial": { "type": "boolean" },
     "payload": {
       "type": "object",
       "properties": {
         "model": { "$ref": "#/$defs/Model" },
         "context": { "$ref": "#/$defs/Context" },
-        "options": { "$ref": "#/$defs/StreamOptions" }
+        "options": { "$ref": "#/$defs/StreamOptions" },
+        "include_partial": {
+          "type": "boolean",
+          "description": "If true, include lightweight partials in events (default: false)"
+        }
       },
       "required": ["model", "context"]
     }
@@ -675,7 +677,6 @@ Request for non-streaming AI completion. Unlike `stream_request`, this returns a
   "properties": {
     "temperature": { "type": "number", "minimum": 0, "maximum": 2 },
     "max_tokens": { "type": "integer", "minimum": 1 },
-    "include_partial": { "type": "boolean" },
     "cache_retention": { "enum": ["none", "short", "long"] },
     "session_id": { "type": "string" },
     "thinking_enabled": { "type": "boolean" },
@@ -1184,6 +1185,8 @@ When `include_partial: false`, the start event includes model and initial token 
 
 #### PongControl
 
+**Note**: In v1.0, the `pong` response is implemented as a simple `void` type without echo of `ping_id`. The `ping_id` field is documented here for forward compatibility and planned for v1.1.
+
 ```json
 {
   "type": "object",
@@ -1196,9 +1199,9 @@ When `include_partial: false`, the start event includes model and initial token 
     "payload": {
       "type": "object",
       "properties": {
-        "ping_id": { "type": "string" }
+        "ping_id": { "type": "string", "description": "Echo of ping_id (optional in v1.0, required in v1.1+)" }
       },
-      "required": ["ping_id"]
+      "required": []
     }
   }
 }
@@ -1558,7 +1561,6 @@ This inversion is necessary because in agentic workflows, the AI controls the fl
   "stream_id": "550e8400-e29b-41d4-a716-446655440002",
   "message_id": "550e8400-e29b-41d4-a716-446655440002",
   "sequence": 1,
-  "include_partial": true,
   "payload": {
     "model": {
       "id": "gpt-4o",
@@ -1585,7 +1587,8 @@ This inversion is necessary because in agentic workflows, the AI controls the fl
     },
     "options": {
       "tool_choice": "auto"
-    }
+    },
+    "include_partial": true
   }
 }
 ```
@@ -1819,6 +1822,15 @@ All events in the stream follow a clear ownership model to ensure safe async han
 
 ## Appendix C: Current Limitations (v1.0)
 
+### Advanced Control Messages
+
+The following control messages are documented for forward compatibility but **not yet implemented** in v1.0:
+
+- **`goodbye`**: Graceful connection close *(planned for v1.1)*
+- **`sync_request`**: Request full state resync *(planned for v1.1)*
+- **`sync`**: Full partial state resync *(planned for v1.1)*
+- **`pong.payload.ping_id`**: The `pong` response is currently implemented as a simple `void` type without echo of `ping_id`. The schema documents `ping_id` for forward compatibility, but v1.0 implementations should not expect this field.
+
 ### Single-Stream Mode
 
 The current v1.0 implementation supports **single active stream per client**. While the protocol specification describes full multiplexing support (Section 7.4), the implementation currently tracks only one stream at a time via `current_stream_id` in the client.
@@ -1837,6 +1849,10 @@ The server implementation creates streams and returns acknowledgment (ACK) but *
 3. Transmit envelopes via the transport layer
 
 This is planned for v2.0.
+
+### Sequence Validation
+
+**Sequence validation not enforced**: While sequence numbers are tracked for each stream, the server does not reject out-of-order or duplicate messages. This is planned for v2.0 when implementing multiplexing.
 
 ### Planned for v2.0
 

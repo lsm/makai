@@ -642,6 +642,7 @@ fn deserializeStreamRequest(
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
+        .owned_strings = true, // Mark as owned since we duped the strings
     };
 
     const context = if (obj.get("context")) |ctx_val|
@@ -698,6 +699,7 @@ fn deserializeCompleteRequest(
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
+        .owned_strings = true, // Mark as owned since we duped the strings
     };
 
     const context = if (obj.get("context")) |ctx_val|
@@ -850,6 +852,7 @@ fn deserializeContext(
         .system_prompt = system_prompt,
         .messages = messages,
         .tools = tools,
+        .owned_strings = true, // Mark as owned since we allocated all strings/arrays
     };
 }
 
@@ -1530,4 +1533,156 @@ test "deserializeEnvelope with explicit version" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.version == 2);
+}
+
+test "deserializeEnvelope with stream_request frees all memory" {
+    // This test verifies that deinit properly frees all allocated memory
+    // when deserializing a stream_request (Issue #3)
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "stream_request",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {
+        \\    "model": {
+        \\      "id": "gpt-4o",
+        \\      "name": "GPT-4o",
+        \\      "api": "openai-completions",
+        \\      "provider": "openai",
+        \\      "base_url": "https://api.openai.com"
+        \\    },
+        \\    "context": {
+        \\      "system_prompt": "You are helpful.",
+        \\      "messages": [
+        \\        {
+        \\          "role": "user",
+        \\          "timestamp": 123,
+        \\          "content": "Hello"
+        \\        }
+        \\      ],
+        \\      "tools": [
+        \\        {
+        \\          "name": "bash",
+        \\          "description": "Run a command",
+        \\          "parameters_schema_json": "{\"type\":\"object\"}"
+        \\        }
+        \\      ]
+        \\    },
+        \\    "include_partial": true
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    // Verify the envelope was parsed correctly
+    try std.testing.expect(envelope.payload == .stream_request);
+    try std.testing.expectEqualStrings("gpt-4o", envelope.payload.stream_request.model.id);
+    try std.testing.expectEqualStrings("GPT-4o", envelope.payload.stream_request.model.name);
+    try std.testing.expect(envelope.payload.stream_request.model.owned_strings);
+    try std.testing.expect(envelope.payload.stream_request.context.owned_strings);
+
+    // deinit will be called by defer - if it doesn't free all memory,
+    // the test will fail with a memory leak error
+}
+
+test "deserializeEnvelope with complete_request frees all memory" {
+    // This test verifies that deinit properly frees all allocated memory
+    // when deserializing a complete_request (Issue #3)
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "complete_request",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {
+        \\    "model": {
+        \\      "id": "claude-3",
+        \\      "name": "Claude 3",
+        \\      "api": "anthropic-messages",
+        \\      "provider": "anthropic",
+        \\      "base_url": "https://api.anthropic.com"
+        \\    },
+        \\    "context": {
+        \\      "messages": []
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    // Verify the envelope was parsed correctly
+    try std.testing.expect(envelope.payload == .complete_request);
+    try std.testing.expectEqualStrings("claude-3", envelope.payload.complete_request.model.id);
+    try std.testing.expect(envelope.payload.complete_request.model.owned_strings);
+    try std.testing.expect(envelope.payload.complete_request.context.owned_strings);
+
+    // deinit will be called by defer - if it doesn't free all memory,
+    // the test will fail with a memory leak error
+}
+
+test "deserializeEnvelope with complex context frees all memory" {
+    // Test with tool_result message to verify complete cleanup
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "stream_request",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {
+        \\    "model": {
+        \\      "id": "gpt-4",
+        \\      "name": "GPT-4",
+        \\      "api": "openai-completions",
+        \\      "provider": "openai",
+        \\      "base_url": "https://api.openai.com"
+        \\    },
+        \\    "context": {
+        \\      "system_prompt": "Be helpful",
+        \\      "messages": [
+        \\        {
+        \\          "role": "user",
+        \\          "timestamp": 100,
+        \\          "content": "Hi"
+        \\        },
+        \\        {
+        \\          "role": "tool",
+        \\          "tool_call_id": "call-123",
+        \\          "tool_name": "bash",
+        \\          "timestamp": 200,
+        \\          "is_error": false,
+        \\          "content": [
+        \\            {"type": "text", "text": "output"}
+        \\          ]
+        \\        }
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var envelope = try deserializeEnvelope(json, allocator);
+    defer envelope.deinit(allocator);
+
+    // Verify parsing
+    try std.testing.expect(envelope.payload == .stream_request);
+    try std.testing.expect(envelope.payload.stream_request.context.messages.len == 2);
+
+    // deinit will be called by defer - verifies complete cleanup
 }

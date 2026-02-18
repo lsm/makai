@@ -107,6 +107,32 @@ pub const StreamOptions = struct {
     http_timeout_ms: ?u64 = 30_000,
     /// Ping interval in milliseconds for streaming keepalive
     ping_interval_ms: ?u64 = null,
+
+    /// Free all owned memory. Only call this if options were created via
+    /// deserialization (which dupes string fields).
+    pub fn deinit(self: *StreamOptions, allocator: std.mem.Allocator) void {
+        if (self.api_key) |key| allocator.free(key);
+        if (self.session_id) |sid| allocator.free(sid);
+        if (self.thinking_effort) |effort| allocator.free(effort);
+        if (self.reasoning_effort) |effort| allocator.free(effort);
+        if (self.reasoning_summary) |summary| allocator.free(summary);
+        if (self.headers) |headers| {
+            for (headers) |header| {
+                allocator.free(header.name);
+                allocator.free(header.value);
+            }
+            allocator.free(headers);
+        }
+        if (self.metadata) |*meta| {
+            if (meta.user_id) |uid| allocator.free(uid);
+        }
+        if (self.tool_choice) |*choice| {
+            switch (choice.*) {
+                .function => |fname| allocator.free(fname),
+                else => {},
+            }
+        }
+    }
 };
 
 pub const SimpleStreamOptions = struct {
@@ -159,11 +185,40 @@ pub const AssistantContent = union(enum) {
 pub const UserContentPart = union(enum) {
     text: TextContent,
     image: ImageContent,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *UserContentPart, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |*t| {
+                allocator.free(t.text);
+                if (t.text_signature) |s| allocator.free(s);
+            },
+            .image => |*img| {
+                allocator.free(img.data);
+                allocator.free(img.mime_type);
+            },
+        }
+    }
 };
 
 pub const UserContent = union(enum) {
     text: []const u8,
     parts: []const UserContentPart,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *UserContent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .text => |t| allocator.free(t),
+            .parts => |parts| {
+                // Cast to mutable since we're freeing owned memory
+                const mut_parts = @as([*]UserContentPart, @ptrFromInt(@intFromPtr(parts.ptr)))[0..parts.len];
+                for (mut_parts) |*part| {
+                    part.deinit(allocator);
+                }
+                allocator.free(parts);
+            },
+        }
+    }
 };
 
 pub const UsageCost = struct {
@@ -196,6 +251,11 @@ pub const Usage = struct {
 pub const UserMessage = struct {
     content: UserContent,
     timestamp: i64,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *UserMessage, allocator: std.mem.Allocator) void {
+        self.content.deinit(allocator);
+    }
 };
 
 pub const AssistantMessage = struct {
@@ -254,24 +314,85 @@ pub const ToolResultMessage = struct {
     details_json: ?[]const u8 = null,
     is_error: bool,
     timestamp: i64,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *ToolResultMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.tool_name);
+        // Cast to mutable since we're freeing owned memory
+        const mut_content = @as([*]UserContentPart, @ptrFromInt(@intFromPtr(self.content.ptr)))[0..self.content.len];
+        for (mut_content) |*part| {
+            part.deinit(allocator);
+        }
+        allocator.free(self.content);
+        if (self.details_json) |dj| {
+            allocator.free(dj);
+        }
+    }
 };
 
 pub const Message = union(enum) {
     user: UserMessage,
     assistant: AssistantMessage,
     tool_result: ToolResultMessage,
+
+    /// Free all owned memory. Only call this if the message was created via
+    /// deserialization (which dupes all string fields).
+    pub fn deinit(self: *Message, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .user => |*msg| msg.deinit(allocator),
+            .assistant => |*msg| msg.deinit(allocator),
+            .tool_result => |*msg| msg.deinit(allocator),
+        }
+    }
 };
 
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
     parameters_schema_json: []const u8,
+
+    /// Free all owned memory.
+    pub fn deinit(self: *Tool, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.description);
+        allocator.free(self.parameters_schema_json);
+    }
 };
 
 pub const Context = struct {
     system_prompt: ?[]const u8 = null,
     messages: []const Message,
     tools: ?[]const Tool = null,
+    /// If true, arrays and strings are owned and will be freed in deinit
+    owned_strings: bool = false,
+
+    /// Free all owned memory. Only frees if owned_strings is true
+    /// (set by deserializer or when explicitly allocating).
+    pub fn deinit(self: *Context, allocator: std.mem.Allocator) void {
+        if (!self.owned_strings) return;
+
+        // Free system_prompt if present
+        if (self.system_prompt) |prompt| {
+            allocator.free(prompt);
+        }
+        // Free messages array and contents
+        // Cast to mutable since we're freeing owned memory
+        const mut_messages = @as([*]Message, @ptrFromInt(@intFromPtr(self.messages.ptr)))[0..self.messages.len];
+        for (mut_messages) |*msg| {
+            msg.deinit(allocator);
+        }
+        allocator.free(self.messages);
+        // Free tools array and contents
+        if (self.tools) |tools| {
+            // Cast to mutable since we're freeing owned memory
+            const mut_tools = @as([*]Tool, @ptrFromInt(@intFromPtr(tools.ptr)))[0..tools.len];
+            for (mut_tools) |*tool| {
+                tool.deinit(allocator);
+            }
+            allocator.free(tools);
+        }
+    }
 };
 
 pub const Cost = struct {
@@ -324,6 +445,33 @@ pub const Model = struct {
     max_tokens: u32,
     headers: ?[]const HeaderPair = null,
     compat: ?OpenAICompatOptions = null,
+    /// If true, string fields are owned and will be freed in deinit
+    owned_strings: bool = false,
+
+    /// Free all owned memory. Only frees strings if owned_strings is true
+    /// (set by deserializer or when explicitly duping).
+    pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
+        if (!self.owned_strings) return;
+
+        allocator.free(self.id);
+        allocator.free(self.name);
+        allocator.free(self.api);
+        allocator.free(self.provider);
+        allocator.free(self.base_url);
+        // Free input slice and its contents
+        for (self.input) |input| {
+            allocator.free(input);
+        }
+        allocator.free(self.input);
+        // Free headers if present
+        if (self.headers) |headers| {
+            for (headers) |header| {
+                allocator.free(header.name);
+                allocator.free(header.value);
+            }
+            allocator.free(headers);
+        }
+    }
 };
 
 pub const AssistantMessageEvent = union(enum) {

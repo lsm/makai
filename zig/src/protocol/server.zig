@@ -92,13 +92,13 @@ pub const ProtocolServer = struct {
     pub fn handleEnvelope(self: *ProtocolServer, env: protocol_types.Envelope) !?protocol_types.Envelope {
         switch (env.payload) {
             .stream_request => |req| {
-                return try handleStreamRequest(self, req, env.message_id, env.sequence);
+                return try handleStreamRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .abort_request => |req| {
                 return try handleAbortRequest(self, req, env.message_id, env.sequence);
             },
             .complete_request => |req| {
-                return try handleCompleteRequest(self, req, env.message_id, env.sequence);
+                return try handleCompleteRequest(self, req, env.stream_id, env.message_id, env.sequence);
             },
             .ack, .nack, .event, .result, .stream_error => {
                 // Server receives these from clients - no response needed
@@ -153,7 +153,9 @@ pub const ProtocolServer = struct {
         return next;
     }
 
-    /// Validate and update expected sequence for incoming message
+    /// Validates and updates expected sequence for a stream.
+    /// NOTE: Currently not used in request handlers. Planned for v2.0
+    /// when implementing full multiplexing support.
     fn validateAndUpdateSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid, received: u64) SequenceError!void {
         const expected = self.expected_sequences.get(stream_id) orelse 1;
         try validateSequence(expected, received);
@@ -163,12 +165,12 @@ pub const ProtocolServer = struct {
 };
 
 /// Handle stream_request - create stream, return ack with stream_id
-fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
     // Check max streams limit
     if (server.active_streams.count() >= server.options.max_streams) {
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -184,7 +186,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -204,7 +206,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         };
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -215,9 +217,6 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
             server.allocator,
         );
     };
-
-    // Generate stream_id
-    const stream_id = protocol_types.generateUuid();
 
     // Create ActiveStream entry
     const active_stream = ProtocolServer.ActiveStream{
@@ -287,24 +286,23 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             } },
         };
     } else {
-        // Stream not found - return nack
-        return try envelope.createNack(
-            .{
-                .stream_id = request.target_stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
-            "Stream not found",
-            .stream_not_found,
-            server.allocator,
-        );
+        // Stream not found (already completed or never existed)
+        // Per spec, abort is idempotent - return ACK even if stream not found
+        return .{
+            .stream_id = request.target_stream_id,
+            .message_id = protocol_types.generateUuid(),
+            .sequence = 0,
+            .in_reply_to = in_reply_to,
+            .timestamp = std.time.milliTimestamp(),
+            .payload = .{ .ack = .{
+                .acknowledged_id = in_reply_to,
+            } },
+        };
     }
 }
 
 /// Handle complete_request - get final result
-fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
     _ = received_seq; // Complete requests are one-shot, no sequence validation needed
 
     // For complete_request, we use the stream_id from the envelope
@@ -315,7 +313,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -335,7 +333,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         };
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -357,9 +355,8 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         var cloned_result = try ai_types.cloneAssistantMessage(server.allocator, result);
         cloned_result.owned_strings = true;
 
-        const response_stream_id = protocol_types.generateUuid();
         return .{
-            .stream_id = response_stream_id,
+            .stream_id = stream_id,
             .message_id = protocol_types.generateUuid(),
             .sequence = 1,
             .in_reply_to = in_reply_to,
@@ -370,7 +367,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         // Return error as nack
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -384,7 +381,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         // Timeout or unknown error
         return try envelope.createNack(
             .{
-                .stream_id = protocol_types.generateUuid(),
+                .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
                 .timestamp = std.time.milliTimestamp(),
@@ -505,8 +502,9 @@ test "handleEnvelope returns nack for stream_request without provider" {
         .max_tokens = 4096,
     };
 
+    const client_stream_id = protocol_types.generateUuid();
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
+        .stream_id = client_stream_id,
         .message_id = protocol_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
@@ -520,6 +518,8 @@ test "handleEnvelope returns nack for stream_request without provider" {
     try std.testing.expect(response != null);
     try std.testing.expect(response.?.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.provider_error, response.?.payload.nack.error_code.?);
+    // Verify NACK echoes client's stream_id
+    try std.testing.expectEqualSlices(u8, &client_stream_id, &response.?.stream_id);
 
     stream_req_env.deinit(std.testing.allocator);
     if (response) |*r| r.deinit(std.testing.allocator);
@@ -552,9 +552,10 @@ test "handleStreamRequest creates stream and returns ack" {
         .max_tokens = 4096,
     };
 
+    const client_stream_id = protocol_types.generateUuid();
     const msg_id = protocol_types.generateUuid();
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
+        .stream_id = client_stream_id,
         .message_id = msg_id,
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
@@ -568,6 +569,9 @@ test "handleStreamRequest creates stream and returns ack" {
     try std.testing.expect(response != null);
     try std.testing.expect(response.?.payload == .ack);
     try std.testing.expectEqualSlices(u8, &msg_id, &response.?.payload.ack.acknowledged_id);
+
+    // Server should echo client's stream_id, not generate a new one
+    try std.testing.expectEqualSlices(u8, &client_stream_id, &response.?.stream_id);
 
     // Verify stream was created
     try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
@@ -641,7 +645,7 @@ test "handleAbortRequest cancels stream" {
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 }
 
-test "handleAbortRequest returns nack for unknown stream" {
+test "handleAbortRequest returns ack for unknown stream (idempotent)" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -661,11 +665,10 @@ test "handleAbortRequest returns nack for unknown stream" {
         } },
     };
 
-    var response = try server.handleEnvelope(abort_env);
+    const response = try server.handleEnvelope(abort_env);
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(protocol_types.ErrorCode.stream_not_found, response.?.payload.nack.error_code.?);
-    if (response) |*r| r.deinit(std.testing.allocator);
+    // Per spec, abort is idempotent - returns ACK even if stream not found
+    try std.testing.expect(response.?.payload == .ack);
 }
 
 test "cleanupCompletedStreams removes done streams" {
@@ -747,8 +750,9 @@ test "max streams limit enforced" {
     };
 
     // Create first stream - should succeed
+    const client_stream_id_1 = protocol_types.generateUuid();
     var req1 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
+        .stream_id = client_stream_id_1,
         .message_id = protocol_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
@@ -760,11 +764,14 @@ test "max streams limit enforced" {
     const resp1 = try server.handleEnvelope(req1);
     try std.testing.expect(resp1 != null);
     try std.testing.expect(resp1.?.payload == .ack);
+    // Verify server echoes client's stream_id
+    try std.testing.expectEqualSlices(u8, &client_stream_id_1, &resp1.?.stream_id);
     req1.deinit(std.testing.allocator);
 
     // Create second stream - should succeed
+    const client_stream_id_2 = protocol_types.generateUuid();
     var req2 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
+        .stream_id = client_stream_id_2,
         .message_id = protocol_types.generateUuid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
@@ -776,11 +783,14 @@ test "max streams limit enforced" {
     const resp2 = try server.handleEnvelope(req2);
     try std.testing.expect(resp2 != null);
     try std.testing.expect(resp2.?.payload == .ack);
+    // Verify server echoes client's stream_id
+    try std.testing.expectEqualSlices(u8, &client_stream_id_2, &resp2.?.stream_id);
     req2.deinit(std.testing.allocator);
 
     // Create third stream - should fail with rate_limited
+    const client_stream_id_3 = protocol_types.generateUuid();
     var req3 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
+        .stream_id = client_stream_id_3,
         .message_id = protocol_types.generateUuid(),
         .sequence = 3,
         .timestamp = std.time.milliTimestamp(),
@@ -793,6 +803,8 @@ test "max streams limit enforced" {
     try std.testing.expect(resp3 != null);
     try std.testing.expect(resp3.?.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.rate_limited, resp3.?.payload.nack.error_code.?);
+    // Verify NACK also echoes client's stream_id
+    try std.testing.expectEqualSlices(u8, &client_stream_id_3, &resp3.?.stream_id);
     req3.deinit(std.testing.allocator);
     if (resp3) |*r| r.deinit(std.testing.allocator);
 }

@@ -228,9 +228,12 @@ pub const StreamRequest = struct {
     include_partial: bool = false,
 
     pub fn deinit(self: *StreamRequest, allocator: std.mem.Allocator) void {
-        // Model fields are typically borrowed references, not owned
-        _ = self;
-        _ = allocator;
+        // Model fields are owned when deserialized
+        self.model.deinit(allocator);
+        self.context.deinit(allocator);
+        if (self.options) |*opts| {
+            opts.deinit(allocator);
+        }
     }
 };
 
@@ -241,8 +244,12 @@ pub const CompleteRequest = struct {
     options: ?ai_types.StreamOptions = null,
 
     pub fn deinit(self: *CompleteRequest, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
+        // Model fields are owned when deserialized
+        self.model.deinit(allocator);
+        self.context.deinit(allocator);
+        if (self.options) |*opts| {
+            opts.deinit(allocator);
+        }
     }
 };
 
@@ -462,4 +469,109 @@ test "Payload deinit handles all variants" {
     // Test ack
     var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUuid() } };
     ack_payload.deinit(std.testing.allocator);
+}
+
+test "StreamRequest deinit with owned strings frees memory" {
+    // Create a StreamRequest with owned strings (simulating deserialized data)
+    const model = ai_types.Model{
+        .id = try std.testing.allocator.dupe(u8, "gpt-4"),
+        .name = try std.testing.allocator.dupe(u8, "GPT-4"),
+        .api = try std.testing.allocator.dupe(u8, "openai-completions"),
+        .provider = try std.testing.allocator.dupe(u8, "openai"),
+        .base_url = try std.testing.allocator.dupe(u8, "https://api.openai.com"),
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+        .owned_strings = true,
+    };
+
+    const sys_prompt = try std.testing.allocator.dupe(u8, "Be helpful");
+    const messages = try std.testing.allocator.alloc(ai_types.Message, 0);
+
+    const context = ai_types.Context{
+        .system_prompt = sys_prompt,
+        .messages = messages,
+        .tools = null,
+        .owned_strings = true,
+    };
+
+    var req = StreamRequest{
+        .model = model,
+        .context = context,
+        .options = null,
+        .include_partial = false,
+    };
+
+    req.deinit(std.testing.allocator);
+    // Should not leak - test passes if no memory leak detected
+}
+
+test "CompleteRequest deinit with owned strings frees memory" {
+    // Create a CompleteRequest with owned strings (simulating deserialized data)
+    const model = ai_types.Model{
+        .id = try std.testing.allocator.dupe(u8, "claude-3"),
+        .name = try std.testing.allocator.dupe(u8, "Claude 3"),
+        .api = try std.testing.allocator.dupe(u8, "anthropic-messages"),
+        .provider = try std.testing.allocator.dupe(u8, "anthropic"),
+        .base_url = try std.testing.allocator.dupe(u8, "https://api.anthropic.com"),
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+        .owned_strings = true,
+    };
+
+    const messages = try std.testing.allocator.alloc(ai_types.Message, 0);
+    const context = ai_types.Context{
+        .system_prompt = null,
+        .messages = messages,
+        .tools = null,
+        .owned_strings = true,
+    };
+
+    var req = CompleteRequest{
+        .model = model,
+        .context = context,
+        .options = null,
+    };
+
+    req.deinit(std.testing.allocator);
+    // Should not leak - test passes if no memory leak detected
+}
+
+test "StreamRequest deinit with borrowed strings does not free" {
+    // Create a StreamRequest with borrowed string literals (owned_strings = false)
+    const model = ai_types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 0,
+        .max_tokens = 0,
+        .owned_strings = false, // Borrowed, not owned
+    };
+
+    const context = ai_types.Context{
+        .system_prompt = "Be helpful",
+        .messages = &.{},
+        .tools = null,
+        .owned_strings = false, // Borrowed, not owned
+    };
+
+    var req = StreamRequest{
+        .model = model,
+        .context = context,
+        .options = null,
+        .include_partial = false,
+    };
+
+    req.deinit(std.testing.allocator);
+    // Should not crash - borrowed strings are not freed
 }
