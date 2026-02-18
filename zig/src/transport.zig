@@ -418,7 +418,7 @@ pub fn serializeError(msg: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-fn serializeAssistantContent(w: *json_writer.JsonWriter, content: ai_types.AssistantContent) !void {
+pub fn serializeAssistantContent(w: *json_writer.JsonWriter, content: ai_types.AssistantContent) !void {
     try w.beginObject();
     switch (content) {
         .text => |t| {
@@ -473,7 +473,7 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     return .{ .event = try parseAssistantMessageEvent(type_str, obj, allocator) };
 }
 
-fn parseAssistantMessageEvent(
+pub fn parseAssistantMessageEvent(
     type_str: []const u8,
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
@@ -587,7 +587,7 @@ fn parseAssistantMessageEvent(
     return error.UnknownEventType;
 }
 
-fn parseAssistantMessage(
+pub fn parseAssistantMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.AssistantMessage {

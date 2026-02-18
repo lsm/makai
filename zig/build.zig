@@ -290,6 +290,95 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const websocket_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const content_partial_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/content_partial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const partial_serializer_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/partial_serializer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+        },
+    });
+
+    const protocol_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const protocol_envelope_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/envelope.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "transport", .module = transport_mod },
+        },
+    });
+
+    const partial_reconstructor_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/partial_reconstructor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "streaming_json", .module = streaming_json_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+        },
+    });
+
+    const protocol_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "transport", .module = transport_mod },
+        },
+    });
+
+    const protocol_client_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "streaming_json", .module = streaming_json_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+        },
+    });
+
     // Tests
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -439,6 +528,22 @@ pub fn build(b: *std.Build) void {
 
     const sse_transport_test = b.addTest(.{ .root_module = sse_transport_mod });
 
+    const websocket_transport_test = b.addTest(.{ .root_module = websocket_transport_mod });
+
+    const content_partial_test = b.addTest(.{ .root_module = content_partial_mod });
+
+    const partial_serializer_test = b.addTest(.{ .root_module = partial_serializer_mod });
+
+    const protocol_types_test = b.addTest(.{ .root_module = protocol_types_mod });
+
+    const protocol_envelope_test = b.addTest(.{ .root_module = protocol_envelope_mod });
+
+    const partial_reconstructor_test = b.addTest(.{ .root_module = partial_reconstructor_mod });
+
+    const protocol_server_test = b.addTest(.{ .root_module = protocol_server_mod });
+
+    const protocol_client_test = b.addTest(.{ .root_module = protocol_client_mod });
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
@@ -449,6 +554,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(transport_test).step);
     test_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
+    test_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_envelope_test).step);
+    test_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(overflow_test).step);
@@ -486,4 +599,7 @@ pub fn build(b: *std.Build) void {
     test_e2e_step.dependOn(test_e2e_azure_step);
     test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
+
+    const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
+    test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
 }
