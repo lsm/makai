@@ -1073,7 +1073,11 @@ fn deserializeStreamOptions(
     };
 
     if (obj.get("temperature")) |temp| {
-        opts.temperature = @floatCast(temp.float);
+        opts.temperature = switch (temp) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
     }
     if (obj.get("max_tokens")) |max| {
         opts.max_tokens = @intCast(max.integer);
