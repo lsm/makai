@@ -411,17 +411,11 @@ test "sendStreamRequest creates valid envelope" {
 
     // Parse and verify the envelope
     var env = try envelope.deserializeEnvelope(written_data.?, allocator);
+    defer env.deinit(allocator);
 
     try std.testing.expect(env.payload == .stream_request);
     try std.testing.expectEqualStrings("gpt-4", env.payload.stream_request.model.id);
     try std.testing.expectEqualSlices(u8, &message_id, &env.message_id);
-
-    // Manually free the allocated model strings (StreamRequest.deinit is a no-op)
-    allocator.free(env.payload.stream_request.model.id);
-    allocator.free(env.payload.stream_request.model.name);
-    allocator.free(env.payload.stream_request.model.api);
-    allocator.free(env.payload.stream_request.model.provider);
-    allocator.free(env.payload.stream_request.model.base_url);
 }
 
 test "processEnvelope handles ack" {
