@@ -15,6 +15,7 @@ jobs:
       has_google: ${{ steps.check.outputs.has_google }}
       has_azure: ${{ steps.check.outputs.has_azure }}
       has_ollama: ${{ steps.check.outputs.has_ollama }}
+      has_github_copilot: ${{ steps.check.outputs.has_github_copilot }}
     steps:
       - name: Check which secrets are available
         id: check
@@ -26,12 +27,15 @@ jobs:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          GITHUB_COPILOT_KEY: ${{ secrets.GITHUB_COPILOT_KEY }}
+          GITHUB_COPILOT_TOKEN: ${{ secrets.GITHUB_COPILOT_TOKEN }}
         run: |
           echo "has_anthropic=$([[ -n \"$ANTHROPIC_API_KEY\" || -n \"$ANTHROPIC_AUTH_TOKEN\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_openai=$([[ -n \"$OPENAI_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_google=$([[ -n \"$GOOGLE_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_azure=$([[ -n \"$AZURE_OPENAI_API_KEY\" && -n \"$AZURE_OPENAI_ENDPOINT\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_ollama=$([[ -n \"$OLLAMA_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_github_copilot=$([[ -n \"$GITHUB_COPILOT_KEY\" && -n \"$GITHUB_COPILOT_TOKEN\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
     name: Unit Tests
@@ -197,7 +201,7 @@ jobs:
   e2e-protocol-fullstack:
     name: E2E - Protocol Fullstack
     needs: [unit-tests, check-secrets]
-    if: needs.check-secrets.outputs.has_ollama == 'true'
+    if: needs.check-secrets.outputs.has_ollama == 'true' || needs.check-secrets.outputs.has_github_copilot == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -216,3 +220,5 @@ jobs:
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_MODEL: ministral-3:3b
+          GITHUB_COPILOT_KEY: ${{ secrets.GITHUB_COPILOT_KEY }}
+          GITHUB_COPILOT_TOKEN: ${{ secrets.GITHUB_COPILOT_TOKEN }}

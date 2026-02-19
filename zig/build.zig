@@ -553,6 +553,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_client", .module = protocol_client_mod },
                 .{ .name = "envelope", .module = protocol_envelope_mod },
                 .{ .name = "transport", .module = transport_mod },
+                .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
     });
