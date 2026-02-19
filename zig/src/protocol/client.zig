@@ -65,6 +65,9 @@ pub const ProtocolClient = struct {
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
         const es = allocator.create(event_stream.AssistantMessageEventStream) catch unreachable;
         es.* = event_stream.AssistantMessageEventStream.init(allocator);
+        // ProtocolClient deep-copies events via cloneAssistantMessageEvent() before pushing,
+        // so the stream owns its events and must free them in deinit()
+        es.owns_events = true;
         return .{
             .allocator = allocator,
             .reconstructor = partial_reconstructor.PartialReconstructor.init(allocator),
