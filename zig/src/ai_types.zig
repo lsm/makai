@@ -211,7 +211,7 @@ pub const UserContent = union(enum) {
             .text => |t| allocator.free(t),
             .parts => |parts| {
                 // Cast to mutable since we're freeing owned memory
-                const mut_parts = @as([*]UserContentPart, @ptrFromInt(@intFromPtr(parts.ptr)))[0..parts.len];
+                const mut_parts: []UserContentPart = @constCast(parts);
                 for (mut_parts) |*part| {
                     part.deinit(allocator);
                 }
@@ -320,7 +320,7 @@ pub const ToolResultMessage = struct {
         allocator.free(self.tool_call_id);
         allocator.free(self.tool_name);
         // Cast to mutable since we're freeing owned memory
-        const mut_content = @as([*]UserContentPart, @ptrFromInt(@intFromPtr(self.content.ptr)))[0..self.content.len];
+        const mut_content: []UserContentPart = @constCast(self.content);
         for (mut_content) |*part| {
             part.deinit(allocator);
         }
@@ -378,7 +378,7 @@ pub const Context = struct {
         }
         // Free messages array and contents
         // Cast to mutable since we're freeing owned memory
-        const mut_messages = @as([*]Message, @ptrFromInt(@intFromPtr(self.messages.ptr)))[0..self.messages.len];
+        const mut_messages: []Message = @constCast(self.messages);
         for (mut_messages) |*msg| {
             msg.deinit(allocator);
         }
@@ -386,7 +386,7 @@ pub const Context = struct {
         // Free tools array and contents
         if (self.tools) |tools| {
             // Cast to mutable since we're freeing owned memory
-            const mut_tools = @as([*]Tool, @ptrFromInt(@intFromPtr(tools.ptr)))[0..tools.len];
+            const mut_tools: []Tool = @constCast(tools);
             for (mut_tools) |*tool| {
                 tool.deinit(allocator);
             }

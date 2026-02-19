@@ -775,9 +775,9 @@ fn parsePartialFromEvent(
 
         return .{
             .content = content,
-            .api = "",
-            .provider = "",
-            .model = "",
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
@@ -798,9 +798,9 @@ fn parsePartialFromEvent(
 
         return .{
             .content = content,
-            .api = "",
-            .provider = "",
-            .model = "",
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
@@ -825,9 +825,9 @@ fn parsePartialFromEvent(
 
         return .{
             .content = content,
-            .api = "",
-            .provider = "",
-            .model = "",
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
@@ -903,7 +903,7 @@ pub fn parseAssistantMessageEvent(
 
         return .{ .text_end = .{
             .content_index = content_index,
-            .content = "",
+            .content = try allocator.dupe(u8, ""),
             .partial = partial,
         } };
     }
@@ -949,7 +949,7 @@ pub fn parseAssistantMessageEvent(
 
         return .{ .thinking_end = .{
             .content_index = content_index,
-            .content = "",
+            .content = try allocator.dupe(u8, ""),
             .partial = partial,
         } };
     }
@@ -1115,33 +1115,50 @@ pub fn parseAssistantMessage(
 
     // Note: role field is optional and ignored (validated as "assistant" if present)
 
-    return .{
-        .content = content,
-        .stop_reason = parseStopReason(obj.get("stop_reason").?.string),
-        .model = try allocator.dupe(u8, obj.get("model").?.string),
-        .api = try allocator.dupe(u8, obj.get("api").?.string),
-        .provider = try allocator.dupe(u8, obj.get("provider").?.string),
-        .timestamp = obj.get("timestamp").?.integer,
-        .usage = usage,
-        .owned_strings = true,
-    };
+    // Build result with errdefer for each allocation to avoid leaks on OOM
+    var result: ai_types.AssistantMessage = undefined;
+    result.content = content;
+    errdefer {
+        for (result.content) |c| {
+            freeAssistantContent(c, allocator);
+        }
+        allocator.free(result.content);
+    }
+
+    result.stop_reason = parseStopReason(obj.get("stop_reason").?.string);
+
+    result.model = try allocator.dupe(u8, obj.get("model").?.string);
+    errdefer allocator.free(result.model);
+
+    result.api = try allocator.dupe(u8, obj.get("api").?.string);
+    errdefer allocator.free(result.api);
+
+    result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
+    // No errdefer needed - this is the last allocation
+
+    result.timestamp = obj.get("timestamp").?.integer;
+    result.usage = usage;
+    result.owned_strings = true;
+    result.error_message = null;
+
+    return result;
 }
 
 /// Free allocated strings in a single AssistantContent item
 fn freeAssistantContent(content: ai_types.AssistantContent, allocator: std.mem.Allocator) void {
     switch (content) {
         .text => |t| {
-            if (t.text.len > 0) allocator.free(t.text);
+            allocator.free(t.text);
             if (t.text_signature) |s| allocator.free(s);
         },
         .tool_call => |tc| {
             allocator.free(tc.id);
             allocator.free(tc.name);
-            if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
+            allocator.free(tc.arguments_json);
             if (tc.thought_signature) |s| allocator.free(s);
         },
         .thinking => |th| {
-            if (th.thinking.len > 0) allocator.free(th.thinking);
+            allocator.free(th.thinking);
             if (th.thinking_signature) |s| allocator.free(s);
         },
         .image => |img| {
