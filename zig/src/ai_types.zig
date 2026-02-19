@@ -107,10 +107,13 @@ pub const StreamOptions = struct {
     http_timeout_ms: ?u64 = 30_000,
     /// Ping interval in milliseconds for streaming keepalive
     ping_interval_ms: ?u64 = null,
+    /// True if strings were allocated (deserialized). When false, strings are borrowed.
+    owned_strings: bool = false,
 
-    /// Free all owned memory. Only call this if options were created via
-    /// deserialization (which dupes string fields).
+    /// Free all owned memory. Only call this if owned_strings = true.
     pub fn deinit(self: *StreamOptions, allocator: std.mem.Allocator) void {
+        if (!self.owned_strings) return; // Guard for borrowed strings
+
         if (self.api_key) |key| allocator.free(key);
         if (self.session_id) |sid| allocator.free(sid);
         if (self.thinking_effort) |effort| allocator.free(effort);

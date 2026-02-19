@@ -312,6 +312,7 @@ pub const ErrorCode = enum {
     invalid_sequence,
     duplicate_sequence,
     sequence_gap,
+    not_implemented,
 };
 
 /// Stream error payload
@@ -349,12 +350,13 @@ pub const SyncRequest = struct {
 
 /// Full partial state resync response
 pub const Sync = struct {
-    stream_id: Uuid,
-    sequence: u64,
-    partial: ?[]const u8 = null, // Serialized partial state
+    target_stream_id: Uuid, // renamed from stream_id per spec
+    partial: ?ai_types.AssistantMessage = null, // AssistantMessage object, not string
 
     pub fn deinit(self: *Sync, allocator: std.mem.Allocator) void {
-        if (self.partial) |p| allocator.free(p);
+        if (self.partial) |*p| {
+            p.deinit(allocator);
+        }
     }
 };
 
@@ -436,10 +438,11 @@ test "ErrorCode enum values match protocol spec" {
         .invalid_sequence,
         .duplicate_sequence,
         .sequence_gap,
+        .not_implemented,
     };
 
-    // Verify enum has exactly 11 values
-    try std.testing.expectEqual(@as(usize, 11), codes.len);
+    // Verify enum has exactly 12 values
+    try std.testing.expectEqual(@as(usize, 12), codes.len);
 
     // Verify each can be instantiated
     inline for (codes) |code| {
@@ -540,21 +543,29 @@ test "Goodbye deinit handles null reason" {
     // Should not crash
 }
 
-test "Sync deinit frees partial" {
-    const partial = try std.testing.allocator.dupe(u8, "{\"partial\": \"state\"}");
+test "Sync deinit handles partial" {
+    // Create a partial with empty content (no strings to free)
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .owned_strings = false,
+    };
     var sync = Sync{
-        .stream_id = generateUuid(),
-        .sequence = 5,
+        .target_stream_id = generateUuid(),
         .partial = partial,
     };
     sync.deinit(std.testing.allocator);
-    // Should not leak
+    // Should not leak or crash
 }
 
 test "Sync deinit handles null partial" {
     var sync = Sync{
-        .stream_id = generateUuid(),
-        .sequence = 5,
+        .target_stream_id = generateUuid(),
         .partial = null,
     };
     sync.deinit(std.testing.allocator);

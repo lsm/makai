@@ -160,7 +160,12 @@ pub const ProtocolServer = struct {
             .sync_request => {
                 // Handle sync request - for now, return not implemented
                 // TODO: Implement full state sync
-                return null;
+                return try envelope.createNack(
+                    env,
+                    "Sync not yet implemented",
+                    protocol_types.ErrorCode.not_implemented,
+                    self.allocator,
+                );
             },
             .sync => {
                 // Handle sync response - for now, ignore
@@ -220,6 +225,22 @@ pub const ProtocolServer = struct {
 
 /// Handle stream_request - create stream, return ack with stream_id
 fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+    // Reject duplicate stream_id
+    if (server.active_streams.contains(stream_id)) {
+        return try envelope.createNack(
+            .{
+                .stream_id = stream_id,
+                .message_id = in_reply_to,
+                .sequence = 0,
+                .timestamp = std.time.milliTimestamp(),
+                .payload = .ping,
+            },
+            "Stream ID already in use",
+            .stream_already_exists,
+            server.allocator,
+        );
+    }
+
     // Check max streams limit
     if (server.active_streams.count() >= server.options.max_streams) {
         return try envelope.createNack(
@@ -284,8 +305,8 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Store in active_streams
     try server.active_streams.put(stream_id, active_stream);
 
-    // Initialize sequence counter (outgoing)
-    try server.sequence_counters.put(stream_id, 0);
+    // Initialize sequence counter to 1 since we're about to return sequence 1 in ACK
+    try server.sequence_counters.put(stream_id, 1);
 
     // Initialize expected sequence for incoming messages (starts at 1)
     // The first message for a new stream should have sequence 1

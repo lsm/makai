@@ -88,12 +88,12 @@ fn serializePayload(
             try w.writeStringField("target_stream_id", target_str);
         },
         .sync => |sync_msg| {
-            const stream_str = try protocol_types.uuidToString(sync_msg.stream_id, allocator);
-            defer allocator.free(stream_str);
-            try w.writeStringField("stream_id", stream_str);
-            try w.writeIntField("sequence", sync_msg.sequence);
+            const target_str = try protocol_types.uuidToString(sync_msg.target_stream_id, allocator);
+            defer allocator.free(target_str);
+            try w.writeStringField("target_stream_id", target_str);
             if (sync_msg.partial) |partial| {
-                try w.writeStringField("partial", partial);
+                try w.writeKey("partial");
+                try serializeResultPayload(w, partial, allocator);
             }
         },
         .stream_request => |req| {
@@ -425,7 +425,7 @@ fn serializeStreamOptions(
     try w.endObject();
 }
 
-/// Serialize event payload
+/// Serialize event payload (without "type" field - type is at envelope top level)
 fn serializeEventPayload(
     w: *json_writer.JsonWriter,
     event: ai_types.AssistantMessageEvent,
@@ -435,13 +435,15 @@ fn serializeEventPayload(
     const event_json = try transport.serializeEvent(event, allocator);
     defer allocator.free(event_json);
 
-    // Parse the event JSON and copy fields
+    // Parse the event JSON and copy fields (excluding "type" which is at top level)
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, event_json, .{});
     defer parsed.deinit();
 
     const obj = parsed.value.object;
     var iter = obj.iterator();
     while (iter.next()) |entry| {
+        // Skip "type" field - it's already at the envelope top level per PROTOCOL.md
+        if (std.mem.eql(u8, entry.key_ptr.*, "type")) continue;
         try w.writeKey(entry.key_ptr.*);
         try writeJsonValue(w, entry.value_ptr.*, allocator);
     }
@@ -870,19 +872,16 @@ fn deserializeSync(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Sync {
-    const stream_str = obj.get("stream_id").?.string;
-    const stream_id = protocol_types.parseUuid(stream_str) orelse return error.InvalidUuid;
-
-    const sequence: u64 = @intCast(obj.get("sequence").?.integer);
+    const target_str = obj.get("target_stream_id").?.string;
+    const target_stream_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
 
     const partial = if (obj.get("partial")) |p|
-        try allocator.dupe(u8, p.string)
+        try transport.parseAssistantMessage(p.object, allocator)
     else
         null;
 
     return .{
-        .stream_id = stream_id,
-        .sequence = sequence,
+        .target_stream_id = target_stream_id,
         .partial = partial,
     };
 }
@@ -1069,7 +1068,9 @@ fn deserializeStreamOptions(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.StreamOptions {
-    var opts: ai_types.StreamOptions = .{};
+    var opts: ai_types.StreamOptions = .{
+        .owned_strings = true, // Mark as owned since we dupe string fields
+    };
 
     if (obj.get("temperature")) |temp| {
         opts.temperature = @floatCast(temp.float);
@@ -1844,15 +1845,24 @@ test "serializeEnvelope with sync_request payload" {
 test "serializeEnvelope with sync payload" {
     const allocator = std.testing.allocator;
 
-    const partial = try allocator.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}");
+    // Create a partial with empty content (no strings to free)
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .owned_strings = false,
+    };
     var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),
         .message_id = protocol_types.generateUuid(),
         .sequence = 60,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .sync = .{
-            .stream_id = protocol_types.generateUuid(),
-            .sequence = 42,
+            .target_stream_id = protocol_types.generateUuid(),
             .partial = partial,
         } },
     };
@@ -1861,7 +1871,7 @@ test "serializeEnvelope with sync payload" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"sync\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"sequence\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"target_stream_id\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"partial\"") != null);
 
     envelope.deinit(allocator);
@@ -1970,9 +1980,15 @@ test "deserializeEnvelope with sync payload" {
         \\  "sequence": 60,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "stream_id": "abcdef01-2345-6789-abcd-ef0123456789",
-        \\    "sequence": 42,
-        \\    "partial": "{\"test\": \"data\"}"
+        \\    "target_stream_id": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\    "partial": {
+        \\      "stop_reason": "stop",
+        \\      "model": "test-model",
+        \\      "api": "test-api",
+        \\      "provider": "test-provider",
+        \\      "timestamp": 0,
+        \\      "content": [{"type": "text", "text": "Hello"}]
+        \\    }
         \\  }
         \\}
     ;
@@ -1981,8 +1997,9 @@ test "deserializeEnvelope with sync payload" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.payload == .sync);
-    try std.testing.expect(envelope.payload.sync.sequence == 42);
-    try std.testing.expectEqualStrings("{\"test\": \"data\"}", envelope.payload.sync.partial.?);
+    const expected_target: protocol_types.Uuid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
+    try std.testing.expectEqualSlices(u8, &expected_target, &envelope.payload.sync.target_stream_id);
+    try std.testing.expect(envelope.payload.sync.partial != null);
 }
 
 test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
