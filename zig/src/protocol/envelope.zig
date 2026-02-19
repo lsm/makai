@@ -1,5 +1,5 @@
 const std = @import("std");
-const protocol_types = @import("types.zig");
+pub const protocol_types = @import("protocol_types");
 const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
 const transport = @import("transport");

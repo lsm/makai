@@ -337,6 +337,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "transport", .module = transport_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
         },
     });
 
@@ -362,6 +363,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "content_partial", .module = content_partial_mod },
             .{ .name = "transport", .module = transport_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
         },
     });
 
@@ -376,6 +379,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "streaming_json", .module = streaming_json_mod },
             .{ .name = "content_partial", .module = content_partial_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
         },
     });
 
@@ -533,6 +538,10 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
                 .{ .name = "test_helpers", .module = test_helpers_mod },
+                .{ .name = "protocol_server", .module = protocol_server_mod },
+                .{ .name = "protocol_client", .module = protocol_client_mod },
+                .{ .name = "envelope", .module = protocol_envelope_mod },
+                .{ .name = "transport", .module = transport_mod },
             },
         }),
     });

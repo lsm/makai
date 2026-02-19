@@ -1,6 +1,6 @@
 const std = @import("std");
-const protocol_types = @import("types.zig");
-const envelope = @import("envelope.zig");
+const protocol_types = @import("protocol_types");
+const envelope = @import("protocol_envelope");
 const partial_serializer = @import("partial_serializer.zig");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
@@ -203,6 +203,36 @@ pub const ProtocolServer = struct {
     /// Get active stream count
     pub fn activeStreamCount(self: *ProtocolServer) usize {
         return self.active_streams.count();
+    }
+
+    /// Public access to active streams for event polling
+    pub const ActiveStreamIterator = struct {
+        iter: std.AutoHashMap(protocol_types.Uuid, ActiveStream).Iterator,
+
+        pub fn next(self: *ActiveStreamIterator) ?struct {
+            stream_id: protocol_types.Uuid,
+            stream: *ActiveStream,
+        } {
+            if (self.iter.next()) |entry| {
+                return .{
+                    .stream_id = entry.key_ptr.*,
+                    .stream = entry.value_ptr,
+                };
+            }
+            return null;
+        }
+    };
+
+    /// Get iterator over active streams
+    pub fn activeStreamIterator(self: *ProtocolServer) ActiveStreamIterator {
+        return .{
+            .iter = self.active_streams.iterator(),
+        };
+    }
+
+    /// Get next sequence number for a stream (public for event forwarding)
+    pub fn getNextSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid) u64 {
+        return self.nextSequence(stream_id);
     }
 
     /// Get next sequence number for a stream
