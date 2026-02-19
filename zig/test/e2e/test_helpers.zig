@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types");
+const ai_types = @import("ai_types");
 const retry = @import("retry");
 
 /// Default E2E test timeout (60 seconds)
@@ -179,7 +179,8 @@ pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
 /// Print a skip message for Ollama tests
 pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     // Check for OLLAMA_API_KEY environment variable
-    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |_| {
+    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |key| {
+        allocator.free(key);
         return; // Has API key, don't skip
     } else |_| {}
     std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'ollama' - OLLAMA_API_KEY not set\n", .{});
@@ -749,19 +750,20 @@ pub fn getFreshGitHubCopilotCredentials(allocator: std.mem.Allocator) !?FreshGit
     };
 }
 
-/// Free allocated strings in a MessageEvent
-pub fn freeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) void {
+/// Free allocated strings in an AssistantMessageEvent
+pub fn freeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
     switch (event) {
-        .start => |s| allocator.free(s.model),
         .text_delta => |d| allocator.free(d.delta),
         .thinking_delta => |d| allocator.free(d.delta),
-        .toolcall_start => |tc| {
-            allocator.free(tc.id);
-            allocator.free(tc.name);
-        },
         .toolcall_delta => |d| allocator.free(d.delta),
-        .toolcall_end => |e| allocator.free(e.input_json),
-        .@"error" => |e| allocator.free(e.message),
+        .toolcall_end => |e| {
+            allocator.free(e.tool_call.id);
+            allocator.free(e.tool_call.name);
+            allocator.free(e.tool_call.arguments_json);
+            if (e.tool_call.thought_signature) |sig| {
+                allocator.free(sig);
+            }
+        },
         else => {},
     }
 }
@@ -778,7 +780,7 @@ pub const EventAccumulator = struct {
     pub const ToolCall = struct {
         id: []const u8,
         name: []const u8,
-        input_json: []const u8,
+        arguments_json: []const u8,
     };
 
     pub fn init(allocator: std.mem.Allocator) EventAccumulator {
@@ -796,7 +798,7 @@ pub const EventAccumulator = struct {
         for (self.tool_calls.items) |tc| {
             self.allocator.free(tc.id);
             self.allocator.free(tc.name);
-            self.allocator.free(tc.input_json);
+            self.allocator.free(tc.arguments_json);
         }
         self.tool_calls.deinit(self.allocator);
         if (self.last_model) |m| {
@@ -804,7 +806,7 @@ pub const EventAccumulator = struct {
         }
     }
 
-    pub fn processEvent(self: *EventAccumulator, event: types.MessageEvent) !void {
+    pub fn processEvent(self: *EventAccumulator, event: ai_types.AssistantMessageEvent) !void {
         self.events_seen += 1;
 
         switch (event) {
@@ -812,7 +814,7 @@ pub const EventAccumulator = struct {
                 if (self.last_model) |m| {
                     self.allocator.free(m);
                 }
-                self.last_model = try self.allocator.dupe(u8, s.model);
+                self.last_model = try self.allocator.dupe(u8, s.partial.model);
             },
             .text_delta => |delta| {
                 try self.text_buffer.appendSlice(self.allocator, delta.delta);
@@ -820,20 +822,13 @@ pub const EventAccumulator = struct {
             .thinking_delta => |delta| {
                 try self.thinking_buffer.appendSlice(self.allocator, delta.delta);
             },
-            .toolcall_start => |tc| {
+            .toolcall_end => |tc| {
                 const tool_call = ToolCall{
-                    .id = try self.allocator.dupe(u8, tc.id),
-                    .name = try self.allocator.dupe(u8, tc.name),
-                    .input_json = &[_]u8{},
+                    .id = try self.allocator.dupe(u8, tc.tool_call.id),
+                    .name = try self.allocator.dupe(u8, tc.tool_call.name),
+                    .arguments_json = try self.allocator.dupe(u8, tc.tool_call.arguments_json),
                 };
                 try self.tool_calls.append(self.allocator, tool_call);
-            },
-            .toolcall_end => |tc| {
-                if (self.tool_calls.items.len > 0) {
-                    const last_idx = self.tool_calls.items.len - 1;
-                    self.allocator.free(self.tool_calls.items[last_idx].input_json);
-                    self.tool_calls.items[last_idx].input_json = try self.allocator.dupe(u8, tc.input_json);
-                }
             },
             else => {},
         }
@@ -880,7 +875,7 @@ pub fn basicTextGeneration(
     try std.testing.expect(accumulator.events_seen > 0);
     try std.testing.expect(accumulator.text_buffer.items.len >= expected_min_text_length);
     try std.testing.expect(result.content.len > 0);
-    try std.testing.expect(result.usage.output_tokens > 0);
+    try std.testing.expect(result.usage.output > 0);
 }
 
 // Unit tests
@@ -896,9 +891,16 @@ test "EventAccumulator process start event" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
-    const model_str = try std.testing.allocator.dupe(u8, "test-model");
-    const event = types.MessageEvent{ .start = .{ .model = model_str } };
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{ .start = .{ .partial = partial } };
     try accumulator.processEvent(event);
 
     try std.testing.expectEqual(@as(usize, 1), accumulator.events_seen);
@@ -909,12 +911,21 @@ test "EventAccumulator process text delta" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
     const delta1 = try std.testing.allocator.dupe(u8, "Hello");
     const delta2 = try std.testing.allocator.dupe(u8, " world");
 
-    const event1 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = delta1 } };
-    const event2 = types.MessageEvent{ .text_delta = .{ .index = 0, .delta = delta2 } };
+    const event1 = ai_types.AssistantMessageEvent{ .text_delta = .{ .content_index = 0, .delta = delta1, .partial = partial } };
+    const event2 = ai_types.AssistantMessageEvent{ .text_delta = .{ .content_index = 0, .delta = delta2, .partial = partial } };
 
     try accumulator.processEvent(event1);
     try accumulator.processEvent(event2);
@@ -927,9 +938,18 @@ test "EventAccumulator process thinking delta" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
     const delta = try std.testing.allocator.dupe(u8, "reasoning...");
-    const event = types.MessageEvent{ .thinking_delta = .{ .index = 0, .delta = delta } };
+    const event = ai_types.AssistantMessageEvent{ .thinking_delta = .{ .content_index = 0, .delta = delta, .partial = partial } };
     try accumulator.processEvent(event);
 
     try std.testing.expectEqualStrings("reasoning...", accumulator.thinking_buffer.items);
@@ -939,19 +959,34 @@ test "EventAccumulator process tool call" {
     var accumulator = EventAccumulator.init(std.testing.allocator);
     defer accumulator.deinit();
 
-    // Events MUST have heap-allocated strings because processEvent() calls freeEvent()
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
     const id = try std.testing.allocator.dupe(u8, "call_1");
     const name = try std.testing.allocator.dupe(u8, "test_tool");
-    const input_json = try std.testing.allocator.dupe(u8, "{\"arg\":\"value\"}");
+    const arguments_json = try std.testing.allocator.dupe(u8, "{\"arg\":\"value\"}");
 
-    const start_event = types.MessageEvent{ .toolcall_start = .{ .index = 0, .id = id, .name = name } };
-    const end_event = types.MessageEvent{ .toolcall_end = .{ .index = 0, .input_json = input_json } };
+    const end_event = ai_types.AssistantMessageEvent{ .toolcall_end = .{
+        .content_index = 0,
+        .tool_call = .{
+            .id = id,
+            .name = name,
+            .arguments_json = arguments_json,
+        },
+        .partial = partial,
+    } };
 
-    try accumulator.processEvent(start_event);
     try accumulator.processEvent(end_event);
 
     try std.testing.expectEqual(@as(usize, 1), accumulator.tool_calls.items.len);
     try std.testing.expectEqualStrings("call_1", accumulator.tool_calls.items[0].id);
     try std.testing.expectEqualStrings("test_tool", accumulator.tool_calls.items[0].name);
-    try std.testing.expectEqualStrings("{\"arg\":\"value\"}", accumulator.tool_calls.items[0].input_json);
+    try std.testing.expectEqualStrings("{\"arg\":\"value\"}", accumulator.tool_calls.items[0].arguments_json);
 }

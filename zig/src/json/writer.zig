@@ -113,7 +113,9 @@ pub const JsonWriter = struct {
     // Helper for string escaping
     fn writeEscapedString(self: *JsonWriter, s: []const u8) !void {
         try self.buffer.append(self.allocator, '"');
-        for (s) |c| {
+        var i: usize = 0;
+        while (i < s.len) {
+            const c = s[i];
             switch (c) {
                 '"' => try self.buffer.appendSlice(self.allocator, "\\\""),
                 '\\' => try self.buffer.appendSlice(self.allocator, "\\\\"),
@@ -121,12 +123,19 @@ pub const JsonWriter = struct {
                 '\r' => try self.buffer.appendSlice(self.allocator, "\\r"),
                 '\t' => try self.buffer.appendSlice(self.allocator, "\\t"),
                 0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
-                    // Other control characters (excluding \n=0x0A, \r=0x0D, \t=0x09)
+                    // Other control characters
+                    const writer = self.buffer.writer(self.allocator);
+                    try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+                },
+                0x80...0xFF => {
+                    // Non-ASCII bytes - escape as \uXXXX to ensure valid JSON
+                    // This handles potentially invalid UTF-8 sequences
                     const writer = self.buffer.writer(self.allocator);
                     try std.fmt.format(writer, "\\u{x:0>4}", .{c});
                 },
                 else => try self.buffer.append(self.allocator, c),
             }
+            i += 1;
         }
         try self.buffer.append(self.allocator, '"');
     }

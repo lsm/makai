@@ -1,4 +1,6 @@
+const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const std = @import("std");
 
@@ -9,7 +11,7 @@ pub fn streamBedrockConverseStream(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = model;
     _ = context;
     _ = options;
@@ -22,7 +24,7 @@ pub fn streamSimpleBedrockConverseStream(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = model;
     _ = context;
     _ = options;

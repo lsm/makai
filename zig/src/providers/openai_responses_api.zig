@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
@@ -547,7 +548,7 @@ const ToolCallState = struct {
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     api_key: []u8,
     body: []u8,
@@ -916,7 +917,7 @@ fn runThread(ctx: *ThreadCtx) void {
         if (ping_interval > 0) {
             const now = std.time.milliTimestamp();
             if (now - last_ping_time >= ping_interval) {
-                stream.push(.{ .ping = {} }) catch {};
+                stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
             }
         }
@@ -1093,6 +1094,8 @@ fn runThread(ctx: *ThreadCtx) void {
                         _ = stream.push(.{
                             .toolcall_start = .{
                                 .content_index = content_index,
+                                .id = compound_id,
+                                .name = name,
                                 .partial = .{
                                     .content = &.{},
                                     .api = model.api,
@@ -1368,7 +1371,7 @@ fn runThread(ctx: *ThreadCtx) void {
     stream.complete(out);
 }
 
-pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
+pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
@@ -1382,9 +1385,9 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     const body = try buildRequestBody(model, context, o, allocator);
     errdefer allocator.free(body);
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -1418,7 +1421,7 @@ fn thinkingLevelToString(level: ai_types.ThinkingLevel) []const u8 {
     };
 }
 
-pub fn streamSimpleOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*ai_types.AssistantMessageEventStream {
+pub fn streamSimpleOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.SimpleStreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
     return streamOpenAIResponses(model, context, .{
         .temperature = o.temperature,

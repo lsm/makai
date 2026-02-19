@@ -1,15 +1,61 @@
 const std = @import("std");
-const types = @import("types");
+const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const json_writer = @import("json_writer");
 
+// --- Async byte stream types ---
+
+/// A chunk of bytes with ownership semantics
+pub const ByteChunk = struct {
+    data: []const u8,
+    /// If true, caller owns the data and must free it
+    owned: bool = true,
+
+    pub fn deinit(self: *ByteChunk, allocator: std.mem.Allocator) void {
+        if (self.owned and self.data.len > 0) {
+            allocator.free(self.data);
+        }
+    }
+};
+
+/// Stream of byte chunks with void result
+pub const ByteStream = event_stream.EventStream(ByteChunk, void);
+
 // --- Wire message type ---
 
-pub const MessageOrControl = union(enum) {
-    event: types.MessageEvent,
-    result: types.AssistantMessage,
-    stream_error: []const u8,
+/// Control messages as defined in PROTOCOL.md Section 3.2
+pub const ControlMessage = union(enum) {
+    ack: struct {
+        acknowledged_id: []const u8,
+    },
+    nack: struct {
+        rejected_id: []const u8,
+        reason: []const u8,
+        error_code: ?[]const u8 = null,
+    },
+    ping: void,
+    pong: void,
+    goodbye: ?[]const u8, // optional reason
+    sync_request: void,
+    sync: struct {
+        stream_id: []const u8,
+        sequence: u64,
+        partial: ?[]const u8, // JSON snapshot
+    },
 };
+
+pub const MessageOrControl = union(enum) {
+    event: ai_types.AssistantMessageEvent,
+    result: ai_types.AssistantMessage,
+    stream_error: []const u8,
+    control: ControlMessage,
+};
+
+/// Callback type for handling control messages
+/// The callback receives the control message and an optional context pointer.
+/// IMPORTANT: The callback must copy any strings it needs from the control message
+/// before returning, as the strings will be freed after the callback returns.
+pub const ControlMessageCallback = *const fn (ctrl: ControlMessage, ctx: ?*anyopaque) void;
 
 // --- Transport interfaces ---
 
@@ -37,11 +83,74 @@ pub const Receiver = struct {
     read_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8,
     close_fn: ?*const fn (ctx: *anyopaque) void = null,
 
+    /// Optional callback for handling control messages
+    control_callback: ?ControlMessageCallback = null,
+    control_callback_ctx: ?*anyopaque = null,
+
     pub fn read(self: *const Receiver, allocator: std.mem.Allocator) !?[]const u8 {
         return self.read_fn(self.context, allocator);
     }
 
     pub fn close(self: *const Receiver) void {
+        if (self.close_fn) |f| f(self.context);
+    }
+
+    /// Set a callback to be invoked when control messages are received.
+    /// The callback receives the control message and the provided context.
+    pub fn setControlCallback(self: *Receiver, callback: ControlMessageCallback, ctx: ?*anyopaque) void {
+        self.control_callback = callback;
+        self.control_callback_ctx = ctx;
+    }
+};
+
+// --- Async transport interfaces ---
+
+pub const AsyncSender = struct {
+    context: *anyopaque,
+    write_fn: *const fn (ctx: *anyopaque, data: []const u8) anyerror!void,
+    flush_fn: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    close_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    pub fn write(self: *const AsyncSender, data: []const u8) !void {
+        return self.write_fn(self.context, data);
+    }
+
+    pub fn flush(self: *const AsyncSender) !void {
+        if (self.flush_fn) |f| return f(self.context);
+    }
+
+    pub fn close(self: *const AsyncSender) void {
+        if (self.close_fn) |f| f(self.context);
+    }
+};
+
+pub const AsyncReceiver = struct {
+    context: *anyopaque,
+
+    /// Create a new byte stream for receiving data
+    receive_stream_fn: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) anyerror!*ByteStream,
+
+    /// Optional: synchronous read for backward compatibility
+    read_fn: ?*const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) anyerror!?[]const u8 = null,
+
+    close_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    pub fn receiveStream(self: *AsyncReceiver, allocator: std.mem.Allocator) !*ByteStream {
+        return self.receive_stream_fn(self.context, allocator);
+    }
+
+    pub fn read(self: *AsyncReceiver, allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.read_fn) |rf| return rf(self.context, allocator);
+        return error.AsyncOnly;
+    }
+
+    pub fn close(self: *AsyncReceiver) void {
         if (self.close_fn) |f| f(self.context);
     }
 };
@@ -74,6 +183,7 @@ pub fn forwardStream(
 }
 
 /// Receive from a Receiver and push into a local stream. Blocks until done.
+/// If receiver.control_callback is set, it will be invoked for control messages.
 pub fn receiveStream(
     receiver: *const Receiver,
     stream: *event_stream.AssistantMessageStream,
@@ -92,14 +202,272 @@ pub fn receiveStream(
                 stream.completeWithError(e);
                 return;
             },
+            .control => |ctrl| {
+                // Invoke callback if set, then free strings
+                if (receiver.control_callback) |cb| {
+                    cb(ctrl, receiver.control_callback_ctx);
+                }
+                freeControlStrings(ctrl, allocator);
+            },
         }
     }
     stream.completeWithError("Transport closed unexpectedly");
 }
 
+// --- Async stream bridge functions ---
+
+/// Free all strings owned by an event.
+///
+/// Memory Ownership Model:
+/// - Events own their strings. When an event is created, any string fields
+///   (delta, content, etc.) are deep copies allocated by the caller.
+/// - The `partial` field in streaming events contains a snapshot of the
+///   accumulated message state. If `partial.owned_strings` is true, the
+///   partial owns its content and must be freed.
+/// - Call this function when done with an event to prevent memory leaks.
+fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
+    switch (ev) {
+        .start => |e| {
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .text_start => |e| {
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .text_delta => |e| {
+            allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .text_end => |e| {
+            allocator.free(e.content);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .thinking_start => |e| {
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .thinking_delta => |e| {
+            allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .thinking_end => |e| {
+            allocator.free(e.content);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .toolcall_start => |e| {
+            if (e.id.len > 0) allocator.free(e.id);
+            if (e.name.len > 0) allocator.free(e.name);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .toolcall_delta => |e| {
+            allocator.free(e.delta);
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .toolcall_end => |e| {
+            if (e.tool_call.id.len > 0) allocator.free(e.tool_call.id);
+            if (e.tool_call.name.len > 0) allocator.free(e.tool_call.name);
+            if (e.tool_call.arguments_json.len > 0) allocator.free(e.tool_call.arguments_json);
+            if (e.tool_call.thought_signature) |sig| {
+                allocator.free(sig);
+            }
+            if (e.partial.owned_strings) {
+                var mutable = e.partial;
+                mutable.deinit(allocator);
+            }
+        },
+        .done => |e| {
+            var mutable = e.message;
+            mutable.deinit(allocator);
+        },
+        .@"error" => |e| {
+            var mutable = e.err;
+            mutable.deinit(allocator);
+        },
+        .keepalive => {},
+    }
+}
+
+/// Free allocated strings in a control message
+fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
+    switch (ctrl) {
+        .ack => |a| allocator.free(a.acknowledged_id),
+        .nack => |n| {
+            allocator.free(n.rejected_id);
+            allocator.free(n.reason);
+            if (n.error_code) |ec| allocator.free(ec);
+        },
+        .goodbye => |g| if (g) |reason| allocator.free(reason),
+        .sync => |s| {
+            allocator.free(s.stream_id);
+            if (s.partial) |p| allocator.free(p);
+        },
+        .ping, .pong, .sync_request => {},
+    }
+}
+
+/// Free allocated strings in a MessageOrControl
+fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
+    switch (msg) {
+        .event => |ev| freeEventStrings(ev, allocator),
+        .result => |r| {
+            var mutable = r;
+            mutable.deinit(allocator);
+        },
+        .stream_error => |e| allocator.free(e),
+        .control => |ctrl| freeControlStrings(ctrl, allocator),
+    }
+}
+
+/// Receive from a ByteStream and push into an AssistantMessageStream
+/// Control messages are discarded. Use receiveStreamFromByteStreamWithControl for control message handling.
+pub fn receiveStreamFromByteStream(
+    byte_stream: *ByteStream,
+    msg_stream: *event_stream.AssistantMessageStream,
+    allocator: std.mem.Allocator,
+) void {
+    receiveStreamFromByteStreamWithControl(byte_stream, msg_stream, null, null, allocator);
+}
+
+/// Receive from a ByteStream and push into an AssistantMessageStream with control message callback.
+/// If control_callback is provided, it will be invoked for control messages before they are freed.
+pub fn receiveStreamFromByteStreamWithControl(
+    byte_stream: *ByteStream,
+    msg_stream: *event_stream.AssistantMessageStream,
+    control_callback: ?ControlMessageCallback,
+    control_callback_ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+) void {
+    defer byte_stream.complete({});
+
+    while (byte_stream.wait()) |chunk| {
+        defer {
+            var mutable_chunk = chunk;
+            mutable_chunk.deinit(allocator);
+        }
+
+        const msg = deserialize(chunk.data, allocator) catch {
+            msg_stream.completeWithError("Deserialization error");
+            return;
+        };
+
+        switch (msg) {
+            .event => |ev| {
+                msg_stream.push(ev) catch {
+                    msg_stream.completeWithError("Stream queue full");
+                    freeEventStrings(ev, allocator);
+                    return;
+                };
+            },
+            .result => |r| {
+                msg_stream.complete(r);
+                return;
+            },
+            .stream_error => |e| {
+                const err_copy = allocator.dupe(u8, e) catch e;
+                msg_stream.completeWithError(err_copy);
+                allocator.free(e);
+                return;
+            },
+            .control => |ctrl| {
+                // Invoke callback if set, then free strings
+                if (control_callback) |cb| {
+                    cb(ctrl, control_callback_ctx);
+                }
+                freeControlStrings(ctrl, allocator);
+            },
+        }
+    }
+
+    if (byte_stream.getError()) |err| {
+        msg_stream.completeWithError(err);
+    } else {
+        msg_stream.completeWithError("Transport closed unexpectedly");
+    }
+}
+
+/// Context for spawnReceiver thread
+const ReceiverThreadContext = struct {
+    byte_stream: *ByteStream,
+    msg_stream: *event_stream.AssistantMessageStream,
+    allocator: std.mem.Allocator,
+    control_callback: ?ControlMessageCallback = null,
+    control_callback_ctx: ?*anyopaque = null,
+
+    fn run(ctx: *@This()) void {
+        defer ctx.allocator.destroy(ctx);
+        receiveStreamFromByteStreamWithControl(
+            ctx.byte_stream,
+            ctx.msg_stream,
+            ctx.control_callback,
+            ctx.control_callback_ctx,
+            ctx.allocator,
+        );
+        ctx.byte_stream.deinit();
+        ctx.allocator.destroy(ctx.byte_stream);
+    }
+};
+
+/// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream
+/// Control messages are discarded. Use spawnReceiverWithControl for control message handling.
+pub fn spawnReceiver(
+    receiver: *const AsyncReceiver,
+    msg_stream: *event_stream.AssistantMessageStream,
+    allocator: std.mem.Allocator,
+) !std.Thread {
+    return spawnReceiverWithControl(receiver, msg_stream, null, null, allocator);
+}
+
+/// Spawn a receiver thread that bridges AsyncReceiver -> AssistantMessageStream with control callback.
+/// If control_callback is provided, it will be invoked for control messages.
+pub fn spawnReceiverWithControl(
+    receiver: *const AsyncReceiver,
+    msg_stream: *event_stream.AssistantMessageStream,
+    control_callback: ?ControlMessageCallback,
+    control_callback_ctx: ?*anyopaque,
+    allocator: std.mem.Allocator,
+) !std.Thread {
+    const byte_stream = try receiver.receiveStream(allocator);
+
+    const ctx = try allocator.create(ReceiverThreadContext);
+    ctx.* = .{
+        .byte_stream = byte_stream,
+        .msg_stream = msg_stream,
+        .allocator = allocator,
+        .control_callback = control_callback,
+        .control_callback_ctx = control_callback_ctx,
+    };
+
+    return std.Thread.spawn(.{}, ReceiverThreadContext.run, .{ctx});
+}
+
 // --- Serialization ---
 
-pub fn serializeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) ![]u8 {
+pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) ![]u8 {
     var buffer = std.ArrayList(u8){};
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
@@ -109,64 +477,102 @@ pub fn serializeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) !
     switch (event) {
         .start => |s| {
             try w.writeStringField("type", "start");
-            try w.writeStringField("model", s.model);
+            try w.writeStringField("model", s.partial.model);
         },
         .text_start => |e| {
             try w.writeStringField("type", "text_start");
-            try w.writeIntField("index", e.index);
+            try w.writeIntField("content_index", e.content_index);
         },
         .text_delta => |d| {
             try w.writeStringField("type", "text_delta");
-            try w.writeIntField("index", d.index);
+            try w.writeIntField("content_index", d.content_index);
             try w.writeStringField("delta", d.delta);
         },
         .text_end => |e| {
             try w.writeStringField("type", "text_end");
-            try w.writeIntField("index", e.index);
+            try w.writeIntField("content_index", e.content_index);
         },
         .thinking_start => |e| {
             try w.writeStringField("type", "thinking_start");
-            try w.writeIntField("index", e.index);
+            try w.writeIntField("content_index", e.content_index);
         },
         .thinking_delta => |d| {
             try w.writeStringField("type", "thinking_delta");
-            try w.writeIntField("index", d.index);
+            try w.writeIntField("content_index", d.content_index);
             try w.writeStringField("delta", d.delta);
         },
         .thinking_end => |e| {
             try w.writeStringField("type", "thinking_end");
-            try w.writeIntField("index", e.index);
+            try w.writeIntField("content_index", e.content_index);
         },
-        .toolcall_start => |tc| {
+        .toolcall_start => |e| {
             try w.writeStringField("type", "toolcall_start");
-            try w.writeIntField("index", tc.index);
-            try w.writeStringField("id", tc.id);
-            try w.writeStringField("name", tc.name);
+            try w.writeIntField("content_index", e.content_index);
+            try w.writeStringField("id", e.id);
+            try w.writeStringField("name", e.name);
         },
         .toolcall_delta => |d| {
             try w.writeStringField("type", "toolcall_delta");
-            try w.writeIntField("index", d.index);
+            try w.writeIntField("content_index", d.content_index);
             try w.writeStringField("delta", d.delta);
         },
         .toolcall_end => |e| {
             try w.writeStringField("type", "toolcall_end");
-            try w.writeIntField("index", e.index);
-            try w.writeStringField("input_json", e.input_json);
+            try w.writeIntField("content_index", e.content_index);
+            try w.writeStringField("id", e.tool_call.id);
+            try w.writeStringField("name", e.tool_call.name);
+            try w.writeStringField("arguments_json", e.tool_call.arguments_json);
+            if (e.tool_call.thought_signature) |sig| {
+                try w.writeStringField("thought_signature", sig);
+            }
         },
         .done => |d| {
             try w.writeStringField("type", "done");
-            try w.writeStringField("stop_reason", @tagName(d.stop_reason));
-            try w.writeIntField("input_tokens", d.usage.input_tokens);
-            try w.writeIntField("output_tokens", d.usage.output_tokens);
-            try w.writeIntField("cache_read_tokens", d.usage.cache_read_tokens);
-            try w.writeIntField("cache_write_tokens", d.usage.cache_write_tokens);
+            try w.writeStringField("reason", @tagName(d.reason));
+
+            // Nest message fields under "message" key
+            try w.writeKey("message");
+            try w.beginObject();
+            try w.writeStringField("role", "assistant");
+            try w.writeStringField("stop_reason", @tagName(d.message.stop_reason));
+            try w.writeStringField("model", d.message.model);
+            try w.writeStringField("api", d.message.api);
+            try w.writeStringField("provider", d.message.provider);
+            try w.writeIntField("timestamp", d.message.timestamp);
+
+            // Nest usage fields under "usage" key
+            try w.writeKey("usage");
+            try w.beginObject();
+            try w.writeIntField("input", d.message.usage.input);
+            try w.writeIntField("output", d.message.usage.output);
+            try w.writeIntField("cache_read", d.message.usage.cache_read);
+            try w.writeIntField("cache_write", d.message.usage.cache_write);
+            try w.endObject();
+
+            try w.writeKey("content");
+            try w.beginArray();
+            for (d.message.content) |block| {
+                try serializeAssistantContent(&w, block);
+            }
+            try w.endArray();
+            try w.endObject();
         },
         .@"error" => |e| {
             try w.writeStringField("type", "error");
-            try w.writeStringField("message", e.message);
+            try w.writeStringField("reason", @tagName(e.reason));
+            if (e.err.error_message) |msg| {
+                try w.writeStringField("error_message", msg);
+            }
+            try w.writeKey("usage");
+            try w.beginObject();
+            try w.writeIntField("input", e.err.usage.input);
+            try w.writeIntField("output", e.err.usage.output);
+            try w.writeIntField("cache_read", e.err.usage.cache_read);
+            try w.writeIntField("cache_write", e.err.usage.cache_write);
+            try w.endObject();
         },
-        .ping => {
-            try w.writeStringField("type", "ping");
+        .keepalive => {
+            try w.writeStringField("type", "keepalive");
         },
     }
 
@@ -177,7 +583,7 @@ pub fn serializeEvent(event: types.MessageEvent, allocator: std.mem.Allocator) !
     return result;
 }
 
-pub fn serializeResult(result: types.AssistantMessage, allocator: std.mem.Allocator) ![]u8 {
+pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.Allocator) ![]u8 {
     var buffer = std.ArrayList(u8){};
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
@@ -186,16 +592,18 @@ pub fn serializeResult(result: types.AssistantMessage, allocator: std.mem.Alloca
     try w.writeStringField("type", "result");
     try w.writeStringField("stop_reason", @tagName(result.stop_reason));
     try w.writeStringField("model", result.model);
+    try w.writeStringField("api", result.api);
+    try w.writeStringField("provider", result.provider);
     try w.writeIntField("timestamp", result.timestamp);
-    try w.writeIntField("input_tokens", result.usage.input_tokens);
-    try w.writeIntField("output_tokens", result.usage.output_tokens);
-    try w.writeIntField("cache_read_tokens", result.usage.cache_read_tokens);
-    try w.writeIntField("cache_write_tokens", result.usage.cache_write_tokens);
+    try w.writeIntField("input", result.usage.input);
+    try w.writeIntField("output", result.usage.output);
+    try w.writeIntField("cache_read", result.usage.cache_read);
+    try w.writeIntField("cache_write", result.usage.cache_write);
 
     try w.writeKey("content");
     try w.beginArray();
     for (result.content) |block| {
-        try serializeContentBlock(&w, block);
+        try serializeAssistantContent(&w, block);
     }
     try w.endArray();
 
@@ -221,36 +629,36 @@ pub fn serializeError(msg: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return out;
 }
 
-fn serializeContentBlock(w: *json_writer.JsonWriter, block: types.ContentBlock) !void {
+pub fn serializeAssistantContent(w: *json_writer.JsonWriter, content: ai_types.AssistantContent) !void {
     try w.beginObject();
-    switch (block) {
+    switch (content) {
         .text => |t| {
             try w.writeStringField("type", "text");
             try w.writeStringField("text", t.text);
-            if (t.signature) |sig| {
-                try w.writeStringField("signature", sig);
+            if (t.text_signature) |sig| {
+                try w.writeStringField("text_signature", sig);
             }
         },
-        .tool_use => |t| {
-            try w.writeStringField("type", "tool_use");
-            try w.writeStringField("id", t.id);
-            try w.writeStringField("name", t.name);
-            try w.writeStringField("input_json", t.input_json);
-            if (t.thought_signature) |sig| {
+        .tool_call => |tc| {
+            try w.writeStringField("type", "tool_call");
+            try w.writeStringField("id", tc.id);
+            try w.writeStringField("name", tc.name);
+            try w.writeStringField("arguments_json", tc.arguments_json);
+            if (tc.thought_signature) |sig| {
                 try w.writeStringField("thought_signature", sig);
             }
         },
         .thinking => |t| {
             try w.writeStringField("type", "thinking");
             try w.writeStringField("thinking", t.thinking);
-            if (t.signature) |sig| {
-                try w.writeStringField("signature", sig);
+            if (t.thinking_signature) |sig| {
+                try w.writeStringField("thinking_signature", sig);
             }
         },
         .image => |img| {
             try w.writeStringField("type", "image");
-            try w.writeStringField("media_type", img.media_type);
             try w.writeStringField("data", img.data);
+            try w.writeStringField("mime_type", img.mime_type);
         },
     }
     try w.endObject();
@@ -273,168 +681,542 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
         return .{ .stream_error = try allocator.dupe(u8, msg) };
     }
 
-    return .{ .event = try parseMessageEvent(type_str, obj, allocator) };
+    // Handle control messages
+    if (std.mem.eql(u8, type_str, "ack")) {
+        const acknowledged_id = if (obj.get("acknowledged_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        return .{ .control = .{ .ack = .{ .acknowledged_id = acknowledged_id } } };
+    }
+    if (std.mem.eql(u8, type_str, "nack")) {
+        const rejected_id = if (obj.get("rejected_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        const reason = if (obj.get("reason")) |r|
+            try allocator.dupe(u8, r.string)
+        else
+            return error.MissingField;
+        const error_code = if (obj.get("error_code")) |ec|
+            try allocator.dupe(u8, ec.string)
+        else
+            null;
+        return .{ .control = .{ .nack = .{
+            .rejected_id = rejected_id,
+            .reason = reason,
+            .error_code = error_code,
+        } } };
+    }
+    if (std.mem.eql(u8, type_str, "ping")) {
+        return .{ .control = .ping };
+    }
+    if (std.mem.eql(u8, type_str, "pong")) {
+        return .{ .control = .pong };
+    }
+    if (std.mem.eql(u8, type_str, "goodbye")) {
+        const reason = if (obj.get("reason")) |r|
+            try allocator.dupe(u8, r.string)
+        else
+            null;
+        return .{ .control = .{ .goodbye = reason } };
+    }
+    if (std.mem.eql(u8, type_str, "sync_request")) {
+        return .{ .control = .sync_request };
+    }
+    if (std.mem.eql(u8, type_str, "sync")) {
+        const stream_id = if (obj.get("stream_id")) |id|
+            try allocator.dupe(u8, id.string)
+        else
+            return error.MissingField;
+        const sequence: u64 = if (obj.get("sequence")) |seq|
+            @intCast(seq.integer)
+        else
+            return error.MissingField;
+        const partial = if (obj.get("partial")) |p|
+            try allocator.dupe(u8, p.string)
+        else
+            null;
+        return .{ .control = .{ .sync = .{
+            .stream_id = stream_id,
+            .sequence = sequence,
+            .partial = partial,
+        } } };
+    }
+
+    return .{ .event = try parseAssistantMessageEvent(type_str, obj, allocator) };
 }
 
-fn parseMessageEvent(
+/// Parse the lightweight partial object from protocol events (include_partial: true)
+/// Returns an AssistantMessage with content populated from the partial fields.
+/// According to PROTOCOL.md:
+/// - Text events: { "current_text": "accumulated text" }
+/// - Thinking events: { "current_thinking": "accumulated thinking" }
+/// - Tool call events: { "current_arguments_json": "..." }
+fn parsePartialFromEvent(
+    partial_obj: ?std.json.Value,
+    content_index: usize,
+    allocator: std.mem.Allocator,
+) !?ai_types.AssistantMessage {
+    if (partial_obj == null or partial_obj.? != .object) return null;
+
+    const obj = partial_obj.?.object;
+
+    // Check for text partial
+    if (obj.get("current_text")) |ct| {
+        const text = try allocator.dupe(u8, ct.string);
+        errdefer allocator.free(text);
+
+        // Create content array with text at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .text = .{ .text = text } };
+
+        return .{
+            .content = content,
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    // Check for thinking partial
+    if (obj.get("current_thinking")) |ct| {
+        const thinking = try allocator.dupe(u8, ct.string);
+        errdefer allocator.free(thinking);
+
+        // Create content array with thinking at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .thinking = .{ .thinking = thinking } };
+
+        return .{
+            .content = content,
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    // Check for tool call arguments partial
+    if (obj.get("current_arguments_json")) |ca| {
+        const args_json = try allocator.dupe(u8, ca.string);
+        errdefer allocator.free(args_json);
+
+        // Create content array with tool_call at content_index
+        const content = try allocator.alloc(ai_types.AssistantContent, content_index + 1);
+        errdefer allocator.free(content);
+        @memset(content, .{ .text = .{ .text = "" } });
+        content[content_index] = .{ .tool_call = .{
+            .id = "",
+            .name = "",
+            .arguments_json = args_json,
+        } };
+
+        return .{
+            .content = content,
+            .api = try allocator.dupe(u8, ""),
+            .provider = try allocator.dupe(u8, ""),
+            .model = try allocator.dupe(u8, ""),
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+            .owned_strings = true,
+        };
+    }
+
+    return null;
+}
+
+pub fn parseAssistantMessageEvent(
     type_str: []const u8,
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
-) !types.MessageEvent {
+) !ai_types.AssistantMessageEvent {
+    // Create a minimal partial message for events (used when no partial field present)
+    const empty_partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
     if (std.mem.eql(u8, type_str, "start")) {
-        return .{ .start = .{
-            .model = try allocator.dupe(u8, obj.get("model").?.string),
-        } };
+        const model = try allocator.dupe(u8, obj.get("model").?.string);
+        var partial = empty_partial;
+        partial.model = model;
+        partial.owned_strings = true;
+        return .{ .start = .{ .partial = partial } };
     }
     if (std.mem.eql(u8, type_str, "text_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_start = .{
-            .index = @intCast(obj.get("index").?.integer),
+            .content_index = content_index,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "text_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_delta = .{
-            .index = @intCast(obj.get("index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "text_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .text_end = .{
-            .index = @intCast(obj.get("index").?.integer),
+            .content_index = content_index,
+            .content = try allocator.dupe(u8, ""),
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_start = .{
-            .index = @intCast(obj.get("index").?.integer),
+            .content_index = content_index,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_delta = .{
-            .index = @intCast(obj.get("index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .thinking_end = .{
-            .index = @intCast(obj.get("index").?.integer),
+            .content_index = content_index,
+            .content = try allocator.dupe(u8, ""),
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_start")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+
+        // Parse id and name - these are now required fields
+        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        errdefer allocator.free(name);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .toolcall_start = .{
-            .index = @intCast(obj.get("index").?.integer),
-            .id = try allocator.dupe(u8, obj.get("id").?.string),
-            .name = try allocator.dupe(u8, obj.get("name").?.string),
+            .content_index = content_index,
+            .id = id,
+            .name = name,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_delta")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const delta = try allocator.dupe(u8, obj.get("delta").?.string);
+        errdefer allocator.free(delta);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .toolcall_delta = .{
-            .index = @intCast(obj.get("index").?.integer),
-            .delta = try allocator.dupe(u8, obj.get("delta").?.string),
+            .content_index = content_index,
+            .delta = delta,
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "toolcall_end")) {
+        const content_index: usize = @intCast(obj.get("content_index").?.integer);
+        const thought_signature = if (obj.get("thought_signature")) |sig_val|
+            try allocator.dupe(u8, sig_val.string)
+        else
+            null;
+        errdefer if (thought_signature) |sig| allocator.free(sig);
+
+        const id = try allocator.dupe(u8, obj.get("id").?.string);
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, obj.get("name").?.string);
+        errdefer allocator.free(name);
+        const arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string);
+        errdefer allocator.free(arguments_json);
+
+        // Parse partial if present
+        const partial = if (try parsePartialFromEvent(obj.get("partial"), content_index, allocator)) |p|
+            p
+        else
+            empty_partial;
+
         return .{ .toolcall_end = .{
-            .index = @intCast(obj.get("index").?.integer),
-            .input_json = try allocator.dupe(u8, obj.get("input_json").?.string),
+            .content_index = content_index,
+            .tool_call = .{
+                .id = id,
+                .name = name,
+                .arguments_json = arguments_json,
+                .thought_signature = thought_signature,
+            },
+            .partial = partial,
         } };
     }
     if (std.mem.eql(u8, type_str, "done")) {
+        const message_obj = obj.get("message").?.object;
+        const message = try parseAssistantMessage(message_obj, allocator);
         return .{ .done = .{
-            .stop_reason = parseStopReason(obj.get("stop_reason").?.string),
-            .usage = .{
-                .input_tokens = @intCast(obj.get("input_tokens").?.integer),
-                .output_tokens = @intCast(obj.get("output_tokens").?.integer),
-                .cache_read_tokens = @intCast(obj.get("cache_read_tokens").?.integer),
-                .cache_write_tokens = @intCast(obj.get("cache_write_tokens").?.integer),
-            },
+            .reason = parseStopReason(obj.get("reason").?.string),
+            .message = message,
         } };
     }
     if (std.mem.eql(u8, type_str, "error")) {
+        var err_msg = empty_partial;
+        err_msg.owned_strings = true;
+
+        // Parse optional error_message
+        if (obj.get("error_message")) |em| {
+            err_msg.error_message = try allocator.dupe(u8, em.string);
+        }
+
+        // Parse optional usage object
+        if (obj.get("usage")) |usage_obj| {
+            if (usage_obj == .object) {
+                const u = usage_obj.object;
+                err_msg.usage = .{
+                    .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
+                    .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
+                    .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
+                    .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+                };
+            }
+        }
+
         return .{ .@"error" = .{
-            .message = try allocator.dupe(u8, obj.get("message").?.string),
+            .reason = parseStopReason(obj.get("reason").?.string),
+            .err = err_msg,
         } };
     }
-    if (std.mem.eql(u8, type_str, "ping")) {
-        return .{ .ping = {} };
+    if (std.mem.eql(u8, type_str, "keepalive")) {
+        return .{ .keepalive = {} };
     }
 
     return error.UnknownEventType;
 }
 
-fn parseAssistantMessage(
+pub fn parseAssistantMessage(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
-) !types.AssistantMessage {
-    const content_array = obj.get("content").?.array;
-    var content = try allocator.alloc(types.ContentBlock, content_array.items.len);
-    errdefer allocator.free(content);
-
-    for (content_array.items, 0..) |item, i| {
-        content[i] = try parseContentBlock(item.object, allocator);
+) !ai_types.AssistantMessage {
+    // Content field is optional - done events don't include it
+    var content: []ai_types.AssistantContent = &.{};
+    if (obj.get("content")) |content_val| {
+        if (content_val == .array) {
+            const content_array = content_val.array;
+            content = try allocator.alloc(ai_types.AssistantContent, content_array.items.len);
+            var parsed_count: usize = 0;
+            errdefer {
+                // Free any successfully parsed content items before freeing the slice
+                for (content[0..parsed_count]) |c| {
+                    freeAssistantContent(c, allocator);
+                }
+                allocator.free(content);
+            }
+            for (content_array.items, 0..) |item, i| {
+                content[i] = try parseAssistantContent(item.object, allocator);
+                parsed_count += 1;
+            }
+        }
     }
 
-    return .{
-        .content = content,
-        .stop_reason = parseStopReason(obj.get("stop_reason").?.string),
-        .model = try allocator.dupe(u8, obj.get("model").?.string),
-        .timestamp = obj.get("timestamp").?.integer,
-        .usage = .{
-            .input_tokens = @intCast(obj.get("input_tokens").?.integer),
-            .output_tokens = @intCast(obj.get("output_tokens").?.integer),
-            .cache_read_tokens = @intCast(obj.get("cache_read_tokens").?.integer),
-            .cache_write_tokens = @intCast(obj.get("cache_write_tokens").?.integer),
-        },
-    };
+    // Parse usage - support both nested object format and flat fields for backward compatibility
+    var usage: ai_types.Usage = .{};
+    if (obj.get("usage")) |usage_val| {
+        if (usage_val == .object) {
+            const u = usage_val.object;
+            usage = .{
+                .input = if (u.get("input")) |v| @intCast(v.integer) else 0,
+                .output = if (u.get("output")) |v| @intCast(v.integer) else 0,
+                .cache_read = if (u.get("cache_read")) |v| @intCast(v.integer) else 0,
+                .cache_write = if (u.get("cache_write")) |v| @intCast(v.integer) else 0,
+            };
+        }
+    } else {
+        // Fall back to flat fields for backward compatibility
+        usage = .{
+            .input = if (obj.get("input")) |v| @intCast(v.integer) else 0,
+            .output = if (obj.get("output")) |v| @intCast(v.integer) else 0,
+            .cache_read = if (obj.get("cache_read")) |v| @intCast(v.integer) else 0,
+            .cache_write = if (obj.get("cache_write")) |v| @intCast(v.integer) else 0,
+        };
+    }
+
+    // Note: role field is optional and ignored (validated as "assistant" if present)
+
+    // Build result with errdefer for each allocation to avoid leaks on OOM
+    var result: ai_types.AssistantMessage = undefined;
+    result.content = content;
+    errdefer {
+        for (result.content) |c| {
+            freeAssistantContent(c, allocator);
+        }
+        allocator.free(result.content);
+    }
+
+    result.stop_reason = parseStopReason(obj.get("stop_reason").?.string);
+
+    result.model = try allocator.dupe(u8, obj.get("model").?.string);
+    errdefer allocator.free(result.model);
+
+    result.api = try allocator.dupe(u8, obj.get("api").?.string);
+    errdefer allocator.free(result.api);
+
+    result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
+    // No errdefer needed - this is the last allocation
+
+    result.timestamp = obj.get("timestamp").?.integer;
+    result.usage = usage;
+    result.owned_strings = true;
+    result.error_message = null;
+
+    return result;
 }
 
-fn parseContentBlock(
+/// Free allocated strings in a single AssistantContent item
+fn freeAssistantContent(content: ai_types.AssistantContent, allocator: std.mem.Allocator) void {
+    switch (content) {
+        .text => |t| {
+            allocator.free(t.text);
+            if (t.text_signature) |s| allocator.free(s);
+        },
+        .tool_call => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+            if (tc.thought_signature) |s| allocator.free(s);
+        },
+        .thinking => |th| {
+            allocator.free(th.thinking);
+            if (th.thinking_signature) |s| allocator.free(s);
+        },
+        .image => |img| {
+            allocator.free(img.data);
+            allocator.free(img.mime_type);
+        },
+    }
+}
+
+fn parseAssistantContent(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
-) !types.ContentBlock {
+) !ai_types.AssistantContent {
     const type_str = obj.get("type").?.string;
 
     if (std.mem.eql(u8, type_str, "text")) {
-        const signature = if (obj.get("signature")) |sig_val|
+        const text_signature = if (obj.get("text_signature")) |sig_val|
             try allocator.dupe(u8, sig_val.string)
         else
             null;
         return .{ .text = .{
             .text = try allocator.dupe(u8, obj.get("text").?.string),
-            .signature = signature,
+            .text_signature = text_signature,
         } };
     }
-    if (std.mem.eql(u8, type_str, "tool_use")) {
+    if (std.mem.eql(u8, type_str, "tool_call")) {
         const thought_signature = if (obj.get("thought_signature")) |sig_val|
             try allocator.dupe(u8, sig_val.string)
         else
             null;
-        return .{ .tool_use = .{
+        return .{ .tool_call = .{
             .id = try allocator.dupe(u8, obj.get("id").?.string),
             .name = try allocator.dupe(u8, obj.get("name").?.string),
-            .input_json = try allocator.dupe(u8, obj.get("input_json").?.string),
+            .arguments_json = try allocator.dupe(u8, obj.get("arguments_json").?.string),
             .thought_signature = thought_signature,
         } };
     }
     if (std.mem.eql(u8, type_str, "thinking")) {
-        const signature = if (obj.get("signature")) |sig_val|
+        const thinking_signature = if (obj.get("thinking_signature")) |sig_val|
             try allocator.dupe(u8, sig_val.string)
         else
             null;
         return .{ .thinking = .{
             .thinking = try allocator.dupe(u8, obj.get("thinking").?.string),
-            .signature = signature,
+            .thinking_signature = thinking_signature,
         } };
     }
     if (std.mem.eql(u8, type_str, "image")) {
         return .{ .image = .{
-            .media_type = try allocator.dupe(u8, obj.get("media_type").?.string),
             .data = try allocator.dupe(u8, obj.get("data").?.string),
+            .mime_type = try allocator.dupe(u8, obj.get("mime_type").?.string),
         } };
     }
 
     return error.UnknownContentBlockType;
 }
 
-fn parseStopReason(str: []const u8) types.StopReason {
+fn parseStopReason(str: []const u8) ai_types.StopReason {
     if (std.mem.eql(u8, str, "stop")) return .stop;
     if (std.mem.eql(u8, str, "length")) return .length;
     if (std.mem.eql(u8, str, "tool_use")) return .tool_use;
@@ -454,7 +1236,16 @@ pub const TransportError = error{
 
 test "serialize and deserialize start event" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .start = .{ .model = "claude-3" } };
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "claude-3",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{ .start = .{ .partial = partial } };
 
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
@@ -462,13 +1253,25 @@ test "serialize and deserialize start event" {
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .start);
-    // model string was duped during deserialization, free it
-    allocator.free(msg.event.start.model);
+    // Clean up partial message
+    var mutable_partial = msg.event.start.partial;
+    mutable_partial.deinit(allocator);
 }
 
 test "serialize and deserialize text_delta event" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .text_delta = .{ .index = 2, .delta = "Hello world" } };
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{
+        .text_delta = .{ .content_index = 2, .delta = "Hello world", .partial = partial },
+    };
 
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
@@ -476,21 +1279,32 @@ test "serialize and deserialize text_delta event" {
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .text_delta);
-    try std.testing.expectEqual(@as(usize, 2), msg.event.text_delta.index);
+    try std.testing.expectEqual(@as(usize, 2), msg.event.text_delta.content_index);
     try std.testing.expectEqualStrings("Hello world", msg.event.text_delta.delta);
     allocator.free(msg.event.text_delta.delta);
 }
 
 test "serialize and deserialize done event" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .done = .{
-        .stop_reason = .tool_use,
+    const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "result" } }};
+    const message = ai_types.AssistantMessage{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
         .usage = .{
-            .input_tokens = 100,
-            .output_tokens = 50,
-            .cache_read_tokens = 20,
-            .cache_write_tokens = 10,
+            .input = 100,
+            .output = 50,
+            .cache_read = 20,
+            .cache_write = 10,
         },
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+        .owned_strings = false,
+    };
+    const event = ai_types.AssistantMessageEvent{ .done = .{
+        .reason = .tool_use,
+        .message = message,
     } };
 
     const json = try serializeEvent(event, allocator);
@@ -499,19 +1313,75 @@ test "serialize and deserialize done event" {
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .done);
-    try std.testing.expectEqual(types.StopReason.tool_use, msg.event.done.stop_reason);
-    try std.testing.expectEqual(@as(u64, 100), msg.event.done.usage.input_tokens);
-    try std.testing.expectEqual(@as(u64, 50), msg.event.done.usage.output_tokens);
-    try std.testing.expectEqual(@as(u64, 20), msg.event.done.usage.cache_read_tokens);
-    try std.testing.expectEqual(@as(u64, 10), msg.event.done.usage.cache_write_tokens);
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, msg.event.done.reason);
+    try std.testing.expectEqual(@as(u64, 100), msg.event.done.message.usage.input);
+    try std.testing.expectEqual(@as(u64, 50), msg.event.done.message.usage.output);
+    try std.testing.expectEqual(@as(u64, 20), msg.event.done.message.usage.cache_read);
+    try std.testing.expectEqual(@as(u64, 10), msg.event.done.message.usage.cache_write);
+    var mutable_msg = msg.event.done.message;
+    mutable_msg.deinit(allocator);
 }
 
-test "serialize and deserialize toolcall_start event" {
+test "serialize and deserialize toolcall_start event with id and name" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .toolcall_start = .{
-        .index = 1,
-        .id = "toolu_123",
-        .name = "search",
+
+    // Create a simple partial (empty content is fine, id/name are now in the event directly)
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{ .toolcall_start = .{
+        .content_index = 0,
+        .id = "toolu_abc",
+        .name = "calculator",
+        .partial = partial,
+    } };
+
+    const json = try serializeEvent(event, allocator);
+    defer allocator.free(json);
+
+    // Verify the serialized JSON contains id and name
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"toolu_abc\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"calculator\"") != null);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .event);
+    try std.testing.expect(msg.event == .toolcall_start);
+    try std.testing.expectEqual(@as(usize, 0), msg.event.toolcall_start.content_index);
+
+    // Verify id and name are accessible directly in the event
+    try std.testing.expectEqualStrings("toolu_abc", msg.event.toolcall_start.id);
+    try std.testing.expectEqualStrings("calculator", msg.event.toolcall_start.name);
+
+    // Free the duped id and name strings
+    allocator.free(msg.event.toolcall_start.id);
+    allocator.free(msg.event.toolcall_start.name);
+}
+
+test "serialize and deserialize toolcall_end event" {
+    const allocator = std.testing.allocator;
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event = ai_types.AssistantMessageEvent{ .toolcall_end = .{
+        .content_index = 1,
+        .tool_call = .{
+            .id = "toolu_123",
+            .name = "search",
+            .arguments_json = "{\"q\":\"test\"}",
+        },
+        .partial = partial,
     } };
 
     const json = try serializeEvent(event, allocator);
@@ -519,56 +1389,96 @@ test "serialize and deserialize toolcall_start event" {
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
-    try std.testing.expect(msg.event == .toolcall_start);
-    try std.testing.expectEqual(@as(usize, 1), msg.event.toolcall_start.index);
-    try std.testing.expectEqualStrings("toolu_123", msg.event.toolcall_start.id);
-    try std.testing.expectEqualStrings("search", msg.event.toolcall_start.name);
-    allocator.free(msg.event.toolcall_start.id);
-    allocator.free(msg.event.toolcall_start.name);
+    try std.testing.expect(msg.event == .toolcall_end);
+    try std.testing.expectEqual(@as(usize, 1), msg.event.toolcall_end.content_index);
+    try std.testing.expectEqualStrings("toolu_123", msg.event.toolcall_end.tool_call.id);
+    try std.testing.expectEqualStrings("search", msg.event.toolcall_end.tool_call.name);
+    allocator.free(msg.event.toolcall_end.tool_call.id);
+    allocator.free(msg.event.toolcall_end.tool_call.name);
+    allocator.free(msg.event.toolcall_end.tool_call.arguments_json);
 }
 
-test "serialize and deserialize ping event" {
+test "serialize and deserialize keepalive event" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .ping = {} };
+    const event = ai_types.AssistantMessageEvent{ .keepalive = {} };
 
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
-    try std.testing.expect(msg.event == .ping);
+    try std.testing.expect(msg.event == .keepalive);
 }
 
 test "serialize and deserialize error event" {
     const allocator = std.testing.allocator;
-    const event = types.MessageEvent{ .@"error" = .{ .message = "Rate limited" } };
+    const err_msg = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{
+            .input = 100,
+            .output = 50,
+            .cache_read = 20,
+            .cache_write = 10,
+        },
+        .stop_reason = .@"error",
+        .timestamp = 0,
+        .error_message = "API rate limit exceeded",
+        .owned_strings = false,
+    };
+    const event = ai_types.AssistantMessageEvent{ .@"error" = .{
+        .reason = .@"error",
+        .err = err_msg,
+    } };
 
     const json = try serializeEvent(event, allocator);
     defer allocator.free(json);
 
+    // Verify JSON contains the new fields
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_message\":\"API rate limit exceeded\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":50") != null);
+
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
     try std.testing.expect(msg.event == .@"error");
-    try std.testing.expectEqualStrings("Rate limited", msg.event.@"error".message);
-    allocator.free(msg.event.@"error".message);
+    try std.testing.expectEqual(ai_types.StopReason.@"error", msg.event.@"error".reason);
+
+    // Verify usage is properly deserialized
+    try std.testing.expectEqual(@as(u64, 100), msg.event.@"error".err.usage.input);
+    try std.testing.expectEqual(@as(u64, 50), msg.event.@"error".err.usage.output);
+    try std.testing.expectEqual(@as(u64, 20), msg.event.@"error".err.usage.cache_read);
+    try std.testing.expectEqual(@as(u64, 10), msg.event.@"error".err.usage.cache_write);
+
+    // Verify error_message is properly deserialized
+    try std.testing.expect(msg.event.@"error".err.error_message != null);
+    try std.testing.expectEqualStrings("API rate limit exceeded", msg.event.@"error".err.error_message.?);
+
+    // Cleanup
+    allocator.free(msg.event.@"error".err.error_message.?);
 }
 
 test "serialize and deserialize result" {
     const allocator = std.testing.allocator;
-    const content = [_]types.ContentBlock{
+    const content = [_]ai_types.AssistantContent{
         .{ .text = .{ .text = "Hello world" } },
     };
-    const result = types.AssistantMessage{
+    const result = ai_types.AssistantMessage{
         .content = &content,
         .usage = .{
-            .input_tokens = 100,
-            .output_tokens = 50,
-            .cache_read_tokens = 0,
-            .cache_write_tokens = 0,
+            .input = 100,
+            .output = 50,
+            .cache_read = 0,
+            .cache_write = 0,
         },
         .stop_reason = .stop,
         .model = "claude-3",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
         .timestamp = 1234567890,
+        .owned_strings = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -578,15 +1488,13 @@ test "serialize and deserialize result" {
     try std.testing.expect(msg == .result);
     try std.testing.expectEqualStrings("claude-3", msg.result.model);
     try std.testing.expectEqual(@as(i64, 1234567890), msg.result.timestamp);
-    try std.testing.expectEqual(types.StopReason.stop, msg.result.stop_reason);
-    try std.testing.expectEqual(@as(u64, 100), msg.result.usage.input_tokens);
+    try std.testing.expectEqual(ai_types.StopReason.stop, msg.result.stop_reason);
+    try std.testing.expectEqual(@as(u64, 100), msg.result.usage.input);
     try std.testing.expectEqual(@as(usize, 1), msg.result.content.len);
     try std.testing.expect(msg.result.content[0] == .text);
     try std.testing.expectEqualStrings("Hello world", msg.result.content[0].text.text);
-    // Free duped strings
-    allocator.free(msg.result.model);
-    allocator.free(msg.result.content[0].text.text);
-    allocator.free(msg.result.content);
+    var mutable_result = msg.result;
+    mutable_result.deinit(allocator);
 }
 
 test "serialize and deserialize stream_error" {
@@ -601,97 +1509,23 @@ test "serialize and deserialize stream_error" {
     allocator.free(msg.stream_error);
 }
 
-test "serialize and deserialize all index-based events" {
-    const allocator = std.testing.allocator;
-
-    // text_start
-    {
-        const event = types.MessageEvent{ .text_start = .{ .index = 0 } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .text_start);
-        try std.testing.expectEqual(@as(usize, 0), msg.event.text_start.index);
-    }
-
-    // text_end
-    {
-        const event = types.MessageEvent{ .text_end = .{ .index = 0 } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .text_end);
-        try std.testing.expectEqual(@as(usize, 0), msg.event.text_end.index);
-    }
-
-    // thinking_start
-    {
-        const event = types.MessageEvent{ .thinking_start = .{ .index = 1 } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .thinking_start);
-        try std.testing.expectEqual(@as(usize, 1), msg.event.thinking_start.index);
-    }
-
-    // thinking_delta
-    {
-        const event = types.MessageEvent{ .thinking_delta = .{ .index = 1, .delta = "Let me think..." } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .thinking_delta);
-        try std.testing.expectEqualStrings("Let me think...", msg.event.thinking_delta.delta);
-        allocator.free(msg.event.thinking_delta.delta);
-    }
-
-    // thinking_end
-    {
-        const event = types.MessageEvent{ .thinking_end = .{ .index = 1 } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .thinking_end);
-        try std.testing.expectEqual(@as(usize, 1), msg.event.thinking_end.index);
-    }
-
-    // toolcall_delta
-    {
-        const event = types.MessageEvent{ .toolcall_delta = .{ .index = 0, .delta = "{\"loc\":" } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .toolcall_delta);
-        try std.testing.expectEqualStrings("{\"loc\":", msg.event.toolcall_delta.delta);
-        allocator.free(msg.event.toolcall_delta.delta);
-    }
-
-    // toolcall_end
-    {
-        const event = types.MessageEvent{ .toolcall_end = .{ .index = 0, .input_json = "{\"location\":\"SF\"}" } };
-        const json = try serializeEvent(event, allocator);
-        defer allocator.free(json);
-        const msg = try deserialize(json, allocator);
-        try std.testing.expect(msg.event == .toolcall_end);
-        try std.testing.expectEqualStrings("{\"location\":\"SF\"}", msg.event.toolcall_end.input_json);
-        allocator.free(msg.event.toolcall_end.input_json);
-    }
-}
-
 test "serialize and deserialize result with multiple content block types" {
     const allocator = std.testing.allocator;
-    const content = [_]types.ContentBlock{
+    const content = [_]ai_types.AssistantContent{
         .{ .text = .{ .text = "Here is the result" } },
-        .{ .tool_use = .{ .id = "t1", .name = "search", .input_json = "{}" } },
+        .{ .tool_call = .{ .id = "t1", .name = "search", .arguments_json = "{}" } },
         .{ .thinking = .{ .thinking = "I should search" } },
-        .{ .image = .{ .media_type = "image/png", .data = "iVBOR" } },
+        .{ .image = .{ .data = "iVBOR", .mime_type = "image/png" } },
     };
-    const result = types.AssistantMessage{
+    const result = ai_types.AssistantMessage{
         .content = &content,
-        .usage = .{ .output_tokens = 25 },
+        .usage = .{ .output = 25 },
         .stop_reason = .tool_use,
         .model = "claude-3",
+        .api = "test-api",
+        .provider = "test-provider",
         .timestamp = 999,
+        .owned_strings = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -704,144 +1538,34 @@ test "serialize and deserialize result with multiple content block types" {
     try std.testing.expect(msg.result.content[0] == .text);
     try std.testing.expectEqualStrings("Here is the result", msg.result.content[0].text.text);
 
-    try std.testing.expect(msg.result.content[1] == .tool_use);
-    try std.testing.expectEqualStrings("t1", msg.result.content[1].tool_use.id);
-    try std.testing.expectEqualStrings("search", msg.result.content[1].tool_use.name);
+    try std.testing.expect(msg.result.content[1] == .tool_call);
+    try std.testing.expectEqualStrings("t1", msg.result.content[1].tool_call.id);
+    try std.testing.expectEqualStrings("search", msg.result.content[1].tool_call.name);
 
     try std.testing.expect(msg.result.content[2] == .thinking);
     try std.testing.expectEqualStrings("I should search", msg.result.content[2].thinking.thinking);
 
     try std.testing.expect(msg.result.content[3] == .image);
-    try std.testing.expectEqualStrings("image/png", msg.result.content[3].image.media_type);
+    try std.testing.expectEqualStrings("image/png", msg.result.content[3].image.mime_type);
 
-    // Free all duped strings
-    allocator.free(msg.result.model);
-    allocator.free(msg.result.content[0].text.text);
-    allocator.free(msg.result.content[1].tool_use.id);
-    allocator.free(msg.result.content[1].tool_use.name);
-    allocator.free(msg.result.content[1].tool_use.input_json);
-    allocator.free(msg.result.content[2].thinking.thinking);
-    allocator.free(msg.result.content[3].image.media_type);
-    allocator.free(msg.result.content[3].image.data);
-    allocator.free(msg.result.content);
-}
-
-test "forwardStream and receiveStream round-trip" {
-    const allocator = std.testing.allocator;
-
-    // Buffer to capture serialized output
-    var captured = std.ArrayList([]u8){};
-    defer {
-        for (captured.items) |item| allocator.free(item);
-        captured.deinit(allocator);
-    }
-
-    // Create a mock sender that captures writes
-    const MockSenderCtx = struct {
-        captured: *std.ArrayList([]u8),
-        allocator: std.mem.Allocator,
-
-        fn writeFn(ctx: *anyopaque, data: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            const copy = try self.allocator.dupe(u8, data);
-            try self.captured.append(self.allocator, copy);
-        }
-    };
-
-    var sender_ctx = MockSenderCtx{ .captured = &captured, .allocator = allocator };
-    const sender = Sender{
-        .context = @ptrCast(&sender_ctx),
-        .write_fn = MockSenderCtx.writeFn,
-    };
-
-    // Create a source stream and push events
-    var source_stream = event_stream.AssistantMessageStream.init(allocator);
-    defer source_stream.deinit();
-
-    try source_stream.push(.{ .start = .{ .model = "test-model" } });
-    try source_stream.push(.{ .text_delta = .{ .index = 0, .delta = "Hi" } });
-
-    // Allocate model string to avoid "Invalid free" when deinit is called
-    const model_str = try allocator.dupe(u8, "test-model");
-    source_stream.complete(.{
-        .content = &[_]types.ContentBlock{},
-        .usage = .{ .output_tokens = 5 },
-        .stop_reason = .stop,
-        .model = model_str,
-        .timestamp = 42,
-    });
-
-    // Forward the source stream to the sender
-    try forwardStream(&source_stream, &sender, allocator);
-
-    // We should have captured 3 writes: start, text_delta, result
-    try std.testing.expectEqual(@as(usize, 3), captured.items.len);
-
-    // Now create a mock receiver from the captured data
-    const MockReceiverCtx = struct {
-        items: [][]u8,
-        index: usize,
-
-        fn readFn(ctx: *anyopaque, alloc: std.mem.Allocator) !?[]const u8 {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (self.index >= self.items.len) return null;
-            const data = try alloc.dupe(u8, self.items[self.index]);
-            self.index += 1;
-            return data;
-        }
-    };
-
-    var receiver_ctx = MockReceiverCtx{ .items = captured.items, .index = 0 };
-    const receiver = Receiver{
-        .context = @ptrCast(&receiver_ctx),
-        .read_fn = MockReceiverCtx.readFn,
-    };
-
-    // Create a destination stream
-    var dest_stream = event_stream.AssistantMessageStream.init(allocator);
-    defer dest_stream.deinit();
-
-    // Receive into the destination stream
-    try receiveStream(&receiver, &dest_stream, allocator);
-
-    // Verify events came through and free deserialized strings
-    var event_count: usize = 0;
-    while (dest_stream.poll()) |ev| {
-        switch (ev) {
-            .start => |s| allocator.free(s.model),
-            .text_delta => |d| allocator.free(d.delta),
-            .thinking_delta => |d| allocator.free(d.delta),
-            .toolcall_start => |tc| {
-                allocator.free(tc.id);
-                allocator.free(tc.name);
-            },
-            .toolcall_delta => |d| allocator.free(d.delta),
-            .toolcall_end => |e| allocator.free(e.input_json),
-            .@"error" => |e| allocator.free(e.message),
-            else => {},
-        }
-        event_count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), event_count);
-    try std.testing.expect(dest_stream.isDone());
-
-    const result = dest_stream.getResult();
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("test-model", result.?.model);
-    try std.testing.expectEqual(@as(u64, 5), result.?.usage.output_tokens);
+    var mutable_result1 = msg.result;
+    mutable_result1.deinit(allocator);
 }
 
 test "serialize and deserialize text block with signature" {
     const allocator = std.testing.allocator;
-    const content = [_]types.ContentBlock{
-        .{ .text = .{ .text = "hello world", .signature = "sig_abc123" } },
+    const content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "hello world", .text_signature = "sig_abc123" } },
     };
-    const result = types.AssistantMessage{
+    const result = ai_types.AssistantMessage{
         .content = &content,
-        .usage = .{ .output_tokens = 2 },
+        .usage = .{ .output = 2 },
         .stop_reason = .stop,
         .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
         .timestamp = 1000,
+        .owned_strings = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -852,27 +1576,27 @@ test "serialize and deserialize text block with signature" {
     try std.testing.expectEqual(@as(usize, 1), msg.result.content.len);
     try std.testing.expect(msg.result.content[0] == .text);
     try std.testing.expectEqualStrings("hello world", msg.result.content[0].text.text);
-    try std.testing.expect(msg.result.content[0].text.signature != null);
-    try std.testing.expectEqualStrings("sig_abc123", msg.result.content[0].text.signature.?);
+    try std.testing.expect(msg.result.content[0].text.text_signature != null);
+    try std.testing.expectEqualStrings("sig_abc123", msg.result.content[0].text.text_signature.?);
 
-    // Free duped strings
-    allocator.free(msg.result.model);
-    allocator.free(msg.result.content[0].text.text);
-    allocator.free(msg.result.content[0].text.signature.?);
-    allocator.free(msg.result.content);
+    var mutable_result2 = msg.result;
+    mutable_result2.deinit(allocator);
 }
 
 test "serialize and deserialize thinking block with signature" {
     const allocator = std.testing.allocator;
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "Let me analyze this...", .signature = "think_sig_xyz" } },
+    const content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "Let me analyze this...", .thinking_signature = "think_sig_xyz" } },
     };
-    const result = types.AssistantMessage{
+    const result = ai_types.AssistantMessage{
         .content = &content,
-        .usage = .{ .output_tokens = 5 },
+        .usage = .{ .output = 5 },
         .stop_reason = .stop,
         .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
         .timestamp = 2000,
+        .owned_strings = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -883,32 +1607,32 @@ test "serialize and deserialize thinking block with signature" {
     try std.testing.expectEqual(@as(usize, 1), msg.result.content.len);
     try std.testing.expect(msg.result.content[0] == .thinking);
     try std.testing.expectEqualStrings("Let me analyze this...", msg.result.content[0].thinking.thinking);
-    try std.testing.expect(msg.result.content[0].thinking.signature != null);
-    try std.testing.expectEqualStrings("think_sig_xyz", msg.result.content[0].thinking.signature.?);
+    try std.testing.expect(msg.result.content[0].thinking.thinking_signature != null);
+    try std.testing.expectEqualStrings("think_sig_xyz", msg.result.content[0].thinking.thinking_signature.?);
 
-    // Free duped strings
-    allocator.free(msg.result.model);
-    allocator.free(msg.result.content[0].thinking.thinking);
-    allocator.free(msg.result.content[0].thinking.signature.?);
-    allocator.free(msg.result.content);
+    var mutable_result3 = msg.result;
+    mutable_result3.deinit(allocator);
 }
 
-test "serialize and deserialize tool_use with thought_signature" {
+test "serialize and deserialize tool_call with thought_signature" {
     const allocator = std.testing.allocator;
-    const content = [_]types.ContentBlock{
-        .{ .tool_use = .{
+    const content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{
             .id = "toolu_456",
             .name = "calculator",
-            .input_json = "{\"expr\":\"2+2\"}",
+            .arguments_json = "{\"expr\":\"2+2\"}",
             .thought_signature = "tool_thought_sig",
         } },
     };
-    const result = types.AssistantMessage{
+    const result = ai_types.AssistantMessage{
         .content = &content,
-        .usage = .{ .output_tokens = 10 },
+        .usage = .{ .output = 10 },
         .stop_reason = .tool_use,
         .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
         .timestamp = 3000,
+        .owned_strings = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -917,18 +1641,400 @@ test "serialize and deserialize tool_use with thought_signature" {
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .result);
     try std.testing.expectEqual(@as(usize, 1), msg.result.content.len);
-    try std.testing.expect(msg.result.content[0] == .tool_use);
-    try std.testing.expectEqualStrings("toolu_456", msg.result.content[0].tool_use.id);
-    try std.testing.expectEqualStrings("calculator", msg.result.content[0].tool_use.name);
-    try std.testing.expectEqualStrings("{\"expr\":\"2+2\"}", msg.result.content[0].tool_use.input_json);
-    try std.testing.expect(msg.result.content[0].tool_use.thought_signature != null);
-    try std.testing.expectEqualStrings("tool_thought_sig", msg.result.content[0].tool_use.thought_signature.?);
+    try std.testing.expect(msg.result.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("toolu_456", msg.result.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("calculator", msg.result.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("{\"expr\":\"2+2\"}", msg.result.content[0].tool_call.arguments_json);
+    try std.testing.expect(msg.result.content[0].tool_call.thought_signature != null);
+    try std.testing.expectEqualStrings("tool_thought_sig", msg.result.content[0].tool_call.thought_signature.?);
 
-    // Free duped strings
-    allocator.free(msg.result.model);
-    allocator.free(msg.result.content[0].tool_use.id);
-    allocator.free(msg.result.content[0].tool_use.name);
-    allocator.free(msg.result.content[0].tool_use.input_json);
-    allocator.free(msg.result.content[0].tool_use.thought_signature.?);
-    allocator.free(msg.result.content);
+    var mutable_result4 = msg.result;
+    mutable_result4.deinit(allocator);
+}
+
+// --- Async interface tests ---
+
+test "ByteChunk creation and deinit" {
+    const allocator = std.testing.allocator;
+
+    // Test owned chunk
+    const data = try allocator.dupe(u8, "hello world");
+    var chunk = ByteChunk{ .data = data, .owned = true };
+    chunk.deinit(allocator);
+
+    // Test non-owned chunk (should not free)
+    const static_data = "static data";
+    var chunk2 = ByteChunk{ .data = static_data, .owned = false };
+    chunk2.deinit(allocator); // Should be safe
+}
+
+test "ByteStream basic operations" {
+    var stream = ByteStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    const data1 = try std.testing.allocator.dupe(u8, "first");
+    const data2 = try std.testing.allocator.dupe(u8, "second");
+
+    try stream.push(.{ .data = data1, .owned = true });
+    try stream.push(.{ .data = data2, .owned = true });
+
+    const chunk1 = stream.poll();
+    try std.testing.expect(chunk1 != null);
+    try std.testing.expectEqualStrings("first", chunk1.?.data);
+    var mutable_chunk1 = chunk1.?;
+    mutable_chunk1.deinit(std.testing.allocator);
+
+    const chunk2 = stream.poll();
+    try std.testing.expect(chunk2 != null);
+    try std.testing.expectEqualStrings("second", chunk2.?.data);
+    var mutable_chunk2 = chunk2.?;
+    mutable_chunk2.deinit(std.testing.allocator);
+
+    stream.complete({});
+}
+
+test "AsyncReceiver mock implementation" {
+    const MockAsyncReceiver = struct {
+        data: []const []const u8,
+        index: usize = 0,
+
+        fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*ByteStream {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+
+            const stream = try allocator.create(ByteStream);
+            stream.* = ByteStream.init(allocator);
+
+            // Push all data into the stream
+            for (self.data) |item| {
+                const data = try allocator.dupe(u8, item);
+                try stream.push(.{ .data = data, .owned = true });
+            }
+            stream.complete({});
+
+            return stream;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var mock = MockAsyncReceiver{ .data = &.{ "line1", "line2", "line3" } };
+
+    var async_receiver = AsyncReceiver{
+        .context = @ptrCast(&mock),
+        .receive_stream_fn = MockAsyncReceiver.receiveStreamFn,
+    };
+
+    const byte_stream = try async_receiver.receiveStream(allocator);
+    defer {
+        byte_stream.deinit();
+        allocator.destroy(byte_stream);
+    }
+
+    // Read all chunks
+    var count: usize = 0;
+    while (byte_stream.wait()) |chunk| {
+        defer {
+            var mutable_chunk = chunk;
+            mutable_chunk.deinit(allocator);
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "receiveStreamFromByteStream bridge" {
+    const allocator = std.testing.allocator;
+
+    // Create a ByteStream with serialized events
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Empty partial for event construction
+    const empty_partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    // Push a text_delta event
+    const event_json = try serializeEvent(.{
+        .text_delta = .{ .content_index = 0, .delta = "Hello", .partial = empty_partial },
+    }, allocator);
+    defer allocator.free(event_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, event_json), .owned = true });
+
+    // Push a result
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    // Create the message stream
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    // Bridge the streams
+    receiveStreamFromByteStream(&byte_stream, &msg_stream, allocator);
+
+    // Poll the text_delta event
+    const event = msg_stream.poll();
+    try std.testing.expect(event != null);
+    try std.testing.expect(event.? == .text_delta);
+    try std.testing.expectEqualStrings("Hello", event.?.text_delta.delta);
+    allocator.free(event.?.text_delta.delta);
+
+    // Stream should be done
+    try std.testing.expect(msg_stream.isDone());
+}
+
+
+// --- Control message callback tests ---
+
+const ControlTestContext = struct {
+    received_ping: bool = false,
+    received_pong: bool = false,
+    ack_count: usize = 0,
+    last_ack_id: []const u8 = "",
+    allocator: std.mem.Allocator,
+
+    fn callback(ctrl: ControlMessage, ctx: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        switch (ctrl) {
+            .ping => {
+                self.received_ping = true;
+            },
+            .pong => {
+                self.received_pong = true;
+            },
+            .ack => |a| {
+                self.ack_count += 1;
+                // Free previous allocation if any
+                if (self.last_ack_id.len > 0) {
+                    self.allocator.free(self.last_ack_id);
+                    self.last_ack_id = "";
+                }
+                // Must copy the string since it will be freed after callback returns
+                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id) catch "";
+            },
+            else => {},
+        }
+    }
+
+    fn deinit(self: *@This()) void {
+        if (self.last_ack_id.len > 0) {
+            self.allocator.free(self.last_ack_id);
+        }
+    }
+};
+
+test "receiveStreamFromByteStreamWithControl invokes callback for ping" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push a ping control message
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expect(test_ctx.received_ping);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl invokes callback for ack with string data" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push an ack control message
+    const ack_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-12345\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), test_ctx.ack_count);
+    try std.testing.expectEqualStrings("msg-12345", test_ctx.last_ack_id);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl handles multiple control messages" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push multiple control messages
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    const ack1_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-1\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack1_json), .owned = true });
+
+    const pong_json = "{\"type\":\"pong\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, pong_json), .owned = true });
+
+    const ack2_json = "{\"type\":\"ack\",\"acknowledged_id\":\"msg-2\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ack2_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    var test_ctx = ControlTestContext{ .allocator = allocator };
+    defer test_ctx.deinit();
+
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        ControlTestContext.callback,
+        &test_ctx,
+        allocator,
+    );
+
+    try std.testing.expect(test_ctx.received_ping);
+    try std.testing.expect(test_ctx.received_pong);
+    try std.testing.expectEqual(@as(usize, 2), test_ctx.ack_count);
+    try std.testing.expectEqualStrings("msg-2", test_ctx.last_ack_id);
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "receiveStreamFromByteStreamWithControl handles null callback (no-op)" {
+    const allocator = std.testing.allocator;
+
+    var byte_stream = ByteStream.init(allocator);
+    defer byte_stream.deinit();
+
+    // Push a ping control message
+    const ping_json = "{\"type\":\"ping\"}";
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, ping_json), .owned = true });
+
+    // Push a result to end the stream
+    const result_json = try serializeResult(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "test-model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .timestamp = 0,
+    }, allocator);
+    defer allocator.free(result_json);
+    try byte_stream.push(.{ .data = try allocator.dupe(u8, result_json), .owned = true });
+
+    byte_stream.complete({});
+
+    var msg_stream = event_stream.AssistantMessageStream.init(allocator);
+    defer msg_stream.deinit();
+
+    // Call with null callback - should not crash
+    receiveStreamFromByteStreamWithControl(
+        &byte_stream,
+        &msg_stream,
+        null,
+        null,
+        allocator,
+    );
+
+    try std.testing.expect(msg_stream.isDone());
+}
+
+test "Receiver.setControlCallback stores callback" {
+    var receiver = Receiver{
+        .context = undefined,
+        .read_fn = undefined,
+    };
+
+    var test_ctx = ControlTestContext{ .allocator = std.testing.allocator };
+
+    try std.testing.expect(receiver.control_callback == null);
+    try std.testing.expect(receiver.control_callback_ctx == null);
+
+    receiver.setControlCallback(ControlTestContext.callback, &test_ctx);
+
+    try std.testing.expect(receiver.control_callback != null);
+    try std.testing.expect(receiver.control_callback_ctx != null);
 }

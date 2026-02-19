@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types");
+const ai_types = @import("ai_types");
 
 const Allocator = std.mem.Allocator;
 
@@ -114,11 +114,11 @@ pub const ToolIdMapping = struct {
     }
 };
 
-/// Create tool ID mappings for a slice of tool use blocks.
+/// Create tool ID mappings for a slice of assistant content.
 /// Caller owns returned slice and all strings within.
-pub fn createToolIdMappingsFromBlocks(
+pub fn createToolIdMappingsFromContent(
     allocator: Allocator,
-    blocks: []const types.ContentBlock,
+    content: []const ai_types.AssistantContent,
     provider: Provider,
 ) ![]ToolIdMapping {
     var mappings = try std.ArrayList(ToolIdMapping).initCapacity(allocator, 0);
@@ -133,9 +133,9 @@ pub fn createToolIdMappingsFromBlocks(
     var seen = std.StringHashMap(void).init(allocator);
     defer seen.deinit();
 
-    for (blocks) |block| {
-        switch (block) {
-            .tool_use => |tool_block| {
+    for (content) |c| {
+        switch (c) {
+            .tool_call => |tool_block| {
                 // Skip if we've already seen this ID
                 if (seen.contains(tool_block.id)) {
                     continue;
@@ -333,15 +333,15 @@ test "generateMistralToolCallId produces valid IDs" {
     try std.testing.expect(!std.mem.eql(u8, id1, id2));
 }
 
-test "ToolIdMapping create and lookup" {
-    const blocks = [_]types.ContentBlock{
-        .{ .tool_use = .{ .id = "tool_1", .name = "search", .input_json = "{}" } },
-        .{ .tool_use = .{ .id = "tool_2", .name = "read", .input_json = "{}" } },
+test "ToolIdMapping create and lookup from AssistantContent" {
+    const content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .id = "tool_2", .name = "read", .arguments_json = "{}" } },
         .{ .text = .{ .text = "some text" } },
-        .{ .tool_use = .{ .id = "tool_1", .name = "search", .input_json = "{}" } }, // duplicate
+        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } }, // duplicate
     };
 
-    const mappings = try createToolIdMappingsFromBlocks(std.testing.allocator, &blocks, .mistral);
+    const mappings = try createToolIdMappingsFromContent(std.testing.allocator, &content, .mistral);
     defer freeToolIdMappings(std.testing.allocator, mappings);
 
     // Should have 2 unique tool IDs
@@ -367,11 +367,11 @@ test "ToolIdMapping create and lookup" {
 }
 
 test "ToolIdMapping for non-Mistral provider preserves IDs" {
-    const blocks = [_]types.ContentBlock{
-        .{ .tool_use = .{ .id = "tool_abc123", .name = "search", .input_json = "{}" } },
+    const content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{ .id = "tool_abc123", .name = "search", .arguments_json = "{}" } },
     };
 
-    const mappings = try createToolIdMappingsFromBlocks(std.testing.allocator, &blocks, .anthropic);
+    const mappings = try createToolIdMappingsFromContent(std.testing.allocator, &content, .anthropic);
     defer freeToolIdMappings(std.testing.allocator, mappings);
 
     try std.testing.expectEqual(@as(usize, 1), mappings.len);

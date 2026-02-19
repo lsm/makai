@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
 const stream_mod = @import("stream");
@@ -11,7 +12,7 @@ fn envOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
 
-fn waitResultOrFail(stream: *ai_types.AssistantMessageEventStream) !ai_types.AssistantMessage {
+fn waitResultOrFail(stream: *event_stream.AssistantMessageEventStream) !ai_types.AssistantMessage {
     const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (!stream.isDone()) {
         if (test_helpers.isDeadlineExceeded(deadline)) {

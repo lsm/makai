@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry_mod = @import("api_registry");
 
 pub fn stream(
@@ -8,7 +9,7 @@ pub fn stream(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const provider = registry.getApiProvider(model.api) orelse return error.NoApiProvider;
     return provider.stream(model, context, options, allocator);
 }
@@ -19,7 +20,7 @@ pub fn streamSimple(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const provider = registry.getApiProvider(model.api) orelse return error.NoApiProvider;
     return provider.stream_simple(model, context, options, allocator);
 }
@@ -71,13 +72,13 @@ fn mockStream(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = model;
     _ = context;
     _ = options;
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     var result_content = try allocator.alloc(ai_types.AssistantContent, 1);
     result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
@@ -101,7 +102,7 @@ fn mockStreamSimple(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     _ = options;
     return mockStream(model, context, null, allocator);
 }

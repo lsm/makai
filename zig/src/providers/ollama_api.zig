@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
 const json_writer = @import("json_writer");
 const sanitize = @import("sanitize");
@@ -250,7 +251,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
                         try w.writeStringField("name", tc.name);
                         try w.writeStringField("arguments", tc.arguments_json);
                         try w.endObject();
-                        try w.endObject();
                     }
                 }
                 try w.endArray();
@@ -275,7 +275,6 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
             try w.writeStringField("description", tool.description);
             try w.writeKey("parameters");
             try w.writeRawJson(tool.parameters_schema_json);
-            try w.endObject();
             try w.endObject();
         }
         try w.endArray();
@@ -459,7 +458,7 @@ fn parseLineExtended(line: []const u8, allocator: std.mem.Allocator) ?OllamaPars
 
 const ThreadCtx = struct {
     allocator: std.mem.Allocator,
-    stream: *ai_types.AssistantMessageEventStream,
+    stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
     base_url: []u8,
     api_key: ?[]u8,
@@ -798,7 +797,7 @@ fn runThread(ctx: *ThreadCtx) void {
         if (ping_interval > 0) {
             const now = std.time.milliTimestamp();
             if (now - last_ping_time >= ping_interval) {
-                stream.push(.{ .ping = {} }) catch {};
+                stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
             }
         }
@@ -917,6 +916,8 @@ fn runThread(ctx: *ThreadCtx) void {
                         // Emit toolcall_start
                         stream.push(.{ .toolcall_start = .{
                             .content_index = content_idx,
+                            .id = tool_id,
+                            .name = tool_name,
                             .partial = createPartialMessage(model),
                         } }) catch {
                             allocator.free(tool_id);
@@ -1067,6 +1068,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Emit toolcall_start
                 stream.push(.{ .toolcall_start = .{
                     .content_index = content_idx,
+                    .id = tool_id,
+                    .name = tool_name,
                     .partial = createPartialMessage(model),
                 } }) catch {
                     allocator.free(tool_id);
@@ -1178,7 +1181,7 @@ pub fn streamOllama(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
     // Ollama supports two modes:
@@ -1204,9 +1207,9 @@ pub fn streamOllama(
     const body = try buildBody(model, context, o, allocator);
     errdefer allocator.free(body);
 
-    const s = try allocator.create(ai_types.AssistantMessageEventStream);
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
-    s.* = ai_types.AssistantMessageEventStream.init(allocator);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -1234,7 +1237,7 @@ pub fn streamSimpleOllama(
     context: ai_types.Context,
     options: ?ai_types.SimpleStreamOptions,
     allocator: std.mem.Allocator,
-) !*ai_types.AssistantMessageEventStream {
+) !*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.SimpleStreamOptions{};
     return streamOllama(model, context, .{
         .temperature = o.temperature,

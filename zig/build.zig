@@ -4,9 +4,8 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Core legacy support modules still required by event_stream generic internals.
-    const types_mod = b.createModule(.{
-        .root_source_file = b.path("src/types.zig"),
+    const ai_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/ai_types.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -16,9 +15,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "types", .module = types_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
         },
     });
+
+    // Update ai_types_mod to import event_stream (circular dependency)
+    ai_types_mod.addImport("event_stream", event_stream_mod);
 
     const sse_parser_mod = b.createModule(.{
         .root_source_file = b.path("src/providers/sse_parser.zig"),
@@ -38,15 +40,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ai_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/ai_types.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "event_stream", .module = event_stream_mod },
-        },
-    });
-
     const tool_call_tracker_mod = b.createModule(.{
         .root_source_file = b.path("src/tool_call_tracker.zig"),
         .target = target,
@@ -63,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
         },
     });
 
@@ -116,7 +110,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "types", .module = types_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "retry", .module = retry_mod },
         },
     });
@@ -133,6 +127,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -151,6 +146,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -167,6 +163,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -183,6 +180,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -195,6 +193,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -210,6 +209,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -224,6 +224,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "sanitize", .module = sanitize_mod },
@@ -253,32 +254,142 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
         },
     });
 
-    // Tests
-    const types_test = b.addTest(.{ .root_module = types_mod });
-
-    const event_stream_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/event_stream.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "types", .module = types_mod }},
-        }),
+    const transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+        },
     });
+
+    const stdio_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/stdio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+        },
+    });
+
+    const sse_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/sse.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const websocket_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/websocket.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const content_partial_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/content_partial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const partial_serializer_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/partial_serializer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+        },
+    });
+
+    const protocol_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
+    const protocol_envelope_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/envelope.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+        },
+    });
+
+    const partial_reconstructor_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/partial_reconstructor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "streaming_json", .module = streaming_json_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+        },
+    });
+
+    const protocol_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+        },
+    });
+
+    const protocol_client_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "streaming_json", .module = streaming_json_mod },
+            .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+        },
+    });
+
+    // Tests
+    const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
     const streaming_json_test = b.addTest(.{ .root_module = streaming_json_mod });
 
-    const ai_types_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/ai_types.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "event_stream", .module = event_stream_mod }},
-        }),
-    });
+    const ai_types_test = b.addTest(.{ .root_module = ai_types_mod });
 
     const tool_call_tracker_test = b.addTest(.{ .root_module = tool_call_tracker_mod });
 
@@ -287,7 +398,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/api_registry.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "ai_types", .module = ai_types_mod }},
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+            },
         }),
     });
 
@@ -298,6 +412,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
             },
         }),
@@ -362,6 +477,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "register_builtins", .module = register_builtins_mod },
                 .{ .name = "stream", .module = stream_mod },
                 .{ .name = "test_helpers", .module = test_helpers_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
             },
         }),
     });
@@ -411,14 +527,83 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_protocol_fullstack_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/protocol_fullstack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+                .{ .name = "protocol_server", .module = protocol_server_mod },
+                .{ .name = "protocol_client", .module = protocol_client_mod },
+                .{ .name = "envelope", .module = protocol_envelope_mod },
+                .{ .name = "transport", .module = transport_mod },
+            },
+        }),
+    });
+
+    // Protocol E2E tests (mock-based, no real providers needed)
+    // Uses protocol_types as the root module to avoid conflict with server's local types.zig import
+    const e2e_protocol_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "transport", .module = transport_mod },
+                .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+                .{ .name = "stdio", .module = stdio_transport_mod },
+            },
+        }),
+    });
+
+    const transport_test = b.addTest(.{ .root_module = transport_mod });
+
+    const stdio_transport_test = b.addTest(.{ .root_module = stdio_transport_mod });
+
+    const sse_transport_test = b.addTest(.{ .root_module = sse_transport_mod });
+
+    const websocket_transport_test = b.addTest(.{ .root_module = websocket_transport_mod });
+
+    const content_partial_test = b.addTest(.{ .root_module = content_partial_mod });
+
+    const partial_serializer_test = b.addTest(.{ .root_module = partial_serializer_mod });
+
+    const protocol_types_test = b.addTest(.{ .root_module = protocol_types_mod });
+
+    const protocol_envelope_test = b.addTest(.{ .root_module = protocol_envelope_mod });
+
+    const partial_reconstructor_test = b.addTest(.{ .root_module = partial_reconstructor_mod });
+
+    const protocol_server_test = b.addTest(.{ .root_module = protocol_server_mod });
+
+    const protocol_client_test = b.addTest(.{ .root_module = protocol_client_mod });
+
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&b.addRunArtifact(types_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
     test_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
     test_step.dependOn(&b.addRunArtifact(api_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(stream_test).step);
+    test_step.dependOn(&b.addRunArtifact(transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
+    test_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_envelope_test).step);
+    test_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(overflow_test).step);
@@ -450,10 +635,21 @@ pub fn build(b: *std.Build) void {
     const test_e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E tests");
     test_e2e_ollama_step.dependOn(&b.addRunArtifact(e2e_ollama_test).step);
 
+    const test_e2e_protocol_fullstack_step = b.step("test-e2e-protocol-fullstack", "Run Protocol Fullstack E2E tests");
+    test_e2e_protocol_fullstack_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_test).step);
+
+    const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
+    test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
+
     const test_e2e_step = b.step("test-e2e", "Run E2E tests");
     test_e2e_step.dependOn(test_e2e_anthropic_step);
     test_e2e_step.dependOn(test_e2e_openai_step);
     test_e2e_step.dependOn(test_e2e_azure_step);
     test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
+    test_e2e_step.dependOn(test_e2e_protocol_fullstack_step);
+    test_e2e_step.dependOn(test_e2e_protocol_step);
+
+    const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
+    test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
 }

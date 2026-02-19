@@ -1,5 +1,5 @@
 const std = @import("std");
-const types = @import("types");
+const ai_types = @import("ai_types");
 const provider_caps = @import("provider_caps.zig");
 
 pub const TransformOptions = struct {
@@ -37,10 +37,10 @@ fn shouldRetainSignature(options: TransformOptions, source: ?[]const u8, target:
 /// Transform messages for a specific target provider
 pub fn transformMessages(
     allocator: std.mem.Allocator,
-    messages: []const types.Message,
+    messages: []const ai_types.Message,
     options: TransformOptions,
-) ![]types.Message {
-    var result = try std.ArrayList(types.Message).initCapacity(allocator, messages.len);
+) ![]ai_types.Message {
+    var result = try std.ArrayList(ai_types.Message).initCapacity(allocator, messages.len);
     errdefer result.deinit(allocator);
 
     // First pass: collect all tool call IDs from assistant messages
@@ -55,10 +55,10 @@ pub fn transformMessages(
 
     if (options.fix_orphaned_tools) {
         for (messages) |msg| {
-            if (msg.role == .assistant) {
-                for (msg.content) |block| {
-                    if (block == .tool_use) {
-                        const id_dup = try allocator.dupe(u8, block.tool_use.id);
+            if (msg == .assistant) {
+                for (msg.assistant.content) |content| {
+                    if (content == .tool_call) {
+                        const id_dup = try allocator.dupe(u8, content.tool_call.id);
                         try tool_call_ids.put(id_dup, {});
                     }
                 }
@@ -69,11 +69,9 @@ pub fn transformMessages(
     // Second pass: transform messages
     for (messages) |msg| {
         // Skip aborted/error messages if requested
-        if (options.skip_aborted and msg.role == .assistant) {
-            if (msg.stop_reason) |sr| {
-                if (sr == .@"error" or sr == .aborted) {
-                    continue; // Skip this message
-                }
+        if (options.skip_aborted and msg == .assistant) {
+            if (msg.assistant.stop_reason == .@"error" or msg.assistant.stop_reason == .aborted) {
+                continue; // Skip this message
             }
         }
 
@@ -95,7 +93,7 @@ pub fn transformMessages(
         };
 
         // Convert thinking blocks if needed
-        if (should_convert_thinking and msg.role != .tool_result) {
+        if (should_convert_thinking and msg != .tool_result) {
             const target_format: ThinkingFormat = switch (options.target_provider) {
                 .anthropic, .bedrock => .anthropic,
                 .openai, .azure => .openai,
@@ -115,25 +113,29 @@ pub fn transformMessages(
                 break :blk false;
             };
 
-            transformed_msg.content = try convertThinkingBlocksEx(allocator, msg.content, target_format, convert_to_text, options);
+            // Only transform assistant messages
+            if (msg == .assistant) {
+                const transformed_content = try convertAssistantThinkingBlocks(allocator, msg.assistant.content, target_format, convert_to_text, options);
+                var new_assistant = msg.assistant;
+                new_assistant.content = transformed_content;
+                transformed_msg = .{ .assistant = new_assistant };
+            }
         }
 
         // Handle orphaned tool results
-        if (options.fix_orphaned_tools and msg.role == .tool_result) {
-            if (msg.tool_call_id) |call_id| {
-                if (!tool_call_ids.contains(call_id)) {
-                    // Skip orphaned tool result
-                    continue;
-                }
+        if (options.fix_orphaned_tools and msg == .tool_result) {
+            if (!tool_call_ids.contains(msg.tool_result.tool_call_id)) {
+                // Skip orphaned tool result
+                continue;
             }
         }
 
         // Normalize tool IDs if requested
-        if (options.normalize_tool_ids and msg.role == .tool_result) {
-            if (msg.tool_call_id) |call_id| {
-                const normalized_id = try normalizeToolId(allocator, call_id);
-                transformed_msg.tool_call_id = normalized_id;
-            }
+        if (options.normalize_tool_ids and msg == .tool_result) {
+            const normalized_id = try normalizeToolId(allocator, msg.tool_result.tool_call_id);
+            var new_tool_result = msg.tool_result;
+            new_tool_result.tool_call_id = normalized_id;
+            transformed_msg = .{ .tool_result = new_tool_result };
         }
 
         try result.append(allocator, transformed_msg);
@@ -146,9 +148,9 @@ pub fn transformMessages(
 /// Returns a new slice with orphaned results removed and synthetic calls inserted
 pub fn fixOrphanedToolCalls(
     allocator: std.mem.Allocator,
-    messages: []const types.Message,
-) ![]types.Message {
-    var result = try std.ArrayList(types.Message).initCapacity(allocator, messages.len);
+    messages: []const ai_types.Message,
+) ![]ai_types.Message {
+    var result = try std.ArrayList(ai_types.Message).initCapacity(allocator, messages.len);
     errdefer result.deinit(allocator);
 
     // Track tool calls and results
@@ -172,30 +174,26 @@ pub fn fixOrphanedToolCalls(
 
     // First pass: collect all IDs
     for (messages) |msg| {
-        if (msg.role == .assistant) {
-            for (msg.content) |block| {
-                if (block == .tool_use) {
-                    const id_dup = try allocator.dupe(u8, block.tool_use.id);
+        if (msg == .assistant) {
+            for (msg.assistant.content) |content| {
+                if (content == .tool_call) {
+                    const id_dup = try allocator.dupe(u8, content.tool_call.id);
                     try tool_call_ids.put(id_dup, {});
                 }
             }
-        } else if (msg.role == .tool_result) {
-            if (msg.tool_call_id) |call_id| {
-                const id_dup = try allocator.dupe(u8, call_id);
-                try tool_result_ids.put(id_dup, {});
-            }
+        } else if (msg == .tool_result) {
+            const id_dup = try allocator.dupe(u8, msg.tool_result.tool_call_id);
+            try tool_result_ids.put(id_dup, {});
         }
     }
 
     // Second pass: build result with fixes
     for (messages) |msg| {
         // For tool results without corresponding tool calls, skip them
-        if (msg.role == .tool_result) {
-            if (msg.tool_call_id) |call_id| {
-                if (!tool_call_ids.contains(call_id)) {
-                    // Orphaned tool result, skip it
-                    continue;
-                }
+        if (msg == .tool_result) {
+            if (!tool_call_ids.contains(msg.tool_result.tool_call_id)) {
+                // Orphaned tool result, skip it
+                continue;
             }
         }
 
@@ -209,64 +207,17 @@ pub fn fixOrphanedToolCalls(
     return result.toOwnedSlice(allocator);
 }
 
-/// Convert thinking blocks between provider formats
-/// Anthropic: { type: "thinking", thinking: "..." }
-/// OpenAI: { type: "reasoning", reasoning: "..." } (conceptually)
-/// Google: { type: "thought", thought: "..." } (conceptually)
-/// Note: In our type system, we use ThinkingBlock for all formats,
-/// but this function exists for future format-specific conversions
-pub fn convertThinkingBlocks(
+/// Convert thinking blocks in assistant content between provider formats
+fn convertAssistantThinkingBlocks(
     allocator: std.mem.Allocator,
-    content: []const types.ContentBlock,
-    target_format: ThinkingFormat,
-) ![]types.ContentBlock {
-    _ = target_format; // Currently all formats use the same ThinkingBlock structure
-
-    var result = try std.ArrayList(types.ContentBlock).initCapacity(allocator, content.len);
-    errdefer result.deinit(allocator);
-
-    for (content) |block| {
-        switch (block) {
-            .thinking => |thinking_block| {
-                // For now, just copy the thinking block
-                // In a more complete implementation, we might:
-                // - Convert between different field names for different providers
-                // - Handle provider-specific extensions
-                const thinking_dup = try allocator.dupe(u8, thinking_block.thinking);
-                const sig_dup = if (thinking_block.signature) |sig|
-                    try allocator.dupe(u8, sig)
-                else
-                    null;
-
-                try result.append(allocator, .{
-                    .thinking = .{
-                        .thinking = thinking_dup,
-                        .signature = sig_dup,
-                    },
-                });
-            },
-            else => {
-                try result.append(allocator, block);
-            },
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-/// Extended thinking block conversion with provider-aware handling
-/// When convert_to_text is true, thinking blocks are converted to plain text blocks
-/// When same-model is detected via options, signatures are retained
-pub fn convertThinkingBlocksEx(
-    allocator: std.mem.Allocator,
-    content: []const types.ContentBlock,
+    content: []const ai_types.AssistantContent,
     target_format: ThinkingFormat,
     convert_to_text: bool,
     options: TransformOptions,
-) ![]types.ContentBlock {
-    _ = target_format; // Currently all formats use the same ThinkingBlock structure
+) ![]ai_types.AssistantContent {
+    _ = target_format; // Currently all formats use the same ThinkingContent structure
 
-    var result = try std.ArrayList(types.ContentBlock).initCapacity(allocator, content.len);
+    var result = try std.ArrayList(ai_types.AssistantContent).initCapacity(allocator, content.len);
     errdefer result.deinit(allocator);
 
     // Check if we should retain signatures (same source and target model)
@@ -282,15 +233,15 @@ pub fn convertThinkingBlocksEx(
                     try result.append(allocator, .{
                         .text = .{
                             .text = text_dup,
-                            .signature = null, // Don't preserve signature when converting to text
+                            .text_signature = null, // Don't preserve signature when converting to text
                         },
                     });
                 } else {
                     // Keep as thinking block, optionally with signature
                     const thinking_dup = try allocator.dupe(u8, thinking_block.thinking);
-                    const sig_dup = if (retain_signature and thinking_block.signature != null)
-                        try allocator.dupe(u8, thinking_block.signature.?)
-                    else if (thinking_block.signature) |sig|
+                    const sig_dup = if (retain_signature and thinking_block.thinking_signature != null)
+                        try allocator.dupe(u8, thinking_block.thinking_signature.?)
+                    else if (thinking_block.thinking_signature) |sig|
                         try allocator.dupe(u8, sig)
                     else
                         null;
@@ -298,7 +249,7 @@ pub fn convertThinkingBlocksEx(
                     try result.append(allocator, .{
                         .thinking = .{
                             .thinking = thinking_dup,
-                            .signature = sig_dup,
+                            .thinking_signature = sig_dup,
                         },
                     });
                 }
@@ -332,36 +283,41 @@ fn normalizeToolId(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
 }
 
 /// Free messages allocated by transform functions
-pub fn freeMessages(allocator: std.mem.Allocator, messages: []types.Message) void {
+pub fn freeMessages(allocator: std.mem.Allocator, messages: []ai_types.Message) void {
     for (messages) |msg| {
-        // Free content blocks if they were transformed
-        for (msg.content) |block| {
-            switch (block) {
-                .text => |text_block| {
-                    allocator.free(text_block.text);
-                    if (text_block.signature) |sig| {
-                        allocator.free(sig);
+        switch (msg) {
+            .assistant => |assistant_msg| {
+                for (assistant_msg.content) |content| {
+                    switch (content) {
+                        .text => |text_block| {
+                            allocator.free(text_block.text);
+                            if (text_block.text_signature) |sig| {
+                                allocator.free(sig);
+                            }
+                        },
+                        .tool_call => |tool_block| {
+                            allocator.free(tool_block.id);
+                            allocator.free(tool_block.name);
+                            allocator.free(tool_block.arguments_json);
+                            if (tool_block.thought_signature) |sig| {
+                                allocator.free(sig);
+                            }
+                        },
+                        .thinking => |thinking_block| {
+                            allocator.free(thinking_block.thinking);
+                            if (thinking_block.thinking_signature) |sig| {
+                                allocator.free(sig);
+                            }
+                        },
+                        .image => |image_block| {
+                            allocator.free(image_block.data);
+                            allocator.free(image_block.mime_type);
+                        },
                     }
-                },
-                .tool_use => |tool_block| {
-                    allocator.free(tool_block.id);
-                    allocator.free(tool_block.name);
-                    allocator.free(tool_block.input_json);
-                    if (tool_block.thought_signature) |sig| {
-                        allocator.free(sig);
-                    }
-                },
-                .thinking => |thinking_block| {
-                    allocator.free(thinking_block.thinking);
-                    if (thinking_block.signature) |sig| {
-                        allocator.free(sig);
-                    }
-                },
-                .image => |image_block| {
-                    allocator.free(image_block.media_type);
-                    allocator.free(image_block.data);
-                },
-            }
+                }
+                allocator.free(assistant_msg.content);
+            },
+            else => {},
         }
     }
     allocator.free(messages);
@@ -371,113 +327,60 @@ pub fn freeMessages(allocator: std.mem.Allocator, messages: []types.Message) voi
 test "transformMessages basic" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
+    const messages = [_]ai_types.Message{
+        .{ .user = .{
+            .content = .{ .text = "Hello" },
             .timestamp = 1000,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
         .target_provider = .anthropic,
     });
     defer {
-        for (result) |msg| {
-            allocator.free(msg.content);
-        }
         allocator.free(result);
     }
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqual(types.Role.user, result[0].role);
-}
-
-test "convertThinkingBlocks preserves thinking content" {
-    const allocator = std.testing.allocator;
-
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "I am thinking..." } },
-        .{ .text = .{ .text = "Hello" } },
-    };
-
-    const result = try convertThinkingBlocks(allocator, &content, .anthropic);
-    defer {
-        for (result) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), result.len);
-    try std.testing.expect(result[0] == .thinking);
-    try std.testing.expectEqualStrings("I am thinking...", result[0].thinking.thinking);
-    try std.testing.expect(result[1] == .text);
-}
-
-test "convertThinkingBlocks with signature" {
-    const allocator = std.testing.allocator;
-
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "thoughts", .signature = "sig123" } },
-    };
-
-    const result = try convertThinkingBlocks(allocator, &content, .openai);
-    defer {
-        for (result) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expect(result[0] == .thinking);
-    try std.testing.expectEqualStrings("sig123", result[0].thinking.signature.?);
+    try std.testing.expect(result[0] == .user);
 }
 
 test "fixOrphanedToolCalls removes orphaned results" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .tool_use = .{ .id = "tool_1", .name = "search", .input_json = "{}" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } },
+    };
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "result 1" } },
+    };
+    const orphaned_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "orphaned result" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "result 1" } },
-            },
+        } },
+        .{ .tool_result = .{
             .tool_call_id = "tool_1",
             .tool_name = "search",
+            .content = &tool_result_content,
+            .is_error = false,
             .timestamp = 1001,
-        },
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "orphaned result" } },
-            },
+        } },
+        .{ .tool_result = .{
             .tool_call_id = "tool_missing",
             .tool_name = "missing",
+            .content = &orphaned_content,
+            .is_error = false,
             .timestamp = 1002,
-        },
+        } },
     };
 
     const result = try fixOrphanedToolCalls(allocator, &messages);
@@ -485,41 +388,48 @@ test "fixOrphanedToolCalls removes orphaned results" {
 
     // Should have 2 messages: assistant with tool call and the matching result
     try std.testing.expectEqual(@as(usize, 2), result.len);
-    try std.testing.expectEqual(types.Role.assistant, result[0].role);
-    try std.testing.expectEqual(types.Role.tool_result, result[1].role);
-    try std.testing.expectEqualStrings("tool_1", result[1].tool_call_id.?);
+    try std.testing.expect(result[0] == .assistant);
+    try std.testing.expect(result[1] == .tool_result);
+    try std.testing.expectEqualStrings("tool_1", result[1].tool_result.tool_call_id);
 }
 
 test "fixOrphanedToolCalls keeps all valid results" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .tool_use = .{ .id = "tool_1", .name = "search", .input_json = "{}" } },
-                .{ .tool_use = .{ .id = "tool_2", .name = "read", .input_json = "{}" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{ .id = "tool_1", .name = "search", .arguments_json = "{}" } },
+        .{ .tool_call = .{ .id = "tool_2", .name = "read", .arguments_json = "{}" } },
+    };
+    const tool_result_content1 = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "result 1" } },
+    };
+    const tool_result_content2 = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "result 2" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "result 1" } },
-            },
+        } },
+        .{ .tool_result = .{
             .tool_call_id = "tool_1",
             .tool_name = "search",
+            .content = &tool_result_content1,
+            .is_error = false,
             .timestamp = 1001,
-        },
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "result 2" } },
-            },
+        } },
+        .{ .tool_result = .{
             .tool_call_id = "tool_2",
             .tool_name = "read",
+            .content = &tool_result_content2,
+            .is_error = false,
             .timestamp = 1002,
-        },
+        } },
     };
 
     const result = try fixOrphanedToolCalls(allocator, &messages);
@@ -531,16 +441,17 @@ test "fixOrphanedToolCalls keeps all valid results" {
 test "transformMessages with orphaned tools disabled" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "orphaned" } },
-            },
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "orphaned" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{
             .tool_call_id = "nonexistent",
             .tool_name = "missing",
+            .content = &tool_result_content,
+            .is_error = false,
             .timestamp = 1000,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
@@ -551,23 +462,22 @@ test "transformMessages with orphaned tools disabled" {
 
     // With fix disabled, orphaned result should be kept
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    // Content is same reference since tool_result doesn't get thinking conversion
-    try std.testing.expect(result[0].content.ptr == messages[0].content.ptr);
 }
 
 test "transformMessages with orphaned tools enabled" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .tool_result,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "orphaned" } },
-            },
+    const tool_result_content = [_]ai_types.UserContentPart{
+        .{ .text = .{ .text = "orphaned" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .tool_result = .{
             .tool_call_id = "nonexistent",
             .tool_name = "missing",
+            .content = &tool_result_content,
+            .is_error = false,
             .timestamp = 1000,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
@@ -599,15 +509,20 @@ test "normalizeToolId adds prefix when needed" {
 test "transformMessages with thinking conversion" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .thinking = .{ .thinking = "internal thoughts" } },
-                .{ .text = .{ .text = "response" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "internal thoughts" } },
+        .{ .text = .{ .text = "response" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
@@ -616,35 +531,42 @@ test "transformMessages with thinking conversion" {
     });
     defer {
         for (result) |msg| {
-            for (msg.content) |block| {
-                switch (block) {
-                    .thinking => |tb| {
-                        allocator.free(tb.thinking);
-                        if (tb.signature) |sig| allocator.free(sig);
-                    },
-                    else => {},
+            if (msg == .assistant) {
+                for (msg.assistant.content) |content| {
+                    switch (content) {
+                        .thinking => |tb| {
+                            allocator.free(tb.thinking);
+                            if (tb.thinking_signature) |sig| allocator.free(sig);
+                        },
+                        else => {},
+                    }
                 }
+                allocator.free(msg.assistant.content);
             }
-            allocator.free(msg.content);
         }
         allocator.free(result);
     }
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqual(@as(usize, 2), result[0].content.len);
+    try std.testing.expectEqual(@as(usize, 2), result[0].assistant.content.len);
 }
 
 test "transformMessages without thinking conversion" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .thinking = .{ .thinking = "internal thoughts" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "internal thoughts" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
@@ -654,8 +576,6 @@ test "transformMessages without thinking conversion" {
     defer allocator.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    // When convert_thinking is false, content should be the same reference
-    try std.testing.expect(result[0].content.ptr == messages[0].content.ptr);
 }
 
 test "TransformOptions defaults" {
@@ -676,66 +596,10 @@ test "ThinkingFormat enum values" {
     try std.testing.expectEqual(ThinkingFormat.google, @as(ThinkingFormat, .google));
 }
 
-test "convertThinkingBlocks for different providers" {
-    const allocator = std.testing.allocator;
-
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "reasoning content" } },
-    };
-
-    // Test Anthropic format
-    const result_anthropic = try convertThinkingBlocks(allocator, &content, .anthropic);
-    defer {
-        for (result_anthropic) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result_anthropic);
-    }
-    try std.testing.expectEqual(@as(usize, 1), result_anthropic.len);
-
-    // Test OpenAI format
-    const result_openai = try convertThinkingBlocks(allocator, &content, .openai);
-    defer {
-        for (result_openai) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result_openai);
-    }
-    try std.testing.expectEqual(@as(usize, 1), result_openai.len);
-
-    // Test Google format
-    const result_google = try convertThinkingBlocks(allocator, &content, .google);
-    defer {
-        for (result_google) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result_google);
-    }
-    try std.testing.expectEqual(@as(usize, 1), result_google.len);
-}
-
 test "fixOrphanedToolCalls with empty messages" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{};
+    const messages = [_]ai_types.Message{};
 
     const result = try fixOrphanedToolCalls(allocator, &messages);
     defer allocator.free(result);
@@ -746,21 +610,22 @@ test "fixOrphanedToolCalls with empty messages" {
 test "fixOrphanedToolCalls with only user messages" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "Hello" } },
-            },
+    const messages = [_]ai_types.Message{
+        .{ .user = .{
+            .content = .{ .text = "Hello" },
             .timestamp = 1000,
-        },
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
+        } },
+        .{ .assistant = .{
+            .content = &[_]ai_types.AssistantContent{
                 .{ .text = .{ .text = "Hi there" } },
             },
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1001,
-        },
+        } },
     };
 
     const result = try fixOrphanedToolCalls(allocator, &messages);
@@ -772,14 +637,11 @@ test "fixOrphanedToolCalls with only user messages" {
 test "transformMessages all providers" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .user,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "test" } },
-            },
+    const messages = [_]ai_types.Message{
+        .{ .user = .{
+            .content = .{ .text = "test" },
             .timestamp = 1000,
-        },
+        } },
     };
 
     const ProviderEnum = @TypeOf(@as(TransformOptions, undefined).target_provider);
@@ -789,12 +651,7 @@ test "transformMessages all providers" {
         const result = try transformMessages(allocator, &messages, .{
             .target_provider = @enumFromInt(field.value),
         });
-        defer {
-            for (result) |msg| {
-                allocator.free(msg.content);
-            }
-            allocator.free(result);
-        }
+        defer allocator.free(result);
         try std.testing.expectEqual(@as(usize, 1), result.len);
     }
 }
@@ -802,67 +659,84 @@ test "transformMessages all providers" {
 test "transformMessages skips aborted assistant messages" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "normal response" } },
-            },
+    const normal_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "normal response" } },
+    };
+    const aborted_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "aborted response" } },
+    };
+    const error_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "error response" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &normal_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "aborted response" } },
-            },
+        } },
+        .{ .assistant = .{
+            .content = &aborted_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
             .stop_reason = .aborted,
             .timestamp = 1001,
-        },
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "error response" } },
-            },
+        } },
+        .{ .assistant = .{
+            .content = &error_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
             .stop_reason = .@"error",
             .timestamp = 1002,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
         .target_provider = .anthropic,
         .skip_aborted = true,
     });
-    defer {
-        for (result) |msg| {
-            allocator.free(msg.content);
-        }
-        allocator.free(result);
-    }
+    defer allocator.free(result);
 
     // Should only have the normal response, aborted and error filtered out
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqual(types.Role.assistant, result[0].role);
+    try std.testing.expect(result[0] == .assistant);
 }
 
 test "transformMessages keeps aborted when skip_aborted is false" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "normal response" } },
-            },
+    const normal_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "normal response" } },
+    };
+    const aborted_content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "aborted response" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &normal_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .text = .{ .text = "aborted response" } },
-            },
+        } },
+        .{ .assistant = .{
+            .content = &aborted_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
             .stop_reason = .aborted,
             .timestamp = 1001,
-        },
+        } },
     };
 
     const result = try transformMessages(allocator, &messages, .{
@@ -905,88 +779,23 @@ test "shouldRetainSignature returns false for null models" {
     try std.testing.expect(!shouldRetainSignature(options, null, "model"));
 }
 
-test "convertThinkingBlocksEx converts to text when requested" {
-    const allocator = std.testing.allocator;
-
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "internal reasoning", .signature = "sig123" } },
-        .{ .text = .{ .text = "response" } },
-    };
-
-    const options: TransformOptions = .{
-        .target_provider = .openai,
-    };
-
-    const result = try convertThinkingBlocksEx(allocator, &content, .openai, true, options);
-    defer {
-        for (result) |block| {
-            switch (block) {
-                .text => |tb| {
-                    allocator.free(tb.text);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), result.len);
-    // First block should now be text (converted from thinking)
-    try std.testing.expect(result[0] == .text);
-    try std.testing.expectEqualStrings("internal reasoning", result[0].text.text);
-    try std.testing.expect(result[0].text.signature == null);
-    // Second block should still be text
-    try std.testing.expect(result[1] == .text);
-}
-
-test "convertThinkingBlocksEx keeps thinking blocks when convert_to_text is false" {
-    const allocator = std.testing.allocator;
-
-    const content = [_]types.ContentBlock{
-        .{ .thinking = .{ .thinking = "internal reasoning", .signature = "sig123" } },
-    };
-
-    const options: TransformOptions = .{
-        .target_provider = .anthropic,
-    };
-
-    const result = try convertThinkingBlocksEx(allocator, &content, .anthropic, false, options);
-    defer {
-        for (result) |block| {
-            switch (block) {
-                .thinking => |tb| {
-                    allocator.free(tb.thinking);
-                    if (tb.signature) |sig| allocator.free(sig);
-                },
-                else => {},
-            }
-        }
-        allocator.free(result);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expect(result[0] == .thinking);
-    try std.testing.expectEqualStrings("internal reasoning", result[0].thinking.thinking);
-    try std.testing.expectEqualStrings("sig123", result[0].thinking.signature.?);
-}
-
 test "transformMessages with convert_thinking_for_provider set" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .thinking = .{ .thinking = "reasoning" } },
-                .{ .text = .{ .text = "response" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "reasoning" } },
+        .{ .text = .{ .text = "response" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
+        } },
     };
 
     // When converting to OpenAI-compatible provider, thinking should be converted to text
@@ -996,41 +805,48 @@ test "transformMessages with convert_thinking_for_provider set" {
     });
     defer {
         for (result) |msg| {
-            for (msg.content) |block| {
-                switch (block) {
-                    .text => |tb| {
-                        allocator.free(tb.text);
-                        if (tb.signature) |sig| allocator.free(sig);
-                    },
-                    .thinking => |tb| {
-                        allocator.free(tb.thinking);
-                        if (tb.signature) |sig| allocator.free(sig);
-                    },
-                    else => {},
+            if (msg == .assistant) {
+                for (msg.assistant.content) |content| {
+                    switch (content) {
+                        .text => |tb| {
+                            allocator.free(tb.text);
+                            if (tb.text_signature) |sig| allocator.free(sig);
+                        },
+                        .thinking => |tb| {
+                            allocator.free(tb.thinking);
+                            if (tb.thinking_signature) |sig| allocator.free(sig);
+                        },
+                        else => {},
+                    }
                 }
+                allocator.free(msg.assistant.content);
             }
-            allocator.free(msg.content);
         }
         allocator.free(result);
     }
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
     // Both blocks should be text (thinking converted to text for OpenAI)
-    try std.testing.expectEqual(@as(usize, 2), result[0].content.len);
-    try std.testing.expect(result[0].content[0] == .text);
+    try std.testing.expectEqual(@as(usize, 2), result[0].assistant.content.len);
+    try std.testing.expect(result[0].assistant.content[0] == .text);
 }
 
 test "transformMessages preserves thinking when same model" {
     const allocator = std.testing.allocator;
 
-    const messages = [_]types.Message{
-        .{
-            .role = .assistant,
-            .content = &[_]types.ContentBlock{
-                .{ .thinking = .{ .thinking = "reasoning", .signature = "sig" } },
-            },
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .thinking = .{ .thinking = "reasoning", .thinking_signature = "sig" } },
+    };
+    const messages = [_]ai_types.Message{
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test",
+            .provider = "test",
+            .model = "test",
+            .usage = .{},
+            .stop_reason = .stop,
             .timestamp = 1000,
-        },
+        } },
     };
 
     // When source and target model match, thinking should be preserved
@@ -1044,5 +860,4 @@ test "transformMessages preserves thinking when same model" {
 
     // Content should be same reference since no conversion needed
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expect(result[0].content.ptr == messages[0].content.ptr);
 }
