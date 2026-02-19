@@ -7,6 +7,7 @@ const protocol_server = @import("protocol_server");
 const protocol_client = @import("protocol_client");
 const envelope = @import("envelope");
 const transport = @import("transport");
+const in_process = @import("transports/in_process");
 
 const testing = std.testing;
 const ProtocolServer = protocol_server.ProtocolServer;
@@ -15,114 +16,13 @@ const ProtocolClient = protocol_client.ProtocolClient;
 // Access protocol_types through envelope module (which re-exports types)
 const protocol_types = envelope.protocol_types;
 
+// Use SerializedPipe from in_process transport module
+const PipeTransport = in_process.SerializedPipe;
+
 /// Helper to get env var or return null
 fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
-
-/// In-memory pipe transport for testing the protocol layer
-const PipeTransport = struct {
-    /// Buffer for server -> client messages
-    to_client: std.ArrayList(u8),
-    /// Buffer for client -> server messages
-    to_server: std.ArrayList(u8),
-    /// Read position for server->client direction (client reads from to_client)
-    to_client_read_pos: usize,
-    /// Read position for client->server direction (server reads from to_server)
-    to_server_read_pos: usize,
-    allocator: std.mem.Allocator,
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return .{
-            .to_client = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
-            .to_server = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
-            .to_client_read_pos = 0,
-            .to_server_read_pos = 0,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.to_client.deinit(self.allocator);
-        self.to_server.deinit(self.allocator);
-    }
-
-    /// Server writes to this to send to client
-    pub fn serverSender(self: *Self) transport.AsyncSender {
-        return .{
-            .context = self,
-            .write_fn = struct {
-                fn write(ctx: *anyopaque, data: []const u8) !void {
-                    const s: *Self = @ptrCast(@alignCast(ctx));
-                    try s.to_client.appendSlice(s.allocator, data);
-                    try s.to_client.append(s.allocator, '\n');
-                }
-            }.write,
-            .flush_fn = struct {
-                fn flush(_: *anyopaque) !void {}
-            }.flush,
-        };
-    }
-
-    /// Client reads from this (reads server->client messages from to_client buffer)
-    pub fn clientReceiver(self: *Self) Receiver {
-        return .{
-            .transport = self,
-            .buffer = &self.to_client,
-            .read_pos_ptr = &self.to_client_read_pos,
-        };
-    }
-
-    /// Client writes to this to send to server
-    pub fn clientSender(self: *Self) transport.AsyncSender {
-        return .{
-            .context = self,
-            .write_fn = struct {
-                fn write(ctx: *anyopaque, data: []const u8) !void {
-                    const s: *Self = @ptrCast(@alignCast(ctx));
-                    try s.to_server.appendSlice(s.allocator, data);
-                    try s.to_server.append(s.allocator, '\n');
-                }
-            }.write,
-            .flush_fn = struct {
-                fn flush(_: *anyopaque) !void {}
-            }.flush,
-        };
-    }
-
-    /// Server reads from this (reads client->server messages from to_server buffer)
-    pub fn serverReceiver(self: *Self) Receiver {
-        return .{
-            .transport = self,
-            .buffer = &self.to_server,
-            .read_pos_ptr = &self.to_server_read_pos,
-        };
-    }
-
-    pub const Receiver = struct {
-        transport: *Self,
-        buffer: *std.ArrayList(u8),
-        read_pos_ptr: *usize,
-
-        pub fn readLine(self: *@This(), allocator: std.mem.Allocator) !?[]const u8 {
-            const read_pos = self.read_pos_ptr.*;
-
-            if (read_pos >= self.buffer.items.len) return null;
-
-            const remaining = self.buffer.items[read_pos..];
-            if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
-                const line_end = read_pos + nl_pos;
-                const line = self.buffer.items[read_pos..line_end];
-                const result = try allocator.dupe(u8, line);
-                self.read_pos_ptr.* = line_end + 1;
-                return result;
-            }
-            return null;
-        }
-    };
-};
 
 /// Protocol pump that forwards events from provider stream to client via protocol layer
 const ProtocolPump = struct {
@@ -301,7 +201,7 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
     defer allocator.free(base_url);
 
     // Set up pipe transport
-    var pipe = PipeTransport.init(allocator);
+    var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
     // Set up provider registry with builtin providers
@@ -504,7 +404,7 @@ test "Protocol: Ollama abort through protocol layer" {
     defer allocator.free(base_url);
 
     // Set up pipe transport
-    var pipe = PipeTransport.init(allocator);
+    var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
     // Set up provider registry
@@ -668,7 +568,7 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     defer creds.deinit(allocator);
 
     // Set up pipe transport
-    var pipe = PipeTransport.init(allocator);
+    var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
     // Set up provider registry
@@ -820,7 +720,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     defer creds.deinit(allocator);
 
     // Set up pipe transport
-    var pipe = PipeTransport.init(allocator);
+    var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
     // Set up provider registry
