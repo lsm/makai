@@ -113,6 +113,18 @@ utils/
 
 All allocations go through explicit `std.mem.Allocator` parameters. Tests use `std.testing.allocator` which detects leaks. The event stream ring buffer is fixed-size (no dynamic allocation during streaming).
 
+#### EventStream Memory Ownership (CRITICAL)
+
+**EventStream does NOT own event strings.** Events pushed by providers contain **borrowed** string slices (delta, content, id, name, etc.) that point into provider-managed temporary buffers (SSE parser buffers, JSON buffers). The stream's `deinit()` does NOT call `deinitAssistantMessageEvent()`.
+
+| Component | Ownership Model |
+|-----------|-----------------|
+| **Providers** | Push events with borrowed strings; manage buffer lifetimes in producer thread |
+| **ProtocolClient** | Deep-copies via `cloneAssistantMessageEvent()` before push; manages cleanup separately |
+| **EventStream** | Does NOT own event strings; only drains ring buffer slots |
+
+**DO NOT** add `deinitAssistantMessageEvent()` to `EventStream.deinit()` - this causes double-free panics. See CI failures from 2026-02-19.
+
 ## Zig Conventions in This Codebase
 
 - snake_case for functions/variables, PascalCase for types

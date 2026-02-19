@@ -20,6 +20,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
+        /// When true, events in this stream were deep-copied via cloneAssistantMessageEvent()
+        /// and should be freed in deinit(). When false (default), events contain borrowed
+        /// string slices and must NOT be freed by the stream.
+        owns_events: bool = false,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             var published: [RING_BUFFER_SIZE]std.atomic.Value(bool) = undefined;
@@ -42,23 +46,29 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             // Wait for producer thread to finish before cleanup
             _ = self.waitForThread(5000);
 
-            // Drain any remaining events in the ring buffer and free their allocations
-            // This is critical when tests abort mid-stream or complete without polling all events
-            while (self.poll()) |event| {
-                // Free allocated strings in the event based on the event type
-                // We need to check if T is AssistantMessageEvent to avoid trying to free non-pointer types
-                const is_assistant_message_event = comptime blk: {
-                    if (@hasDecl(ai_types, "AssistantMessageEvent")) {
-                        break :blk T == ai_types.AssistantMessageEvent;
-                    }
-                    break :blk false;
-                };
+            // Drain any remaining events in the ring buffer.
+            // IMPORTANT: By default (owns_events=false), events contain BORROWED string slices
+            // that point into provider-managed temporary buffers (SSE parser buffers, JSON buffers).
+            // The stream does NOT own these strings, so freeing them would cause double-free panics.
+            //
+            // Memory ownership model:
+            // - Providers: Push events with borrowed strings; provider manages buffer lifetimes (owns_events=false)
+            // - ProtocolClient: Deep-copies via cloneAssistantMessageEvent() before push (owns_events=true)
+            //
+            // DO NOT change the default behavior - see CI failures from 2026-02-19.
+            const is_assistant_message_event = comptime blk: {
+                if (@hasDecl(ai_types, "AssistantMessageEvent")) {
+                    break :blk T == ai_types.AssistantMessageEvent;
+                }
+                break :blk false;
+            };
 
+            while (self.poll()) |event| {
                 if (comptime is_assistant_message_event) {
-                    // Events that own their strings (deep-copied via cloneAssistantMessageEvent)
-                    // need to be freed when draining the stream.
-                    var ev = event;
-                    ai_types.deinitAssistantMessageEvent(self.allocator, &ev);
+                    if (self.owns_events) {
+                        var ev = event;
+                        ai_types.deinitAssistantMessageEvent(self.allocator, &ev);
+                    }
                 }
             }
 
@@ -85,6 +95,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
         }
 
+        /// Push an event to the stream.
+        ///
+        /// IMPORTANT: The event's string fields (delta, content, id, name, etc.) are
+        /// treated as BORROWED references. The stream does NOT take ownership and will
+        /// NOT free them in deinit(). The caller must ensure the backing memory outlives
+        /// the event's consumption from the stream (typically by managing buffer lifetimes
+        /// in the producer thread).
+        ///
+        /// If you need the stream to own event memory, deep-copy via cloneAssistantMessageEvent()
+        /// before calling push(), and manage cleanup separately.
         pub fn push(self: *Self, event: T) !void {
             while (true) {
                 const current_head = self.head.load(.acquire);
