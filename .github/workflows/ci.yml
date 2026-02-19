@@ -27,15 +27,15 @@ jobs:
           AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          GITHUB_COPILOT_KEY: ${{ secrets.GITHUB_COPILOT_KEY }}
-          GITHUB_COPILOT_TOKEN: ${{ secrets.GITHUB_COPILOT_TOKEN }}
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
         run: |
           echo "has_anthropic=$([[ -n \"$ANTHROPIC_API_KEY\" || -n \"$ANTHROPIC_AUTH_TOKEN\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_openai=$([[ -n \"$OPENAI_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_google=$([[ -n \"$GOOGLE_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_azure=$([[ -n \"$AZURE_OPENAI_API_KEY\" && -n \"$AZURE_OPENAI_ENDPOINT\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_ollama=$([[ -n \"$OLLAMA_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
-          echo "has_github_copilot=$([[ -n \"$GITHUB_COPILOT_KEY\" && -n \"$GITHUB_COPILOT_TOKEN\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+          echo "has_github_copilot=$([[ -n \"$GH_COPILOT_REFRESH\" && -n \"$GH_COPILOT_ACCESS\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
   unit-tests:
     name: Unit Tests
@@ -220,5 +220,5 @@ jobs:
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_MODEL: ministral-3:3b
-          GITHUB_COPILOT_KEY: ${{ secrets.GITHUB_COPILOT_KEY }}
-          GITHUB_COPILOT_TOKEN: ${{ secrets.GITHUB_COPILOT_TOKEN }}
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
