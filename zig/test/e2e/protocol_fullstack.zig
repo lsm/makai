@@ -195,9 +195,13 @@ test "Full stack: Ollama abort propagates through provider" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
+    // Get API key
+    const api_key = getEnvOwned(allocator, "OLLAMA_API_KEY");
+    defer if (api_key) |k| allocator.free(k);
+
     // Stream with cancel token
     const stream = try stream_mod.stream(&registry, model, ctx, .{
-        .api_key = getEnvOwned(allocator, "OLLAMA_API_KEY"),
+        .api_key = api_key,
         .max_tokens = 500,
         .cancel_token = cancel_token,
     }, allocator);
@@ -273,9 +277,13 @@ test "Full stack: Ollama event reconstruction from stream" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
+    // Get API key
+    const api_key = getEnvOwned(allocator, "OLLAMA_API_KEY");
+    defer if (api_key) |k| allocator.free(k);
+
     // Stream through the provider
     const stream = try stream_mod.stream(&registry, model, ctx, .{
-        .api_key = getEnvOwned(allocator, "OLLAMA_API_KEY"),
+        .api_key = api_key,
         .max_tokens = 100,
         .temperature = 0.0,
     }, allocator);

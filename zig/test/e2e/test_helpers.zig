@@ -179,7 +179,8 @@ pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
 /// Print a skip message for Ollama tests
 pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     // Check for OLLAMA_API_KEY environment variable
-    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |_| {
+    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |key| {
+        allocator.free(key);
         return; // Has API key, don't skip
     } else |_| {}
     std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'ollama' - OLLAMA_API_KEY not set\n", .{});
