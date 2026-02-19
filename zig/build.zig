@@ -300,6 +300,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const in_process_transport_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/in_process.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
     const content_partial_mod = b.createModule(.{
         .root_source_file = b.path("src/protocol/content_partial.zig"),
         .target = target,
@@ -572,6 +583,8 @@ pub fn build(b: *std.Build) void {
 
     const websocket_transport_test = b.addTest(.{ .root_module = websocket_transport_mod });
 
+    const in_process_transport_test = b.addTest(.{ .root_module = in_process_transport_mod });
+
     const content_partial_test = b.addTest(.{ .root_module = content_partial_mod });
 
     const partial_serializer_test = b.addTest(.{ .root_module = partial_serializer_mod });
@@ -597,6 +610,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(in_process_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
     test_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
