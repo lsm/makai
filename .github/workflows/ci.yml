@@ -198,10 +198,10 @@ jobs:
         working-directory: zig
         run: zig build test-e2e-protocol
 
-  e2e-protocol-fullstack:
-    name: E2E - Protocol Fullstack
+  e2e-protocol-fullstack-ollama:
+    name: E2E - Protocol Fullstack (Ollama)
     needs: [unit-tests, check-secrets]
-    if: needs.check-secrets.outputs.has_ollama == 'true' || needs.check-secrets.outputs.has_github_copilot == 'true'
+    if: needs.check-secrets.outputs.has_ollama == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -214,11 +214,32 @@ jobs:
           key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
           restore-keys: |
             ${{ runner.os }}-zig-
-      - name: Run Protocol Fullstack E2E tests
+      - name: Run Protocol Fullstack E2E tests (Ollama)
         working-directory: zig
-        run: zig build test-e2e-protocol-fullstack
+        run: zig build test-e2e-protocol-fullstack -Dtest-filter="Ollama"
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_MODEL: ministral-3:3b
+
+  e2e-protocol-fullstack-github:
+    name: E2E - Protocol Fullstack (GitHub Copilot)
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Protocol Fullstack E2E tests (GitHub Copilot)
+        working-directory: zig
+        run: zig build test-e2e-protocol-fullstack -Dtest-filter="GitHub Copilot"
+        env:
           GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
           GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}

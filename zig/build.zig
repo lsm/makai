@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const test_filter = b.option([]const u8, "test-filter", "Skip tests that do not match filter");
 
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("src/ai_types.zig"),
@@ -538,6 +539,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_protocol_fullstack_test_filters: []const []const u8 = if (test_filter) |filter| &[_][]const u8{filter} else &[_][]const u8{};
+
     const e2e_protocol_fullstack_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/e2e/protocol_fullstack.zig"),
@@ -556,6 +559,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
+        .filters = e2e_protocol_fullstack_test_filters,
     });
 
     // Protocol E2E tests (mock-based, no real providers needed)
