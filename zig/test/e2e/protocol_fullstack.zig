@@ -103,9 +103,9 @@ test "Full stack: Ollama streaming through provider to event stream" {
         allocator.destroy(stream);
     }
 
-    // Accumulate events
-    var accumulator = test_helpers.EventAccumulator.init(allocator);
-    defer accumulator.deinit();
+    // Track events (without accumulator.processEvent which tries to free borrowed strings)
+    var text_buffer = std.ArrayList(u8).initCapacity(allocator, 64) catch return error.OutOfMemory;
+    defer text_buffer.deinit(allocator);
 
     var saw_start = false;
     var saw_text_delta = false;
@@ -113,14 +113,16 @@ test "Full stack: Ollama streaming through provider to event stream" {
     var saw_result = false;
 
     // Poll events with timeout
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
     const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
-            try accumulator.processEvent(event);
-
             switch (event) {
                 .start => saw_start = true,
-                .text_delta => saw_text_delta = true,
+                .text_delta => |d| {
+                    saw_text_delta = true;
+                    text_buffer.appendSlice(allocator, d.delta) catch {};
+                },
                 .done => saw_done = true,
                 else => {},
             }
@@ -145,7 +147,7 @@ test "Full stack: Ollama streaming through provider to event stream" {
     try testing.expect(saw_text_delta);
     try testing.expect(saw_done);
     try testing.expect(saw_result);
-    try testing.expect(accumulator.text_buffer.items.len > 0);
+    try testing.expect(text_buffer.items.len > 0);
 
     test_helpers.testSuccess("Full stack: Ollama streaming through provider to event stream");
 }
@@ -205,13 +207,14 @@ test "Full stack: Ollama abort propagates through provider" {
     }
 
     // Read a few events then abort
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
     var event_count: usize = 0;
     const max_events = 5;
 
     const deadline = test_helpers.createDeadline(10_000); // 10 second deadline
     while (event_count < max_events) {
-        if (stream.poll()) |event| {
-            test_helpers.freeEvent(event, allocator);
+        if (stream.poll()) |_| {
+            // Don't free event - strings are borrowed from provider's internal buffer
             event_count += 1;
         } else {
             if (stream.isDone()) break;
@@ -293,6 +296,7 @@ test "Full stack: Ollama event reconstruction from stream" {
     var usage: ?ai_types.Usage = null;
 
     // Poll events
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
     const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
@@ -300,16 +304,12 @@ test "Full stack: Ollama event reconstruction from stream" {
                 .start => |s| {
                     saw_start = true;
                     try testing.expect(s.partial.model.len > 0);
-                    allocator.free(s.partial.model);
-                    allocator.free(s.partial.api);
-                    allocator.free(s.partial.provider);
+                    // Don't free - strings are borrowed from provider's internal buffer
                 },
                 .text_delta => |d| {
+                    // Dupe the delta for later reconstruction, but don't free the original
                     try text_deltas.append(allocator, try allocator.dupe(u8, d.delta));
-                    allocator.free(d.delta);
-                    allocator.free(d.partial.model);
-                    allocator.free(d.partial.api);
-                    allocator.free(d.partial.provider);
+                    // Don't free d.delta, d.partial.model, etc. - they're borrowed
                 },
                 .done => |d| {
                     saw_done = true;
@@ -412,9 +412,10 @@ test "Full stack: GitHub Copilot streaming through provider" {
         allocator.destroy(stream);
     }
 
-    // Accumulate events
-    var accumulator = test_helpers.EventAccumulator.init(allocator);
-    defer accumulator.deinit();
+    // Track events (without accumulator.processEvent which tries to free borrowed strings)
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
+    var text_buffer = std.ArrayList(u8).initCapacity(allocator, 64) catch return error.OutOfMemory;
+    defer text_buffer.deinit(allocator);
 
     var saw_start = false;
     var saw_text_delta = false;
@@ -424,11 +425,12 @@ test "Full stack: GitHub Copilot streaming through provider" {
     const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
     while (true) {
         if (stream.poll()) |event| {
-            try accumulator.processEvent(event);
-
             switch (event) {
                 .start => saw_start = true,
-                .text_delta => saw_text_delta = true,
+                .text_delta => |d| {
+                    saw_text_delta = true;
+                    text_buffer.appendSlice(allocator, d.delta) catch {};
+                },
                 .done => saw_done = true,
                 else => {},
             }
@@ -446,7 +448,7 @@ test "Full stack: GitHub Copilot streaming through provider" {
     try testing.expect(saw_start);
     try testing.expect(saw_text_delta);
     try testing.expect(saw_done);
-    try testing.expect(accumulator.text_buffer.items.len > 0);
+    try testing.expect(text_buffer.items.len > 0);
 
     // Verify result
     const result = stream.getResult() orelse return error.NoResult;
@@ -515,10 +517,8 @@ test "Full stack: GitHub Copilot tool calls through provider" {
         allocator.destroy(stream);
     }
 
-    // Accumulate events
-    var accumulator = test_helpers.EventAccumulator.init(allocator);
-    defer accumulator.deinit();
-
+    // Track events (without accumulator.processEvent which tries to free borrowed strings)
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
     var saw_tool_call = false;
 
     // Poll until done
@@ -529,7 +529,7 @@ test "Full stack: GitHub Copilot tool calls through provider" {
                 .toolcall_start => saw_tool_call = true,
                 .toolcall_delta => saw_tool_call = true,
                 .toolcall_end => saw_tool_call = true,
-                else => try accumulator.processEvent(event),
+                else => {}, // Don't process or free - strings are borrowed
             }
         } else {
             if (stream.isDone()) break;
@@ -603,13 +603,14 @@ test "Full stack: GitHub Copilot abort through provider" {
     }
 
     // Read a few events then abort
+    // Note: Event strings are borrowed from provider's internal buffer, so we must NOT free them.
     var event_count: usize = 0;
     const max_events = 5;
 
     const deadline = test_helpers.createDeadline(10_000); // 10 second deadline
     while (event_count < max_events) {
-        if (stream.poll()) |event| {
-            test_helpers.freeEvent(event, allocator);
+        if (stream.poll()) |_| {
+            // Don't free event - strings are borrowed from provider's internal buffer
             event_count += 1;
         } else {
             if (stream.isDone()) break;
