@@ -418,7 +418,10 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
 
         // Check client's event stream for events - poll ALL available events
         while (client.getEventStream().poll()) |event| {
-            switch (event) {
+            var ev = event; // Make mutable copy for deinit
+            defer protocol_types.deinitEvent(allocator, &ev);
+
+            switch (ev) {
                 .start => saw_start = true,
                 .text_delta => |d| {
                     saw_text_delta = true;
@@ -605,7 +608,9 @@ test "Protocol: Ollama abort through protocol layer" {
         }
 
         // Poll ALL available events
-        while (client.getEventStream().poll()) |_| {
+        while (client.getEventStream().poll()) |event| {
+            var ev = event;
+            defer protocol_types.deinitEvent(allocator, &ev);
             event_count += 1;
         }
 
@@ -917,7 +922,9 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
         }
 
         // Poll ALL available events
-        while (client.getEventStream().poll()) |_| {
+        while (client.getEventStream().poll()) |event| {
+            var ev = event;
+            defer protocol_types.deinitEvent(allocator, &ev);
             event_count += 1;
         }
 

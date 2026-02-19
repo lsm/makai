@@ -211,20 +211,25 @@ pub const ProtocolClient = struct {
                 self.last_error = try self.allocator.dupe(u8, nack.reason);
             },
             .event => |evt| {
+                // Deep copy the event so the event stream owns its memory
+                // This is necessary because the envelope's deinit will free
+                // the original event's strings
+                const owned_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, evt);
+
                 // Push to event stream for polling
-                try self.event_stream.push(evt);
+                try self.event_stream.push(owned_evt);
 
                 // Process through reconstructor
-                try self.reconstructor.processEvent(evt);
+                try self.reconstructor.processEvent(owned_evt);
 
                 // Check for done event
-                if (evt == .done) {
+                if (owned_evt == .done) {
                     self.stream_complete = true;
 
                     // Build final message from reconstructor
                     const result = try self.reconstructor.buildMessage(
-                        evt.done.reason,
-                        evt.done.message.timestamp,
+                        owned_evt.done.reason,
+                        owned_evt.done.message.timestamp,
                     );
 
                     // Clean up previous result

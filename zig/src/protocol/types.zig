@@ -192,8 +192,16 @@ pub const Payload = union(enum) {
 };
 
 /// Helper to deinit AssistantMessageEvent variants that own memory
-fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEvent) void {
+pub fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEvent) void {
     switch (event.*) {
+        .start => |*s| s.partial.deinit(allocator),
+        .text_start => |*t| t.partial.deinit(allocator),
+        .thinking_start => |*t| t.partial.deinit(allocator),
+        .toolcall_start => |*t| {
+            allocator.free(t.id);
+            allocator.free(t.name);
+            t.partial.deinit(allocator);
+        },
         .text_delta => |*d| {
             allocator.free(d.delta);
             d.partial.deinit(allocator);
@@ -223,7 +231,7 @@ fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEv
         },
         .done => |*d| d.message.deinit(allocator),
         .@"error" => |*e| e.err.deinit(allocator),
-        .start, .text_start, .thinking_start, .toolcall_start, .keepalive => {},
+        .keepalive => {},
     }
 }
 

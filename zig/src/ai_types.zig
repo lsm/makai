@@ -570,6 +570,74 @@ pub fn deinitAssistantMessageOwned(allocator: std.mem.Allocator, msg: *Assistant
     msg.deinit(allocator);
 }
 
+/// Deep copy an AssistantMessageEvent, duplicating all owned strings.
+/// The caller is responsible for calling deinitEvent on the returned copy.
+pub fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: AssistantMessageEvent) !AssistantMessageEvent {
+    return switch (event) {
+        .start => |s| .{ .start = .{
+            .partial = try cloneAssistantMessage(allocator, s.partial),
+        } },
+        .text_start => |t| .{ .text_start = .{
+            .content_index = t.content_index,
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .text_delta => |d| .{ .text_delta = .{
+            .content_index = d.content_index,
+            .delta = try allocator.dupe(u8, d.delta),
+            .partial = try cloneAssistantMessage(allocator, d.partial),
+        } },
+        .text_end => |t| .{ .text_end = .{
+            .content_index = t.content_index,
+            .content = try allocator.dupe(u8, t.content),
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .thinking_start => |t| .{ .thinking_start = .{
+            .content_index = t.content_index,
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .thinking_delta => |d| .{ .thinking_delta = .{
+            .content_index = d.content_index,
+            .delta = try allocator.dupe(u8, d.delta),
+            .partial = try cloneAssistantMessage(allocator, d.partial),
+        } },
+        .thinking_end => |t| .{ .thinking_end = .{
+            .content_index = t.content_index,
+            .content = try allocator.dupe(u8, t.content),
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .toolcall_start => |t| .{ .toolcall_start = .{
+            .content_index = t.content_index,
+            .id = try allocator.dupe(u8, t.id),
+            .name = try allocator.dupe(u8, t.name),
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .toolcall_delta => |d| .{ .toolcall_delta = .{
+            .content_index = d.content_index,
+            .delta = try allocator.dupe(u8, d.delta),
+            .partial = try cloneAssistantMessage(allocator, d.partial),
+        } },
+        .toolcall_end => |t| .{ .toolcall_end = .{
+            .content_index = t.content_index,
+            .tool_call = .{
+                .id = try allocator.dupe(u8, t.tool_call.id),
+                .name = try allocator.dupe(u8, t.tool_call.name),
+                .arguments_json = try allocator.dupe(u8, t.tool_call.arguments_json),
+                .thought_signature = if (t.tool_call.thought_signature) |s| try allocator.dupe(u8, s) else null,
+            },
+            .partial = try cloneAssistantMessage(allocator, t.partial),
+        } },
+        .done => |d| .{ .done = .{
+            .reason = d.reason,
+            .message = try cloneAssistantMessage(allocator, d.message),
+        } },
+        .@"error" => |e| .{ .@"error" = .{
+            .reason = e.reason,
+            .err = try cloneAssistantMessage(allocator, e.err),
+        } },
+        .keepalive => .keepalive,
+    };
+}
+
 test "cloneAssistantMessage deep copies text content" {
     const content = [_]AssistantContent{.{ .text = .{ .text = "hello" } }};
     const msg = AssistantMessage{
