@@ -522,6 +522,39 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_protocol_fullstack_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/protocol_fullstack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+            },
+        }),
+    });
+
+    // Protocol E2E tests (mock-based, no real providers needed)
+    // Uses protocol_types as the root module to avoid conflict with server's local types.zig import
+    const e2e_protocol_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "transport", .module = transport_mod },
+                .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+                .{ .name = "stdio", .module = stdio_transport_mod },
+            },
+        }),
+    });
+
     const transport_test = b.addTest(.{ .root_module = transport_mod });
 
     const stdio_transport_test = b.addTest(.{ .root_module = stdio_transport_mod });
@@ -593,12 +626,20 @@ pub fn build(b: *std.Build) void {
     const test_e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E tests");
     test_e2e_ollama_step.dependOn(&b.addRunArtifact(e2e_ollama_test).step);
 
+    const test_e2e_protocol_fullstack_step = b.step("test-e2e-protocol-fullstack", "Run Protocol Fullstack E2E tests");
+    test_e2e_protocol_fullstack_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_test).step);
+
+    const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
+    test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
+
     const test_e2e_step = b.step("test-e2e", "Run E2E tests");
     test_e2e_step.dependOn(test_e2e_anthropic_step);
     test_e2e_step.dependOn(test_e2e_openai_step);
     test_e2e_step.dependOn(test_e2e_azure_step);
     test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
+    test_e2e_step.dependOn(test_e2e_protocol_fullstack_step);
+    test_e2e_step.dependOn(test_e2e_protocol_step);
 
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
     test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
