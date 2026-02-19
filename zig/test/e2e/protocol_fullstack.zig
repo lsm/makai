@@ -26,6 +26,10 @@ const PipeTransport = struct {
     to_client: std.ArrayList(u8),
     /// Buffer for client -> server messages
     to_server: std.ArrayList(u8),
+    /// Read position for server->client direction (client reads from to_client)
+    to_client_read_pos: usize,
+    /// Read position for client->server direction (server reads from to_server)
+    to_server_read_pos: usize,
     allocator: std.mem.Allocator,
 
     const Self = @This();
@@ -34,6 +38,8 @@ const PipeTransport = struct {
         return .{
             .to_client = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
             .to_server = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
+            .to_client_read_pos = 0,
+            .to_server_read_pos = 0,
             .allocator = allocator,
         };
     }
@@ -60,11 +66,12 @@ const PipeTransport = struct {
         };
     }
 
-    /// Client reads from this
+    /// Client reads from this (reads server->client messages from to_client buffer)
     pub fn clientReceiver(self: *Self) Receiver {
         return .{
             .transport = self,
-            .read_pos = 0,
+            .buffer = &self.to_client,
+            .read_pos_ptr = &self.to_client_read_pos,
         };
     }
 
@@ -85,39 +92,31 @@ const PipeTransport = struct {
         };
     }
 
-    /// Server reads from this
+    /// Server reads from this (reads client->server messages from to_server buffer)
     pub fn serverReceiver(self: *Self) Receiver {
         return .{
             .transport = self,
-            .read_pos = 0,
+            .buffer = &self.to_server,
+            .read_pos_ptr = &self.to_server_read_pos,
         };
     }
 
     pub const Receiver = struct {
         transport: *Self,
-        read_pos: usize,
+        buffer: *std.ArrayList(u8),
+        read_pos_ptr: *usize,
 
         pub fn readLine(self: *@This(), allocator: std.mem.Allocator) !?[]const u8 {
-            // Determine which buffer to read from based on direction
-            const buffer = if (self.read_pos < self.transport.to_client.items.len)
-                &self.transport.to_client
-            else
-                &self.transport.to_server;
+            const read_pos = self.read_pos_ptr.*;
 
-            // Find next newline starting from read_pos
-            const start_pos = if (self.read_pos < self.transport.to_client.items.len)
-                self.read_pos
-            else
-                self.read_pos - self.transport.to_client.items.len;
+            if (read_pos >= self.buffer.items.len) return null;
 
-            if (start_pos >= buffer.items.len) return null;
-
-            const remaining = buffer.items[start_pos..];
+            const remaining = self.buffer.items[read_pos..];
             if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
-                const line_end = start_pos + nl_pos;
-                const line = buffer.items[start_pos..line_end];
+                const line_end = read_pos + nl_pos;
+                const line = self.buffer.items[read_pos..line_end];
                 const result = try allocator.dupe(u8, line);
-                self.read_pos = line_end + 1;
+                self.read_pos_ptr.* = line_end + 1;
                 return result;
             }
             return null;
