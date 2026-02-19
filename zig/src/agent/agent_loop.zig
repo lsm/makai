@@ -1,7 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
-const api_registry = @import("api_registry");
 const types = @import("types.zig");
 
 // Re-export types needed by callers
@@ -12,21 +11,8 @@ pub const AgentLoopResult = types.AgentLoopResult;
 pub const AgentContext = types.AgentContext;
 pub const AgentTool = types.AgentTool;
 pub const AgentToolResult = types.AgentToolResult;
-
-/// Resolve the stream function from config.
-/// Priority: explicit stream_fn > registry lookup
-fn getStreamFn(config: AgentLoopConfig) !types.AgentStreamFn {
-    // Explicit stream_fn takes precedence
-    if (config.stream_fn) |fn_ptr| return fn_ptr;
-
-    // Fall back to registry lookup
-    if (config.registry) |registry| {
-        const provider = registry.getApiProvider(config.model.api) orelse return error.ProviderNotFound;
-        return provider.stream_simple;
-    }
-
-    return error.NoStreamFunction;
-}
+pub const ProtocolClient = types.ProtocolClient;
+pub const ProtocolOptions = types.ProtocolOptions;
 
 /// Build tool definitions array for LLM request
 fn buildToolsArray(
@@ -91,14 +77,56 @@ const ToolUpdateContext = struct {
     tool_name: []const u8,
 };
 
-/// Tool update callback implementation
+/// Tool update callback implementation - pushes tool_execution_update events
 fn onToolUpdate(ctx: ?*anyopaque, tool_call_id: []const u8, tool_name: []const u8, partial_result_json: []const u8) void {
-    _ = ctx;
-    _ = tool_call_id;
-    _ = tool_name;
-    _ = partial_result_json;
-    // Note: In a full implementation, we would push a tool_execution_update event here.
-    // For now, this is a placeholder as streaming tool updates are optional.
+    const context: *ToolUpdateContext = @ptrCast(@alignCast(ctx));
+
+    context.event_stream.push(.{ .tool_execution_update = .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .partial_result_json = partial_result_json,
+    } }) catch {};
+}
+
+/// Skip a tool call due to steering message interrupt.
+/// Emits tool_execution_start/end events and returns a ToolResultMessage
+/// with an error indicating the tool was skipped.
+fn skipToolCall(
+    allocator: std.mem.Allocator,
+    tool_call: ai_types.ToolCall,
+    event_stream: *AgentEventStream,
+) !ai_types.ToolResultMessage {
+    const skip_message = "Skipped due to queued user message.";
+
+    // Emit start event
+    try event_stream.push(.{ .tool_execution_start = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .args_json = tool_call.arguments_json,
+    } });
+
+    // Emit end event with skip result
+    try event_stream.push(.{ .tool_execution_end = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .result_json = skip_message,
+        .is_error = true,
+    } });
+
+    // Create tool result message
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, skip_message),
+    } };
+
+    return .{
+        .tool_call_id = try allocator.dupe(u8, tool_call.id),
+        .tool_name = try allocator.dupe(u8, tool_call.name),
+        .content = content,
+        .details_json = null,
+        .is_error = true,
+        .timestamp = std.time.milliTimestamp(),
+    };
 }
 
 /// Result from tool execution phase
@@ -141,7 +169,7 @@ fn executeToolCalls(
     var has_steering = false;
     var steering_messages: ?[]ai_types.Message = null;
 
-    for (tool_calls.items) |tool_call| {
+    for (tool_calls.items, 0..) |tool_call, index| {
         // Find tool
         const tool = findTool(config.tools, tool_call.name);
 
@@ -156,11 +184,18 @@ fn executeToolCalls(
         var is_error = false;
 
         if (tool) |t| {
+            // Create context for tool update callback
+            var update_ctx = ToolUpdateContext{
+                .event_stream = event_stream,
+                .tool_call_id = tool_call.id,
+                .tool_name = tool_call.name,
+            };
+
             result = t.execute(
                 tool_call.id,
                 tool_call.arguments_json,
                 config.cancel_token,
-                event_stream,
+                &update_ctx,
                 onToolUpdate,
                 allocator,
             ) catch |err| {
@@ -193,7 +228,13 @@ fn executeToolCalls(
                 if (msgs.len > 0) {
                     steering_messages = msgs;
                     has_steering = true;
-                    // Skip remaining tools - steering message takes priority
+
+                    // Skip remaining tools - emit skip events for each
+                    const remaining = tool_calls.items[index + 1 ..];
+                    for (remaining) |skipped_call| {
+                        const skipped_result = try skipToolCall(allocator, skipped_call, event_stream);
+                        try results.append(allocator, skipped_result);
+                    }
                     break;
                 } else {
                     allocator.free(msgs);
@@ -216,9 +257,6 @@ fn streamAssistantResponse(
     config: AgentLoopConfig,
     event_stream: *AgentEventStream,
 ) !ai_types.AssistantMessage {
-    // Resolve stream function (custom or from registry)
-    const stream_fn = try getStreamFn(config);
-
     // Build tools array for LLM
     var tools: ?[]ai_types.Tool = null;
     defer if (tools) |t| allocator.free(t);
@@ -232,19 +270,19 @@ fn streamAssistantResponse(
         .owned_strings = false,
     };
 
-    // Build stream options
-    const options = ai_types.SimpleStreamOptions{
+    // Build protocol options
+    const options = ProtocolOptions{
+        .api_key = config.api_key,
+        .session_id = config.session_id,
+        .cancel_token = config.cancel_token,
+        .thinking_budgets = config.thinking_budgets,
+        .max_retry_delay_ms = config.max_retry_delay_ms orelse 60_000,
         .temperature = config.temperature,
         .max_tokens = config.max_tokens,
-        .api_key = config.api_key,
-        .cancel_token = config.cancel_token,
-        .session_id = config.session_id,
-        .thinking_budgets = config.thinking_budgets,
-        .retry = .{ .max_retry_delay_ms = config.max_retry_delay_ms },
     };
 
-    // Call stream function (either direct provider or custom)
-    const provider_stream = try stream_fn(
+    // Call protocol client to stream
+    const provider_stream = try config.protocol.stream(
         config.model,
         llm_context,
         options,

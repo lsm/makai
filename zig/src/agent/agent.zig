@@ -1,6 +1,5 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
-const api_registry = @import("api_registry");
 const types = @import("types.zig");
 const agent_loop = @import("agent_loop.zig");
 
@@ -13,7 +12,7 @@ pub const AgentToolResult = types.AgentToolResult;
 pub const AgentState = types.AgentState;
 pub const AgentContext = types.AgentContext;
 pub const QueueMode = types.QueueMode;
-pub const AgentStreamFn = types.AgentStreamFn;
+pub const ProtocolClient = types.ProtocolClient;
 pub const TransformContextFn = types.TransformContextFn;
 pub const ConvertToLlmFn = types.ConvertToLlmFn;
 pub const GetApiKeyFn = types.GetApiKeyFn;
@@ -25,11 +24,8 @@ pub const AgentOptions = struct {
     // Initial state
     initial_state: ?AgentState = null,
 
-    // Provider access (one of these is required):
-    // Option 1: Registry for direct provider access
-    registry: ?*api_registry.ApiRegistry = null,
-    // Option 2: Custom stream function (e.g., protocol client)
-    stream_fn: ?AgentStreamFn = null,
+    // Protocol client (required) - single interface to provider layer
+    protocol: ProtocolClient,
 
     // Message transformation
     convert_to_llm_fn: ?ConvertToLlmFn = null,
@@ -56,9 +52,8 @@ pub const Agent = struct {
     _state: AgentState,
     _allocator: std.mem.Allocator,
 
-    // Provider access (one of these)
-    _registry: ?*api_registry.ApiRegistry,
-    _stream_fn: ?AgentStreamFn,
+    // Protocol client (single interface to provider layer)
+    _protocol: ProtocolClient,
 
     // Subscribers
     _listeners: std.ArrayList(*const fn (event: AgentEvent) void),
@@ -72,6 +67,9 @@ pub const Agent = struct {
     _follow_up_queue: std.ArrayList(ai_types.Message),
     _steering_mode: QueueMode,
     _follow_up_mode: QueueMode,
+
+    // Run context for skip flag (thread-safe per-agent)
+    _skip_initial_steering_poll: bool,
 
     // Configuration
     _convert_to_llm_fn: ?ConvertToLlmFn,
@@ -96,8 +94,7 @@ pub const Agent = struct {
         return .{
             ._state = initial_state.?,
             ._allocator = allocator,
-            ._registry = options.registry,
-            ._stream_fn = options.stream_fn,
+            ._protocol = options.protocol,
             ._listeners = .{},
             ._cancel_token = null,
             ._is_running = false,
@@ -105,6 +102,7 @@ pub const Agent = struct {
             ._follow_up_queue = .{},
             ._steering_mode = options.steering_mode,
             ._follow_up_mode = options.follow_up_mode,
+            ._skip_initial_steering_poll = false,
             ._convert_to_llm_fn = options.convert_to_llm_fn,
             ._convert_to_llm_ctx = options.convert_to_llm_ctx,
             ._transform_context_fn = options.transform_context_fn,
@@ -385,6 +383,9 @@ pub const Agent = struct {
         self._state.stream_message = null;
         self._state.error_message = null;
 
+        // Set skip flag for this run (stored in agent, not global)
+        self._skip_initial_steering_poll = options.skip_initial_steering_poll;
+
         // Build context
         var context = AgentContext.init(self._allocator);
         defer context.deinit();
@@ -397,13 +398,10 @@ pub const Agent = struct {
             try context.appendMessage(msg);
         }
 
-        _ = options.skip_initial_steering_poll;
-
         // Build config
         const config = agent_loop.AgentLoopConfig{
             .model = model,
-            .stream_fn = self._stream_fn,
-            .registry = self._registry,
+            .protocol = self._protocol,
             .tools = self._state.tools,
             .temperature = null,
             .max_tokens = null,
@@ -424,9 +422,6 @@ pub const Agent = struct {
             .get_api_key_fn = self._get_api_key_fn,
             .get_api_key_ctx = self._get_api_key_ctx,
         };
-
-        // Store skip flag - using module-level variable for callback
-        _skip_initial_steering_poll = true;
 
         // Run loop
         const stream = if (messages) |msgs|
@@ -479,9 +474,6 @@ pub const Agent = struct {
         self._state.is_streaming = false;
         self._cancel_token = null;
     }
-
-    // Flag for skipping initial steering poll
-    var _skip_initial_steering_poll: bool = false;
 
     fn emit(self: *Agent, event: AgentEvent) void {
         for (self._listeners.items) |listener| {
@@ -539,8 +531,9 @@ pub const Agent = struct {
         _ = allocator; // Used by dequeueSteeringMessages internally
         const self: *Agent = @ptrCast(@alignCast(ctx));
 
-        if (_skip_initial_steering_poll) {
-            _skip_initial_steering_poll = false;
+        // Check skip flag stored in agent instance (thread-safe per-agent)
+        if (self._skip_initial_steering_poll) {
+            self._skip_initial_steering_poll = false;
             return null;
         }
 

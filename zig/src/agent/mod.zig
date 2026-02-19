@@ -12,33 +12,22 @@
 ///
 /// ## Provider Access
 ///
-/// The agent supports two modes of provider access:
+/// The agent uses a ProtocolClient interface to communicate with the provider layer.
+/// This abstracts away transport, credentials, and provider-specific details.
 ///
-/// ### Option 1: Direct Provider Access (via ApiRegistry)
-/// For in-process use where providers are registered locally:
+/// ### Example: In-Process Provider Access
 /// ```zig
-/// var registry = api_registry.ApiRegistry.init(allocator);
-/// try registerBuiltins(&registry);
-///
+/// const protocol = createInProcessProtocolClient(allocator, &registry);
 /// var agent = Agent.init(allocator, .{
-///     .registry = &registry,
+///     .protocol = protocol,
 /// });
 /// ```
 ///
-/// ### Option 2: Custom Stream Function (via Protocol Client)
-/// For remote access or custom implementations:
+/// ### Example: Remote Protocol Server
 /// ```zig
-/// fn streamViaProtocol(
-///     model: ai_types.Model,
-///     context: ai_types.Context,
-///     options: ?ai_types.SimpleStreamOptions,
-///     allocator: std.mem.Allocator,
-/// ) anyerror!*event_stream.AssistantMessageEventStream {
-///     // Use protocol client to communicate with remote server
-/// }
-///
+/// const protocol = createRemoteProtocolClient(allocator, "ws://localhost:8080");
 /// var agent = Agent.init(allocator, .{
-///     .stream_fn = streamViaProtocol,
+///     .protocol = protocol,
 /// });
 /// ```
 
@@ -70,6 +59,11 @@ pub const AgentState = @import("types.zig").AgentState;
 pub const AgentLoopResult = @import("types.zig").AgentLoopResult;
 pub const AgentEventStream = @import("types.zig").AgentEventStream;
 pub const QueueMode = @import("types.zig").QueueMode;
+
+// Re-export ProtocolClient types
+pub const ProtocolClient = @import("types.zig").ProtocolClient;
+pub const ProtocolOptions = @import("types.zig").ProtocolOptions;
+pub const ProtocolStreamFn = @import("types.zig").ProtocolStreamFn;
 
 // Re-export low-level functions from agent_loop.zig
 pub const agentLoop = @import("agent_loop.zig").agentLoop;
@@ -107,6 +101,8 @@ test "module exports all required types" {
     const mode: QueueMode = undefined;
     const agent: Agent = undefined;
     const opts: AgentOptions = undefined;
+    const protocol: ProtocolClient = undefined;
+    const protocol_opts: ProtocolOptions = undefined;
 
     // Use the variables to avoid unused errors
     _ = event;
@@ -119,4 +115,6 @@ test "module exports all required types" {
     _ = mode;
     _ = agent;
     _ = opts;
+    _ = protocol;
+    _ = protocol_opts;
 }

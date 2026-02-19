@@ -9,7 +9,7 @@ This document describes the design for implementing an agent loop in the Makai Z
 
 ## Goals
 
-1. **Flexible Provider Access**: Support both direct provider access (via `ApiRegistry`) and protocol client access (via custom stream function)
+1. **Clean Architecture**: Agent loop uses ProtocolClient as single interface to provider layer
 2. **Event-Driven Architecture**: Emit granular events for UI updates via `AgentEventStream`
 3. **Tool Execution**: Execute tools sequentially with streaming update support
 4. **Multi-Turn Support**: Automatically continue conversation when tools are called
@@ -17,6 +17,40 @@ This document describes the design for implementing an agent loop in the Makai Z
 6. **State Management**: Track streaming state, pending tool calls, and current partial message
 
 ## Architecture
+
+### Layer Separation
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Agent Layer                               │
+│  agent.zig, agent_loop.zig, types.zig                           │
+│  - Turn management, tool execution, steering/follow-up          │
+│  - Uses ProtocolClient interface (no provider knowledge)        │
+└─────────────────────┬───────────────────────────────────────────┘
+                      │ ProtocolClient interface
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Protocol Layer                               │
+│  client.zig, server.zig, types.zig                              │
+│  - Wire protocol (envelopes, sequencing)                        │
+│  - Transport abstraction (WebSocket, TCP, etc.)                 │
+└─────────────────────┬───────────────────────────────────────────┘
+                      │ Provider API calls
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      Provider Layer                              │
+│  api_registry.zig, providers/*                                  │
+│  - Provider implementations (Anthropic, OpenAI, Google, etc.)   │
+│  - Credential management, transport details (SSE, etc.)         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Key Principle**: The agent loop does NOT know about:
+- Which transport the provider uses (SSE, WebSocket, etc.)
+- How credentials are resolved
+- Provider-specific API formats
+
+All of that is hidden behind the `ProtocolClient` interface.
 
 ### Module Structure
 
@@ -34,7 +68,7 @@ zig/src/agent/
 types.zig
   ├── agent_loop.zig
   │     └── agent.zig
-  └── (uses ai_types, event_stream, api_registry)
+  └── (uses ai_types, event_stream)
 ```
 
 ---
@@ -135,6 +169,8 @@ pub const AgentToolResult = struct {
 /// Callback for streaming tool execution updates
 pub const ToolUpdateCallback = *const fn (
     ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
     partial_result_json: []const u8,
 ) void;
 
@@ -168,18 +204,47 @@ pub const AgentTool = struct {
 };
 ```
 
-### AgentStreamFn
+### ProtocolClient Interface
+
+The agent loop uses a single interface to communicate with the provider layer:
 
 ```zig
-/// Custom stream function for provider access.
-/// If provided, used directly. Otherwise, falls back to registry lookup.
-/// This allows both in-process (via registry) and remote (via protocol client) access.
-pub const AgentStreamFn = *const fn (
-    model: ai_types.Model,
-    context: ai_types.Context,
-    options: ?ai_types.SimpleStreamOptions,
-    allocator: std.mem.Allocator,
-) anyerror!*event_stream.AssistantMessageEventStream;
+/// Protocol client interface for agent loop.
+/// Abstracts away transport, credentials, and provider specifics.
+pub const ProtocolClient = struct {
+    /// Stream function pointer
+    stream_fn: *const fn (
+        ctx: ?*anyopaque,
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ProtocolOptions,
+        allocator: std.mem.Allocator,
+    ) anyerror!*event_stream.AssistantMessageEventStream,
+
+    /// Context pointer passed to stream_fn
+    ctx: ?*anyopaque = null,
+
+    /// Convenience method to call the stream function
+    pub fn stream(
+        self: ProtocolClient,
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ProtocolOptions,
+        allocator: std.mem.Allocator,
+    ) anyerror!*event_stream.AssistantMessageEventStream {
+        return self.stream_fn(self.ctx, model, context, options, allocator);
+    }
+};
+
+/// Options for protocol streaming (agent-level concerns only)
+pub const ProtocolOptions = struct {
+    api_key: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    cancel_token: ?ai_types.CancelToken = null,
+    thinking_budgets: ?ai_types.ThinkingBudgets = null,
+    max_retry_delay_ms: u32 = 60_000,
+    // Note: NO transport field - that's provider-level config
+};
 ```
 
 ### AgentLoopConfig
@@ -221,16 +286,13 @@ pub const AgentLoopConfig = struct {
     // Required
     model: ai_types.Model,
 
-    // Provider access (one of these is required):
-    // Option 1: Custom stream function (e.g., protocol client, mock, etc.)
-    stream_fn: ?AgentStreamFn = null,
-    // Option 2: Registry for direct provider access (in-process)
-    registry: ?*api_registry.ApiRegistry = null,
+    // Protocol client (single interface to provider layer)
+    protocol: ProtocolClient,
 
     // Tools (optional)
     tools: ?[]const AgentTool = null,
 
-    // Streaming options (passed through to provider)
+    // Streaming options (passed through to protocol)
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
@@ -397,7 +459,7 @@ pub fn agentLoopContinue(
          - Emit message_start/message_end for each
          - Add to context
       ii. Stream assistant response:
-          - Call provider via registry
+          - Call protocol.stream()
           - Forward AssistantMessageEvents as message_update events
           - Emit message_start on first event, message_end on done
       iii. Check stop_reason:
@@ -407,11 +469,12 @@ pub fn agentLoopContinue(
       iv. If tool calls:
           - For each tool call (sequential):
             a. Emit tool_execution_start
-            b. Execute tool
-            c. Emit tool_execution_update during execution (if streaming)
-            d. Emit tool_execution_end
-            e. Check steering messages - if any, skip remaining tools
-          - Create ToolResultMessage for each result
+            b. Execute tool (may emit tool_execution_update during)
+            c. Emit tool_execution_end
+            d. Check steering messages - if any:
+               - Skip remaining tools with skipToolCall()
+               - Break out of tool loop
+          - Create ToolResultMessage for each result (including skipped)
           - Emit message_start/message_end for each tool result
           - Add to context
       v. Check steering messages after turn
@@ -426,6 +489,238 @@ pub fn agentLoopContinue(
 
 ---
 
+## Tool Execution
+
+### executeToolCalls
+
+```zig
+const ToolExecutionResult = struct {
+    tool_results: []ai_types.ToolResultMessage,
+    has_steering: bool,
+    steering_messages: ?[]ai_types.Message,
+};
+
+fn executeToolCalls(
+    allocator: std.mem.Allocator,
+    assistant_message: ai_types.AssistantMessage,
+    config: AgentLoopConfig,
+    event_stream: *AgentEventStream,
+) !ToolExecutionResult {
+
+    // Extract tool calls from assistant message
+    var tool_calls = std.ArrayList(ai_types.ToolCall).init(allocator);
+    defer tool_calls.deinit();
+    for (assistant_message.content) |block| {
+        if (block == .tool_call) {
+            try tool_calls.append(block.tool_call);
+        }
+    }
+
+    var results = std.ArrayList(ai_types.ToolResultMessage).init(allocator);
+    var has_steering = false;
+    var steering_messages: ?[]ai_types.Message = null;
+
+    for (tool_calls.items) |tool_call| {
+        // Find tool
+        const tool = findTool(config.tools, tool_call.name);
+
+        // Emit start event
+        try event_stream.push(.{ .tool_execution_start = .{
+            .tool_call_id = tool_call.id,
+            .tool_name = tool_call.name,
+            .args_json = tool_call.arguments_json,
+        }});
+
+        var result: AgentToolResult = undefined;
+        var is_error = false;
+
+        if (tool) |t| {
+            // Create context for tool update callback
+            var update_ctx = ToolUpdateContext{
+                .event_stream = event_stream,
+                .tool_call_id = tool_call.id,
+                .tool_name = tool_call.name,
+            };
+
+            result = t.execute(
+                tool_call.id,
+                tool_call.arguments_json,
+                config.cancel_token,
+                &update_ctx,     // Context for callback
+                onToolUpdate,    // Callback function
+                allocator,
+            ) catch |err| {
+                result = createErrorResult(allocator, err);
+                is_error = true;
+            };
+        } else {
+            result = createErrorResult(allocator, error.ToolNotFound);
+            is_error = true;
+        }
+
+        // Emit end event
+        try event_stream.push(.{ .tool_execution_end = .{
+            .tool_call_id = tool_call.id,
+            .tool_name = tool_call.name,
+            .result_json = result.details_json orelse "null",
+            .is_error = is_error,
+        }});
+
+        // Create tool result message
+        try results.append(createToolResultMessage(allocator, tool_call, result, is_error));
+
+        // Check for steering messages - skip remaining tools if any
+        if (config.get_steering_messages_fn) |get_steering| {
+            if (try get_steering(config.get_steering_messages_ctx, allocator)) |msgs| {
+                if (msgs.len > 0) {
+                    steering_messages = msgs;
+                    has_steering = true;
+
+                    // Skip remaining tools - emit skip events for each
+                    const remaining = tool_calls.items[tool_call_index + 1..];
+                    for (remaining) |skipped_call| {
+                        try results.append(skipToolCall(allocator, skipped_call, event_stream));
+                    }
+                    break;
+                } else {
+                    allocator.free(msgs);
+                }
+            }
+        }
+    }
+
+    return .{
+        .tool_results = try results.toOwnedSlice(),
+        .has_steering = has_steering,
+        .steering_messages = steering_messages,
+    };
+}
+```
+
+### skipToolCall
+
+When a steering message arrives, remaining tool calls must be marked as skipped so the LLM receives complete tool results:
+
+```zig
+/// Skip a tool call due to steering message interrupt.
+/// Emits tool_execution_start/end events and returns a ToolResultMessage
+/// with an error indicating the tool was skipped.
+fn skipToolCall(
+    allocator: std.mem.Allocator,
+    tool_call: ai_types.ToolCall,
+    event_stream: *AgentEventStream,
+) !ai_types.ToolResultMessage {
+    const skip_message = "Skipped due to queued user message.";
+
+    // Emit start event
+    try event_stream.push(.{ .tool_execution_start = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .args_json = tool_call.arguments_json,
+    }});
+
+    // Emit end event with skip result
+    try event_stream.push(.{ .tool_execution_end = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .result_json = skip_message,
+        .is_error = true,
+    }});
+
+    // Create tool result message
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, skip_message),
+    }};
+
+    return .{
+        .tool_call_id = try allocator.dupe(u8, tool_call.id),
+        .tool_name = try allocator.dupe(u8, tool_call.name),
+        .content = content,
+        .is_error = true,
+        .timestamp = std.time.milliTimestamp(),
+    };
+}
+```
+
+### Tool Update Streaming
+
+Long-running tools can report progress via the `on_update` callback:
+
+```zig
+/// Context passed to tool update callback
+const ToolUpdateContext = struct {
+    event_stream: *AgentEventStream,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+};
+
+/// Callback invoked by tools during execution to report progress
+fn onToolUpdate(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    partial_result_json: []const u8,
+) void {
+    const context: *ToolUpdateContext = @ptrCast(@alignCast(ctx));
+
+    context.event_stream.push(.{ .tool_execution_update = .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .partial_result_json = partial_result_json,
+    }}) catch {};
+}
+```
+
+**Example: Long-running tool with progress updates**
+
+```zig
+const SearchFilesTool = struct {
+    fn execute(
+        tool_call_id: []const u8,
+        args_json: []const u8,
+        cancel_token: ?ai_types.CancelToken,
+        on_update_ctx: ?*anyopaque,
+        on_update: ?ToolUpdateCallback,
+        allocator: std.mem.Allocator,
+    ) anyerror!AgentToolResult {
+        const args = try parseArgs(allocator, args_json);
+        var results = std.ArrayList(FileMatch).init(allocator);
+
+        const files = try getAllFiles(allocator, args.directory);
+        for (files, 0..) |file, i| {
+            // Check for cancellation
+            if (cancel_token) |token| {
+                if (token.isCancelled()) break;
+            }
+
+            const matches = try searchFile(allocator, file, args.query);
+            try results.appendSlice(matches);
+
+            // Report progress every 100 files
+            if (on_update) |callback| {
+                if (i % 100 == 0) {
+                    const progress = try std.fmt.allocPrint(allocator,
+                        "{{\"scanned\":{},\"total\":{},\"matches\":{}}}",
+                        .{ i + 1, files.len, results.items.len });
+                    defer allocator.free(progress);
+
+                    callback(on_update_ctx, tool_call_id, "search_files", progress);
+                }
+            }
+        }
+
+        return .{
+            .content = try buildContent(allocator, results.items),
+            .details_json = try buildDetails(allocator, results.items),
+            .owned_strings = true,
+        };
+    }
+};
+```
+
+---
+
 ## High-Level API (agent.zig)
 
 ### AgentOptions
@@ -435,11 +730,8 @@ pub const AgentOptions = struct {
     // Initial state
     initial_state: ?AgentState = null,
 
-    // Provider access (one of these is required):
-    // Option 1: Registry for direct provider access
-    registry: ?*api_registry.ApiRegistry = null,
-    // Option 2: Custom stream function (e.g., protocol client)
-    stream_fn: ?AgentStreamFn = null,
+    // Protocol client (required)
+    protocol: ProtocolClient,
 
     // Message transformation
     convert_to_llm_fn: ?ConvertToLlmFn = null,
@@ -451,7 +743,7 @@ pub const AgentOptions = struct {
     steering_mode: QueueMode = .one_at_a_time,
     follow_up_mode: QueueMode = .one_at_a_time,
 
-    // Provider options
+    // Protocol options
     session_id: ?[]const u8 = null,
     get_api_key_fn: ?GetApiKeyFn = null,
     get_api_key_ctx: ?*anyopaque = null,
@@ -468,22 +760,24 @@ pub const Agent = struct {
     _state: AgentState,
     _allocator: std.mem.Allocator,
 
-    // Provider access (one of these)
-    _registry: ?*api_registry.ApiRegistry,
-    _stream_fn: ?AgentStreamFn,
+    // Protocol client
+    _protocol: ProtocolClient,
 
     // Subscribers
     _listeners: std.ArrayList(*const fn (event: AgentEvent) void),
 
     // Control
     _cancel_token: ?ai_types.CancelToken = null,
-    _running_promise: ?Promise(void) = null,
+    _is_running: bool = false,
 
     // Message queues
     _steering_queue: std.ArrayList(ai_types.Message),
     _follow_up_queue: std.ArrayList(ai_types.Message),
     _steering_mode: QueueMode,
     _follow_up_mode: QueueMode,
+
+    // Skip initial steering poll flag (stored in run context, not global)
+    _skip_initial_steering_poll: bool = false,
 
     // Configuration
     _convert_to_llm_fn: ?ConvertToLlmFn,
@@ -550,6 +844,10 @@ pub const Agent = struct {
     /// Abort the current operation.
     pub fn abort(self: *Agent) void;
 
+    /// Wait for the agent to become idle.
+    /// Returns immediately if not running, otherwise blocks until current operation completes.
+    pub fn waitForIdle(self: *Agent) void;
+
     /// Reset all state (clear messages, queues, error).
     pub fn reset(self: *Agent) void;
 
@@ -559,212 +857,103 @@ pub const Agent = struct {
     fn emit(self: *Agent, event: AgentEvent) void;
     fn dequeueSteeringMessages(self: *Agent) ?[]const ai_types.Message;
     fn dequeueFollowUpMessages(self: *Agent) ?[]const ai_types.Message;
-    fn getStreamFn(self: Agent) ?AgentStreamFn;
 };
 ```
 
 ---
 
-## Provider Access
+## Protocol Client Integration
 
-The agent supports two modes of provider access:
+### Creating a Protocol Client
 
-### Option 1: Direct Provider Access (via ApiRegistry)
-
-For in-process use where providers are registered locally:
+The protocol client wraps the protocol layer and provides a clean interface to the agent:
 
 ```zig
-const config = agent.AgentLoopConfig{
-    .model = my_model,
-    .registry = &registry,  // Direct provider access
-    .api_key = "sk-...",
-};
-```
+const protocol = @import("protocol");
 
-### Option 2: Custom Stream Function (via Protocol Client)
-
-For remote access or custom implementations:
-
-```zig
-// Custom stream function wrapping a protocol client
-fn streamViaProtocol(
-    model: ai_types.Model,
-    context: ai_types.Context,
-    options: ?ai_types.SimpleStreamOptions,
-    allocator: std.mem.Allocator,
-) anyerror!*event_stream.AssistantMessageEventStream {
-    // Use protocol client to communicate with remote server
-    const client = protocol.Client.init(...);
-    return client.streamRequest(model, context, options, allocator);
-}
-
-const config = agent.AgentLoopConfig{
-    .model = my_model,
-    .stream_fn = streamViaProtocol,  // Custom stream function
-};
-```
-
-### Resolution Logic
-
-```zig
-fn getStreamFn(config: AgentLoopConfig) anyerror!AgentStreamFn {
-    // Explicit stream_fn takes precedence
-    if (config.stream_fn) |fn| return fn;
-
-    // Fall back to registry lookup
-    if (config.registry) |registry| {
-        const provider = registry.getApiProvider(config.model.api)
-            orelse return error.ProviderNotFound;
-        return provider.stream_simple;
-    }
-
-    return error.NoStreamFunction;
-}
-```
-
-### Full Example
-
-```zig
-fn streamAssistantResponse(
-    allocator: std.mem.Allocator,
-    context: *AgentContext,
-    config: AgentLoopConfig,
-    event_stream: *AgentEventStream,
-) !ai_types.AssistantMessage {
-    // Resolve stream function (custom or from registry)
-    const stream_fn = try getStreamFn(config);
-
-    // Build tools array for LLM
-    var tools: ?[]ai_types.Tool = null;
-    defer if (tools) |t| allocator.free(t);
-    if (context.tools) |agent_tools| {
-        tools = try allocator.alloc(ai_types.Tool, agent_tools.len);
-        for (agent_tools, 0..) |tool, i| {
-            tools.?[i] = tool.toTool(allocator);
-        }
-    }
-
-    // Build LLM context
-    const llm_context = ai_types.Context{
-        .system_prompt = context.system_prompt,
-        .messages = context.messagesSlice(),
-        .tools = tools,
-    };
-
-    // Build stream options
-    const options = ai_types.SimpleStreamOptions{
-        .temperature = config.temperature,
-        .max_tokens = config.max_tokens,
-        .api_key = config.api_key,
-        .cancel_token = config.cancel_token,
-        .session_id = config.session_id,
-        .thinking_budgets = config.thinking_budgets,
-        .retry = .{ .max_retry_delay_ms = config.max_retry_delay_ms },
-    };
-
-    // Call stream function (either direct provider or custom)
-    const provider_stream = try stream_fn(
-        config.model,
-        llm_context,
-        options,
-        allocator,
-    );
-    defer provider_stream.deinit();
-
-    // Forward events and collect final message
-    // ... (poll loop forwarding events)
-}
-```
-
----
-
-## Tool Execution
-
-```zig
-fn executeToolCalls(
-    allocator: std.mem.Allocator,
-    tools: ?[]const AgentTool,
-    assistant_message: ai_types.AssistantMessage,
-    config: AgentLoopConfig,
-    event_stream: *AgentEventStream,
-) !ToolExecutionResult {
-
-    // Extract tool calls from assistant message
-    var tool_calls = std.ArrayList(ai_types.ToolCall).init(allocator);
-    defer tool_calls.deinit();
-    for (assistant_message.content) |block| {
-        if (block == .tool_call) {
-            try tool_calls.append(block.tool_call);
-        }
-    }
-
-    var results = std.ArrayList(ai_types.ToolResultMessage).init(allocator);
-    var steering_messages: ?[]ai_types.Message = null;
-
-    for (tool_calls.items) |tool_call| {
-        // Find tool
-        const tool = findTool(tools, tool_call.name);
-
-        // Emit start event
-        try event_stream.push(.{ .tool_execution_start = .{
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .args_json = tool_call.arguments_json,
-        } });
-
-        var result: AgentToolResult = undefined;
-        var is_error = false;
-
-        if (tool) |t| {
-            result = t.execute(
-                tool_call.id,
-                tool_call.arguments_json,
-                config.cancel_token,
-                event_stream, // on_update_ctx
-                onToolUpdate, // callback
-                allocator,
-            ) catch |err| {
-                result = createErrorResult(allocator, err);
-                is_error = true;
-            };
-        } else {
-            result = createErrorResult(allocator, error.ToolNotFound);
-            is_error = true;
-        }
-
-        // Emit end event
-        try event_stream.push(.{ .tool_execution_end = .{
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .result_json = result.details_json orelse "null",
-            .is_error = is_error,
-        } });
-
-        // Create tool result message
-        try results.append(createToolResultMessage(allocator, tool_call, result, is_error));
-
-        // Check for steering messages - skip remaining tools if any
-        if (config.get_steering_messages_fn) |get_steering| {
-            steering_messages = try get_steering(config.get_steering_messages_ctx, allocator);
-            if (steering_messages != null and steering_messages.?.len > 0) {
-                // Skip remaining tools
-                // TODO: mark remaining as skipped
-                break;
-            }
-        }
-    }
+/// Create a protocol client that connects to a remote server
+fn createProtocolClient(allocator: std.mem.Allocator, server_url: []const u8) !ProtocolClient {
+    var client = try protocol.Client.init(allocator, server_url);
 
     return .{
-        .tool_results = try results.toOwnedSlice(),
-        .steering_messages = steering_messages,
+        .stream_fn = protocolStreamFn,
+        .ctx = client,
     };
 }
 
-fn onToolUpdate(ctx: ?*anyopaque, partial_result_json: []const u8) void {
-    const event_stream: *AgentEventStream = @ptrCast(@alignCast(ctx));
-    event_stream.push(.{ .tool_execution_update = .{
-        .partial_result_json = partial_result_json,
-    }}) catch {};
+/// Stream function that uses protocol client
+fn protocolStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream.AssistantMessageEventStream {
+    const client: *protocol.Client = @ptrCast(@alignCast(ctx));
+
+    // Convert protocol options to stream options
+    const stream_options = ai_types.SimpleStreamOptions{
+        .api_key = options.api_key,
+        .session_id = options.session_id,
+        .cancel_token = options.cancel_token,
+        .thinking_budgets = options.thinking_budgets,
+        .retry = .{ .max_retry_delay_ms = options.max_retry_delay_ms },
+    };
+
+    return client.streamRequest(model, context, stream_options, allocator);
+}
+```
+
+### In-Process Protocol (Direct Provider Access)
+
+For cases where the agent runs in the same process as the providers:
+
+```zig
+const api_registry = @import("api_registry");
+
+/// Create a protocol client that uses providers directly
+fn createInProcessProtocolClient(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry) !ProtocolClient {
+    var ctx = try allocator.create(InProcessContext);
+    ctx.* = .{
+        .allocator = allocator,
+        .registry = registry,
+    };
+
+    return .{
+        .stream_fn = inProcessStreamFn,
+        .ctx = ctx,
+    };
+}
+
+const InProcessContext = struct {
+    allocator: std.mem.Allocator,
+    registry: *api_registry.ApiRegistry,
+};
+
+fn inProcessStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream.AssistantMessageEventStream {
+    const ipc: *InProcessContext = @ptrCast(@alignCast(ctx));
+
+    // Look up provider in registry
+    const provider = ipc.registry.getApiProvider(model.api)
+        orelse return error.ProviderNotFound;
+
+    // Build stream options
+    const stream_options = ai_types.SimpleStreamOptions{
+        .api_key = options.api_key,
+        .session_id = options.session_id,
+        .cancel_token = options.cancel_token,
+        .thinking_budgets = options.thinking_budgets,
+        .retry = .{ .max_retry_delay_ms = options.max_retry_delay_ms },
+    };
+
+    // Call provider directly
+    return provider.stream_simple(model, context, stream_options, allocator);
 }
 ```
 
@@ -772,124 +961,20 @@ fn onToolUpdate(ctx: ?*anyopaque, partial_result_json: []const u8) void {
 
 ## Example Usage
 
-### Low-Level API - Direct Provider Access
+### High-Level API with Remote Protocol Server
 
 ```zig
 const std = @import("std");
 const agent = @import("agent");
 const ai_types = @import("ai_types");
-const api_registry = @import("api_registry");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Initialize registry
-    var registry = api_registry.ApiRegistry.init(allocator);
-    defer registry.deinit();
-    try @import("register_builtins").registerBuiltins(&registry);
-
-    // Create context
-    var context = agent.AgentContext.init(allocator);
-    defer context.deinit();
-    context.system_prompt = try allocator.dupe(u8, "You are a helpful assistant.");
-
-    // Configure loop with registry (direct provider access)
-    const config = agent.AgentLoopConfig{
-        .model = .{
-            .id = "claude-sonnet-4-20250514",
-            .api = "anthropic-messages",
-            // ... other fields
-        },
-        .registry = &registry,
-        .api_key = std.os.getenv("ANTHROPIC_API_KEY"),
-    };
-
-    // Create prompt
-    const user_msg = ai_types.Message{
-        .user = .{
-            .content = .{ .text = "Hello!" },
-            .timestamp = std.time.milliTimestamp(),
-        },
-    };
-
-    // Run loop
-    var event_stream = try agent.agentLoop(allocator, &.{user_msg}, context, config);
-    defer event_stream.deinit();
-
-    // Process events
-    while (event_stream.poll()) |event| {
-        switch (event) {
-            .message_end => |e| {
-                if (e.message == .assistant) {
-                    std.debug.print("Assistant: {s}\n", .{e.message.assistant.content[0].text.text});
-                }
-            },
-            .agent_end => {
-                std.debug.print("Done!\n", .{});
-            },
-            else => {},
-        }
-    }
-}
-```
-
-### Low-Level API - Protocol Client Access
-
-```zig
-const std = @import("std");
-const agent = @import("agent");
-const ai_types = @import("ai_types");
-const protocol = @import("protocol");
-const event_stream = @import("event_stream");
-
-// Custom stream function using protocol client
-fn myStreamFn(
-    model: ai_types.Model,
-    context: ai_types.Context,
-    options: ?ai_types.SimpleStreamOptions,
-    allocator: std.mem.Allocator,
-) anyerror!*event_stream.AssistantMessageEventStream {
-    var client = try protocol.Client.init(allocator, "ws://localhost:8080");
-    return client.streamRequest(model, context, options);
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var context = agent.AgentContext.init(allocator);
-    defer context.deinit();
-    context.system_prompt = try allocator.dupe(u8, "You are a helpful assistant.");
-
-    // Configure loop with custom stream function (no registry needed)
-    const config = agent.AgentLoopConfig{
-        .model = .{
-            .id = "claude-sonnet-4-20250514",
-            .api = "anthropic-messages",
-            // ... other fields
-        },
-        .stream_fn = myStreamFn,  // Custom stream function
-    };
-
-    // ... rest is the same
-}
-```
-
-### High-Level API (Agent Class) - Direct Provider Access
-
-```zig
-const std = @import("std");
-const agent = @import("agent");
-const ai_types = @import("ai_types");
-const api_registry = @import("api_registry");
 
 fn onAgentEvent(event: agent.AgentEvent) void {
     switch (event) {
         .tool_execution_start => |e| {
             std.debug.print("Tool started: {s}\n", .{e.tool_name});
+        },
+        .tool_execution_update => |e| {
+            std.debug.print("Tool progress: {s}\n", .{e.partial_result_json});
         },
         .tool_execution_end => |e| {
             std.debug.print("Tool finished: {s} (error: {})\n", .{ e.tool_name, e.is_error });
@@ -908,14 +993,12 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Initialize registry with built-in providers
-    var registry = api_registry.ApiRegistry.init(allocator);
-    defer registry.deinit();
-    try @import("register_builtins").registerBuiltins(&registry);
+    // Create protocol client (connects to remote server)
+    const protocol_client = try createProtocolClient(allocator, "ws://localhost:8080");
 
-    // Create agent with direct provider access
+    // Create agent with protocol client
     var ag = agent.Agent.init(allocator, .{
-        .registry = &registry,  // Direct provider access
+        .protocol = protocol_client,
     });
     defer ag.deinit();
 
@@ -938,49 +1021,40 @@ pub fn main() !void {
         },
     };
     try ag.prompt(user_msg);
+
+    // Wait for completion
+    ag.waitForIdle();
 }
 ```
 
-### High-Level API (Agent Class) - Protocol Client Access
+### High-Level API with In-Process Providers
 
 ```zig
 const std = @import("std");
 const agent = @import("agent");
 const ai_types = @import("ai_types");
-const protocol = @import("protocol");
-const event_stream = @import("event_stream");
-
-// Custom stream function that uses protocol client
-fn streamViaProtocol(
-    model: ai_types.Model,
-    context: ai_types.Context,
-    options: ?ai_types.SimpleStreamOptions,
-    allocator: std.mem.Allocator,
-) anyerror!*event_stream.AssistantMessageEventStream {
-    var client = try protocol.Client.init(allocator, "ws://localhost:8080");
-    return client.streamRequest(model, context, options);
-}
+const api_registry = @import("api_registry");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Create agent with custom stream function (no registry needed)
+    // Initialize registry with built-in providers
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try @import("register_builtins").registerBuiltins(&registry);
+
+    // Create in-process protocol client
+    const protocol_client = try createInProcessProtocolClient(allocator, &registry);
+
+    // Create agent
     var ag = agent.Agent.init(allocator, .{
-        .stream_fn = streamViaProtocol,  // Custom stream function
+        .protocol = protocol_client,
     });
     defer ag.deinit();
 
-    // Configure and use...
-    try ag.setSystemPrompt("You are a helpful assistant.");
-    ag.setModel(.{
-        .id = "claude-sonnet-4-20250514",
-        .api = "anthropic-messages",
-        // ...
-    });
-
-    // ...
+    // ... rest is the same
 }
 ```
 
@@ -991,6 +1065,7 @@ pub fn main() !void {
 1. **types.zig** - All type definitions
    - AgentEvent variants and payloads
    - AgentTool, AgentToolResult
+   - ProtocolClient, ProtocolOptions
    - AgentLoopConfig, AgentContext, AgentState
    - QueueMode
 
@@ -998,14 +1073,16 @@ pub fn main() !void {
    - `agentLoop()` entry point
    - `agentLoopContinue()` entry point
    - `runLoop()` inner/outer loop logic
-   - `streamAssistantResponse()` - provider integration
-   - `executeToolCalls()` - tool execution
+   - `streamAssistantResponse()` - protocol client integration
+   - `executeToolCalls()` - tool execution with steering check
+   - `skipToolCall()` - mark skipped tools
+   - `onToolUpdate()` - streaming progress callback
 
 3. **agent.zig** - High-level Agent class
    - State management
    - Message queues (steering/follow-up)
    - Subscribe/unsubscribe
-   - Control flow (prompt, continue, abort, reset)
+   - Control flow (prompt, continue, abort, reset, waitForIdle)
 
 4. **mod.zig** - Public exports
 
@@ -1022,14 +1099,16 @@ pub fn main() !void {
 | Error handling | Exceptions | Error unions |
 | Subscribers | Set<fn> | ArrayList(*const fn) |
 | Message queues | Array push/slice | ArrayList |
-| Proxy | Built-in | Not needed (provider layer handles) |
+| Provider access | streamFn or direct | ProtocolClient interface only |
+| Steering skip | Global skipInitialSteeringPoll | Stored in run context |
 
 ---
 
 ## Notes
 
-- **Flexible Provider Access**: Agent supports both direct provider access (via `registry`) and custom stream functions (e.g., protocol client). If `stream_fn` is provided, it takes precedence; otherwise falls back to registry lookup.
-- **Proxy streaming is NOT implemented** since the provider layer already handles different transport mechanisms
+- **Clean Layer Separation**: Agent loop uses ProtocolClient as single interface. Transport and credential details are hidden in the provider layer.
+- **skipToolCall**: When steering messages arrive, remaining tools are skipped with proper error events so the LLM receives complete tool results.
+- **Tool Update Streaming**: Long-running tools can report progress via the on_update callback, which pushes tool_execution_update events.
+- **No Global State**: The skip_initial_steering_poll flag is stored in the run context, not a global variable, making it safe for multiple agents.
 - **TypeScript's declaration merging for AgentMessage** doesn't translate to Zig - we use `ai_types.Message` directly
 - **AbortController pattern** replaced with `CancelToken` (atomic bool wrapper)
-- **Promise tracking** for `waitForIdle()` would need a simple completion flag or condition variable

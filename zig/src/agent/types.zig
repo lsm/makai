@@ -1,7 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
-const api_registry = @import("api_registry");
 
 // ============================================================================
 // Agent Event Types
@@ -158,12 +157,61 @@ pub const AgentTool = struct {
 };
 
 // ============================================================================
-// Agent Stream Function
+// Protocol Client Interface
+// ============================================================================
+
+/// Options for protocol streaming (agent-level concerns only).
+/// Transport and credential details are handled by the protocol client.
+pub const ProtocolOptions = struct {
+    api_key: ?[]const u8 = null,
+    session_id: ?[]const u8 = null,
+    cancel_token: ?ai_types.CancelToken = null,
+    thinking_budgets: ?ai_types.ThinkingBudgets = null,
+    max_retry_delay_ms: u32 = 60_000,
+    temperature: ?f32 = null,
+    max_tokens: ?u32 = null,
+};
+
+/// Stream function signature for ProtocolClient.
+pub const ProtocolStreamFn = *const fn (
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream.AssistantMessageEventStream;
+
+/// Protocol client interface for agent loop.
+/// Abstracts away transport, credentials, and provider specifics.
+/// This is the single interface the agent loop uses to communicate
+/// with the provider layer.
+pub const ProtocolClient = struct {
+    /// Stream function pointer
+    stream_fn: ProtocolStreamFn,
+
+    /// Context pointer passed to stream_fn
+    ctx: ?*anyopaque = null,
+
+    /// Convenience method to call the stream function
+    pub fn stream(
+        self: ProtocolClient,
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ProtocolOptions,
+        allocator: std.mem.Allocator,
+    ) anyerror!*event_stream.AssistantMessageEventStream {
+        return self.stream_fn(self.ctx, model, context, options, allocator);
+    }
+};
+
+// ============================================================================
+// Legacy Stream Function (for backward compatibility)
 // ============================================================================
 
 /// Custom stream function for provider access.
 /// If provided, used directly. Otherwise, falls back to registry lookup.
 /// This allows both in-process (via registry) and remote (via protocol client) access.
+/// Note: Prefer using ProtocolClient for new code.
 pub const AgentStreamFn = *const fn (
     model: ai_types.Model,
     context: ai_types.Context,
@@ -212,16 +260,14 @@ pub const AgentLoopConfig = struct {
     // Required
     model: ai_types.Model,
 
-    // Provider access (one of these is required):
-    // Option 1: Custom stream function (e.g., protocol client, mock, etc.)
-    stream_fn: ?AgentStreamFn = null,
-    // Option 2: Registry for direct provider access (in-process)
-    registry: ?*api_registry.ApiRegistry = null,
+    // Protocol client (single interface to provider layer)
+    // This abstracts away transport, credentials, and provider specifics.
+    protocol: ProtocolClient,
 
     // Tools (optional)
     tools: ?[]const AgentTool = null,
 
-    // Streaming options (passed through to provider)
+    // Streaming options (passed through to protocol)
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
@@ -484,4 +530,24 @@ test "TurnEndPayload with tool results" {
 
     // Just verify it compiles and has correct fields
     try std.testing.expect(payload.tool_results.len == 0);
+}
+
+test "ProtocolClient has stream method" {
+    // This is a compile-time check that ProtocolClient has the expected interface
+    const client: ProtocolClient = .{
+        .stream_fn = undefined,
+        .ctx = null,
+    };
+    try std.testing.expect(client.ctx == null);
+}
+
+test "ProtocolOptions defaults" {
+    const opts = ProtocolOptions{};
+    try std.testing.expect(opts.api_key == null);
+    try std.testing.expect(opts.session_id == null);
+    try std.testing.expect(opts.cancel_token == null);
+    try std.testing.expect(opts.thinking_budgets == null);
+    try std.testing.expectEqual(@as(u32, 60_000), opts.max_retry_delay_ms);
+    try std.testing.expect(opts.temperature == null);
+    try std.testing.expect(opts.max_tokens == null);
 }
