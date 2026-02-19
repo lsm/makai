@@ -147,14 +147,15 @@ const ProtocolPump = struct {
             if (active_stream.event_stream.poll()) |event| {
                 // Create an envelope with the event
                 const seq = self.server.getNextSequence(stream_id);
-                var env = protocol_types.Envelope{
+                const env = protocol_types.Envelope{
                     .stream_id = stream_id,
                     .message_id = protocol_types.generateUuid(),
                     .sequence = seq,
                     .timestamp = std.time.milliTimestamp(),
                     .payload = .{ .event = event },
                 };
-                defer env.deinit(self.allocator);
+                // NOTE: Do NOT call env.deinit() - event payloads have borrowed strings
+                // from the provider's internal buffer that will be freed when the stream deinit
 
                 // Serialize and send to client
                 const json = try envelope.serializeEnvelope(env, self.allocator);
@@ -172,14 +173,15 @@ const ProtocolPump = struct {
                 // Send done event if we haven't already
                 if (active_stream.event_stream.getResult()) |result| {
                     const seq = self.server.getNextSequence(stream_id);
-                    var env = protocol_types.Envelope{
+                    const env = protocol_types.Envelope{
                         .stream_id = stream_id,
                         .message_id = protocol_types.generateUuid(),
                         .sequence = seq,
                         .timestamp = std.time.milliTimestamp(),
                         .payload = .{ .result = result },
                     };
-                    defer env.deinit(self.allocator);
+                    // NOTE: Do NOT call env.deinit() - result payloads have borrowed strings
+                    // from the provider's internal buffer that will be freed when the stream deinit
 
                     const json = try envelope.serializeEnvelope(env, self.allocator);
                     defer self.allocator.free(json);
