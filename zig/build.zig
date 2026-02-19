@@ -639,6 +639,50 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
 
+    // Grouped unit test steps for parallel CI
+    const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
+    test_unit_core_step.dependOn(&b.addRunArtifact(event_stream_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(ai_types_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
+
+    const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
+    test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
+    test_unit_transport_step.dependOn(&b.addRunArtifact(stdio_transport_test).step);
+    test_unit_transport_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
+    test_unit_transport_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
+    test_unit_transport_step.dependOn(&b.addRunArtifact(in_process_transport_test).step);
+
+    const test_unit_protocol_step = b.step("test-unit-protocol", "Run protocol layer unit tests");
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(content_partial_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_envelope_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
+
+    const test_unit_providers_step = b.step("test-unit-providers", "Run provider unit tests");
+    test_unit_providers_step.dependOn(&b.addRunArtifact(api_registry_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(stream_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(azure_openai_responses_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+
+    const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
+    test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(retry_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
 
