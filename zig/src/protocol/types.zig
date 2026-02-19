@@ -192,47 +192,9 @@ pub const Payload = union(enum) {
 };
 
 /// Helper to deinit AssistantMessageEvent variants that own memory
+/// This is a convenience wrapper around ai_types.deinitAssistantMessageEvent
 pub fn deinitEvent(allocator: std.mem.Allocator, event: *ai_types.AssistantMessageEvent) void {
-    switch (event.*) {
-        .start => |*s| s.partial.deinit(allocator),
-        .text_start => |*t| t.partial.deinit(allocator),
-        .thinking_start => |*t| t.partial.deinit(allocator),
-        .toolcall_start => |*t| {
-            allocator.free(t.id);
-            allocator.free(t.name);
-            t.partial.deinit(allocator);
-        },
-        .text_delta => |*d| {
-            allocator.free(d.delta);
-            d.partial.deinit(allocator);
-        },
-        .text_end => |*t| {
-            allocator.free(t.content);
-            t.partial.deinit(allocator);
-        },
-        .thinking_delta => |*t| {
-            allocator.free(t.delta);
-            t.partial.deinit(allocator);
-        },
-        .thinking_end => |*t| {
-            allocator.free(t.content);
-            t.partial.deinit(allocator);
-        },
-        .toolcall_delta => |*t| {
-            allocator.free(t.delta);
-            t.partial.deinit(allocator);
-        },
-        .toolcall_end => |*t| {
-            allocator.free(t.tool_call.id);
-            allocator.free(t.tool_call.name);
-            if (t.tool_call.arguments_json.len > 0) allocator.free(t.tool_call.arguments_json);
-            if (t.tool_call.thought_signature) |s| allocator.free(s);
-            t.partial.deinit(allocator);
-        },
-        .done => |*d| d.message.deinit(allocator),
-        .@"error" => |*e| e.err.deinit(allocator),
-        .keepalive => {},
-    }
+    ai_types.deinitAssistantMessageEvent(allocator, event);
 }
 
 /// Request to start a streaming completion
