@@ -143,8 +143,9 @@ const ProtocolPump = struct {
             const active_stream = entry.stream;
             const stream_id = entry.stream_id;
 
-            // Poll the provider's event stream
-            if (active_stream.event_stream.poll()) |event| {
+            // Poll ALL available events from the provider's event stream
+            // before checking if the stream is done
+            while (active_stream.event_stream.poll()) |event| {
                 // Create an envelope with the event
                 const seq = self.server.getNextSequence(stream_id);
                 const env = protocol_types.Envelope{
@@ -168,9 +169,9 @@ const ProtocolPump = struct {
                 events_forwarded += 1;
             }
 
-            // Check if stream is done
+            // Check if stream is done (only after polling all events)
             if (active_stream.event_stream.isDone()) {
-                // Send done event if we haven't already
+                // Send result or error to client
                 if (active_stream.event_stream.getResult()) |result| {
                     const seq = self.server.getNextSequence(stream_id);
                     const env = protocol_types.Envelope{
@@ -189,6 +190,30 @@ const ProtocolPump = struct {
                     var sender = self.pipe.serverSender();
                     try sender.write(json);
                     try sender.flush();
+                } else if (active_stream.event_stream.getError()) |err_msg| {
+                    // Stream completed with error - send stream_error to client
+                    const seq = self.server.getNextSequence(stream_id);
+                    const err_copy = try self.allocator.dupe(u8, err_msg);
+                    var env = protocol_types.Envelope{
+                        .stream_id = stream_id,
+                        .message_id = protocol_types.generateUuid(),
+                        .sequence = seq,
+                        .timestamp = std.time.milliTimestamp(),
+                        .payload = .{ .stream_error = .{
+                            .code = .provider_error,
+                            .message = err_copy,
+                        } },
+                    };
+
+                    const json = try envelope.serializeEnvelope(env, self.allocator);
+                    defer self.allocator.free(json);
+
+                    var sender = self.pipe.serverSender();
+                    try sender.write(json);
+                    try sender.flush();
+
+                    // Free the error envelope's allocated memory
+                    env.deinit(self.allocator);
                 }
             }
         }
@@ -318,6 +343,13 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
     const stream_id = protocol_types.generateUuid();
     const message_id = protocol_types.generateUuid();
 
+    // Register pending request with client so ACK is processed correctly
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .sent_at = std.time.milliTimestamp(),
+        .timeout_ms = 30_000,
+    });
+
     var stream_req_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = message_id,
@@ -384,8 +416,8 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
             try client.processEnvelope(env);
         }
 
-        // Check client's event stream for events
-        if (client.getEventStream().poll()) |event| {
+        // Check client's event stream for events - poll ALL available events
+        while (client.getEventStream().poll()) |event| {
             switch (event) {
                 .start => saw_start = true,
                 .text_delta => |d| {
@@ -511,6 +543,13 @@ test "Protocol: Ollama abort through protocol layer" {
     const stream_id = protocol_types.generateUuid();
     const message_id = protocol_types.generateUuid();
 
+    // Register pending request with client so ACK is processed correctly
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .sent_at = std.time.milliTimestamp(),
+        .timeout_ms = 30_000,
+    });
+
     var stream_req_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = message_id,
@@ -565,7 +604,8 @@ test "Protocol: Ollama abort through protocol layer" {
             try client.processEnvelope(env);
         }
 
-        if (client.getEventStream().poll()) |_| {
+        // Poll ALL available events
+        while (client.getEventStream().poll()) |_| {
             event_count += 1;
         }
 
@@ -664,6 +704,13 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     // Create and send stream request
     const stream_id = protocol_types.generateUuid();
     const message_id = protocol_types.generateUuid();
+
+    // Register pending request with client so ACK is processed correctly
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .sent_at = std.time.milliTimestamp(),
+        .timeout_ms = 30_000,
+    });
 
     var stream_req_env = protocol_types.Envelope{
         .stream_id = stream_id,
@@ -810,6 +857,13 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     const stream_id = protocol_types.generateUuid();
     const message_id = protocol_types.generateUuid();
 
+    // Register pending request with client so ACK is processed correctly
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .sent_at = std.time.milliTimestamp(),
+        .timeout_ms = 30_000,
+    });
+
     var stream_req_env = protocol_types.Envelope{
         .stream_id = stream_id,
         .message_id = message_id,
@@ -862,7 +916,8 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
             try client.processEnvelope(env);
         }
 
-        if (client.getEventStream().poll()) |_| {
+        // Poll ALL available events
+        while (client.getEventStream().poll()) |_| {
             event_count += 1;
         }
 
