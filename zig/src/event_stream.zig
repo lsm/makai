@@ -55,16 +55,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 };
 
                 if (comptime is_assistant_message_event) {
-                    // Per PROTOCOL.md Section 12, events should own their strings.
-                    // Current implementation: events reference strings that may be owned by
-                    // the caller/producer. Callers who poll events are responsible for freeing
-                    // any owned strings. Unpolled events in the drain loop do not have their
-                    // strings freed here - the producer retains ownership and manages cleanup.
-                    // See transport.zig freeEventStrings() for proper cleanup when needed.
-                    _ = event;
-                } else {
-                    // Generic event handling for other event types.
-                    _ = event;
+                    // Events that own their strings (deep-copied via cloneAssistantMessageEvent)
+                    // need to be freed when draining the stream.
+                    var ev = event;
+                    ai_types.deinitAssistantMessageEvent(self.allocator, &ev);
                 }
             }
 
