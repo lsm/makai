@@ -124,8 +124,12 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
             try client.processEnvelope(env);
         }
 
-        if (client.getEventStream().poll()) |event| {
-            switch (event) {
+        // Check client's event stream for events - poll ALL available events
+        while (client.getEventStream().poll()) |event| {
+            var ev = event; // Make mutable copy for deinit
+            defer protocol_types.deinitEvent(allocator, &ev);
+
+            switch (ev) {
                 .start => saw_start = true,
                 .text_delta => |d| {
                     saw_text_delta = true;
