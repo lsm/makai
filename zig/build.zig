@@ -740,8 +740,27 @@ pub fn build(b: *std.Build) void {
     const test_e2e_protocol_fullstack_ollama_step = b.step("test-e2e-protocol-fullstack-ollama", "Run Protocol Fullstack E2E tests - Ollama");
     test_e2e_protocol_fullstack_ollama_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_ollama_test).step);
 
+    // GitHub Copilot E2E tests
+    const e2e_github_copilot_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/github_copilot_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "stream", .module = stream_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+            },
+        }),
+    });
+
     const test_e2e_protocol_fullstack_github_step = b.step("test-e2e-protocol-fullstack-github", "Run Protocol Fullstack E2E tests - GitHub Copilot");
     test_e2e_protocol_fullstack_github_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_github_test).step);
+
+    const test_e2e_github_copilot_step = b.step("test-e2e-github-copilot", "Run GitHub Copilot E2E tests");
+    test_e2e_github_copilot_step.dependOn(&b.addRunArtifact(e2e_github_copilot_test).step);
 
     const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
@@ -752,6 +771,7 @@ pub fn build(b: *std.Build) void {
     test_e2e_step.dependOn(test_e2e_azure_step);
     test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
+    test_e2e_step.dependOn(test_e2e_github_copilot_step);
     test_e2e_step.dependOn(test_e2e_protocol_fullstack_ollama_step);
     test_e2e_step.dependOn(test_e2e_protocol_fullstack_github_step);
     test_e2e_step.dependOn(test_e2e_protocol_step);
