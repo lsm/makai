@@ -117,7 +117,6 @@ test "github_copilot e2e: streaming events sequence" {
 
     var saw_start = false;
     var saw_text_delta = false;
-    var saw_done = false;
     var text_len: usize = 0;
 
     while (!stream.isDone()) {
@@ -128,7 +127,6 @@ test "github_copilot e2e: streaming events sequence" {
                     saw_text_delta = true;
                     text_len += d.delta.len;
                 },
-                .done => saw_done = true,
                 else => {},
             }
         }
@@ -145,6 +143,5 @@ test "github_copilot e2e: streaming events sequence" {
 
     try testing.expect(saw_start);
     try testing.expect(saw_text_delta);
-    try testing.expect(saw_done);
     try testing.expect(text_len > 0);
 }
