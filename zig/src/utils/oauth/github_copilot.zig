@@ -550,6 +550,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     try headers.append(allocator, .{ .name = "editor-version", .value = COPILOT_HEADERS.editor_version });
     try headers.append(allocator, .{ .name = "editor-plugin-version", .value = COPILOT_HEADERS.editor_plugin_version });
     try headers.append(allocator, .{ .name = "user-agent", .value = COPILOT_HEADERS.user_agent });
+    try headers.append(allocator, .{ .name = "copilot-integration-id", .value = COPILOT_HEADERS.copilot_integration_id });
 
     var request = try client.request(.GET, uri, .{
         .extra_headers = headers.items,
