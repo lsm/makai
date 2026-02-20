@@ -742,6 +742,8 @@ const ThreadCtx = struct {
         self.allocator.free(self.request_body);
         var mut_context = self.context;
         mut_context.deinit(self.allocator);
+        var mut_model = self.model;
+        mut_model.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 };
@@ -1665,6 +1667,13 @@ pub fn streamOpenAICompletions(
     };
     errdefer allocator.free(api_key);
 
+    // Clone model to own the memory (background thread outlives caller's memory)
+    const owned_model = try ai_types.cloneModel(allocator, model);
+    errdefer {
+        var mut_m = owned_model;
+        mut_m.deinit(allocator);
+    }
+
     // Clone context to own the memory (background thread outlives caller's memory)
     const owned_context = try ai_types.cloneContext(allocator, context);
     errdefer {
@@ -1672,7 +1681,7 @@ pub fn streamOpenAICompletions(
         mut_ctx.deinit(allocator);
     }
 
-    const req_body = try buildRequestBody(model, owned_context, resolved, allocator);
+    const req_body = try buildRequestBody(owned_model, owned_context, resolved, allocator);
     errdefer allocator.free(req_body);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
@@ -1685,13 +1694,15 @@ pub fn streamOpenAICompletions(
         allocator.free(req_body);
         var mut_ctx = owned_context;
         mut_ctx.deinit(allocator);
+        var mut_m = owned_model;
+        mut_m.deinit(allocator);
         allocator.free(api_key);
         allocator.destroy(ctx);
     }
     ctx.* = .{
         .allocator = allocator,
         .stream = s,
-        .model = model,
+        .model = owned_model,
         .api_key = @constCast(api_key),
         .request_body = req_body,
         .context = owned_context,

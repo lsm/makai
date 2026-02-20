@@ -786,6 +786,65 @@ pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
     };
 }
 
+/// Deep clone a Model. Caller owns the returned model and must call deinit().
+pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
+    // Clone string fields
+    const id = try allocator.dupe(u8, model.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, model.name);
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, model.api);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, model.provider);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, model.base_url);
+    errdefer allocator.free(base_url);
+
+    // Clone input array
+    const input = try allocator.alloc([]const u8, model.input.len);
+    errdefer allocator.free(input);
+    for (model.input, 0..) |inp, i| {
+        errdefer for (input[0..i]) |in| allocator.free(in);
+        input[i] = try allocator.dupe(u8, inp);
+    }
+
+    // Clone headers if present
+    var headers: ?[]HeaderPair = null;
+    if (model.headers) |h| {
+        headers = try allocator.alloc(HeaderPair, h.len);
+        errdefer if (headers) |hs| allocator.free(hs);
+        for (h, 0..) |hp, i| {
+            headers.?[i] = .{
+                .name = try allocator.dupe(u8, hp.name),
+                .value = try allocator.dupe(u8, hp.value),
+            };
+        }
+    }
+    errdefer if (headers) |hs| {
+        for (hs) |*hp| {
+            allocator.free(hp.name);
+            allocator.free(hp.value);
+        }
+        allocator.free(hs);
+    };
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = model.reasoning,
+        .input = input,
+        .cost = model.cost,
+        .context_window = model.context_window,
+        .max_tokens = model.max_tokens,
+        .headers = headers,
+        .compat = model.compat,
+        .owned_strings = true,
+    };
+}
+
 test "cloneAssistantMessage deep copies text content" {
     const content = [_]AssistantContent{.{ .text = .{ .text = "hello" } }};
     const msg = AssistantMessage{
