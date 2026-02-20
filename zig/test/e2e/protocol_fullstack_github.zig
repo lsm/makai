@@ -150,15 +150,6 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
-    // Debug output
-    std.debug.print("\n\x1b[36mDEBUG\x1b[0m: saw_start={}, saw_text_delta={}, saw_done={}, saw_result={}, text_len={}\n", .{
-        saw_start,
-        saw_text_delta,
-        saw_done,
-        saw_result,
-        text_buffer.items.len,
-    });
-
     // Check for errors before asserting success
     if (client.last_error) |err| {
         std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
