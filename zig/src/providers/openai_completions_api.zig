@@ -1324,6 +1324,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // After retry loop, check final status
     if (response.head.status != .ok) {
+        // Read error body for debugging
+        var error_buf: [4096]u8 = undefined;
+        const error_body = response.reader(&error_buf).*.allocRemaining(allocator, std.io.Limit.limited(8192)) catch null;
+        defer if (error_body) |eb| allocator.free(eb);
+
+        std.debug.print("OpenAI API error: status={d}, url={s}\n", .{ @intFromEnum(response.head.status), base_url });
+        if (error_body) |eb| {
+            std.debug.print("Error body: {s}\n", .{eb});
+        }
+
         allocator.free(api_key);
         allocator.free(request_body);
         allocator.destroy(ctx);
