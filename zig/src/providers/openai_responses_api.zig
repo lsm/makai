@@ -1413,6 +1413,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
 /// Convert ThinkingLevel enum to reasoning_effort string
 fn thinkingLevelToString(level: ai_types.ThinkingLevel) []const u8 {
     return switch (level) {
+        .off => "off",
         .minimal => "minimal",
         .low => "low",
         .medium => "medium",

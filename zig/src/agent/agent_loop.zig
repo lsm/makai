@@ -299,6 +299,27 @@ fn streamAssistantResponse(
     config: AgentLoopConfig,
     event_stream: *AgentEventStream,
 ) !ai_types.AssistantMessage {
+    // Get messages to send to LLM
+    var messages = context.messagesSlice();
+
+    // Apply context transformation if configured (works on Message[] level)
+    var transformed_messages: ?[]const ai_types.Message = null;
+    defer if (transformed_messages) |tm| allocator.free(tm);
+
+    if (config.transform_context_fn) |transform| {
+        transformed_messages = try transform(config.transform_context_ctx, messages, allocator);
+        messages = transformed_messages.?;
+    }
+
+    // Convert to LLM-compatible messages if configured
+    var llm_messages: ?[]const ai_types.Message = null;
+    defer if (llm_messages) |lm| allocator.free(llm_messages);
+
+    if (config.convert_to_llm_fn) |convert| {
+        llm_messages = try convert(config.convert_to_llm_ctx, messages, allocator);
+        messages = llm_messages.?;
+    }
+
     // Build tools array for LLM
     var tools: ?[]ai_types.Tool = null;
     defer if (tools) |t| allocator.free(t);
@@ -307,7 +328,7 @@ fn streamAssistantResponse(
     // Build LLM context
     const llm_context = ai_types.Context{
         .system_prompt = context.system_prompt,
-        .messages = context.messagesSlice(),
+        .messages = messages,
         .tools = tools,
         .owned_strings = false,
     };

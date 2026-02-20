@@ -312,23 +312,79 @@ pub const Agent = struct {
     // === Control Flow ===
 
     /// Send a prompt to start a new conversation turn.
+    /// Accepts:
+    ///   - []const u8 (string) - creates a user message with text
+    ///   - []const ai_types.Message - array of messages
+    ///   - ai_types.Message - single message
     /// Returns error if already streaming.
     pub fn prompt(self: *Agent, message_or_messages: anytype) !void {
         if (self._state.is_streaming) {
             return error.AgentAlreadyStreaming;
         }
 
-        const messages: []const ai_types.Message = switch (@TypeOf(message_or_messages)) {
+        const T = @TypeOf(message_or_messages);
+        const messages: []const ai_types.Message = switch (T) {
+            []const u8, *const []const u8 => blk: {
+                // String input - create a user message
+                const text = if (T == *const []const u8) message_or_messages.* else message_or_messages;
+                const msg = ai_types.Message{
+                    .user = .{
+                        .content = .{ .text = text },
+                        .timestamp = std.time.milliTimestamp(),
+                    },
+                };
+                break :blk @as([]const ai_types.Message, &.{msg});
+            },
             []const ai_types.Message => message_or_messages,
             ai_types.Message => blk: {
                 // Single message - need to create a temporary array
                 // Note: caller retains ownership of the message
                 break :blk @as([]const ai_types.Message, &.{message_or_messages});
             },
-            else => @compileError("prompt expects a Message or []const Message"),
+            else => @compileError("prompt expects a string, Message, or []const Message"),
         };
 
         try self.runLoop(messages);
+    }
+
+    /// Send a prompt with text and optional images.
+    /// Creates a user message with content parts (text + images).
+    /// Returns error if already streaming.
+    pub fn promptWithImages(
+        self: *Agent,
+        text: []const u8,
+        images: ?[]const ai_types.ImageContent,
+    ) !void {
+        if (self._state.is_streaming) {
+            return error.AgentAlreadyStreaming;
+        }
+
+        // Build content parts
+        var content_parts: std.ArrayList(ai_types.UserContentPart) = .{};
+        defer content_parts.deinit(self._allocator);
+
+        // Add text part
+        try content_parts.append(self._allocator, .{
+            .text = .{ .text = text },
+        });
+
+        // Add image parts if provided
+        if (images) |imgs| {
+            for (imgs) |img| {
+                try content_parts.append(self._allocator, .{
+                    .image = img,
+                });
+            }
+        }
+
+        const msg = ai_types.Message{
+            .user = .{
+                .content = .{ .parts = content_parts.items },
+                .timestamp = std.time.milliTimestamp(),
+            },
+        };
+
+        try self.runLoop(&.{msg});
     }
 
     /// Continue from current context (for retries and queued messages).

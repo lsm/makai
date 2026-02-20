@@ -51,6 +51,7 @@ fn supportsAdaptiveThinking(model_id: []const u8) bool {
 /// Map ThinkingLevel to Anthropic effort levels for adaptive thinking
 fn mapThinkingLevelToEffort(level: ai_types.ThinkingLevel) []const u8 {
     return switch (level) {
+        .off => "low", // off maps to lowest effort
         .minimal => "low",
         .low => "low",
         .medium => "medium",
@@ -63,14 +64,16 @@ fn mapThinkingLevelToEffort(level: ai_types.ThinkingLevel) []const u8 {
 fn getDefaultThinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets) u32 {
     if (budgets) |b| {
         return switch (level) {
+            .off => 0, // off means no thinking budget
             .minimal => b.minimal orelse 256,
             .low => b.low orelse 512,
             .medium => b.medium orelse 1024,
             .high => b.high orelse 2048,
-            .xhigh => 4096,
+            .xhigh => b.xhigh orelse 4096,
         };
     }
     return switch (level) {
+        .off => 0,
         .minimal => 256,
         .low => 512,
         .medium => 1024,

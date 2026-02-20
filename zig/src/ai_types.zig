@@ -11,7 +11,7 @@ pub const KnownApi = enum {
     ollama,
 };
 
-pub const ThinkingLevel = enum { minimal, low, medium, high, xhigh };
+pub const ThinkingLevel = enum { off, minimal, low, medium, high, xhigh };
 
 pub const ServiceTier = enum {
     default,
@@ -30,6 +30,7 @@ pub const ThinkingBudgets = struct {
     low: ?u32 = null,
     medium: ?u32 = null,
     high: ?u32 = null,
+    xhigh: ?u32 = null,
 };
 
 pub const CacheRetention = enum { none, short, long };

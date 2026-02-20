@@ -123,11 +123,13 @@ fn isValidThoughtSignature(sig: ?[]const u8) bool {
 fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model) []const u8 {
     if (isGemini3ProModel(model.id)) {
         return switch (level) {
+            .off => "NONE",
             .minimal, .low => "LOW",
             .medium, .high, .xhigh => "HIGH",
         };
     }
     return switch (level) {
+        .off => "NONE",
         .minimal => "MINIMAL",
         .low => "LOW",
         .medium => "MEDIUM",
@@ -137,18 +139,22 @@ fn getGemini3ThinkingLevel(level: ai_types.ThinkingLevel, model: ai_types.Model)
 
 /// Get default thinking budget for Gemini 2.5 models
 fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets, model_id: []const u8) i32 {
+    if (level == .off) return 0;
+
     if (budgets) |b| {
         return switch (level) {
+            .off => 0,
             .minimal => if (b.minimal) |v| @intCast(v) else -1,
             .low => if (b.low) |v| @intCast(v) else -1,
             .medium => if (b.medium) |v| @intCast(v) else -1,
             .high => if (b.high) |v| @intCast(v) else -1,
-            .xhigh => -1,
+            .xhigh => if (b.xhigh) |v| @intCast(v) else -1,
         };
     }
 
     if (isGemini25ProModel(model_id)) {
         return switch (level) {
+            .off => 0,
             .minimal => 128,
             .low => 2048,
             .medium => 8192,
@@ -158,6 +164,7 @@ fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBud
 
     if (isGemini25FlashModel(model_id)) {
         return switch (level) {
+            .off => 0,
             .minimal => 128,
             .low => 2048,
             .medium => 8192,
