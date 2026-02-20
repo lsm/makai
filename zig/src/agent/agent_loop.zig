@@ -38,6 +38,28 @@ fn findTool(tools: ?[]const AgentTool, name: []const u8) ?AgentTool {
     return null;
 }
 
+/// Validate tool arguments against the tool's parameter schema.
+/// Currently a placeholder that passes through arguments unchanged.
+/// TODO: Implement JSON Schema validation when a suitable validator is available.
+fn validateToolArguments(
+    allocator: std.mem.Allocator,
+    tool: AgentTool,
+    args_json: []const u8,
+) ![]const u8 {
+    _ = allocator;
+    _ = tool.parameters_schema_json; // Would be used for schema validation
+
+    // For now, pass through the arguments unchanged.
+    // In the future, this should:
+    // 1. Parse the JSON schema from tool.parameters_schema_json
+    // 2. Parse args_json
+    // 3. Validate args against schema
+    // 4. Return validated args (possibly with defaults filled in)
+    // 5. Return error.InvalidToolArguments if validation fails
+
+    return args_json;
+}
+
 /// Create an error result for failed tool execution
 fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResult {
     const error_name = @errorName(err);
@@ -75,6 +97,7 @@ const ToolUpdateContext = struct {
     event_stream: *AgentEventStream,
     tool_call_id: []const u8,
     tool_name: []const u8,
+    args_json: []const u8,
 };
 
 /// Tool update callback implementation - pushes tool_execution_update events
@@ -84,6 +107,7 @@ fn onToolUpdate(ctx: ?*anyopaque, tool_call_id: []const u8, tool_name: []const u
     context.event_stream.push(.{ .tool_execution_update = .{
         .tool_call_id = tool_call_id,
         .tool_name = tool_name,
+        .args_json = context.args_json,
         .partial_result_json = partial_result_json,
     } }) catch {};
 }
@@ -184,16 +208,34 @@ fn executeToolCalls(
         var is_error = false;
 
         if (tool) |t| {
+            // Validate tool arguments against schema
+            const validated_args = validateToolArguments(allocator, t, tool_call.arguments_json) catch |err| {
+                result = try createErrorResult(allocator, err);
+                is_error = true;
+                // Still need to emit end event even on validation error
+                const result_json = result.details_json orelse "null";
+                try event_stream.push(.{ .tool_execution_end = .{
+                    .tool_call_id = tool_call.id,
+                    .tool_name = tool_call.name,
+                    .result_json = result_json,
+                    .is_error = is_error,
+                } });
+                const tool_result_msg = try createToolResultMessage(allocator, tool_call, result, is_error);
+                try results.append(allocator, tool_result_msg);
+                continue;
+            };
+
             // Create context for tool update callback
             var update_ctx = ToolUpdateContext{
                 .event_stream = event_stream,
                 .tool_call_id = tool_call.id,
                 .tool_name = tool_call.name,
+                .args_json = validated_args,
             };
 
             result = t.execute(
                 tool_call.id,
-                tool_call.arguments_json,
+                validated_args,
                 config.cancel_token,
                 &update_ctx,
                 onToolUpdate,
@@ -289,9 +331,6 @@ fn streamAssistantResponse(
         allocator,
     );
     defer provider_stream.deinit();
-
-    // Emit turn_start
-    try event_stream.push(.turn_start);
 
     // Forward events and collect final message
     var final_message: ?ai_types.AssistantMessage = null;
@@ -445,6 +484,9 @@ fn runLoop(
                 }
             }
 
+            // Emit turn_start before streaming assistant response
+            try event_stream.push(.turn_start);
+
             // Stream assistant response
             const assistant_message = streamAssistantResponse(
                 allocator,
@@ -558,9 +600,18 @@ fn runLoop(
                     // Add assistant message to context
                     try context.appendMessage(.{ .assistant = assistant_message });
 
-                    // Add tool results to context
+                    // Add tool results to context with message_start/end events
                     for (tool_result.tool_results) |tool_result_msg| {
-                        try context.appendMessage(.{ .tool_result = tool_result_msg });
+                        const msg: ai_types.Message = .{ .tool_result = tool_result_msg };
+                        try event_stream.push(.{ .message_start = .{
+                            .message = msg,
+                            .owned_strings = false,
+                        } });
+                        try context.appendMessage(msg);
+                        try event_stream.push(.{ .message_end = .{
+                            .message = msg,
+                            .owned_strings = false,
+                        } });
                     }
 
                     // If steering messages arrived, they'll be picked up at the top of inner loop
