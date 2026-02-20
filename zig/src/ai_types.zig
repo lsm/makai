@@ -684,6 +684,108 @@ pub fn deinitAssistantMessageEvent(allocator: std.mem.Allocator, event: *Assista
     }
 }
 
+/// Deep clone a Message. Caller owns the returned message and must call deinit().
+pub fn cloneMessage(allocator: std.mem.Allocator, msg: Message) !Message {
+    return switch (msg) {
+        .user => |u| .{ .user = .{
+            .content = try cloneUserContent(u.content, allocator),
+            .timestamp = u.timestamp,
+        } },
+        .assistant => |a| .{ .assistant = try cloneAssistantMessage(allocator, a) },
+        .tool_result => |tr| .{ .tool_result = try cloneToolResultMessage(allocator, tr) },
+    };
+}
+
+/// Deep clone UserContent.
+fn cloneUserContent(content: UserContent, allocator: std.mem.Allocator) !UserContent {
+    return switch (content) {
+        .text => |t| .{ .text = try allocator.dupe(u8, t) },
+        .parts => |parts| blk: {
+            const cloned_parts = try allocator.alloc(UserContentPart, parts.len);
+            errdefer allocator.free(cloned_parts);
+            for (parts, 0..) |part, i| {
+                cloned_parts[i] = try cloneUserContentPart(allocator, part);
+            }
+            break :blk .{ .parts = cloned_parts };
+        },
+    };
+}
+
+/// Deep clone UserContentPart.
+fn cloneUserContentPart(allocator: std.mem.Allocator, part: UserContentPart) !UserContentPart {
+    return switch (part) {
+        .text => |t| .{ .text = .{
+            .text = try allocator.dupe(u8, t.text),
+            .text_signature = if (t.text_signature) |sig| try allocator.dupe(u8, sig) else null,
+        } },
+        .image => |img| .{ .image = .{
+            .data = try allocator.dupe(u8, img.data),
+            .mime_type = try allocator.dupe(u8, img.mime_type),
+        } },
+    };
+}
+
+/// Deep clone ToolResultMessage.
+fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !ToolResultMessage {
+    const cloned_content = try allocator.alloc(UserContentPart, tr.content.len);
+    errdefer allocator.free(cloned_content);
+    for (tr.content, 0..) |part, i| {
+        cloned_content[i] = try cloneUserContentPart(allocator, part);
+    }
+    return .{
+        .tool_call_id = try allocator.dupe(u8, tr.tool_call_id),
+        .tool_name = try allocator.dupe(u8, tr.tool_name),
+        .content = cloned_content,
+        .details_json = if (tr.details_json) |dj| try allocator.dupe(u8, dj) else null,
+        .is_error = tr.is_error,
+        .timestamp = tr.timestamp,
+    };
+}
+
+/// Deep clone a Context. Caller owns the returned context and must call deinit().
+pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
+    // Clone system_prompt
+    const system_prompt = if (ctx.system_prompt) |sp|
+        try allocator.dupe(u8, sp)
+    else
+        null;
+    errdefer if (system_prompt) |sp| allocator.free(sp);
+
+    // Clone messages
+    const messages = try allocator.alloc(Message, ctx.messages.len);
+    errdefer allocator.free(messages);
+    for (ctx.messages, 0..) |msg, i| {
+        // Use errdefer to clean up already-cloned messages on error
+        errdefer for (messages[0..i]) |*m| m.deinit(allocator);
+        messages[i] = try cloneMessage(allocator, msg);
+    }
+
+    // Clone tools
+    var tools: ?[]Tool = null;
+    if (ctx.tools) |t| {
+        tools = try allocator.alloc(Tool, t.len);
+        errdefer if (tools) |ts| allocator.free(ts);
+        for (t, 0..) |tool, i| {
+            tools.?[i] = .{
+                .name = try allocator.dupe(u8, tool.name),
+                .description = try allocator.dupe(u8, tool.description),
+                .parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json),
+            };
+        }
+    }
+    errdefer if (tools) |ts| {
+        for (ts) |*tool| tool.deinit(allocator);
+        allocator.free(ts);
+    };
+
+    return .{
+        .system_prompt = system_prompt,
+        .messages = messages,
+        .tools = tools,
+        .owned_strings = true,
+    };
+}
+
 test "cloneAssistantMessage deep copies text content" {
     const content = [_]AssistantContent{.{ .text = .{ .text = "hello" } }};
     const msg = AssistantMessage{

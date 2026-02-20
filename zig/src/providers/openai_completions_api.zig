@@ -735,6 +735,15 @@ const ThreadCtx = struct {
     on_payload_ctx: ?*anyopaque = null,
     retry_config: ?ai_types.RetryConfig = null,
     ping_interval_ms: ?u64 = null,
+
+    /// Clean up all owned resources
+    fn deinit(self: *ThreadCtx) void {
+        self.allocator.free(self.api_key);
+        self.allocator.free(self.request_body);
+        var mut_context = self.context;
+        mut_context.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
 };
 
 /// Current block type being parsed
@@ -1016,9 +1025,7 @@ fn runThread(ctx: *ThreadCtx) void {
     // Check cancellation before sending
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("request cancelled");
             return;
@@ -1029,9 +1036,7 @@ fn runThread(ctx: *ThreadCtx) void {
     defer client.deinit();
 
     const url = std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{model.base_url}) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom building url");
         return;
@@ -1039,9 +1044,7 @@ fn runThread(ctx: *ThreadCtx) void {
     defer allocator.free(url);
 
     const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom building auth header");
         return;
@@ -1049,9 +1052,7 @@ fn runThread(ctx: *ThreadCtx) void {
     defer allocator.free(auth);
 
     const uri = std.Uri.parse(url) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("invalid provider URL");
         return;
@@ -1060,25 +1061,19 @@ fn runThread(ctx: *ThreadCtx) void {
     var headers: std.ArrayList(std.http.Header) = .{};
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom headers");
         return;
     };
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom headers");
         return;
     };
     headers.append(allocator, .{ .name = "accept", .value = "text/event-stream" }) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom headers");
         return;
@@ -1088,33 +1083,25 @@ fn runThread(ctx: *ThreadCtx) void {
     if (std.mem.eql(u8, model.provider, "github-copilot")) {
         // Static Copilot headers (required for all requests)
         headers.append(allocator, .{ .name = "user-agent", .value = github_copilot.COPILOT_HEADERS.user_agent }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
             return;
         };
         headers.append(allocator, .{ .name = "editor-version", .value = github_copilot.COPILOT_HEADERS.editor_version }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
             return;
         };
         headers.append(allocator, .{ .name = "editor-plugin-version", .value = github_copilot.COPILOT_HEADERS.editor_plugin_version }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
             return;
         };
         headers.append(allocator, .{ .name = "copilot-integration-id", .value = github_copilot.COPILOT_HEADERS.copilot_integration_id }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
             return;
@@ -1127,9 +1114,7 @@ fn runThread(ctx: *ThreadCtx) void {
             has_images,
             allocator,
         ) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
             return;
@@ -1138,9 +1123,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
         for (copilot_headers) |h| {
             headers.append(allocator, h) catch {
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("oom headers");
                 return;
@@ -1164,9 +1147,7 @@ fn runThread(ctx: *ThreadCtx) void {
         // Check cancellation before each attempt
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
@@ -1188,16 +1169,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 // Sleep was cancelled
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
             }
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("failed to open request");
             return;
@@ -1215,16 +1192,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 // Sleep was cancelled
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
             }
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("failed to send request");
             return;
@@ -1239,16 +1212,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     continue;
                 }
                 // Sleep was cancelled
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
             }
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("failed to receive response");
             return;
@@ -1306,9 +1275,7 @@ fn runThread(ctx: *ThreadCtx) void {
             // Wait before retry
             if (!retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 // Sleep was cancelled
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
@@ -1334,9 +1301,7 @@ fn runThread(ctx: *ThreadCtx) void {
             std.debug.print("Error body: {s}\n", .{eb});
         }
 
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("openai request failed");
         return;
@@ -1411,9 +1376,7 @@ fn runThread(ctx: *ThreadCtx) void {
         // Check cancellation during streaming
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request cancelled");
                 return;
@@ -1421,9 +1384,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         const n = reader.*.readSliceShort(&read_buf) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("read error");
             return;
@@ -1431,9 +1392,7 @@ fn runThread(ctx: *ThreadCtx) void {
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("sse parse error");
             return;
@@ -1451,9 +1410,7 @@ fn runThread(ctx: *ThreadCtx) void {
             }
             reasoning_detail_events.clearRetainingCapacity();
             parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, &reasoning_detail_events, allocator) catch {
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("json parse error");
                 return;
@@ -1472,9 +1429,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     const id = tce.id orelse "";
                     const name = tce.name orelse "";
                     _ = tool_call_tracker_instance.startCall(tce.api_index, content_index, id, name) catch {
-                        allocator.free(api_key);
-                        allocator.free(request_body);
-                        allocator.destroy(ctx);
+                        ctx.deinit();
                         stream.markThreadDone();
                         stream.completeWithError("oom tool call start");
                         return;
@@ -1502,9 +1457,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 } else if (tce.arguments_delta) |delta| {
                     // Append arguments delta
                     tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
-                        allocator.free(api_key);
-                        allocator.free(request_body);
-                        allocator.destroy(ctx);
+                        ctx.deinit();
                         stream.markThreadDone();
                         stream.completeWithError("oom tool call delta");
                         return;
@@ -1567,9 +1520,7 @@ fn runThread(ctx: *ThreadCtx) void {
         // No content - create empty text block with borrowed empty string reference
         // Using a static empty string avoids an unnecessary allocation for the empty case
         var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom building result");
             return;
@@ -1584,18 +1535,14 @@ fn runThread(ctx: *ThreadCtx) void {
             .stop_reason = stop_reason,
             .timestamp = std.time.milliTimestamp(),
         };
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.complete(out);
         return;
     }
 
     var content = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom building result");
         return;
@@ -1606,9 +1553,7 @@ fn runThread(ctx: *ThreadCtx) void {
         content[idx] = .{ .thinking = .{
             .thinking = allocator.dupe(u8, thinking.items) catch {
                 allocator.free(content);
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("oom building thinking");
                 return;
@@ -1622,9 +1567,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
                 }
                 allocator.free(content);
-                allocator.free(api_key);
-                allocator.free(request_body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("oom building signature");
                 return;
@@ -1646,9 +1589,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
             }
             allocator.free(content);
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom building text");
             return;
@@ -1702,9 +1643,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .timestamp = std.time.milliTimestamp(),
     };
 
-    allocator.free(api_key);
-    allocator.free(request_body);
-    allocator.destroy(ctx);
+    ctx.deinit();
     stream.markThreadDone();
     stream.complete(out);
 }
@@ -1726,7 +1665,14 @@ pub fn streamOpenAICompletions(
     };
     errdefer allocator.free(api_key);
 
-    const req_body = try buildRequestBody(model, context, resolved, allocator);
+    // Clone context to own the memory (background thread outlives caller's memory)
+    const owned_context = try ai_types.cloneContext(allocator, context);
+    errdefer {
+        var mut_ctx = owned_context;
+        mut_ctx.deinit(allocator);
+    }
+
+    const req_body = try buildRequestBody(model, owned_context, resolved, allocator);
     errdefer allocator.free(req_body);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
@@ -1734,14 +1680,21 @@ pub fn streamOpenAICompletions(
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const ctx = try allocator.create(ThreadCtx);
-    errdefer allocator.destroy(ctx);
+    errdefer {
+        allocator.destroy(s);
+        allocator.free(req_body);
+        var mut_ctx = owned_context;
+        mut_ctx.deinit(allocator);
+        allocator.free(api_key);
+        allocator.destroy(ctx);
+    }
     ctx.* = .{
         .allocator = allocator,
         .stream = s,
         .model = model,
         .api_key = @constCast(api_key),
         .request_body = req_body,
-        .context = context,
+        .context = owned_context,
         .cancel_token = resolved.cancel_token,
         .on_payload_fn = resolved.on_payload_fn,
         .on_payload_ctx = resolved.on_payload_ctx,
