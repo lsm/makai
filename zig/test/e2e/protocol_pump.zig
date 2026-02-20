@@ -31,10 +31,14 @@ pub const ProtocolPump = struct {
             const active_stream = entry.stream;
             const stream_id = entry.stream_id;
 
+            // Debug: check if stream is done before polling
+            const was_done_before = active_stream.event_stream.isDone();
+
             // Poll ALL available events from the provider's event stream
             // before checking if the stream is done
             while (active_stream.event_stream.poll()) |event| {
-                // Create an envelope with the event
+                // Debug: log what event type we're forwarding
+                std.debug.print("\n\x1b[35mPUMP\x1b[0m: forwarding event type: {s}\n", .{@tagName(event)});
                 const seq = self.server.getNextSequence(stream_id);
                 const env = protocol_types.Envelope{
                     .stream_id = stream_id,
