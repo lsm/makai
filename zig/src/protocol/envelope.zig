@@ -339,6 +339,9 @@ fn serializeStreamOptions(
 ) !void {
     try w.beginObject();
 
+    if (opts.api_key) |key| {
+        try w.writeStringField("api_key", key);
+    }
     if (opts.temperature) |temp| {
         try w.writeKey("temperature");
         try w.writeFloat(temp);
@@ -346,7 +349,6 @@ fn serializeStreamOptions(
     if (opts.max_tokens) |max| {
         try w.writeIntField("max_tokens", max);
     }
-    // NOTE: api_key is intentionally NOT serialized - must use transport headers
     if (opts.cache_retention) |ret| {
         try w.writeStringField("cache_retention", @tagName(ret));
     }
@@ -1072,6 +1074,9 @@ fn deserializeStreamOptions(
         .owned_strings = true, // Mark as owned since we dupe string fields
     };
 
+    if (obj.get("api_key")) |key| {
+        opts.api_key = try allocator.dupe(u8, key.string);
+    }
     if (obj.get("temperature")) |temp| {
         opts.temperature = switch (temp) {
             .float => |f| @floatCast(f),
@@ -1082,7 +1087,6 @@ fn deserializeStreamOptions(
     if (obj.get("max_tokens")) |max| {
         opts.max_tokens = @intCast(max.integer);
     }
-    // NOTE: api_key is intentionally NOT deserialized - must use transport headers
     if (obj.get("cache_retention")) |ret| {
         opts.cache_retention = parseCacheRetention(ret.string);
     }

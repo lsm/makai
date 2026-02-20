@@ -278,6 +278,9 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     const resolved_base_url = base_url orelse getDefaultBaseUrl(allocator);
     const enabled_models = try enableAllModels(allocator, copilot_token, resolved_base_url, null);
 
+    // Dupe base_url BEFORE freeing the original
+    const result_base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null;
+
     if (base_url) |bu| allocator.free(bu);
 
     return .{
@@ -286,7 +289,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
         .expires = std.time.milliTimestamp() + (3600 * 1000),
         .provider_data = if (credentials.provider_data) |data| try allocator.dupe(u8, data) else null,
         .enabled_models = enabled_models,
-        .base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null,
+        .base_url = result_base_url,
     };
 }
 

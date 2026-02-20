@@ -312,7 +312,7 @@ jobs:
             ${{ runner.os }}-zig-
       - name: Run Protocol Fullstack E2E tests (Ollama)
         working-directory: zig
-        run: zig build test-e2e-protocol-fullstack -Dtest-filter="Ollama"
+        run: zig build test-e2e-protocol-fullstack-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_MODEL: ministral-3:3b
@@ -335,7 +335,7 @@ jobs:
             ${{ runner.os }}-zig-
       - name: Run Protocol Fullstack E2E tests (GitHub Copilot)
         working-directory: zig
-        run: zig build test-e2e-protocol-fullstack -Dtest-filter="GitHub Copilot"
+        run: zig build test-e2e-protocol-fullstack-github
         env:
           GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
           GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}

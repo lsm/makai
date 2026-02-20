@@ -3,7 +3,6 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const test_filter = b.option([]const u8, "test-filter", "Skip tests that do not match filter");
 
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("src/ai_types.zig"),
@@ -70,6 +69,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const oauth_anthropic_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/anthropic.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
     const provider_caps_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/provider_caps.zig"),
         .target = target,
@@ -113,6 +121,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "retry", .module = retry_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
     });
 
@@ -539,27 +549,56 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const e2e_protocol_fullstack_test_filters: []const []const u8 = if (test_filter) |filter| &[_][]const u8{filter} else &[_][]const u8{};
+    // Protocol pump helper module for fullstack tests
+    const protocol_pump_mod = b.createModule(.{
+        .root_source_file = b.path("test/e2e/protocol_pump.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol_server", .module = protocol_server_mod },
+            .{ .name = "envelope", .module = protocol_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+        },
+    });
 
-    const e2e_protocol_fullstack_test = b.addTest(.{
+    // Protocol Fullstack E2E tests - Ollama
+    const e2e_protocol_fullstack_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/protocol_fullstack.zig"),
+            .root_source_file = b.path("test/e2e/protocol_fullstack_ollama.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
-                .{ .name = "stream", .module = stream_mod },
                 .{ .name = "test_helpers", .module = test_helpers_mod },
                 .{ .name = "protocol_server", .module = protocol_server_mod },
                 .{ .name = "protocol_client", .module = protocol_client_mod },
                 .{ .name = "envelope", .module = protocol_envelope_mod },
-                .{ .name = "transport", .module = transport_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
+                .{ .name = "protocol_pump", .module = protocol_pump_mod },
             },
         }),
-        .filters = e2e_protocol_fullstack_test_filters,
+    });
+
+    // Protocol Fullstack E2E tests - GitHub Copilot
+    const e2e_protocol_fullstack_github_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/protocol_fullstack_github.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "register_builtins", .module = register_builtins_mod },
+                .{ .name = "test_helpers", .module = test_helpers_mod },
+                .{ .name = "protocol_server", .module = protocol_server_mod },
+                .{ .name = "protocol_client", .module = protocol_client_mod },
+                .{ .name = "envelope", .module = protocol_envelope_mod },
+                .{ .name = "transports/in_process", .module = in_process_transport_mod },
+                .{ .name = "protocol_pump", .module = protocol_pump_mod },
+            },
+        }),
     });
 
     // Protocol E2E tests (mock-based, no real providers needed)
@@ -698,8 +737,11 @@ pub fn build(b: *std.Build) void {
     const test_e2e_ollama_step = b.step("test-e2e-ollama", "Run Ollama E2E tests");
     test_e2e_ollama_step.dependOn(&b.addRunArtifact(e2e_ollama_test).step);
 
-    const test_e2e_protocol_fullstack_step = b.step("test-e2e-protocol-fullstack", "Run Protocol Fullstack E2E tests");
-    test_e2e_protocol_fullstack_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_test).step);
+    const test_e2e_protocol_fullstack_ollama_step = b.step("test-e2e-protocol-fullstack-ollama", "Run Protocol Fullstack E2E tests - Ollama");
+    test_e2e_protocol_fullstack_ollama_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_ollama_test).step);
+
+    const test_e2e_protocol_fullstack_github_step = b.step("test-e2e-protocol-fullstack-github", "Run Protocol Fullstack E2E tests - GitHub Copilot");
+    test_e2e_protocol_fullstack_github_step.dependOn(&b.addRunArtifact(e2e_protocol_fullstack_github_test).step);
 
     const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
@@ -710,7 +752,8 @@ pub fn build(b: *std.Build) void {
     test_e2e_step.dependOn(test_e2e_azure_step);
     test_e2e_step.dependOn(test_e2e_google_step);
     test_e2e_step.dependOn(test_e2e_ollama_step);
-    test_e2e_step.dependOn(test_e2e_protocol_fullstack_step);
+    test_e2e_step.dependOn(test_e2e_protocol_fullstack_ollama_step);
+    test_e2e_step.dependOn(test_e2e_protocol_fullstack_github_step);
     test_e2e_step.dependOn(test_e2e_protocol_step);
 
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
