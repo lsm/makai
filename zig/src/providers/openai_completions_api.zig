@@ -1329,7 +1329,7 @@ fn runThread(ctx: *ThreadCtx) void {
         const error_body = response.reader(&error_buf).*.allocRemaining(allocator, std.io.Limit.limited(8192)) catch null;
         defer if (error_body) |eb| allocator.free(eb);
 
-        std.debug.print("OpenAI API error: status={d}, url={s}\n", .{ @intFromEnum(response.head.status), base_url });
+        std.debug.print("OpenAI API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), model.name });
         if (error_body) |eb| {
             std.debug.print("Error body: {s}\n", .{eb});
         }
