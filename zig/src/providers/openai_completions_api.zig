@@ -1037,12 +1037,21 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{model.base_url}) catch {
-        ctx.deinit();
-        stream.markThreadDone();
-        stream.completeWithError("oom building url");
-        return;
-    };
+    // GitHub Copilot uses /chat/completions, others use /v1/chat/completions
+    const url = if (std.mem.eql(u8, model.provider, "github-copilot"))
+        std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom building url");
+            return;
+        }
+    else
+        std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{model.base_url}) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom building url");
+            return;
+        };
     defer allocator.free(url);
 
     const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
