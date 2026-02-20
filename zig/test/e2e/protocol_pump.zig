@@ -31,9 +31,6 @@ pub const ProtocolPump = struct {
             const active_stream = entry.stream;
             const stream_id = entry.stream_id;
 
-            // Debug: check if stream is done before polling
-            const was_done_before = active_stream.event_stream.isDone();
-
             // Poll ALL available events from the provider's event stream
             // before checking if the stream is done
             while (active_stream.event_stream.poll()) |event| {
