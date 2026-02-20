@@ -38,7 +38,7 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     defer creds.deinit(allocator);
 
     // Use base_url from token, or fall back to default
-    const base_url = creds.base_url orelse "https://api.githubcopilot.com";
+    const base_url = creds.base_url orelse "https://api.individual.githubcopilot.com";
 
     // Set up pipe transport
     var pipe = in_process.createSerializedPipe(allocator);
@@ -173,7 +173,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     defer creds.deinit(allocator);
 
     // Use base_url from token, or fall back to default
-    const base_url = creds.base_url orelse "https://api.githubcopilot.com";
+    const base_url = creds.base_url orelse "https://api.individual.githubcopilot.com";
 
     // Set up pipe transport
     var pipe = in_process.createSerializedPipe(allocator);
