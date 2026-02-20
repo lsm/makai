@@ -68,6 +68,7 @@ pub const ToolExecutionStartPayload = struct {
 pub const ToolExecutionUpdatePayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
+    args_json: []const u8,
     partial_result_json: []const u8,
 };
 
@@ -400,6 +401,102 @@ pub const QueueMode = enum {
 };
 
 // ============================================================================
+// AgentMessage - Extended Message Type
+// ============================================================================
+
+/// Custom message types can be added by apps.
+/// This placeholder allows for future extension without breaking changes.
+/// Apps that need custom message types can create their own union that
+/// includes this AgentMessage as one of its variants.
+pub const CustomAgentMessage = union(enum) {
+    /// Placeholder for custom message types.
+    /// Apps should define their own specific message types.
+    custom: struct {
+        /// Type identifier for the custom message
+        type: []const u8,
+        /// JSON-encoded payload
+        payload: []const u8,
+        /// Timestamp in milliseconds
+        timestamp: i64,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            allocator.free(self.type);
+            allocator.free(self.payload);
+        }
+    },
+
+    pub fn deinit(self: *CustomAgentMessage, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .custom => |*c| c.deinit(allocator),
+        }
+    }
+};
+
+/// AgentMessage is the union of LLM-compatible Message types and custom message types.
+/// This separation allows apps to track additional metadata (artifacts, notifications, etc.)
+/// that shouldn't be sent to the LLM but should be tracked in the conversation history.
+///
+/// Use `convertToLlm` in AgentLoopConfig to filter/convert AgentMessages to LLM-compatible
+/// Messages before each LLM call.
+pub const AgentMessage = union(enum) {
+    /// Standard LLM message (user, assistant, or tool_result)
+    llm: ai_types.Message,
+    /// Custom application-specific message
+    custom: CustomAgentMessage,
+
+    /// Create an AgentMessage from a standard LLM Message
+    pub fn fromLlm(msg: ai_types.Message) AgentMessage {
+        return .{ .llm = msg };
+    }
+
+    /// Create an AgentMessage from a user message
+    pub fn fromUser(user: ai_types.UserMessage) AgentMessage {
+        return .{ .llm = .{ .user = user } };
+    }
+
+    /// Create an AgentMessage from an assistant message
+    pub fn fromAssistant(assistant: ai_types.AssistantMessage) AgentMessage {
+        return .{ .llm = .{ .assistant = assistant } };
+    }
+
+    /// Create an AgentMessage from a tool result message
+    pub fn fromToolResult(tool_result: ai_types.ToolResultMessage) AgentMessage {
+        return .{ .llm = .{ .tool_result = tool_result } };
+    }
+
+    /// Check if this is an LLM-compatible message
+    pub fn isLlmCompatible(self: AgentMessage) bool {
+        return self == .llm;
+    }
+
+    /// Get the LLM message if this is an LLM-compatible message
+    pub fn getLlm(self: AgentMessage) ?ai_types.Message {
+        if (self == .llm) return self.llm;
+        return null;
+    }
+
+    /// Get timestamp from any message variant
+    pub fn getTimestamp(self: AgentMessage) i64 {
+        return switch (self) {
+            .llm => |msg| switch (msg) {
+                .user => |u| u.timestamp,
+                .assistant => |a| a.timestamp,
+                .tool_result => |t| t.timestamp,
+            },
+            .custom => |c| c.timestamp,
+        };
+    }
+
+    /// Free all owned memory
+    pub fn deinit(self: *AgentMessage, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .llm => |*msg| msg.deinit(allocator),
+            .custom => |*c| c.deinit(allocator),
+        }
+    }
+};
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -550,4 +647,64 @@ test "ProtocolOptions defaults" {
     try std.testing.expectEqual(@as(u32, 60_000), opts.max_retry_delay_ms);
     try std.testing.expect(opts.temperature == null);
     try std.testing.expect(opts.max_tokens == null);
+}
+
+test "AgentMessage fromLlm" {
+    const user_msg = ai_types.UserMessage{
+        .content = .{ .text = "Hello" },
+        .timestamp = 12345,
+    };
+    const agent_msg = AgentMessage.fromUser(user_msg);
+
+    try std.testing.expect(agent_msg == .llm);
+    try std.testing.expect(agent_msg.isLlmCompatible());
+    try std.testing.expectEqual(@as(i64, 12345), agent_msg.getTimestamp());
+
+    const llm = agent_msg.getLlm();
+    try std.testing.expect(llm != null);
+    try std.testing.expect(llm.? == .user);
+}
+
+test "AgentMessage custom message" {
+    var custom = CustomAgentMessage{ .custom = .{
+        .type = "notification",
+        .payload = "{\"text\": \"Test notification\"}",
+        .timestamp = 12345,
+    } };
+    defer custom.deinit(std.testing.allocator);
+
+    // Note: This would require owned strings to work properly with deinit
+    // For testing purposes, we're just checking the structure
+}
+
+test "AgentMessage fromAssistant" {
+    const assistant_msg = ai_types.AssistantMessage{
+        .content = &.{.{ .text = .{ .text = "Hello back" } }},
+        .api = "test",
+        .provider = "test",
+        .model = "test",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 12345,
+    };
+    const agent_msg = AgentMessage.fromAssistant(assistant_msg);
+
+    try std.testing.expect(agent_msg == .llm);
+    try std.testing.expect(agent_msg.isLlmCompatible());
+    try std.testing.expectEqual(@as(i64, 12345), agent_msg.getTimestamp());
+}
+
+test "AgentMessage fromToolResult" {
+    const tool_result = ai_types.ToolResultMessage{
+        .tool_call_id = "call-123",
+        .tool_name = "test_tool",
+        .content = &.{.{ .text = .{ .text = "result" } }},
+        .is_error = false,
+        .timestamp = 12345,
+    };
+    const agent_msg = AgentMessage.fromToolResult(tool_result);
+
+    try std.testing.expect(agent_msg == .llm);
+    try std.testing.expect(agent_msg.isLlmCompatible());
+    try std.testing.expectEqual(@as(i64, 12345), agent_msg.getTimestamp());
 }

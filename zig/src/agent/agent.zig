@@ -82,6 +82,11 @@ pub const Agent = struct {
     _thinking_budgets: ?ai_types.ThinkingBudgets,
     _max_retry_delay_ms: ?u32,
 
+    // Async support
+    _thread: ?std.Thread,
+    _done_event: std.Thread.ResetEvent,
+    _mutex: std.Thread.Mutex,
+
     // === Lifecycle ===
 
     /// Initialize a new Agent with the given options.
@@ -112,11 +117,20 @@ pub const Agent = struct {
             ._get_api_key_ctx = options.get_api_key_ctx,
             ._thinking_budgets = options.thinking_budgets,
             ._max_retry_delay_ms = options.max_retry_delay_ms,
+            ._thread = null,
+            ._done_event = std.Thread.ResetEvent{},
+            ._mutex = .{},
         };
     }
 
     /// Free all resources owned by the Agent.
+    /// Waits for any running operation to complete.
     pub fn deinit(self: *Agent) void {
+        // Wait for any running thread to complete
+        if (self._thread != null) {
+            self.waitForIdle();
+        }
+
         // Clear queues
         self.clearAllQueues();
         self._steering_queue.deinit(self._allocator);
@@ -245,18 +259,26 @@ pub const Agent = struct {
 
     /// Queue a steering message to interrupt the agent mid-run.
     /// Delivered after current tool execution, skips remaining tools.
+    /// Thread-safe: can be called while agent is running.
     pub fn steer(self: *Agent, message: ai_types.Message) !void {
+        self._mutex.lock();
+        defer self._mutex.unlock();
         try self._steering_queue.append(self._allocator, message);
     }
 
     /// Queue a follow-up message to be processed after the agent finishes.
     /// Delivered only when agent has no more tool calls or steering messages.
+    /// Thread-safe: can be called while agent is running.
     pub fn followUp(self: *Agent, message: ai_types.Message) !void {
+        self._mutex.lock();
+        defer self._mutex.unlock();
         try self._follow_up_queue.append(self._allocator, message);
     }
 
     /// Clear the steering queue.
     pub fn clearSteeringQueue(self: *Agent) void {
+        self._mutex.lock();
+        defer self._mutex.unlock();
         for (self._steering_queue.items) |*msg| {
             msg.deinit(self._allocator);
         }
@@ -265,6 +287,8 @@ pub const Agent = struct {
 
     /// Clear the follow-up queue.
     pub fn clearFollowUpQueue(self: *Agent) void {
+        self._mutex.lock();
+        defer self._mutex.unlock();
         for (self._follow_up_queue.items) |*msg| {
             msg.deinit(self._allocator);
         }
@@ -273,8 +297,16 @@ pub const Agent = struct {
 
     /// Clear all message queues.
     pub fn clearAllQueues(self: *Agent) void {
-        self.clearSteeringQueue();
-        self.clearFollowUpQueue();
+        self._mutex.lock();
+        defer self._mutex.unlock();
+        for (self._steering_queue.items) |*msg| {
+            msg.deinit(self._allocator);
+        }
+        self._steering_queue.clearRetainingCapacity();
+        for (self._follow_up_queue.items) |*msg| {
+            msg.deinit(self._allocator);
+        }
+        self._follow_up_queue.clearRetainingCapacity();
     }
 
     // === Control Flow ===
@@ -347,6 +379,163 @@ pub const Agent = struct {
         if (self._cancel_token) |token| {
             token.cancelled.store(true, .release);
         }
+    }
+
+    /// Check if the agent is currently idle (not streaming).
+    pub fn isIdle(self: Agent) bool {
+        self._mutex.lock();
+        defer self._mutex.unlock();
+        return !self._state.is_streaming;
+    }
+
+    /// Wait for the agent to become idle.
+    /// Blocks until the current operation completes.
+    /// Returns immediately if not streaming.
+    pub fn waitForIdle(self: *Agent) void {
+        // Wait for the done event (blocks until set)
+        self._done_event.wait();
+
+        // Join the thread if it exists
+        self._mutex.lock();
+        defer self._mutex.unlock();
+
+        if (self._thread) |t| {
+            t.join();
+            self._thread = null;
+        }
+    }
+
+    /// Send a prompt asynchronously. Returns immediately.
+    /// Use waitForIdle() to block until completion.
+    /// Returns error if already streaming.
+    pub fn promptAsync(self: *Agent, message_or_messages: anytype) !void {
+        self._mutex.lock();
+        defer self._mutex.unlock();
+
+        if (self._state.is_streaming) {
+            return error.AgentAlreadyStreaming;
+        }
+
+        const messages: []const ai_types.Message = switch (@TypeOf(message_or_messages)) {
+            []const ai_types.Message => message_or_messages,
+            ai_types.Message => blk: {
+                // Single message - need to create a temporary array
+                break :blk @as([]const ai_types.Message, &.{message_or_messages});
+            },
+            else => @compileError("promptAsync expects a Message or []const Message"),
+        };
+
+        // Deep copy messages for thread ownership
+        const owned_messages = try self.copyMessagesForThread(messages);
+
+        // Reset done event and set streaming flag
+        self._done_event.reset();
+        self._state.is_streaming = true;
+
+        // Spawn thread
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, false });
+    }
+
+    /// Deep copy messages for thread ownership
+    fn copyMessagesForThread(self: *Agent, messages: []const ai_types.Message) ![]ai_types.Message {
+        const owned = try self._allocator.alloc(ai_types.Message, messages.len);
+        for (messages, 0..) |msg, i| {
+            owned[i] = try self.cloneMessage(msg);
+        }
+        return owned;
+    }
+
+    /// Clone a message with owned strings
+    fn cloneMessage(self: *Agent, msg: ai_types.Message) !ai_types.Message {
+        return switch (msg) {
+            .user => |u| .{ .user = .{
+                .content = try self.cloneUserContent(u.content),
+                .timestamp = u.timestamp,
+            } },
+            .assistant => |a| .{ .assistant = try self.cloneAssistantMessage(a) },
+            .tool_result => |t| .{ .tool_result = try self.cloneToolResultMessage(t) },
+        };
+    }
+
+    fn cloneUserContent(self: *Agent, content: ai_types.UserContent) !ai_types.UserContent {
+        return switch (content) {
+            .text => |t| .{ .text = .{ .text = try self._allocator.dupe(u8, t.text) } },
+            .image => |i| .{ .image = .{
+                .url = if (i.url) |u| try self._allocator.dupe(u8, u) else null,
+                .base64 = if (i.base64) |b| try self._allocator.dupe(u8, b) else null,
+                .media_type = i.media_type,
+            } },
+        };
+    }
+
+    fn cloneAssistantMessage(self: *Agent, msg: ai_types.AssistantMessage) !ai_types.AssistantMessage {
+        var content = try self._allocator.alloc(ai_types.AssistantContent, msg.content.len);
+        for (msg.content, 0..) |c, i| {
+            content[i] = try self.cloneAssistantContent(c);
+        }
+        return .{
+            .content = content,
+            .api = try self._allocator.dupe(u8, msg.api),
+            .provider = try self._allocator.dupe(u8, msg.provider),
+            .model = try self._allocator.dupe(u8, msg.model),
+            .usage = msg.usage,
+            .stop_reason = msg.stop_reason,
+            .error_message = if (msg.error_message) |e| try self._allocator.dupe(u8, e) else null,
+            .timestamp = msg.timestamp,
+            .owned_strings = true,
+        };
+    }
+
+    fn cloneAssistantContent(self: *Agent, content: ai_types.AssistantContent) !ai_types.AssistantContent {
+        return switch (content) {
+            .text => |t| .{ .text = .{ .text = try self._allocator.dupe(u8, t.text) } },
+            .thinking => |t| .{ .thinking = .{ .thinking = try self._allocator.dupe(u8, t.thinking) } },
+            .tool_call => |tc| .{ .tool_call = .{
+                .id = try self._allocator.dupe(u8, tc.id),
+                .name = try self._allocator.dupe(u8, tc.name),
+                .arguments_json = try self._allocator.dupe(u8, tc.arguments_json),
+            } },
+        };
+    }
+
+    fn cloneToolResultMessage(self: *Agent, msg: ai_types.ToolResultMessage) !ai_types.ToolResultMessage {
+        var content = try self._allocator.alloc(ai_types.UserContentPart, msg.content.len);
+        for (msg.content, 0..) |c, i| {
+            content[i] = .{ .text = .{ .text = try self._allocator.dupe(u8, c.text.text) } };
+        }
+        return .{
+            .tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id),
+            .tool_name = try self._allocator.dupe(u8, msg.tool_name),
+            .content = content,
+            .details_json = if (msg.details_json) |d| try self._allocator.dupe(u8, d) else null,
+            .is_error = msg.is_error,
+            .timestamp = msg.timestamp,
+        };
+    }
+
+    /// Thread entry point for async execution
+    fn runLoopThread(self: *Agent, messages: []ai_types.Message, skip_steering: bool) void {
+        defer {
+            // Signal completion
+            self._done_event.set();
+
+            // Update state under lock
+            self._mutex.lock();
+            self._state.is_streaming = false;
+            self._mutex.unlock();
+        }
+
+        // Run the loop (errors are handled internally)
+        self.runLoopInternal(
+            if (messages.len > 0) messages else null,
+            .{ .skip_initial_steering_poll = skip_steering },
+        ) catch {};
+
+        // Free the owned messages
+        for (messages) |*m| {
+            m.deinit(self._allocator);
+        }
+        self._allocator.free(messages);
     }
 
     /// Reset all state (clear messages, queues, error).
@@ -482,6 +671,9 @@ pub const Agent = struct {
     }
 
     fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
+        self._mutex.lock();
+        defer self._mutex.unlock();
+
         if (self._steering_mode == .one_at_a_time) {
             if (self._steering_queue.items.len > 0) {
                 const first = self._steering_queue.orderedRemove(0);
@@ -504,6 +696,9 @@ pub const Agent = struct {
     }
 
     fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
+        self._mutex.lock();
+        defer self._mutex.unlock();
+
         if (self._follow_up_mode == .one_at_a_time) {
             if (self._follow_up_queue.items.len > 0) {
                 const first = self._follow_up_queue.orderedRemove(0);
@@ -639,4 +834,36 @@ test "Agent subscribe and unsubscribe" {
 
     agent.unsubscribe(callback);
     try std.testing.expectEqual(@as(usize, 0), agent._listeners.items.len);
+}
+
+test "Agent isIdle and waitForIdle" {
+    var agent = Agent.init(std.testing.allocator, .{});
+    defer agent.deinit();
+
+    // Agent starts idle
+    try std.testing.expect(agent.isIdle());
+
+    // waitForIdle should return immediately when idle
+    agent.waitForIdle();
+
+    // Still idle after waitForIdle
+    try std.testing.expect(agent.isIdle());
+}
+
+test "Agent cloneMessage" {
+    var agent = Agent.init(std.testing.allocator, .{});
+    defer agent.deinit();
+
+    const original = ai_types.Message{
+        .user = .{
+            .content = .{ .text = "Hello, world!" },
+            .timestamp = 12345,
+        },
+    };
+
+    var cloned = try agent.cloneMessage(original);
+    defer cloned.deinit(std.testing.allocator);
+
+    try std.testing.expect(cloned == .user);
+    try std.testing.expectEqualStrings("Hello, world!", cloned.user.content.text);
 }
