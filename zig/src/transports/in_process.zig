@@ -1,24 +1,39 @@
 //! In-Process Transport
 //!
-//! Zero-overhead transport for communication within the same process.
-//! No serialization, no network overhead, direct event-to-event bridging.
+//! Transport for communication within the same process with configurable modes:
+//!
+//! - `.direct`: Zero-copy, deserialize on write and push events directly to stream.
+//!   Use for production in-process communication, agent-to-agent bridging.
+//!
+//! - `.serialized`: Serialize to bytes with framing, deserialize on read.
+//!   Use for testing to validate the full serialization/deserialization path.
 //!
 //! Use cases:
 //! - Testing without mock transports
 //! - Agent-to-agent communication in same process
 //! - Protocol adapters and bridges
+//! - Full-stack e2e tests that need to exercise serialization
 
 const std = @import("std");
 const transport_mod = @import("transport");
 const event_stream = @import("event_stream");
 const ai_types = @import("ai_types");
 
-/// In-process transport using direct stream bridging.
-/// Zero-copy between sender and receiver in the same process.
+/// Transport mode determining how messages are handled
+pub const Mode = enum {
+    /// Zero-copy: deserialize on write, push events directly to stream
+    direct,
+    /// Serialize to bytes with newline framing, deserialize on read
+    /// Tests full serialization path
+    serialized,
+};
+
+/// In-process transport with configurable serialization mode.
 pub const InProcessTransport = struct {
     stream: *event_stream.AssistantMessageStream,
     allocator: std.mem.Allocator,
     owns_stream: bool,
+    mode: Mode,
 
     const Self = @This();
 
@@ -28,11 +43,17 @@ pub const InProcessTransport = struct {
             .stream = stream,
             .allocator = allocator,
             .owns_stream = false,
+            .mode = .direct,
         };
     }
 
-    /// Initialize with a new stream (takes ownership)
+    /// Initialize with a new stream in direct mode (takes ownership)
     pub fn init(allocator: std.mem.Allocator) !*Self {
+        return initWithMode(allocator, .direct);
+    }
+
+    /// Initialize with a new stream and specified mode (takes ownership)
+    pub fn initWithMode(allocator: std.mem.Allocator, mode: Mode) !*Self {
         const self = try allocator.create(Self);
         const stream = try allocator.create(event_stream.AssistantMessageStream);
         stream.* = event_stream.AssistantMessageStream.init(allocator);
@@ -41,6 +62,7 @@ pub const InProcessTransport = struct {
             .stream = stream,
             .allocator = allocator,
             .owns_stream = true,
+            .mode = mode,
         };
         return self;
     }
@@ -231,6 +253,131 @@ pub fn destroyPair(allocator: std.mem.Allocator, client: *InProcessTransport, se
     allocator.destroy(client);
     allocator.destroy(server);
 }
+
+/// Create a serialized pipe for testing the full serialization path.
+/// This simulates a network-like transport where messages are serialized
+/// to bytes with newline framing before being read on the other side.
+pub fn createSerializedPipe(allocator: std.mem.Allocator) SerializedPipe {
+    return SerializedPipe.init(allocator);
+}
+
+/// A serialized bidirectional pipe for testing.
+/// Simulates network transport with full serialization/deserialization.
+///
+/// Usage:
+/// ```zig
+/// var pipe = try createSerializedPipe(allocator);
+/// defer pipe.deinit();
+///
+/// // Client sends to server
+/// var sender = pipe.clientSender();
+/// try sender.write(json_data);
+///
+/// // Server receives
+/// var receiver = pipe.serverReceiver();
+/// const line = try receiver.readLine(allocator);
+/// ```
+pub const SerializedPipe = struct {
+    /// Buffer for server -> client messages
+    to_client: std.ArrayList(u8),
+    /// Buffer for client -> server messages
+    to_server: std.ArrayList(u8),
+    /// Read position for client direction (client reads from to_client)
+    to_client_read_pos: usize,
+    /// Read position for server direction (server reads from to_server)
+    to_server_read_pos: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn init(allocator: std.mem.Allocator) SerializedPipe {
+        return .{
+            .to_client = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
+            .to_server = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
+            .to_client_read_pos = 0,
+            .to_server_read_pos = 0,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *SerializedPipe) void {
+        self.to_client.deinit(self.allocator);
+        self.to_server.deinit(self.allocator);
+    }
+
+    /// Server writes to this to send to client
+    pub fn serverSender(self: *SerializedPipe) transport_mod.AsyncSender {
+        return .{
+            .context = self,
+            .write_fn = struct {
+                fn write(ctx: *anyopaque, data: []const u8) !void {
+                    const s: *SerializedPipe = @ptrCast(@alignCast(ctx));
+                    try s.to_client.appendSlice(s.allocator, data);
+                    try s.to_client.append(s.allocator, '\n');
+                }
+            }.write,
+            .flush_fn = struct {
+                fn flush(_: *anyopaque) !void {}
+            }.flush,
+        };
+    }
+
+    /// Client reads from this (reads server->client messages from to_client buffer)
+    pub fn clientReceiver(self: *SerializedPipe) Receiver {
+        return .{
+            .pipe = self,
+            .buffer = &self.to_client,
+            .read_pos_ptr = &self.to_client_read_pos,
+        };
+    }
+
+    /// Client writes to this to send to server
+    pub fn clientSender(self: *SerializedPipe) transport_mod.AsyncSender {
+        return .{
+            .context = self,
+            .write_fn = struct {
+                fn write(ctx: *anyopaque, data: []const u8) !void {
+                    const s: *SerializedPipe = @ptrCast(@alignCast(ctx));
+                    try s.to_server.appendSlice(s.allocator, data);
+                    try s.to_server.append(s.allocator, '\n');
+                }
+            }.write,
+            .flush_fn = struct {
+                fn flush(_: *anyopaque) !void {}
+            }.flush,
+        };
+    }
+
+    /// Server reads from this (reads client->server messages from to_server buffer)
+    pub fn serverReceiver(self: *SerializedPipe) Receiver {
+        return .{
+            .pipe = self,
+            .buffer = &self.to_server,
+            .read_pos_ptr = &self.to_server_read_pos,
+        };
+    }
+
+    /// Receiver with line-based reading
+    pub const Receiver = struct {
+        pipe: *SerializedPipe,
+        buffer: *std.ArrayList(u8),
+        read_pos_ptr: *usize,
+
+        pub fn readLine(self: *@This(), allocator: std.mem.Allocator) !?[]const u8 {
+            const read_pos = self.read_pos_ptr.*;
+
+            if (read_pos >= self.buffer.items.len) return null;
+
+            const remaining = self.buffer.items[read_pos..];
+            if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
+                const line_end = read_pos + nl_pos;
+                const line = self.buffer.items[read_pos..line_end];
+                const result = try allocator.dupe(u8, line);
+                self.read_pos_ptr.* = line_end + 1;
+                return result;
+            }
+            return null;
+        }
+    };
+};
 
 /// Direct event-to-event bridge without serialization.
 /// Forwards events from source stream to destination stream.
@@ -565,4 +712,65 @@ test "InProcessTransport async receiver" {
     _ = byte_stream.waitForThread(5000);
     byte_stream.deinit();
     allocator.destroy(byte_stream);
+}
+
+test "SerializedPipe bidirectional communication" {
+    const allocator = std.testing.allocator;
+
+    var pipe = createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    // Server sends a message to client
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const event_json = try transport_mod.serializeEvent(.{ .start = .{ .partial = partial } }, allocator);
+    defer allocator.free(event_json);
+
+    var sender = pipe.serverSender();
+    try sender.write(event_json);
+    try sender.flush();
+
+    // Client receives the message
+    var receiver = pipe.clientReceiver();
+    const line = try receiver.readLine(allocator) orelse return error.NoDataReceived;
+    defer allocator.free(line);
+
+    // Verify the line matches what was sent
+    try std.testing.expectEqualStrings(event_json, line);
+}
+
+test "SerializedPipe full round trip" {
+    const allocator = std.testing.allocator;
+
+    var pipe = createSerializedPipe(allocator);
+    defer pipe.deinit();
+
+    // Client sends request to server
+    const request = "{\"type\":\"ping\"}";
+    var client_sender = pipe.clientSender();
+    try client_sender.write(request);
+
+    // Server receives request
+    var server_receiver = pipe.serverReceiver();
+    const received_req = try server_receiver.readLine(allocator) orelse return error.NoDataReceived;
+    defer allocator.free(received_req);
+    try std.testing.expectEqualStrings(request, received_req);
+
+    // Server sends response to client
+    const response = "{\"type\":\"pong\"}";
+    var server_sender = pipe.serverSender();
+    try server_sender.write(response);
+
+    // Client receives response
+    var client_receiver = pipe.clientReceiver();
+    const received_resp = try client_receiver.readLine(allocator) orelse return error.NoDataReceived;
+    defer allocator.free(received_resp);
+    try std.testing.expectEqualStrings(response, received_resp);
 }
