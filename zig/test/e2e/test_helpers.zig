@@ -711,10 +711,12 @@ pub fn getFreshAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?FreshAn
 pub const FreshGitHubCopilotCredentials = struct {
     copilot_token: []const u8,
     github_token: []const u8,
+    base_url: ?[]const u8 = null,
 
     pub fn deinit(self: *FreshGitHubCopilotCredentials, allocator: std.mem.Allocator) void {
         allocator.free(self.copilot_token);
         allocator.free(self.github_token);
+        if (self.base_url) |url| allocator.free(url);
     }
 };
 
@@ -733,20 +735,26 @@ pub fn getFreshGitHubCopilotCredentials(allocator: std.mem.Allocator) !?FreshGit
         .access = creds.copilot_token, // Copilot token (may be expired)
         .expires = 0, // Will be set by refresh
     }, allocator);
-    defer {
-        allocator.free(fresh_creds.refresh);
-        allocator.free(fresh_creds.access);
-        if (fresh_creds.provider_data) |pd| allocator.free(pd);
-        if (fresh_creds.enabled_models) |models| {
-            for (models) |m| allocator.free(m);
-            allocator.free(models);
-        }
-        if (fresh_creds.base_url) |url| allocator.free(url);
+
+    // Copy values BEFORE freeing fresh_creds
+    const copilot_token = try allocator.dupe(u8, fresh_creds.access);
+    const github_token = try allocator.dupe(u8, fresh_creds.refresh);
+    const base_url = if (fresh_creds.base_url) |url| try allocator.dupe(u8, url) else null;
+
+    // Now free fresh_creds
+    allocator.free(fresh_creds.refresh);
+    allocator.free(fresh_creds.access);
+    if (fresh_creds.provider_data) |pd| allocator.free(pd);
+    if (fresh_creds.enabled_models) |models| {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
     }
+    if (fresh_creds.base_url) |url| allocator.free(url);
 
     return FreshGitHubCopilotCredentials{
-        .copilot_token = try allocator.dupe(u8, fresh_creds.access),
-        .github_token = try allocator.dupe(u8, fresh_creds.refresh),
+        .copilot_token = copilot_token,
+        .github_token = github_token,
+        .base_url = base_url,
     };
 }
 

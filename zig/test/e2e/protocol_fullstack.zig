@@ -239,50 +239,22 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Create stream request envelope
-    const stream_id = protocol_types.generateUuid();
-    const message_id = protocol_types.generateUuid();
-
-    // Register pending request with client so ACK is processed correctly
-    try client.pending_requests.put(message_id, .{
-        .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
-        .timeout_ms = 30_000,
-    });
-
-    var stream_req_env = protocol_types.Envelope{
-        .stream_id = stream_id,
-        .message_id = message_id,
-        .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .stream_request = .{
-            .model = model,
-            .context = ctx,
-            .options = .{
-                .api_key = api_key,
-                .max_tokens = 50,
-                .temperature = 0.0,
-            },
-        } },
-    };
-    defer stream_req_env.deinit(allocator);
-
-    // Serialize and send through client
-    const req_json = try envelope.serializeEnvelope(stream_req_env, allocator);
-    defer allocator.free(req_json);
-
-    var sender = pipe.clientSender();
-    try sender.write(req_json);
-    try sender.flush();
-
-    // Process the request through server
+    // Set up protocol pump
     var pump = ProtocolPump{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
     };
 
-    // Process client -> server message
+    // Send stream request using official ProtocolClient API
+    const options = ai_types.StreamOptions{
+        .api_key = api_key,
+        .max_tokens = 50,
+        .temperature = 0.0,
+    };
+    _ = try client.sendStreamRequest(model, ctx, options);
+
+    // Process the request through server
     try pump.pumpClientMessages();
 
     // Verify stream was created
@@ -442,46 +414,19 @@ test "Protocol: Ollama abort through protocol layer" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Create and send stream request
-    const stream_id = protocol_types.generateUuid();
-    const message_id = protocol_types.generateUuid();
-
-    // Register pending request with client so ACK is processed correctly
-    try client.pending_requests.put(message_id, .{
-        .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
-        .timeout_ms = 30_000,
-    });
-
-    var stream_req_env = protocol_types.Envelope{
-        .stream_id = stream_id,
-        .message_id = message_id,
-        .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .stream_request = .{
-            .model = model,
-            .context = ctx,
-            .options = .{
-                .api_key = api_key,
-                .max_tokens = 500,
-            },
-        } },
-    };
-    defer stream_req_env.deinit(allocator);
-
-    const req_json = try envelope.serializeEnvelope(stream_req_env, allocator);
-    defer allocator.free(req_json);
-
-    var sender = pipe.clientSender();
-    try sender.write(req_json);
-    try sender.flush();
-
     // Set up pump
     var pump = ProtocolPump{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
     };
+
+    // Send stream request using official ProtocolClient API
+    const options = ai_types.StreamOptions{
+        .api_key = api_key,
+        .max_tokens = 500,
+    };
+    _ = try client.sendStreamRequest(model, ctx, options);
 
     // Process stream request
     try pump.pumpClientMessages();
@@ -517,28 +462,14 @@ test "Protocol: Ollama abort through protocol layer" {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
-    // Get the stream_id from the client
-    const current_stream_id = client.getCurrentStreamId() orelse return error.NoActiveStream;
+    // Check for errors before proceeding
+    if (client.last_error) |err| {
+        std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
+        return error.StreamError;
+    }
 
-    // Create abort request envelope
-    client.sequence = 2; // Next sequence
-    var abort_env = protocol_types.Envelope{
-        .stream_id = current_stream_id,
-        .message_id = protocol_types.generateUuid(),
-        .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .abort_request = .{
-            .target_stream_id = current_stream_id,
-            .reason = null,
-        } },
-    };
-    defer abort_env.deinit(allocator);
-
-    const abort_json = try envelope.serializeEnvelope(abort_env, allocator);
-    defer allocator.free(abort_json);
-
-    try sender.write(abort_json);
-    try sender.flush();
+    // Send abort request using official ProtocolClient API
+    try client.sendAbortRequest(null);
 
     // Process abort request
     try pump.pumpClientMessages();
@@ -564,8 +495,11 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
 
     test_helpers.testStart("Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClient");
 
-    var creds = (try test_helpers.getGitHubCopilotCredentials(allocator)) orelse return error.SkipZigTest;
+    var creds = (try test_helpers.getFreshGitHubCopilotCredentials(allocator)) orelse return error.SkipZigTest;
     defer creds.deinit(allocator);
+
+    // Use base_url from token, or fall back to default
+    const base_url = creds.base_url orelse "https://api.githubcopilot.com";
 
     // Set up pipe transport
     var pipe = in_process.createSerializedPipe(allocator);
@@ -586,12 +520,13 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     client.setSender(pipe.clientSender());
 
     // Create model and context
+    // GitHub Copilot uses openai-completions API with github-copilot provider
     const model = ai_types.Model{
         .id = "gpt-4o",
         .name = "GPT-4o",
-        .api = "github-copilot",
+        .api = "openai-completions",
         .provider = "github-copilot",
-        .base_url = "https://api.githubcopilot.com",
+        .base_url = base_url,
         .reasoning = false,
         .input = &[_][]const u8{"text"},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -606,48 +541,21 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Create and send stream request
-    const stream_id = protocol_types.generateUuid();
-    const message_id = protocol_types.generateUuid();
-
-    // Register pending request with client so ACK is processed correctly
-    try client.pending_requests.put(message_id, .{
-        .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
-        .timeout_ms = 30_000,
-    });
-
-    var stream_req_env = protocol_types.Envelope{
-        .stream_id = stream_id,
-        .message_id = message_id,
-        .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .stream_request = .{
-            .model = model,
-            .context = ctx,
-            .options = .{
-                .api_key = creds.copilot_token,
-                .session_id = "test-session",
-                .max_tokens = 50,
-                .temperature = 0.0,
-            },
-        } },
-    };
-    defer stream_req_env.deinit(allocator);
-
-    const req_json = try envelope.serializeEnvelope(stream_req_env, allocator);
-    defer allocator.free(req_json);
-
-    var sender = pipe.clientSender();
-    try sender.write(req_json);
-    try sender.flush();
-
     // Set up pump
     var pump = ProtocolPump{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
     };
+
+    // Send stream request using official ProtocolClient API
+    const options = ai_types.StreamOptions{
+        .api_key = creds.copilot_token,
+        .session_id = "test-session",
+        .max_tokens = 50,
+        .temperature = 0.0,
+    };
+    _ = try client.sendStreamRequest(model, ctx, options);
 
     // Process stream request
     try pump.pumpClientMessages();
@@ -699,6 +607,12 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
+    // Check for errors before asserting success
+    if (client.last_error) |err| {
+        std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
+        return error.StreamError;
+    }
+
     // Verify event sequence
     try testing.expect(saw_start);
     try testing.expect(saw_text_delta);
@@ -716,8 +630,11 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
 
     test_helpers.testStart("Protocol: GitHub Copilot abort through protocol layer");
 
-    var creds = (try test_helpers.getGitHubCopilotCredentials(allocator)) orelse return error.SkipZigTest;
+    var creds = (try test_helpers.getFreshGitHubCopilotCredentials(allocator)) orelse return error.SkipZigTest;
     defer creds.deinit(allocator);
+
+    // Use base_url from token, or fall back to default
+    const base_url = creds.base_url orelse "https://api.githubcopilot.com";
 
     // Set up pipe transport
     var pipe = in_process.createSerializedPipe(allocator);
@@ -738,12 +655,13 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     client.setSender(pipe.clientSender());
 
     // Create model and context
+    // GitHub Copilot uses openai-completions API with github-copilot provider
     const model = ai_types.Model{
         .id = "gpt-4o",
         .name = "GPT-4o",
-        .api = "github-copilot",
+        .api = "openai-completions",
         .provider = "github-copilot",
-        .base_url = "https://api.githubcopilot.com",
+        .base_url = base_url,
         .reasoning = false,
         .input = &[_][]const u8{"text"},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
@@ -758,47 +676,20 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Create and send stream request
-    const stream_id = protocol_types.generateUuid();
-    const message_id = protocol_types.generateUuid();
-
-    // Register pending request with client so ACK is processed correctly
-    try client.pending_requests.put(message_id, .{
-        .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
-        .timeout_ms = 30_000,
-    });
-
-    var stream_req_env = protocol_types.Envelope{
-        .stream_id = stream_id,
-        .message_id = message_id,
-        .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .stream_request = .{
-            .model = model,
-            .context = ctx,
-            .options = .{
-                .api_key = creds.copilot_token,
-                .session_id = "test-session",
-                .max_tokens = 500,
-            },
-        } },
-    };
-    defer stream_req_env.deinit(allocator);
-
-    const req_json = try envelope.serializeEnvelope(stream_req_env, allocator);
-    defer allocator.free(req_json);
-
-    var sender = pipe.clientSender();
-    try sender.write(req_json);
-    try sender.flush();
-
     // Set up pump
     var pump = ProtocolPump{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
     };
+
+    // Send stream request using official ProtocolClient API
+    const options = ai_types.StreamOptions{
+        .api_key = creds.copilot_token,
+        .session_id = "test-session",
+        .max_tokens = 500,
+    };
+    _ = try client.sendStreamRequest(model, ctx, options);
 
     // Process stream request
     try pump.pumpClientMessages();
@@ -831,27 +722,14 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
-    // Get the stream_id from the client
-    const current_stream_id = client.getCurrentStreamId() orelse return error.NoActiveStream;
+    // Check for errors before proceeding
+    if (client.last_error) |err| {
+        std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
+        return error.StreamError;
+    }
 
-    // Create abort request envelope
-    var abort_env = protocol_types.Envelope{
-        .stream_id = current_stream_id,
-        .message_id = protocol_types.generateUuid(),
-        .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .abort_request = .{
-            .target_stream_id = current_stream_id,
-            .reason = null,
-        } },
-    };
-    defer abort_env.deinit(allocator);
-
-    const abort_json = try envelope.serializeEnvelope(abort_env, allocator);
-    defer allocator.free(abort_json);
-
-    try sender.write(abort_json);
-    try sender.flush();
+    // Send abort request using official ProtocolClient API
+    try client.sendAbortRequest(null);
 
     // Process abort request
     try pump.pumpClientMessages();
