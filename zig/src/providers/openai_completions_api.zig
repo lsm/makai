@@ -1420,12 +1420,57 @@ fn runThread(ctx: *ThreadCtx) void {
                 @constCast(rde).deinit(allocator);
             }
             reasoning_detail_events.clearRetainingCapacity();
+
+            // Track previous lengths for delta emission
+            const prev_text_len = text.items.len;
+            const prev_thinking_len = thinking.items.len;
+
             parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, &reasoning_detail_events, allocator) catch {
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("json parse error");
                 return;
             };
+
+            // Emit text_delta event if text was appended
+            if (text.items.len > prev_text_len) {
+                const delta = text.items[prev_text_len..];
+                _ = stream.push(.{
+                    .text_delta = .{
+                        .content_index = 0, // Text is always first content block
+                        .delta = delta,
+                        .partial = .{
+                            .content = &.{},
+                            .api = model.api,
+                            .provider = model.provider,
+                            .model = model.id,
+                            .usage = usage,
+                            .stop_reason = stop_reason,
+                            .timestamp = std.time.milliTimestamp(),
+                        },
+                    },
+                }) catch {};
+            }
+
+            // Emit thinking_delta event if thinking was appended
+            if (thinking.items.len > prev_thinking_len) {
+                const delta = thinking.items[prev_thinking_len..];
+                _ = stream.push(.{
+                    .thinking_delta = .{
+                        .content_index = 0, // Thinking is always first if present
+                        .delta = delta,
+                        .partial = .{
+                            .content = &.{},
+                            .api = model.api,
+                            .provider = model.provider,
+                            .model = model.id,
+                            .usage = usage,
+                            .stop_reason = stop_reason,
+                            .timestamp = std.time.milliTimestamp(),
+                        },
+                    },
+                }) catch {};
+            }
 
             // Process reasoning detail events - set thought_signature on matching tool calls
             for (reasoning_detail_events.items) |rde| {
