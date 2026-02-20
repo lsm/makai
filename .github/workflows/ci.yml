@@ -37,9 +37,16 @@ jobs:
           echo "has_ollama=$([[ -n \"$OLLAMA_API_KEY\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
           echo "has_github_copilot=$([[ -n \"$GH_COPILOT_REFRESH\" && -n \"$GH_COPILOT_ACCESS\" ]] && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
 
-  unit-tests-core:
-    name: Unit Tests - Core
+  # =============================================================================
+  # Unit Tests (always run, no secrets needed)
+  # =============================================================================
+  unit-tests:
+    name: Unit Tests - ${{ matrix.group }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [core, transport, protocol, providers, utils]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -57,109 +64,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-zig-
 
-      - name: Run core unit tests
+      - name: Run ${{ matrix.group }} unit tests
         working-directory: zig
-        run: zig build test-unit-core
+        run: zig build test-unit-${{ matrix.group }}
 
-  unit-tests-transport:
-    name: Unit Tests - Transport
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
-
-      - name: Run transport unit tests
-        working-directory: zig
-        run: zig build test-unit-transport
-
-  unit-tests-protocol:
-    name: Unit Tests - Protocol
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
-
-      - name: Run protocol unit tests
-        working-directory: zig
-        run: zig build test-unit-protocol
-
-  unit-tests-providers:
-    name: Unit Tests - Providers
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
-
-      - name: Run provider unit tests
-        working-directory: zig
-        run: zig build test-unit-providers
-
-  unit-tests-utils:
-    name: Unit Tests - Utils/OAuth
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/zig
-          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-
-
-      - name: Run utils/oauth unit tests
-        working-directory: zig
-        run: zig build test-unit-utils
+  # =============================================================================
+  # E2E Tests (run in parallel)
+  # Add new tests by adding a new job following the pattern below
+  # =============================================================================
 
   e2e-anthropic:
     name: E2E - Anthropic
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_anthropic == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -183,7 +99,7 @@ jobs:
 
   e2e-openai:
     name: E2E - OpenAI
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_openai == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -205,33 +121,9 @@ jobs:
           OPENAI_MODEL: gpt-4o-mini
           OPENAI_RESPONSES_MODEL: gpt-4o-mini
 
-  # e2e-azure:
-  #   name: E2E - Azure
-  #   needs: [unit-tests, check-secrets]
-  #   if: needs.check-secrets.outputs.has_azure == 'true'
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: mlugg/setup-zig@v2
-  #       with:
-  #         version: 0.15.2
-  #     - uses: actions/cache@v4
-  #       with:
-  #         path: ~/.cache/zig
-  #         key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
-  #         restore-keys: |
-  #           ${{ runner.os }}-zig-
-  #     - name: Run Azure E2E tests
-  #       working-directory: zig
-  #       run: zig build test-e2e-azure
-  #       env:
-  #         AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
-  #         AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-  #         AZURE_OPENAI_MODEL: gpt-4o-mini
-
   e2e-google:
     name: E2E - Google
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_google == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -254,7 +146,7 @@ jobs:
 
   e2e-ollama:
     name: E2E - Ollama
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_ollama == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -275,9 +167,32 @@ jobs:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
           OLLAMA_MODEL: ministral-3:3b
 
+  e2e-github-copilot:
+    name: E2E - GitHub Copilot
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run GitHub Copilot E2E tests
+        working-directory: zig
+        run: zig build test-e2e-github-copilot
+        env:
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
+
   e2e-protocol:
     name: E2E - Protocol (Mock)
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils]
+    needs: [unit-tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -296,7 +211,7 @@ jobs:
 
   e2e-protocol-fullstack-ollama:
     name: E2E - Protocol Fullstack (Ollama)
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_ollama == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -319,7 +234,7 @@ jobs:
 
   e2e-protocol-fullstack-github:
     name: E2E - Protocol Fullstack (GitHub Copilot)
-    needs: [unit-tests-core, unit-tests-transport, unit-tests-protocol, unit-tests-providers, unit-tests-utils, check-secrets]
+    needs: [unit-tests, check-secrets]
     if: needs.check-secrets.outputs.has_github_copilot == 'true'
     runs-on: ubuntu-latest
     steps:
