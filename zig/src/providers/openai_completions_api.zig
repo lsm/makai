@@ -1084,8 +1084,43 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    // Add GitHub Copilot dynamic headers if provider is github-copilot
+    // Add GitHub Copilot headers if provider is github-copilot
     if (std.mem.eql(u8, model.provider, "github-copilot")) {
+        // Static Copilot headers (required for all requests)
+        headers.append(allocator, .{ .name = "user-agent", .value = github_copilot.COPILOT_HEADERS.user_agent }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("oom copilot headers");
+            return;
+        };
+        headers.append(allocator, .{ .name = "editor-version", .value = github_copilot.COPILOT_HEADERS.editor_version }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("oom copilot headers");
+            return;
+        };
+        headers.append(allocator, .{ .name = "editor-plugin-version", .value = github_copilot.COPILOT_HEADERS.editor_plugin_version }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("oom copilot headers");
+            return;
+        };
+        headers.append(allocator, .{ .name = "copilot-integration-id", .value = github_copilot.COPILOT_HEADERS.copilot_integration_id }) catch {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("oom copilot headers");
+            return;
+        };
+
+        // Dynamic Copilot headers (based on request content)
         const has_images = github_copilot.hasCopilotVisionInput(context.messages);
         const copilot_headers = github_copilot.buildCopilotDynamicHeaders(
             context.messages,
