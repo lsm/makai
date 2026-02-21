@@ -494,6 +494,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "agent_types", .module = protocol_agent_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

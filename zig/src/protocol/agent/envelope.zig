@@ -145,14 +145,14 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
 
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
-    const session_id = try agent_types.parseUuid(root.get("session_id").?.string);
-    const message_id = try agent_types.parseUuid(root.get("message_id").?.string);
+    const session_id = parseUuidOrError(root.get("session_id").?.string) orelse return error.InvalidUuid;
+    const message_id = parseUuidOrError(root.get("message_id").?.string) orelse return error.InvalidUuid;
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
     const version = @as(u8, @intCast(root.get("version").?.integer));
 
     var in_reply_to: ?agent_types.Uuid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try agent_types.parseUuid(v.string);
+    if (root.get("in_reply_to")) |v| in_reply_to = try parseUuidRequired(v.string);
 
     const payload_obj = root.get("payload").?.object;
     const payload = try deserializePayload(type_str, payload_obj, allocator);
@@ -168,30 +168,38 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     };
 }
 
+fn parseUuidRequired(str: []const u8) !agent_types.Uuid {
+    return agent_types.parseUuid(str) orelse error.InvalidUuid;
+}
+
+fn parseUuidOrError(str: []const u8) ?agent_types.Uuid {
+    return agent_types.parseUuid(str);
+}
+
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
     if (std.mem.eql(u8, type_str, "agent_start")) {
         const config = try allocator.dupe(u8, payload.get("config_json").?.string);
         var result = agent_types.AgentStartRequest{ .config_json = config };
         if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("resume_session_id")) |v| result.session_id = try agent_types.parseUuid(v.string);
+        if (payload.get("resume_session_id")) |v| result.session_id = try parseUuidRequired(v.string);
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
         const msg = try allocator.dupe(u8, payload.get("message_json").?.string);
         var req = agent_types.AgentMessageRequest{
-            .session_id = try agent_types.parseUuid(payload.get("session_id").?.string),
+            .session_id = try parseUuidRequired(payload.get("session_id").?.string),
             .message_json = msg,
         };
         if (payload.get("options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_message = req };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
-        var req = agent_types.AgentStopRequest{ .session_id = try agent_types.parseUuid(payload.get("session_id").?.string) };
+        var req = agent_types.AgentStopRequest{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) };
         if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_stop = req };
     }
     if (std.mem.eql(u8, type_str, "agent_status")) {
-        return .{ .agent_status = .{ .session_id = try agent_types.parseUuid(payload.get("session_id").?.string) } };
+        return .{ .agent_status = .{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = agent_types.ToolListRequest{};
@@ -199,12 +207,12 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "agent_started")) {
-        return .{ .agent_started = .{ .session_id = try agent_types.parseUuid(payload.get("session_id").?.string) } };
+        return .{ .agent_started = .{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) } };
     }
     if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, payload.get("event_json").?.string) };
     if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, payload.get("result_json").?.string) };
     if (std.mem.eql(u8, type_str, "agent_stopped")) {
-        var stopped = agent_types.AgentStopped{ .session_id = try agent_types.parseUuid(payload.get("session_id").?.string) };
+        var stopped = agent_types.AgentStopped{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) };
         if (payload.get("reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_stopped = stopped };
     }
@@ -216,7 +224,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
         return .{ .session_info = .{
-            .session_id = try agent_types.parseUuid(payload.get("session_id").?.string),
+            .session_id = try parseUuidRequired(payload.get("session_id").?.string),
             .status = std.meta.stringToEnum(agent_types.AgentStatus, payload.get("status").?.string) orelse .@"error",
             .model = try allocator.dupe(u8, payload.get("model").?.string),
             .message_count = @as(u32, @intCast(payload.get("message_count").?.integer)),

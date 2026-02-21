@@ -1,5 +1,6 @@
 const std = @import("std");
 const agent_types = @import("agent_types");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const SessionState = struct {
     session_id: agent_types.Uuid,
@@ -72,7 +73,7 @@ pub const AgentProtocolServer = struct {
                     .sequence = env.sequence,
                     .in_reply_to = env.message_id,
                     .timestamp = std.time.milliTimestamp(),
-                    .payload = .{ .pong = .{ .ping_id = agent_types.OwnedSlice(u8).initOwned(ping_id) } },
+                    .payload = .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(ping_id) } },
                 };
             },
             .goodbye => return null,
@@ -149,7 +150,7 @@ pub const AgentProtocolServer = struct {
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .agent_stopped = .{
                 .session_id = req.session_id,
-                .reason = agent_types.OwnedSlice(u8).initOwned(reason),
+                .reason = OwnedSlice(u8).initOwned(reason),
             } },
         };
     }
