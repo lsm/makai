@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider_types = @import("protocol_types");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Re-export Uuid from provider types for convenience
 pub const Uuid = provider_types.Uuid;
@@ -61,7 +62,12 @@ pub const AgentStopRequest = struct {
     /// Target agent session
     session_id: Uuid,
     /// Reason for stopping
-    reason: ?[]const u8 = null,
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const AgentStopRequest) ?[]const u8 {
+        const reason = self.reason.slice();
+        return if (reason.len > 0) reason else null;
+    }
 };
 
 /// Request to execute a tool (from agent to tool server)
@@ -127,6 +133,33 @@ pub const AgentSessionInfo = struct {
     updated_at: i64,
 };
 
+pub const AgentStopped = struct {
+    session_id: Uuid,
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const AgentStopped) ?[]const u8 {
+        const reason = self.reason.slice();
+        return if (reason.len > 0) reason else null;
+    }
+
+    pub fn deinit(self: *AgentStopped, allocator: std.mem.Allocator) void {
+        self.reason.deinit(allocator);
+    }
+};
+
+pub const Goodbye = struct {
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const Goodbye) ?[]const u8 {
+        const reason = self.reason.slice();
+        return if (reason.len > 0) reason else null;
+    }
+
+    pub fn deinit(self: *Goodbye, allocator: std.mem.Allocator) void {
+        self.reason.deinit(allocator);
+    }
+};
+
 /// Agent protocol payload
 pub const Payload = union(enum) {
     // Client -> Agent Server
@@ -140,7 +173,7 @@ pub const Payload = union(enum) {
     agent_started: struct { session_id: Uuid },
     agent_event: []const u8, // JSON-encoded AgentEvent
     agent_result: []const u8, // JSON-encoded AgentLoopResult
-    agent_stopped: struct { session_id: Uuid, reason: ?[]const u8 },
+    agent_stopped: AgentStopped,
     agent_error: struct { code: AgentErrorCode, message: []const u8 },
     session_info: AgentSessionInfo,
     tool_list_response: ToolListResponse,
@@ -154,10 +187,10 @@ pub const Payload = union(enum) {
 
     // Keepalive (reused from provider protocol)
     ping: void,
-    pong: struct { ping_id: []const u8 },
+    pong: struct { ping_id: OwnedSlice(u8) },
 
     // Connection management
-    goodbye: struct { reason: ?[]const u8 },
+    goodbye: Goodbye,
 
     pub fn deinit(self: *Payload, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -170,7 +203,7 @@ pub const Payload = union(enum) {
                 if (req.options_json) |o| allocator.free(o);
             },
             .agent_stop => |*req| {
-                if (req.reason) |r| allocator.free(r);
+                req.reason.deinit(allocator);
             },
             .tool_execute => |*req| {
                 allocator.free(req.tool_call_id);
@@ -196,10 +229,10 @@ pub const Payload = union(enum) {
             },
             .agent_event => |e| allocator.free(e),
             .agent_result => |r| allocator.free(r),
-            .agent_stopped => |*s| if (s.reason) |r| allocator.free(r),
+            .agent_stopped => |*s| s.deinit(allocator),
             .agent_error => |*e| allocator.free(e.message),
-            .pong => |*p| allocator.free(p.ping_id),
-            .goodbye => |*g| if (g.reason) |r| allocator.free(r),
+            .pong => |*p| p.ping_id.deinit(allocator),
+            .goodbye => |*g| g.deinit(allocator),
             .tool_streaming => |*t| {
                 allocator.free(t.tool_call_id);
                 allocator.free(t.partial_json);

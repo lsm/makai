@@ -451,6 +451,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -463,6 +464,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

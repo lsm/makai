@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider_types = @import("protocol_types");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Re-export Uuid from provider types for convenience
 pub const Uuid = provider_types.Uuid;
@@ -127,17 +128,27 @@ pub const ToolExecuteResult = struct {
     /// Whether execution failed
     is_error: bool = false,
     /// Error message (if failed)
-    error_message: ?[]const u8 = null,
+    error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Additional details JSON
     details_json: ?[]const u8 = null,
     /// Execution duration in milliseconds
     duration_ms: u32,
+
+    pub fn getErrorMessage(self: *const ToolExecuteResult) ?[]const u8 {
+        const msg = self.error_message.slice();
+        return if (msg.len > 0) msg else null;
+    }
 };
 
 /// Request to cancel a tool execution
 pub const ToolCancelRequest = struct {
     execution_id: Uuid,
-    reason: ?[]const u8 = null,
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const ToolCancelRequest) ?[]const u8 {
+        const reason = self.reason.slice();
+        return if (reason.len > 0) reason else null;
+    }
 };
 
 /// Tool execution status
@@ -158,6 +169,19 @@ pub const ToolExecutionInfo = struct {
     status: ToolExecutionStatus,
     started_at: i64,
     completed_at: ?i64 = null,
+};
+
+pub const Goodbye = struct {
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const Goodbye) ?[]const u8 {
+        const reason = self.reason.slice();
+        return if (reason.len > 0) reason else null;
+    }
+
+    pub fn deinit(self: *Goodbye, allocator: std.mem.Allocator) void {
+        self.reason.deinit(allocator);
+    }
 };
 
 /// Tool protocol payload
@@ -184,10 +208,10 @@ pub const Payload = union(enum) {
 
     // Keepalive
     ping: void,
-    pong: struct { ping_id: []const u8 },
+    pong: struct { ping_id: OwnedSlice(u8) },
 
     // Connection management
-    goodbye: struct { reason: ?[]const u8 },
+    goodbye: Goodbye,
 
     pub fn deinit(self: *Payload, allocator: std.mem.Allocator) void {
         switch (self.*) {
@@ -234,13 +258,13 @@ pub const Payload = union(enum) {
             .tool_result => |*res| {
                 allocator.free(res.tool_call_id);
                 allocator.free(res.result_json);
-                if (res.error_message) |m| allocator.free(m);
+                res.error_message.deinit(allocator);
                 if (res.details_json) |d| allocator.free(d);
             },
-            .tool_cancel => |*req| if (req.reason) |r| allocator.free(r),
+            .tool_cancel => |*req| req.reason.deinit(allocator),
             .tool_error => |*err| allocator.free(err.message),
-            .pong => |*p| allocator.free(p.ping_id),
-            .goodbye => |*g| if (g.reason) |r| allocator.free(r),
+            .pong => |*p| p.ping_id.deinit(allocator),
+            .goodbye => |*g| g.deinit(allocator),
             .ping, .tool_cancelled, .tool_status, .tool_status_response => {},
         }
     }
