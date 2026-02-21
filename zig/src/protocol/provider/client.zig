@@ -327,15 +327,21 @@ pub const ProtocolClient = struct {
 
                 // Check for done event
                 if (owned_evt == .done) {
-                    const result = try ai_types.cloneAssistantMessage(self.allocator, owned_evt.done.message);
-                    try self.setStreamResult(env.stream_id, result);
+                    const stream_result = recon.buildMessage(
+                        owned_evt.done.reason,
+                        owned_evt.done.message.timestamp,
+                    ) catch try ai_types.cloneAssistantMessage(self.allocator, owned_evt.done.message);
+                    try self.setStreamResult(env.stream_id, stream_result);
 
-                    // Legacy fields for current stream users
+                    // Legacy fields for current stream users use the legacy reconstructor
                     self.stream_complete = true;
                     if (self.last_result) |*prev| {
                         prev.deinit(self.allocator);
                     }
-                    self.last_result = try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(env.stream_id).?);
+                    self.last_result = try self.reconstructor.buildMessage(
+                        owned_evt.done.reason,
+                        owned_evt.done.message.timestamp,
+                    );
                 }
             },
             .result => |result| {
