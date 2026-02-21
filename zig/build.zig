@@ -423,6 +423,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "hive_array", .module = hive_array_mod },
         },
     });
 

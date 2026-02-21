@@ -5,6 +5,7 @@ const partial_serializer = @import("partial_serializer.zig");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const event_stream = @import("event_stream");
+const hive_array = @import("hive_array");
 
 /// Errors for sequence validation
 pub const SequenceError = error{
@@ -180,21 +181,57 @@ pub const ProtocolServer = struct {
 
     /// Clean up completed streams
     pub fn cleanupCompletedStreams(self: *ProtocolServer) void {
-        var to_remove = std.ArrayList(protocol_types.Uuid).initCapacity(self.allocator, 16) catch return;
-        defer to_remove.deinit(self.allocator);
+        // Common path: avoid heap allocation by collecting IDs in a fixed pool.
+        const CleanupNode = struct {
+            stream_id: protocol_types.Uuid,
+            next: ?*@This() = null,
+        };
+        var remove_pool = hive_array.HiveArray(CleanupNode, 128).init();
+        var remove_head: ?*CleanupNode = null;
+
+        // Overflow path for unusually large batches in a single cleanup pass.
+        var overflow = std.ArrayList(protocol_types.Uuid).initCapacity(self.allocator, 8) catch return;
+        defer overflow.deinit(self.allocator);
 
         var iter = self.active_streams.iterator();
         while (iter.next()) |entry| {
-            if (entry.value_ptr.event_stream.isDone()) {
-                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
+            if (!entry.value_ptr.event_stream.isDone()) continue;
+
+            if (remove_pool.get()) |node| {
+                node.* = .{
+                    .stream_id = entry.key_ptr.*,
+                    .next = remove_head,
+                };
+                remove_head = node;
+            } else {
+                overflow.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
-        for (to_remove.items) |stream_id| {
+        // Remove pooled IDs
+        var current = remove_head;
+        while (current) |node| {
+            const stream_id = node.stream_id;
+            const next = node.next;
+
             if (self.active_streams.fetchRemove(stream_id)) |removed| {
                 var partial = removed.value.partial_state;
                 partial.deinit();
-                // Clean up the event stream
+                removed.value.event_stream.deinit();
+                self.allocator.destroy(removed.value.event_stream);
+            }
+            _ = self.sequence_counters.remove(stream_id);
+            _ = self.expected_sequences.remove(stream_id);
+
+            remove_pool.put(node);
+            current = next;
+        }
+
+        // Remove overflow IDs
+        for (overflow.items) |stream_id| {
+            if (self.active_streams.fetchRemove(stream_id)) |removed| {
+                var partial = removed.value.partial_state;
+                partial.deinit();
                 removed.value.event_stream.deinit();
                 self.allocator.destroy(removed.value.event_stream);
             }
