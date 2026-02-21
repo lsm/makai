@@ -290,6 +290,8 @@ pub const SerializedPipe = struct {
 
     pub fn init(allocator: std.mem.Allocator) SerializedPipe {
         return .{
+            // OOM is the only possible error from initCapacity(); treat as fatal since
+            // the pipe cannot function without its buffers.
             .to_client = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
             .to_server = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
             .to_client_read_pos = 0,

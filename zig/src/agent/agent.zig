@@ -147,6 +147,9 @@ pub const Agent = struct {
         if (self._session_id) |sid| {
             self._allocator.free(sid);
         }
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     // === Subscribe ===

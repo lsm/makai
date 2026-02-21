@@ -93,6 +93,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             if (self.err_msg) |msg| {
                 self.allocator.free(msg);
             }
+
+            // Poison freed memory to catch use-after-free in debug builds
+            self.* = undefined;
         }
 
         /// Push an event to the stream.

@@ -1,6 +1,9 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
+const owned_slice_mod = @import("owned_slice");
+
+pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 // ============================================================================
 // Agent Event Types
@@ -372,16 +375,12 @@ pub const AgentState = struct {
 
 /// Result from agent loop execution
 pub const AgentLoopResult = struct {
-    messages: []const ai_types.Message,
+    messages: OwnedSlice(ai_types.Message),
     final_message: ai_types.AssistantMessage,
     iterations: u32,
-    owned_strings: bool = false,
 
     pub fn deinit(self: *AgentLoopResult, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return;
-        const mut_msgs: []ai_types.Message = @constCast(self.messages);
-        for (mut_msgs) |*msg| msg.deinit(allocator);
-        allocator.free(self.messages);
+        self.messages.deinit(allocator);
         var final = self.final_message;
         final.deinit(allocator);
     }
@@ -575,7 +574,7 @@ test "AgentEventStream basic usage" {
     try std.testing.expect(std.meta.activeTag(event.?) == .agent_start);
 
     const result = AgentLoopResult{
-        .messages = &.{},
+        .messages = OwnedSlice(ai_types.Message).initBorrowed(&.{}),
         .final_message = .{
             .content = &.{},
             .api = "test",
@@ -586,7 +585,6 @@ test "AgentEventStream basic usage" {
             .timestamp = 0,
         },
         .iterations = 0,
-        .owned_strings = false,
     };
     stream.complete(result);
 

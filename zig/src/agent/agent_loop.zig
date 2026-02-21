@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
 const types = @import("agent_types");
+const owned_slice_mod = @import("owned_slice");
 
 // Re-export types needed by callers
 pub const AgentEvent = types.AgentEvent;
@@ -680,7 +681,7 @@ fn runLoop(
 
     // Build result
     const result = AgentLoopResult{
-        .messages = try state.messages.toOwnedSlice(allocator),
+        .messages = owned_slice_mod.OwnedSlice(ai_types.Message).initOwned(try state.messages.toOwnedSlice(allocator)),
         .final_message = state.final_message orelse .{
             .content = &.{},
             .api = config.model.api,
@@ -692,12 +693,11 @@ fn runLoop(
             .owned_strings = false,
         },
         .iterations = state.iterations,
-        .owned_strings = true,
     };
 
     // Emit agent_end
     try event_stream.push(.{ .agent_end = .{
-        .messages = result.messages,
+        .messages = result.messages.slice(),
         .owned_strings = false, // Ownership transferred to result
     } });
 

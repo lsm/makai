@@ -45,6 +45,9 @@ pub const ApiRegistry = struct {
             if (entry.value_ptr.source_id) |source_id| self.allocator.free(source_id);
         }
         self.providers.deinit();
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     pub fn registerApiProvider(self: *ApiRegistry, provider: ApiProvider, source_id: ?[]const u8) !void {

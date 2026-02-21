@@ -117,6 +117,9 @@ pub const ProtocolServer = struct {
         self.active_streams.deinit();
         self.sequence_counters.deinit();
         self.expected_sequences.deinit();
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Handle incoming envelope, optionally return response envelope

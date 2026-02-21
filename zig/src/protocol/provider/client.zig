@@ -63,6 +63,8 @@ pub const ProtocolClient = struct {
 
     /// Initialize a new ProtocolClient
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
+        // OOM is the only possible error from allocator.create(); treat as fatal since
+        // the client cannot function without its event stream.
         const es = allocator.create(event_stream.AssistantMessageEventStream) catch unreachable;
         es.* = event_stream.AssistantMessageEventStream.init(allocator);
         // ProtocolClient deep-copies events via cloneAssistantMessageEvent() before pushing,
@@ -98,6 +100,9 @@ pub const ProtocolClient = struct {
         if (self.last_error) |err| {
             self.allocator.free(err);
         }
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Set the transport sender
