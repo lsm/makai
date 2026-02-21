@@ -8,6 +8,7 @@ const tool_call_tracker = @import("tool_call_tracker");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
@@ -19,6 +20,42 @@ fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
 
 fn isOAuthToken(key: []const u8) bool {
     return std.mem.indexOf(u8, key, "sk-ant-oat") != null;
+}
+
+fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(base_url);
+    sb.count(suffix);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(base_url);
+    _ = sb.append(suffix);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
+fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var sb = StringBuilder{};
+    sb.count("Bearer ");
+    sb.count(token);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append("Bearer ");
+    _ = sb.append(token);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 /// Result of cache control resolution
@@ -984,7 +1021,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(allocator, "{s}/v1/messages", .{model.base_url}) catch {
+    const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/messages") catch {
         allocator.free(api_key);
         allocator.free(request_body);
         allocator.destroy(ctx);
@@ -1014,7 +1051,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // OAuth tokens use Authorization: Bearer, API keys use x-api-key
     if (is_oauth) {
-        auth_header = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+        auth_header = buildBearerAuthValue(allocator, api_key) catch {
             allocator.free(api_key);
             allocator.free(request_body);
             allocator.destroy(ctx);

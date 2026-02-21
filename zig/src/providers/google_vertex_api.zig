@@ -6,6 +6,7 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 /// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
@@ -31,6 +32,40 @@ pub const VertexError = error{
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
+}
+
+fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, project: []const u8, model_id: []const u8, api_key: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count("https://");
+    sb.count(location);
+    sb.count("-aiplatform.googleapis.com/v1/projects/");
+    sb.count(project);
+    sb.count("/locations/");
+    sb.count(location);
+    sb.count("/publishers/google/models/");
+    sb.count(model_id);
+    sb.count(":streamGenerateContent?alt=sse&key=");
+    sb.count(api_key);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append("https://");
+    _ = sb.append(location);
+    _ = sb.append("-aiplatform.googleapis.com/v1/projects/");
+    _ = sb.append(project);
+    _ = sb.append("/locations/");
+    _ = sb.append(location);
+    _ = sb.append("/publishers/google/models/");
+    _ = sb.append(model_id);
+    _ = sb.append(":streamGenerateContent?alt=sse&key=");
+    _ = sb.append(api_key);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 /// Resolve project ID from options or environment variables
@@ -679,11 +714,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // Vertex AI URL structure:
     // https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
-    const url = std.fmt.allocPrint(
-        allocator,
-        "https://{s}-aiplatform.googleapis.com/v1/projects/{s}/locations/{s}/publishers/google/models/{s}:streamGenerateContent?alt=sse&key={s}",
-        .{ location, project, location, model.id, api_key },
-    ) catch {
+    const url = buildVertexStreamUrl(allocator, location, project, model.id, api_key) catch {
         allocator.free(project);
         allocator.free(location);
         allocator.free(api_key);

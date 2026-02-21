@@ -7,6 +7,7 @@ const json_writer = @import("json_writer");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -76,6 +77,30 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
+}
+
+fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const u8, model_id: []const u8, api_key: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(base_url);
+    sb.count("/v1beta/models/");
+    sb.count(model_id);
+    sb.count(":streamGenerateContent?alt=sse&key=");
+    sb.count(api_key);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(base_url);
+    _ = sb.append("/v1beta/models/");
+    _ = sb.append(model_id);
+    _ = sb.append(":streamGenerateContent?alt=sse&key=");
+    _ = sb.append(api_key);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 // Model detection helpers
@@ -732,11 +757,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(
-        allocator,
-        "{s}/v1beta/models/{s}:streamGenerateContent?alt=sse&key={s}",
-        .{ base_url, model.id, api_key },
-    ) catch {
+    const url = buildStreamGenerateContentUrl(allocator, base_url, model.id, api_key) catch {
         allocator.free(base_url);
         allocator.free(api_key);
         allocator.free(body);

@@ -78,6 +78,42 @@ fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
 }
 
+fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(base_url);
+    sb.count(suffix);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(base_url);
+    _ = sb.append(suffix);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
+fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var sb = StringBuilder{};
+    sb.count("Bearer ");
+    sb.count(token);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append("Bearer ");
+    _ = sb.append(token);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
 fn buildGeneratedToolCallId(allocator: std.mem.Allocator, tool_name: []const u8, timestamp: i64, counter: usize) ![]const u8 {
     var sb = StringBuilder{};
     sb.count(tool_name);
@@ -543,7 +579,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(allocator, "{s}/api/chat", .{base_url}) catch {
+    const url = buildUrlWithSuffix(allocator, base_url, "/api/chat") catch {
         allocator.free(base_url);
         if (api_key) |k| allocator.free(k);
         allocator.free(body);
@@ -580,7 +616,7 @@ fn runThread(ctx: *ThreadCtx) void {
     defer if (auth_value) |v| allocator.free(v);
 
     if (api_key) |k| {
-        auth_value = std.fmt.allocPrint(allocator, "Bearer {s}", .{k}) catch {
+        auth_value = buildBearerAuthValue(allocator, k) catch {
             allocator.free(base_url);
             allocator.free(k);
             allocator.free(body);

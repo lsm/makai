@@ -346,6 +346,42 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     return buf.toOwnedSlice(allocator);
 }
 
+fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(base_url);
+    sb.count(suffix);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(base_url);
+    _ = sb.append(suffix);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
+fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var sb = StringBuilder{};
+    sb.count("Bearer ");
+    sb.count(token);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append("Bearer ");
+    _ = sb.append(token);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
 /// Build compound ID for OpenAI Responses tool calls: {call_id}|{item_id}
 fn buildCompoundId(allocator: std.mem.Allocator, call_id: []const u8, item_id: []const u8) ![]const u8 {
     var sb = StringBuilder{};
@@ -610,7 +646,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(allocator, "{s}/v1/responses", .{model.base_url}) catch {
+    const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/responses") catch {
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(ctx);
@@ -619,7 +655,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+    const auth = buildBearerAuthValue(allocator, api_key) catch {
         allocator.free(url);
         allocator.free(api_key);
         allocator.free(body);

@@ -177,6 +177,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sanitize", .module = sanitize_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
+            .{ .name = "string_builder", .module = string_builder_mod },
         },
     });
 
@@ -194,6 +195,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sanitize", .module = sanitize_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
+            .{ .name = "string_builder", .module = string_builder_mod },
         },
     });
 
@@ -241,6 +243,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sanitize", .module = sanitize_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
+            .{ .name = "string_builder", .module = string_builder_mod },
         },
     });
 
@@ -256,6 +259,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
+            .{ .name = "string_builder", .module = string_builder_mod },
         },
     });
 

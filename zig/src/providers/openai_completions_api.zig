@@ -10,6 +10,7 @@ const provider_caps = @import("provider_caps");
 const sanitize = @import("sanitize");
 const retry = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 /// Merged compatibility options from model-level config and detected capabilities
 const MergedCompat = struct {
@@ -1003,6 +1004,42 @@ fn parseChunk(
     }
 }
 
+fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(base_url);
+    sb.count(suffix);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(base_url);
+    _ = sb.append(suffix);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
+fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
+    var sb = StringBuilder{};
+    sb.count("Bearer ");
+    sb.count(token);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append("Bearer ");
+    _ = sb.append(token);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
+}
+
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1036,14 +1073,14 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // GitHub Copilot uses /chat/completions, others use /v1/chat/completions
     const url = if (std.mem.eql(u8, model.provider, "github-copilot"))
-        std.fmt.allocPrint(allocator, "{s}/chat/completions", .{model.base_url}) catch {
+        buildUrlWithSuffix(allocator, model.base_url, "/chat/completions") catch {
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom building url");
             return;
         }
     else
-        std.fmt.allocPrint(allocator, "{s}/v1/chat/completions", .{model.base_url}) catch {
+        buildUrlWithSuffix(allocator, model.base_url, "/v1/chat/completions") catch {
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("oom building url");
@@ -1051,7 +1088,7 @@ fn runThread(ctx: *ThreadCtx) void {
         };
     defer allocator.free(url);
 
-    const auth = std.fmt.allocPrint(allocator, "Bearer {s}", .{api_key}) catch {
+    const auth = buildBearerAuthValue(allocator, api_key) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom building auth header");
