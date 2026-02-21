@@ -96,12 +96,11 @@ test "AgentProtocolRuntime supports multi-session routing" {
     _ = try runtime.pumpOnce(&client);
     const sid1 = client.session_id.?;
 
-    // New session starts currently require sequence 1.
-    client.sequence = 0;
     _ = try client.sendAgentStart("{}", null);
     _ = try runtime.pumpOnce(&client);
     const sid2 = client.session_id.?;
 
+    try std.testing.expect(!std.mem.eql(u8, sid1[0..], sid2[0..]));
     try std.testing.expectEqual(@as(usize, 2), server.sessionCount());
 
     _ = try client.sendAgentMessage(sid1, "{\"role\":\"user\",\"content\":\"one\"}", null);

@@ -10,16 +10,14 @@ const owned_slice_mod = @import("owned_slice");
 
 const OwnedSlice = owned_slice_mod.OwnedSlice;
 
-/// Client-side protocol handler for the Makai Wire Protocol
+/// Client-side protocol handler for the Makai Wire Protocol.
 ///
-/// Current Limitation (v1.0): This implementation supports single-stream mode only.
-/// The `current_stream_id` field tracks one active stream at a time. Clients should
-/// wait for a stream to complete (done/error) before starting a new stream.
-/// Full multiplexing support is planned for v2.0.
+/// Supports multiplexed streams with per-stream sequence tracking.
 pub const ProtocolClient = struct {
     // Declarations must come before fields
     pub const PendingRequest = struct {
         message_id: protocol_types.Uuid,
+        stream_id: protocol_types.Uuid = [_]u8{0} ** 16,
         sent_at: i64,
         timeout_ms: u64,
     };
@@ -43,24 +41,37 @@ pub const ProtocolClient = struct {
     /// Pending requests awaiting ACK/NACK
     pending_requests: std.AutoHashMap(protocol_types.Uuid, PendingRequest),
 
-    /// Current stream ID (if streaming)
-    /// NOTE: v1.0 limitation - only one active stream is supported at a time.
-    /// Full multiplexing with concurrent streams is planned for v2.0.
+    /// Per-stream outgoing sequence counters
+    stream_sequences: std.AutoHashMap(protocol_types.Uuid, u64),
+
+    /// Per-stream reconstructors
+    reconstructors: std.AutoHashMap(protocol_types.Uuid, partial_reconstructor.PartialReconstructor),
+
+    /// Per-stream final results
+    stream_results: std.AutoHashMap(protocol_types.Uuid, ai_types.AssistantMessage),
+
+    /// Per-stream errors
+    stream_errors: std.AutoHashMap(protocol_types.Uuid, OwnedSlice(u8)),
+
+    /// Per-stream completion flags
+    stream_complete_flags: std.AutoHashMap(protocol_types.Uuid, bool),
+
+    /// Current stream ID (compatibility for legacy single-stream callers)
     current_stream_id: ?protocol_types.Uuid = null,
 
     /// Event stream for consuming events
     event_stream: *event_stream.AssistantMessageEventStream,
 
-    /// Last received result (from done event or result envelope)
+    /// Last received result (legacy compatibility)
     last_result: ?ai_types.AssistantMessage = null,
 
-    /// Last error message (from NACK or stream_error)
+    /// Last error message (legacy compatibility)
     last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
-    /// Whether the stream is complete
+    /// Whether the stream is complete (legacy compatibility)
     stream_complete: bool = false,
 
-    /// Sequence number for outgoing messages
+    /// Sequence number for outgoing messages (legacy compatibility mirror)
     sequence: u64 = 0,
 
     options: Options,
@@ -78,6 +89,11 @@ pub const ProtocolClient = struct {
             .allocator = allocator,
             .reconstructor = partial_reconstructor.PartialReconstructor.init(allocator),
             .pending_requests = std.AutoHashMap(protocol_types.Uuid, PendingRequest).init(allocator),
+            .stream_sequences = std.AutoHashMap(protocol_types.Uuid, u64).init(allocator),
+            .reconstructors = std.AutoHashMap(protocol_types.Uuid, partial_reconstructor.PartialReconstructor).init(allocator),
+            .stream_results = std.AutoHashMap(protocol_types.Uuid, ai_types.AssistantMessage).init(allocator),
+            .stream_errors = std.AutoHashMap(protocol_types.Uuid, OwnedSlice(u8)).init(allocator),
+            .stream_complete_flags = std.AutoHashMap(protocol_types.Uuid, bool).init(allocator),
             .event_stream = es,
             .options = options,
         };
@@ -85,10 +101,33 @@ pub const ProtocolClient = struct {
 
     /// Deinitialize the ProtocolClient
     pub fn deinit(self: *Self) void {
-        // Clean up pending requests
+        // Clean up pending requests and stream metadata
         self.pending_requests.deinit();
+        self.stream_sequences.deinit();
+        self.stream_complete_flags.deinit();
 
-        // Clean up reconstructor
+        // Clean up per-stream reconstructors
+        var recon_it = self.reconstructors.iterator();
+        while (recon_it.next()) |entry| {
+            entry.value_ptr.deinit();
+        }
+        self.reconstructors.deinit();
+
+        // Clean up per-stream results
+        var result_it = self.stream_results.iterator();
+        while (result_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_results.deinit();
+
+        // Clean up per-stream errors
+        var err_it = self.stream_errors.iterator();
+        while (err_it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.stream_errors.deinit();
+
+        // Clean up legacy reconstructor
         self.reconstructor.deinit();
 
         // Clean up event stream
@@ -121,6 +160,39 @@ pub const ProtocolClient = struct {
         self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
     }
 
+    fn nextSequenceForStream(self: *Self, stream_id: protocol_types.Uuid) !u64 {
+        const next = if (self.stream_sequences.get(stream_id)) |cur| cur + 1 else 1;
+        try self.stream_sequences.put(stream_id, next);
+        self.sequence = next; // compatibility mirror
+        return next;
+    }
+
+    fn ensureReconstructor(self: *Self, stream_id: protocol_types.Uuid) !*partial_reconstructor.PartialReconstructor {
+        if (self.reconstructors.getPtr(stream_id)) |r| return r;
+        try self.reconstructors.put(stream_id, partial_reconstructor.PartialReconstructor.init(self.allocator));
+        return self.reconstructors.getPtr(stream_id).?;
+    }
+
+    fn setStreamError(self: *Self, stream_id: protocol_types.Uuid, msg: []const u8) !void {
+        if (self.stream_errors.getPtr(stream_id)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
+        } else {
+            try self.stream_errors.put(stream_id, OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg)));
+        }
+        try self.stream_complete_flags.put(stream_id, true);
+    }
+
+    fn setStreamResult(self: *Self, stream_id: protocol_types.Uuid, result: ai_types.AssistantMessage) !void {
+        if (self.stream_results.getPtr(stream_id)) |existing| {
+            existing.deinit(self.allocator);
+            existing.* = result;
+        } else {
+            try self.stream_results.put(stream_id, result);
+        }
+        try self.stream_complete_flags.put(stream_id, true);
+    }
+
     /// Send stream_request, returns message_id for correlation
     pub fn sendStreamRequest(
         self: *Self,
@@ -133,9 +205,8 @@ pub const ProtocolClient = struct {
         }
 
         const message_id = protocol_types.generateUuid();
-        self.sequence += 1;
-
-        const stream_id = self.current_stream_id orelse message_id;
+        const stream_id = message_id;
+        const seq = try self.nextSequenceForStream(stream_id);
 
         const payload = protocol_types.Payload{
             .stream_request = .{
@@ -149,7 +220,7 @@ pub const ProtocolClient = struct {
         var env = protocol_types.Envelope{
             .stream_id = stream_id,
             .message_id = message_id,
-            .sequence = self.sequence,
+            .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
         };
@@ -164,24 +235,32 @@ pub const ProtocolClient = struct {
         // Store pending request
         try self.pending_requests.put(message_id, .{
             .message_id = message_id,
+            .stream_id = stream_id,
             .sent_at = std.time.milliTimestamp(),
             .timeout_ms = self.options.request_timeout_ms,
         });
+        try self.stream_complete_flags.put(stream_id, false);
+        _ = try self.ensureReconstructor(stream_id);
 
         return message_id;
     }
 
-    /// Send abort_request for current stream
+    /// Send abort_request for current stream (legacy convenience method)
     pub fn sendAbortRequest(self: *Self, reason: ?[]const u8) !void {
+        const stream_id = self.current_stream_id orelse return error.NoActiveStream;
+        try self.sendAbortRequestFor(stream_id, reason);
+    }
+
+    /// Send abort_request for a specific stream
+    pub fn sendAbortRequestFor(self: *Self, stream_id: protocol_types.Uuid, reason: ?[]const u8) !void {
         if (self.sender == null) {
             return error.NoSender;
         }
-
-        if (self.current_stream_id == null) {
+        if (!self.stream_sequences.contains(stream_id)) {
             return error.NoActiveStream;
         }
 
-        self.sequence += 1;
+        const seq = try self.nextSequenceForStream(stream_id);
 
         const reason_owned = if (reason) |r|
             OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r))
@@ -190,15 +269,15 @@ pub const ProtocolClient = struct {
 
         const payload = protocol_types.Payload{
             .abort_request = .{
-                .target_stream_id = self.current_stream_id.?,
+                .target_stream_id = stream_id,
                 .reason = reason_owned,
             },
         };
 
         var env = protocol_types.Envelope{
-            .stream_id = self.current_stream_id.?,
+            .stream_id = stream_id,
             .message_id = protocol_types.generateUuid(),
-            .sequence = self.sequence,
+            .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
         };
@@ -216,17 +295,22 @@ pub const ProtocolClient = struct {
         switch (env.payload) {
             .ack => |ack| {
                 // Correlate with pending request
-                if (self.pending_requests.fetchRemove(ack.acknowledged_id)) |_| {
+                if (self.pending_requests.fetchRemove(ack.acknowledged_id)) |pending| {
                     // Request acknowledged
-                    // Note: current_stream_id is set from the envelope's stream_id field
-                    self.current_stream_id = env.stream_id;
+                    var sid = pending.value.stream_id;
+                    if (std.mem.allEqual(u8, &sid, 0)) sid = env.stream_id;
+                    self.current_stream_id = sid;
                 }
             },
             .nack => |nack| {
                 // Mark request as failed
-                _ = self.pending_requests.fetchRemove(nack.rejected_id);
+                if (self.pending_requests.fetchRemove(nack.rejected_id)) |pending| {
+                    var sid = pending.value.stream_id;
+                    if (std.mem.allEqual(u8, &sid, 0)) sid = env.stream_id;
+                    try self.setStreamError(sid, nack.reason.slice());
+                }
 
-                // Store error
+                // Store legacy error
                 try self.setLastError(nack.reason.slice());
             },
             .event => |evt| {
@@ -238,45 +322,47 @@ pub const ProtocolClient = struct {
                 // Push to event stream for polling
                 try self.event_stream.push(owned_evt);
 
-                // Process through reconstructor
+                // Process through legacy reconstructor for compatibility
                 try self.reconstructor.processEvent(owned_evt);
+
+                // Process through per-stream reconstructor
+                const recon = try self.ensureReconstructor(env.stream_id);
+                try recon.processEvent(owned_evt);
 
                 // Check for done event
                 if (owned_evt == .done) {
-                    self.stream_complete = true;
-
-                    // Build final message from reconstructor
-                    const result = try self.reconstructor.buildMessage(
+                    const result = try recon.buildMessage(
                         owned_evt.done.reason,
                         owned_evt.done.message.timestamp,
                     );
+                    try self.setStreamResult(env.stream_id, result);
 
-                    // Clean up previous result
+                    // Legacy fields for current stream users
+                    self.stream_complete = true;
                     if (self.last_result) |*prev| {
                         prev.deinit(self.allocator);
                     }
-                    self.last_result = result;
+                    self.last_result = try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(env.stream_id).?);
                 }
             },
             .result => |result| {
-                // Store as last result
+                const result_copy = try ai_types.cloneAssistantMessage(self.allocator, result);
+                try self.setStreamResult(env.stream_id, result_copy);
+
+                // Legacy compatibility
                 if (self.last_result) |*prev| {
                     prev.deinit(self.allocator);
                 }
-
-                // Deep copy the result
-                self.last_result = try ai_types.cloneAssistantMessage(self.allocator, result);
+                self.last_result = try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(env.stream_id).?);
                 self.stream_complete = true;
             },
             .stream_error => |err| {
                 const msg = err.message.slice();
 
-                // Store error
+                // Store per-stream + legacy error
+                try self.setStreamError(env.stream_id, msg);
                 try self.setLastError(msg);
                 self.stream_complete = true;
-
-                // Complete the event stream with error
-                self.event_stream.completeWithError(msg);
             },
             .pong => {
                 // No-op for pong
@@ -292,42 +378,66 @@ pub const ProtocolClient = struct {
         return self.event_stream;
     }
 
-    /// Get last result (blocking wait if not ready)
+    /// Get last result for current stream (legacy convenience)
     pub fn waitResult(self: *Self, timeout_ms: u64) !?ai_types.AssistantMessage {
+        const stream_id = self.current_stream_id orelse return self.last_result;
+        return self.waitResultFor(stream_id, timeout_ms);
+    }
+
+    /// Get result for a specific stream (blocking wait if not ready)
+    pub fn waitResultFor(self: *Self, stream_id: protocol_types.Uuid, timeout_ms: u64) !?ai_types.AssistantMessage {
         const start_time = std.time.milliTimestamp();
         const deadline = start_time + @as(i64, @intCast(timeout_ms));
 
-        while (!self.stream_complete) {
+        while (!(self.stream_complete_flags.get(stream_id) orelse false)) {
             if (std.time.milliTimestamp() >= deadline) {
                 return error.TimeoutExceeded;
             }
-
-            // Check for errors
-            if (self.hasLastError()) {
-                return error.StreamError;
-            }
-
-            // Wait for more events
             std.Thread.sleep(1 * std.time.ns_per_ms);
         }
 
-        // Check for error
-        if (self.hasLastError()) {
+        if (self.stream_errors.get(stream_id)) |_| {
             return error.StreamError;
         }
 
-        return self.last_result;
+        if (self.stream_results.get(stream_id)) |result| {
+            return result;
+        }
+        return null;
     }
 
-    /// Check if stream is complete
+    /// Check if current stream is complete (legacy)
     pub fn isComplete(self: *Self) bool {
+        if (self.current_stream_id) |sid| {
+            return self.isCompleteFor(sid);
+        }
         return self.stream_complete;
     }
 
-    /// Reset for a new stream
+    /// Check if a specific stream is complete
+    pub fn isCompleteFor(self: *Self, stream_id: protocol_types.Uuid) bool {
+        return self.stream_complete_flags.get(stream_id) orelse false;
+    }
+
+    /// Reset all stream state
     pub fn reset(self: *Self) void {
         self.reconstructor.reset();
         self.pending_requests.clearRetainingCapacity();
+        self.stream_sequences.clearRetainingCapacity();
+        self.stream_complete_flags.clearRetainingCapacity();
+
+        var recon_it = self.reconstructors.iterator();
+        while (recon_it.next()) |entry| entry.value_ptr.deinit();
+        self.reconstructors.clearRetainingCapacity();
+
+        var result_it = self.stream_results.iterator();
+        while (result_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.stream_results.clearRetainingCapacity();
+
+        var err_it = self.stream_errors.iterator();
+        while (err_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.stream_errors.clearRetainingCapacity();
+
         self.current_stream_id = null;
         self.stream_complete = false;
         self.sequence = 0;
@@ -346,10 +456,19 @@ pub const ProtocolClient = struct {
         return self.current_stream_id;
     }
 
-    /// Get the last error message
+    /// Get the last error message for current stream (legacy)
     pub fn getLastError(self: *Self) ?[]const u8 {
         if (!self.hasLastError()) return null;
         return self.last_error.slice();
+    }
+
+    /// Get error for a specific stream
+    pub fn getLastErrorFor(self: *Self, stream_id: protocol_types.Uuid) ?[]const u8 {
+        if (self.stream_errors.get(stream_id)) |err| {
+            const msg = err.slice();
+            if (msg.len > 0) return msg;
+        }
+        return null;
     }
 };
 

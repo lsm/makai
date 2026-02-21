@@ -7,11 +7,13 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 pub const AgentProtocolClient = struct {
     allocator: std.mem.Allocator,
     sender: ?transport.AsyncSender = null,
+    /// Deprecated compatibility field; sequence is now tracked per session.
     sequence: u64 = 0,
     session_id: ?agent_types.Uuid = null,
     last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     last_result_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     event_queue: std.ArrayList(OwnedSlice(u8)),
+    next_sequence_by_session: std.AutoHashMap(agent_types.Uuid, u64),
 
     const Self = @This();
 
@@ -19,6 +21,7 @@ pub const AgentProtocolClient = struct {
         return .{
             .allocator = allocator,
             .event_queue = std.ArrayList(OwnedSlice(u8)){},
+            .next_sequence_by_session = std.AutoHashMap(agent_types.Uuid, u64).init(allocator),
         };
     }
 
@@ -27,6 +30,7 @@ pub const AgentProtocolClient = struct {
         self.last_result_json.deinit(self.allocator);
         for (self.event_queue.items) |*e| e.deinit(self.allocator);
         self.event_queue.deinit(self.allocator);
+        self.next_sequence_by_session.deinit();
         self.* = undefined;
     }
 
@@ -34,10 +38,17 @@ pub const AgentProtocolClient = struct {
         self.sender = sender;
     }
 
+    fn nextSequence(self: *Self, session_id: agent_types.Uuid) !u64 {
+        const next = if (self.next_sequence_by_session.get(session_id)) |cur| cur + 1 else 1;
+        try self.next_sequence_by_session.put(session_id, next);
+        self.sequence = next; // compatibility mirror
+        return next;
+    }
+
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Uuid {
         const sid = agent_types.generateUuid();
         const msg_id = agent_types.generateUuid();
-        self.sequence += 1;
+        const seq = try self.nextSequence(sid);
 
         var payload = agent_types.Payload{ .agent_start = .{ .config_json = try self.allocator.dupe(u8, config_json), .session_id = sid } };
         defer payload.deinit(self.allocator);
@@ -48,7 +59,7 @@ pub const AgentProtocolClient = struct {
         try self.sendEnvelope(.{
             .session_id = sid,
             .message_id = msg_id,
-            .sequence = self.sequence,
+            .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
         });
@@ -58,7 +69,7 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentMessage(self: *Self, session_id: agent_types.Uuid, message_json: []const u8, options_json: ?[]const u8) !agent_types.Uuid {
         const msg_id = agent_types.generateUuid();
-        self.sequence += 1;
+        const seq = try self.nextSequence(session_id);
 
         var payload = agent_types.Payload{ .agent_message = .{
             .session_id = session_id,
@@ -70,7 +81,7 @@ pub const AgentProtocolClient = struct {
         try self.sendEnvelope(.{
             .session_id = session_id,
             .message_id = msg_id,
-            .sequence = self.sequence,
+            .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
         });
@@ -79,7 +90,7 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStop(self: *Self, session_id: agent_types.Uuid, reason: ?[]const u8) !agent_types.Uuid {
         const msg_id = agent_types.generateUuid();
-        self.sequence += 1;
+        const seq = try self.nextSequence(session_id);
 
         var payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
         defer payload.deinit(self.allocator);
@@ -88,7 +99,7 @@ pub const AgentProtocolClient = struct {
         try self.sendEnvelope(.{
             .session_id = session_id,
             .message_id = msg_id,
-            .sequence = self.sequence,
+            .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
         });
@@ -119,6 +130,7 @@ pub const AgentProtocolClient = struct {
                 if (self.session_id) |sid| {
                     if (std.mem.eql(u8, sid[0..], p.session_id[0..])) self.session_id = null;
                 }
+                _ = self.next_sequence_by_session.remove(p.session_id);
             },
             else => {},
         }
