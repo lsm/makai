@@ -70,9 +70,8 @@ fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResu
         .text = try allocator.dupe(u8, "Tool execution failed"),
     } };
     return .{
-        .content = content,
+        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
         .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
-        .owned_strings = true,
     };
 }
 
@@ -94,7 +93,7 @@ fn createToolResultMessage(
     return .{
         .tool_call_id = try allocator.dupe(u8, tool_call.id),
         .tool_name = try allocator.dupe(u8, tool_call.name),
-        .content = result.content,
+        .content = result.content.slice(),
         .details_json = details_json,
         .is_error = is_error,
         .timestamp = std.time.milliTimestamp(),
@@ -374,7 +373,6 @@ fn streamAssistantResponse(
                 const msg: ai_types.Message = .{ .assistant = s.partial };
                 try event_stream.push(.{ .message_start = .{
                     .message = msg,
-                    .owned_strings = false,
                 } });
                 message_started = true;
             },
@@ -437,7 +435,6 @@ fn streamAssistantResponse(
                 const msg: ai_types.Message = .{ .assistant = d.message };
                 try event_stream.push(.{ .message_end = .{
                     .message = msg,
-                    .owned_strings = false,
                 } });
             },
             .@"error" => |e| {
@@ -445,7 +442,6 @@ fn streamAssistantResponse(
                 const msg: ai_types.Message = .{ .assistant = e.err };
                 try event_stream.push(.{ .message_end = .{
                     .message = msg,
-                    .owned_strings = false,
                 } });
             },
             .keepalive => {
@@ -499,11 +495,9 @@ fn runLoop(
             // Emit message_start/message_end for each prompt
             try event_stream.push(.{ .message_start = .{
                 .message = prompt,
-                .owned_strings = false,
             } });
             try event_stream.push(.{ .message_end = .{
                 .message = prompt,
-                .owned_strings = false,
             } });
         }
     }
@@ -537,11 +531,9 @@ fn runLoop(
                         try context.appendMessage(steering_msg);
                         try event_stream.push(.{ .message_start = .{
                             .message = steering_msg,
-                            .owned_strings = false,
                         } });
                         try event_stream.push(.{ .message_end = .{
                             .message = steering_msg,
-                            .owned_strings = false,
                         } });
                     }
                     allocator.free(msgs);
@@ -580,8 +572,7 @@ fn runLoop(
                 // Emit turn_end with error
                 try event_stream.push(.{ .turn_end = .{
                     .message = error_msg,
-                    .tool_results = &.{},
-                    .owned_strings = false,
+                    .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                 } });
 
                 break :outer;
@@ -596,8 +587,7 @@ fn runLoop(
                     // Emit turn_end and exit
                     try event_stream.push(.{ .turn_end = .{
                         .message = assistant_message,
-                        .tool_results = &.{},
-                        .owned_strings = false,
+                        .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
                     break :outer;
                 },
@@ -605,8 +595,7 @@ fn runLoop(
                     // Emit turn_end, check follow-up messages
                     try event_stream.push(.{ .turn_end = .{
                         .message = assistant_message,
-                        .tool_results = &.{},
-                        .owned_strings = false,
+                        .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
 
                     // Add assistant message to context
@@ -621,11 +610,9 @@ fn runLoop(
                                     try context.appendMessage(follow_up);
                                     try event_stream.push(.{ .message_start = .{
                                         .message = follow_up,
-                                        .owned_strings = false,
                                     } });
                                     try event_stream.push(.{ .message_end = .{
                                         .message = follow_up,
-                                        .owned_strings = false,
                                     } });
                                 }
                                 allocator.free(follow_ups);
@@ -659,8 +646,7 @@ fn runLoop(
                     // Emit turn_end with tool results
                     try event_stream.push(.{ .turn_end = .{
                         .message = assistant_message,
-                        .tool_results = tool_result.tool_results,
-                        .owned_strings = false,
+                        .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(tool_result.tool_results),
                     } });
 
                     // Add assistant message to context
@@ -671,12 +657,10 @@ fn runLoop(
                         const msg: ai_types.Message = .{ .tool_result = tool_result_msg };
                         try event_stream.push(.{ .message_start = .{
                             .message = msg,
-                            .owned_strings = false,
                         } });
                         try context.appendMessage(msg);
                         try event_stream.push(.{ .message_end = .{
                             .message = msg,
-                            .owned_strings = false,
                         } });
                     }
 
@@ -706,8 +690,7 @@ fn runLoop(
     // Emit agent_end
     try event_stream.push(.{
         .agent_end = .{
-            .messages = result.messages.slice(),
-            .owned_strings = false, // Ownership transferred to result
+            .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
         },
     });
 
@@ -810,8 +793,8 @@ test "createErrorResult creates valid result" {
         mut_result.deinit(std.testing.allocator);
     }
 
-    try std.testing.expectEqual(@as(usize, 1), result.content.len);
-    try std.testing.expect(result.content[0] == .text);
+    try std.testing.expectEqual(@as(usize, 1), result.content.slice().len);
+    try std.testing.expect(result.content.slice()[0] == .text);
 }
 
 // Note: Full integration tests would require a mock provider

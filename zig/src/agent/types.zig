@@ -11,41 +11,30 @@ pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 /// Payload for agent_end event
 pub const AgentEndPayload = struct {
-    messages: []const ai_types.Message,
-    owned_strings: bool = false,
+    messages: OwnedSlice(ai_types.Message) = OwnedSlice(ai_types.Message).initBorrowed(&.{}),
 
     pub fn deinit(self: *AgentEndPayload, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return;
-        const mut_msgs: []ai_types.Message = @constCast(self.messages);
-        for (mut_msgs) |*msg| {
-            msg.deinit(allocator);
-        }
-        allocator.free(self.messages);
+        self.messages.deinit(allocator);
     }
 };
 
 /// Payload for turn_end event
 pub const TurnEndPayload = struct {
     message: ai_types.AssistantMessage,
-    tool_results: []const ai_types.ToolResultMessage,
-    owned_strings: bool = false,
+    tool_results: OwnedSlice(ai_types.ToolResultMessage) = OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
 
     pub fn deinit(self: *TurnEndPayload, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return;
-        var mut_msg = self.message;
-        mut_msg.deinit(allocator);
-        const mut_results: []ai_types.ToolResultMessage = @constCast(self.tool_results);
-        for (mut_results) |*result| {
-            result.deinit(allocator);
+        if (self.message.owned_strings) {
+            var mut_msg = self.message;
+            mut_msg.deinit(allocator);
         }
-        allocator.free(self.tool_results);
+        self.tool_results.deinit(allocator);
     }
 };
 
 /// Payload for message_start event
 pub const MessageStartPayload = struct {
     message: ai_types.Message,
-    owned_strings: bool = false,
 };
 
 /// Payload for message_update event
@@ -57,7 +46,6 @@ pub const MessageUpdatePayload = struct {
 /// Payload for message_end event
 pub const MessageEndPayload = struct {
     message: ai_types.Message,
-    owned_strings: bool = false,
 };
 
 /// Payload for tool_execution_start event
@@ -110,9 +98,8 @@ pub const AgentEvent = union(enum) {
 
 /// Tool result returned from execute
 pub const AgentToolResult = struct {
-    content: []const ai_types.UserContentPart,
+    content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    owned_strings: bool = false,
 
     pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
         const details = self.details_json.slice();
@@ -120,10 +107,7 @@ pub const AgentToolResult = struct {
     }
 
     pub fn deinit(self: *AgentToolResult, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return;
-        const mut_content: []ai_types.UserContentPart = @constCast(self.content);
-        for (mut_content) |*part| part.deinit(allocator);
-        allocator.free(self.content);
+        self.content.deinit(allocator);
         self.details_json.deinit(allocator);
     }
 };
@@ -519,8 +503,7 @@ test "AgentEvent tags are correct" {
     try std.testing.expect(std.meta.activeTag(event) == .agent_start);
 
     const end_event: AgentEvent = .{ .agent_end = .{
-        .messages = &.{},
-        .owned_strings = false,
+        .messages = OwnedSlice(ai_types.Message).initBorrowed(&.{}),
     } };
     try std.testing.expect(std.meta.activeTag(end_event) == .agent_end);
 }
@@ -617,8 +600,7 @@ test "AgentEndPayload deinit with owned strings" {
     msgs[0] = msg;
 
     var payload = AgentEndPayload{
-        .messages = msgs,
-        .owned_strings = true,
+        .messages = OwnedSlice(ai_types.Message).initOwned(msgs),
     };
 
     payload.deinit(std.testing.allocator);
@@ -636,12 +618,11 @@ test "TurnEndPayload with tool results" {
             .stop_reason = .stop,
             .timestamp = 0,
         },
-        .tool_results = &.{},
-        .owned_strings = false,
+        .tool_results = OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
     };
 
     // Just verify it compiles and has correct fields
-    try std.testing.expect(payload.tool_results.len == 0);
+    try std.testing.expect(payload.tool_results.slice().len == 0);
 }
 
 test "ProtocolClient has stream method" {
