@@ -1,7 +1,8 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
-const types = @import("types.zig");
-const agent_loop = @import("agent_loop.zig");
+const event_stream_mod = @import("event_stream");
+const types = @import("agent_types");
+const agent_loop = @import("agent_loop");
 
 // Re-export types
 pub const AgentEvent = types.AgentEvent;
@@ -438,7 +439,7 @@ pub const Agent = struct {
     }
 
     /// Check if the agent is currently idle (not streaming).
-    pub fn isIdle(self: Agent) bool {
+    pub fn isIdle(self: *Agent) bool {
         self._mutex.lock();
         defer self._mutex.unlock();
         return !self._state.is_streaming;
@@ -515,11 +516,23 @@ pub const Agent = struct {
 
     fn cloneUserContent(self: *Agent, content: ai_types.UserContent) !ai_types.UserContent {
         return switch (content) {
+            .text => |t| .{ .text = try self._allocator.dupe(u8, t) },
+            .parts => |parts| blk: {
+                var cloned_parts = try self._allocator.alloc(ai_types.UserContentPart, parts.len);
+                for (parts, 0..) |p, i| {
+                    cloned_parts[i] = try self.cloneUserContentPart(p);
+                }
+                break :blk .{ .parts = cloned_parts };
+            },
+        };
+    }
+
+    fn cloneUserContentPart(self: *Agent, part: ai_types.UserContentPart) !ai_types.UserContentPart {
+        return switch (part) {
             .text => |t| .{ .text = .{ .text = try self._allocator.dupe(u8, t.text) } },
             .image => |i| .{ .image = .{
-                .url = if (i.url) |u| try self._allocator.dupe(u8, u) else null,
-                .base64 = if (i.base64) |b| try self._allocator.dupe(u8, b) else null,
-                .media_type = i.media_type,
+                .data = try self._allocator.dupe(u8, i.data),
+                .mime_type = try self._allocator.dupe(u8, i.mime_type),
             } },
         };
     }
@@ -550,6 +563,10 @@ pub const Agent = struct {
                 .id = try self._allocator.dupe(u8, tc.id),
                 .name = try self._allocator.dupe(u8, tc.name),
                 .arguments_json = try self._allocator.dupe(u8, tc.arguments_json),
+            } },
+            .image => |i| .{ .image = .{
+                .data = try self._allocator.dupe(u8, i.data),
+                .mime_type = try self._allocator.dupe(u8, i.mime_type),
             } },
         };
     }
@@ -802,8 +819,31 @@ pub const Agent = struct {
 // Tests
 // ============================================================================
 
+// Mock protocol for testing - just returns an error since we're testing state management
+fn mockStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_mod.AssistantMessageEventStream {
+    _ = ctx;
+    _ = model;
+    _ = context;
+    _ = options;
+    _ = allocator;
+    return error.NotImplemented;
+}
+
+fn createMockProtocol() types.ProtocolClient {
+    return .{
+        .stream_fn = mockStreamFn,
+        .ctx = null,
+    };
+}
+
 test "Agent init and deinit" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     try std.testing.expect(!agent.isStreaming());
@@ -811,7 +851,7 @@ test "Agent init and deinit" {
 }
 
 test "Agent setSystemPrompt" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     try agent.setSystemPrompt("You are helpful.");
@@ -819,24 +859,35 @@ test "Agent setSystemPrompt" {
 
     // Overwrite
     try agent.setSystemPrompt("New prompt");
-    try std.testing.expectEqualStrings("New prompt.", agent._state.system_prompt);
+    try std.testing.expectEqualStrings("New prompt", agent._state.system_prompt);
 }
 
 test "Agent message queues" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
-    const msg = ai_types.Message{
+    // Use owned strings since clearAllQueues will try to free them
+    // Create separate messages for each queue to avoid double-free
+    const text1 = try std.testing.allocator.dupe(u8, "test1");
+    const msg1 = ai_types.Message{
         .user = .{
-            .content = .{ .text = "test" },
+            .content = .{ .text = text1 },
             .timestamp = 0,
         },
     };
 
-    try agent.steer(msg);
+    const text2 = try std.testing.allocator.dupe(u8, "test2");
+    const msg2 = ai_types.Message{
+        .user = .{
+            .content = .{ .text = text2 },
+            .timestamp = 0,
+        },
+    };
+
+    try agent.steer(msg1);
     try std.testing.expect(agent.hasQueuedMessages());
 
-    try agent.followUp(msg);
+    try agent.followUp(msg2);
     try std.testing.expect(agent.hasQueuedMessages());
 
     agent.clearAllQueues();
@@ -844,7 +895,7 @@ test "Agent message queues" {
 }
 
 test "Agent queue modes" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     agent.setSteeringMode(.all);
@@ -855,18 +906,29 @@ test "Agent queue modes" {
 }
 
 test "Agent reset" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
-    const msg = ai_types.Message{
+    // Use owned strings since reset will try to free them
+    // Create separate messages for each queue to avoid double-free
+    const text1 = try std.testing.allocator.dupe(u8, "test1");
+    const msg1 = ai_types.Message{
         .user = .{
-            .content = .{ .text = "test" },
+            .content = .{ .text = text1 },
             .timestamp = 0,
         },
     };
 
-    try agent.appendMessage(msg);
-    try agent.steer(msg);
+    const text2 = try std.testing.allocator.dupe(u8, "test2");
+    const msg2 = ai_types.Message{
+        .user = .{
+            .content = .{ .text = text2 },
+            .timestamp = 0,
+        },
+    };
+
+    try agent.appendMessage(msg1);
+    try agent.steer(msg2);
 
     agent.reset();
 
@@ -875,7 +937,7 @@ test "Agent reset" {
 }
 
 test "Agent subscribe and unsubscribe" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     const callback = struct {
@@ -893,7 +955,7 @@ test "Agent subscribe and unsubscribe" {
 }
 
 test "Agent isIdle and waitForIdle" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     // Agent starts idle
@@ -907,7 +969,7 @@ test "Agent isIdle and waitForIdle" {
 }
 
 test "Agent cloneMessage" {
-    var agent = Agent.init(std.testing.allocator, .{});
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
 
     const original = ai_types.Message{
