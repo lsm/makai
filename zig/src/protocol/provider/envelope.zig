@@ -1081,9 +1081,7 @@ fn deserializeStreamOptions(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.StreamOptions {
-    var opts: ai_types.StreamOptions = .{
-        .owned_strings = true, // Mark as owned since we dupe string fields
-    };
+    var opts: ai_types.StreamOptions = .{};
 
     if (obj.get("api_key")) |key| {
         opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key.string));
@@ -1145,7 +1143,9 @@ fn deserializeStreamOptions(
         } else if (std.mem.eql(u8, choice_type, "required")) {
             opts.tool_choice = .required;
         } else if (std.mem.eql(u8, choice_type, "function")) {
-            opts.tool_choice = .{ .function = try allocator.dupe(u8, choice.object.get("function").?.string) };
+            const function_name = try allocator.dupe(u8, choice.object.get("function").?.string);
+            opts.tool_choice = .{ .function = function_name };
+            opts.owned_tool_choice_function = ai_types.OwnedSlice(u8).initOwned(function_name);
         }
     }
     if (obj.get("http_timeout_ms")) |timeout| {

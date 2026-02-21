@@ -50,6 +50,11 @@ pub const StopReason = enum {
 pub const HeaderPair = struct {
     name: []const u8,
     value: []const u8,
+
+    pub fn deinit(self: *HeaderPair, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.value);
+    }
 };
 
 pub const RetryConfig = struct {
@@ -116,12 +121,14 @@ pub const StreamOptions = struct {
     metadata: ?Metadata = null,
     /// Tool choice behavior
     tool_choice: ?ToolChoice = null,
+    /// Owned storage for `tool_choice.function` when deserialized/cloned.
+    owned_tool_choice_function: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// HTTP connection timeout in milliseconds (default: 30s)
     http_timeout_ms: ?u64 = 30_000,
     /// Ping interval in milliseconds for streaming keepalive
     ping_interval_ms: ?u64 = null,
-    /// True if non-OwnedSlice strings were allocated (deserialized). When false, they are borrowed.
-    owned_strings: bool = false,
+    /// Owned storage for headers when deserialized/cloned.
+    owned_headers: ?OwnedSlice(HeaderPair) = null,
 
     pub fn getApiKey(self: *const StreamOptions) ?[]const u8 {
         const key = self.api_key.slice();
@@ -159,20 +166,9 @@ pub const StreamOptions = struct {
             meta.deinit(allocator);
         }
 
-        if (!self.owned_strings) return; // Guard for borrowed non-OwnedSlice fields
-
-        if (self.headers) |headers| {
-            for (headers) |header| {
-                allocator.free(header.name);
-                allocator.free(header.value);
-            }
-            allocator.free(headers);
-        }
-        if (self.tool_choice) |*choice| {
-            switch (choice.*) {
-                .function => |fname| allocator.free(fname),
-                else => {},
-            }
+        self.owned_tool_choice_function.deinit(allocator);
+        if (self.owned_headers) |*headers| {
+            headers.deinit(allocator);
         }
     }
 };
