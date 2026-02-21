@@ -71,7 +71,7 @@ fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResu
     } };
     return .{
         .content = content,
-        .details_json = null,
+        .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
         .owned_strings = true,
     };
 }
@@ -83,11 +83,19 @@ fn createToolResultMessage(
     result: AgentToolResult,
     is_error: bool,
 ) !ai_types.ToolResultMessage {
+    const details_json = if (result.getDetailsJson()) |details|
+        if (result.details_json.is_owned)
+            details
+        else
+            try allocator.dupe(u8, details)
+    else
+        null;
+
     return .{
         .tool_call_id = try allocator.dupe(u8, tool_call.id),
         .tool_name = try allocator.dupe(u8, tool_call.name),
         .content = result.content,
-        .details_json = result.details_json,
+        .details_json = details_json,
         .is_error = is_error,
         .timestamp = std.time.milliTimestamp(),
     };
@@ -214,7 +222,7 @@ fn executeToolCalls(
                 result = try createErrorResult(allocator, err);
                 is_error = true;
                 // Still need to emit end event even on validation error
-                const result_json = result.details_json orelse "null";
+                const result_json = result.getDetailsJson() orelse "null";
                 try event_stream.push(.{ .tool_execution_end = .{
                     .tool_call_id = tool_call.id,
                     .tool_name = tool_call.name,
@@ -252,7 +260,7 @@ fn executeToolCalls(
         }
 
         // Build result JSON for event
-        const result_json = result.details_json orelse "null";
+        const result_json = result.getDetailsJson() orelse "null";
 
         // Emit end event
         try event_stream.push(.{ .tool_execution_end = .{
@@ -329,7 +337,7 @@ fn streamAssistantResponse(
 
     // Build LLM context
     const llm_context = ai_types.Context{
-        .system_prompt = context.system_prompt,
+        .system_prompt = context.getSystemPrompt(),
         .messages = messages,
         .tools = tools,
         .owned_strings = false,

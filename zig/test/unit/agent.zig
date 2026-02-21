@@ -34,7 +34,7 @@ test "AgentContext: init and deinit" {
     defer ctx.deinit();
 
     try testing.expect(ctx.messages.items.len == 0);
-    try testing.expect(ctx.system_prompt == null);
+    try testing.expect(ctx.getSystemPrompt() == null);
 }
 
 test "AgentContext: append and retrieve messages" {
@@ -70,9 +70,9 @@ test "AgentContext: with system prompt" {
     defer ctx.deinit();
 
     // Don't free system_prompt ourselves - let AgentContext.deinit do it
-    ctx.system_prompt = try allocator.dupe(u8, "You are a helpful assistant.");
+    ctx.system_prompt = agent_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "You are a helpful assistant."));
 
-    try testing.expectEqualStrings("You are a helpful assistant.", ctx.system_prompt.?);
+    try testing.expectEqualStrings("You are a helpful assistant.", ctx.getSystemPrompt().?);
 }
 
 // =============================================================================

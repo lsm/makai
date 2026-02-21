@@ -660,7 +660,7 @@ pub const Agent = struct {
         var context = AgentContext.init(self._allocator);
         defer context.deinit();
 
-        context.system_prompt = self._state.system_prompt;
+        context.system_prompt = types.OwnedSlice(u8).initBorrowed(self._state.system_prompt);
         context.tools = self._state.tools;
 
         // Copy existing messages

@@ -111,15 +111,20 @@ pub const AgentEvent = union(enum) {
 /// Tool result returned from execute
 pub const AgentToolResult = struct {
     content: []const ai_types.UserContentPart,
-    details_json: ?[]const u8 = null,
+    details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     owned_strings: bool = false,
+
+    pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
+        const details = self.details_json.slice();
+        return if (details.len > 0) details else null;
+    }
 
     pub fn deinit(self: *AgentToolResult, allocator: std.mem.Allocator) void {
         if (!self.owned_strings) return;
         const mut_content: []ai_types.UserContentPart = @constCast(self.content);
         for (mut_content) |*part| part.deinit(allocator);
         allocator.free(self.content);
-        if (self.details_json) |dj| allocator.free(dj);
+        self.details_json.deinit(allocator);
     }
 };
 
@@ -302,7 +307,7 @@ pub const AgentLoopConfig = struct {
 
 /// Context for agent execution - holds messages, system prompt, and tools
 pub const AgentContext = struct {
-    system_prompt: ?[]const u8 = null,
+    system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     messages: std.ArrayList(ai_types.Message),
     tools: ?[]const AgentTool = null,
     allocator: std.mem.Allocator,
@@ -314,13 +319,18 @@ pub const AgentContext = struct {
         };
     }
 
+    pub fn getSystemPrompt(self: *const AgentContext) ?[]const u8 {
+        const prompt = self.system_prompt.slice();
+        return if (prompt.len > 0) prompt else null;
+    }
+
     pub fn deinit(self: *AgentContext) void {
         // Free messages if owned
         for (self.messages.items) |*msg| {
             msg.deinit(self.allocator);
         }
         self.messages.deinit(self.allocator);
-        if (self.system_prompt) |p| self.allocator.free(p);
+        self.system_prompt.deinit(self.allocator);
     }
 
     pub fn appendMessage(self: *AgentContext, msg: ai_types.Message) !void {
@@ -520,7 +530,7 @@ test "AgentContext init and deinit" {
     defer context.deinit();
 
     try std.testing.expect(context.messages.items.len == 0);
-    try std.testing.expect(context.system_prompt == null);
+    try std.testing.expect(context.getSystemPrompt() == null);
 }
 
 test "AgentContext appendMessage" {
