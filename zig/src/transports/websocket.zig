@@ -310,10 +310,9 @@ pub const WebSocketClient = struct {
                     .data = data,
                     .owned = true,
                 };
-                ctx.stream.push(chunk) catch {
-                    ctx.stream.completeWithError("Stream queue full");
+                if (!pushChunkOrFail(ctx.stream, chunk, ctx.allocator)) {
                     return;
-                };
+                }
             } else {
                 // Connection closed
                 ctx.stream.complete({});
@@ -327,6 +326,16 @@ pub const WebSocketClient = struct {
         return self.receive(allocator);
     }
 };
+
+fn pushChunkOrFail(stream: *transport.ByteStream, chunk: transport.ByteChunk, allocator: std.mem.Allocator) bool {
+    stream.push(chunk) catch {
+        var dropped = chunk;
+        dropped.deinit(allocator);
+        stream.completeWithError("Stream queue full");
+        return false;
+    };
+    return true;
+}
 
 // --- Internal types ---
 
@@ -774,6 +783,31 @@ test "decodeFrame preserves interleaved logical stream ordering" {
         offset += decoded.consumed;
     }
     try std.testing.expectEqual(offset, buf.items.len);
+}
+
+test "websocket producer backpressure completes stream with error" {
+    const allocator = std.testing.allocator;
+
+    var stream = transport.ByteStream.init(allocator);
+    defer {
+        stream.markThreadDone();
+        stream.deinit();
+    }
+
+    // Fill queue with borrowed chunks to simulate sustained consumer lag.
+    while (true) {
+        stream.push(.{ .data = "x", .owned = false }) catch |err| {
+            try std.testing.expectEqual(error.QueueFull, err);
+            break;
+        };
+    }
+
+    const overflow = try allocator.dupe(u8, "overflow");
+    const ok = pushChunkOrFail(&stream, .{ .data = overflow, .owned = true }, allocator);
+    try std.testing.expect(!ok);
+
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("Stream queue full", stream.getError().?);
 }
 
 test "WebSocketClient init and deinit" {

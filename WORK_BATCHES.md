@@ -24,7 +24,7 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [x] Add websocket fragmented/partial frame handling tests
 - [x] Add websocket ordering guarantees tests (single stream)
 - [x] Add websocket multiplex ordering tests (multi stream)
-- [ ] Add websocket backpressure behavior tests
+- [x] Add websocket backpressure behavior tests
 
 ### Batch B — WebSocket Transport Hardening Tests (Phase 2)
 - [ ] Add reconnect/resubscribe behavior tests
