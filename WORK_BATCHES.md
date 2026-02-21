@@ -20,9 +20,9 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 ## Batch Queue (Next)
 
 ### Batch A — WebSocket Transport Hardening Tests (Phase 1)
-- [ ] Add websocket malformed-frame rejection tests
-- [ ] Add websocket fragmented/partial frame handling tests
-- [ ] Add websocket ordering guarantees tests (single stream)
+- [x] Add websocket malformed-frame rejection tests
+- [x] Add websocket fragmented/partial frame handling tests
+- [x] Add websocket ordering guarantees tests (single stream)
 - [ ] Add websocket multiplex ordering tests (multi stream)
 - [ ] Add websocket backpressure behavior tests
 

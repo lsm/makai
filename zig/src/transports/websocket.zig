@@ -390,11 +390,8 @@ pub fn encodeFrame(frame: Frame, allocator: std.mem.Allocator) ![]u8 {
         offset += 1;
         // 64-bit length (big endian) - only use lower 32 bits for simplicity
         buffer[offset..][0..8].* = .{
-            0, 0, 0, 0, // Upper 32 bits (always 0)
-            @truncate(payload_len >> 24),
-            @truncate(payload_len >> 16),
-            @truncate(payload_len >> 8),
-            @truncate(payload_len),
+            0,                            0,                            0,                           0, // Upper 32 bits (always 0)
+            @truncate(payload_len >> 24), @truncate(payload_len >> 16), @truncate(payload_len >> 8), @truncate(payload_len),
         };
         offset += 8;
     }
@@ -684,6 +681,69 @@ test "encodeFrame and decodeFrame roundtrip" {
     try std.testing.expectEqual(Opcode.ping, result3.frame.opcode);
     try std.testing.expect(!result3.frame.masked);
     try std.testing.expectEqualStrings("ping", result3.frame.payload);
+}
+
+test "decodeFrame rejects incomplete extended length and masked payloads" {
+    // Extended length marker (126) but missing the two-byte length
+    try std.testing.expect(decodeFrame(&.{ 0x81, 0x7E }) == null);
+
+    // Extended length marker (127) but missing the eight-byte length
+    try std.testing.expect(decodeFrame(&.{ 0x81, 0x7F, 0, 0, 0 }) == null);
+
+    // Mask bit set but missing mask key
+    try std.testing.expect(decodeFrame(&.{ 0x81, 0x80 }) == null);
+
+    // Mask + key present, but payload byte missing
+    try std.testing.expect(decodeFrame(&.{ 0x81, 0x81, 1, 2, 3, 4 }) == null);
+}
+
+test "decodeFrame supports partial buffering and consumed ordering" {
+    const allocator = std.testing.allocator;
+
+    const f1 = Frame{ .opcode = .text, .payload = "first", .fin = true, .masked = false };
+    const f2 = Frame{ .opcode = .text, .payload = "second", .fin = true, .masked = false };
+
+    const e1 = try encodeFrame(f1, allocator);
+    defer allocator.free(e1);
+    const e2 = try encodeFrame(f2, allocator);
+    defer allocator.free(e2);
+
+    // Simulate partial read: first frame + partial second frame
+    var partial = std.ArrayList(u8){};
+    defer partial.deinit(allocator);
+    try partial.appendSlice(allocator, e1);
+    try partial.appendSlice(allocator, e2[0..2]);
+
+    const first = decodeFrame(partial.items).?;
+    try std.testing.expectEqualStrings("first", first.frame.payload);
+
+    const rem1 = partial.items[first.consumed..];
+    try std.testing.expect(decodeFrame(rem1) == null);
+
+    // Append rest of second frame and decode in order
+    try partial.appendSlice(allocator, e2[2..]);
+    const second = decodeFrame(partial.items[first.consumed..]).?;
+    try std.testing.expectEqualStrings("second", second.frame.payload);
+}
+
+test "decodeFrame preserves fragmentation flags" {
+    const allocator = std.testing.allocator;
+
+    const start = Frame{ .opcode = .text, .payload = "hel", .fin = false, .masked = false };
+    const cont = Frame{ .opcode = .continuation, .payload = "lo", .fin = true, .masked = false };
+
+    const start_encoded = try encodeFrame(start, allocator);
+    defer allocator.free(start_encoded);
+    const cont_encoded = try encodeFrame(cont, allocator);
+    defer allocator.free(cont_encoded);
+
+    const r1 = decodeFrame(start_encoded).?;
+    try std.testing.expectEqual(Opcode.text, r1.frame.opcode);
+    try std.testing.expect(!r1.frame.fin);
+
+    const r2 = decodeFrame(cont_encoded).?;
+    try std.testing.expectEqual(Opcode.continuation, r2.frame.opcode);
+    try std.testing.expect(r2.frame.fin);
 }
 
 test "WebSocketClient init and deinit" {
