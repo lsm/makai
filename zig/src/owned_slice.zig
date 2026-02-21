@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// A slice that tracks ownership, replacing the scattered `owned_strings: bool` + manual guard pattern.
+/// A slice that tracks ownership, replacing scattered legacy bool-guard ownership patterns.
 ///
 /// When `is_owned` is true, `deinit()` frees the items (calling per-element `deinit` if available)
 /// and then frees the backing slice. When `is_owned` is false, `deinit()` is a no-op.

@@ -632,7 +632,7 @@ test "CompleteRequest deinit with owned strings frees memory" {
 }
 
 test "StreamRequest deinit with borrowed strings does not free" {
-    // Create a StreamRequest with borrowed string literals (owned_strings = false)
+    // Create a StreamRequest with borrowed string literals (is_owned = false)
     const model = ai_types.Model{
         .id = "gpt-4",
         .name = "GPT-4",
