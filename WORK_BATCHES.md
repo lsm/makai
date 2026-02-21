@@ -33,7 +33,7 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [ ] Add CI job split for websocket-heavy test lanes (if needed)
 
 Progress note:
-- Added reconnect precondition coverage (`closed` state can reconnect path) and close idempotence test coverage.
+- Added reconnect precondition coverage (`closed` state can reconnect path), guard coverage for non-reconnectable states, and close idempotence test coverage.
 
 ### Batch C — Provider Client Multiplexing API Cleanup
 - [ ] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)

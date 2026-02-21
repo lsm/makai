@@ -822,6 +822,22 @@ test "WebSocketClient connect precondition allows disconnected/closed" {
     try std.testing.expect(!canInitiateConnect(.closing));
 }
 
+test "WebSocketClient connect rejects non-reconnectable states early" {
+    const allocator = std.testing.allocator;
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+
+    client.state = .connected;
+    try std.testing.expectError(error.AlreadyConnected, client.connect("not-a-websocket-url", null));
+
+    client.state = .connecting;
+    try std.testing.expectError(error.AlreadyConnected, client.connect("not-a-websocket-url", null));
+
+    client.state = .closing;
+    try std.testing.expectError(error.AlreadyConnected, client.connect("not-a-websocket-url", null));
+}
+
 test "WebSocketClient close is idempotent" {
     const allocator = std.testing.allocator;
 
