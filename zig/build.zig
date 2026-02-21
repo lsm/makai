@@ -138,6 +138,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "string_builder", .module = string_builder_mod },
         },
     });
 

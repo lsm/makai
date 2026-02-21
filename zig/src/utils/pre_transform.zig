@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const ai_types = @import("ai_types");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 pub const TransformConfig = struct {
     /// Target model for same-model detection
@@ -46,28 +47,32 @@ pub fn normalizeToolId(allocator: std.mem.Allocator, id: []const u8, max_len: us
         effective_id = id[0..pipe_pos];
     }
 
-    // Sanitize to [a-zA-Z0-9_-]
-    var buf: std.ArrayList(u8) = .{};
-    try buf.ensureTotalCapacity(allocator, effective_id.len);
-    errdefer buf.deinit(allocator);
-    for (effective_id) |c| {
+    // Truncate first (max_len == 0 means no limit)
+    const limit = if (max_len > 0) max_len else effective_id.len;
+    const final_len = @min(effective_id.len, limit);
+
+    // StringBuilder two-phase build: count once, allocate once, fill once.
+    var sb = StringBuilder{};
+    sb.count(effective_id[0..final_len]);
+
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    for (effective_id[0..final_len]) |c| {
         if (std.ascii.isAlphanumeric(c) or c == '_' or c == '-') {
-            try buf.append(allocator, c);
+            var ch = [1]u8{c};
+            _ = sb.append(&ch);
         } else {
-            try buf.append(allocator, '_');
+            _ = sb.append("_");
         }
     }
 
-    // Truncate
-    const limit = if (max_len > 0) max_len else buf.items.len;
-    const final_len = @min(buf.items.len, limit);
-
-    // If we don't need the full buffer, shrink
-    if (final_len < buf.items.len) {
-        buf.shrinkRetainingCapacity(final_len);
-    }
-
-    return buf.toOwnedSlice(allocator);
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 /// Generate a Mistral-compatible 9-char alphanumeric tool ID from source ID
