@@ -24,7 +24,7 @@ pub const TurnEndPayload = struct {
     tool_results: OwnedSlice(ai_types.ToolResultMessage) = OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
 
     pub fn deinit(self: *TurnEndPayload, allocator: std.mem.Allocator) void {
-        if (self.message.owned_strings) {
+        if (self.message.is_owned) {
             var mut_msg = self.message;
             mut_msg.deinit(allocator);
         }

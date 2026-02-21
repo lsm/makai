@@ -535,7 +535,7 @@ test "Sync deinit handles partial" {
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = 0,
-        .owned_strings = false,
+        .is_owned = false,
     };
     var sync = Sync{
         .target_stream_id = generateUuid(),
@@ -573,7 +573,7 @@ test "StreamRequest deinit with owned strings frees memory" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .owned_strings = true,
+        .is_owned = true,
     };
 
     const sys_prompt = try std.testing.allocator.dupe(u8, "Be helpful");
@@ -583,7 +583,7 @@ test "StreamRequest deinit with owned strings frees memory" {
         .system_prompt = ai_types.OwnedSlice(u8).initOwned(sys_prompt),
         .messages = messages,
         .tools = null,
-        .owned_strings = true,
+        .is_owned = true,
     };
 
     var req = StreamRequest{
@@ -610,7 +610,7 @@ test "CompleteRequest deinit with owned strings frees memory" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .owned_strings = true,
+        .is_owned = true,
     };
 
     const messages = try std.testing.allocator.alloc(ai_types.Message, 0);
@@ -618,7 +618,7 @@ test "CompleteRequest deinit with owned strings frees memory" {
         .system_prompt = ai_types.OwnedSlice(u8).initBorrowed(""),
         .messages = messages,
         .tools = null,
-        .owned_strings = true,
+        .is_owned = true,
     };
 
     var req = CompleteRequest{
@@ -644,14 +644,14 @@ test "StreamRequest deinit with borrowed strings does not free" {
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .owned_strings = false, // Borrowed, not owned
+        .is_owned = false, // Borrowed, not owned
     };
 
     const context = ai_types.Context{
         .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("Be helpful"),
         .messages = &.{},
         .tools = null,
-        .owned_strings = false, // Borrowed, not owned
+        .is_owned = false, // Borrowed, not owned
     };
 
     var req = StreamRequest{

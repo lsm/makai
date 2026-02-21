@@ -1623,7 +1623,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = std.time.milliTimestamp(),
-        .owned_strings = true, // Strings were duped above
+        .is_owned = true, // Strings were duped above
     };
 
     stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};

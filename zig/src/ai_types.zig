@@ -306,7 +306,7 @@ pub const AssistantMessage = struct {
     error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     timestamp: i64,
     /// If true, api/provider/model strings are owned and will be freed in deinit
-    owned_strings: bool = false,
+    is_owned: bool = false,
 
     pub fn getErrorMessage(self: *const AssistantMessage) ?[]const u8 {
         const err = self.error_message.slice();
@@ -340,8 +340,8 @@ pub const AssistantMessage = struct {
             }
         }
         allocator.free(self.content);
-        // Free duped string fields only if owned (providers set owned_strings=true when duping)
-        if (self.owned_strings) {
+        // Free duped string fields only if owned (providers set is_owned=true when duping)
+        if (self.is_owned) {
             allocator.free(self.api);
             allocator.free(self.provider);
             allocator.free(self.model);
@@ -411,18 +411,18 @@ pub const Context = struct {
     messages: []const Message,
     tools: ?[]const Tool = null,
     /// If true, arrays and strings are owned and will be freed in deinit
-    owned_strings: bool = false,
+    is_owned: bool = false,
 
     pub fn getSystemPrompt(self: *const Context) ?[]const u8 {
         const prompt = self.system_prompt.slice();
         return if (prompt.len > 0) prompt else null;
     }
 
-    /// Free all owned memory. Only frees arrays/collections if owned_strings is true
+    /// Free all owned memory. Only frees arrays/collections if is_owned is true
     /// (set by deserializer or when explicitly allocating).
     pub fn deinit(self: *Context, allocator: std.mem.Allocator) void {
         self.system_prompt.deinit(allocator);
-        if (!self.owned_strings) return;
+        if (!self.is_owned) return;
 
         // Free messages array and contents
         // Cast to mutable since we're freeing owned memory
@@ -494,12 +494,12 @@ pub const Model = struct {
     headers: ?[]const HeaderPair = null,
     compat: ?OpenAICompatOptions = null,
     /// If true, string fields are owned and will be freed in deinit
-    owned_strings: bool = false,
+    is_owned: bool = false,
 
-    /// Free all owned memory. Only frees strings if owned_strings is true
+    /// Free all owned memory. Only frees strings if is_owned is true
     /// (set by deserializer or when explicitly duping).
     pub fn deinit(self: *Model, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return;
+        if (!self.is_owned) return;
 
         allocator.free(self.id);
         allocator.free(self.name);
@@ -939,7 +939,7 @@ pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
         .system_prompt = system_prompt,
         .messages = messages,
         .tools = tools,
-        .owned_strings = true,
+        .is_owned = true,
     };
 }
 
@@ -998,7 +998,7 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
         .max_tokens = model.max_tokens,
         .headers = headers,
         .compat = model.compat,
-        .owned_strings = true,
+        .is_owned = true,
     };
 }
 
@@ -1008,7 +1008,7 @@ test "Context deinit frees owned system_prompt even with borrowed messages" {
     var ctx = Context{
         .system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "be concise")),
         .messages = &.{},
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     ctx.deinit(allocator);

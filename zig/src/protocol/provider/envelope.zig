@@ -678,7 +678,7 @@ fn deserializeStreamRequest(
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .owned_strings = true, // Mark as owned since we duped the strings
+        .is_owned = true, // Mark as owned since we duped the strings
     };
 
     const context = if (obj.get("context")) |ctx_val|
@@ -735,7 +735,7 @@ fn deserializeCompleteRequest(
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 0,
         .max_tokens = 0,
-        .owned_strings = true, // Mark as owned since we duped the strings
+        .is_owned = true, // Mark as owned since we duped the strings
     };
 
     const context = if (obj.get("context")) |ctx_val|
@@ -926,7 +926,7 @@ fn deserializeContext(
         return ai_types.Context{
             .system_prompt = system_prompt,
             .messages = empty_messages,
-            .owned_strings = true,
+            .is_owned = true,
         };
     };
 
@@ -950,7 +950,7 @@ fn deserializeContext(
         .system_prompt = system_prompt,
         .messages = messages,
         .tools = tools,
-        .owned_strings = true, // Mark as owned since we allocated all strings/arrays
+        .is_owned = true, // Mark as owned since we allocated all strings/arrays
     };
 }
 
@@ -1697,8 +1697,8 @@ test "deserializeEnvelope with stream_request frees all memory" {
     try std.testing.expect(envelope.payload == .stream_request);
     try std.testing.expectEqualStrings("gpt-4o", envelope.payload.stream_request.model.id);
     try std.testing.expectEqualStrings("GPT-4o", envelope.payload.stream_request.model.name);
-    try std.testing.expect(envelope.payload.stream_request.model.owned_strings);
-    try std.testing.expect(envelope.payload.stream_request.context.owned_strings);
+    try std.testing.expect(envelope.payload.stream_request.model.is_owned);
+    try std.testing.expect(envelope.payload.stream_request.context.is_owned);
 
     // deinit will be called by defer - if it doesn't free all memory,
     // the test will fail with a memory leak error
@@ -1738,8 +1738,8 @@ test "deserializeEnvelope with complete_request frees all memory" {
     // Verify the envelope was parsed correctly
     try std.testing.expect(envelope.payload == .complete_request);
     try std.testing.expectEqualStrings("claude-3", envelope.payload.complete_request.model.id);
-    try std.testing.expect(envelope.payload.complete_request.model.owned_strings);
-    try std.testing.expect(envelope.payload.complete_request.context.owned_strings);
+    try std.testing.expect(envelope.payload.complete_request.model.is_owned);
+    try std.testing.expect(envelope.payload.complete_request.context.is_owned);
 
     // deinit will be called by defer - if it doesn't free all memory,
     // the test will fail with a memory leak error
@@ -1873,7 +1873,7 @@ test "serializeEnvelope with sync payload" {
         .usage = .{},
         .stop_reason = .stop,
         .timestamp = 0,
-        .owned_strings = false,
+        .is_owned = false,
     };
     var envelope = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),

@@ -337,7 +337,7 @@ pub const PartialReconstructor = struct {
             .usage = self.usage,
             .stop_reason = final_stop_reason,
             .timestamp = timestamp,
-            .owned_strings = true,
+            .is_owned = true,
         };
     }
 
@@ -535,7 +535,7 @@ test "buildMessage creates valid AssistantMessage" {
     try std.testing.expectEqualStrings("gpt-4o", msg.model);
     try std.testing.expectEqual(ai_types.StopReason.stop, msg.stop_reason);
     try std.testing.expectEqual(@as(i64, 12345), msg.timestamp);
-    try std.testing.expect(msg.owned_strings);
+    try std.testing.expect(msg.is_owned);
 }
 
 test "buildMessage includes all content blocks" {

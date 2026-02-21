@@ -339,7 +339,7 @@ fn streamAssistantResponse(
         .system_prompt = ai_types.OwnedSlice(u8).initBorrowed(context.getSystemPrompt() orelse ""),
         .messages = messages,
         .tools = tools,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     // Build protocol options
@@ -565,7 +565,7 @@ fn runLoop(
                     .stop_reason = .@"error",
                     .error_message = ai_types.OwnedSlice(u8).initBorrowed(@errorName(err)),
                     .timestamp = std.time.milliTimestamp(),
-                    .owned_strings = false,
+                    .is_owned = false,
                 };
                 state.final_message = error_msg;
 
@@ -682,7 +682,7 @@ fn runLoop(
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = std.time.milliTimestamp(),
-            .owned_strings = false,
+            .is_owned = false,
         },
         .iterations = state.iterations,
     };

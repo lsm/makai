@@ -498,7 +498,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     if (stream.getResult()) |result| {
         // Clone the result to return (the stream owns the original)
         var cloned_result = try ai_types.cloneAssistantMessage(server.allocator, result);
-        cloned_result.owned_strings = true;
+        cloned_result.is_owned = true;
 
         return .{
             .stream_id = stream_id,

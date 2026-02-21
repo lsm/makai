@@ -557,7 +557,7 @@ pub const Agent = struct {
             else
                 ai_types.OwnedSlice(u8).initBorrowed(""),
             .timestamp = msg.timestamp,
-            .owned_strings = true,
+            .is_owned = true,
         };
     }
 

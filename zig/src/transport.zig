@@ -227,53 +227,53 @@ pub fn receiveStream(
 /// - Events own their strings. When an event is created, any string fields
 ///   (delta, content, etc.) are deep copies allocated by the caller.
 /// - The `partial` field in streaming events contains a snapshot of the
-///   accumulated message state. If `partial.owned_strings` is true, the
+///   accumulated message state. If `partial.is_owned` is true, the
 ///   partial owns its content and must be freed.
 /// - Call this function when done with an event to prevent memory leaks.
 fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
     switch (ev) {
         .start => |e| {
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .text_start => |e| {
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .text_delta => |e| {
             allocator.free(e.delta);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .text_end => |e| {
             allocator.free(e.content);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .thinking_start => |e| {
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .thinking_delta => |e| {
             allocator.free(e.delta);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .thinking_end => |e| {
             allocator.free(e.content);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
@@ -281,14 +281,14 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
         .toolcall_start => |e| {
             if (e.id.len > 0) allocator.free(e.id);
             if (e.name.len > 0) allocator.free(e.name);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
         },
         .toolcall_delta => |e| {
             allocator.free(e.delta);
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
@@ -300,7 +300,7 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
             if (e.tool_call.thought_signature) |sig| {
                 allocator.free(sig);
             }
-            if (e.partial.owned_strings) {
+            if (e.partial.is_owned) {
                 var mutable = e.partial;
                 mutable.deinit(allocator);
             }
@@ -821,7 +821,7 @@ fn parsePartialFromEvent(
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
-            .owned_strings = true,
+            .is_owned = true,
         };
     }
 
@@ -844,7 +844,7 @@ fn parsePartialFromEvent(
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
-            .owned_strings = true,
+            .is_owned = true,
         };
     }
 
@@ -871,7 +871,7 @@ fn parsePartialFromEvent(
             .usage = .{},
             .stop_reason = .stop,
             .timestamp = 0,
-            .owned_strings = true,
+            .is_owned = true,
         };
     }
 
@@ -898,7 +898,7 @@ pub fn parseAssistantMessageEvent(
         const model = try allocator.dupe(u8, obj.get("model").?.string);
         var partial = empty_partial;
         partial.model = model;
-        partial.owned_strings = true;
+        partial.is_owned = true;
         return .{ .start = .{ .partial = partial } };
     }
     if (std.mem.eql(u8, type_str, "text_start")) {
@@ -1074,7 +1074,7 @@ pub fn parseAssistantMessageEvent(
     }
     if (std.mem.eql(u8, type_str, "error")) {
         var err_msg = empty_partial;
-        err_msg.owned_strings = true;
+        err_msg.is_owned = true;
 
         // Parse optional error_message
         if (obj.get("error_message")) |em| {
@@ -1178,7 +1178,7 @@ pub fn parseAssistantMessage(
 
     result.timestamp = obj.get("timestamp").?.integer;
     result.usage = usage;
-    result.owned_strings = true;
+    result.is_owned = true;
     result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
 
     return result;
@@ -1340,7 +1340,7 @@ test "serialize and deserialize done event" {
         },
         .stop_reason = .tool_use,
         .timestamp = 0,
-        .owned_strings = false,
+        .is_owned = false,
     };
     const event = ai_types.AssistantMessageEvent{ .done = .{
         .reason = .tool_use,
@@ -1466,7 +1466,7 @@ test "serialize and deserialize error event" {
         .stop_reason = .@"error",
         .timestamp = 0,
         .error_message = ai_types.OwnedSlice(u8).initBorrowed("API rate limit exceeded"),
-        .owned_strings = false,
+        .is_owned = false,
     };
     const event = ai_types.AssistantMessageEvent{ .@"error" = .{
         .reason = .@"error",
@@ -1519,7 +1519,7 @@ test "serialize and deserialize result" {
         .api = "anthropic-messages",
         .provider = "anthropic",
         .timestamp = 1234567890,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -1568,7 +1568,7 @@ test "serialize and deserialize result with multiple content block types" {
         .api = "test-api",
         .provider = "test-provider",
         .timestamp = 999,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -1608,7 +1608,7 @@ test "serialize and deserialize text block with signature" {
         .api = "test-api",
         .provider = "test-provider",
         .timestamp = 1000,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -1639,7 +1639,7 @@ test "serialize and deserialize thinking block with signature" {
         .api = "test-api",
         .provider = "test-provider",
         .timestamp = 2000,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     const json = try serializeResult(result, allocator);
@@ -1675,7 +1675,7 @@ test "serialize and deserialize tool_call with thought_signature" {
         .api = "test-api",
         .provider = "test-provider",
         .timestamp = 3000,
-        .owned_strings = false,
+        .is_owned = false,
     };
 
     const json = try serializeResult(result, allocator);

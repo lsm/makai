@@ -812,7 +812,7 @@ test "processEnvelope handles result payload" {
         .usage = .{ .input = 100, .output = 50 },
         .stop_reason = .stop,
         .timestamp = 12345,
-        .owned_strings = true,
+        .is_owned = true,
     };
 
     var env = protocol_types.Envelope{
