@@ -151,7 +151,7 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     }
 
     // Check for errors before asserting success
-    if (client.last_error) |err| {
+    if (client.getLastError()) |err| {
         std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
         return error.StreamError;
     }
@@ -266,7 +266,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     }
 
     // Check for errors before proceeding
-    if (client.last_error) |err| {
+    if (client.getLastError()) |err| {
         std.debug.print("\n\x1b[31mERROR\x1b[0m: Stream failed with error: {s}\n", .{err});
         return error.StreamError;
     }
