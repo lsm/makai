@@ -30,7 +30,6 @@
 ///     .protocol = protocol,
 /// });
 /// ```
-
 const std = @import("std");
 
 // Re-export all public types from types.zig
@@ -72,6 +71,7 @@ pub const agentLoopContinue = @import("agent_loop.zig").agentLoopContinue;
 // Re-export high-level Agent class from agent.zig
 pub const Agent = @import("agent.zig").Agent;
 pub const AgentOptions = @import("agent.zig").AgentOptions;
+pub const InProcessProviderProtocolBridge = @import("provider_protocol_bridge.zig").InProcessProviderProtocolBridge;
 
 // Re-export commonly used types from dependencies for convenience
 pub const ai_types = @import("ai_types");
@@ -87,6 +87,7 @@ test {
     _ = @import("types.zig");
     _ = @import("agent_loop.zig");
     _ = @import("agent.zig");
+    _ = @import("provider_protocol_bridge.zig");
 }
 
 test "module exports all required types" {
@@ -101,6 +102,7 @@ test "module exports all required types" {
     const mode: QueueMode = undefined;
     const agent: Agent = undefined;
     const opts: AgentOptions = undefined;
+    const bridge: InProcessProviderProtocolBridge = undefined;
     const protocol: ProtocolClient = undefined;
     const protocol_opts: ProtocolOptions = undefined;
 
@@ -115,6 +117,7 @@ test "module exports all required types" {
     _ = mode;
     _ = agent;
     _ = opts;
+    _ = bridge;
     _ = protocol;
     _ = protocol_opts;
 }

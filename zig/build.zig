@@ -515,7 +515,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const agent_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/agent.zig"),
+        .root_source_file = b.path("src/agent/mod.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -523,6 +523,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "agent_loop", .module = agent_loop_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "protocol_server", .module = protocol_server_mod },
+            .{ .name = "protocol_client", .module = protocol_client_mod },
+            .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
         },
     });
 
@@ -691,18 +696,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Protocol pump helper module for fullstack tests
-    const protocol_pump_mod = b.createModule(.{
-        .root_source_file = b.path("test/e2e/protocol_pump.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "protocol_server", .module = protocol_server_mod },
-            .{ .name = "envelope", .module = protocol_envelope_mod },
-            .{ .name = "transports/in_process", .module = in_process_transport_mod },
-        },
-    });
-
     // Protocol Fullstack E2E tests - Ollama
     const e2e_protocol_fullstack_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -718,7 +711,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_client", .module = protocol_client_mod },
                 .{ .name = "envelope", .module = protocol_envelope_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
-                .{ .name = "protocol_pump", .module = protocol_pump_mod },
+                .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
             },
         }),
     });
@@ -738,7 +731,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_client", .module = protocol_client_mod },
                 .{ .name = "envelope", .module = protocol_envelope_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
-                .{ .name = "protocol_pump", .module = protocol_pump_mod },
+                .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
             },
         }),
     });

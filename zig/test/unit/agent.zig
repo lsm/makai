@@ -3,10 +3,7 @@
 //! Tests basic agent functionality:
 //! - Type definitions
 //! - Context operations
-//!
-//! Note: Agent loop tests with mock ProtocolClient are disabled due to
-//! complex memory ownership issues. The agent code works correctly with
-//! real providers as verified by E2E tests.
+//! - Agent loop behavior with a mock ProtocolClient implementation
 
 const std = @import("std");
 const ai_types = @import("ai_types");
@@ -15,14 +12,11 @@ const agent_types = @import("agent_types");
 const agent_loop = @import("agent_loop");
 
 const testing = std.testing;
-const Allocator = std.mem.Allocator;
 
 // Re-export types for convenience
 const AgentEvent = agent_types.AgentEvent;
-const AgentEventStream = agent_types.AgentEventStream;
 const AgentContext = agent_types.AgentContext;
 const AgentLoopConfig = agent_types.AgentLoopConfig;
-const ProtocolClient = agent_types.ProtocolClient;
 const ProtocolOptions = agent_types.ProtocolOptions;
 
 // =============================================================================
@@ -98,25 +92,241 @@ test "ProtocolOptions: default values" {
 }
 
 // =============================================================================
-// Skipped Tests (need better mocking approach)
+// Agent loop tests with mock ProtocolClient
 // =============================================================================
 
+const MockMode = enum { done, err };
+
+const MockProtocolState = struct {
+    mode: MockMode,
+    text: []const u8 = "ok",
+    call_count: usize = 0,
+    last_options: ?ProtocolOptions = null,
+};
+
+fn createModel() ai_types.Model {
+    return .{
+        .id = "mock-model",
+        .name = "Mock",
+        .api = "mock-api",
+        .provider = "mock-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+}
+
+fn makeOwnedAssistantMessage(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    stop_reason: ai_types.StopReason,
+) !ai_types.AssistantMessage {
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+
+    return .{
+        .content = content,
+        .api = "mock-api",
+        .provider = "mock-provider",
+        .model = "mock-model",
+        .usage = .{},
+        .stop_reason = stop_reason,
+        .timestamp = std.time.milliTimestamp(),
+        .is_owned = false,
+    };
+}
+
+fn mockProtocolStream(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: agent_types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    const state: *MockProtocolState = @ptrCast(@alignCast(ctx));
+    state.call_count += 1;
+    state.last_options = options;
+
+    const stream = try allocator.create(event_stream.AssistantMessageEventStream);
+    stream.* = event_stream.AssistantMessageEventStream.init(allocator);
+
+    var msg = try makeOwnedAssistantMessage(
+        allocator,
+        state.text,
+        if (state.mode == .done) .stop else .@"error",
+    );
+    errdefer msg.deinit(allocator);
+
+    if (state.mode == .done) {
+        try stream.push(.{ .done = .{
+            .reason = .stop,
+            .message = msg,
+        } });
+    } else {
+        msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "mock provider error"));
+        try stream.push(.{ .@"error" = .{
+            .reason = .@"error",
+            .err = msg,
+        } });
+    }
+
+    // Mark stream completed without attaching result ownership to avoid
+    // double-ownership in this test mock.
+    stream.completeWithError("");
+    return stream;
+}
+
+fn createMockProtocol(state: *MockProtocolState) agent_types.ProtocolClient {
+    return .{
+        .stream_fn = mockProtocolStream,
+        .ctx = state,
+    };
+}
+
 test "agentLoop: basic single turn with text response" {
-    // Skip: requires mock ProtocolClient with proper string ownership handling
-    return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "hello from mock" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = "Hello" },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |_| {}
+
+    const result = stream.getResult().?;
+    try testing.expectEqual(@as(usize, 2), result.messages.slice().len);
+    try testing.expect(result.final_message.stop_reason == .stop);
+    try testing.expectEqual(@as(usize, 1), state.call_count);
 }
 
 test "agentLoop: collects events in correct order" {
-    // Skip: requires mock ProtocolClient with proper string ownership handling
-    return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "event order" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = "Hi" },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var saw_agent_start = false;
+    var saw_turn_start = false;
+    var saw_agent_end = false;
+
+    while (stream.wait()) |event| {
+        switch (event) {
+            .agent_start => saw_agent_start = true,
+            .turn_start => saw_turn_start = true,
+            .agent_end => saw_agent_end = true,
+            else => {},
+        }
+    }
+
+    try testing.expect(saw_agent_start);
+    try testing.expect(saw_turn_start);
+    try testing.expect(saw_agent_end);
 }
 
 test "agentLoop: handles provider error" {
-    // Skip: requires mock ProtocolClient with proper string ownership handling
-    return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .err, .text = "" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = "Fail please" },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |_| {}
+
+    const result = stream.getResult().?;
+    try testing.expect(result.final_message.stop_reason == .@"error");
+    try testing.expect(result.final_message.getErrorMessage() != null);
 }
 
 test "ProtocolOptions: passed through to protocol client" {
-    // Skip: requires mock ProtocolClient with proper string ownership handling
-    return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "options" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = "options test" },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .temperature = 0.25,
+        .max_tokens = 42,
+        .api_key = "key-123",
+        .session_id = "session-abc",
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |_| {}
+
+    const seen = state.last_options.?;
+    try testing.expectEqual(@as(?f32, 0.25), seen.temperature);
+    try testing.expectEqual(@as(?u32, 42), seen.max_tokens);
+    try testing.expectEqualStrings("key-123", seen.api_key.?);
+    try testing.expectEqualStrings("session-abc", seen.session_id.?);
 }

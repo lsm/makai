@@ -11,12 +11,12 @@ const protocol_server = @import("protocol_server");
 const protocol_client = @import("protocol_client");
 const envelope = @import("envelope");
 const in_process = @import("transports/in_process");
-const protocol_pump = @import("protocol_pump.zig");
+const protocol_runtime = @import("protocol_runtime");
 
 const testing = std.testing;
 const ProtocolServer = protocol_server.ProtocolServer;
 const ProtocolClient = protocol_client.ProtocolClient;
-const ProtocolPump = protocol_pump.ProtocolPump;
+const ProviderProtocolRuntime = protocol_runtime.ProviderProtocolRuntime;
 const PipeTransport = in_process.SerializedPipe;
 
 // Access protocol_types through envelope module (which re-exports types)
@@ -80,8 +80,8 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Set up pump
-    var pump = ProtocolPump{
+    // Set up protocol runtime
+    var runtime = ProviderProtocolRuntime{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
@@ -97,7 +97,7 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     _ = try client.sendStreamRequest(model, ctx, options);
 
     // Process stream request
-    try pump.pumpClientMessages();
+    try runtime.pumpClientMessages();
 
     // Track events
     var text_buffer = std.ArrayList(u8).initCapacity(allocator, 64) catch return error.OutOfMemory;
@@ -112,17 +112,7 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
     const deadline = test_helpers.createDeadline(test_helpers.DEFAULT_E2E_TIMEOUT_MS);
 
     while (!test_helpers.isDeadlineExceeded(deadline)) {
-        _ = try pump.pumpEvents();
-
-        var client_receiver = pipe.clientReceiver();
-        while (try client_receiver.readLine(allocator)) |line| {
-            defer allocator.free(line);
-
-            var env = envelope.deserializeEnvelope(line, allocator) catch continue;
-            defer env.deinit(allocator);
-
-            try client.processEnvelope(env);
-        }
+        _ = try runtime.pumpOnce(&client);
 
         // Check client's event stream for events - poll ALL available events
         while (client.getEventStream().poll()) |event| {
@@ -219,8 +209,8 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
-    // Set up pump
-    var pump = ProtocolPump{
+    // Set up protocol runtime
+    var runtime = ProviderProtocolRuntime{
         .server = &server,
         .pipe = &pipe,
         .allocator = allocator,
@@ -235,7 +225,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     _ = try client.sendStreamRequest(model, ctx, options);
 
     // Process stream request
-    try pump.pumpClientMessages();
+    try runtime.pumpClientMessages();
 
     // Read a few events then abort
     var event_count: usize = 0;
@@ -243,17 +233,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
 
     const deadline = test_helpers.createDeadline(10_000);
     while (event_count < max_events and !test_helpers.isDeadlineExceeded(deadline)) {
-        _ = try pump.pumpEvents();
-
-        var client_receiver = pipe.clientReceiver();
-        while (try client_receiver.readLine(allocator)) |line| {
-            defer allocator.free(line);
-
-            var env = envelope.deserializeEnvelope(line, allocator) catch continue;
-            defer env.deinit(allocator);
-
-            try client.processEnvelope(env);
-        }
+        _ = try runtime.pumpOnce(&client);
 
         // Poll ALL available events
         while (client.getEventStream().poll()) |event| {
@@ -275,7 +255,7 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
     try client.sendAbortRequest(null);
 
     // Process abort request
-    try pump.pumpClientMessages();
+    try runtime.pumpClientMessages();
 
     // Verify stream was removed
     try testing.expect(server.activeStreamCount() == 0);
