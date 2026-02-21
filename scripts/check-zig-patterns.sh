@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 echo "[patterns] checking runtime catch unreachable usage..."
-all_catch_unreachable="$(rg -n "catch unreachable" zig/src || true)"
+all_catch_unreachable="$(grep -Rns "catch unreachable" zig/src || true)"
 if [[ -n "$all_catch_unreachable" ]]; then
   runtime_catch_unreachable="$(printf "%s\n" "$all_catch_unreachable" \
     | grep -vE "^[^:]+:[0-9]+:\s*//" \
@@ -31,7 +31,7 @@ required_files=(
 )
 
 for file in "${required_files[@]}"; do
-  if ! rg -q "self\.\* = undefined;" "$file"; then
+  if ! grep -q "self\.\* = undefined;" "$file"; then
     echo "[patterns] missing deinit poisoning in $file" >&2
     exit 1
   fi
