@@ -42,9 +42,14 @@ pub const AgentStartRequest = struct {
     /// Agent configuration (model, tools, etc.)
     config_json: []const u8,
     /// Initial system prompt
-    system_prompt: ?[]const u8 = null,
+    system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Session ID for resumption (null for new session)
     session_id: ?Uuid = null,
+
+    pub fn getSystemPrompt(self: *const AgentStartRequest) ?[]const u8 {
+        const prompt = self.system_prompt.slice();
+        return if (prompt.len > 0) prompt else null;
+    }
 };
 
 /// Request to send a message to an agent
@@ -54,7 +59,12 @@ pub const AgentMessageRequest = struct {
     /// Message to send
     message_json: []const u8,
     /// Options for this message
-    options_json: ?[]const u8 = null,
+    options_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getOptionsJson(self: *const AgentMessageRequest) ?[]const u8 {
+        const options = self.options_json.slice();
+        return if (options.len > 0) options else null;
+    }
 };
 
 /// Request to stop an agent session
@@ -79,7 +89,12 @@ pub const ToolExecuteRequest = struct {
     /// Arguments as JSON
     args_json: []const u8,
     /// Partial result callback URL (for streaming tools)
-    callback_url: ?[]const u8 = null,
+    callback_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getCallbackUrl(self: *const ToolExecuteRequest) ?[]const u8 {
+        const url = self.callback_url.slice();
+        return if (url.len > 0) url else null;
+    }
 };
 
 /// Response from tool execution
@@ -91,13 +106,23 @@ pub const ToolExecuteResponse = struct {
     /// Whether execution failed
     is_error: bool = false,
     /// Additional details JSON (optional)
-    details_json: ?[]const u8 = null,
+    details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getDetailsJson(self: *const ToolExecuteResponse) ?[]const u8 {
+        const details = self.details_json.slice();
+        return if (details.len > 0) details else null;
+    }
 };
 
 /// Request to list available tools
 pub const ToolListRequest = struct {
     /// Filter by tool name prefix (optional)
-    prefix: ?[]const u8 = null,
+    prefix: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getPrefix(self: *const ToolListRequest) ?[]const u8 {
+        const prefix = self.prefix.slice();
+        return if (prefix.len > 0) prefix else null;
+    }
 };
 
 /// Tool definition for listing
@@ -196,11 +221,11 @@ pub const Payload = union(enum) {
         switch (self.*) {
             .agent_start => |*req| {
                 allocator.free(req.config_json);
-                if (req.system_prompt) |p| allocator.free(p);
+                req.system_prompt.deinit(allocator);
             },
             .agent_message => |*req| {
                 allocator.free(req.message_json);
-                if (req.options_json) |o| allocator.free(o);
+                req.options_json.deinit(allocator);
             },
             .agent_stop => |*req| {
                 req.reason.deinit(allocator);
@@ -209,15 +234,15 @@ pub const Payload = union(enum) {
                 allocator.free(req.tool_call_id);
                 allocator.free(req.tool_name);
                 allocator.free(req.args_json);
-                if (req.callback_url) |u| allocator.free(u);
+                req.callback_url.deinit(allocator);
             },
             .tool_result => |*res| {
                 allocator.free(res.tool_call_id);
                 allocator.free(res.result_json);
-                if (res.details_json) |d| allocator.free(d);
+                res.details_json.deinit(allocator);
             },
             .tool_list => |*req| {
-                if (req.prefix) |p| allocator.free(p);
+                req.prefix.deinit(allocator);
             },
             .tool_list_response => |*res| {
                 for (res.tools) |*tool| {

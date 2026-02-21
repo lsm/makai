@@ -62,7 +62,12 @@ pub const ToolRegisterRequest = struct {
     /// Tool metadata
     tool: ToolMetadata,
     /// Callback URL for execution requests (for remote tools)
-    callback_url: ?[]const u8 = null,
+    callback_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getCallbackUrl(self: *const ToolRegisterRequest) ?[]const u8 {
+        const url = self.callback_url.slice();
+        return if (url.len > 0) url else null;
+    }
 };
 
 /// Response from tool registration
@@ -81,9 +86,14 @@ pub const ToolUnregisterRequest = struct {
 /// Request to list available tools
 pub const ToolListRequest = struct {
     /// Filter by name prefix
-    prefix: ?[]const u8 = null,
+    prefix: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Filter by capability
     supports_streaming: ?bool = null,
+
+    pub fn getPrefix(self: *const ToolListRequest) ?[]const u8 {
+        const prefix = self.prefix.slice();
+        return if (prefix.len > 0) prefix else null;
+    }
 };
 
 /// Response from tool list request
@@ -104,7 +114,12 @@ pub const ToolExecuteRequest = struct {
     /// Timeout in milliseconds
     timeout_ms: ?u32 = null,
     /// Callback URL for streaming results
-    stream_callback_url: ?[]const u8 = null,
+    stream_callback_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getStreamCallbackUrl(self: *const ToolExecuteRequest) ?[]const u8 {
+        const url = self.stream_callback_url.slice();
+        return if (url.len > 0) url else null;
+    }
 };
 
 /// Streaming update during tool execution
@@ -116,7 +131,12 @@ pub const ToolStreamUpdate = struct {
     /// Progress percentage (0-100)
     progress: ?u8 = null,
     /// Status message
-    status: ?[]const u8 = null,
+    status: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getStatus(self: *const ToolStreamUpdate) ?[]const u8 {
+        const status = self.status.slice();
+        return if (status.len > 0) status else null;
+    }
 };
 
 /// Final result from tool execution
@@ -130,13 +150,18 @@ pub const ToolExecuteResult = struct {
     /// Error message (if failed)
     error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Additional details JSON
-    details_json: ?[]const u8 = null,
+    details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Execution duration in milliseconds
     duration_ms: u32,
 
     pub fn getErrorMessage(self: *const ToolExecuteResult) ?[]const u8 {
         const msg = self.error_message.slice();
         return if (msg.len > 0) msg else null;
+    }
+
+    pub fn getDetailsJson(self: *const ToolExecuteResult) ?[]const u8 {
+        const details = self.details_json.slice();
+        return if (details.len > 0) details else null;
     }
 };
 
@@ -225,12 +250,12 @@ pub const Payload = union(enum) {
                     for (perms) |p| allocator.free(p);
                     allocator.free(perms);
                 }
-                if (req.callback_url) |u| allocator.free(u);
+                req.callback_url.deinit(allocator);
             },
             .tool_registered => |*res| allocator.free(res.tool_id),
             .tool_unregister => |*req| allocator.free(req.tool_id),
             .tool_unregistered => |*res| allocator.free(res.tool_id),
-            .tool_list => |*req| if (req.prefix) |p| allocator.free(p),
+            .tool_list => |*req| req.prefix.deinit(allocator),
             .tool_list_response => |*res| {
                 for (res.tools) |*tool| {
                     allocator.free(tool.name);
@@ -248,18 +273,18 @@ pub const Payload = union(enum) {
                 allocator.free(req.tool_call_id);
                 allocator.free(req.tool_name);
                 allocator.free(req.args_json);
-                if (req.stream_callback_url) |u| allocator.free(u);
+                req.stream_callback_url.deinit(allocator);
             },
             .tool_stream => |*upd| {
                 allocator.free(upd.tool_call_id);
                 allocator.free(upd.partial_result_json);
-                if (upd.status) |s| allocator.free(s);
+                upd.status.deinit(allocator);
             },
             .tool_result => |*res| {
                 allocator.free(res.tool_call_id);
                 allocator.free(res.result_json);
                 res.error_message.deinit(allocator);
-                if (res.details_json) |d| allocator.free(d);
+                res.details_json.deinit(allocator);
             },
             .tool_cancel => |*req| req.reason.deinit(allocator),
             .tool_error => |*err| allocator.free(err.message),
