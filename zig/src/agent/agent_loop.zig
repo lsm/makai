@@ -85,11 +85,11 @@ fn createToolResultMessage(
 ) !ai_types.ToolResultMessage {
     const details_json = if (result.getDetailsJson()) |details|
         if (result.details_json.is_owned)
-            details
+            ai_types.OwnedSlice(u8).initOwned(@constCast(details))
         else
-            try allocator.dupe(u8, details)
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, details))
     else
-        null;
+        ai_types.OwnedSlice(u8).initBorrowed("");
 
     return .{
         .tool_call_id = try allocator.dupe(u8, tool_call.id),
@@ -156,7 +156,7 @@ fn skipToolCall(
         .tool_call_id = try allocator.dupe(u8, tool_call.id),
         .tool_name = try allocator.dupe(u8, tool_call.name),
         .content = content,
-        .details_json = null,
+        .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
         .is_error = true,
         .timestamp = std.time.milliTimestamp(),
     };

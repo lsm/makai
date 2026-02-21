@@ -318,7 +318,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                     try w.writeStringField("result", text);
                 }
                 // Include details_json if present
-                if (tr.details_json) |dj| {
+                if (tr.getDetailsJson()) |dj| {
                     try w.writeKey("details");
                     try w.writeRawJson(dj);
                 }
@@ -546,7 +546,7 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                     .text = text_copy,
                                                     .is_thinking = is_thinking,
                                                     .thought_signature = sig,
-                                                }}) catch {
+                                                } }) catch {
                                                     allocator.free(text_copy);
                                                     if (sig) |s| allocator.free(s);
                                                     continue;
@@ -557,12 +557,14 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                             if (fc == .object) {
                                                 const name = if (fc.object.get("name")) |n|
                                                     if (n == .string) n.string else ""
-                                                else "";
+                                                else
+                                                    "";
 
                                                 // Get or generate ID (may be null)
                                                 const id = if (fc.object.get("id")) |i|
                                                     if (i == .string) allocator.dupe(u8, i.string) catch null else null
-                                                else null;
+                                                else
+                                                    null;
 
                                                 // Get thought signature if present (for Gemini 3 thinking tool calls)
                                                 const sig = if (p.object.get("thoughtSignature")) |s| blk: {
@@ -586,7 +588,7 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
                                                     .name = name_copy,
                                                     .args_json = args_json,
                                                     .thought_signature = sig,
-                                                }}) catch {
+                                                } }) catch {
                                                     allocator.free(name_copy);
                                                     if (id) |i| allocator.free(i);
                                                     allocator.free(args_json);

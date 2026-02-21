@@ -582,11 +582,17 @@ pub const Agent = struct {
         for (msg.content, 0..) |c, i| {
             content[i] = .{ .text = .{ .text = try self._allocator.dupe(u8, c.text.text) } };
         }
+
+        const details_json = if (msg.getDetailsJson()) |d|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, d))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+
         return .{
             .tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id),
             .tool_name = try self._allocator.dupe(u8, msg.tool_name),
             .content = content,
-            .details_json = if (msg.details_json) |d| try self._allocator.dupe(u8, d) else null,
+            .details_json = details_json,
             .is_error = msg.is_error,
             .timestamp = msg.timestamp,
         };

@@ -270,7 +270,7 @@ fn serializeMessage(
             }
             try w.endArray();
 
-            if (tool_res.details_json) |details| {
+            if (tool_res.getDetailsJson()) |details| {
                 try w.writeStringField("details_json", details);
             }
         },
@@ -981,9 +981,9 @@ fn deserializeMessage(
         }
 
         const details_json = if (obj.get("details_json")) |dj|
-            try allocator.dupe(u8, dj.string)
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj.string))
         else
-            null;
+            ai_types.OwnedSlice(u8).initBorrowed("");
 
         return .{ .tool_result = .{
             .tool_call_id = tool_call_id,

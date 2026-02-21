@@ -332,9 +332,14 @@ pub const ToolResultMessage = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     content: []const UserContentPart,
-    details_json: ?[]const u8 = null,
+    details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     is_error: bool,
     timestamp: i64,
+
+    pub fn getDetailsJson(self: *const ToolResultMessage) ?[]const u8 {
+        const details = self.details_json.slice();
+        return if (details.len > 0) details else null;
+    }
 
     /// Free all owned memory.
     pub fn deinit(self: *ToolResultMessage, allocator: std.mem.Allocator) void {
@@ -346,9 +351,7 @@ pub const ToolResultMessage = struct {
             part.deinit(allocator);
         }
         allocator.free(self.content);
-        if (self.details_json) |dj| {
-            allocator.free(dj);
-        }
+        self.details_json.deinit(allocator);
     }
 };
 
@@ -752,11 +755,17 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
     for (tr.content, 0..) |part, i| {
         cloned_content[i] = try cloneUserContentPart(allocator, part);
     }
+
+    const details_json = if (tr.getDetailsJson()) |dj|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj))
+    else
+        OwnedSlice(u8).initBorrowed("");
+
     return .{
         .tool_call_id = try allocator.dupe(u8, tr.tool_call_id),
         .tool_name = try allocator.dupe(u8, tr.tool_name),
         .content = cloned_content,
-        .details_json = if (tr.details_json) |dj| try allocator.dupe(u8, dj) else null,
+        .details_json = details_json,
         .is_error = tr.is_error,
         .timestamp = tr.timestamp,
     };
@@ -882,6 +891,30 @@ test "cloneAssistantMessage deep copies text content" {
 
     try std.testing.expectEqualStrings("hello", cloned.content[0].text.text);
     try std.testing.expectEqualStrings("openai", cloned.provider);
+}
+
+test "ToolResultMessage details_json uses OwnedSlice and deep clones" {
+    const allocator = std.testing.allocator;
+
+    const content = try allocator.alloc(UserContentPart, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+
+    var msg = ToolResultMessage{
+        .tool_call_id = try allocator.dupe(u8, "call-1"),
+        .tool_name = try allocator.dupe(u8, "test_tool"),
+        .content = content,
+        .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"k\":1}")),
+        .is_error = false,
+        .timestamp = 1,
+    };
+    defer msg.deinit(allocator);
+
+    var cloned = try cloneToolResultMessage(allocator, msg);
+    defer cloned.deinit(allocator);
+
+    try std.testing.expectEqualStrings("{\"k\":1}", msg.getDetailsJson().?);
+    try std.testing.expectEqualStrings("{\"k\":1}", cloned.getDetailsJson().?);
+    try std.testing.expect(@intFromPtr(msg.details_json.slice().ptr) != @intFromPtr(cloned.details_json.slice().ptr));
 }
 
 test "AssistantMessageEventStream deinit drains unpolled events" {
