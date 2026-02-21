@@ -552,7 +552,10 @@ pub const Agent = struct {
             .model = try self._allocator.dupe(u8, msg.model),
             .usage = msg.usage,
             .stop_reason = msg.stop_reason,
-            .error_message = if (msg.error_message) |e| try self._allocator.dupe(u8, e) else null,
+            .error_message = if (msg.getErrorMessage()) |e|
+                ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, e))
+            else
+                ai_types.OwnedSlice(u8).initBorrowed(""),
             .timestamp = msg.timestamp,
             .owned_strings = true,
         };
@@ -721,7 +724,7 @@ pub const Agent = struct {
                     _ = self._state.pending_tool_calls.remove(e.tool_call_id);
                 },
                 .turn_end => |e| {
-                    if (e.message.error_message) |err| {
+                    if (e.message.getErrorMessage()) |err| {
                         self._state.error_message = try self._allocator.dupe(u8, err);
                     }
                 },

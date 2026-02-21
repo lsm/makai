@@ -19,7 +19,7 @@ const ai_types = @import("ai_types");
 pub fn isContextOverflow(message: ai_types.AssistantMessage, context_window: ?u64) bool {
     // Case 1: Check error message patterns
     if (message.stop_reason == .@"error") {
-        if (message.error_message) |err_msg| {
+        if (message.getErrorMessage()) |err_msg| {
             if (matchesOverflowPattern(err_msg)) {
                 return true;
             }
@@ -140,7 +140,7 @@ test "isContextOverflow detects Anthropic pattern" {
         .model = "claude-3-opus",
         .usage = .{ .input = 213462 },
         .stop_reason = .@"error",
-        .error_message = "prompt is too long: 213462 tokens > 200000 maximum",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("prompt is too long: 213462 tokens > 200000 maximum"),
         .timestamp = 0,
     };
 
@@ -156,7 +156,7 @@ test "isContextOverflow detects OpenAI pattern" {
         .model = "gpt-4o",
         .usage = .{ .input = 150000 },
         .stop_reason = .@"error",
-        .error_message = "Your input exceeds the context window of this model",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("Your input exceeds the context window of this model"),
         .timestamp = 0,
     };
 
@@ -172,7 +172,7 @@ test "isContextOverflow detects xAI pattern" {
         .model = "grok-2",
         .usage = .{ .input = 537812 },
         .stop_reason = .@"error",
-        .error_message = "This model's maximum prompt length is 131072 but the request contains 537812 tokens",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("This model's maximum prompt length is 131072 but the request contains 537812 tokens"),
         .timestamp = 0,
     };
 
@@ -188,7 +188,7 @@ test "isContextOverflow detects Groq pattern" {
         .model = "llama-3",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "Please reduce the length of the messages or completion",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("Please reduce the length of the messages or completion"),
         .timestamp = 0,
     };
 
@@ -204,7 +204,7 @@ test "isContextOverflow detects Google pattern" {
         .model = "gemini-2.5-flash",
         .usage = .{ .input = 1196265 },
         .stop_reason = .@"error",
-        .error_message = "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)"),
         .timestamp = 0,
     };
 
@@ -220,7 +220,7 @@ test "isContextOverflow detects llama.cpp pattern" {
         .model = "llama-3",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "the request exceeds the available context size, try increasing it",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("the request exceeds the available context size, try increasing it"),
         .timestamp = 0,
     };
 
@@ -236,7 +236,7 @@ test "isContextOverflow detects Cerebras/Mistral 400 status code (no body)" {
         .model = "llama-3",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "400 status code (no body)",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("400 status code (no body)"),
         .timestamp = 0,
     };
 
@@ -252,7 +252,7 @@ test "isContextOverflow detects Cerebras/Mistral 413 status code (no body)" {
         .model = "mistral-large",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "413 (no body)",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("413 (no body)"),
         .timestamp = 0,
     };
 
@@ -268,7 +268,7 @@ test "isContextOverflow detects silent overflow with context_window" {
         .model = "model-x",
         .usage = .{ .input = 250000, .cache_read = 10000 },
         .stop_reason = .stop, // Successful response
-        .error_message = null,
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed(""),
         .timestamp = 0,
     };
 
@@ -287,7 +287,7 @@ test "isContextOverflow returns false for normal errors" {
         .model = "gpt-4o",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "429 status code (no body)", // Rate limiting
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("429 status code (no body)"), // Rate limiting
         .timestamp = 0,
     };
     try std.testing.expect(!isContextOverflow(rate_limit_msg, null));
@@ -300,7 +300,7 @@ test "isContextOverflow returns false for normal errors" {
         .model = "claude-3-opus",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "API error: service unavailable",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("API error: service unavailable"),
         .timestamp = 0,
     };
     try std.testing.expect(!isContextOverflow(api_error_msg, null));
@@ -313,7 +313,7 @@ test "isContextOverflow returns false for normal errors" {
         .model = "gpt-4o",
         .usage = .{ .input = 50000 },
         .stop_reason = .stop,
-        .error_message = null,
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed(""),
         .timestamp = 0,
     };
     try std.testing.expect(!isContextOverflow(success_msg, 128000));
@@ -330,7 +330,7 @@ test "isContextOverflow case insensitive matching" {
         .model = "claude-3-opus",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "PROMPT IS TOO LONG: exceeded limit",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("PROMPT IS TOO LONG: exceeded limit"),
         .timestamp = 0,
     };
     try std.testing.expect(isContextOverflow(uppercase_msg, null));
@@ -343,7 +343,7 @@ test "isContextOverflow case insensitive matching" {
         .model = "gpt-4o",
         .usage = .{},
         .stop_reason = .@"error",
-        .error_message = "Your Input Exceeds The Context Window",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("Your Input Exceeds The Context Window"),
         .timestamp = 0,
     };
     try std.testing.expect(isContextOverflow(mixedcase_msg, null));

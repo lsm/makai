@@ -563,7 +563,7 @@ fn runLoop(
                     .model = config.model.id,
                     .usage = .{},
                     .stop_reason = .@"error",
-                    .error_message = @errorName(err),
+                    .error_message = ai_types.OwnedSlice(u8).initBorrowed(@errorName(err)),
                     .timestamp = std.time.milliTimestamp(),
                     .owned_strings = false,
                 };
@@ -696,10 +696,12 @@ fn runLoop(
     };
 
     // Emit agent_end
-    try event_stream.push(.{ .agent_end = .{
-        .messages = result.messages.slice(),
-        .owned_strings = false, // Ownership transferred to result
-    } });
+    try event_stream.push(.{
+        .agent_end = .{
+            .messages = result.messages.slice(),
+            .owned_strings = false, // Ownership transferred to result
+        },
+    });
 
     // Complete the stream
     event_stream.complete(result);

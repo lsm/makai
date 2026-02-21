@@ -582,7 +582,7 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
         .@"error" => |e| {
             try w.writeStringField("type", "error");
             try w.writeStringField("reason", @tagName(e.reason));
-            if (e.err.error_message) |msg| {
+            if (e.err.getErrorMessage()) |msg| {
                 try w.writeStringField("error_message", msg);
             }
             try w.writeKey("usage");
@@ -1078,7 +1078,7 @@ pub fn parseAssistantMessageEvent(
 
         // Parse optional error_message
         if (obj.get("error_message")) |em| {
-            err_msg.error_message = try allocator.dupe(u8, em.string);
+            err_msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
         }
 
         // Parse optional usage object
@@ -1179,7 +1179,7 @@ pub fn parseAssistantMessage(
     result.timestamp = obj.get("timestamp").?.integer;
     result.usage = usage;
     result.owned_strings = true;
-    result.error_message = null;
+    result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
 
     return result;
 }
@@ -1465,7 +1465,7 @@ test "serialize and deserialize error event" {
         },
         .stop_reason = .@"error",
         .timestamp = 0,
-        .error_message = "API rate limit exceeded",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("API rate limit exceeded"),
         .owned_strings = false,
     };
     const event = ai_types.AssistantMessageEvent{ .@"error" = .{
@@ -1493,11 +1493,12 @@ test "serialize and deserialize error event" {
     try std.testing.expectEqual(@as(u64, 10), msg.event.@"error".err.usage.cache_write);
 
     // Verify error_message is properly deserialized
-    try std.testing.expect(msg.event.@"error".err.error_message != null);
-    try std.testing.expectEqualStrings("API rate limit exceeded", msg.event.@"error".err.error_message.?);
+    try std.testing.expect(msg.event.@"error".err.getErrorMessage() != null);
+    try std.testing.expectEqualStrings("API rate limit exceeded", msg.event.@"error".err.getErrorMessage().?);
 
     // Cleanup
-    allocator.free(msg.event.@"error".err.error_message.?);
+    var mutable_err = msg.event.@"error".err;
+    mutable_err.deinit(allocator);
 }
 
 test "serialize and deserialize result" {

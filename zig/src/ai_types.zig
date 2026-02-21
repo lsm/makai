@@ -281,10 +281,15 @@ pub const AssistantMessage = struct {
     model: []const u8,
     usage: Usage,
     stop_reason: StopReason,
-    error_message: ?[]const u8 = null,
+    error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     timestamp: i64,
     /// If true, api/provider/model strings are owned and will be freed in deinit
     owned_strings: bool = false,
+
+    pub fn getErrorMessage(self: *const AssistantMessage) ?[]const u8 {
+        const err = self.error_message.slice();
+        return if (err.len > 0) err else null;
+    }
 
     pub fn deinit(self: *AssistantMessage, allocator: std.mem.Allocator) void {
         for (self.content) |block| {
@@ -319,7 +324,7 @@ pub const AssistantMessage = struct {
             allocator.free(self.provider);
             allocator.free(self.model);
         }
-        if (self.error_message) |e| allocator.free(e);
+        self.error_message.deinit(allocator);
     }
 };
 
@@ -565,7 +570,10 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         cloned_count += 1;
     }
 
-    const error_msg = if (msg.error_message) |e| try allocator.dupe(u8, e) else null;
+    const error_msg = if (msg.getErrorMessage()) |e|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, e))
+    else
+        OwnedSlice(u8).initBorrowed("");
 
     return .{
         .content = content,
