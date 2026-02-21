@@ -452,6 +452,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/provider/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol_server", .module = protocol_server_mod },
+            .{ .name = "protocol_client", .module = protocol_client_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+        },
+    });
+
     // =========================================================================
     // Protocol Agent Modules (protocol/agent/)
     // =========================================================================
@@ -511,6 +523,22 @@ pub fn build(b: *std.Build) void {
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "agent_loop", .module = agent_loop_mod },
+        },
+    });
+
+    const agent_provider_protocol_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/provider_protocol_bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "protocol_server", .module = protocol_server_mod },
+            .{ .name = "protocol_client", .module = protocol_client_mod },
+            .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
         },
     });
 
@@ -757,6 +785,8 @@ pub fn build(b: *std.Build) void {
 
     const protocol_client_test = b.addTest(.{ .root_module = protocol_client_mod });
 
+    const protocol_runtime_test = b.addTest(.{ .root_module = protocol_runtime_mod });
+
     // Protocol Agent tests
     const protocol_agent_types_test = b.addTest(.{ .root_module = protocol_agent_types_mod });
 
@@ -769,6 +799,8 @@ pub fn build(b: *std.Build) void {
     const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
 
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
+
+    const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
 
     const agent_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -806,6 +838,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(register_builtins_test).step);
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(overflow_test).step);
@@ -825,6 +858,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
@@ -854,6 +888,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_runtime_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
 
@@ -883,6 +918,7 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
