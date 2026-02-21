@@ -168,3 +168,11 @@ All allocations go through explicit `std.mem.Allocator` parameters. Tests use `s
 - Inline tests in source files (`test "name" { ... }`)
 - Error unions for fallible operations
 - Comptime generics (e.g., `EventStream(T, R)`)
+
+### Adopted Bun-Inspired Patterns (Use When Appropriate)
+
+- **Poison after deinit**: end critical `deinit()` methods with `self.* = undefined;` to catch use-after-free bugs in debug builds.
+- **`OwnedSlice(T)` for ownership-tracked slices** (`zig/src/owned_slice.zig`): prefer this over ad-hoc `owned_*: bool` fields when values may be borrowed or owned.
+- **Document `catch unreachable` on allocator calls**: only use for truly fatal/OOM-only initialization paths; add a brief comment explaining why it is safe.
+- **Two-phase `StringBuilder`** (`zig/src/string_builder.zig`): use `count/countFmt` then single `allocate`, followed by `append/appendFmt` when building strings with known composition to avoid repeated reallocations.
+- **`HiveArray(T, capacity)` fixed pool** (`zig/src/hive_array.zig`): use for bounded, high-churn resources where fixed-capacity slot reuse is preferable to heap allocation.
