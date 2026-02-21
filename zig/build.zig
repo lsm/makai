@@ -406,6 +406,40 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Agent modules
+    const agent_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+        },
+    });
+
+    const agent_loop_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/agent_loop.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+        },
+    });
+
+    const agent_mod = b.createModule(.{
+        .root_source_file = b.path("src/agent/agent.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "agent_loop", .module = agent_loop_mod },
+        },
+    });
+
     // Tests
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -643,6 +677,27 @@ pub fn build(b: *std.Build) void {
 
     const protocol_client_test = b.addTest(.{ .root_module = protocol_client_mod });
 
+    // Agent tests
+    const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
+
+    const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
+
+    const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
+
+    const agent_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/unit/agent.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "agent_types", .module = agent_types_mod },
+                .{ .name = "agent_loop", .module = agent_loop_mod },
+            },
+        }),
+    });
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
@@ -677,6 +732,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_test).step);
 
     // Grouped unit test steps for parallel CI
     const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
@@ -721,6 +780,12 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(retry_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+
+    const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
