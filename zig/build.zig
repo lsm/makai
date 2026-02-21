@@ -858,6 +858,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const agent_protocol_chain_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/unit/agent_protocol_chain.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "agent_types", .module = agent_types_mod },
+                .{ .name = "agent_loop", .module = agent_loop_mod },
+                .{ .name = "agent_bridge", .module = agent_provider_protocol_bridge_mod },
+                .{ .name = "protocol_agent_server", .module = protocol_agent_server_mod },
+                .{ .name = "protocol_agent_client", .module = protocol_agent_client_mod },
+                .{ .name = "protocol_agent_runtime", .module = protocol_agent_runtime_mod },
+                .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            },
+        }),
+    });
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
@@ -902,6 +922,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
+    test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_server_test).step);
@@ -970,6 +991,7 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);

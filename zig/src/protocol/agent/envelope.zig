@@ -279,6 +279,26 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     return error.InvalidPayloadType;
 }
 
+test "deserializeEnvelope rejects invalid uuid" {
+    const allocator = std.testing.allocator;
+    const bad =
+        "{\"type\":\"ping\",\"session_id\":\"not-a-uuid\",\"message_id\":\"not-a-uuid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
+    try std.testing.expectError(error.InvalidUuid, deserializeEnvelope(bad, allocator));
+}
+
+test "deserializeEnvelope rejects unknown payload type" {
+    const allocator = std.testing.allocator;
+    const sid = "00000000-0000-0000-0000-000000000001";
+    const mid = "00000000-0000-0000-0000-000000000002";
+    const bad = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"not_real\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{ sid, mid },
+    );
+    defer allocator.free(bad);
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(bad, allocator));
+}
+
 test "agent envelope roundtrip" {
     const allocator = std.testing.allocator;
 

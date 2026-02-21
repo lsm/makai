@@ -73,6 +73,56 @@ pub const AgentProtocolRuntime = struct {
     }
 };
 
+test "AgentProtocolRuntime supports multi-session routing" {
+    const allocator = std.testing.allocator;
+
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    var pipe = PipeTransport.init(allocator);
+    defer pipe.deinit();
+
+    var client = AgentProtocolClient.init(allocator);
+    defer client.deinit();
+    client.setSender(pipe.clientSender());
+
+    var runtime = AgentProtocolRuntime{
+        .server = &server,
+        .pipe = &pipe,
+        .allocator = allocator,
+    };
+
+    _ = try client.sendAgentStart("{}", null);
+    _ = try runtime.pumpOnce(&client);
+    const sid1 = client.session_id.?;
+
+    _ = try client.sendAgentStart("{}", null);
+    _ = try runtime.pumpOnce(&client);
+    const sid2 = client.session_id.?;
+
+    try std.testing.expect(!std.mem.eql(u8, sid1[0..], sid2[0..]));
+
+    _ = try client.sendAgentMessage(sid1, "{\"role\":\"user\",\"content\":\"one\"}", null);
+    _ = try client.sendAgentMessage(sid2, "{\"role\":\"user\",\"content\":\"two\"}", null);
+    _ = try runtime.pumpOnce(&client);
+
+    try server.publishAgentEvent(sid1, "{\"session\":1}");
+    try server.publishAgentEvent(sid2, "{\"session\":2}");
+    _ = try runtime.pumpOnce(&client);
+
+    var ev1 = client.popEvent().?;
+    defer ev1.deinit(allocator);
+    var ev2 = client.popEvent().?;
+    defer ev2.deinit(allocator);
+
+    const a = ev1.slice();
+    const b = ev2.slice();
+    const ok = (std.mem.indexOf(u8, a, "session") != null) and (std.mem.indexOf(u8, b, "session") != null);
+    try std.testing.expect(ok);
+
+    try std.testing.expectEqual(@as(usize, 2), server.sessionCount());
+}
+
 test "AgentProtocolRuntime pumps full request/response and outbox" {
     const allocator = std.testing.allocator;
 

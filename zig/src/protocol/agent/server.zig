@@ -226,6 +226,52 @@ pub const AgentProtocolServer = struct {
     }
 };
 
+test "AgentProtocolServer rejects invalid start sequence" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    var start = agent_types.Envelope{
+        .session_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUuid(),
+        .sequence = 2,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
+    };
+    defer start.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(start)).?;
+    defer resp.deinit(allocator);
+
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, resp.payload.agent_error.code);
+}
+
+test "AgentProtocolServer rejects unknown session message" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateUuid();
+    var msg = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .agent_message = .{
+            .session_id = sid,
+            .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
+        } },
+    };
+    defer msg.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(msg)).?;
+    defer resp.deinit(allocator);
+
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.agent_not_found, resp.payload.agent_error.code);
+}
+
 test "AgentProtocolServer start message status stop" {
     const allocator = std.testing.allocator;
     var server = AgentProtocolServer.init(allocator);
