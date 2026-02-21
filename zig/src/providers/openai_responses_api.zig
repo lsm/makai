@@ -8,6 +8,7 @@ const tool_call_tracker = @import("tool_call_tracker");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -347,7 +348,23 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
 /// Build compound ID for OpenAI Responses tool calls: {call_id}|{item_id}
 fn buildCompoundId(allocator: std.mem.Allocator, call_id: []const u8, item_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}|{s}", .{ call_id, item_id });
+    var sb = StringBuilder{};
+    sb.count(call_id);
+    sb.count("|");
+    sb.count(item_id);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(call_id);
+    _ = sb.append("|");
+    _ = sb.append(item_id);
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 /// Event parsed from a response SSE event

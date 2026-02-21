@@ -6,6 +6,7 @@ const json_writer = @import("json_writer");
 const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
+const StringBuilder = @import("string_builder").StringBuilder;
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -75,6 +76,30 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return std.process.getEnvVarOwned(allocator, name) catch null;
+}
+
+fn buildGeneratedToolCallId(allocator: std.mem.Allocator, tool_name: []const u8, timestamp: i64, counter: usize) ![]const u8 {
+    var sb = StringBuilder{};
+    sb.count(tool_name);
+    sb.count("_");
+    try sb.countFmt("{}", .{timestamp});
+    sb.count("_");
+    try sb.countFmt("{}", .{counter});
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
+
+    _ = sb.append(tool_name);
+    _ = sb.append("_");
+    _ = try sb.fmt("{}", .{timestamp});
+    _ = sb.append("_");
+    _ = try sb.fmt("{}", .{counter});
+
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -896,11 +921,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         // Generate unique ID for the tool call
                         tool_call_counter += 1;
                         const timestamp = std.time.milliTimestamp();
-                        const tool_id = std.fmt.allocPrint(
-                            allocator,
-                            "{s}_{}_{}",
-                            .{ tc.name, timestamp, tool_call_counter },
-                        ) catch continue;
+                        const tool_id = buildGeneratedToolCallId(allocator, tc.name, timestamp, tool_call_counter) catch continue;
 
                         const tool_name = allocator.dupe(u8, tc.name) catch {
                             allocator.free(tool_id);
@@ -1048,11 +1069,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Generate unique ID for the tool call
                 tool_call_counter += 1;
                 const timestamp = std.time.milliTimestamp();
-                const tool_id = std.fmt.allocPrint(
-                    allocator,
-                    "{s}_{}_{}",
-                    .{ tc.name, timestamp, tool_call_counter },
-                ) catch continue;
+                const tool_id = buildGeneratedToolCallId(allocator, tc.name, timestamp, tool_call_counter) catch continue;
 
                 const tool_name = allocator.dupe(u8, tc.name) catch {
                     allocator.free(tool_id);

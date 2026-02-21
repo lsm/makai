@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const provider_caps = @import("provider_caps.zig");
+const StringBuilder = @import("string_builder.zig").StringBuilder;
 
 pub const TransformOptions = struct {
     /// Target provider for message transformation
@@ -272,14 +273,22 @@ fn normalizeToolId(allocator: std.mem.Allocator, id: []const u8) ![]const u8 {
         return allocator.dupe(u8, id);
     }
 
-    // Otherwise, prefix with "call_"
-    var result = try std.ArrayList(u8).initCapacity(allocator, id.len + 5);
-    defer result.deinit(allocator);
+    // Otherwise, prefix with "call_" using two-phase StringBuilder
+    var sb = StringBuilder{};
+    sb.count("call_");
+    sb.count(id);
+    try sb.allocate(allocator);
+    errdefer sb.deinit(allocator);
 
-    try result.appendSlice(allocator, "call_");
-    try result.appendSlice(allocator, id);
+    _ = sb.append("call_");
+    _ = sb.append(id);
 
-    return result.toOwnedSlice(allocator);
+    std.debug.assert(sb.len == sb.cap);
+    const out = sb.ptr.?[0..sb.cap];
+    sb.ptr = null;
+    sb.cap = 0;
+    sb.len = 0;
+    return out;
 }
 
 /// Free messages allocated by transform functions
