@@ -173,6 +173,7 @@ All allocations go through explicit `std.mem.Allocator` parameters. Tests use `s
 
 - **Poison after deinit**: end critical `deinit()` methods with `self.* = undefined;` to catch use-after-free bugs in debug builds.
 - **`OwnedSlice(T)` for ownership-tracked slices** (`zig/src/owned_slice.zig`): prefer this over ad-hoc `owned_*: bool` fields when values may be borrowed or owned.
-- **Document `catch unreachable` on allocator calls**: only use for truly fatal/OOM-only initialization paths; add a brief comment explaining why it is safe.
+- **Prefer `oom.unreachableOnOom(...)` over raw `catch unreachable`** (`zig/src/utils/oom.zig`): use this for truly OOM-only allocator init paths so intent is explicit.
 - **Two-phase `StringBuilder`** (`zig/src/string_builder.zig`): use `count/countFmt` then single `allocate`, followed by `append/appendFmt` when building strings with known composition to avoid repeated reallocations.
 - **`HiveArray(T, capacity)` fixed pool** (`zig/src/hive_array.zig`): use for bounded, high-churn resources where fixed-capacity slot reuse is preferable to heap allocation.
+- **Pattern guardrails script**: keep `./scripts/check-zig-patterns.sh` passing (CI runs it before unit tests).

@@ -51,6 +51,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Check Zig pattern guardrails
+        run: ./scripts/check-zig-patterns.sh
+
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
