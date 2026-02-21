@@ -5,6 +5,7 @@ const partial_reconstructor = @import("partial_reconstructor.zig");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const transport = @import("transport");
+const oom = @import("oom");
 
 /// Client-side protocol handler for the Makai Wire Protocol
 ///
@@ -65,7 +66,7 @@ pub const ProtocolClient = struct {
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
         // OOM is the only possible error from allocator.create(); treat as fatal since
         // the client cannot function without its event stream.
-        const es = allocator.create(event_stream.AssistantMessageEventStream) catch unreachable;
+        const es = oom.unreachableOnOom(allocator.create(event_stream.AssistantMessageEventStream));
         es.* = event_stream.AssistantMessageEventStream.init(allocator);
         // ProtocolClient deep-copies events via cloneAssistantMessageEvent() before pushing,
         // so the stream owns its events and must free them in deinit()

@@ -18,6 +18,7 @@ const std = @import("std");
 const transport_mod = @import("transport");
 const event_stream = @import("event_stream");
 const ai_types = @import("ai_types");
+const oom = @import("oom");
 
 /// Transport mode determining how messages are handled
 pub const Mode = enum {
@@ -292,8 +293,8 @@ pub const SerializedPipe = struct {
         return .{
             // OOM is the only possible error from initCapacity(); treat as fatal since
             // the pipe cannot function without its buffers.
-            .to_client = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
-            .to_server = std.ArrayList(u8).initCapacity(allocator, 4096) catch unreachable,
+            .to_client = oom.unreachableOnOom(std.ArrayList(u8).initCapacity(allocator, 4096)),
+            .to_server = oom.unreachableOnOom(std.ArrayList(u8).initCapacity(allocator, 4096)),
             .to_client_read_pos = 0,
             .to_server_read_pos = 0,
             .allocator = allocator,
@@ -303,6 +304,9 @@ pub const SerializedPipe = struct {
     pub fn deinit(self: *SerializedPipe) void {
         self.to_client.deinit(self.allocator);
         self.to_server.deinit(self.allocator);
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Server writes to this to send to client

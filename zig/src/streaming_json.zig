@@ -17,6 +17,9 @@ pub const StreamingJsonAccumulator = struct {
     /// Free all allocated memory.
     pub fn deinit(self: *StreamingJsonAccumulator) void {
         self.buffer.deinit(self.allocator);
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Append a delta chunk to the accumulated buffer.

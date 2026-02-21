@@ -7,6 +7,9 @@ pub const SSEEvent = struct {
     pub fn deinit(self: *SSEEvent, allocator: std.mem.Allocator) void {
         if (self.event_type) |et| allocator.free(et);
         allocator.free(self.data);
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 };
 
@@ -37,6 +40,9 @@ pub const SSEParser = struct {
             event.deinit(self.allocator);
         }
         self.pending_events.deinit(self.allocator);
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Feed a chunk of data, returns completed events
@@ -95,7 +101,7 @@ pub const SSEParser = struct {
         // Find the colon separator
         if (std.mem.indexOfScalar(u8, line, ':')) |colon_pos| {
             const field = line[0..colon_pos];
-            var value = line[colon_pos + 1..];
+            var value = line[colon_pos + 1 ..];
 
             // Skip leading space in value
             if (value.len > 0 and value[0] == ' ') {

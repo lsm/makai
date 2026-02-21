@@ -42,6 +42,9 @@ pub const ToolCallTracker = struct {
             call.json_accumulator.deinit();
         }
         self.calls.deinit();
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Start tracking a new tool call. Returns the content index.

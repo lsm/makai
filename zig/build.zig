@@ -117,6 +117,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const oom_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const sanitize_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/sanitize.zig"),
         .target = target,
@@ -337,6 +343,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oom", .module = oom_mod },
         },
     });
 
@@ -424,6 +431,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "oom", .module = oom_mod },
         },
     });
 
@@ -532,6 +540,8 @@ pub fn build(b: *std.Build) void {
     const overflow_test = b.addTest(.{ .root_module = overflow_mod });
 
     const retry_test = b.addTest(.{ .root_module = retry_mod });
+
+    const oom_test = b.addTest(.{ .root_module = oom_mod });
 
     const sanitize_test = b.addTest(.{ .root_module = sanitize_mod });
 
@@ -781,6 +791,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_step.dependOn(&b.addRunArtifact(overflow_test).step);
     test_step.dependOn(&b.addRunArtifact(retry_test).step);
+    test_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
@@ -845,6 +856,7 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(retry_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
 

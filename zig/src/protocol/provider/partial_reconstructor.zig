@@ -68,6 +68,9 @@ pub const PartialReconstructor = struct {
             }
         }
         self.content_blocks.deinit();
+
+        // Poison freed memory to catch use-after-free in debug builds
+        self.* = undefined;
     }
 
     /// Process an event, updating internal state
