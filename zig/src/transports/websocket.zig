@@ -519,7 +519,7 @@ fn performHandshake(
     var request = std.ArrayList(u8){};
     defer request.deinit(client.allocator);
 
-    const writer = request.writer();
+    const writer = request.writer(client.allocator);
 
     try writer.print("GET {s} HTTP/1.1\r\n", .{path});
     try writer.print("Host: {s}\r\n", .{host});
