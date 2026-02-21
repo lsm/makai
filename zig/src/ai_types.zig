@@ -1,4 +1,7 @@
 const std = @import("std");
+const owned_slice_mod = @import("owned_slice");
+
+pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 pub const KnownApi = enum {
     openai_completions,
@@ -62,7 +65,16 @@ pub const CancelToken = struct {
 };
 
 pub const Metadata = struct {
-    user_id: ?[]const u8 = null,
+    user_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getUserId(self: *const Metadata) ?[]const u8 {
+        const uid = self.user_id.slice();
+        return if (uid.len > 0) uid else null;
+    }
+
+    pub fn deinit(self: *Metadata, allocator: std.mem.Allocator) void {
+        self.user_id.deinit(allocator);
+    }
 };
 
 pub const ToolChoice = union(enum) {
@@ -128,7 +140,7 @@ pub const StreamOptions = struct {
             allocator.free(headers);
         }
         if (self.metadata) |*meta| {
-            if (meta.user_id) |uid| allocator.free(uid);
+            meta.deinit(allocator);
         }
         if (self.tool_choice) |*choice| {
             switch (choice.*) {

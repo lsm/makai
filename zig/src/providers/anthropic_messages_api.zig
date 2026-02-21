@@ -45,7 +45,7 @@ fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetenti
 /// Check if a model supports adaptive thinking (Opus 4.6+)
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "opus-4-6") != null or
-           std.mem.indexOf(u8, model_id, "opus-4.6") != null;
+        std.mem.indexOf(u8, model_id, "opus-4.6") != null;
 }
 
 /// Map ThinkingLevel to Anthropic effort levels for adaptive thinking
@@ -726,7 +726,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // Serialize metadata.user_id if present
     if (options.metadata) |meta| {
-        if (meta.user_id) |user_id| {
+        if (meta.getUserId()) |user_id| {
             try w.writeKey("metadata");
             try w.beginObject();
             try w.writeStringField("user_id", user_id);
@@ -915,9 +915,7 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
             if (delta_val == .object) {
                 if (delta_val.object.get("stop_reason")) |sr| {
                     if (sr == .string) {
-                        if (std.mem.eql(u8, sr.string, "max_tokens")) stop_reason = .length
-                        else if (std.mem.eql(u8, sr.string, "tool_use")) stop_reason = .tool_use
-                        else stop_reason = .stop;
+                        if (std.mem.eql(u8, sr.string, "max_tokens")) stop_reason = .length else if (std.mem.eql(u8, sr.string, "tool_use")) stop_reason = .tool_use else stop_reason = .stop;
                     }
                 }
             }
@@ -1420,7 +1418,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .id = cbs.tool_id,
                                 .name = cbs.tool_name,
                                 .partial = createPartialMessage(model),
-                            }}) catch {};
+                            } }) catch {};
                         },
                     }
 
@@ -1450,7 +1448,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .content_index = content_idx,
                                         .delta = json_delta,
                                         .partial = createPartialMessage(model),
-                                    }}) catch {};
+                                    } }) catch {};
                                 }
                             },
                         }
@@ -1513,7 +1511,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .content_index = content_blocks.items.len - 1,
                                         .tool_call = event_tc,
                                         .partial = createPartialMessage(model),
-                                    }}) catch {};
+                                    } }) catch {};
                                 }
                             },
                         }

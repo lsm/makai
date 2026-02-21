@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ai_types depends on OwnedSlice for selective ownership wrappers
+    ai_types_mod.addImport("owned_slice", owned_slice_mod);
+
     const string_builder_mod = b.createModule(.{
         .root_source_file = b.path("src/string_builder.zig"),
         .target = target,

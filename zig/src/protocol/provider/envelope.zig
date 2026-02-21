@@ -383,7 +383,7 @@ fn serializeStreamOptions(
     if (opts.metadata) |meta| {
         try w.writeKey("metadata");
         try w.beginObject();
-        if (meta.user_id) |uid| {
+        if (meta.getUserId()) |uid| {
             try w.writeStringField("user_id", uid);
         }
         try w.endObject();
@@ -1124,9 +1124,9 @@ fn deserializeStreamOptions(
     if (obj.get("metadata")) |meta| {
         opts.metadata = .{
             .user_id = if (meta.object.get("user_id")) |uid|
-                try allocator.dupe(u8, uid.string)
+                ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, uid.string))
             else
-                null,
+                ai_types.OwnedSlice(u8).initBorrowed(""),
         };
     }
     if (obj.get("tool_choice")) |choice| {
