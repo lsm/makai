@@ -1,6 +1,7 @@
 const std = @import("std");
 const streaming_json = @import("streaming_json");
 const ai_types = @import("ai_types");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Tracks tool calls being accumulated during streaming
 pub const ToolCallTracker = struct {
@@ -14,13 +15,13 @@ pub const ToolCallTracker = struct {
         /// API-provided index for tracking (varies by provider)
         api_index: usize,
         /// Tool call ID (e.g., "toolu_01..." for Anthropic, "call_..." for OpenAI)
-        id: []const u8,
+        id: OwnedSlice(u8),
         /// Tool name
-        name: []const u8,
+        name: OwnedSlice(u8),
         /// Accumulated JSON arguments
         json_accumulator: streaming_json.StreamingJsonAccumulator,
         /// Encrypted reasoning detail for round-trip (OpenAI reasoning_details)
-        thought_signature: ?[]const u8 = null,
+        thought_signature: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     };
 
     const Self = @This();
@@ -36,9 +37,9 @@ pub const ToolCallTracker = struct {
         var iter = self.calls.iterator();
         while (iter.next()) |entry| {
             var call = entry.value_ptr;
-            self.allocator.free(call.id);
-            self.allocator.free(call.name);
-            if (call.thought_signature) |sig| self.allocator.free(sig);
+            call.id.deinit(self.allocator);
+            call.name.deinit(self.allocator);
+            call.thought_signature.deinit(self.allocator);
             call.json_accumulator.deinit();
         }
         self.calls.deinit();
@@ -59,8 +60,8 @@ pub const ToolCallTracker = struct {
         const call = InProgressToolCall{
             .content_index = content_index,
             .api_index = api_index,
-            .id = duped_id,
-            .name = duped_name,
+            .id = OwnedSlice(u8).initOwned(duped_id),
+            .name = OwnedSlice(u8).initOwned(duped_name),
             .json_accumulator = streaming_json.StreamingJsonAccumulator.init(self.allocator),
         };
 
@@ -96,12 +97,9 @@ pub const ToolCallTracker = struct {
     pub fn setThoughtSignatureById(self: *Self, tool_call_id: []const u8, signature: []const u8) !void {
         var iter = self.calls.iterator();
         while (iter.next()) |entry| {
-            if (std.mem.eql(u8, entry.value_ptr.id, tool_call_id)) {
-                // Free any existing signature
-                if (entry.value_ptr.thought_signature) |existing| {
-                    self.allocator.free(existing);
-                }
-                entry.value_ptr.thought_signature = try self.allocator.dupe(u8, signature);
+            if (std.mem.eql(u8, entry.value_ptr.id.slice(), tool_call_id)) {
+                entry.value_ptr.thought_signature.deinit(self.allocator);
+                entry.value_ptr.thought_signature = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, signature));
                 return;
             }
         }
@@ -113,22 +111,20 @@ pub const ToolCallTracker = struct {
         if (self.calls.fetchRemove(api_index)) |removed| {
             var call = removed.value;
 
-            // Dupe the strings for the returned ToolCall
-            const duped_id = allocator.dupe(u8, call.id) catch {
-                // On allocation failure, clean up and return null
-                self.allocator.free(call.id);
-                self.allocator.free(call.name);
-                if (call.thought_signature) |sig| self.allocator.free(sig);
+            const duped_id = allocator.dupe(u8, call.id.slice()) catch {
+                call.id.deinit(self.allocator);
+                call.name.deinit(self.allocator);
+                call.thought_signature.deinit(self.allocator);
                 call.json_accumulator.deinit();
                 return null;
             };
             errdefer allocator.free(duped_id);
 
-            const duped_name = allocator.dupe(u8, call.name) catch {
+            const duped_name = allocator.dupe(u8, call.name.slice()) catch {
                 allocator.free(duped_id);
-                self.allocator.free(call.id);
-                self.allocator.free(call.name);
-                if (call.thought_signature) |sig| self.allocator.free(sig);
+                call.id.deinit(self.allocator);
+                call.name.deinit(self.allocator);
+                call.thought_signature.deinit(self.allocator);
                 call.json_accumulator.deinit();
                 return null;
             };
@@ -139,34 +135,33 @@ pub const ToolCallTracker = struct {
                 allocator.dupe(u8, json_buf) catch {
                     allocator.free(duped_id);
                     allocator.free(duped_name);
-                    self.allocator.free(call.id);
-                    self.allocator.free(call.name);
-                    if (call.thought_signature) |sig| self.allocator.free(sig);
+                    call.id.deinit(self.allocator);
+                    call.name.deinit(self.allocator);
+                    call.thought_signature.deinit(self.allocator);
                     call.json_accumulator.deinit();
                     return null;
                 }
             else
                 "";
 
-            // Dupe thought_signature if present
-            const duped_sig = if (call.thought_signature) |sig|
-                allocator.dupe(u8, sig) catch {
+            const signature_slice = call.thought_signature.slice();
+            const duped_sig = if (signature_slice.len > 0)
+                allocator.dupe(u8, signature_slice) catch {
                     allocator.free(duped_id);
                     allocator.free(duped_name);
                     if (json_buf.len > 0) allocator.free(duped_json);
-                    self.allocator.free(call.id);
-                    self.allocator.free(call.name);
-                    self.allocator.free(sig);
+                    call.id.deinit(self.allocator);
+                    call.name.deinit(self.allocator);
+                    call.thought_signature.deinit(self.allocator);
                     call.json_accumulator.deinit();
                     return null;
                 }
             else
                 null;
 
-            // Free the tracker's copy of the strings
-            self.allocator.free(call.id);
-            self.allocator.free(call.name);
-            if (call.thought_signature) |sig| self.allocator.free(sig);
+            call.id.deinit(self.allocator);
+            call.name.deinit(self.allocator);
+            call.thought_signature.deinit(self.allocator);
             call.json_accumulator.deinit();
 
             return ai_types.ToolCall{

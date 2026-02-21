@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "streaming_json", .module = streaming_json_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
