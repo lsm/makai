@@ -82,9 +82,9 @@ fn buildGeneratedToolCallId(allocator: std.mem.Allocator, tool_name: []const u8,
     var sb = StringBuilder{};
     sb.count(tool_name);
     sb.count("_");
-    try sb.countFmt("{}", .{timestamp});
+    sb.countFmt("{}", .{timestamp});
     sb.count("_");
-    try sb.countFmt("{}", .{counter});
+    sb.countFmt("{}", .{counter});
     try sb.allocate(allocator);
     errdefer sb.deinit(allocator);
 
