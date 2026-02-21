@@ -256,10 +256,6 @@ pub const ProtocolClient = struct {
         if (self.sender == null) {
             return error.NoSender;
         }
-        if (!self.stream_sequences.contains(stream_id)) {
-            return error.NoActiveStream;
-        }
-
         const seq = try self.nextSequenceForStream(stream_id);
 
         const reason_owned = if (reason) |r|
@@ -331,10 +327,7 @@ pub const ProtocolClient = struct {
 
                 // Check for done event
                 if (owned_evt == .done) {
-                    const result = try recon.buildMessage(
-                        owned_evt.done.reason,
-                        owned_evt.done.message.timestamp,
-                    );
+                    const result = try ai_types.cloneAssistantMessage(self.allocator, owned_evt.done.message);
                     try self.setStreamResult(env.stream_id, result);
 
                     // Legacy fields for current stream users
