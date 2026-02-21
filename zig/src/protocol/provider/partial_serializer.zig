@@ -2,7 +2,6 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
 const content_partial = @import("content_partial");
-const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const SerializationOptions = struct {
     /// If true, include lightweight partial field in events
@@ -117,8 +116,8 @@ pub const PartialState = struct {
                 const name = try self.allocator.dupe(u8, e.tool_call.name);
                 try self.blocks.put(e.content_index, .{
                     .tool_call = .{
-                        .id = OwnedSlice(u8).initOwned(id),
-                        .name = OwnedSlice(u8).initOwned(name),
+                        .id = content_partial.OwnedSlice(u8).initOwned(id),
+                        .name = content_partial.OwnedSlice(u8).initOwned(name),
                         .json_len = e.tool_call.arguments_json.len,
                     },
                 });

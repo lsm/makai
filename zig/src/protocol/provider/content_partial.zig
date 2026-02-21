@@ -1,6 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
-const OwnedSlice = @import("owned_slice").OwnedSlice;
+pub const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Partial state for a text content block
 pub const TextPartial = struct {
