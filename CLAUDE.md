@@ -4,16 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Makai is a Zig implementation of a unified multi-provider AI streaming abstraction layer. It provides a common interface for streaming responses from Anthropic, OpenAI (Completions & Responses APIs), Google (Generative AI & Vertex), Azure OpenAI, AWS Bedrock, and Ollama, with lock-free event queues, type-safe tagged unions, OAuth flows, and benchmarking infrastructure.
+Makai is a Zig implementation of a unified multi-provider AI streaming abstraction layer. It provides a common interface for streaming responses from Anthropic, OpenAI (Completions & Responses APIs), Google (Generative AI & Vertex), Azure OpenAI, AWS Bedrock, and Ollama, with lock-free event queues, type-safe tagged unions, a distributed client-server protocol, an agent loop with tool execution, OAuth flows, and multiple transport backends.
 
 ## Build Commands
 
-All build commands run from the `zig/` directory. Requires Zig 0.13.0+.
+All build commands run from the `zig/` directory. Requires Zig 0.15.2.
 
 ```bash
 cd zig
-zig build test          # Run all unit tests (27 modules: 22 unit + 5 e2e)
-zig build run           # Run the demo application
+zig build test                    # Run all unit tests
+zig build run                     # Run the demo application
+```
+
+### Grouped Test Steps
+
+Unit tests are split into groups for parallel CI:
+
+```bash
+zig build test-unit-core          # event_stream, streaming_json, ai_types, tool_call_tracker
+zig build test-unit-transport     # transport, stdio, sse, websocket, in_process
+zig build test-unit-protocol      # content_partial, partial_serializer, protocol types/envelope/reconstructor, server, client, agent types, tool types
+zig build test-unit-providers     # api_registry, stream, register_builtins, all provider APIs
+zig build test-unit-utils         # github_copilot, oauth/pkce, oauth/mod, overflow, retry, sanitize, pre_transform
+zig build test-unit-agent         # agent types, agent_loop, agent module, agent unit test
+```
+
+E2E tests require API keys (set via env vars, see `.github/workflows/ci.yml`):
+
+```bash
+zig build test-e2e-anthropic
+zig build test-e2e-openai
+zig build test-e2e-google
+zig build test-e2e-ollama
+zig build test-e2e-github-copilot
+zig build test-e2e-protocol                     # mock-based, no API keys needed
+zig build test-e2e-protocol-fullstack-ollama
+zig build test-e2e-protocol-fullstack-github
 ```
 
 There is no single-test command. Tests are inline in each `.zig` file using Zig's built-in `test` blocks, and `zig build test` runs all modules.
@@ -25,78 +51,90 @@ Managed via `zig/build.zig.zon` with automatic fetching and hash verification:
 
 ## Architecture
 
-### Module Dependency Graph
+The system is organized into four layers, each building on the one below:
 
 ```
-types.zig                    (core types, no deps)
-  ├── ai_types.zig           (extended AI types: Model, Message, ContentBlock variants)
-  │     ├── event_stream.zig (lock-free ring buffer event queue)
-  │     │     ├── api_registry.zig (API provider registry)
-  │     │     │     ├── providers/anthropic_messages_api.zig
-  │     │     │     ├── providers/openai_completions_api.zig
-  │     │     │     ├── providers/openai_responses_api.zig
-  │     │     │     ├── providers/google_generative_api.zig
-  │     │     │     ├── providers/google_vertex_api.zig
-  │     │     │     ├── providers/azure_openai_responses_api.zig
-  │     │     │     ├── providers/bedrock_converse_stream_api.zig
-  │     │     │     └── providers/ollama_api.zig
-  │     │     └── (used by all providers)
-  │     └── oauth/mod.zig    (OAuth credentials and provider registry)
-  │           ├── oauth/pkce.zig
-  │           ├── oauth/github_copilot.zig
-  │           └── oauth/google_*.zig, openai_codex.zig
-  └── providers/config.zig   (per-provider configuration structs)
-
-json/writer.zig              (JSON serialization, no deps)
-providers/sse_parser.zig     (SSE parsing, no deps)
-providers/http.zig           (async HTTP client, depends on libxev)
-streaming_json.zig           (streaming JSON parsing)
-tool_call_tracker.zig        (partial tool call assembly)
-
-utils/
-  ├── sanitize.zig           (UTF-16 surrogate sanitization)
-  ├── overflow.zig           (context overflow error detection)
-  ├── retry.zig              (exponential backoff, Retry-After parsing)
-  ├── provider_caps.zig      (provider capability detection)
-  ├── message_transform.zig  (thinking block format conversion)
-  ├── pre_transform.zig      (cross-model thinking conversion)
-  ├── tokens.zig             (token estimation utilities)
-  ├── tool_utils.zig         (tool call ID normalization)
-  └── aws_sigv4.zig          (AWS Signature v4 signing - for Bedrock)
+┌─────────────────────────────────────────────┐
+│  Agent Layer (agent/)                       │  ← Agent loop with tool execution
+│    agent.zig, agent_loop.zig, types.zig     │
+├─────────────────────────────────────────────┤
+│  Protocol Layer (protocol/)                 │  ← Client-server wire protocol
+│    provider/ (server, client, envelope,     │
+│      partial_serializer, partial_recon-     │
+│      structor, content_partial, types)      │
+│    agent/types.zig   tool/types.zig         │
+├─────────────────────────────────────────────┤
+│  Transport Layer (transports/)              │  ← Pluggable byte-level I/O
+│    stdio, sse, websocket, in_process        │
+│  transport.zig (interfaces + ByteStream)    │
+├─────────────────────────────────────────────┤
+│  Streaming Core                             │  ← Provider-agnostic streaming
+│    ai_types.zig, event_stream.zig,          │
+│    api_registry.zig, stream.zig,            │
+│    streaming_json.zig, tool_call_tracker.zig│
+│    json/writer.zig, providers/sse_parser.zig│
+├─────────────────────────────────────────────┤
+│  Providers (providers/)                     │  ← Per-API streaming impls
+│    anthropic, openai (completions+responses)│
+│    google (generative+vertex), azure, ollama│
+│    register_builtins.zig                    │
+├─────────────────────────────────────────────┤
+│  Utils & OAuth                              │
+│    sanitize, overflow, retry, provider_caps │
+│    pre_transform, tokens, tool_utils,       │
+│    aws_sigv4, oauth/ (pkce, github_copilot, │
+│    anthropic, google_*, openai_codex)       │
+└─────────────────────────────────────────────┘
 ```
 
 ### Key Abstractions
 
-**`types.zig`** - Core domain types:
+**`ai_types.zig`** - Core domain types:
 - `ContentBlock`: Tagged union — `text`, `tool_use`, `thinking`, `image`, `tool_result`
-- `ToolResultContent`: Union of `text` and `image` for tool result payloads
-- `MessageEvent`: 13-variant tagged union for streaming events (start, text_delta, thinking_delta, toolcall_delta, done, error, etc.)
+- `MessageEvent` / `AssistantMessageEvent`: 13-variant tagged union for streaming events (start, text_delta, thinking_delta, toolcall_delta, done, error, etc.)
 - `Usage`: Token counting with `add()` and `total()` methods, includes cache read/write tokens
 - `AssistantMessage`: Final result containing content blocks, usage, stop reason, model
-
-**`ai_types.zig`** - Extended AI types:
 - `Model`: Provider, name, context window, pricing, compatibility options (`OpenAICompatOptions`)
 - `StreamOptions`: All streaming options including service_tier, reasoning_summary, thinking config, cache control
-- `ServiceTier`: `default`, `flex` (0.5x cost), `priority` (2x cost)
 - `CancelToken`: Atomic bool wrapper for request cancellation
 
 **`event_stream.zig`** - `EventStream(T, R)`: Lock-free ring buffer (256 slots) with futex synchronization. Main type: `AssistantMessageStream = EventStream(MessageEvent, AssistantMessage)`. Key methods: `push`, `poll`, `pollBatch`, `wait` (blocking), `complete`, `completeWithError`.
 
-**`api_registry.zig`** - Provider registry with `registerApiProvider()` for registering streaming API implementations by name (e.g., "anthropic-messages", "openai-responses").
+**`transport.zig`** - Defines transport interfaces (`Sender`, `Receiver`, `AsyncSender`, `AsyncReceiver`) and wire message types (`MessageOrControl`, `ControlMessage`). Also defines `ByteStream = EventStream(ByteChunk, void)` for async byte-level I/O. Transports implement these interfaces over different backends.
+
+**`protocol/provider/`** - Client-server wire protocol:
+- `types.zig`: UUID generation, `Envelope` (stream_id, message_id, sequence, timestamp, payload), `ErrorCode` enum
+- `envelope.zig`: JSON serialization/deserialization of protocol envelopes, creation helpers (createStreamStart, createAck, createNack, etc.)
+- `server.zig`: Server-side protocol handler — validates sequences, manages streams, routes envelopes to providers
+- `client.zig`: Client-side `ProtocolClient` — sends requests via transport, reconstructs `AssistantMessage` from streamed events, manages pending requests. v1.0: single-stream only
+- `partial_serializer.zig`: Converts `MessageEvent` stream into partial `AssistantMessage` snapshots for protocol transmission
+- `partial_reconstructor.zig`: Rebuilds `AssistantMessage` from partial snapshots on the client side
+- `content_partial.zig`: Content block partial state tracking
+
+**`protocol/agent/types.zig`** - Agent protocol types (for distributed agent protocol)
+
+**`protocol/tool/types.zig`** - Tool protocol types (for distributed tool execution)
+
+**`agent/`** - Agent loop system:
+- `types.zig`: `AgentEvent` (agent_start, turn_start, message_start, message_update, tool_execution_start/end, turn_end, agent_end, error), `AgentTool`, `AgentLoopConfig`, `AgentContext`, `AgentEventStream`
+- `agent_loop.zig`: Core agentic loop — sends messages to LLM, processes tool calls, feeds results back. Uses `ProtocolClient` or direct streaming
+- `agent.zig`: `Agent` struct — high-level API wrapping the agent loop with configuration and state management
 
 **`providers/`** - Each provider implements streaming via SSE parsing over HTTP, building request JSON with `json/writer.zig`, and pushing events into an `AssistantMessageStream`. Providers support cancellation tokens and payload callbacks.
 
-**`oauth/`** - OAuth implementations:
-- `pkce.zig`: SHA-256 verifier/challenge generation
-- `github_copilot.zig`: Device Flow (RFC 8628) with token exchange
-- `google_gemini_cli.zig`, `google_antigravity.zig`, `openai_codex.zig`: Authorization Code Flow with PKCE
+**`api_registry.zig`** - Provider registry with `registerApiProvider()` for registering streaming API implementations by name (e.g., "anthropic-messages", "openai-responses").
 
 ### Adding a New Provider
 
 1. Create `zig/src/providers/<name>_api.zig` implementing `stream*()` functions
 2. Register in `zig/src/register_builtins.zig` with the API registry
 3. Add provider-specific config struct in `config.zig` if needed
-4. Register the module in `zig/build.zig` (create module + add to test step)
+4. Create module in `zig/build.zig`, add to test step and appropriate test group
+
+### Adding a New Transport
+
+1. Create `zig/src/transports/<name>.zig` implementing `Sender`/`Receiver` from `transport.zig`
+2. Create module in `zig/build.zig` with `transport` import, add to test step and `test-unit-transport` group
 
 ### Provider-Specific Notes
 
