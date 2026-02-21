@@ -346,7 +346,7 @@ pub const AgentState = struct {
     is_streaming: bool = false,
     stream_message: ?ai_types.Message = null,
     pending_tool_calls: std.StringHashMap(void),
-    error_message: ?[]const u8 = null,
+    error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) AgentState {
@@ -357,13 +357,18 @@ pub const AgentState = struct {
         };
     }
 
+    pub fn getErrorMessage(self: *const AgentState) ?[]const u8 {
+        const msg = self.error_message.slice();
+        return if (msg.len > 0) msg else null;
+    }
+
     pub fn deinit(self: *AgentState) void {
         for (self.messages.items) |*msg| {
             msg.deinit(self.allocator);
         }
         self.messages.deinit(self.allocator);
         if (self.system_prompt.len > 0) self.allocator.free(self.system_prompt);
-        if (self.error_message) |e| self.allocator.free(e);
+        self.error_message.deinit(self.allocator);
         // Note: doesn't own model or tools
         self.pending_tool_calls.deinit();
     }

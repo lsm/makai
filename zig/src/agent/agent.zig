@@ -624,7 +624,8 @@ pub const Agent = struct {
         self._state.is_streaming = false;
         self._state.stream_message = null;
         self._state.pending_tool_calls.clearRetainingCapacity();
-        self._state.error_message = null;
+        self._state.error_message.deinit(self._allocator);
+        self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
     }
 
     // === Internal ===
@@ -649,7 +650,8 @@ pub const Agent = struct {
         self._cancel_token = .{ .cancelled = &cancelled };
         self._state.is_streaming = true;
         self._state.stream_message = null;
-        self._state.error_message = null;
+        self._state.error_message.deinit(self._allocator);
+        self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
 
         // Set skip flag for this run (stored in agent, not global)
         self._skip_initial_steering_poll = options.skip_initial_steering_poll;
@@ -725,7 +727,8 @@ pub const Agent = struct {
                 },
                 .turn_end => |e| {
                     if (e.message.getErrorMessage()) |err| {
-                        self._state.error_message = try self._allocator.dupe(u8, err);
+                        self._state.error_message.deinit(self._allocator);
+                        self._state.error_message = types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, err));
                     }
                 },
                 .agent_end => {
