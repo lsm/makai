@@ -34,6 +34,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const owned_slice_mod = b.createModule(.{
+        .root_source_file = b.path("src/owned_slice.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const string_builder_mod = b.createModule(.{
+        .root_source_file = b.path("src/string_builder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const hive_array_mod = b.createModule(.{
+        .root_source_file = b.path("src/hive_array.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const streaming_json_mod = b.createModule(.{
         .root_source_file = b.path("src/streaming_json.zig"),
         .target = target,
@@ -441,6 +459,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -452,6 +471,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -468,6 +488,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // Tests
+    const owned_slice_test = b.addTest(.{ .root_module = owned_slice_mod });
+    const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
+    const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
+
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
     const streaming_json_test = b.addTest(.{ .root_module = streaming_json_mod });
@@ -732,6 +756,9 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
+    test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
+    test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
@@ -778,6 +805,9 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(ai_types_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(tool_call_tracker_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(string_builder_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
 
     const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
