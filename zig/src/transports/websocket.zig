@@ -59,7 +59,7 @@ pub const WebSocketClient = struct {
         url: []const u8,
         headers: ?[]const ai_types.HeaderPair,
     ) !void {
-        if (self.state != .disconnected and self.state != .closed) {
+        if (!canInitiateConnect(self.state)) {
             return error.AlreadyConnected;
         }
 
@@ -338,6 +338,10 @@ fn pushChunkOrFail(stream: *transport.ByteStream, chunk: transport.ByteChunk, al
 }
 
 // --- Internal types ---
+
+fn canInitiateConnect(state: WebSocketClient.ConnectionState) bool {
+    return state == .disconnected or state == .closed;
+}
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -810,16 +814,12 @@ test "websocket producer backpressure completes stream with error" {
     try std.testing.expectEqualStrings("Stream queue full", stream.getError().?);
 }
 
-test "WebSocketClient connect allows closed state" {
-    const allocator = std.testing.allocator;
-
-    var client = WebSocketClient.init(allocator);
-    defer client.deinit();
-
-    client.state = .closed;
-
-    // Should attempt URL parsing instead of failing precondition.
-    try std.testing.expectError(error.InvalidUrl, client.connect("not-a-websocket-url", null));
+test "WebSocketClient connect precondition allows disconnected/closed" {
+    try std.testing.expect(canInitiateConnect(.disconnected));
+    try std.testing.expect(canInitiateConnect(.closed));
+    try std.testing.expect(!canInitiateConnect(.connecting));
+    try std.testing.expect(!canInitiateConnect(.connected));
+    try std.testing.expect(!canInitiateConnect(.closing));
 }
 
 test "WebSocketClient close is idempotent" {
