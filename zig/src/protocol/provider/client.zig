@@ -27,6 +27,11 @@ pub const ProtocolClient = struct {
         request_timeout_ms: u64 = 30_000,
     };
 
+    pub const StreamRequestRef = struct {
+        stream_id: protocol_types.Uuid,
+        message_id: protocol_types.Uuid,
+    };
+
     const Self = @This();
 
     // Fields
@@ -55,6 +60,9 @@ pub const ProtocolClient = struct {
 
     /// Per-stream completion flags
     stream_complete_flags: std.AutoHashMap(protocol_types.Uuid, bool),
+
+    /// Per-stream event streams (owned events)
+    stream_event_streams: std.AutoHashMap(protocol_types.Uuid, *event_stream.AssistantMessageEventStream),
 
     /// Current stream ID (compatibility for legacy single-stream callers)
     current_stream_id: ?protocol_types.Uuid = null,
@@ -94,6 +102,7 @@ pub const ProtocolClient = struct {
             .stream_results = std.AutoHashMap(protocol_types.Uuid, ai_types.AssistantMessage).init(allocator),
             .stream_errors = std.AutoHashMap(protocol_types.Uuid, OwnedSlice(u8)).init(allocator),
             .stream_complete_flags = std.AutoHashMap(protocol_types.Uuid, bool).init(allocator),
+            .stream_event_streams = std.AutoHashMap(protocol_types.Uuid, *event_stream.AssistantMessageEventStream).init(allocator),
             .event_stream = es,
             .options = options,
         };
@@ -112,6 +121,14 @@ pub const ProtocolClient = struct {
             entry.value_ptr.deinit();
         }
         self.reconstructors.deinit();
+
+        // Clean up per-stream event streams
+        var ses_it = self.stream_event_streams.iterator();
+        while (ses_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.stream_event_streams.deinit();
 
         // Clean up per-stream results
         var result_it = self.stream_results.iterator();
@@ -173,6 +190,15 @@ pub const ProtocolClient = struct {
         return self.reconstructors.getPtr(stream_id).?;
     }
 
+    fn ensureStreamEventStream(self: *Self, stream_id: protocol_types.Uuid) !*event_stream.AssistantMessageEventStream {
+        if (self.stream_event_streams.get(stream_id)) |es| return es;
+        const es = oom.unreachableOnOom(self.allocator.create(event_stream.AssistantMessageEventStream));
+        es.* = event_stream.AssistantMessageEventStream.init(self.allocator);
+        es.owns_events = true;
+        try self.stream_event_streams.put(stream_id, es);
+        return es;
+    }
+
     fn setStreamError(self: *Self, stream_id: protocol_types.Uuid, msg: []const u8) !void {
         if (self.stream_errors.getPtr(stream_id)) |existing| {
             existing.deinit(self.allocator);
@@ -181,6 +207,9 @@ pub const ProtocolClient = struct {
             try self.stream_errors.put(stream_id, OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg)));
         }
         try self.stream_complete_flags.put(stream_id, true);
+
+        const ses = try self.ensureStreamEventStream(stream_id);
+        ses.completeWithError(msg);
     }
 
     fn setStreamResult(self: *Self, stream_id: protocol_types.Uuid, result: ai_types.AssistantMessage) !void {
@@ -191,15 +220,18 @@ pub const ProtocolClient = struct {
             try self.stream_results.put(stream_id, result);
         }
         try self.stream_complete_flags.put(stream_id, true);
+
+        const ses = try self.ensureStreamEventStream(stream_id);
+        ses.complete(try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(stream_id).?));
     }
 
-    /// Send stream_request, returns message_id for correlation
-    pub fn sendStreamRequest(
+    /// Start a new stream and return both stream_id and message_id.
+    pub fn startStream(
         self: *Self,
         model: ai_types.Model,
         context: ai_types.Context,
         options: ?ai_types.StreamOptions,
-    ) !protocol_types.Uuid {
+    ) !StreamRequestRef {
         if (self.sender == null) {
             return error.NoSender;
         }
@@ -241,8 +273,20 @@ pub const ProtocolClient = struct {
         });
         try self.stream_complete_flags.put(stream_id, false);
         _ = try self.ensureReconstructor(stream_id);
+        _ = try self.ensureStreamEventStream(stream_id);
 
-        return message_id;
+        return .{ .stream_id = stream_id, .message_id = message_id };
+    }
+
+    /// Send stream_request, returns message_id for correlation (legacy API).
+    pub fn sendStreamRequest(
+        self: *Self,
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ?ai_types.StreamOptions,
+    ) !protocol_types.Uuid {
+        const req = try self.startStream(model, context, options);
+        return req.message_id;
     }
 
     /// Send abort_request for current stream (legacy convenience method)
@@ -315,8 +359,13 @@ pub const ProtocolClient = struct {
                 // the original event's strings
                 const owned_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, evt);
 
-                // Push to event stream for polling
+                // Push to global event stream for polling
                 try self.event_stream.push(owned_evt);
+
+                // Push to per-stream event stream
+                const stream_es = try self.ensureStreamEventStream(env.stream_id);
+                const per_stream_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, owned_evt);
+                try stream_es.push(per_stream_evt);
 
                 // Process through legacy reconstructor for compatibility
                 try self.reconstructor.processEvent(owned_evt);
@@ -372,9 +421,14 @@ pub const ProtocolClient = struct {
         }
     }
 
-    /// Get the event stream for consuming events
+    /// Get the global event stream for consuming interleaved events
     pub fn getEventStream(self: *Self) *event_stream.AssistantMessageEventStream {
         return self.event_stream;
+    }
+
+    /// Get a per-stream event stream if it exists
+    pub fn getEventStreamFor(self: *Self, stream_id: protocol_types.Uuid) ?*event_stream.AssistantMessageEventStream {
+        return self.stream_event_streams.get(stream_id);
     }
 
     /// Get last result for current stream (legacy convenience)
@@ -436,6 +490,13 @@ pub const ProtocolClient = struct {
         var err_it = self.stream_errors.iterator();
         while (err_it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.stream_errors.clearRetainingCapacity();
+
+        var ses_it = self.stream_event_streams.iterator();
+        while (ses_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.stream_event_streams.clearRetainingCapacity();
 
         self.current_stream_id = null;
         self.stream_complete = false;
@@ -556,6 +617,116 @@ test "sendStreamRequest creates valid envelope" {
     try std.testing.expect(env.payload == .stream_request);
     try std.testing.expectEqualStrings("gpt-4", env.payload.stream_request.model.id);
     try std.testing.expectEqualSlices(u8, &message_id, &env.message_id);
+}
+
+test "startStream uses per-stream sequence numbers" {
+    const allocator = std.testing.allocator;
+
+    var writes = std.ArrayList([]u8){};
+    defer {
+        for (writes.items) |line| allocator.free(line);
+        writes.deinit(allocator);
+    }
+
+    const MockSender = struct {
+        writes: *std.ArrayList([]u8),
+
+        fn writeFn(ctx: *anyopaque, data: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
+        }
+
+        fn flushFn(_: *anyopaque) !void {}
+    };
+
+    var mock = MockSender{ .writes = &writes };
+    const sender = transport.AsyncSender{
+        .context = @ptrCast(&mock),
+        .write_fn = MockSender.writeFn,
+        .flush_fn = MockSender.flushFn,
+    };
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+    client.setSender(sender);
+
+    const model = ai_types.Model{
+        .id = "gpt-4",
+        .name = "GPT-4",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const context = ai_types.Context{ .messages = &.{} };
+
+    const r1 = try client.startStream(model, context, null);
+    const r2 = try client.startStream(model, context, null);
+    try std.testing.expect(!std.mem.eql(u8, &r1.stream_id, &r2.stream_id));
+
+    try std.testing.expectEqual(@as(usize, 2), writes.items.len);
+
+    var env1 = try envelope.deserializeEnvelope(writes.items[0], allocator);
+    defer env1.deinit(allocator);
+    var env2 = try envelope.deserializeEnvelope(writes.items[1], allocator);
+    defer env2.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 1), env1.sequence);
+    try std.testing.expectEqual(@as(u64, 1), env2.sequence);
+}
+
+test "processEnvelope routes events to per-stream event stream" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const sid1 = protocol_types.generateUuid();
+    const sid2 = protocol_types.generateUuid();
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    var env1 = protocol_types.Envelope{
+        .stream_id = sid1,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .event = .{ .start = .{ .partial = partial } } },
+    };
+    defer env1.deinit(allocator);
+
+    var env2 = protocol_types.Envelope{
+        .stream_id = sid2,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .event = .{ .start = .{ .partial = partial } } },
+    };
+    defer env2.deinit(allocator);
+
+    try client.processEnvelope(env1);
+    try client.processEnvelope(env2);
+
+    const s1 = client.getEventStreamFor(sid1).?;
+    const s2 = client.getEventStreamFor(sid2).?;
+
+    const e1 = s1.poll();
+    const e2 = s2.poll();
+    try std.testing.expect(e1 != null and e1.? == .start);
+    try std.testing.expect(e2 != null and e2.? == .start);
 }
 
 test "processEnvelope handles ack" {
