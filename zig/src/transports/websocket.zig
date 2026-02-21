@@ -746,6 +746,36 @@ test "decodeFrame preserves fragmentation flags" {
     try std.testing.expect(r2.frame.fin);
 }
 
+test "decodeFrame preserves interleaved logical stream ordering" {
+    const allocator = std.testing.allocator;
+
+    const a = Frame{ .opcode = .text, .payload = "s1:a", .fin = true, .masked = false };
+    const b = Frame{ .opcode = .text, .payload = "s2:b", .fin = true, .masked = false };
+    const c = Frame{ .opcode = .text, .payload = "s1:c", .fin = true, .masked = false };
+
+    const ea = try encodeFrame(a, allocator);
+    defer allocator.free(ea);
+    const eb = try encodeFrame(b, allocator);
+    defer allocator.free(eb);
+    const ec = try encodeFrame(c, allocator);
+    defer allocator.free(ec);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, ea);
+    try buf.appendSlice(allocator, eb);
+    try buf.appendSlice(allocator, ec);
+
+    var offset: usize = 0;
+    const expected = [_][]const u8{ "s1:a", "s2:b", "s1:c" };
+    for (expected) |want| {
+        const decoded = decodeFrame(buf.items[offset..]).?;
+        try std.testing.expectEqualStrings(want, decoded.frame.payload);
+        offset += decoded.consumed;
+    }
+    try std.testing.expectEqual(offset, buf.items.len);
+}
+
 test "WebSocketClient init and deinit" {
     const allocator = std.testing.allocator;
 

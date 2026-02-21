@@ -23,7 +23,7 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [x] Add websocket malformed-frame rejection tests
 - [x] Add websocket fragmented/partial frame handling tests
 - [x] Add websocket ordering guarantees tests (single stream)
-- [ ] Add websocket multiplex ordering tests (multi stream)
+- [x] Add websocket multiplex ordering tests (multi stream)
 - [ ] Add websocket backpressure behavior tests
 
 ### Batch B — WebSocket Transport Hardening Tests (Phase 2)
