@@ -217,7 +217,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    if (context.system_prompt) |sp| {
+    if (context.getSystemPrompt()) |sp| {
         try w.beginObject();
         const system_role: []const u8 = if (model.reasoning) "developer" else "system";
         try w.writeStringField("role", system_role);
@@ -1740,7 +1740,7 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
         .max_tokens = 16384,
     };
     const context: ai_types.Context = .{
-        .system_prompt = "You are helpful.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
         .messages = &.{},
     };
     const options: ai_types.StreamOptions = .{
@@ -1769,7 +1769,7 @@ test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {
         .max_tokens = 16384,
     };
     const context: ai_types.Context = .{
-        .system_prompt = "You are helpful.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
         .messages = &.{},
     };
     const options: ai_types.StreamOptions = .{
@@ -1797,7 +1797,7 @@ test "buildRequestBody omits juice workaround for non-GPT-5 models" {
         .max_tokens = 16384,
     };
     const context: ai_types.Context = .{
-        .system_prompt = "You are helpful.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
         .messages = &.{},
     };
     const options: ai_types.StreamOptions = .{

@@ -312,7 +312,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
     }
     try w.endArray();
 
-    if (context.system_prompt) |sp| {
+    if (context.getSystemPrompt()) |sp| {
         try w.writeKey("systemInstruction");
         try w.beginObject();
         try w.writeKey("parts");

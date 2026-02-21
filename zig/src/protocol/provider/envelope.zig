@@ -193,7 +193,7 @@ fn serializeContext(
 ) !void {
     try w.beginObject();
 
-    if (context.system_prompt) |prompt| {
+    if (context.getSystemPrompt()) |prompt| {
         try w.writeStringField("system_prompt", prompt);
     }
 
@@ -913,15 +913,22 @@ fn deserializeContext(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !ai_types.Context {
-    const system_prompt = if (obj.get("system_prompt")) |sp|
-        try allocator.dupe(u8, sp.string)
+    var system_prompt = if (obj.get("system_prompt")) |sp|
+        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp.string))
     else
-        null;
+        ai_types.OwnedSlice(u8).initBorrowed("");
+    errdefer system_prompt.deinit(allocator);
 
     const messages_arr = if (obj.get("messages")) |msgs_val|
         msgs_val.array
-    else
-        return ai_types.Context{ .system_prompt = system_prompt, .messages = &.{} };
+    else {
+        const empty_messages = try allocator.alloc(ai_types.Message, 0);
+        return ai_types.Context{
+            .system_prompt = system_prompt,
+            .messages = empty_messages,
+            .owned_strings = true,
+        };
+    };
 
     const messages = try allocator.alloc(ai_types.Message, messages_arr.items.len);
     errdefer allocator.free(messages);
@@ -1315,7 +1322,7 @@ test "serializeEnvelope with stream_request payload" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "You are helpful.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
         .messages = &.{},
     };
 

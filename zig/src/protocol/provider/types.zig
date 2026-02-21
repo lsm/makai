@@ -580,7 +580,7 @@ test "StreamRequest deinit with owned strings frees memory" {
     const messages = try std.testing.allocator.alloc(ai_types.Message, 0);
 
     const context = ai_types.Context{
-        .system_prompt = sys_prompt,
+        .system_prompt = ai_types.OwnedSlice(u8).initOwned(sys_prompt),
         .messages = messages,
         .tools = null,
         .owned_strings = true,
@@ -615,7 +615,7 @@ test "CompleteRequest deinit with owned strings frees memory" {
 
     const messages = try std.testing.allocator.alloc(ai_types.Message, 0);
     const context = ai_types.Context{
-        .system_prompt = null,
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed(""),
         .messages = messages,
         .tools = null,
         .owned_strings = true,
@@ -648,7 +648,7 @@ test "StreamRequest deinit with borrowed strings does not free" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "Be helpful",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("Be helpful"),
         .messages = &.{},
         .tools = null,
         .owned_strings = false, // Borrowed, not owned

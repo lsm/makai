@@ -232,7 +232,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // System prompt as array of content blocks with cache_control
     // For OAuth, prepend Claude Code identity to system prompt
-    if (context.system_prompt) |sp| {
+    if (context.getSystemPrompt()) |sp| {
         try w.writeKey("system");
         try w.beginArray();
 
@@ -1752,7 +1752,7 @@ test "buildRequestBody includes cache_control in system prompt" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "You are a helpful assistant.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are a helpful assistant."),
         .messages = &messages,
     };
 
@@ -1791,7 +1791,7 @@ test "buildRequestBody includes ttl for long retention on anthropic url" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "You are a helpful assistant.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are a helpful assistant."),
         .messages = &messages,
     };
 
@@ -1836,7 +1836,7 @@ test "buildRequestBody serializes tool_result as tool_result content block" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "You are a helpful assistant.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are a helpful assistant."),
         .messages = &messages,
     };
 
@@ -1933,7 +1933,7 @@ test "buildRequestBody adds cache_control to last user message" {
     };
 
     const context = ai_types.Context{
-        .system_prompt = "You are a helpful assistant.",
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are a helpful assistant."),
         .messages = &messages,
     };
 

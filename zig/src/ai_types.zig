@@ -385,21 +385,23 @@ pub const Tool = struct {
 };
 
 pub const Context = struct {
-    system_prompt: ?[]const u8 = null,
+    system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     messages: []const Message,
     tools: ?[]const Tool = null,
     /// If true, arrays and strings are owned and will be freed in deinit
     owned_strings: bool = false,
 
-    /// Free all owned memory. Only frees if owned_strings is true
+    pub fn getSystemPrompt(self: *const Context) ?[]const u8 {
+        const prompt = self.system_prompt.slice();
+        return if (prompt.len > 0) prompt else null;
+    }
+
+    /// Free all owned memory. Only frees arrays/collections if owned_strings is true
     /// (set by deserializer or when explicitly allocating).
     pub fn deinit(self: *Context, allocator: std.mem.Allocator) void {
+        self.system_prompt.deinit(allocator);
         if (!self.owned_strings) return;
 
-        // Free system_prompt if present
-        if (self.system_prompt) |prompt| {
-            allocator.free(prompt);
-        }
         // Free messages array and contents
         // Cast to mutable since we're freeing owned memory
         const mut_messages: []Message = @constCast(self.messages);
@@ -774,11 +776,11 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
 /// Deep clone a Context. Caller owns the returned context and must call deinit().
 pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
     // Clone system_prompt
-    const system_prompt = if (ctx.system_prompt) |sp|
-        try allocator.dupe(u8, sp)
+    var system_prompt = if (ctx.getSystemPrompt()) |sp|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, sp))
     else
-        null;
-    errdefer if (system_prompt) |sp| allocator.free(sp);
+        OwnedSlice(u8).initBorrowed("");
+    errdefer system_prompt.deinit(allocator);
 
     // Clone messages
     const messages = try allocator.alloc(Message, ctx.messages.len);
@@ -872,6 +874,18 @@ pub fn cloneModel(allocator: std.mem.Allocator, model: Model) !Model {
         .compat = model.compat,
         .owned_strings = true,
     };
+}
+
+test "Context deinit frees owned system_prompt even with borrowed messages" {
+    const allocator = std.testing.allocator;
+
+    var ctx = Context{
+        .system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "be concise")),
+        .messages = &.{},
+        .owned_strings = false,
+    };
+
+    ctx.deinit(allocator);
 }
 
 test "cloneAssistantMessage deep copies text content" {

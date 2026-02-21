@@ -211,7 +211,7 @@ fn writeMessagesArray(
     var tool_call_ids = collectToolCallIds(allocator, context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    if (context.system_prompt) |sp| {
+    if (context.getSystemPrompt()) |sp| {
         try writer.beginObject();
         // Use developer role for reasoning models on providers that support it
         const use_developer = model.reasoning and merged.supports_developer_role;

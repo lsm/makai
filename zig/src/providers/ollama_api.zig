@@ -142,7 +142,7 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
     try w.writeKey("messages");
     try w.beginArray();
 
-    if (tx_context.system_prompt) |sp| {
+    if (tx_context.getSystemPrompt()) |sp| {
         try w.beginObject();
         try w.writeStringField("role", "system");
         // Sanitize system prompt to remove unpaired surrogates
@@ -1280,7 +1280,7 @@ test "buildBody includes model stream options and messages" {
         .timestamp = 1,
     } };
 
-    const ctx = ai_types.Context{ .system_prompt = "be concise", .messages = &[_]ai_types.Message{msg} };
+    const ctx = ai_types.Context{ .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("be concise"), .messages = &[_]ai_types.Message{msg} };
 
     const body = try buildBody(model, ctx, .{ .temperature = 0.2, .max_tokens = 12 }, std.testing.allocator);
     defer std.testing.allocator.free(body);

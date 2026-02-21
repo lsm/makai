@@ -337,7 +337,7 @@ fn streamAssistantResponse(
 
     // Build LLM context
     const llm_context = ai_types.Context{
-        .system_prompt = context.getSystemPrompt(),
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed(context.getSystemPrompt() orelse ""),
         .messages = messages,
         .tools = tools,
         .owned_strings = false,

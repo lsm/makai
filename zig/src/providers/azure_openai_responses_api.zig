@@ -74,7 +74,7 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
 
     try w.writeKey("input");
     try w.beginArray();
-    if (context.system_prompt) |sp| {
+    if (context.getSystemPrompt()) |sp| {
         try w.beginObject();
         try w.writeStringField("role", "system");
         try w.writeStringField("content", sp);
