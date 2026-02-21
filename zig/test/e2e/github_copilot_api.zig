@@ -119,7 +119,7 @@ test "github_copilot e2e: streaming events sequence" {
     var saw_text_delta = false;
     var text_len: usize = 0;
 
-    while (!stream.isDone()) {
+    while (true) {
         if (stream.poll()) |event| {
             switch (event) {
                 .start => saw_start = true,
@@ -129,8 +129,10 @@ test "github_copilot e2e: streaming events sequence" {
                 },
                 else => {},
             }
+        } else {
+            if (stream.isDone()) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
 
     // Allow detached provider thread to complete deferred cleanup
