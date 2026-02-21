@@ -1,7 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
-const types = @import("types.zig");
+const types = @import("agent_types");
 
 // Re-export types needed by callers
 pub const AgentEvent = types.AgentEvent;
@@ -157,7 +157,7 @@ fn skipToolCall(
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
     has_steering: bool,
-    steering_messages: ?[]ai_types.Message,
+    steering_messages: ?[]const ai_types.Message,
 
     fn deinit(self: *ToolExecutionResult, allocator: std.mem.Allocator) void {
         for (self.tool_results) |*result| {
@@ -191,7 +191,7 @@ fn executeToolCalls(
 
     var results: std.ArrayList(ai_types.ToolResultMessage) = .{};
     var has_steering = false;
-    var steering_messages: ?[]ai_types.Message = null;
+    var steering_messages: ?[]const ai_types.Message = null;
 
     for (tool_calls.items, 0..) |tool_call, index| {
         // Find tool
@@ -240,9 +240,10 @@ fn executeToolCalls(
                 &update_ctx,
                 onToolUpdate,
                 allocator,
-            ) catch |err| {
+            ) catch |err| blk: {
                 result = try createErrorResult(allocator, err);
                 is_error = true;
+                break :blk result;
             };
         } else {
             result = try createErrorResult(allocator, error.ToolNotFound);
@@ -313,7 +314,7 @@ fn streamAssistantResponse(
 
     // Convert to LLM-compatible messages if configured
     var llm_messages: ?[]const ai_types.Message = null;
-    defer if (llm_messages) |lm| allocator.free(llm_messages);
+    defer if (llm_messages) |_| allocator.free(llm_messages.?);
 
     if (config.convert_to_llm_fn) |convert| {
         llm_messages = try convert(config.convert_to_llm_ctx, messages, allocator);
@@ -368,22 +369,57 @@ fn streamAssistantResponse(
                 } });
                 message_started = true;
             },
-            .text_start, .text_delta, .text_end, .thinking_start, .thinking_delta, .thinking_end, .toolcall_start, .toolcall_delta, .toolcall_end => |evt| {
-                // Forward as message_update
-                const partial_msg = switch (provider_event) {
-                    .text_start => evt.partial,
-                    .text_delta => evt.partial,
-                    .text_end => evt.partial,
-                    .thinking_start => evt.partial,
-                    .thinking_delta => evt.partial,
-                    .thinking_end => evt.partial,
-                    .toolcall_start => evt.partial,
-                    .toolcall_delta => evt.partial,
-                    .toolcall_end => evt.partial,
-                    else => unreachable,
-                };
+            .text_start => |evt| {
                 try event_stream.push(.{ .message_update = .{
-                    .message = partial_msg,
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .text_delta => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .text_end => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .thinking_start => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .thinking_delta => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .thinking_end => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .toolcall_start => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .toolcall_delta => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
+                    .event = provider_event,
+                } });
+            },
+            .toolcall_end => |evt| {
+                try event_stream.push(.{ .message_update = .{
+                    .message = evt.partial,
                     .event = provider_event,
                 } });
             },
@@ -480,7 +516,7 @@ fn runLoop(
         // Inner loop: process tool calls and steering
         while (state.iterations < max_iterations) {
             // Check for steering messages
-            var steering_messages: ?[]ai_types.Message = null;
+            var steering_messages: ?[]const ai_types.Message = null;
             if (config.get_steering_messages_fn) |get_steering| {
                 steering_messages = try get_steering(config.get_steering_messages_ctx, allocator);
             }

@@ -483,7 +483,7 @@ pub const AgentMessage = union(enum) {
                 .assistant => |a| a.timestamp,
                 .tool_result => |t| t.timestamp,
             },
-            .custom => |c| c.timestamp,
+            .custom => |c| c.custom.timestamp,
         };
     }
 
@@ -523,9 +523,11 @@ test "AgentContext appendMessage" {
     var context = AgentContext.init(std.testing.allocator);
     defer context.deinit();
 
+    // Create a message with owned strings
+    const text = try std.testing.allocator.dupe(u8, "Hello");
     const msg = ai_types.Message{
         .user = .{
-            .content = .{ .text = "Hello" },
+            .content = .{ .text = text },
             .timestamp = std.time.milliTimestamp(),
         },
     };
@@ -666,15 +668,19 @@ test "AgentMessage fromLlm" {
 }
 
 test "AgentMessage custom message" {
+    // Create with owned strings
+    const msg_type = try std.testing.allocator.dupe(u8, "notification");
+    const payload = try std.testing.allocator.dupe(u8, "{\"text\": \"Test notification\"}");
+
     var custom = CustomAgentMessage{ .custom = .{
-        .type = "notification",
-        .payload = "{\"text\": \"Test notification\"}",
+        .type = msg_type,
+        .payload = payload,
         .timestamp = 12345,
     } };
     defer custom.deinit(std.testing.allocator);
 
-    // Note: This would require owned strings to work properly with deinit
-    // For testing purposes, we're just checking the structure
+    try std.testing.expectEqualStrings("notification", custom.custom.type);
+    try std.testing.expectEqualStrings("{\"text\": \"Test notification\"}", custom.custom.payload);
 }
 
 test "AgentMessage fromAssistant" {
