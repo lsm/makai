@@ -807,9 +807,15 @@ fn cloneUserContent(content: UserContent, allocator: std.mem.Allocator) !UserCon
         .text => |t| .{ .text = try allocator.dupe(u8, t) },
         .parts => |parts| blk: {
             const cloned_parts = try allocator.alloc(UserContentPart, parts.len);
-            errdefer allocator.free(cloned_parts);
+            var initialized: usize = 0;
+            errdefer {
+                for (cloned_parts[0..initialized]) |*part| part.deinit(allocator);
+                allocator.free(cloned_parts);
+            }
+
             for (parts, 0..) |part, i| {
                 cloned_parts[i] = try cloneUserContentPart(allocator, part);
+                initialized += 1;
             }
             break :blk .{ .parts = cloned_parts };
         },
@@ -819,33 +825,62 @@ fn cloneUserContent(content: UserContent, allocator: std.mem.Allocator) !UserCon
 /// Deep clone UserContentPart.
 fn cloneUserContentPart(allocator: std.mem.Allocator, part: UserContentPart) !UserContentPart {
     return switch (part) {
-        .text => |t| .{ .text = .{
-            .text = try allocator.dupe(u8, t.text),
-            .text_signature = if (t.text_signature) |sig| try allocator.dupe(u8, sig) else null,
-        } },
-        .image => |img| .{ .image = .{
-            .data = try allocator.dupe(u8, img.data),
-            .mime_type = try allocator.dupe(u8, img.mime_type),
-        } },
+        .text => |t| blk: {
+            const text = try allocator.dupe(u8, t.text);
+            errdefer allocator.free(text);
+            const text_signature = if (t.text_signature) |sig|
+                try allocator.dupe(u8, sig)
+            else
+                null;
+            errdefer if (text_signature) |sig| allocator.free(sig);
+
+            break :blk .{ .text = .{
+                .text = text,
+                .text_signature = text_signature,
+            } };
+        },
+        .image => |img| blk: {
+            const data = try allocator.dupe(u8, img.data);
+            errdefer allocator.free(data);
+            const mime_type = try allocator.dupe(u8, img.mime_type);
+            errdefer allocator.free(mime_type);
+
+            break :blk .{ .image = .{
+                .data = data,
+                .mime_type = mime_type,
+            } };
+        },
     };
 }
 
 /// Deep clone ToolResultMessage.
 fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !ToolResultMessage {
     const cloned_content = try allocator.alloc(UserContentPart, tr.content.len);
-    errdefer allocator.free(cloned_content);
-    for (tr.content, 0..) |part, i| {
-        cloned_content[i] = try cloneUserContentPart(allocator, part);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned_content[0..initialized]) |*part| part.deinit(allocator);
+        allocator.free(cloned_content);
     }
 
-    const details_json = if (tr.getDetailsJson()) |dj|
+    for (tr.content, 0..) |part, i| {
+        cloned_content[i] = try cloneUserContentPart(allocator, part);
+        initialized += 1;
+    }
+
+    var details_json = if (tr.getDetailsJson()) |dj|
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, dj))
     else
         OwnedSlice(u8).initBorrowed("");
+    errdefer details_json.deinit(allocator);
+
+    const tool_call_id = try allocator.dupe(u8, tr.tool_call_id);
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, tr.tool_name);
+    errdefer allocator.free(tool_name);
 
     return .{
-        .tool_call_id = try allocator.dupe(u8, tr.tool_call_id),
-        .tool_name = try allocator.dupe(u8, tr.tool_name),
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
         .content = cloned_content,
         .details_json = details_json,
         .is_error = tr.is_error,
@@ -864,30 +899,45 @@ pub fn cloneContext(allocator: std.mem.Allocator, ctx: Context) !Context {
 
     // Clone messages
     const messages = try allocator.alloc(Message, ctx.messages.len);
-    errdefer allocator.free(messages);
+    var initialized_messages: usize = 0;
+    errdefer {
+        for (messages[0..initialized_messages]) |*m| m.deinit(allocator);
+        allocator.free(messages);
+    }
+
     for (ctx.messages, 0..) |msg, i| {
-        // Use errdefer to clean up already-cloned messages on error
-        errdefer for (messages[0..i]) |*m| m.deinit(allocator);
         messages[i] = try cloneMessage(allocator, msg);
+        initialized_messages += 1;
     }
 
     // Clone tools
     var tools: ?[]Tool = null;
     if (ctx.tools) |t| {
-        tools = try allocator.alloc(Tool, t.len);
-        errdefer if (tools) |ts| allocator.free(ts);
-        for (t, 0..) |tool, i| {
-            tools.?[i] = .{
-                .name = try allocator.dupe(u8, tool.name),
-                .description = try allocator.dupe(u8, tool.description),
-                .parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json),
-            };
+        const owned_tools = try allocator.alloc(Tool, t.len);
+        var initialized_tools: usize = 0;
+        errdefer {
+            for (owned_tools[0..initialized_tools]) |*tool| tool.deinit(allocator);
+            allocator.free(owned_tools);
         }
+
+        for (t, 0..) |tool, i| {
+            const name = try allocator.dupe(u8, tool.name);
+            errdefer allocator.free(name);
+            const description = try allocator.dupe(u8, tool.description);
+            errdefer allocator.free(description);
+            const parameters_schema_json = try allocator.dupe(u8, tool.parameters_schema_json);
+            errdefer allocator.free(parameters_schema_json);
+
+            owned_tools[i] = .{
+                .name = name,
+                .description = description,
+                .parameters_schema_json = parameters_schema_json,
+            };
+            initialized_tools += 1;
+        }
+
+        tools = owned_tools;
     }
-    errdefer if (tools) |ts| {
-        for (ts) |*tool| tool.deinit(allocator);
-        allocator.free(ts);
-    };
 
     return .{
         .system_prompt = system_prompt,
