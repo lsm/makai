@@ -340,7 +340,7 @@ fn serializeStreamOptions(
 ) !void {
     try w.beginObject();
 
-    if (opts.api_key) |key| {
+    if (opts.getApiKey()) |key| {
         try w.writeStringField("api_key", key);
     }
     if (opts.temperature) |temp| {
@@ -353,7 +353,7 @@ fn serializeStreamOptions(
     if (opts.cache_retention) |ret| {
         try w.writeStringField("cache_retention", @tagName(ret));
     }
-    if (opts.session_id) |sid| {
+    if (opts.getSessionId()) |sid| {
         try w.writeStringField("session_id", sid);
     }
     if (opts.thinking_enabled) {
@@ -362,13 +362,13 @@ fn serializeStreamOptions(
     if (opts.thinking_budget_tokens) |budget| {
         try w.writeIntField("thinking_budget_tokens", budget);
     }
-    if (opts.thinking_effort) |effort| {
+    if (opts.getThinkingEffort()) |effort| {
         try w.writeStringField("thinking_effort", effort);
     }
-    if (opts.reasoning_effort) |effort| {
+    if (opts.getReasoningEffort()) |effort| {
         try w.writeStringField("reasoning_effort", effort);
     }
-    if (opts.reasoning_summary) |summary| {
+    if (opts.getReasoningSummary()) |summary| {
         try w.writeStringField("reasoning_summary", summary);
     }
     if (opts.include_reasoning_encrypted) {
@@ -1086,7 +1086,7 @@ fn deserializeStreamOptions(
     };
 
     if (obj.get("api_key")) |key| {
-        opts.api_key = try allocator.dupe(u8, key.string);
+        opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key.string));
     }
     if (obj.get("temperature")) |temp| {
         opts.temperature = switch (temp) {
@@ -1102,7 +1102,7 @@ fn deserializeStreamOptions(
         opts.cache_retention = parseCacheRetention(ret.string);
     }
     if (obj.get("session_id")) |sid| {
-        opts.session_id = try allocator.dupe(u8, sid.string);
+        opts.session_id = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, sid.string));
     }
     if (obj.get("thinking_enabled")) |te| {
         opts.thinking_enabled = te.bool;
@@ -1111,13 +1111,13 @@ fn deserializeStreamOptions(
         opts.thinking_budget_tokens = @intCast(tbt.integer);
     }
     if (obj.get("thinking_effort")) |effort| {
-        opts.thinking_effort = try allocator.dupe(u8, effort.string);
+        opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
     }
     if (obj.get("reasoning_effort")) |effort| {
-        opts.reasoning_effort = try allocator.dupe(u8, effort.string);
+        opts.reasoning_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
     }
     if (obj.get("reasoning_summary")) |summary| {
-        opts.reasoning_summary = try allocator.dupe(u8, summary.string);
+        opts.reasoning_summary = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, summary.string));
     }
     if (obj.get("include_reasoning_encrypted")) |ire| {
         opts.include_reasoning_encrypted = ire.bool;

@@ -667,7 +667,7 @@ fn buildRequestBody(
         try w.writeFloat(t);
     }
     // Add reasoning_effort for providers that support it
-    if (options.reasoning_effort) |effort| {
+    if (options.getReasoningEffort()) |effort| {
         if (model.reasoning and merged.supports_reasoning_effort) {
             try w.writeStringField("reasoning_effort", effort);
         }
@@ -871,10 +871,7 @@ fn parseChunk(
 
         if (ch.object.get("finish_reason")) |fr| {
             if (fr == .string) {
-                if (std.mem.eql(u8, fr.string, "length")) stop_reason.* = .length
-                else if (std.mem.eql(u8, fr.string, "tool_calls")) stop_reason.* = .tool_use
-                else if (std.mem.eql(u8, fr.string, "content_filter")) stop_reason.* = .@"error"
-                else stop_reason.* = .stop;
+                if (std.mem.eql(u8, fr.string, "length")) stop_reason.* = .length else if (std.mem.eql(u8, fr.string, "tool_calls")) stop_reason.* = .tool_use else if (std.mem.eql(u8, fr.string, "content_filter")) stop_reason.* = .@"error" else stop_reason.* = .stop;
             }
         }
 
@@ -1606,50 +1603,56 @@ fn runThread(ctx: *ThreadCtx) void {
     var idx: usize = 0;
 
     if (has_thinking) {
-        content[idx] = .{ .thinking = .{
-            .thinking = allocator.dupe(u8, thinking.items) catch {
-                allocator.free(content);
-                ctx.deinit();
-                stream.markThreadDone();
-                stream.completeWithError("oom building thinking");
-                return;
-            },
-            .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
-                // Free previously allocated content
-                for (content[0..idx]) |*block| {
-                    switch (block.*) {
-                        .thinking => |t| allocator.free(t.thinking),
-                        else => {},
+        content[idx] = .{
+            .thinking = .{
+                .thinking = allocator.dupe(u8, thinking.items) catch {
+                    allocator.free(content);
+                    ctx.deinit();
+                    stream.markThreadDone();
+                    stream.completeWithError("oom building thinking");
+                    return;
+                },
+                .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
+                    // Free previously allocated content
+                    for (content[0..idx]) |*block| {
+                        switch (block.*) {
+                            .thinking => |t| allocator.free(t.thinking),
+                            else => {},
+                        }
                     }
-                }
-                allocator.free(content);
-                ctx.deinit();
-                stream.markThreadDone();
-                stream.completeWithError("oom building signature");
-                return;
-            } else null,
-        } };
+                    allocator.free(content);
+                    ctx.deinit();
+                    stream.markThreadDone();
+                    stream.completeWithError("oom building signature");
+                    return;
+                } else null,
+            },
+        };
         idx += 1;
     }
 
     if (has_text) {
-        content[idx] = .{ .text = .{ .text = allocator.dupe(u8, text.items) catch {
-            // Free previously allocated content
-            for (content[0..idx]) |*block| {
-                switch (block.*) {
-                    .thinking => |t| {
-                        allocator.free(t.thinking);
-                        if (t.thinking_signature) |sig| allocator.free(sig);
-                    },
-                    else => {},
-                }
-            }
-            allocator.free(content);
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom building text");
-            return;
-        } } };
+        content[idx] = .{
+            .text = .{
+                .text = allocator.dupe(u8, text.items) catch {
+                    // Free previously allocated content
+                    for (content[0..idx]) |*block| {
+                        switch (block.*) {
+                            .thinking => |t| {
+                                allocator.free(t.thinking);
+                                if (t.thinking_signature) |sig| allocator.free(sig);
+                            },
+                            else => {},
+                        }
+                    }
+                    allocator.free(content);
+                    ctx.deinit();
+                    stream.markThreadDone();
+                    stream.completeWithError("oom building text");
+                    return;
+                },
+            },
+        };
         idx += 1;
     }
 
@@ -1714,7 +1717,7 @@ pub fn streamOpenAICompletions(
 
     var key_owned: ?[]const u8 = null;
     const api_key = blk: {
-        if (resolved.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (resolved.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         key_owned = envApiKey(allocator);
         if (key_owned) |k| break :blk k;
         return error.MissingApiKey;
@@ -1794,15 +1797,15 @@ pub fn streamSimpleOpenAICompletions(
     return streamOpenAICompletions(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
-        .reasoning_effort = if (o.reasoning) |r| thinkingLevelToString(r) else null,
+        .reasoning_effort = if (o.reasoning) |r| ai_types.OwnedSlice(u8).initBorrowed(thinkingLevelToString(r)) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
 }
 

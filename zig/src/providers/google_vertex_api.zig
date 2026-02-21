@@ -382,7 +382,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         try w.beginObject();
         try w.writeBoolField("includeThoughts", true);
 
-        if (options.thinking_effort) |effort| {
+        if (options.getThinkingEffort()) |effort| {
             try w.writeStringField("thinkingLevel", effort);
         } else if (options.thinking_budget_tokens) |budget| {
             try w.writeIntField("thinkingBudget", budget);
@@ -1296,7 +1296,7 @@ pub fn streamGoogleVertex(
 
     // Resolve API key (required for Vertex AI with API key auth)
     const api_key: []u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
         std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
@@ -1391,9 +1391,9 @@ pub fn streamSimpleGoogleVertex(
     return streamGoogleVertex(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,
@@ -1401,7 +1401,7 @@ pub fn streamSimpleGoogleVertex(
         .on_payload_ctx = o.on_payload_ctx,
         .thinking_enabled = thinking_enabled,
         .thinking_budget_tokens = thinking_budget_tokens,
-        .thinking_effort = thinking_effort,
+        .thinking_effort = if (thinking_effort) |eff| ai_types.OwnedSlice(u8).initBorrowed(eff) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
 }
 

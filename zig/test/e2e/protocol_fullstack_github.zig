@@ -89,8 +89,8 @@ test "Protocol: GitHub Copilot streaming through ProtocolServer and ProtocolClie
 
     // Send stream request using official ProtocolClient API
     const options = ai_types.StreamOptions{
-        .api_key = creds.copilot_token,
-        .session_id = "test-session",
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(creds.copilot_token),
+        .session_id = ai_types.OwnedSlice(u8).initBorrowed("test-session"),
         .max_tokens = 50,
         .temperature = 0.0,
     };
@@ -228,8 +228,8 @@ test "Protocol: GitHub Copilot abort through protocol layer" {
 
     // Send stream request using official ProtocolClient API
     const options = ai_types.StreamOptions{
-        .api_key = creds.copilot_token,
-        .session_id = "test-session",
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(creds.copilot_token),
+        .session_id = ai_types.OwnedSlice(u8).initBorrowed("test-session"),
         .max_tokens = 500,
     };
     _ = try client.sendStreamRequest(model, ctx, options);

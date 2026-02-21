@@ -743,7 +743,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.writeStringField("type", "adaptive");
             try w.endObject();
 
-            if (options.thinking_effort) |effort| {
+            if (options.getThinkingEffort()) |effort| {
                 try w.writeKey("output_config");
                 try w.beginObject();
                 try w.writeStringField("effort", effort);
@@ -1621,7 +1621,7 @@ pub fn streamAnthropicMessages(
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         const env = envApiKey(allocator);
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
@@ -1683,9 +1683,9 @@ pub fn streamSimpleAnthropicMessages(
     return streamAnthropicMessages(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,
@@ -1693,7 +1693,7 @@ pub fn streamSimpleAnthropicMessages(
         .on_payload_ctx = o.on_payload_ctx,
         .thinking_enabled = thinking_enabled,
         .thinking_budget_tokens = thinking_budget_tokens,
-        .thinking_effort = thinking_effort,
+        .thinking_effort = if (thinking_effort) |eff| ai_types.OwnedSlice(u8).initBorrowed(eff) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
 }
 

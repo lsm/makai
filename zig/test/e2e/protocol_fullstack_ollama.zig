@@ -129,7 +129,7 @@ test "Protocol: Ollama streaming through ProtocolServer and ProtocolClient" {
 
     // Send stream request using official ProtocolClient API
     const options = ai_types.StreamOptions{
-        .api_key = api_key,
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(api_key),
         .max_tokens = 50,
         .temperature = 0.0,
     };
@@ -304,7 +304,7 @@ test "Protocol: Ollama abort through protocol layer" {
 
     // Send stream request using official ProtocolClient API
     const options = ai_types.StreamOptions{
-        .api_key = api_key,
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(api_key),
         .max_tokens = 500,
     };
     _ = try client.sendStreamRequest(model, ctx, options);

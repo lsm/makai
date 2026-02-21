@@ -405,7 +405,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
         try w.writeBoolField("includeThoughts", true);
 
         // Gemini 3 uses thinkingLevel, Gemini 2.5 uses thinkingBudget
-        if (options.thinking_effort) |effort| {
+        if (options.getThinkingEffort()) |effort| {
             // Effort was provided directly (string like "LOW", "HIGH", etc.)
             try w.writeStringField("thinkingLevel", effort);
         } else if (options.thinking_budget_tokens) |budget| {
@@ -1374,7 +1374,7 @@ pub fn streamGoogleGenerativeAI(model: ai_types.Model, context: ai_types.Context
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
         return error.MissingApiKey;
@@ -1446,9 +1446,9 @@ pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.C
     return streamGoogleGenerativeAI(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,
@@ -1456,7 +1456,7 @@ pub fn streamSimpleGoogleGenerativeAI(model: ai_types.Model, context: ai_types.C
         .on_payload_ctx = o.on_payload_ctx,
         .thinking_enabled = thinking_enabled,
         .thinking_budget_tokens = thinking_budget_tokens,
-        .thinking_effort = thinking_effort,
+        .thinking_effort = if (thinking_effort) |eff| ai_types.OwnedSlice(u8).initBorrowed(eff) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
 }
 

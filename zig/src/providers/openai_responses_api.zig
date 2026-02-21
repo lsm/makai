@@ -161,12 +161,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     if (model.reasoning) {
         try w.writeKey("reasoning");
         try w.beginObject();
-        if (options.reasoning_effort) |effort| {
+        if (options.getReasoningEffort()) |effort| {
             try w.writeStringField("effort", effort);
         } else {
             try w.writeStringField("effort", "medium"); // default
         }
-        if (options.reasoning_summary) |summary| {
+        if (options.getReasoningSummary()) |summary| {
             try w.writeStringField("summary", summary);
         } else {
             try w.writeStringField("summary", "auto"); // default
@@ -195,7 +195,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Session-based caching
-    if (options.session_id) |sid| {
+    if (options.getSessionId()) |sid| {
         if (options.cache_retention) |retention| {
             if (retention != .none) {
                 try w.writeStringField("prompt_cache_key", sid);
@@ -1325,24 +1325,28 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     if (has_text) {
-        content[idx] = .{ .text = .{ .text = allocator.dupe(u8, text.items) catch {
-            // Free previously allocated content
-            for (content[0..idx]) |*block| {
-                switch (block.*) {
-                    .thinking => |t| allocator.free(t.thinking),
-                    else => {},
-                }
-            }
-            allocator.free(content);
-            allocator.free(auth);
-            allocator.free(url);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom building text");
-            return;
-        } } };
+        content[idx] = .{
+            .text = .{
+                .text = allocator.dupe(u8, text.items) catch {
+                    // Free previously allocated content
+                    for (content[0..idx]) |*block| {
+                        switch (block.*) {
+                            .thinking => |t| allocator.free(t.thinking),
+                            else => {},
+                        }
+                    }
+                    allocator.free(content);
+                    allocator.free(auth);
+                    allocator.free(url);
+                    allocator.free(api_key);
+                    allocator.free(body);
+                    allocator.destroy(ctx);
+                    stream.markThreadDone();
+                    stream.completeWithError("oom building text");
+                    return;
+                },
+            },
+        };
         idx += 1;
     }
 
@@ -1375,7 +1379,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         const env = envApiKey(allocator);
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
@@ -1427,16 +1431,16 @@ pub fn streamSimpleOpenAIResponses(model: ai_types.Model, context: ai_types.Cont
     return streamOpenAIResponses(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,
         .on_payload_fn = o.on_payload_fn,
         .on_payload_ctx = o.on_payload_ctx,
-        .reasoning_effort = if (o.reasoning) |r| thinkingLevelToString(r) else null,
-        .reasoning_summary = o.reasoning_summary,
+        .reasoning_effort = if (o.reasoning) |r| ai_types.OwnedSlice(u8).initBorrowed(thinkingLevelToString(r)) else ai_types.OwnedSlice(u8).initBorrowed(""),
+        .reasoning_summary = if (o.reasoning_summary) |s| ai_types.OwnedSlice(u8).initBorrowed(s) else ai_types.OwnedSlice(u8).initBorrowed(""),
     }, allocator);
 }
 

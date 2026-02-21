@@ -83,7 +83,7 @@ test "ollama e2e: basic text generation (new api)" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{
-        .api_key = api_key,
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(api_key),
         .max_tokens = 48,
         .temperature = 0.0,
     }, testing.allocator);

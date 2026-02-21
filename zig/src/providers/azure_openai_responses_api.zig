@@ -377,7 +377,7 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     const o = options orelse ai_types.StreamOptions{};
 
     const api_key: []u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         const e = env(allocator, "AZURE_OPENAI_API_KEY");
         if (e) |k| break :blk @constCast(k);
         return error.MissingApiKey;
@@ -415,9 +415,9 @@ pub fn streamSimpleAzureOpenAIResponses(model: ai_types.Model, context: ai_types
     return streamAzureOpenAIResponses(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,

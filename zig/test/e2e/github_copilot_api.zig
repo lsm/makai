@@ -42,7 +42,7 @@ test "github_copilot e2e: basic text generation" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{
-        .api_key = creds.copilot_token,
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(creds.copilot_token),
         .max_tokens = 50,
         .temperature = 0.0,
     }, testing.allocator);
@@ -107,7 +107,7 @@ test "github_copilot e2e: streaming events sequence" {
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{
-        .api_key = creds.copilot_token,
+        .api_key = ai_types.OwnedSlice(u8).initBorrowed(creds.copilot_token),
         .max_tokens = 50,
     }, testing.allocator);
     defer {

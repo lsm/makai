@@ -405,7 +405,8 @@ fn parseLineExtended(line: []const u8, allocator: std.mem.Allocator) ?OllamaPars
                                 if (func == .object) {
                                     const name = if (func.object.get("name")) |n|
                                         if (n == .string) n.string else ""
-                                    else "";
+                                    else
+                                        "";
 
                                     // Stringify arguments object to JSON
                                     const args_json = if (func.object.get("arguments")) |args| blk: {
@@ -1188,7 +1189,7 @@ pub fn streamOllama(
     // 1. Local server (localhost:11434) - default, no auth required
     // 2. Cloud API (ollama.com) - requires OLLAMA_API_KEY via Authorization header
     const api_key: ?[]u8 = blk: {
-        if (o.api_key) |k| break :blk try allocator.dupe(u8, k);
+        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
         if (env(allocator, "OLLAMA_API_KEY")) |k| break :blk @constCast(k);
         break :blk null;
     };
@@ -1242,9 +1243,9 @@ pub fn streamSimpleOllama(
     return streamOllama(model, context, .{
         .temperature = o.temperature,
         .max_tokens = o.max_tokens,
-        .api_key = o.api_key,
+        .api_key = if (o.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .cache_retention = o.cache_retention,
-        .session_id = o.session_id,
+        .session_id = if (o.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
         .headers = o.headers,
         .retry = o.retry,
         .cancel_token = o.cancel_token,

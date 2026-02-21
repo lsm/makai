@@ -87,9 +87,9 @@ pub const ToolChoice = union(enum) {
 pub const StreamOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
-    api_key: ?[]const u8 = null,
+    api_key: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     cache_retention: ?CacheRetention = null,
-    session_id: ?[]const u8 = null,
+    session_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     headers: ?[]const HeaderPair = null,
     retry: RetryConfig = .{},
     cancel_token: ?CancelToken = null,
@@ -101,11 +101,11 @@ pub const StreamOptions = struct {
     /// Token budget for extended thinking (older models only).
     thinking_budget_tokens: ?u32 = null,
     /// Effort level for adaptive thinking (Opus 4.6+ only). Values: "low", "medium", "high", "max".
-    thinking_effort: ?[]const u8 = null,
+    thinking_effort: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Reasoning effort level for OpenAI-compatible endpoints. Values: "minimal", "low", "medium", "high", "xhigh".
-    reasoning_effort: ?[]const u8 = null,
+    reasoning_effort: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Reasoning summary format: "auto" | "concise" | "detailed"
-    reasoning_summary: ?[]const u8 = null,
+    reasoning_summary: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Whether to include encrypted reasoning content
     include_reasoning_encrypted: bool = false,
     /// Whether reasoning is enabled (for GPT-5 juice workaround)
@@ -120,27 +120,53 @@ pub const StreamOptions = struct {
     http_timeout_ms: ?u64 = 30_000,
     /// Ping interval in milliseconds for streaming keepalive
     ping_interval_ms: ?u64 = null,
-    /// True if strings were allocated (deserialized). When false, strings are borrowed.
+    /// True if non-OwnedSlice strings were allocated (deserialized). When false, they are borrowed.
     owned_strings: bool = false,
 
-    /// Free all owned memory. Only call this if owned_strings = true.
-    pub fn deinit(self: *StreamOptions, allocator: std.mem.Allocator) void {
-        if (!self.owned_strings) return; // Guard for borrowed strings
+    pub fn getApiKey(self: *const StreamOptions) ?[]const u8 {
+        const key = self.api_key.slice();
+        return if (key.len > 0) key else null;
+    }
 
-        if (self.api_key) |key| allocator.free(key);
-        if (self.session_id) |sid| allocator.free(sid);
-        if (self.thinking_effort) |effort| allocator.free(effort);
-        if (self.reasoning_effort) |effort| allocator.free(effort);
-        if (self.reasoning_summary) |summary| allocator.free(summary);
+    pub fn getSessionId(self: *const StreamOptions) ?[]const u8 {
+        const sid = self.session_id.slice();
+        return if (sid.len > 0) sid else null;
+    }
+
+    pub fn getThinkingEffort(self: *const StreamOptions) ?[]const u8 {
+        const effort = self.thinking_effort.slice();
+        return if (effort.len > 0) effort else null;
+    }
+
+    pub fn getReasoningEffort(self: *const StreamOptions) ?[]const u8 {
+        const effort = self.reasoning_effort.slice();
+        return if (effort.len > 0) effort else null;
+    }
+
+    pub fn getReasoningSummary(self: *const StreamOptions) ?[]const u8 {
+        const summary = self.reasoning_summary.slice();
+        return if (summary.len > 0) summary else null;
+    }
+
+    /// Free all owned memory.
+    pub fn deinit(self: *StreamOptions, allocator: std.mem.Allocator) void {
+        self.api_key.deinit(allocator);
+        self.session_id.deinit(allocator);
+        self.thinking_effort.deinit(allocator);
+        self.reasoning_effort.deinit(allocator);
+        self.reasoning_summary.deinit(allocator);
+        if (self.metadata) |*meta| {
+            meta.deinit(allocator);
+        }
+
+        if (!self.owned_strings) return; // Guard for borrowed non-OwnedSlice fields
+
         if (self.headers) |headers| {
             for (headers) |header| {
                 allocator.free(header.name);
                 allocator.free(header.value);
             }
             allocator.free(headers);
-        }
-        if (self.metadata) |*meta| {
-            meta.deinit(allocator);
         }
         if (self.tool_choice) |*choice| {
             switch (choice.*) {
