@@ -674,14 +674,14 @@ pub const Agent = struct {
             try context.appendMessage(msg);
         }
 
-        // Build config
+        // Build config. Agent remains auth-agnostic; provider layer owns credentials.
         const config = agent_loop.AgentLoopConfig{
             .model = model,
             .protocol = self._protocol,
             .tools = self._state.tools,
             .temperature = null,
             .max_tokens = null,
-            .api_key = null, // TODO: get from get_api_key_fn
+            .api_key = null,
             .cancel_token = self._cancel_token,
             .max_iterations = null,
             .session_id = self._session_id,

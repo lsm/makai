@@ -471,6 +471,27 @@ const LoopState = struct {
     }
 };
 
+fn appendClonedStateMessage(
+    messages: *std.ArrayList(ai_types.Message),
+    allocator: std.mem.Allocator,
+    msg: ai_types.Message,
+) !void {
+    var cloned = try ai_types.cloneMessage(allocator, msg);
+    errdefer cloned.deinit(allocator);
+    try messages.append(allocator, cloned);
+}
+
+fn setFinalMessage(state: *LoopState, allocator: std.mem.Allocator, msg: ai_types.AssistantMessage) !void {
+    var cloned = try ai_types.cloneAssistantMessage(allocator, msg);
+    errdefer cloned.deinit(allocator);
+
+    if (state.final_message) |*prev| {
+        prev.deinit(allocator);
+    }
+
+    state.final_message = cloned;
+}
+
 /// Run the agent loop with new prompt messages.
 /// This is the internal implementation used by both agentLoop and agentLoopContinue.
 fn runLoop(
@@ -499,6 +520,9 @@ fn runLoop(
             try event_stream.push(.{ .message_end = .{
                 .message = prompt,
             } });
+
+            // Track as an owned result message
+            try appendClonedStateMessage(&state.messages, allocator, prompt);
         }
     }
 
@@ -535,6 +559,7 @@ fn runLoop(
                         try event_stream.push(.{ .message_end = .{
                             .message = steering_msg,
                         } });
+                        try appendClonedStateMessage(&state.messages, allocator, steering_msg);
                     }
                     allocator.free(msgs);
                 } else {
@@ -567,7 +592,8 @@ fn runLoop(
                     .timestamp = std.time.milliTimestamp(),
                     .is_owned = false,
                 };
-                state.final_message = error_msg;
+                try setFinalMessage(&state, allocator, error_msg);
+                try appendClonedStateMessage(&state.messages, allocator, .{ .assistant = error_msg });
 
                 // Emit turn_end with error
                 try event_stream.push(.{ .turn_end = .{
@@ -579,7 +605,8 @@ fn runLoop(
             };
 
             state.iterations += 1;
-            state.final_message = assistant_message;
+            try setFinalMessage(&state, allocator, assistant_message);
+            try appendClonedStateMessage(&state.messages, allocator, .{ .assistant = assistant_message });
 
             // Check stop_reason
             switch (assistant_message.stop_reason) {
@@ -614,6 +641,7 @@ fn runLoop(
                                     try event_stream.push(.{ .message_end = .{
                                         .message = follow_up,
                                     } });
+                                    try appendClonedStateMessage(&state.messages, allocator, follow_up);
                                 }
                                 allocator.free(follow_ups);
                                 continue :outer;
@@ -662,6 +690,7 @@ fn runLoop(
                         try event_stream.push(.{ .message_end = .{
                             .message = msg,
                         } });
+                        try appendClonedStateMessage(&state.messages, allocator, msg);
                     }
 
                     // If steering messages arrived, they'll be picked up at the top of inner loop
@@ -671,11 +700,15 @@ fn runLoop(
         }
     }
 
-    // Build result
-    const result = AgentLoopResult{
-        .messages = owned_slice_mod.OwnedSlice(ai_types.Message).initOwned(try state.messages.toOwnedSlice(allocator)),
-        .final_message = state.final_message orelse .{
-            .content = &.{},
+    // Build result and transfer ownership out of local loop state.
+    const result_messages = try state.messages.toOwnedSlice(allocator);
+
+    const result_final_message: ai_types.AssistantMessage = if (state.final_message) |fm| blk: {
+        state.final_message = null;
+        break :blk fm;
+    } else blk: {
+        break :blk .{
+            .content = try allocator.alloc(ai_types.AssistantContent, 0),
             .api = config.model.api,
             .provider = config.model.provider,
             .model = config.model.id,
@@ -683,7 +716,12 @@ fn runLoop(
             .stop_reason = .stop,
             .timestamp = std.time.milliTimestamp(),
             .is_owned = false,
-        },
+        };
+    };
+
+    const result = AgentLoopResult{
+        .messages = owned_slice_mod.OwnedSlice(ai_types.Message).initOwned(result_messages),
+        .final_message = result_final_message,
         .iterations = state.iterations,
     };
 

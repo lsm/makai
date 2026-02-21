@@ -87,6 +87,38 @@ The system is organized into four layers, each building on the one below:
 └─────────────────────────────────────────────┘
 ```
 
+### Target Distributed Agent Topology (Canonical)
+
+Use this as the default end-to-end architecture when implementing distributed agent execution:
+
+```
+End user code
+  -> Agent Protocol Client
+  -> Agent Protocol Transport
+  -> Agent Protocol Server
+  -> Agent
+  -> Agent Loop
+  -> Provider Protocol Client
+  -> Provider Protocol Transport
+  -> Provider Protocol Server
+  -> Provider
+```
+
+Distributed tool execution extension (when tools are remote):
+
+```
+Agent Loop
+  -> Tool Protocol Client
+  -> Tool Protocol Transport
+  -> Tool Protocol Server
+  -> Tool Runtime
+```
+
+Ownership and auth boundary:
+- **Agent layer is auth-agnostic** (no provider API key/OAuth handling in agent logic).
+- **Provider layer owns authentication/credentials** (API keys, OAuth tokens, signing).
+- **Tool auth/permissions are handled in the tool protocol/tool runtime boundary** (not in provider auth).
+
 ### Key Abstractions
 
 **`ai_types.zig`** - Core domain types:
