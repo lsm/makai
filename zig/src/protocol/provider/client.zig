@@ -200,6 +200,8 @@ pub const ProtocolClient = struct {
     }
 
     fn setStreamError(self: *Self, stream_id: protocol_types.Uuid, msg: []const u8) !void {
+        const already_complete = self.stream_complete_flags.get(stream_id) orelse false;
+
         if (self.stream_errors.getPtr(stream_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
@@ -208,11 +210,15 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        const ses = try self.ensureStreamEventStream(stream_id);
-        ses.completeWithError(msg);
+        if (!already_complete) {
+            const ses = try self.ensureStreamEventStream(stream_id);
+            ses.completeWithError(msg);
+        }
     }
 
     fn setStreamResult(self: *Self, stream_id: protocol_types.Uuid, result: ai_types.AssistantMessage) !void {
+        const already_complete = self.stream_complete_flags.get(stream_id) orelse false;
+
         if (self.stream_results.getPtr(stream_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = result;
@@ -221,8 +227,10 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        const ses = try self.ensureStreamEventStream(stream_id);
-        ses.complete(try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(stream_id).?));
+        if (!already_complete) {
+            const ses = try self.ensureStreamEventStream(stream_id);
+            ses.complete(try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(stream_id).?));
+        }
     }
 
     /// Start a new stream and return both stream_id and message_id.
