@@ -155,7 +155,7 @@ pub const AgentProtocolServer = struct {
         };
     }
 
-    fn handleStatus(self: *Self, req: struct { session_id: agent_types.Uuid }, env: agent_types.Envelope) !?agent_types.Envelope {
+    fn handleStatus(self: *Self, req: anytype, env: agent_types.Envelope) !?agent_types.Envelope {
         const session = self.sessions.get(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
