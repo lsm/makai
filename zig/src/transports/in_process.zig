@@ -56,7 +56,11 @@ pub const InProcessTransport = struct {
     /// Initialize with a new stream and specified mode (takes ownership)
     pub fn initWithMode(allocator: std.mem.Allocator, mode: Mode) !*Self {
         const self = try allocator.create(Self);
+        errdefer allocator.destroy(self);
+
         const stream = try allocator.create(event_stream.AssistantMessageStream);
+        errdefer allocator.destroy(stream);
+
         stream.* = event_stream.AssistantMessageStream.init(allocator);
 
         self.* = .{

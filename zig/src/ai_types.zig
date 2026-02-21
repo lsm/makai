@@ -633,51 +633,105 @@ pub fn cloneAssistantMessageEvent(allocator: std.mem.Allocator, event: Assistant
             .content_index = t.content_index,
             .partial = try cloneAssistantMessage(allocator, t.partial),
         } },
-        .text_delta => |d| .{ .text_delta = .{
-            .content_index = d.content_index,
-            .delta = try allocator.dupe(u8, d.delta),
-            .partial = try cloneAssistantMessage(allocator, d.partial),
-        } },
-        .text_end => |t| .{ .text_end = .{
-            .content_index = t.content_index,
-            .content = try allocator.dupe(u8, t.content),
-            .partial = try cloneAssistantMessage(allocator, t.partial),
-        } },
+        .text_delta => |d| blk: {
+            const delta = try allocator.dupe(u8, d.delta);
+            errdefer allocator.free(delta);
+            var partial = try cloneAssistantMessage(allocator, d.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .text_delta = .{
+                .content_index = d.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .text_end => |t| blk: {
+            const content = try allocator.dupe(u8, t.content);
+            errdefer allocator.free(content);
+            var partial = try cloneAssistantMessage(allocator, t.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .text_end = .{
+                .content_index = t.content_index,
+                .content = content,
+                .partial = partial,
+            } };
+        },
         .thinking_start => |t| .{ .thinking_start = .{
             .content_index = t.content_index,
             .partial = try cloneAssistantMessage(allocator, t.partial),
         } },
-        .thinking_delta => |d| .{ .thinking_delta = .{
-            .content_index = d.content_index,
-            .delta = try allocator.dupe(u8, d.delta),
-            .partial = try cloneAssistantMessage(allocator, d.partial),
-        } },
-        .thinking_end => |t| .{ .thinking_end = .{
-            .content_index = t.content_index,
-            .content = try allocator.dupe(u8, t.content),
-            .partial = try cloneAssistantMessage(allocator, t.partial),
-        } },
-        .toolcall_start => |t| .{ .toolcall_start = .{
-            .content_index = t.content_index,
-            .id = try allocator.dupe(u8, t.id),
-            .name = try allocator.dupe(u8, t.name),
-            .partial = try cloneAssistantMessage(allocator, t.partial),
-        } },
-        .toolcall_delta => |d| .{ .toolcall_delta = .{
-            .content_index = d.content_index,
-            .delta = try allocator.dupe(u8, d.delta),
-            .partial = try cloneAssistantMessage(allocator, d.partial),
-        } },
-        .toolcall_end => |t| .{ .toolcall_end = .{
-            .content_index = t.content_index,
-            .tool_call = .{
-                .id = try allocator.dupe(u8, t.tool_call.id),
-                .name = try allocator.dupe(u8, t.tool_call.name),
-                .arguments_json = try allocator.dupe(u8, t.tool_call.arguments_json),
-                .thought_signature = if (t.tool_call.thought_signature) |s| try allocator.dupe(u8, s) else null,
-            },
-            .partial = try cloneAssistantMessage(allocator, t.partial),
-        } },
+        .thinking_delta => |d| blk: {
+            const delta = try allocator.dupe(u8, d.delta);
+            errdefer allocator.free(delta);
+            var partial = try cloneAssistantMessage(allocator, d.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .thinking_delta = .{
+                .content_index = d.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .thinking_end => |t| blk: {
+            const content = try allocator.dupe(u8, t.content);
+            errdefer allocator.free(content);
+            var partial = try cloneAssistantMessage(allocator, t.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .thinking_end = .{
+                .content_index = t.content_index,
+                .content = content,
+                .partial = partial,
+            } };
+        },
+        .toolcall_start => |t| blk: {
+            const id = try allocator.dupe(u8, t.id);
+            errdefer allocator.free(id);
+            const name = try allocator.dupe(u8, t.name);
+            errdefer allocator.free(name);
+            var partial = try cloneAssistantMessage(allocator, t.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .toolcall_start = .{
+                .content_index = t.content_index,
+                .id = id,
+                .name = name,
+                .partial = partial,
+            } };
+        },
+        .toolcall_delta => |d| blk: {
+            const delta = try allocator.dupe(u8, d.delta);
+            errdefer allocator.free(delta);
+            var partial = try cloneAssistantMessage(allocator, d.partial);
+            errdefer partial.deinit(allocator);
+            break :blk .{ .toolcall_delta = .{
+                .content_index = d.content_index,
+                .delta = delta,
+                .partial = partial,
+            } };
+        },
+        .toolcall_end => |t| blk: {
+            const id = try allocator.dupe(u8, t.tool_call.id);
+            errdefer allocator.free(id);
+            const name = try allocator.dupe(u8, t.tool_call.name);
+            errdefer allocator.free(name);
+            const arguments_json = try allocator.dupe(u8, t.tool_call.arguments_json);
+            errdefer allocator.free(arguments_json);
+            const thought_signature = if (t.tool_call.thought_signature) |s|
+                try allocator.dupe(u8, s)
+            else
+                null;
+            errdefer if (thought_signature) |s| allocator.free(s);
+            var partial = try cloneAssistantMessage(allocator, t.partial);
+            errdefer partial.deinit(allocator);
+
+            break :blk .{ .toolcall_end = .{
+                .content_index = t.content_index,
+                .tool_call = .{
+                    .id = id,
+                    .name = name,
+                    .arguments_json = arguments_json,
+                    .thought_signature = thought_signature,
+                },
+                .partial = partial,
+            } };
+        },
         .done => |d| .{ .done = .{
             .reason = d.reason,
             .message = try cloneAssistantMessage(allocator, d.message),
