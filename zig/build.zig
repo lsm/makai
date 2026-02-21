@@ -322,8 +322,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // =========================================================================
+    // Protocol Provider Modules (protocol/provider/)
+    // =========================================================================
     const content_partial_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/content_partial.zig"),
+        .root_source_file = b.path("src/protocol/provider/content_partial.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -332,7 +335,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const partial_serializer_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/partial_serializer.zig"),
+        .root_source_file = b.path("src/protocol/provider/partial_serializer.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -343,7 +346,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/types.zig"),
+        .root_source_file = b.path("src/protocol/provider/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -352,7 +355,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_envelope_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/envelope.zig"),
+        .root_source_file = b.path("src/protocol/provider/envelope.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -364,7 +367,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const partial_reconstructor_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/partial_reconstructor.zig"),
+        .root_source_file = b.path("src/protocol/provider/partial_reconstructor.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -375,7 +378,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_server_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/server.zig"),
+        .root_source_file = b.path("src/protocol/provider/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -391,7 +394,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_client_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/client.zig"),
+        .root_source_file = b.path("src/protocol/provider/client.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -403,6 +406,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+        },
+    });
+
+    // =========================================================================
+    // Protocol Agent Modules (protocol/agent/)
+    // =========================================================================
+    const protocol_agent_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/agent/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+        },
+    });
+
+    // =========================================================================
+    // Protocol Tool Modules (protocol/tool/)
+    // =========================================================================
+    const protocol_tool_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/tool/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol_types", .module = protocol_types_mod },
         },
     });
 
@@ -677,6 +704,12 @@ pub fn build(b: *std.Build) void {
 
     const protocol_client_test = b.addTest(.{ .root_module = protocol_client_mod });
 
+    // Protocol Agent tests
+    const protocol_agent_types_test = b.addTest(.{ .root_module = protocol_agent_types_mod });
+
+    // Protocol Tool tests
+    const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
+
     // Agent tests
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
 
@@ -736,6 +769,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
 
     // Grouped unit test steps for parallel CI
     const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
@@ -759,6 +794,8 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_reconstructor_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_client_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
 
     const test_unit_providers_step = b.step("test-unit-providers", "Run provider unit tests");
     test_unit_providers_step.dependOn(&b.addRunArtifact(api_registry_test).step);
