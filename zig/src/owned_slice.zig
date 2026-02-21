@@ -28,6 +28,19 @@ pub fn OwnedSlice(comptime T: type) type {
             return self.items;
         }
 
+        /// Ensure this slice is owned by duplicating if currently borrowed.
+        /// No-op if already owned.
+        pub fn ensureOwned(self: *Self, allocator: std.mem.Allocator) !void {
+            if (self.is_owned) return;
+            self.items = try allocator.dupe(T, self.items);
+            self.is_owned = true;
+        }
+
+        /// Backward-compatible alias for ensureOwned().
+        pub fn cloneIfBorrowed(self: *Self, allocator: std.mem.Allocator) !void {
+            return self.ensureOwned(allocator);
+        }
+
         /// Free owned memory. No-op for borrowed slices.
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             if (!self.is_owned) return;
@@ -120,4 +133,30 @@ test "OwnedSlice empty borrowed slice" {
     var s = OwnedSlice(u32).initBorrowed(&.{});
     try std.testing.expectEqual(@as(usize, 0), s.slice().len);
     s.deinit(std.testing.allocator);
+}
+
+test "OwnedSlice ensureOwned upgrades borrowed slice" {
+    const allocator = std.testing.allocator;
+    const input = [_]u8{ 'a', 'b', 'c' };
+
+    var s = OwnedSlice(u8).initBorrowed(&input);
+    try std.testing.expect(!s.is_owned);
+
+    try s.ensureOwned(allocator);
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.is_owned);
+    try std.testing.expectEqualStrings("abc", s.slice());
+}
+
+test "OwnedSlice cloneIfBorrowed is alias of ensureOwned" {
+    const allocator = std.testing.allocator;
+    const input = [_]u8{ 'x', 'y' };
+
+    var s = OwnedSlice(u8).initBorrowed(&input);
+    try s.cloneIfBorrowed(allocator);
+    defer s.deinit(allocator);
+
+    try std.testing.expect(s.is_owned);
+    try std.testing.expectEqualStrings("xy", s.slice());
 }
