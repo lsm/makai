@@ -38,8 +38,8 @@ zig build test-e2e-google
 zig build test-e2e-ollama
 zig build test-e2e-github-copilot
 zig build test-e2e-protocol                     # mock-based, no API keys needed
-zig build test-e2e-protocol-fullstack-ollama
-zig build test-e2e-protocol-fullstack-github
+zig build test-e2e-provider-protocol-fullstack-ollama
+zig build test-e2e-provider-protocol-fullstack-github
 ```
 
 There is no single-test command. Tests are inline in each `.zig` file using Zig's built-in `test` blocks, and `zig build test` runs all modules.
