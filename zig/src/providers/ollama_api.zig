@@ -90,9 +90,9 @@ fn buildGeneratedToolCallId(allocator: std.mem.Allocator, tool_name: []const u8,
 
     _ = sb.append(tool_name);
     _ = sb.append("_");
-    _ = try sb.fmt("{}", .{timestamp});
+    _ = sb.appendFmt("{}", .{timestamp});
     _ = sb.append("_");
-    _ = try sb.fmt("{}", .{counter});
+    _ = sb.appendFmt("{}", .{counter});
 
     std.debug.assert(sb.len == sb.cap);
     const out = sb.ptr.?[0..sb.cap];
