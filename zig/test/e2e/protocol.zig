@@ -193,7 +193,7 @@ test "Envelope roundtrip preserves NACK structure" {
     defer allocator.free(serialized);
 
     try testing.expect(parsed.payload == .nack);
-    try testing.expectEqualStrings("Model not found", parsed.payload.nack.reason);
+    try testing.expectEqualStrings("Model not found", parsed.payload.nack.reason.slice());
 }
 
 test "Envelope roundtrip preserves abort_request" {
@@ -218,7 +218,7 @@ test "Envelope roundtrip preserves abort_request" {
     defer parsed.deinit(allocator);
 
     try testing.expect(parsed.payload == .abort_request);
-    try testing.expectEqualStrings("User cancelled", parsed.payload.abort_request.reason.?);
+    try testing.expectEqualStrings("User cancelled", parsed.payload.abort_request.getReason().?);
 }
 
 test "Envelope roundtrip preserves stream_error" {
@@ -243,7 +243,7 @@ test "Envelope roundtrip preserves stream_error" {
     defer parsed.deinit(allocator);
 
     try testing.expect(parsed.payload == .stream_error);
-    try testing.expectEqualStrings("Connection timeout", parsed.payload.stream_error.message);
+    try testing.expectEqualStrings("Connection timeout", parsed.payload.stream_error.message.slice());
 }
 
 test "Envelope roundtrip preserves goodbye" {
@@ -267,7 +267,7 @@ test "Envelope roundtrip preserves goodbye" {
     defer parsed.deinit(allocator);
 
     try testing.expect(parsed.payload == .goodbye);
-    try testing.expectEqualStrings("Client shutting down", parsed.payload.goodbye.reason.?);
+    try testing.expectEqualStrings("Client shutting down", parsed.payload.goodbye.getReason().?);
 }
 
 // =============================================================================

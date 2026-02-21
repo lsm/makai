@@ -149,7 +149,7 @@ pub const ProtocolServer = struct {
             .ping => {
                 // Respond with pong containing the ping's message_id as ping_id
                 const ping_id_str = try protocol_types.uuidToString(env.message_id, self.allocator);
-                const pong_payload: protocol_types.Payload = .{ .pong = .{ .ping_id = ping_id_str } };
+                const pong_payload: protocol_types.Payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id_str) } };
                 return envelope.createReply(env, pong_payload, self.allocator);
             },
             .pong => {
@@ -368,7 +368,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
     // Find stream by stream_id
     if (server.active_streams.fetchRemove(request.target_stream_id)) |removed| {
         // Complete the stream with an error
-        const reason = request.reason orelse "Stream aborted";
+        const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
         // Clean up - need to copy to mutable for deinit
@@ -747,7 +747,7 @@ test "handleAbortRequest cancels stream" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
-            .reason = null,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
         } },
     };
 
@@ -775,7 +775,7 @@ test "handleAbortRequest returns ack for unknown stream (idempotent)" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
             .target_stream_id = unknown_stream_id,
-            .reason = null,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
         } },
     };
 
@@ -1110,7 +1110,7 @@ test "handleAbortRequest rejects duplicate sequence" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
-            .reason = null,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
         } },
     };
 
@@ -1176,7 +1176,7 @@ test "handleAbortRequest rejects sequence gap" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
-            .reason = null,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
         } },
     };
 

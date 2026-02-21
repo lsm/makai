@@ -1,5 +1,8 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const owned_slice_mod = @import("owned_slice");
+
+pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 /// UUID type for stream/message identification
 pub const Uuid = [16]u8;
@@ -234,10 +237,16 @@ pub const CompleteRequest = struct {
 /// Request to abort a stream
 pub const AbortRequest = struct {
     target_stream_id: Uuid,
-    reason: ?[]const u8 = null,
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const AbortRequest) ?[]const u8 {
+        const r = self.reason.slice();
+        return if (r.len > 0) r else null;
+    }
 
     pub fn deinit(self: *AbortRequest, allocator: std.mem.Allocator) void {
-        if (self.reason) |r| allocator.free(r);
+        self.reason.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -252,20 +261,16 @@ pub const Nack = struct {
     /// The message_id that was rejected
     rejected_id: Uuid,
     /// Human-readable reason for rejection
-    reason: []const u8,
+    reason: OwnedSlice(u8),
     /// Optional error code
     error_code: ?ErrorCode = null,
     /// Optional list of supported protocol versions (for VERSION_MISMATCH)
-    supported_versions: ?[]const []const u8 = null,
+    supported_versions: OwnedSlice(OwnedSlice(u8)) = OwnedSlice(OwnedSlice(u8)).initBorrowed(&.{}),
 
     pub fn deinit(self: *Nack, allocator: std.mem.Allocator) void {
-        allocator.free(self.reason);
-        if (self.supported_versions) |versions| {
-            for (versions) |v| {
-                allocator.free(v);
-            }
-            allocator.free(versions);
-        }
+        self.reason.deinit(allocator);
+        self.supported_versions.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -288,28 +293,36 @@ pub const ErrorCode = enum {
 /// Stream error payload
 pub const StreamError = struct {
     code: ErrorCode,
-    message: []const u8,
+    message: OwnedSlice(u8),
 
     pub fn deinit(self: *StreamError, allocator: std.mem.Allocator) void {
-        allocator.free(self.message);
+        self.message.deinit(allocator);
+        self.* = undefined;
     }
 };
 
 /// Pong response - echoes ping_id from the corresponding ping
 pub const Pong = struct {
-    ping_id: []const u8,
+    ping_id: OwnedSlice(u8),
 
     pub fn deinit(self: *Pong, allocator: std.mem.Allocator) void {
-        allocator.free(self.ping_id);
+        self.ping_id.deinit(allocator);
+        self.* = undefined;
     }
 };
 
 /// Graceful connection close message
 pub const Goodbye = struct {
-    reason: ?[]const u8 = null,
+    reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getReason(self: *const Goodbye) ?[]const u8 {
+        const r = self.reason.slice();
+        return if (r.len > 0) r else null;
+    }
 
     pub fn deinit(self: *Goodbye, allocator: std.mem.Allocator) void {
-        if (self.reason) |r| allocator.free(r);
+        self.reason.deinit(allocator);
+        self.* = undefined;
     }
 };
 
@@ -438,7 +451,7 @@ test "Nack deinit frees reason and supported_versions" {
     const reason = try std.testing.allocator.dupe(u8, "Test error reason");
     var nack = Nack{
         .rejected_id = generateUuid(),
-        .reason = reason,
+        .reason = OwnedSlice(u8).initOwned(reason),
         .error_code = .invalid_request,
     };
 
@@ -450,7 +463,7 @@ test "StreamError deinit frees message" {
     const msg = try std.testing.allocator.dupe(u8, "Provider error");
     var stream_err = StreamError{
         .code = .provider_error,
-        .message = msg,
+        .message = OwnedSlice(u8).initOwned(msg),
     };
 
     stream_err.deinit(std.testing.allocator);
@@ -461,17 +474,16 @@ test "AbortRequest deinit frees reason" {
     const reason = try std.testing.allocator.dupe(u8, "User cancelled");
     var abort = AbortRequest{
         .target_stream_id = generateUuid(),
-        .reason = reason,
+        .reason = OwnedSlice(u8).initOwned(reason),
     };
 
     abort.deinit(std.testing.allocator);
     // Should not leak - test passes if no memory leak detected
 }
 
-test "AbortRequest deinit handles null reason" {
+test "AbortRequest deinit handles empty reason" {
     var abort = AbortRequest{
         .target_stream_id = generateUuid(),
-        .reason = null,
     };
 
     abort.deinit(std.testing.allocator);
@@ -485,7 +497,7 @@ test "Payload deinit handles all variants" {
 
     // Test pong with ping_id
     const ping_id = try std.testing.allocator.dupe(u8, "test-ping-123");
-    var pong_payload: Payload = .{ .pong = .{ .ping_id = ping_id } };
+    var pong_payload: Payload = .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(ping_id) } };
     pong_payload.deinit(std.testing.allocator);
 
     // Test ack
@@ -495,20 +507,20 @@ test "Payload deinit handles all variants" {
 
 test "Pong deinit frees ping_id" {
     const ping_id = try std.testing.allocator.dupe(u8, "test-ping-id");
-    var pong = Pong{ .ping_id = ping_id };
+    var pong = Pong{ .ping_id = OwnedSlice(u8).initOwned(ping_id) };
     pong.deinit(std.testing.allocator);
     // Should not leak - test passes if no memory leak detected
 }
 
 test "Goodbye deinit frees reason" {
     const reason = try std.testing.allocator.dupe(u8, "Server shutting down");
-    var goodbye = Goodbye{ .reason = reason };
+    var goodbye = Goodbye{ .reason = OwnedSlice(u8).initOwned(reason) };
     goodbye.deinit(std.testing.allocator);
     // Should not leak
 }
 
-test "Goodbye deinit handles null reason" {
-    var goodbye = Goodbye{ .reason = null };
+test "Goodbye deinit handles empty reason" {
+    var goodbye = Goodbye{};
     goodbye.deinit(std.testing.allocator);
     // Should not crash
 }

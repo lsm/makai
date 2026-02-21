@@ -376,6 +376,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

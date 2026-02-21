@@ -75,10 +75,10 @@ fn serializePayload(
             // Empty payload for ping
         },
         .pong => |pong| {
-            try w.writeStringField("ping_id", pong.ping_id);
+            try w.writeStringField("ping_id", pong.ping_id.slice());
         },
         .goodbye => |goodbye| {
-            if (goodbye.reason) |reason| {
+            if (goodbye.getReason()) |reason| {
                 try w.writeStringField("reason", reason);
             }
         },
@@ -143,7 +143,7 @@ fn serializePayload(
             const target_str = try protocol_types.uuidToString(req.target_stream_id, allocator);
             defer allocator.free(target_str);
             try w.writeStringField("target_stream_id", target_str);
-            if (req.reason) |reason| {
+            if (req.getReason()) |reason| {
                 try w.writeStringField("reason", reason);
             }
         },
@@ -156,15 +156,16 @@ fn serializePayload(
             const rejected_id_str = try protocol_types.uuidToString(nack.rejected_id, allocator);
             defer allocator.free(rejected_id_str);
             try w.writeStringField("rejected_id", rejected_id_str);
-            try w.writeStringField("reason", nack.reason);
+            try w.writeStringField("reason", nack.reason.slice());
             if (nack.error_code) |code| {
                 try w.writeStringField("error_code", @tagName(code));
             }
-            if (nack.supported_versions) |versions| {
+            const versions = nack.supported_versions.slice();
+            if (versions.len > 0) {
                 try w.writeKey("supported_versions");
                 try w.beginArray();
                 for (versions) |v| {
-                    try w.writeString(v);
+                    try w.writeString(v.slice());
                 }
                 try w.endArray();
             }
@@ -177,7 +178,7 @@ fn serializePayload(
         },
         .stream_error => |err| {
             try w.writeStringField("code", @tagName(err.code));
-            try w.writeStringField("message", err.message);
+            try w.writeStringField("message", err.message.slice());
         },
     }
 
@@ -763,9 +764,9 @@ fn deserializeAbortRequest(
     const target_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
 
     const reason = if (obj.get("reason")) |r|
-        try allocator.dupe(u8, r.string)
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
     else
-        null;
+        protocol_types.OwnedSlice(u8).initBorrowed("");
 
     return .{
         .target_stream_id = target_id,
@@ -791,28 +792,31 @@ fn deserializeNack(
     const rejected_id_str = obj.get("rejected_id").?.string;
     const rejected_id = protocol_types.parseUuid(rejected_id_str) orelse return error.InvalidUuid;
 
-    const reason = try allocator.dupe(u8, obj.get("reason").?.string);
-    errdefer allocator.free(reason);
+    const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("reason").?.string));
+    errdefer {
+        var mutable_reason = reason;
+        mutable_reason.deinit(allocator);
+    }
 
     const error_code = if (obj.get("error_code")) |code_val|
         parseErrorCode(code_val.string)
     else
         null;
 
-    var supported_versions: ?[]const []const u8 = null;
+    var supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initBorrowed(&.{});
     if (obj.get("supported_versions")) |versions_val| {
         const versions_arr = versions_val.array;
-        const versions = try allocator.alloc([]const u8, versions_arr.items.len);
+        const versions = try allocator.alloc(protocol_types.OwnedSlice(u8), versions_arr.items.len);
         var allocated_count: usize = 0;
         errdefer {
-            for (versions[0..allocated_count]) |v| allocator.free(v);
+            for (versions[0..allocated_count]) |*v| v.deinit(allocator);
             allocator.free(versions);
         }
         for (versions_arr.items, 0..) |item, i| {
-            versions[i] = try allocator.dupe(u8, item.string);
+            versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, item.string));
             allocated_count += 1;
         }
-        supported_versions = versions;
+        supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initOwned(versions);
     }
 
     return .{
@@ -831,7 +835,7 @@ fn deserializeStreamError(
     const code_str = obj.get("code").?.string;
     const code = parseErrorCode(code_str);
 
-    const message = try allocator.dupe(u8, obj.get("message").?.string);
+    const message = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("message").?.string));
 
     return .{
         .code = code,
@@ -844,7 +848,7 @@ fn deserializePong(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.Pong {
-    const ping_id = try allocator.dupe(u8, obj.get("ping_id").?.string);
+    const ping_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("ping_id").?.string));
     return .{ .ping_id = ping_id };
 }
 
@@ -854,9 +858,9 @@ fn deserializeGoodbye(
     allocator: std.mem.Allocator,
 ) !protocol_types.Goodbye {
     const reason = if (obj.get("reason")) |r|
-        try allocator.dupe(u8, r.string)
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
     else
-        null;
+        protocol_types.OwnedSlice(u8).initBorrowed("");
 
     return .{ .reason = reason };
 }
@@ -1231,7 +1235,7 @@ pub fn createNack(
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
             .rejected_id = original.message_id,
-            .reason = reason_copy,
+            .reason = protocol_types.OwnedSlice(u8).initOwned(reason_copy),
             .error_code = error_code,
         } },
     };
@@ -1281,7 +1285,7 @@ test "serializeEnvelope with pong payload" {
         .message_id = protocol_types.generateUuid(),
         .sequence = 2,
         .timestamp = 1708234567900,
-        .payload = .{ .pong = .{ .ping_id = ping_id } },
+        .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id) } },
     };
 
     const json = try serializeEnvelope(envelope, allocator);
@@ -1436,7 +1440,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
             .rejected_id = rejected_id,
-            .reason = reason,
+            .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
             .error_code = .invalid_request,
         } },
     };
@@ -1450,7 +1454,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
     try std.testing.expect(parsed.payload == .nack);
     try std.testing.expectEqualSlices(u8, &rejected_id, &parsed.payload.nack.rejected_id);
     try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, parsed.payload.nack.error_code.?);
-    try std.testing.expectEqualStrings("Test error reason", parsed.payload.nack.reason);
+    try std.testing.expectEqualStrings("Test error reason", parsed.payload.nack.reason.slice());
 
     original.deinit(allocator);
 }
@@ -1535,7 +1539,7 @@ test "createNack creates valid nack" {
     try std.testing.expect(nack_env.payload == .nack);
     try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.payload.nack.rejected_id);
     try std.testing.expectEqual(protocol_types.ErrorCode.model_not_found, nack_env.payload.nack.error_code.?);
-    try std.testing.expectEqualStrings("Model gpt-5 not found", nack_env.payload.nack.reason);
+    try std.testing.expectEqualStrings("Model gpt-5 not found", nack_env.payload.nack.reason.slice());
     try std.testing.expect(nack_env.in_reply_to != null);
     try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.in_reply_to.?);
 }
@@ -1553,7 +1557,7 @@ test "serializeEnvelope with abort_request payload" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
             .target_stream_id = protocol_types.generateUuid(),
-            .reason = reason,
+            .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
         } },
     };
 
@@ -1580,7 +1584,7 @@ test "serializeEnvelope with stream_error payload" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_error = .{
             .code = .provider_error,
-            .message = msg,
+            .message = protocol_types.OwnedSlice(u8).initOwned(msg),
         } },
     };
 
@@ -1797,7 +1801,7 @@ test "serializeEnvelope with goodbye payload" {
         .message_id = protocol_types.generateUuid(),
         .sequence = 100,
         .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .goodbye = .{ .reason = reason } },
+        .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
     };
 
     const json = try serializeEnvelope(envelope, allocator);
@@ -1817,7 +1821,7 @@ test "serializeEnvelope with goodbye payload (no reason)" {
         .message_id = protocol_types.generateUuid(),
         .sequence = 100,
         .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .goodbye = .{ .reason = null } },
+        .payload = .{ .goodbye = .{} },
     };
 
     const json = try serializeEnvelope(envelope, allocator);
@@ -1905,7 +1909,7 @@ test "deserializeEnvelope with pong payload" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.payload == .pong);
-    try std.testing.expectEqualStrings("test-ping-456", envelope.payload.pong.ping_id);
+    try std.testing.expectEqualStrings("test-ping-456", envelope.payload.pong.ping_id.slice());
 }
 
 test "deserializeEnvelope with goodbye payload" {
@@ -1928,7 +1932,7 @@ test "deserializeEnvelope with goodbye payload" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.payload == .goodbye);
-    try std.testing.expectEqualStrings("Server maintenance", envelope.payload.goodbye.reason.?);
+    try std.testing.expectEqualStrings("Server maintenance", envelope.payload.goodbye.getReason().?);
 }
 
 test "deserializeEnvelope with goodbye payload (no reason)" {
@@ -1949,7 +1953,7 @@ test "deserializeEnvelope with goodbye payload (no reason)" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.payload == .goodbye);
-    try std.testing.expect(envelope.payload.goodbye.reason == null);
+    try std.testing.expect(envelope.payload.goodbye.getReason() == null);
 }
 
 test "deserializeEnvelope with sync_request payload" {
@@ -2019,7 +2023,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
         .message_id = protocol_types.generateUuid(),
         .sequence = 10,
         .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .pong = .{ .ping_id = ping_id } },
+        .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id) } },
     };
 
     const json = try serializeEnvelope(original, allocator);
@@ -2029,7 +2033,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
     defer parsed.deinit(allocator);
 
     try std.testing.expect(parsed.payload == .pong);
-    try std.testing.expectEqualStrings("roundtrip-ping-id", parsed.payload.pong.ping_id);
+    try std.testing.expectEqualStrings("roundtrip-ping-id", parsed.payload.pong.ping_id.slice());
 
     original.deinit(allocator);
 }
@@ -2043,7 +2047,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
         .message_id = protocol_types.generateUuid(),
         .sequence = 200,
         .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .goodbye = .{ .reason = reason } },
+        .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
     };
 
     const json = try serializeEnvelope(original, allocator);
@@ -2053,7 +2057,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
     defer parsed.deinit(allocator);
 
     try std.testing.expect(parsed.payload == .goodbye);
-    try std.testing.expectEqualStrings("Graceful shutdown", parsed.payload.goodbye.reason.?);
+    try std.testing.expectEqualStrings("Graceful shutdown", parsed.payload.goodbye.getReason().?);
 
     original.deinit(allocator);
 }

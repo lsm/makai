@@ -183,12 +183,15 @@ pub const ProtocolClient = struct {
 
         self.sequence += 1;
 
-        const reason_dup = if (reason) |r| try self.allocator.dupe(u8, r) else null;
+        const reason_owned = if (reason) |r|
+            OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r))
+        else
+            OwnedSlice(u8).initBorrowed("");
 
         const payload = protocol_types.Payload{
             .abort_request = .{
                 .target_stream_id = self.current_stream_id.?,
-                .reason = reason_dup,
+                .reason = reason_owned,
             },
         };
 
@@ -224,7 +227,7 @@ pub const ProtocolClient = struct {
                 _ = self.pending_requests.fetchRemove(nack.rejected_id);
 
                 // Store error
-                try self.setLastError(nack.reason);
+                try self.setLastError(nack.reason.slice());
             },
             .event => |evt| {
                 // Deep copy the event so the event stream owns its memory
@@ -266,12 +269,14 @@ pub const ProtocolClient = struct {
                 self.stream_complete = true;
             },
             .stream_error => |err| {
+                const msg = err.message.slice();
+
                 // Store error
-                try self.setLastError(err.message);
+                try self.setLastError(msg);
                 self.stream_complete = true;
 
                 // Complete the event stream with error
-                self.event_stream.completeWithError(err.message);
+                self.event_stream.completeWithError(msg);
             },
             .pong => {
                 // No-op for pong
@@ -496,7 +501,7 @@ test "processEnvelope handles nack" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
             .rejected_id = message_id,
-            .reason = nack_reason,
+            .reason = OwnedSlice(u8).initOwned(nack_reason),
             .error_code = .model_not_found,
         } },
     };
@@ -692,8 +697,8 @@ test "sendAbortRequest sends valid envelope" {
     defer env.deinit(allocator);
 
     try std.testing.expect(env.payload == .abort_request);
-    try std.testing.expect(env.payload.abort_request.reason != null);
-    try std.testing.expectEqualStrings("User cancelled", env.payload.abort_request.reason.?);
+    try std.testing.expect(env.payload.abort_request.getReason() != null);
+    try std.testing.expectEqualStrings("User cancelled", env.payload.abort_request.getReason().?);
 }
 
 test "processEnvelope handles done event and builds result" {
@@ -847,7 +852,7 @@ test "processEnvelope handles stream_error payload" {
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_error = .{
             .code = .provider_error,
-            .message = error_msg,
+            .message = OwnedSlice(u8).initOwned(error_msg),
         } },
     };
 

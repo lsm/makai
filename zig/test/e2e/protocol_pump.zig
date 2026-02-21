@@ -88,7 +88,7 @@ pub const ProtocolPump = struct {
                         .timestamp = std.time.milliTimestamp(),
                         .payload = .{ .stream_error = .{
                             .code = .provider_error,
-                            .message = err_copy,
+                            .message = protocol_types.OwnedSlice(u8).initOwned(err_copy),
                         } },
                     };
 
