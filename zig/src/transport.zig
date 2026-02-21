@@ -2,6 +2,9 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const json_writer = @import("json_writer");
+const owned_slice_mod = @import("owned_slice");
+
+const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 // --- Async byte stream types ---
 
@@ -26,35 +29,35 @@ pub const ByteStream = event_stream.EventStream(ByteChunk, void);
 /// Control messages as defined in PROTOCOL.md Section 3.2
 pub const ControlMessage = union(enum) {
     ack: struct {
-        acknowledged_id: []const u8,
+        acknowledged_id: OwnedSlice(u8),
     },
     nack: struct {
-        rejected_id: []const u8,
-        reason: []const u8,
-        error_code: ?[]const u8 = null,
+        rejected_id: OwnedSlice(u8),
+        reason: OwnedSlice(u8),
+        error_code: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     },
     ping: void,
     pong: void,
-    goodbye: ?[]const u8, // optional reason
+    goodbye: OwnedSlice(u8), // empty means no reason
     sync_request: void,
     sync: struct {
-        stream_id: []const u8,
+        stream_id: OwnedSlice(u8),
         sequence: u64,
-        partial: ?[]const u8, // JSON snapshot
+        partial: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), // JSON snapshot
     },
 };
 
 pub const MessageOrControl = union(enum) {
     event: ai_types.AssistantMessageEvent,
     result: ai_types.AssistantMessage,
-    stream_error: []const u8,
+    stream_error: OwnedSlice(u8),
     control: ControlMessage,
 };
 
 /// Callback type for handling control messages
 /// The callback receives the control message and an optional context pointer.
-/// IMPORTANT: The callback must copy any strings it needs from the control message
-/// before returning, as the strings will be freed after the callback returns.
+/// IMPORTANT: The callback must copy any string slices it needs (via `.slice()`)
+/// before returning, as owned strings will be freed after the callback returns.
 pub const ControlMessageCallback = *const fn (ctrl: ControlMessage, ctx: ?*anyopaque) void;
 
 // --- Transport interfaces ---
@@ -199,7 +202,9 @@ pub fn receiveStream(
                 return;
             },
             .stream_error => |e| {
-                stream.completeWithError(e);
+                stream.completeWithError(e.slice());
+                var mutable_e = e;
+                mutable_e.deinit(allocator);
                 return;
             },
             .control => |ctrl| {
@@ -315,16 +320,30 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
 /// Free allocated strings in a control message
 fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
     switch (ctrl) {
-        .ack => |a| allocator.free(a.acknowledged_id),
-        .nack => |n| {
-            allocator.free(n.rejected_id);
-            allocator.free(n.reason);
-            if (n.error_code) |ec| allocator.free(ec);
+        .ack => |a| {
+            var id = a.acknowledged_id;
+            id.deinit(allocator);
         },
-        .goodbye => |g| if (g) |reason| allocator.free(reason),
+        .nack => |n| {
+            var rejected_id = n.rejected_id;
+            rejected_id.deinit(allocator);
+
+            var reason = n.reason;
+            reason.deinit(allocator);
+
+            var error_code = n.error_code;
+            error_code.deinit(allocator);
+        },
+        .goodbye => |g| {
+            var reason = g;
+            reason.deinit(allocator);
+        },
         .sync => |s| {
-            allocator.free(s.stream_id);
-            if (s.partial) |p| allocator.free(p);
+            var stream_id = s.stream_id;
+            stream_id.deinit(allocator);
+
+            var partial = s.partial;
+            partial.deinit(allocator);
         },
         .ping, .pong, .sync_request => {},
     }
@@ -338,7 +357,10 @@ fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocat
             var mutable = r;
             mutable.deinit(allocator);
         },
-        .stream_error => |e| allocator.free(e),
+        .stream_error => |e| {
+            var mutable = e;
+            mutable.deinit(allocator);
+        },
         .control => |ctrl| freeControlStrings(ctrl, allocator),
     }
 }
@@ -388,9 +410,9 @@ pub fn receiveStreamFromByteStreamWithControl(
                 return;
             },
             .stream_error => |e| {
-                const err_copy = allocator.dupe(u8, e) catch e;
-                msg_stream.completeWithError(err_copy);
-                allocator.free(e);
+                msg_stream.completeWithError(e.slice());
+                var mutable_e = e;
+                mutable_e.deinit(allocator);
                 return;
             },
             .control => |ctrl| {
@@ -678,30 +700,41 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     }
     if (std.mem.eql(u8, type_str, "stream_error")) {
         const msg = obj.get("message").?.string;
-        return .{ .stream_error = try allocator.dupe(u8, msg) };
+        return .{ .stream_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, msg)) };
     }
 
     // Handle control messages
     if (std.mem.eql(u8, type_str, "ack")) {
         const acknowledged_id = if (obj.get("acknowledged_id")) |id|
-            try allocator.dupe(u8, id.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
         else
             return error.MissingField;
         return .{ .control = .{ .ack = .{ .acknowledged_id = acknowledged_id } } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
         const rejected_id = if (obj.get("rejected_id")) |id|
-            try allocator.dupe(u8, id.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
         else
             return error.MissingField;
+        errdefer {
+            var mutable = rejected_id;
+            mutable.deinit(allocator);
+        }
+
         const reason = if (obj.get("reason")) |r|
-            try allocator.dupe(u8, r.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
         else
             return error.MissingField;
+        errdefer {
+            var mutable = reason;
+            mutable.deinit(allocator);
+        }
+
         const error_code = if (obj.get("error_code")) |ec|
-            try allocator.dupe(u8, ec.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, ec.string))
         else
-            null;
+            OwnedSlice(u8).initBorrowed("");
+
         return .{ .control = .{ .nack = .{
             .rejected_id = rejected_id,
             .reason = reason,
@@ -716,9 +749,9 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     }
     if (std.mem.eql(u8, type_str, "goodbye")) {
         const reason = if (obj.get("reason")) |r|
-            try allocator.dupe(u8, r.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
         else
-            null;
+            OwnedSlice(u8).initBorrowed("");
         return .{ .control = .{ .goodbye = reason } };
     }
     if (std.mem.eql(u8, type_str, "sync_request")) {
@@ -726,17 +759,24 @@ pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !MessageOrCon
     }
     if (std.mem.eql(u8, type_str, "sync")) {
         const stream_id = if (obj.get("stream_id")) |id|
-            try allocator.dupe(u8, id.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, id.string))
         else
             return error.MissingField;
+        errdefer {
+            var mutable = stream_id;
+            mutable.deinit(allocator);
+        }
+
         const sequence: u64 = if (obj.get("sequence")) |seq|
             @intCast(seq.integer)
         else
             return error.MissingField;
+
         const partial = if (obj.get("partial")) |p|
-            try allocator.dupe(u8, p.string)
+            OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.string))
         else
-            null;
+            OwnedSlice(u8).initBorrowed("");
+
         return .{ .control = .{ .sync = .{
             .stream_id = stream_id,
             .sequence = sequence,
@@ -1505,8 +1545,10 @@ test "serialize and deserialize stream_error" {
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .stream_error);
-    try std.testing.expectEqualStrings("Connection failed", msg.stream_error);
-    allocator.free(msg.stream_error);
+    try std.testing.expectEqualStrings("Connection failed", msg.stream_error.slice());
+
+    var mutable_msg = msg.stream_error;
+    mutable_msg.deinit(allocator);
 }
 
 test "serialize and deserialize result with multiple content block types" {
@@ -1800,7 +1842,6 @@ test "receiveStreamFromByteStream bridge" {
     try std.testing.expect(msg_stream.isDone());
 }
 
-
 // --- Control message callback tests ---
 
 const ControlTestContext = struct {
@@ -1827,7 +1868,7 @@ const ControlTestContext = struct {
                     self.last_ack_id = "";
                 }
                 // Must copy the string since it will be freed after callback returns
-                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id) catch "";
+                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id.slice()) catch "";
             },
             else => {},
         }

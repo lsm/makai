@@ -412,12 +412,12 @@ const TestControlContext = struct {
             .ack => |a| {
                 self.received_ack = true;
                 if (self.last_ack_id) |id| self.allocator.free(id);
-                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id) catch null;
+                self.last_ack_id = self.allocator.dupe(u8, a.acknowledged_id.slice()) catch null;
             },
             .nack => |n| {
                 self.received_nack = true;
                 if (self.last_nack_reason) |r| self.allocator.free(r);
-                self.last_nack_reason = self.allocator.dupe(u8, n.reason) catch null;
+                self.last_nack_reason = self.allocator.dupe(u8, n.reason.slice()) catch null;
             },
             .ping => {
                 self.received_ping = true;

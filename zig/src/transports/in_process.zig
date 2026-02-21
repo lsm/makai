@@ -115,8 +115,9 @@ pub const InProcessTransport = struct {
                 self.stream.complete(r);
             },
             .stream_error => |e| {
-                self.stream.completeWithError(e);
-                self.allocator.free(e);
+                self.stream.completeWithError(e.slice());
+                var mutable_e = e;
+                mutable_e.deinit(self.allocator);
             },
             .control => |ctrl| {
                 // Handle control messages (ping/pong/etc)
@@ -216,16 +217,30 @@ pub const InProcessTransport = struct {
 /// Free allocated strings in a control message (local copy since transport.freeControlStrings is not pub)
 fn freeControlStrings(ctrl: transport_mod.ControlMessage, allocator: std.mem.Allocator) void {
     switch (ctrl) {
-        .ack => |a| allocator.free(a.acknowledged_id),
-        .nack => |n| {
-            allocator.free(n.rejected_id);
-            allocator.free(n.reason);
-            if (n.error_code) |ec| allocator.free(ec);
+        .ack => |a| {
+            var id = a.acknowledged_id;
+            id.deinit(allocator);
         },
-        .goodbye => |g| if (g) |reason| allocator.free(reason),
+        .nack => |n| {
+            var rejected_id = n.rejected_id;
+            rejected_id.deinit(allocator);
+
+            var reason = n.reason;
+            reason.deinit(allocator);
+
+            var error_code = n.error_code;
+            error_code.deinit(allocator);
+        },
+        .goodbye => |g| {
+            var reason = g;
+            reason.deinit(allocator);
+        },
         .sync => |s| {
-            allocator.free(s.stream_id);
-            if (s.partial) |p| allocator.free(p);
+            var stream_id = s.stream_id;
+            stream_id.deinit(allocator);
+
+            var partial = s.partial;
+            partial.deinit(allocator);
         },
         .ping, .pong, .sync_request => {},
     }
