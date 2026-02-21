@@ -260,10 +260,10 @@ pub const PartialReconstructor = struct {
                         .json_len = tc.json_chunks.items.len,
                     };
                     if (tc.id) |id| {
-                        tcp.id = try self.allocator.dupe(u8, id);
+                        tcp.id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, id));
                     }
                     if (tc.name) |name| {
-                        tcp.name = try self.allocator.dupe(u8, name);
+                        tcp.name = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, name));
                     }
                     break :blk .{ .tool_call = tcp };
                 },

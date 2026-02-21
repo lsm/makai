@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
 const content_partial = @import("content_partial");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const SerializationOptions = struct {
     /// If true, include lightweight partial field in events
@@ -116,8 +117,8 @@ pub const PartialState = struct {
                 const name = try self.allocator.dupe(u8, e.tool_call.name);
                 try self.blocks.put(e.content_index, .{
                     .tool_call = .{
-                        .id = id,
-                        .name = name,
+                        .id = OwnedSlice(u8).initOwned(id),
+                        .name = OwnedSlice(u8).initOwned(name),
                         .json_len = e.tool_call.arguments_json.len,
                     },
                 });
@@ -294,10 +295,10 @@ fn serializeBlockPartial(w: *json_writer.JsonWriter, content_index: usize, parti
         .tool_call => |tc| {
             try w.writeKey("tool_call");
             try w.beginObject();
-            if (tc.id) |id| {
+            if (tc.getId()) |id| {
                 try w.writeStringField("id", id);
             }
-            if (tc.name) |name| {
+            if (tc.getName()) |name| {
                 try w.writeStringField("name", name);
             }
             try w.writeIntField("json_len", tc.json_len);
@@ -446,8 +447,8 @@ test "processEvent tracks tool call accumulation" {
     const block2 = state.getBlockPartial(0);
     try std.testing.expect(block2 != null);
     if (block2) |b| {
-        try std.testing.expectEqualStrings("tool-123", b.tool_call.id.?);
-        try std.testing.expectEqualStrings("bash", b.tool_call.name.?);
+        try std.testing.expectEqualStrings("tool-123", b.tool_call.getId().?);
+        try std.testing.expectEqualStrings("bash", b.tool_call.getName().?);
         // {"cmd": "ls"} = 13 characters
         try std.testing.expectEqual(@as(usize, 13), b.tool_call.json_len);
     }

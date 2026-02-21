@@ -360,6 +360,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -371,6 +372,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

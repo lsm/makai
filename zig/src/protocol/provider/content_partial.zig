@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Partial state for a text content block
 pub const TextPartial = struct {
@@ -16,21 +17,25 @@ pub const ThinkingPartial = struct {
 /// Partial state for a tool call content block
 pub const ToolCallPartial = struct {
     /// Tool call ID (from toolcall_start)
-    id: ?[]const u8 = null,
+    id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Tool name (from toolcall_start)
-    name: ?[]const u8 = null,
+    name: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Length of accumulated JSON arguments
     json_len: usize = 0,
 
+    pub fn getId(self: *const ToolCallPartial) ?[]const u8 {
+        const id = self.id.slice();
+        return if (id.len > 0) id else null;
+    }
+
+    pub fn getName(self: *const ToolCallPartial) ?[]const u8 {
+        const name = self.name.slice();
+        return if (name.len > 0) name else null;
+    }
+
     pub fn deinit(self: *ToolCallPartial, allocator: std.mem.Allocator) void {
-        if (self.id) |id| {
-            allocator.free(id);
-            self.id = null;
-        }
-        if (self.name) |name| {
-            allocator.free(name);
-            self.name = null;
-        }
+        self.id.deinit(allocator);
+        self.name.deinit(allocator);
     }
 };
 
@@ -124,8 +129,8 @@ test "ContentBlockPartial deinit frees owned strings" {
 
     var partial: ContentBlockPartial = .{
         .tool_call = .{
-            .id = id,
-            .name = name,
+            .id = OwnedSlice(u8).initOwned(id),
+            .name = OwnedSlice(u8).initOwned(name),
             .json_len = 10,
         },
     };
@@ -202,8 +207,8 @@ test "updateBlockPartial replaces and frees old partial" {
 
     try partial.updateBlockPartial(0, .{
         .tool_call = .{
-            .id = id1,
-            .name = name1,
+            .id = OwnedSlice(u8).initOwned(id1),
+            .name = OwnedSlice(u8).initOwned(name1),
             .json_len = 5,
         },
     });
@@ -214,8 +219,8 @@ test "updateBlockPartial replaces and frees old partial" {
 
     try partial.updateBlockPartial(0, .{
         .tool_call = .{
-            .id = id2,
-            .name = name2,
+            .id = OwnedSlice(u8).initOwned(id2),
+            .name = OwnedSlice(u8).initOwned(name2),
             .json_len = 10,
         },
     });
@@ -223,8 +228,8 @@ test "updateBlockPartial replaces and frees old partial" {
     const block = partial.getBlockPartial(0);
     try std.testing.expect(block != null);
     if (block) |b| {
-        try std.testing.expectEqualStrings("tool-new", b.tool_call.id.?);
-        try std.testing.expectEqualStrings("new-tool", b.tool_call.name.?);
+        try std.testing.expectEqualStrings("tool-new", b.tool_call.getId().?);
+        try std.testing.expectEqualStrings("new-tool", b.tool_call.getName().?);
         try std.testing.expectEqual(@as(usize, 10), b.tool_call.json_len);
     }
 }
@@ -257,7 +262,7 @@ test "ThinkingPartial default values" {
 
 test "ToolCallPartial default values" {
     const tc_partial = ToolCallPartial{};
-    try std.testing.expect(tc_partial.id == null);
-    try std.testing.expect(tc_partial.name == null);
+    try std.testing.expect(tc_partial.getId() == null);
+    try std.testing.expect(tc_partial.getName() == null);
     try std.testing.expectEqual(@as(usize, 0), tc_partial.json_len);
 }
