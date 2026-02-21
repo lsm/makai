@@ -523,7 +523,7 @@ fn performHandshake(
 
     try writer.print("GET {s} HTTP/1.1\r\n", .{path});
     try writer.print("Host: {s}\r\n", .{host});
-    try writer.print("Upgrade: websocket\r\n", .{host});
+    try writer.print("Upgrade: websocket\r\n", .{});
     try writer.print("Connection: Upgrade\r\n", .{});
     try writer.print("Sec-WebSocket-Key: {s}\r\n", .{key});
     try writer.print("Sec-WebSocket-Protocol: makai.v1\r\n", .{});
