@@ -143,7 +143,12 @@ Ownership and auth boundary:
 - `partial_reconstructor.zig`: Rebuilds `AssistantMessage` from partial snapshots on the client side
 - `content_partial.zig`: Content block partial state tracking
 
-**`protocol/agent/types.zig`** - Agent protocol types (for distributed agent protocol)
+**`protocol/agent/`** - Distributed agent protocol runtime:
+- `types.zig`: wire types/envelopes/payloads
+- `envelope.zig`: JSON serialization/deserialization helpers
+- `server.zig`: `AgentProtocolServer` session/state handler + outbox
+- `client.zig`: `AgentProtocolClient` sender/state/event collector
+- `runtime.zig`: `AgentProtocolRuntime` pump for client/server over transport
 
 **`protocol/tool/types.zig`** - Tool protocol types (for distributed tool execution)
 

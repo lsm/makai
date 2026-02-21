@@ -262,7 +262,8 @@ pub const Payload = union(enum) {
                 allocator.free(t.tool_call_id);
                 allocator.free(t.partial_json);
             },
-            .agent_started, .agent_status, .session_info, .ping => {},
+            .session_info => |*s| allocator.free(s.model),
+            .agent_started, .agent_status, .ping => {},
         }
     }
 };
