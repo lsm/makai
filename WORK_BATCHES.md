@@ -32,6 +32,9 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [ ] Add close-handshake robustness tests
 - [ ] Add CI job split for websocket-heavy test lanes (if needed)
 
+Progress note:
+- Added reconnect precondition coverage (`closed` state can reconnect path) and close idempotence test coverage.
+
 ### Batch C — Provider Client Multiplexing API Cleanup
 - [ ] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)
 - [ ] Add tests for per-stream cleanup (no leaks after stream terminal)
