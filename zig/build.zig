@@ -399,6 +399,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "streaming_json", .module = streaming_json_mod },
             .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -432,6 +433,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
             .{ .name = "oom", .module = oom_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

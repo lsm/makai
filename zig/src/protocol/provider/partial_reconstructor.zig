@@ -2,6 +2,9 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const streaming_json = @import("streaming_json");
 const content_partial = @import("content_partial");
+const owned_slice_mod = @import("owned_slice");
+
+const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 /// Client-side reconstructor for building AssistantMessage from events
 pub const PartialReconstructor = struct {
@@ -13,10 +16,10 @@ pub const PartialReconstructor = struct {
     /// Running usage
     usage: ai_types.Usage,
 
-    /// Metadata from start event
-    model: ?[]const u8 = null,
-    api: ?[]const u8 = null,
-    provider: ?[]const u8 = null,
+    /// Metadata from start event (owned or borrowed)
+    model: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    api: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    provider: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     /// Track if we've seen start
     started: bool = false,
@@ -49,9 +52,9 @@ pub const PartialReconstructor = struct {
 
     pub fn deinit(self: *Self) void {
         // Free metadata strings
-        if (self.model) |m| self.allocator.free(m);
-        if (self.api) |a| self.allocator.free(a);
-        if (self.provider) |p| self.allocator.free(p);
+        self.model.deinit(self.allocator);
+        self.api.deinit(self.allocator);
+        self.provider.deinit(self.allocator);
 
         // Free content blocks
         var iter = self.content_blocks.iterator();
@@ -79,16 +82,24 @@ pub const PartialReconstructor = struct {
         switch (event) {
             .start => |s| {
                 self.started = true;
-                // Dupe metadata strings
-                if (s.partial.model.len > 0) {
-                    self.model = try self.allocator.dupe(u8, s.partial.model);
-                }
-                if (s.partial.api.len > 0) {
-                    self.api = try self.allocator.dupe(u8, s.partial.api);
-                }
-                if (s.partial.provider.len > 0) {
-                    self.provider = try self.allocator.dupe(u8, s.partial.provider);
-                }
+                // Dupe metadata strings into owned wrappers
+                self.model.deinit(self.allocator);
+                self.model = if (s.partial.model.len > 0)
+                    OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, s.partial.model))
+                else
+                    OwnedSlice(u8).initBorrowed("");
+
+                self.api.deinit(self.allocator);
+                self.api = if (s.partial.api.len > 0)
+                    OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, s.partial.api))
+                else
+                    OwnedSlice(u8).initBorrowed("");
+
+                self.provider.deinit(self.allocator);
+                self.provider = if (s.partial.provider.len > 0)
+                    OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, s.partial.provider))
+                else
+                    OwnedSlice(u8).initBorrowed("");
                 // Accumulate initial usage
                 self.usage.input += s.partial.usage.input;
                 self.usage.output += s.partial.usage.output;
@@ -222,14 +233,14 @@ pub const PartialReconstructor = struct {
         errdefer partial.deinit();
 
         // Set metadata (borrowed references - do not dupe)
-        if (self.model) |m| {
-            partial.model = m;
+        if (self.model.slice().len > 0) {
+            partial.model = self.model.slice();
         }
-        if (self.api) |a| {
-            partial.api = a;
+        if (self.api.slice().len > 0) {
+            partial.api = self.api.slice();
         }
-        if (self.provider) |p| {
-            partial.provider = p;
+        if (self.provider.slice().len > 0) {
+            partial.provider = self.provider.slice();
         }
 
         // Copy usage
@@ -309,13 +320,13 @@ pub const PartialReconstructor = struct {
         }
 
         // Dupe metadata strings for the message
-        const duped_model = if (self.model) |m| try self.allocator.dupe(u8, m) else try self.allocator.dupe(u8, "");
+        const duped_model = try self.allocator.dupe(u8, self.model.slice());
         errdefer self.allocator.free(duped_model);
 
-        const duped_api = if (self.api) |a| try self.allocator.dupe(u8, a) else try self.allocator.dupe(u8, "");
+        const duped_api = try self.allocator.dupe(u8, self.api.slice());
         errdefer self.allocator.free(duped_api);
 
-        const duped_provider = if (self.provider) |p| try self.allocator.dupe(u8, p) else try self.allocator.dupe(u8, "");
+        const duped_provider = try self.allocator.dupe(u8, self.provider.slice());
         errdefer self.allocator.free(duped_provider);
 
         return .{
@@ -333,18 +344,12 @@ pub const PartialReconstructor = struct {
     /// Reset for reuse with new stream
     pub fn reset(self: *Self) void {
         // Free metadata strings
-        if (self.model) |m| {
-            self.allocator.free(m);
-            self.model = null;
-        }
-        if (self.api) |a| {
-            self.allocator.free(a);
-            self.api = null;
-        }
-        if (self.provider) |p| {
-            self.allocator.free(p);
-            self.provider = null;
-        }
+        self.model.deinit(self.allocator);
+        self.model = OwnedSlice(u8).initBorrowed("");
+        self.api.deinit(self.allocator);
+        self.api = OwnedSlice(u8).initBorrowed("");
+        self.provider.deinit(self.allocator);
+        self.provider = OwnedSlice(u8).initBorrowed("");
 
         // Free content blocks
         var iter = self.content_blocks.iterator();
@@ -380,9 +385,9 @@ test "PartialReconstructor init and deinit" {
 
     try std.testing.expect(!recon.started);
     try std.testing.expect(!recon.done_received);
-    try std.testing.expect(recon.model == null);
-    try std.testing.expect(recon.api == null);
-    try std.testing.expect(recon.provider == null);
+    try std.testing.expectEqual(@as(usize, 0), recon.model.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), recon.api.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), recon.provider.slice().len);
 }
 
 test "processEvent accumulates text deltas" {
@@ -644,7 +649,7 @@ test "reset clears all state" {
     // Verify state exists
     try std.testing.expect(recon.started);
     try std.testing.expect(recon.done_received);
-    try std.testing.expect(recon.model != null);
+    try std.testing.expect(recon.model.slice().len > 0);
     try std.testing.expectEqual(@as(usize, 1), recon.content_blocks.count());
 
     // Reset
@@ -653,9 +658,9 @@ test "reset clears all state" {
     // Verify state is cleared
     try std.testing.expect(!recon.started);
     try std.testing.expect(!recon.done_received);
-    try std.testing.expect(recon.model == null);
-    try std.testing.expect(recon.api == null);
-    try std.testing.expect(recon.provider == null);
+    try std.testing.expectEqual(@as(usize, 0), recon.model.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), recon.api.slice().len);
+    try std.testing.expectEqual(@as(usize, 0), recon.provider.slice().len);
     try std.testing.expectEqual(@as(usize, 0), recon.content_blocks.count());
     try std.testing.expectEqual(@as(u64, 0), recon.usage.input);
     try std.testing.expectEqual(@as(u64, 0), recon.usage.output);

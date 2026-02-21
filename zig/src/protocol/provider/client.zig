@@ -6,6 +6,9 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const transport = @import("transport");
 const oom = @import("oom");
+const owned_slice_mod = @import("owned_slice");
+
+const OwnedSlice = owned_slice_mod.OwnedSlice;
 
 /// Client-side protocol handler for the Makai Wire Protocol
 ///
@@ -52,7 +55,7 @@ pub const ProtocolClient = struct {
     last_result: ?ai_types.AssistantMessage = null,
 
     /// Last error message (from NACK or stream_error)
-    last_error: ?[]const u8 = null,
+    last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     /// Whether the stream is complete
     stream_complete: bool = false,
@@ -98,9 +101,7 @@ pub const ProtocolClient = struct {
         }
 
         // Clean up last error
-        if (self.last_error) |err| {
-            self.allocator.free(err);
-        }
+        self.last_error.deinit(self.allocator);
 
         // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
@@ -109,6 +110,15 @@ pub const ProtocolClient = struct {
     /// Set the transport sender
     pub fn setSender(self: *Self, sender: transport.AsyncSender) void {
         self.sender = sender;
+    }
+
+    fn hasLastError(self: *const Self) bool {
+        return self.last_error.slice().len > 0;
+    }
+
+    fn setLastError(self: *Self, msg: []const u8) !void {
+        self.last_error.deinit(self.allocator);
+        self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
     }
 
     /// Send stream_request, returns message_id for correlation
@@ -214,10 +224,7 @@ pub const ProtocolClient = struct {
                 _ = self.pending_requests.fetchRemove(nack.rejected_id);
 
                 // Store error
-                if (self.last_error) |err| {
-                    self.allocator.free(err);
-                }
-                self.last_error = try self.allocator.dupe(u8, nack.reason);
+                try self.setLastError(nack.reason);
             },
             .event => |evt| {
                 // Deep copy the event so the event stream owns its memory
@@ -260,10 +267,7 @@ pub const ProtocolClient = struct {
             },
             .stream_error => |err| {
                 // Store error
-                if (self.last_error) |e| {
-                    self.allocator.free(e);
-                }
-                self.last_error = try self.allocator.dupe(u8, err.message);
+                try self.setLastError(err.message);
                 self.stream_complete = true;
 
                 // Complete the event stream with error
@@ -294,7 +298,7 @@ pub const ProtocolClient = struct {
             }
 
             // Check for errors
-            if (self.last_error) |_| {
+            if (self.hasLastError()) {
                 return error.StreamError;
             }
 
@@ -303,7 +307,7 @@ pub const ProtocolClient = struct {
         }
 
         // Check for error
-        if (self.last_error) |_| {
+        if (self.hasLastError()) {
             return error.StreamError;
         }
 
@@ -328,10 +332,8 @@ pub const ProtocolClient = struct {
             self.last_result = null;
         }
 
-        if (self.last_error) |err| {
-            self.allocator.free(err);
-            self.last_error = null;
-        }
+        self.last_error.deinit(self.allocator);
+        self.last_error = OwnedSlice(u8).initBorrowed("");
     }
 
     /// Get the current stream ID
@@ -341,7 +343,8 @@ pub const ProtocolClient = struct {
 
     /// Get the last error message
     pub fn getLastError(self: *Self) ?[]const u8 {
-        return self.last_error;
+        if (!self.hasLastError()) return null;
+        return self.last_error.slice();
     }
 };
 
@@ -504,8 +507,8 @@ test "processEnvelope handles nack" {
     try std.testing.expect(!client.pending_requests.contains(message_id));
 
     // Verify error was stored
-    try std.testing.expect(client.last_error != null);
-    try std.testing.expectEqualStrings("Model not found", client.last_error.?);
+    try std.testing.expect(client.getLastError() != null);
+    try std.testing.expectEqualStrings("Model not found", client.getLastError().?);
 
     env.deinit(allocator);
 }
@@ -854,8 +857,8 @@ test "processEnvelope handles stream_error payload" {
     try std.testing.expect(client.isComplete());
 
     // Verify error was stored
-    try std.testing.expect(client.last_error != null);
-    try std.testing.expectEqualStrings("Connection timeout", client.last_error.?);
+    try std.testing.expect(client.getLastError() != null);
+    try std.testing.expectEqualStrings("Connection timeout", client.getLastError().?);
 
     env.deinit(allocator);
 }
@@ -881,7 +884,7 @@ test "reset clears all state" {
         .stop_reason = .stop,
         .timestamp = 0,
     });
-    client.last_error = try allocator.dupe(u8, "test error");
+    client.last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "test error"));
 
     // Reset
     client.reset();
@@ -891,7 +894,7 @@ test "reset clears all state" {
     try std.testing.expect(!client.stream_complete);
     try std.testing.expectEqual(@as(u64, 0), client.sequence);
     try std.testing.expect(client.last_result == null);
-    try std.testing.expect(client.last_error == null);
+    try std.testing.expect(client.getLastError() == null);
 }
 
 test "getCurrentStreamId returns correct value" {
@@ -922,7 +925,7 @@ test "getLastError returns correct value" {
     try std.testing.expect(client.getLastError() == null);
 
     // After setting
-    client.last_error = try allocator.dupe(u8, "Test error");
+    client.last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Test error"));
 
     const result = client.getLastError();
     try std.testing.expect(result != null);
