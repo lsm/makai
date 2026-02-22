@@ -36,7 +36,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
     // 2. Build authorization URL
     const auth_url = try std.fmt.allocPrint(allocator,
-        "{s}?client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
+        "{s}?code=true&client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
         .{ auth_url_base, client_id, redirect_uri, scopes, pkce.challenge, pkce.verifier },
     );
     defer allocator.free(auth_url);
@@ -56,8 +56,10 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     defer allocator.free(parsed_auth.code);
     defer allocator.free(parsed_auth.state);
 
-    // 5. Exchange code for tokens
-    const token_response = try exchangeCode(parsed_auth.code, parsed_auth.state, pkce.verifier, allocator);
+    // 5. Exchange code for tokens.
+    // Some UX paths provide only the code, so fall back to our original state value.
+    const state_for_exchange = if (parsed_auth.state.len > 0) parsed_auth.state else pkce.verifier;
+    const token_response = try exchangeCode(parsed_auth.code, state_for_exchange, pkce.verifier, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
@@ -187,6 +189,72 @@ const TokenResponse = struct {
     expires_in: i64,
 };
 
+fn getObjectStringField(obj: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |value| {
+        if (value == .string) return value.string;
+    }
+    return null;
+}
+
+fn getObjectI64Field(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
+    if (obj.get(key)) |value| {
+        return switch (value) {
+            .integer => value.integer,
+            .float => @intFromFloat(value.float),
+            else => null,
+        };
+    }
+    return null;
+}
+
+fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
+        std.debug.print("Failed to parse token response JSON: {s}\n", .{response_body});
+        return error.ParseError;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) {
+        std.debug.print("Token response is not an object: {s}\n", .{response_body});
+        return error.ParseError;
+    }
+
+    const obj = &parsed.value.object;
+    if (getObjectStringField(obj, "error")) |err| {
+        std.debug.print("OAuth error: {s}", .{err});
+        if (getObjectStringField(obj, "error_description")) |desc| {
+            std.debug.print(" - {s}", .{desc});
+        }
+        std.debug.print("\n", .{});
+        return error.OAuthFailed;
+    }
+
+    const access_token = getObjectStringField(obj, "access_token") orelse
+        getObjectStringField(obj, "accessToken") orelse {
+        std.debug.print("Token response missing access_token: {s}\n", .{response_body});
+        return error.ParseError;
+    };
+    const refresh_token = getObjectStringField(obj, "refresh_token") orelse
+        getObjectStringField(obj, "refreshToken") orelse access_token;
+
+    var expires_in = getObjectI64Field(obj, "expires_in") orelse
+        getObjectI64Field(obj, "expiresIn") orelse 3600;
+    if (expires_in <= 0) {
+        if (getObjectI64Field(obj, "expires_at")) |expires_at| {
+            const now_seconds = std.time.timestamp();
+            if (expires_at > now_seconds) expires_in = expires_at - now_seconds else expires_in = 3600;
+        } else {
+            expires_in = 3600;
+        }
+    }
+
+    return .{
+        .access_token = try allocator.dupe(u8, access_token),
+        .refresh_token = try allocator.dupe(u8, refresh_token),
+        .expires_in = expires_in,
+    };
+}
+
 /// Exchange authorization code for tokens
 fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     // Build JSON body
@@ -220,12 +288,14 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
-    try headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" });
 
     var request = try client.request(.POST, uri, .{
         .extra_headers = headers.items,
     });
     defer request.deinit();
+
+    // Avoid compressed response bodies for stable token JSON parsing.
+    request.headers.accept_encoding = .omit;
 
     request.transfer_encoding = .{ .content_length = body.len };
     try request.sendBodyComplete(@constCast(body));
@@ -245,48 +315,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
     defer allocator.free(response_body);
 
-    // First check for error response
-    if (std.json.parseFromSlice(
-        struct {
-            @"error": ?[]const u8 = null,
-            error_description: ?[]const u8 = null,
-        },
-        allocator,
-        response_body,
-        .{ .ignore_unknown_fields = true },
-    )) |error_parsed| {
-        defer error_parsed.deinit();
-        if (error_parsed.value.@"error") |err| {
-            std.debug.print("OAuth error: {s}", .{err});
-            if (error_parsed.value.error_description) |desc| {
-                std.debug.print(" - {s}", .{desc});
-            }
-            std.debug.print("\n", .{});
-            return error.OAuthFailed;
-        }
-    } else |_| {}
-
-    // Parse JSON response
-    const parsed = std.json.parseFromSlice(
-        struct {
-            access_token: []const u8,
-            refresh_token: []const u8,
-            expires_in: i64,
-        },
-        allocator,
-        response_body,
-        .{ .ignore_unknown_fields = true },
-    ) catch {
-        std.debug.print("Failed to parse JSON response: {s}\n", .{response_body});
-        return error.ParseError;
-    };
-    defer parsed.deinit();
-
-    return .{
-        .access_token = try allocator.dupe(u8, parsed.value.access_token),
-        .refresh_token = try allocator.dupe(u8, parsed.value.refresh_token),
-        .expires_in = parsed.value.expires_in,
-    };
+    return try parseTokenResponse(response_body, allocator);
 }
 
 test "parseAuthFromManualInput - hash fragment with state" {
@@ -340,4 +369,17 @@ test "getApiKey - returns access token" {
     defer std.testing.allocator.free(api_key);
 
     try std.testing.expectEqualStrings("access_token", api_key);
+}
+
+test "parseTokenResponse handles missing refresh and expires" {
+    const payload =
+        \\{"access_token":"a-token"}
+    ;
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer std.testing.allocator.free(response.access_token);
+    defer std.testing.allocator.free(response.refresh_token);
+
+    try std.testing.expectEqualStrings("a-token", response.access_token);
+    try std.testing.expectEqualStrings("a-token", response.refresh_token);
+    try std.testing.expect(response.expires_in > 0);
 }

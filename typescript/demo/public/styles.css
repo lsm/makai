@@ -55,6 +55,21 @@ button {
   color: #9ed0ff;
 }
 
+.auth-url {
+  margin-top: 8px;
+  color: #b5d6ff;
+}
+
+.auth-url a {
+  color: #8fcbff;
+}
+
+.auth-instructions {
+  margin-top: 6px;
+  color: #9fb0d4;
+}
+
+.auth-url.hidden,
 .prompt.hidden {
   display: none;
 }

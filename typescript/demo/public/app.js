@@ -7,6 +7,9 @@ const state = {
 const authProviderSelect = document.getElementById("authProvider");
 const authStartBtn = document.getElementById("authStartBtn");
 const authStatus = document.getElementById("authStatus");
+const authUrlBox = document.getElementById("authUrlBox");
+const authUrlLink = document.getElementById("authUrlLink");
+const authUrlInstructions = document.getElementById("authUrlInstructions");
 const authEvents = document.getElementById("authEvents");
 const authPromptBox = document.getElementById("authPromptBox");
 const authPromptLabel = document.getElementById("authPromptLabel");
@@ -35,6 +38,44 @@ function setAuthPrompt(promptEvent) {
   authPromptLabel.textContent = promptEvent.message;
   authPromptBox.classList.remove("hidden");
   authPromptInput.focus();
+}
+
+function setAuthUrl(urlEvent) {
+  if (!urlEvent || !urlEvent.url) {
+    authUrlBox.classList.add("hidden");
+    authUrlLink.removeAttribute("href");
+    authUrlLink.textContent = "";
+    authUrlInstructions.textContent = "";
+    return;
+  }
+  authUrlLink.href = urlEvent.url;
+  authUrlLink.textContent = urlEvent.url;
+  authUrlInstructions.textContent = urlEvent.instructions ?? "";
+  authUrlBox.classList.remove("hidden");
+}
+
+function normalizePromptAnswer(rawInput) {
+  const raw = (rawInput ?? "").trim();
+  if (!raw) return raw;
+
+  try {
+    const parsed = new URL(raw);
+    const hash = parsed.hash.startsWith("#") ? parsed.hash.slice(1) : parsed.hash;
+    const hashParams = new URLSearchParams(hash);
+    const hashCode = hashParams.get("code");
+    if (hashCode) return hashCode;
+    const queryCode = parsed.searchParams.get("code");
+    if (queryCode) return queryCode;
+  } catch {}
+
+  const fragmentLike = raw.startsWith("#") ? raw.slice(1) : raw;
+  if (fragmentLike.includes("code=")) {
+    const params = new URLSearchParams(fragmentLike);
+    const code = params.get("code");
+    if (code) return code;
+  }
+
+  return raw;
 }
 
 function renderProviderModels() {
@@ -84,9 +125,12 @@ async function pollAuthSession() {
 
   authStatus.textContent = `Auth status: ${payload.status}`;
   authEvents.textContent = "";
+  let latestAuthUrl = null;
   for (const event of payload.events) {
+    if (event.type === "auth_url") latestAuthUrl = event;
     appendAuthLine(JSON.stringify(event));
   }
+  setAuthUrl(latestAuthUrl);
 
   setAuthPrompt(payload.pendingPrompt);
 
@@ -109,6 +153,7 @@ function addMessage(role, text) {
 
 authStartBtn.addEventListener("click", async () => {
   authEvents.textContent = "";
+  setAuthUrl(null);
   setAuthPrompt(null);
   authStatus.textContent = "Starting auth session...";
 
@@ -135,7 +180,10 @@ authStartBtn.addEventListener("click", async () => {
 
 authPromptSubmit.addEventListener("click", async () => {
   if (!state.authSessionId) return;
-  const answer = authPromptInput.value;
+  const answer = normalizePromptAnswer(authPromptInput.value);
+  if (answer !== authPromptInput.value.trim()) {
+    appendAuthLine("info: extracted code from pasted callback URL");
+  }
   const response = await fetch(`/api/auth/sessions/${state.authSessionId}/respond`, {
     method: "POST",
     headers: { "content-type": "application/json" },

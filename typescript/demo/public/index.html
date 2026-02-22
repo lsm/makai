@@ -19,6 +19,11 @@
           <button id="authStartBtn">Start OAuth</button>
         </div>
         <div id="authStatus" class="status">Idle</div>
+        <div id="authUrlBox" class="auth-url hidden">
+          Open this URL to continue:
+          <a id="authUrlLink" href="#" target="_blank" rel="noopener noreferrer"></a>
+          <div id="authUrlInstructions" class="auth-instructions"></div>
+        </div>
         <div id="authPromptBox" class="prompt hidden">
           <label for="authPromptInput" id="authPromptLabel">Prompt</label>
           <input id="authPromptInput" type="text" autocomplete="off" />

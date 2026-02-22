@@ -155,7 +155,9 @@ export async function loginWithMakaiAuth(options: LoginWithMakaiAuthOptions): Pr
         }
 
         if (event.type === "error") {
-          throw new MakaiAuthError(event.message, event.code);
+          const stderrDetail = stderr.trim();
+          const message = stderrDetail.length > 0 ? `${event.message}: ${stderrDetail}` : event.message;
+          throw new MakaiAuthError(message, event.code);
         }
 
         if (event.type === "success") {
