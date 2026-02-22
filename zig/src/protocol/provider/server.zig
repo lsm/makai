@@ -362,6 +362,9 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
             server.allocator,
         );
     };
+    // Provider streams are produced by background threads; wait for producer completion
+    // before deinit/destroy during abort and cleanup paths.
+    stream.wait_for_thread_on_deinit = true;
 
     // Create ActiveStream entry
     const active_stream = ProtocolServer.ActiveStream{
@@ -726,6 +729,8 @@ test "handleStreamRequest creates stream and returns ack" {
 
     // Verify stream was created
     try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    const created = server.active_streams.get(client_stream_id).?;
+    try std.testing.expect(created.event_stream.wait_for_thread_on_deinit);
 
     stream_req_env.deinit(std.testing.allocator);
     // ack response doesn't allocate memory, so no need to deinit
