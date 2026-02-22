@@ -91,13 +91,26 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const oauth_utils_pkce_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/pkce.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const oauth_anthropic_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/oauth/anthropic.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
         },
+    });
+
+    const oauth_storage_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/storage.zig"),
+        .target = target,
+        .optimize = optimize,
     });
 
     const provider_caps_mod = b.createModule(.{
@@ -948,6 +961,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/tools/makai.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+                .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+                .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            },
         }),
     });
     b.installArtifact(makai_cli);

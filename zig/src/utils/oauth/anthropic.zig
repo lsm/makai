@@ -1,5 +1,5 @@
 const std = @import("std");
-const pkce_mod = @import("pkce");
+const pkce_mod = @import("oauth/pkce");
 
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const redirect_uri = "https://console.anthropic.com/oauth/code/callback";

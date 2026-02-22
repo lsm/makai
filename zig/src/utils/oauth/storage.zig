@@ -122,47 +122,58 @@ pub const AuthStorage = struct {
         defer file.close();
 
         // Build JSON
-        var json_buf = std.ArrayList(u8).init(self.allocator);
-        defer json_buf.deinit();
+        var json_buf = std.ArrayList(u8){};
+        defer json_buf.deinit(self.allocator);
 
-        try json_buf.appendSlice("{\n");
+        const appendJsonString = struct {
+            fn appendJsonString(
+                allocator: std.mem.Allocator,
+                buf: *std.ArrayList(u8),
+                value: []const u8,
+            ) !void {
+                const encoded = try std.json.Stringify.valueAlloc(allocator, value, .{});
+                defer allocator.free(encoded);
+                try buf.appendSlice(allocator, encoded);
+            }
+        }.appendJsonString;
+
+        try json_buf.appendSlice(self.allocator, "{\n");
 
         var iter = self.providers.iterator();
         var first = true;
         while (iter.next()) |entry| {
-            if (!first) try json_buf.appendSlice(",\n");
+            if (!first) try json_buf.appendSlice(self.allocator, ",\n");
             first = false;
 
-            try json_buf.appendSlice("  \"");
-            try json_buf.appendSlice(entry.key_ptr.*);
-            try json_buf.appendSlice("\": ");
+            try json_buf.appendSlice(self.allocator, "  ");
+            try appendJsonString(self.allocator, &json_buf, entry.key_ptr.*);
+            try json_buf.appendSlice(self.allocator, ": ");
 
             switch (entry.value_ptr.*) {
                 .api_key => |key| {
-                    try json_buf.appendSlice("{\"api_key\":\"");
-                    try json_buf.appendSlice(key);
-                    try json_buf.appendSlice("\"}");
+                    try json_buf.appendSlice(self.allocator, "{\"api_key\":");
+                    try appendJsonString(self.allocator, &json_buf, key);
+                    try json_buf.appendSlice(self.allocator, "}");
                 },
                 .oauth => |creds| {
-                    try json_buf.appendSlice("{\"refresh\":\"");
-                    try json_buf.appendSlice(creds.refresh);
-                    try json_buf.appendSlice("\",\"access\":\"");
-                    try json_buf.appendSlice(creds.access);
-                    try json_buf.appendSlice("\",\"expires\":");
+                    try json_buf.appendSlice(self.allocator, "{\"refresh\":");
+                    try appendJsonString(self.allocator, &json_buf, creds.refresh);
+                    try json_buf.appendSlice(self.allocator, ",\"access\":");
+                    try appendJsonString(self.allocator, &json_buf, creds.access);
+                    try json_buf.appendSlice(self.allocator, ",\"expires\":");
                     const expires_str = try std.fmt.allocPrint(self.allocator, "{d}", .{creds.expires});
                     defer self.allocator.free(expires_str);
-                    try json_buf.appendSlice(expires_str);
+                    try json_buf.appendSlice(self.allocator, expires_str);
                     if (creds.provider_data) |data| {
-                        try json_buf.appendSlice(",\"provider_data\":\"");
-                        try json_buf.appendSlice(data);
-                        try json_buf.appendSlice("\"");
+                        try json_buf.appendSlice(self.allocator, ",\"provider_data\":");
+                        try appendJsonString(self.allocator, &json_buf, data);
                     }
-                    try json_buf.appendSlice("}");
+                    try json_buf.appendSlice(self.allocator, "}");
                 },
             }
         }
 
-        try json_buf.appendSlice("\n}\n");
+        try json_buf.appendSlice(self.allocator, "\n}\n");
 
         try file.writeAll(json_buf.items);
 

@@ -1,6 +1,6 @@
 const std = @import("std");
-const pkce_mod = @import("pkce");
-const callback_server = @import("callback_server");
+const pkce_mod = @import("oauth/pkce");
+const callback_server = @import("oauth/callback_server");
 
 const client_id_gemini = "534761656150-8dc8f1ih2f0bjpvpu7he6tq0lqr6jq2r.apps.googleusercontent.com";
 const auth_url_base = "https://accounts.google.com/o/oauth2/v2/auth";
