@@ -24,6 +24,35 @@ This spec does not define transport framing changes.
 
 Normative rule: end users do not manage provider-specific headers, token files, or response parsing.
 
+### 2.1 Agent vs Provider Path (Normative)
+
+- `client.agent.run` / `client.agent.stream`:
+  - default end-user path,
+  - includes session semantics and tool-orchestration behavior,
+  - preferred for agentic workflows and multi-turn execution.
+- `client.provider.complete` / `client.provider.stream`:
+  - advanced direct-provider path,
+  - no agent loop/tool orchestration beyond what provider natively supports,
+  - preferred for simple passthrough chat/completion workloads.
+
+### 2.2 Model Data Source and Caching (Normative)
+
+Model discovery is provider-owned and auth-aware.
+
+Data source precedence:
+1. Dynamic provider fetch (if provider exposes model listing and credentials allow it).
+2. Static built-in fallback catalog (for providers without dynamic listing support).
+
+Caching rules:
+- `fetched_at_ms` is required for all responses.
+- `cache_max_age_ms` is required for all responses.
+- Clients treat cached data as stale when `now_ms > fetched_at_ms + cache_max_age_ms`.
+- `source` indicates origin: `"dynamic"` or `"static_fallback"`.
+
+Auth for listing:
+- Providers that require auth for model listing must return `auth_status = "login_required"` (or `"expired"` / `"failed"`).
+- Missing auth must not hard-fail the whole response if static fallback is available.
+
 ## 3. TypeScript SDK Public API (Normative)
 
 ```ts
@@ -38,7 +67,14 @@ export type ApiId =
   | "ollama"
   | string;
 
-export type AuthStatus = "authenticated" | "login_required" | "expired" | "unknown";
+export type AuthStatus =
+  | "authenticated"
+  | "login_required"
+  | "expired"
+  | "refreshing"
+  | "login_in_progress"
+  | "failed"
+  | "unknown";
 
 export type ModelLifecycle = "stable" | "preview" | "deprecated";
 
@@ -60,7 +96,7 @@ export interface ProviderAuthInfo {
 }
 
 export interface ModelDescriptor {
-  model_ref: string; // stable ref: "<provider>:<model_id>"
+  model_ref: string; // stable ref: "<provider_id>/<api>:<model_id>"
   model_id: string;
   display_name: string;
   provider_id: ProviderId;
@@ -85,6 +121,8 @@ export interface ListModelsRequest {
 export interface ListModelsResponse {
   models: ModelDescriptor[];
   fetched_at_ms: number;
+  cache_max_age_ms: number;
+  source: "dynamic" | "static_fallback";
 }
 
 export interface ChatMessage {
@@ -134,9 +172,13 @@ export interface AgentRunResponse {
 export type AgentStreamEvent =
   | { type: "message_start" }
   | { type: "text_delta"; delta: string }
+  | { type: "thinking_delta"; delta: string }
+  | { type: "reasoning_delta"; delta: string }
   | { type: "tool_call"; name: string; arguments_json: string; id: string }
   | { type: "message_end" }
   | { type: "error"; message: string; code?: string };
+
+export type ProviderStreamEvent = AgentStreamEvent;
 
 export interface ProviderCompleteRequest {
   model_ref: string;
@@ -179,7 +221,7 @@ export interface MakaiAgentApi {
 
 export interface MakaiProviderApi {
   complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse>;
-  stream(request: ProviderCompleteRequest): AsyncIterable<AgentStreamEvent>;
+  stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent>;
 }
 
 export interface MakaiClient {
@@ -190,6 +232,20 @@ export interface MakaiClient {
   close(): Promise<void>;
 }
 ```
+
+### 3.1 `model_ref` Format (Normative)
+
+Canonical format:
+- `model_ref = "<provider_id>/<api>:<model_id>"`
+
+Examples:
+- `anthropic/anthropic-messages:claude-sonnet-4-5`
+- `openai/openai-responses:gpt-4o`
+
+Constraints:
+- `provider_id` and `api` must match `[a-z0-9][a-z0-9-]*`.
+- `model_id` must be non-empty UTF-8 and must not contain `:` (colon).
+- `model_ref` parsing must be deterministic and lossless.
 
 ## 4. Provider Protocol Changes (Normative)
 
@@ -230,6 +286,8 @@ pub const ModelDescriptor = struct {
 pub const ModelsResponse = struct {
     models: OwnedSlice(ModelDescriptor),
     fetched_at_ms: i64,
+    cache_max_age_ms: u64,
+    source: enum { dynamic, static_fallback },
     pub fn deinit(self: *ModelsResponse, allocator: std.mem.Allocator) void { ... }
 };
 ```
@@ -241,6 +299,8 @@ Envelope type values:
 Server behavior:
 1. On `models_request`, return `ack` then `models_response`, or `nack` on failure.
 2. For unsupported runtime, return `nack` with `error_code = not_implemented`.
+3. Dynamic listing should be preferred; static fallback may be used when dynamic listing is unavailable.
+4. For mixed-auth states, return partial results with per-model `auth_status` instead of failing the entire call.
 
 Client behavior:
 1. Treat `not_implemented` as capability absence.
@@ -293,7 +353,7 @@ Provider models response:
     "fetched_at_ms": 1760000000198,
     "models": [
       {
-        "model_ref": "anthropic:claude-sonnet-4-5",
+        "model_ref": "anthropic/anthropic-messages:claude-sonnet-4-5",
         "model_id": "claude-sonnet-4-5",
         "display_name": "Claude Sonnet 4.5",
         "provider_id": "anthropic",
@@ -302,7 +362,9 @@ Provider models response:
         "lifecycle": "stable",
         "capabilities": ["chat", "streaming", "tools", "reasoning"]
       }
-    ]
+    ],
+    "cache_max_age_ms": 300000,
+    "source": "dynamic"
   }
 }
 ```
@@ -317,6 +379,11 @@ Recommended error code mapping:
 - Provider timeout/upstream issue: `provider_error`
 - Invalid filter arguments: `invalid_request`
 
+Auth refresh semantics:
+- Refresh occurs in Zig binary request path.
+- On expired credentials, implementation may auto-refresh before request dispatch.
+- If refresh fails, return `provider_error` with reason prefix `auth:refresh_failed`.
+
 ## 8. Compatibility and Rollout
 
 1. Phase A: ship provider `models_request/models_response` first.
@@ -327,6 +394,12 @@ Recommended error code mapping:
 Backward compatibility:
 - Keep protocol version as `1`.
 - Feature detect by attempting models request and handling `not_implemented`.
+- V1 evolution rule: additive-only changes. Do not repurpose existing fields.
+- Unknown fields must be ignored by parsers.
+
+Capability negotiation:
+- V1 uses implicit feature detection (`not_implemented` probing).
+- Optional explicit capability advertisement may be added in a future protocol revision.
 
 ## 9. Acceptance Criteria
 
@@ -334,3 +407,9 @@ Backward compatibility:
 2. Model list output shape is identical whether called via provider endpoint or agent passthrough.
 3. Agent and provider execution accept the same `model_ref` format.
 4. Existing auth and stream/complete flows remain functional.
+
+## 10. Stream Recovery (V1)
+
+- V1 streams are not resumable after transport interruption.
+- Client behavior on interruption: retry request with full context.
+- Session-level replay/resume is deferred to a future revision.

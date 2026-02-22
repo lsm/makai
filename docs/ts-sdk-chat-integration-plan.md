@@ -28,11 +28,22 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 ### Phase 2: Add auth resolution in binary request path
 
-- Add credential resolution for provider requests:
+- Ownership:
+  - Zig binary owns auth resolution and refresh.
+  - TS client never reads token files and never handles refresh tokens directly.
+- Credential resolution for provider requests:
   - use explicit request API key when provided,
   - otherwise load from auth storage by provider ID.
-- Add OAuth refresh path via provider registry when token is expired.
-- Persist refreshed credentials back to storage.
+- Refresh flow:
+  - if stored credentials are expired, perform refresh before upstream call,
+  - if upstream returns auth failure and credentials are refreshable, refresh and retry once.
+- Concurrency:
+  - apply per-provider refresh lock to prevent concurrent refresh storms.
+- Persistence:
+  - write refreshed credentials atomically back to auth storage.
+- Failure behavior:
+  - return protocol error with `provider_error` and reason prefix `auth:refresh_failed`.
+  - if failure occurs before terminal event in streaming path, terminate stream with error envelope.
 
 ### Phase 3: Add high-level TS SDK APIs
 
@@ -51,6 +62,8 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Zig tests:
   - stdio protocol request/response loop tests,
   - auth resolution and refresh tests.
+  - concurrent refresh tests (single refresh for N simultaneous requests).
+  - auth/stdio coexistence tests to ensure `makai auth providers` and `makai auth login` still work.
 - TS tests:
   - high-level `chat()`/`streamChat()` integration tests with fixtures,
   - demo tests updated to assert provider-agnostic chat path.
