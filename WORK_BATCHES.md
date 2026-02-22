@@ -40,10 +40,13 @@ Progress note:
 - Evaluated CI split need: no extra websocket-only lane needed now (unit matrix already isolates transport; recent failures were external E2E Anthropic 429s).
 
 ### Batch C — Provider Client Multiplexing API Cleanup
-- [ ] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)
-- [ ] Add tests for per-stream cleanup (no leaks after stream terminal)
-- [ ] Add tests for interleaved done/error/result across 2+ streams
-- [ ] Add docs/examples for new `startStream` + `getEventStreamFor` flow
+- [x] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)
+- [x] Add tests for per-stream cleanup (no leaks after stream terminal)
+- [x] Add tests for interleaved done/error/result across 2+ streams
+- [x] Add docs/examples for new `startStream` + `getEventStreamFor` flow
+
+Progress note:
+- Added explicit provider client stream lifecycle APIs (`closeStream`, `removeStreamState`) and tests for cleanup + interleaved stream terminal isolation; documented normative `startStream` per-stream flow in `DESIGN.md`.
 
 ### Batch D — Agent Client Multiplexing Ergonomics
 - [ ] Add explicit per-session helpers (query completion/error by session)

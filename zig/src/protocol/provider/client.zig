@@ -480,6 +480,75 @@ pub const ProtocolClient = struct {
         return self.stream_complete_flags.get(stream_id) orelse false;
     }
 
+    /// Mark a specific stream as closed and complete with an explicit client-side error.
+    pub fn closeStream(self: *Self, stream_id: protocol_types.Uuid) !void {
+        if (self.stream_complete_flags.get(stream_id) orelse false) return;
+
+        try self.setStreamError(stream_id, "Stream closed by client");
+
+        if (self.current_stream_id) |sid| {
+            if (std.mem.eql(u8, &sid, &stream_id)) {
+                self.stream_complete = true;
+            }
+        }
+    }
+
+    /// Remove all tracked client state for a specific stream.
+    pub fn removeStreamState(self: *Self, stream_id: protocol_types.Uuid) void {
+        // Remove any pending requests associated with this stream.
+        while (true) {
+            var pending_to_remove: ?protocol_types.Uuid = null;
+            var pending_it = self.pending_requests.iterator();
+            while (pending_it.next()) |entry| {
+                if (std.mem.eql(u8, &entry.value_ptr.stream_id, &stream_id)) {
+                    pending_to_remove = entry.key_ptr.*;
+                    break;
+                }
+            }
+            if (pending_to_remove) |mid| {
+                _ = self.pending_requests.remove(mid);
+            } else break;
+        }
+
+        _ = self.stream_sequences.remove(stream_id);
+        _ = self.stream_complete_flags.remove(stream_id);
+
+        if (self.reconstructors.fetchRemove(stream_id)) |entry| {
+            var recon = entry.value;
+            recon.deinit();
+        }
+
+        if (self.stream_results.fetchRemove(stream_id)) |entry| {
+            var result = entry.value;
+            result.deinit(self.allocator);
+        }
+
+        if (self.stream_errors.fetchRemove(stream_id)) |entry| {
+            var err = entry.value;
+            err.deinit(self.allocator);
+        }
+
+        if (self.stream_event_streams.fetchRemove(stream_id)) |entry| {
+            entry.value.deinit();
+            self.allocator.destroy(entry.value);
+        }
+
+        if (self.current_stream_id) |sid| {
+            if (std.mem.eql(u8, &sid, &stream_id)) {
+                self.current_stream_id = null;
+                self.stream_complete = false;
+
+                if (self.last_result) |*result| {
+                    result.deinit(self.allocator);
+                    self.last_result = null;
+                }
+
+                self.last_error.deinit(self.allocator);
+                self.last_error = OwnedSlice(u8).initBorrowed("");
+            }
+        }
+    }
+
     /// Reset all stream state
     pub fn reset(self: *Self) void {
         self.reconstructor.reset();
@@ -1242,6 +1311,192 @@ test "getEventStream returns internal stream" {
 
     const stream = client.getEventStream();
     try std.testing.expect(stream == client.event_stream);
+}
+
+test "closeStream marks stream complete with client-side error" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const sid = protocol_types.generateUuid();
+    try client.stream_complete_flags.put(sid, false);
+    _ = try client.ensureStreamEventStream(sid);
+
+    try client.closeStream(sid);
+
+    try std.testing.expect(client.isCompleteFor(sid));
+    try std.testing.expect(client.getLastErrorFor(sid) != null);
+    try std.testing.expectEqualStrings("Stream closed by client", client.getLastErrorFor(sid).?);
+    try std.testing.expect(client.getEventStreamFor(sid).?.getError() != null);
+}
+
+test "removeStreamState clears per-stream maps and legacy current stream state" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const sid = protocol_types.generateUuid();
+    const mid = protocol_types.generateUuid();
+
+    try client.pending_requests.put(mid, .{
+        .message_id = mid,
+        .stream_id = sid,
+        .sent_at = std.time.milliTimestamp(),
+        .timeout_ms = 30_000,
+    });
+    try client.stream_sequences.put(sid, 7);
+    try client.stream_complete_flags.put(sid, true);
+    try client.reconstructors.put(sid, partial_reconstructor.PartialReconstructor.init(allocator));
+    try client.stream_errors.put(sid, OwnedSlice(u8).initOwned(try allocator.dupe(u8, "stream failed")));
+    _ = try client.ensureStreamEventStream(sid);
+
+    const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "result" } }};
+    try client.stream_results.put(sid, try ai_types.cloneAssistantMessage(allocator, .{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 123,
+    }));
+
+    client.current_stream_id = sid;
+    client.stream_complete = true;
+    client.last_result = try ai_types.cloneAssistantMessage(allocator, .{
+        .content = &content,
+        .api = "legacy-api",
+        .provider = "legacy-provider",
+        .model = "legacy-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 456,
+    });
+    client.last_error = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "legacy error"));
+
+    client.removeStreamState(sid);
+
+    try std.testing.expect(!client.pending_requests.contains(mid));
+    try std.testing.expect(!client.stream_sequences.contains(sid));
+    try std.testing.expect(!client.stream_complete_flags.contains(sid));
+    try std.testing.expect(!client.reconstructors.contains(sid));
+    try std.testing.expect(!client.stream_results.contains(sid));
+    try std.testing.expect(!client.stream_errors.contains(sid));
+    try std.testing.expect(client.getEventStreamFor(sid) == null);
+    try std.testing.expect(client.current_stream_id == null);
+    try std.testing.expect(!client.stream_complete);
+    try std.testing.expect(client.last_result == null);
+    try std.testing.expect(client.getLastError() == null);
+}
+
+test "processEnvelope keeps interleaved terminal state isolated per stream" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const sid_result = protocol_types.generateUuid();
+    const sid_error = protocol_types.generateUuid();
+    const sid_done = protocol_types.generateUuid();
+
+    const result_text = try allocator.dupe(u8, "result stream text");
+    const result_api = try allocator.dupe(u8, "test-api");
+    const result_provider = try allocator.dupe(u8, "test-provider");
+    const result_model = try allocator.dupe(u8, "result-model");
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = result_text } };
+
+    var env_result = protocol_types.Envelope{
+        .stream_id = sid_result,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .result = .{
+            .content = result_content,
+            .api = result_api,
+            .provider = result_provider,
+            .model = result_model,
+            .usage = .{ .input = 1, .output = 2 },
+            .stop_reason = .stop,
+            .timestamp = 10,
+            .is_owned = true,
+        } },
+    };
+    defer env_result.deinit(allocator);
+
+    const err_msg = try allocator.dupe(u8, "stream two failed");
+    var env_error = protocol_types.Envelope{
+        .stream_id = sid_error,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_error = .{
+            .code = .provider_error,
+            .message = OwnedSlice(u8).initOwned(err_msg),
+        } },
+    };
+    defer env_error.deinit(allocator);
+
+    const done_partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "done-api",
+        .provider = "done-provider",
+        .model = "done-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 19,
+    };
+    var env_done_start = protocol_types.Envelope{
+        .stream_id = sid_done,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .event = .{ .start = .{ .partial = done_partial } } },
+    };
+    defer env_done_start.deinit(allocator);
+
+    const done_msg = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "done-api",
+        .provider = "done-provider",
+        .model = "done-model",
+        .usage = .{ .input = 3, .output = 4 },
+        .stop_reason = .stop,
+        .timestamp = 20,
+    };
+    var env_done = protocol_types.Envelope{
+        .stream_id = sid_done,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 2,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .event = .{ .done = .{
+            .reason = .stop,
+            .message = done_msg,
+        } } },
+    };
+    defer env_done.deinit(allocator);
+
+    try client.processEnvelope(env_result);
+    try client.processEnvelope(env_error);
+    try client.processEnvelope(env_done_start);
+    try client.processEnvelope(env_done);
+
+    try std.testing.expect(client.isCompleteFor(sid_result));
+    try std.testing.expect(client.isCompleteFor(sid_error));
+    try std.testing.expect(client.isCompleteFor(sid_done));
+
+    const got_result = try client.waitResultFor(sid_result, 1000);
+    try std.testing.expect(got_result != null);
+    try std.testing.expectEqualStrings("result-model", got_result.?.model);
+
+    try std.testing.expectError(error.StreamError, client.waitResultFor(sid_error, 1000));
+    try std.testing.expectEqualStrings("stream two failed", client.getLastErrorFor(sid_error).?);
+
+    const got_done = try client.waitResultFor(sid_done, 1000);
+    try std.testing.expect(got_done != null);
+    try std.testing.expectEqualStrings("done-model", got_done.?.model);
 }
 
 test "sendStreamRequest without sender returns error" {

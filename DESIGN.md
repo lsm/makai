@@ -93,6 +93,18 @@ Both protocols are designed for multi-session multiplexing:
 Implementation objective:
 - provider and agent clients/servers must support true concurrent multiplexing.
 
+### 5.1 Provider protocol client lifecycle API (normative usage)
+
+For multiplexed provider streams, callers should use per-stream APIs explicitly:
+
+1. `startStream(...)` -> keep returned `stream_id`
+2. `getEventStreamFor(stream_id)` -> consume events for only that stream
+3. `waitResultFor(stream_id, timeout_ms)` / `getLastErrorFor(stream_id)` -> terminal query
+4. `closeStream(stream_id)` when terminating locally
+5. `removeStreamState(stream_id)` after terminal consumption to release per-stream state
+
+This lifecycle keeps stream state isolated and prevents long-lived client state growth.
+
 ---
 
 ## 6) Memory Ownership Model (Critical)
