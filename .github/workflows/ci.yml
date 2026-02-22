@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, transport, protocol, providers, utils]
+        group: [core, transport, protocol, providers, utils, agent]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -123,6 +123,30 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini
           OPENAI_RESPONSES_MODEL: gpt-4o-mini
+
+  e2e-azure:
+    name: E2E - Azure
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_azure == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Azure E2E tests
+        working-directory: zig
+        run: zig build test-e2e-azure
+        env:
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_BASE_URL: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_MODEL: gpt-4o-mini
 
   e2e-google:
     name: E2E - Google
