@@ -26,6 +26,14 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Pump provider stream events/results/errors back to stdio.
 - Keep backward-compatible ready handshake semantics.
 
+### Phase 1.5: Implement model discovery and resolution primitives
+
+- Add shared catalog types module (`model_catalog_types.zig`) and model ref helpers (`model_ref.zig`).
+- Implement model catalog sources (dynamic listing + static fallback) with cache metadata.
+- Implement provider protocol `models_request` / `models_response` handler, including exact `model_id` filter for resolve semantics.
+- Implement agent passthrough for model discovery with the same typed response shape.
+- Add resolver behavior for ambiguous matches (`invalid_request` when `api` is omitted and multiple models match).
+
 ### Phase 2a: Add auth resolution in binary request path
 
 - Ownership:

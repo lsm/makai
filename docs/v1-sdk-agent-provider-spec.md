@@ -56,6 +56,7 @@ Caching rules:
   - dynamic source: `cache_max_age_ms = 300_000` (5 minutes),
   - static fallback: `cache_max_age_ms = 3_600_000` (1 hour).
 - Auth status can lag reality by up to `cache_max_age_ms` in cache-hit paths.
+- `models.resolve(...)` reuses the same cache semantics as `models.list(...)`.
 
 Auth for listing:
 - Providers that require auth for model listing must return `auth_status = "login_required"` (or `"expired"` / `"failed"`).
@@ -125,6 +126,7 @@ export interface ModelDescriptor {
 export interface ListModelsRequest {
   provider_id?: ProviderId;
   api?: ApiId;
+  model_id?: string; // exact-match filter used by resolve semantics
   include_deprecated?: boolean;
   include_login_required?: boolean;
 }
@@ -142,7 +144,6 @@ export interface ResolveModelRequest {
 }
 
 export interface ResolveModelResponse {
-  model_ref: string;
   model: ModelDescriptor;
 }
 
@@ -201,6 +202,7 @@ export interface ChatMessage {
 export interface ToolDefinition {
   name: string;
   description: string;
+  // JSON-string form preserves wire parity with Zig protocol envelopes.
   parameters_schema_json: string;
 }
 
@@ -220,7 +222,7 @@ export interface AgentRunRequest {
   options?: RunOptions;
 }
 
-export interface AgentRunResponse {
+export interface CompletionResponse {
   message: {
     role: "assistant";
     content: string | ContentPart[];
@@ -234,19 +236,25 @@ export interface AgentRunResponse {
   provider_id: ProviderId;
   api: ApiId;
   model_id: string;
+  stop_reason?: string;
 }
+
+export type AgentRunResponse = CompletionResponse;
 
 // Provider-native reasoning/thinking deltas are normalized to `thinking_delta`.
 export type ProviderStreamEvent =
   | { type: "message_start" }
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
+  // V1 emits tool calls only after full argument buffering (non-incremental).
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
   | { type: "message_end" }
   | { type: "error"; message: string; code?: string };
 
 export type AgentStreamEvent =
   | ProviderStreamEvent
+  | { type: "agent_start" }
+  | { type: "agent_end"; stop_reason?: string }
   | { type: "turn_start" }
   | { type: "turn_end"; stop_reason?: string }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
@@ -259,21 +267,9 @@ export interface ProviderCompleteRequest {
   options?: RunOptions;
 }
 
-export interface ProviderCompleteResponse {
-  message: {
-    role: "assistant";
-    content: string | ContentPart[];
-  };
-  usage?: {
-    input: number;
-    output: number;
-    cache_read?: number;
-    cache_write?: number;
-  };
-  provider_id: ProviderId;
-  api: ApiId;
-  model_id: string;
-}
+export type ProviderCompleteResponse = CompletionResponse;
+// V1 reuses a shared completion shape for both agent/provider non-streaming paths.
+// Method namespaces stay separate for ergonomics and future divergence.
 
 export interface MakaiAuthApi {
   listProviders(): Promise<ProviderAuthInfo[]>;
@@ -336,7 +332,9 @@ Versioning/stability:
 - scripts/config/tests may persist `model_ref` values directly.
 
 Bootstrapping requirement:
-- SDK must provide `models.resolve({ provider_id, api?, model_id }) -> { model_ref, model }` for deterministic lookup.
+- SDK must provide `models.resolve({ provider_id, api?, model_id }) -> { model }` for deterministic lookup.
+- `resolve` is server-side and maps to `models_request` with exact `model_id` filter (not client-side full-list filtering by default).
+- If `api` is omitted and multiple models match within the provider, server must return `nack` with `error_code = invalid_request`.
 
 Required helper surfaces:
 - Zig: `protocol/model_ref.zig` with parse/format + tests.
@@ -360,6 +358,7 @@ Normative implementation requirement:
 Type safety requirement:
 - Zig protocol model capabilities must use an enum (not string slices).
 - TS string union remains API-facing; mapping happens at serialization boundaries.
+- Wire format note: `capabilities` are string-encoded in JSON and deserialized into `ModelCapability` enums in Zig.
 
 ### 3.3 Auth Cancellation Semantics (Normative)
 
@@ -372,16 +371,31 @@ Provider stream rules:
 - Each provider stream must emit exactly one terminal event: `message_end` or `error`.
 - Terminal `error` must end the stream; `message_end` must not be followed by `error`.
 - Provider-native naming differences for reasoning output (for example `"reasoning"` vs `"thinking"`) must be normalized to `thinking_delta`.
+- `tool_call` is emitted after full argument buffering in V1; incremental tool-call delta streaming is deferred.
 
 Agent stream rules:
 - Agent streams wrap one or more provider turns and may emit `turn_start` / `turn_end` plus tool execution lifecycle events.
+- `agent_start` should be the first agent-level event for a run.
+- Each agent stream must emit exactly one terminal event for the overall run: `agent_end` or `error`.
+- On success, `agent_end` must be the last event in the stream.
+- `turn_end` marks per-turn boundaries only and must not be interpreted as overall stream completion.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
 - `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
-- For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure).
+- For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted.
 
 SDK behavior:
 - Async iterator failure paths may throw `MakaiStreamError`.
 - Envelope-level protocol errors and stream terminal `error` events should map to a single surfaced failure per request.
+
+### 3.5 `models.resolve` Wire Mapping (Normative)
+
+- V1 does not define separate `resolve_model_request` / `resolve_model_response` envelope types.
+- `models.resolve(...)` maps to `models_request` with:
+  - required `provider_id`,
+  - required exact `model_id` filter,
+  - optional `api`.
+- If runtime returns more than one result for a resolve request, SDK must treat it as an `invalid_request` error.
+- If runtime returns no result for a resolve request, SDK must surface not found semantics via `invalid_request` or provider-specific typed error mapping.
 
 ## 4. Provider Protocol Changes (Normative)
 
@@ -397,11 +411,13 @@ Add request/response structs:
 pub const ModelsRequest = struct {
     provider_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     api: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    model_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), // exact match filter
     include_deprecated: bool = false,
     include_login_required: bool = true,
 
     pub fn getProviderId(self: *const ModelsRequest) ?[]const u8 { ... }
     pub fn getApi(self: *const ModelsRequest) ?[]const u8 { ... }
+    pub fn getModelId(self: *const ModelsRequest) ?[]const u8 { ... }
     pub fn deinit(self: *ModelsRequest, allocator: std.mem.Allocator) void { ... }
 };
 
@@ -448,17 +464,20 @@ Server behavior:
 2. For unsupported runtime, return `nack` with `error_code = not_implemented`.
 3. Dynamic listing should be preferred; static fallback may be used when dynamic listing is unavailable.
 4. For mixed-auth states, return partial results with per-model `auth_status` instead of failing the entire call.
+5. If `model_id` is set, server must apply exact-match filtering before response.
+6. If `model_id` is set and `api` is omitted and multiple matches remain, return `nack` with `error_code = invalid_request`.
 
 Client behavior:
 1. Treat `not_implemented` as capability absence.
 2. Preserve existing behavior for `stream_request` and `complete_request`.
+3. `models.resolve(...)` should issue `models_request` with `provider_id` + exact `model_id` filter (and optional `api`).
 
 ## 5. Agent Protocol Changes (Normative)
 
 File target: `zig/src/protocol/agent/types.zig`
 
 Add payload variants:
-- `models_request: struct { provider_id: OwnedSlice(u8), api: OwnedSlice(u8), include_deprecated: bool, include_login_required: bool }`
+- `models_request: struct { provider_id: OwnedSlice(u8), api: OwnedSlice(u8), model_id: OwnedSlice(u8), include_deprecated: bool, include_login_required: bool }`
 - `models_response: ModelsResponse`
 
 Rationale: agent protocol carries passthrough model discovery for clients connected only to agent endpoint.
@@ -486,6 +505,25 @@ Provider models request:
   "version": 1,
   "payload": {
     "provider_id": "anthropic",
+    "include_deprecated": false,
+    "include_login_required": true
+  }
+}
+```
+
+Resolve-style models request (same envelope with exact filter):
+
+```json
+{
+  "type": "models_request",
+  "stream_id": "10f42e8a-3d4c-4a90-9459-a7207d1d8b5f",
+  "message_id": "10f42e8a-3d4c-4a90-9459-a7207d1d8b5f",
+  "sequence": 1,
+  "timestamp": 1760000001000,
+  "version": 1,
+  "payload": {
+    "provider_id": "anthropic",
+    "model_id": "claude-sonnet-4-5",
     "include_deprecated": false,
     "include_login_required": true
   }
