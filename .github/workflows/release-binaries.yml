@@ -1,0 +1,144 @@
+name: Release Binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.os_name }}-${{ matrix.arch_name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-macos
+            os_name: macos
+            arch_name: arm64
+            archive: tar.gz
+            binary_name: makai
+          - runner: macos-latest
+            target: x86_64-macos
+            os_name: macos
+            arch_name: x64
+            archive: tar.gz
+            binary_name: makai
+          - runner: ubuntu-latest
+            target: aarch64-linux
+            os_name: linux
+            arch_name: arm64
+            archive: tar.gz
+            binary_name: makai
+          - runner: ubuntu-latest
+            target: x86_64-linux
+            os_name: linux
+            arch_name: x64
+            archive: tar.gz
+            binary_name: makai
+          - runner: windows-latest
+            target: x86_64-windows
+            os_name: windows
+            arch_name: x64
+            archive: zip
+            binary_name: makai.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build target binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_ROOT="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}"
+          cd zig
+          zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$OUT_ROOT"
+
+      - name: Package tar.gz
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION="$(node -p "require('./package.json').version")"
+          fi
+          ARTIFACT="makai-${VERSION}-${{ matrix.os_name }}-${{ matrix.arch_name }}.tar.gz"
+          BIN_DIR="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          tar -C "$BIN_DIR" -czf "$GITHUB_WORKSPACE/dist/$ARTIFACT" "${{ matrix.binary_name }}"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $env:GITHUB_REF_NAME.Substring(1)
+          } else {
+            (Get-Content package.json | ConvertFrom-Json).version
+          }
+          $artifact = "makai-$version-${{ matrix.os_name }}-${{ matrix.arch_name }}.zip"
+          $binDir = "$env:GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin"
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/dist" | Out-Null
+          Compress-Archive -Path "$binDir/${{ matrix.binary_name }}" -DestinationPath "$env:GITHUB_WORKSPACE/dist/$artifact" -Force
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: makai-${{ matrix.os_name }}-${{ matrix.arch_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  checksums:
+    name: Generate checksums
+    runs-on: ubuntu-latest
+    needs: [build-binaries]
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create SHA256 checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum makai-* > SHA256SUMS.txt
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: makai-checksums
+          path: dist/SHA256SUMS.txt
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [checksums]
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/makai-*.tar.gz
+            dist/makai-*.zip
+            dist/SHA256SUMS.txt
