@@ -282,3 +282,26 @@ jobs:
         env:
           GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
           GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}
+
+  e2e-distributed-fullstack-github:
+    name: E2E - Distributed Fullstack (GitHub Copilot)
+    needs: [unit-tests, check-secrets]
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-${{ hashFiles('zig/build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+      - name: Run Distributed Fullstack E2E tests (GitHub Copilot)
+        working-directory: zig
+        run: zig build test-e2e-distributed-fullstack-github
+        env:
+          GH_COPILOT_REFRESH: ${{ secrets.GH_COPILOT_REFRESH }}
+          GH_COPILOT_ACCESS: ${{ secrets.GH_COPILOT_ACCESS }}

@@ -1115,7 +1115,6 @@ pub fn build(b: *std.Build) void {
 
     const test_e2e_provider_protocol_fullstack_github_step = b.step("test-e2e-provider-protocol-fullstack-github", "Run Provider Protocol Fullstack E2E tests - GitHub Copilot");
     test_e2e_provider_protocol_fullstack_github_step.dependOn(&b.addRunArtifact(e2e_provider_protocol_fullstack_github_test).step);
-    test_e2e_provider_protocol_fullstack_github_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_github_test).step);
 
     const test_e2e_github_copilot_step = b.step("test-e2e-github-copilot", "Run GitHub Copilot E2E tests");
     test_e2e_github_copilot_step.dependOn(&b.addRunArtifact(e2e_github_copilot_test).step);

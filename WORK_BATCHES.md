@@ -74,6 +74,7 @@ Progress note:
 - Added `zig/test/e2e/distributed_fullstack.zig` and wired `test-e2e-distributed-fullstack` into the mock-based protocol E2E lane to cover agent loop + provider protocol bridge + tool protocol execution path in one end-to-end test.
 - Added agent-loop protocol tool execution hook (`execute_tool_via_protocol_fn`) and coverage for protocol-path execution, cancellation, and terminal start/end event guarantees.
 - Added `zig/test/e2e/distributed_fullstack_github.zig` and wired it into `test-e2e-provider-protocol-fullstack-github` so CI now runs a non-mock provider distributed fullstack path.
+- Split non-mock distributed fullstack into its own CI lane: `E2E - Distributed Fullstack (GitHub Copilot)`.
 
 ### Batch G — Bun-inspired WebSocket Evaluation
 - [ ] Add short design note on low-level socket/C-C++ interop options
