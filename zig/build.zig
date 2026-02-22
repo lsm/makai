@@ -535,6 +535,27 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_tool_envelope_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/tool/envelope.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tool_types", .module = protocol_tool_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const protocol_tool_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/tool/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+        },
+    });
+
     // Agent modules
     const agent_types_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/types.zig"),
@@ -834,6 +855,8 @@ pub fn build(b: *std.Build) void {
 
     // Protocol Tool tests
     const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
+    const protocol_tool_envelope_test = b.addTest(.{ .root_module = protocol_tool_envelope_mod });
+    const protocol_tool_runtime_test = b.addTest(.{ .root_module = protocol_tool_runtime_mod });
 
     // Agent tests
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
@@ -929,6 +952,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_agent_client_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
 
     // Grouped unit test steps for parallel CI
     const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
@@ -962,6 +987,8 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_client_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_runtime_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
 
     const test_unit_providers_step = b.step("test-unit-providers", "Run provider unit tests");
     test_unit_providers_step.dependOn(&b.addRunArtifact(api_registry_test).step);

@@ -57,10 +57,13 @@ Progress note:
 - Added per-session completion/result/error tracking and `removeSessionState` lifecycle cleanup API in `protocol/agent/client.zig`, plus continuity tests for independent per-session sequence counters across stop/restart.
 
 ### Batch E — Tool Protocol Design -> Implementation Slice 1
-- [ ] Define tool protocol message types (request/response/events)
-- [ ] Add envelope serialization/deserialization tests
-- [ ] Add negative tests (unknown tool, malformed args, timeout)
-- [ ] Add runtime pump path for tool protocol messages
+- [x] Define tool protocol message types (request/response/events)
+- [x] Add envelope serialization/deserialization tests
+- [x] Add negative tests (unknown tool, malformed args, timeout)
+- [x] Add runtime pump path for tool protocol messages
+
+Progress note:
+- Added `protocol/tool/envelope.zig` with roundtrip + negative tests, added `protocol/tool/runtime.zig` runtime pump, wired both into `zig/build.zig` protocol unit lane, and tightened tool payload deinit ownership for `tool_status_response`.
 
 ### Batch F — Tool Protocol Integration Slice 2
 - [ ] Integrate tool protocol with agent loop execution path

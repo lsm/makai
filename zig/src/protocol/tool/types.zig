@@ -288,9 +288,10 @@ pub const Payload = union(enum) {
             },
             .tool_cancel => |*req| req.reason.deinit(allocator),
             .tool_error => |*err| allocator.free(err.message),
+            .tool_status_response => |*info| allocator.free(info.tool_name),
             .pong => |*p| p.ping_id.deinit(allocator),
             .goodbye => |*g| g.deinit(allocator),
-            .ping, .tool_cancelled, .tool_status, .tool_status_response => {},
+            .ping, .tool_cancelled, .tool_status => {},
         }
     }
 };
