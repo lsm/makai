@@ -104,6 +104,10 @@ Progress note:
 - Verified with `./scripts/check-zig-patterns.sh`, `zig build test-unit-core`,
   `zig build test-unit-protocol`, `zig build test-unit-providers`, and
   `zig build test-unit-agent`.
+- Added Google Generative + Vertex usage/finish-reason parser coverage to improve
+  cross-provider usage parity checks.
+- Added in-process transport burst backpressure test and fixed event cleanup on
+  `QueueFull` in `InProcessTransport.writeFn` to prevent leaked parsed events.
 
 ---
 

@@ -1669,3 +1669,25 @@ test "parseGoogleEventExtended - functionCall with thoughtSignature" {
         try std.testing.expect(false);
     }
 }
+
+test "parseGoogleEventExtended - extracts usage and finish reason" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":20,"thoughtsTokenCount":5,"totalTokenCount":35}}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(u64, 10), result.usage.input);
+    try std.testing.expectEqual(@as(u64, 25), result.usage.output);
+    try std.testing.expectEqual(@as(u64, 35), result.usage.total_tokens);
+    if (result.finish_reason) |reason| {
+        try std.testing.expectEqualStrings("MAX_TOKENS", reason);
+    } else {
+        try std.testing.expect(false);
+    }
+}

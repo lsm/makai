@@ -1588,6 +1588,28 @@ test "parseGoogleEventExtended - tool call part" {
     try std.testing.expectEqualStrings("{\"sql\":\"SELECT * FROM table\"}", tc.args_json);
 }
 
+test "parseGoogleEventExtended - extracts usage and finish reason" {
+    const allocator = std.testing.allocator;
+    const data =
+        \\{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":9,"thoughtsTokenCount":4,"totalTokenCount":20}}
+    ;
+
+    const result = parseGoogleEventExtended(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitGoogleParseResult(&result, allocator);
+
+    try std.testing.expectEqual(@as(u64, 7), result.usage.input);
+    try std.testing.expectEqual(@as(u64, 13), result.usage.output);
+    try std.testing.expectEqual(@as(u64, 20), result.usage.total_tokens);
+    if (result.finish_reason) |reason| {
+        try std.testing.expectEqualStrings("MAX_TOKENS", reason);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "mapFinishReason - Vertex finish reasons" {
     try std.testing.expectEqual(ai_types.StopReason.stop, mapFinishReason("STOP"));
     try std.testing.expectEqual(ai_types.StopReason.length, mapFinishReason("MAX_TOKENS"));

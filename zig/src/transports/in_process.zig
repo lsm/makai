@@ -113,7 +113,11 @@ pub const InProcessTransport = struct {
         const msg = try transport_mod.deserialize(data, self.allocator);
         switch (msg) {
             .event => |ev| {
-                try self.stream.push(ev);
+                var mutable_ev = ev;
+                self.stream.push(mutable_ev) catch |err| {
+                    ai_types.deinitAssistantMessageEvent(self.allocator, &mutable_ev);
+                    return err;
+                };
             },
             .result => |r| {
                 self.stream.complete(r);
@@ -798,4 +802,57 @@ test "SerializedPipe full round trip" {
     const received_resp = try client_receiver.readLine(allocator) orelse return error.NoDataReceived;
     defer allocator.free(received_resp);
     try std.testing.expectEqualStrings(response, received_resp);
+}
+
+test "InProcessTransport applies queue backpressure under burst writes" {
+    const allocator = std.testing.allocator;
+
+    var ip_transport = try InProcessTransport.init(allocator);
+    defer ip_transport.deinit();
+
+    var sender = ip_transport.asyncSender();
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    // Fill ring buffer capacity (255 usable slots).
+    for (0..255) |_| {
+        const event_json = try transport_mod.serializeEvent(
+            .{ .start = .{ .partial = partial } },
+            allocator,
+        );
+        try sender.write(event_json);
+        allocator.free(event_json);
+    }
+
+    // Next write should hit EventStream.QueueFull.
+    const overflow_json = try transport_mod.serializeEvent(
+        .{ .start = .{ .partial = partial } },
+        allocator,
+    );
+    defer allocator.free(overflow_json);
+    try std.testing.expectError(error.QueueFull, sender.write(overflow_json));
+
+    // Drain one event and verify writes can proceed again.
+    const ev = ip_transport.stream.poll().?;
+    var mut_ev = ev;
+    ai_types.deinitAssistantMessageEvent(allocator, &mut_ev);
+
+    const retry_json = try transport_mod.serializeEvent(
+        .{ .start = .{ .partial = partial } },
+        allocator,
+    );
+    defer allocator.free(retry_json);
+    try sender.write(retry_json);
+
+    while (ip_transport.stream.poll()) |leftover| {
+        var mut_leftover = leftover;
+        ai_types.deinitAssistantMessageEvent(allocator, &mut_leftover);
+    }
 }
