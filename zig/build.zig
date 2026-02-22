@@ -820,6 +820,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_distributed_fullstack_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/e2e/distributed_fullstack.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "agent_types", .module = agent_types_mod },
+                .{ .name = "agent_loop", .module = agent_loop_mod },
+                .{ .name = "agent_bridge", .module = agent_provider_protocol_bridge_mod },
+                .{ .name = "tool_types", .module = protocol_tool_types_mod },
+                .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
+                .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+                .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            },
+        }),
+    });
+
     const transport_test = b.addTest(.{ .root_module = transport_mod });
 
     const stdio_transport_test = b.addTest(.{ .root_module = stdio_transport_mod });
@@ -1080,6 +1100,10 @@ pub fn build(b: *std.Build) void {
 
     const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
+    test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
+
+    const test_e2e_distributed_fullstack_step = b.step("test-e2e-distributed-fullstack", "Run distributed fullstack E2E tests (mock-based)");
+    test_e2e_distributed_fullstack_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
 
     const test_e2e_step = b.step("test-e2e", "Run E2E tests");
     test_e2e_step.dependOn(test_e2e_anthropic_step);
