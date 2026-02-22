@@ -58,7 +58,9 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 ### Phase 3: Add high-level TS SDK APIs
 
-- Introduce `chat()` (non-streaming) and `streamChat()` (streaming) APIs on top of stdio protocol envelopes.
+- Implement spec-aligned high-level APIs on top of stdio protocol envelopes:
+  - `client.provider.complete()` / `client.provider.stream()`
+  - `client.agent.run()` / `client.agent.stream()`
 - Keep `MakaiStdioClient` as low-level transport primitive.
 - Add ergonomic request/response types that hide provider-specific headers and parsing.
 
@@ -76,7 +78,7 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
   - concurrent refresh tests (single refresh for N simultaneous requests).
   - auth/stdio coexistence tests to ensure `makai auth providers` and `makai auth login` still work.
 - TS tests:
-  - high-level `chat()`/`streamChat()` integration tests with fixtures,
+  - high-level `provider.complete` / `provider.stream` / `agent.run` / `agent.stream` integration tests with fixtures,
   - demo tests updated to assert provider-agnostic chat path.
 - End-to-end:
   - run binary smoke/e2e tests with `MAKAI_BINARY_PATH` configured in CI.

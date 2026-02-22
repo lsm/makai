@@ -18,6 +18,7 @@ This spec does not define transport framing changes.
 2. User calls `client.auth.listProviders()`.
 3. User calls `client.auth.login(providerId)` if needed.
 4. User calls `client.models.list()`.
+   - Optional: call `client.models.resolve(...)` for deterministic provider/model lookup.
 5. User uses returned `model_ref` with either:
 - `client.agent.run(...)` (default path)
 - `client.provider.complete(...)` or `client.provider.stream(...)` (advanced path)
@@ -33,6 +34,7 @@ Normative rule: end users do not manage provider-specific headers, token files, 
 - `client.provider.complete` / `client.provider.stream`:
   - advanced direct-provider path,
   - no agent loop/tool orchestration beyond what provider natively supports,
+  - supports provider-native tool/function calling via request `tools` when available,
   - preferred for simple passthrough chat/completion workloads.
 
 ### 2.2 Model Data Source and Caching (Normative)
@@ -49,6 +51,7 @@ Caching rules:
 - Clients treat cached data as stale when `now_ms > fetched_at_ms + cache_max_age_ms`.
 - If `cache_max_age_ms` is missing from a non-conformant server response, clients should default to `300_000` (5 minutes).
 - `source` is per-model metadata: `"dynamic"` or `"static_fallback"`.
+- `fetched_at_ms` is response-generation time (not per-model last-verified time).
 - Recommended server defaults:
   - dynamic source: `cache_max_age_ms = 300_000` (5 minutes),
   - static fallback: `cache_max_age_ms = 3_600_000` (1 hour).
@@ -132,15 +135,28 @@ export interface ListModelsResponse {
   cache_max_age_ms: number;
 }
 
+export interface ResolveModelRequest {
+  provider_id: ProviderId;
+  api?: ApiId;
+  model_id: string;
+}
+
+export interface ResolveModelResponse {
+  model_ref: string;
+  model: ModelDescriptor;
+}
+
 export type TextContentPart = {
   type: "text";
   text: string;
+  // Optional provider passthrough signature for replay/integrity workflows.
   text_signature?: string;
 };
 
 export type ThinkingContentPart = {
   type: "thinking";
   thinking: string;
+  // Optional provider passthrough signature for replay/integrity workflows.
   thinking_signature?: string;
 };
 
@@ -189,6 +205,7 @@ export interface ToolDefinition {
 export interface RunOptions {
   temperature?: number;
   max_tokens?: number;
+  // If the selected model lacks `reasoning` capability, server may ignore this field.
   reasoning_effort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   session_id?: string;
   metadata?: Record<string, string>;
@@ -217,11 +234,11 @@ export interface AgentRunResponse {
   model_id: string;
 }
 
+// Provider-native reasoning/thinking deltas are normalized to `thinking_delta`.
 export type ProviderStreamEvent =
   | { type: "message_start" }
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
-  | { type: "reasoning_delta"; delta: string }
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
   | { type: "message_end" }
   | { type: "error"; message: string; code?: string };
@@ -231,12 +248,12 @@ export type AgentStreamEvent =
   | { type: "turn_start" }
   | { type: "turn_end"; stop_reason?: string }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
-  | { type: "tool_execution_update"; tool_call_id: string; delta: string }
   | { type: "tool_execution_end"; tool_call_id: string; is_error?: boolean };
 
 export interface ProviderCompleteRequest {
   model_ref: string;
   messages: ChatMessage[];
+  tools?: ToolDefinition[];
   options?: RunOptions;
 }
 
@@ -269,8 +286,14 @@ export class MakaiAuthError extends Error {
   kind: "provider_error" | "cancelled" | "transport_error" | "unknown";
 }
 
+export class MakaiStreamError extends Error {
+  code?: string;
+  kind: "provider_error" | "transport_error" | "aborted" | "unknown";
+}
+
 export interface MakaiModelsApi {
   list(request?: ListModelsRequest): Promise<ListModelsResponse>;
+  resolve(request: ResolveModelRequest): Promise<ResolveModelResponse>;
 }
 
 export interface MakaiAgentApi {
@@ -292,11 +315,6 @@ export interface MakaiClient {
 }
 ```
 
-### 3.3 Auth Cancellation Semantics (Normative)
-
-- User-cancelled OAuth must reject with `MakaiAuthError { kind: "cancelled" }`.
-- Successful login resolves with `{ status: "success" }`.
-
 ### 3.1 `model_ref` Format (Normative)
 
 `model_ref` is an opaque, server-issued stable handle. Clients must not parse it.
@@ -313,6 +331,10 @@ Recommended internal canonical form:
 Versioning/stability:
 - servers may remap legacy aliases to canonical refs,
 - once a ref is emitted by `models.list`, it must remain valid until model retirement policy removes it.
+- scripts/config/tests may persist `model_ref` values directly.
+
+Bootstrapping requirement:
+- SDK must provide `models.resolve({ provider_id, api?, model_id }) -> { model_ref, model }` for deterministic lookup.
 
 Required helper surfaces:
 - Zig: `protocol/model_ref.zig` with parse/format + tests.
@@ -336,6 +358,28 @@ Normative implementation requirement:
 Type safety requirement:
 - Zig protocol model capabilities must use an enum (not string slices).
 - TS string union remains API-facing; mapping happens at serialization boundaries.
+
+### 3.3 Auth Cancellation Semantics (Normative)
+
+- User-cancelled OAuth must reject with `MakaiAuthError { kind: "cancelled" }`.
+- Successful login resolves with `{ status: "success" }`.
+
+### 3.4 Stream Lifecycle and Error Propagation (Normative)
+
+Provider stream rules:
+- Each provider stream must emit exactly one terminal event: `message_end` or `error`.
+- Terminal `error` must end the stream; `message_end` must not be followed by `error`.
+- Provider-native naming differences for reasoning output (for example `"reasoning"` vs `"thinking"`) must be normalized to `thinking_delta`.
+
+Agent stream rules:
+- Agent streams wrap one or more provider turns and may emit `turn_start` / `turn_end` plus tool execution lifecycle events.
+- V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
+- `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
+- For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure).
+
+SDK behavior:
+- Async iterator failure paths may throw `MakaiStreamError`.
+- Envelope-level protocol errors and stream terminal `error` events should map to a single surfaced failure per request.
 
 ## 4. Provider Protocol Changes (Normative)
 
@@ -413,10 +457,10 @@ File target: `zig/src/protocol/agent/types.zig`
 
 Add payload variants:
 - `models_request: struct { provider_id: OwnedSlice(u8), api: OwnedSlice(u8), include_deprecated: bool, include_login_required: bool }`
-- `models_response: SharedModelsResponse`
+- `models_response: ModelsResponse`
 
 Rationale: agent protocol carries passthrough model discovery for clients connected only to agent endpoint.
-`SharedModelsResponse` must reuse the same typed shape as provider protocol (no raw JSON blob passthrough).
+`ModelsResponse` must reuse the same typed shape as provider protocol (no raw JSON blob passthrough).
 Passthrough requirement includes all `ModelsResponse` fields (`models`, `fetched_at_ms`, `cache_max_age_ms`) and per-model `source`.
 
 Required shared module:
