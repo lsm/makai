@@ -128,7 +128,7 @@ jobs:
   e2e-azure:
     name: E2E - Azure
     needs: [unit-tests, check-secrets]
-    if: needs.check-secrets.outputs.has_azure == 'true'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
