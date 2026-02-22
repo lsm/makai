@@ -43,10 +43,11 @@ jobs:
   unit-tests:
     name: Unit Tests - ${{ matrix.group }}
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     strategy:
       fail-fast: false
       matrix:
-        group: [core, transport, protocol, providers, utils, agent]
+        group: [core, transport, protocol, providers, utils, agent-types, agent-loop, agent-mod, agent-bridge, agent-unit, agent-chain]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

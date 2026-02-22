@@ -993,6 +993,24 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
+    const test_unit_agent_types_step = b.step("test-unit-agent-types", "Run agent types unit tests");
+    test_unit_agent_types_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+
+    const test_unit_agent_loop_step = b.step("test-unit-agent-loop", "Run agent loop unit tests");
+    test_unit_agent_loop_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
+
+    const test_unit_agent_mod_step = b.step("test-unit-agent-mod", "Run agent module unit tests");
+    test_unit_agent_mod_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
+
+    const test_unit_agent_bridge_step = b.step("test-unit-agent-bridge", "Run agent bridge unit tests");
+    test_unit_agent_bridge_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
+
+    const test_unit_agent_unit_step = b.step("test-unit-agent-unit", "Run agent unit test file");
+    test_unit_agent_unit_step.dependOn(&b.addRunArtifact(agent_test).step);
+
+    const test_unit_agent_chain_step = b.step("test-unit-agent-chain", "Run agent protocol chain unit tests");
+    test_unit_agent_chain_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
+
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
 
