@@ -130,6 +130,18 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
+/// Tool execution via remote protocol path
+pub const ToolProtocolExecuteFn = *const fn (
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult;
+
 /// Agent tool definition
 pub const AgentTool = struct {
     label: []const u8, // Human-readable label for UI
@@ -259,6 +271,8 @@ pub const AgentLoopConfig = struct {
 
     // Tools (optional)
     tools: ?[]const AgentTool = null,
+    execute_tool_via_protocol_fn: ?ToolProtocolExecuteFn = null,
+    execute_tool_via_protocol_ctx: ?*anyopaque = null,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,

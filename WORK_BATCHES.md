@@ -66,9 +66,13 @@ Progress note:
 - Added `protocol/tool/envelope.zig` with roundtrip + negative tests, added `protocol/tool/runtime.zig` runtime pump, wired both into `zig/build.zig` protocol unit lane, and tightened tool payload deinit ownership for `tool_status_response`.
 
 ### Batch F — Tool Protocol Integration Slice 2
-- [ ] Integrate tool protocol with agent loop execution path
-- [ ] Add distributed chain integration test including tool execution
-- [ ] Add cancellation and terminal guarantees tests
+- [x] Integrate tool protocol with agent loop execution path
+- [x] Add distributed chain integration test including tool execution
+- [x] Add cancellation and terminal guarantees tests
+
+Progress note:
+- Added `zig/test/e2e/distributed_fullstack.zig` and wired `test-e2e-distributed-fullstack` into the mock-based protocol E2E lane to cover agent loop + provider protocol bridge + tool protocol execution path in one end-to-end test.
+- Added agent-loop protocol tool execution hook (`execute_tool_via_protocol_fn`) and coverage for protocol-path execution, cancellation, and terminal start/end event guarantees.
 
 ### Batch G — Bun-inspired WebSocket Evaluation
 - [ ] Add short design note on low-level socket/C-C++ interop options

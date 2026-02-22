@@ -241,17 +241,36 @@ fn executeToolCalls(
                 .args_json = validated_args,
             };
 
-            result = t.execute(
-                tool_call.id,
-                validated_args,
-                config.cancel_token,
-                &update_ctx,
-                onToolUpdate,
-                allocator,
-            ) catch |err| blk: {
-                result = try createErrorResult(allocator, err);
-                is_error = true;
-                break :blk result;
+            result = blk: {
+                if (config.execute_tool_via_protocol_fn) |exec_remote| {
+                    break :blk exec_remote(
+                        config.execute_tool_via_protocol_ctx,
+                        tool_call.id,
+                        tool_call.name,
+                        validated_args,
+                        config.cancel_token,
+                        &update_ctx,
+                        onToolUpdate,
+                        allocator,
+                    ) catch |err| {
+                        result = try createErrorResult(allocator, err);
+                        is_error = true;
+                        break :blk result;
+                    };
+                }
+
+                break :blk t.execute(
+                    tool_call.id,
+                    validated_args,
+                    config.cancel_token,
+                    &update_ctx,
+                    onToolUpdate,
+                    allocator,
+                ) catch |err| {
+                    result = try createErrorResult(allocator, err);
+                    is_error = true;
+                    break :blk result;
+                };
             };
         } else {
             result = try createErrorResult(allocator, error.ToolNotFound);
@@ -838,5 +857,214 @@ test "createErrorResult creates valid result" {
     try std.testing.expect(result.content.slice()[0] == .text);
 }
 
-// Note: Full integration tests would require a mock provider
-// which is beyond the scope of this unit test file
+const MockProtocolToolContext = struct {
+    call_count: usize = 0,
+    saw_update: bool = false,
+};
+
+fn mockProtocolExecute(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?types.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult {
+    _ = args_json;
+    _ = cancel_token;
+    const protocol_ctx: *MockProtocolToolContext = @ptrCast(@alignCast(ctx.?));
+    protocol_ctx.call_count += 1;
+
+    if (on_update) |update| {
+        update(on_update_ctx, tool_call_id, tool_name, "{\"status\":\"running\"}");
+        protocol_ctx.saw_update = true;
+    }
+
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, "executed via protocol"),
+    } };
+    return .{
+        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
+        .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"source\":\"protocol\"}")),
+    };
+}
+
+fn mockProtocolExecuteCancelled(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?types.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult {
+    _ = ctx;
+    _ = tool_call_id;
+    _ = tool_name;
+    _ = args_json;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    if (cancel_token) |token| {
+        if (token.isCancelled()) return error.Cancelled;
+    }
+    return error.Cancelled;
+}
+
+test "executeToolCalls uses protocol executor when configured" {
+    const allocator = std.testing.allocator;
+
+    const tools = [_]AgentTool{
+        .{
+            .label = "Remote Tool",
+            .name = "remote_tool",
+            .description = "Remote tool",
+            .parameters_schema_json = "{}",
+            .execute = undefined,
+        },
+    };
+
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{
+            .id = "call_1",
+            .name = "remote_tool",
+            .arguments_json = "{\"q\":\"x\"}",
+        } },
+    };
+    const assistant_message = ai_types.AssistantMessage{
+        .content = &assistant_content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var protocol_ctx = MockProtocolToolContext{};
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var tool_result = try executeToolCalls(
+        allocator,
+        assistant_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &tools,
+            .execute_tool_via_protocol_fn = mockProtocolExecute,
+            .execute_tool_via_protocol_ctx = &protocol_ctx,
+        },
+        &agent_events,
+    );
+    defer tool_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), protocol_ctx.call_count);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
+    try std.testing.expect(!tool_result.tool_results[0].is_error);
+    try std.testing.expectEqualStrings("executed via protocol", tool_result.tool_results[0].content[0].text.text);
+
+    var saw_update = false;
+    while (agent_events.poll()) |evt| {
+        if (evt == .tool_execution_update) saw_update = true;
+    }
+    try std.testing.expect(protocol_ctx.saw_update);
+    try std.testing.expect(saw_update);
+}
+
+test "executeToolCalls emits terminal events on protocol cancellation" {
+    const allocator = std.testing.allocator;
+
+    const tools = [_]AgentTool{
+        .{
+            .label = "Remote Tool",
+            .name = "remote_tool",
+            .description = "Remote tool",
+            .parameters_schema_json = "{}",
+            .execute = undefined,
+        },
+    };
+
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{
+            .id = "call_2",
+            .name = "remote_tool",
+            .arguments_json = "{\"q\":\"x\"}",
+        } },
+    };
+    const assistant_message = ai_types.AssistantMessage{
+        .content = &assistant_content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var tool_result = try executeToolCalls(
+        allocator,
+        assistant_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &tools,
+            .cancel_token = cancel_token,
+            .execute_tool_via_protocol_fn = mockProtocolExecuteCancelled,
+        },
+        &agent_events,
+    );
+    defer tool_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
+    try std.testing.expect(tool_result.tool_results[0].is_error);
+
+    var start_count: usize = 0;
+    var end_count: usize = 0;
+    while (agent_events.poll()) |evt| {
+        switch (evt) {
+            .tool_execution_start => start_count += 1,
+            .tool_execution_end => end_count += 1,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), start_count);
+    try std.testing.expectEqual(@as(usize, 1), end_count);
+}
