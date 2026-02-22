@@ -1,3 +1,4 @@
+process.stderr.write("token exchange error 400: invalid_grant\n");
 process.stdout.write(
   JSON.stringify({
     type: "error",

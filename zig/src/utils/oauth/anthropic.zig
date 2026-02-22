@@ -28,6 +28,13 @@ pub const Prompt = struct {
     allow_empty: bool = false,
 };
 
+fn buildAuthUrl(allocator: std.mem.Allocator, challenge: []const u8, state: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        "{s}?code=true&client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
+        .{ auth_url_base, client_id, redirect_uri, scopes, challenge, state },
+    );
+}
+
 /// Anthropic OAuth login (manual code flow with PKCE)
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     // 1. Generate PKCE
@@ -35,10 +42,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     defer pkce.deinit(allocator);
 
     // 2. Build authorization URL
-    const auth_url = try std.fmt.allocPrint(allocator,
-        "{s}?code=true&client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
-        .{ auth_url_base, client_id, redirect_uri, scopes, pkce.challenge, pkce.verifier },
-    );
+    const auth_url = try buildAuthUrl(allocator, pkce.challenge, pkce.verifier);
     defer allocator.free(auth_url);
 
     // 3. Show URL to user
@@ -382,4 +386,31 @@ test "parseTokenResponse handles missing refresh and expires" {
     try std.testing.expectEqualStrings("a-token", response.access_token);
     try std.testing.expectEqualStrings("a-token", response.refresh_token);
     try std.testing.expect(response.expires_in > 0);
+}
+
+test "buildAuthUrl includes code=true" {
+    const url = try buildAuthUrl(std.testing.allocator, "challenge-value", "state-value");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "code=true") != null);
+}
+
+test "parseTokenResponse handles camelCase token fields" {
+    const payload =
+        \\{"accessToken":"camel-access","refreshToken":"camel-refresh","expiresIn":1800}
+    ;
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer std.testing.allocator.free(response.access_token);
+    defer std.testing.allocator.free(response.refresh_token);
+
+    try std.testing.expectEqualStrings("camel-access", response.access_token);
+    try std.testing.expectEqualStrings("camel-refresh", response.refresh_token);
+    try std.testing.expectEqual(@as(i64, 1800), response.expires_in);
+}
+
+test "parseTokenResponse maps oauth error payload to OAuthFailed" {
+    const payload =
+        \\{"error":"invalid_grant","error_description":"Invalid 'code' in request."}
+    ;
+    try std.testing.expectError(error.OAuthFailed, parseTokenResponse(payload, std.testing.allocator));
 }

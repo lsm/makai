@@ -28,7 +28,8 @@ test("loginWithMakaiAuth rejects on auth error event", async () => {
     (error: unknown) =>
       error instanceof MakaiAuthError &&
       error.code === "auth_failed" &&
-      error.message.includes("fixture auth failed"),
+      error.message.includes("fixture auth failed") &&
+      error.message.includes("token exchange error 400"),
   );
 });
 
