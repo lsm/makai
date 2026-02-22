@@ -99,6 +99,15 @@ export type ModelCapability =
 
 export type ModelSource = "dynamic" | "static_fallback";
 
+// Known values are standardized; the union stays open-ended for forward compatibility.
+export type StopReason =
+  | "end_turn"
+  | "max_tokens"
+  | "tool_use"
+  | "stop_sequence"
+  | "max_turns"
+  | string;
+
 export interface ProviderAuthInfo {
   id: ProviderId;
   name: string;
@@ -215,6 +224,13 @@ export interface RunOptions {
   metadata?: Record<string, string>;
 }
 
+export interface UsageSummary {
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
+}
+
 export interface AgentRunRequest {
   model_ref: string;
   messages: ChatMessage[];
@@ -227,36 +243,31 @@ export interface CompletionResponse {
     role: "assistant";
     content: string | ContentPart[];
   };
-  usage?: {
-    input: number;
-    output: number;
-    cache_read?: number;
-    cache_write?: number;
-  };
+  usage?: UsageSummary;
   provider_id: ProviderId;
   api: ApiId;
   model_id: string;
-  stop_reason?: string;
+  stop_reason?: StopReason;
 }
 
 export type AgentRunResponse = CompletionResponse;
 
 // Provider-native reasoning/thinking deltas are normalized to `thinking_delta`.
 export type ProviderStreamEvent =
-  | { type: "message_start" }
+  | { type: "message_start"; provider_id?: ProviderId; api?: ApiId; model_id?: string }
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
   // V1 emits tool calls only after full argument buffering (non-incremental).
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
-  | { type: "message_end" }
+  | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason }
   | { type: "error"; message: string; code?: string };
 
 export type AgentStreamEvent =
   | ProviderStreamEvent
-  | { type: "agent_start" }
-  | { type: "agent_end"; stop_reason?: string }
+  | { type: "agent_start"; session_id?: string }
+  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary }
   | { type: "turn_start" }
-  | { type: "turn_end"; stop_reason?: string }
+  | { type: "turn_end"; stop_reason?: StopReason }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
   | { type: "tool_execution_end"; tool_call_id: string; is_error?: boolean };
 
@@ -266,6 +277,8 @@ export interface ProviderCompleteRequest {
   tools?: ToolDefinition[];
   options?: RunOptions;
 }
+// V1 request shapes are currently aligned across agent/provider; method namespaces
+// stay separate for ergonomics and future divergence.
 
 export type ProviderCompleteResponse = CompletionResponse;
 // V1 reuses a shared completion shape for both agent/provider non-streaming paths.
@@ -335,6 +348,7 @@ Bootstrapping requirement:
 - SDK must provide `models.resolve({ provider_id, api?, model_id }) -> { model }` for deterministic lookup.
 - `resolve` is server-side and maps to `models_request` with exact `model_id` filter (not client-side full-list filtering by default).
 - If `api` is omitted and multiple models match within the provider, server must return `nack` with `error_code = invalid_request`.
+- If no models match resolve criteria, server must return `nack` with `error_code = invalid_request` and a "model not found" message.
 
 Required helper surfaces:
 - Zig: `protocol/model_ref.zig` with parse/format + tests.
@@ -371,14 +385,17 @@ Provider stream rules:
 - Each provider stream must emit exactly one terminal event: `message_end` or `error`.
 - Terminal `error` must end the stream; `message_end` must not be followed by `error`.
 - Provider-native naming differences for reasoning output (for example `"reasoning"` vs `"thinking"`) must be normalized to `thinking_delta`.
-- `tool_call` is emitted after full argument buffering in V1; incremental tool-call delta streaming is deferred.
+- `message_start` may include resolved `provider_id`, `api`, and `model_id` metadata when available.
+- `message_end` should include `usage` and `stop_reason` when available from upstream provider.
+- `tool_call` is emitted after full argument buffering in V1; incremental tool-call delta streaming is deferred (planned future shape: `tool_call_start` / `tool_call_delta` / `tool_call_end`).
 
 Agent stream rules:
 - Agent streams wrap one or more provider turns and may emit `turn_start` / `turn_end` plus tool execution lifecycle events.
-- `agent_start` should be the first agent-level event for a run.
+- `agent_start` should be the first agent-level event for a run and may include resolved `session_id`.
 - Each agent stream must emit exactly one terminal event for the overall run: `agent_end` or `error`.
-- On success, `agent_end` must be the last event in the stream.
+- On success, `agent_end` must be the last event in the stream and should include aggregate `usage` and `stop_reason`.
 - `turn_end` marks per-turn boundaries only and must not be interpreted as overall stream completion.
+- `turn_end.stop_reason` is turn-scoped; `agent_end.stop_reason` may include agent-level reasons such as `max_turns`.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
 - `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
 - For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted.
@@ -395,7 +412,7 @@ SDK behavior:
   - required exact `model_id` filter,
   - optional `api`.
 - If runtime returns more than one result for a resolve request, SDK must treat it as an `invalid_request` error.
-- If runtime returns no result for a resolve request, SDK must surface not found semantics via `invalid_request` or provider-specific typed error mapping.
+- If runtime returns no result for a resolve request, SDK must surface `invalid_request` with a "model not found" message.
 
 ## 4. Provider Protocol Changes (Normative)
 
@@ -466,6 +483,7 @@ Server behavior:
 4. For mixed-auth states, return partial results with per-model `auth_status` instead of failing the entire call.
 5. If `model_id` is set, server must apply exact-match filtering before response.
 6. If `model_id` is set and `api` is omitted and multiple matches remain, return `nack` with `error_code = invalid_request`.
+7. If `model_id` is set and no matches remain, return `nack` with `error_code = invalid_request` and "model not found" detail.
 
 Client behavior:
 1. Treat `not_implemented` as capability absence.
