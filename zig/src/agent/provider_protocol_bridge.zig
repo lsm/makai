@@ -59,6 +59,7 @@ fn streamViaProtocol(
     const out_stream = try allocator.create(event_stream.AssistantMessageEventStream);
     out_stream.* = event_stream.AssistantMessageEventStream.init(allocator);
     out_stream.owns_events = true;
+    out_stream.wait_for_thread_on_deinit = true;
 
     const thread_ctx = try allocator.create(StreamThreadContext);
     errdefer allocator.destroy(thread_ctx);
@@ -129,7 +130,14 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         .max_tokens = ctx.options.max_tokens,
     };
 
-    _ = client.sendStreamRequest(ctx.model, ctx.context, stream_options) catch |err| {
+    // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
+    var request_model = ctx.model;
+    request_model.is_owned = false;
+    var request_context = ctx.context;
+    request_context.is_owned = false;
+    request_context.system_prompt = ai_types.OwnedSlice(u8).initBorrowed(ctx.context.system_prompt.slice());
+
+    _ = client.sendStreamRequest(request_model, request_context, stream_options) catch |err| {
         ctx.out_stream.completeWithError(@errorName(err));
         return;
     };
@@ -232,6 +240,7 @@ test "InProcessProviderProtocolBridge smoke test" {
                 .timestamp = std.time.milliTimestamp(),
                 .is_owned = false,
             });
+            s.markThreadDone();
             return s;
         }
 

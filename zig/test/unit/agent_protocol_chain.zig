@@ -108,8 +108,9 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
         .max_tokens = 256,
     };
 
+    const prompt_text = try allocator.dupe(u8, "hello");
     const prompt = ai_types.Message{ .user = .{
-        .content = .{ .text = "hello" },
+        .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
     } };
 

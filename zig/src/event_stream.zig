@@ -20,6 +20,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
+        /// When true, deinit waits for markThreadDone() from a producer thread.
+        wait_for_thread_on_deinit: bool = false,
         /// When true, events in this stream were deep-copied via cloneAssistantMessageEvent()
         /// and should be freed in deinit(). When false (default), events contain borrowed
         /// string slices and must NOT be freed by the stream.
@@ -43,8 +45,9 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            // Wait for producer thread to finish before cleanup
-            _ = self.waitForThread(5000);
+            if (self.wait_for_thread_on_deinit) {
+                _ = self.waitForThread(120_000);
+            }
 
             // Drain any remaining events in the ring buffer.
             // IMPORTANT: By default (owns_events=false), events contain BORROWED string slices

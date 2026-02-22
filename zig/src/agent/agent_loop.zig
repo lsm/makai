@@ -360,7 +360,10 @@ fn streamAssistantResponse(
         options,
         allocator,
     );
-    defer provider_stream.deinit();
+    defer {
+        provider_stream.deinit();
+        allocator.destroy(provider_stream);
+    }
 
     // Forward events and collect final message
     var final_message: ?ai_types.AssistantMessage = null;

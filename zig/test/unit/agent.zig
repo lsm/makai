@@ -156,12 +156,22 @@ fn mockProtocolStream(
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
 
-    var msg = try makeOwnedAssistantMessage(
-        allocator,
-        state.text,
-        if (state.mode == .done) .stop else .@"error",
-    );
-    errdefer msg.deinit(allocator);
+    const msg = if (state.mode == .done)
+        try makeOwnedAssistantMessage(allocator, state.text, .stop)
+    else
+        ai_types.AssistantMessage{
+            .content = &[_]ai_types.AssistantContent{
+                .{ .text = .{ .text = "" } },
+            },
+            .api = "mock-api",
+            .provider = "mock-provider",
+            .model = "mock-model",
+            .usage = .{},
+            .stop_reason = .@"error",
+            .error_message = ai_types.OwnedSlice(u8).initBorrowed("mock provider error"),
+            .timestamp = std.time.milliTimestamp(),
+            .is_owned = false,
+        };
 
     if (state.mode == .done) {
         try stream.push(.{ .done = .{
@@ -169,7 +179,6 @@ fn mockProtocolStream(
             .message = msg,
         } });
     } else {
-        msg.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "mock provider error"));
         try stream.push(.{ .@"error" = .{
             .reason = .@"error",
             .err = msg,
@@ -179,6 +188,7 @@ fn mockProtocolStream(
     // Mark stream completed without attaching result ownership to avoid
     // double-ownership in this test mock.
     stream.completeWithError("");
+    stream.markThreadDone();
     return stream;
 }
 
