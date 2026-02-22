@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Makai TS SDK Demo</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <h1>Makai TS SDK Demo</h1>
+      <p class="muted">OAuth bootstrap + provider/model chat from a browser UI.</p>
+
+      <section class="card">
+        <h2>1) Authenticate Provider</h2>
+        <div class="row">
+          <label for="authProvider">OAuth provider</label>
+          <select id="authProvider"></select>
+          <button id="authStartBtn">Start OAuth</button>
+        </div>
+        <div id="authStatus" class="status">Idle</div>
+        <div id="authPromptBox" class="prompt hidden">
+          <label for="authPromptInput" id="authPromptLabel">Prompt</label>
+          <input id="authPromptInput" type="text" autocomplete="off" />
+          <button id="authPromptSubmit">Submit</button>
+        </div>
+        <pre id="authEvents" class="log"></pre>
+      </section>
+
+      <section class="card">
+        <h2>2) Chat</h2>
+        <div class="row">
+          <label for="chatProvider">Provider</label>
+          <select id="chatProvider"></select>
+          <label for="chatModel">Model</label>
+          <select id="chatModel"></select>
+          <span id="chatAuthBadge" class="badge">auth unknown</span>
+          <button id="refreshMetaBtn">Refresh</button>
+        </div>
+
+        <div id="chatTranscript" class="transcript"></div>
+
+        <div class="row">
+          <textarea id="chatInput" rows="3" placeholder="Ask something..."></textarea>
+        </div>
+        <div class="row right">
+          <button id="chatSendBtn">Send</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

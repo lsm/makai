@@ -7,6 +7,7 @@
   "scripts": {
     "build:sdk": "tsc -p tsconfig.json",
     "test:sdk": "npm run build:sdk && node --test dist/test/**/*.test.js",
+    "demo:start": "npm run build:sdk && node dist/demo/server.js",
     "test": "npm run test:sdk"
   },
   "keywords": [

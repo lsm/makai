@@ -10,5 +10,5 @@
     "rootDir": "typescript",
     "outDir": "dist"
   },
-  "include": ["typescript/src/**/*.ts", "typescript/test/**/*.ts"]
+  "include": ["typescript/src/**/*.ts", "typescript/test/**/*.ts", "typescript/demo/**/*.ts"]
 }
