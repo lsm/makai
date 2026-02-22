@@ -276,7 +276,7 @@ pub const ModelDescriptor = struct {
     provider_id: OwnedSlice(u8),
     api: OwnedSlice(u8),
     base_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    auth_status: enum { authenticated, login_required, expired, unknown },
+    auth_status: enum { authenticated, login_required, expired, refreshing, login_in_progress, failed, unknown },
     lifecycle: enum { stable, preview, deprecated },
     capabilities: OwnedSlice(OwnedSlice(u8)),
     context_window: ?u32 = null,
