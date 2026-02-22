@@ -942,6 +942,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const makai_cli = b.addExecutable(.{
+        .name = "makai",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/makai.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(makai_cli);
+
+    const run_cmd = b.addRunArtifact(makai_cli);
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run the Makai CLI");
+    run_step.dependOn(&run_cmd.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
