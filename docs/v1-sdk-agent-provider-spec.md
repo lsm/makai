@@ -168,6 +168,7 @@ export type ImageContentPart = {
 
 export type ToolCallContentPart = {
   type: "tool_call";
+  // Correlates with Zig/provider tool-use identifiers.
   tool_call_id: string;
   name: string;
   arguments_json: string;
@@ -179,6 +180,7 @@ export type ToolResultContentPart = {
   tool_name: string;
   content: string | TextContentPart[]; // V1 minimal structured result
   is_error?: boolean;
+  // Optional JSON-encoded provider/runtime metadata for diagnostics or replay context.
   details_json?: string;
 };
 
@@ -571,6 +573,8 @@ Capability negotiation:
 ## 10. Model List Scope and Cancellation (V1)
 
 - V1 model list returns all matching models (no pagination).
+- Expected V1 scale target is O(100) models in a single response.
+- Catalogs approaching O(1000+) models should be addressed with future pagination/search support.
 - Pagination (`next_cursor`/`limit`) and search semantics are deferred to a future revision.
 - `models_request` is not cancellable in V1.
 
