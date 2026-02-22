@@ -100,6 +100,7 @@ const MockMode = enum { done, err };
 const MockProtocolState = struct {
     mode: MockMode,
     text: []const u8 = "ok",
+    stop_reason: ai_types.StopReason = .stop,
     call_count: usize = 0,
     last_options: ?ProtocolOptions = null,
 };
@@ -157,7 +158,7 @@ fn mockProtocolStream(
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     const msg = if (state.mode == .done)
-        try makeOwnedAssistantMessage(allocator, state.text, .stop)
+        try makeOwnedAssistantMessage(allocator, state.text, state.stop_reason)
     else
         ai_types.AssistantMessage{
             .content = &[_]ai_types.AssistantContent{
@@ -275,6 +276,58 @@ test "agentLoop: collects events in correct order" {
     try testing.expect(saw_agent_end);
 }
 
+test "agentLoop: emits lifecycle events in strict sequence" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "ordered" };
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "Hi");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var step: u8 = 0;
+    while (stream.wait()) |event| {
+        switch (event) {
+            .message_start => {
+                if (step == 0) step = 1;
+            },
+            .message_end => {
+                if (step == 1) step = 2;
+            },
+            .agent_start => {
+                if (step == 2) step = 3;
+            },
+            .turn_start => {
+                if (step == 3) step = 4;
+            },
+            .turn_end => {
+                if (step == 4) step = 5;
+            },
+            .agent_end => {
+                if (step == 5) step = 6;
+            },
+            else => {},
+        }
+    }
+
+    try testing.expectEqual(@as(u8, 6), step);
+}
+
 test "agentLoop: handles provider error" {
     const allocator = testing.allocator;
 
@@ -343,4 +396,73 @@ test "ProtocolOptions: passed through to protocol client" {
     try testing.expectEqual(@as(?u32, 42), seen.max_tokens);
     try testing.expectEqualStrings("key-123", seen.api_key.?);
     try testing.expectEqualStrings("session-abc", seen.session_id.?);
+}
+
+test "agentLoop: cancellation token stops before protocol stream call" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "unused" };
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "cancel");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .cancel_token = cancel_token,
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+    while (stream.wait()) |_| {}
+
+    const result = stream.getResult().?;
+    try testing.expectEqual(@as(usize, 0), result.iterations);
+    try testing.expectEqual(@as(usize, 0), state.call_count);
+}
+
+test "agentLoop: max_iterations caps repeated tool_use loop" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{
+        .mode = .done,
+        .text = "need tools",
+        .stop_reason = .tool_use,
+    };
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "loop");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = std.time.milliTimestamp(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .max_iterations = 2,
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+    while (stream.wait()) |_| {}
+
+    const result = stream.getResult().?;
+    try testing.expectEqual(@as(usize, 2), result.iterations);
+    try testing.expectEqual(@as(usize, 2), state.call_count);
 }

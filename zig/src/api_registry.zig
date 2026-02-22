@@ -164,3 +164,27 @@ test "unregister by source id" {
     registry.unregisterApiProviders("ext-1");
     try std.testing.expect(registry.getApiProvider("openai-completions") == null);
 }
+
+test "clearApiProviders removes all providers" {
+    var registry = ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "openai-completions",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    }, "ext-1");
+    try registry.registerApiProvider(.{
+        .api = "anthropic-messages",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    }, "ext-2");
+
+    try std.testing.expect(registry.getApiProvider("openai-completions") != null);
+    try std.testing.expect(registry.getApiProvider("anthropic-messages") != null);
+
+    registry.clearApiProviders();
+
+    try std.testing.expect(registry.getApiProvider("openai-completions") == null);
+    try std.testing.expect(registry.getApiProvider("anthropic-messages") == null);
+}

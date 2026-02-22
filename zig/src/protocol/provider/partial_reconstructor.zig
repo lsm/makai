@@ -779,6 +779,36 @@ test "buildMessage with tool_use stop reason" {
     try std.testing.expect(msg.content[0] == .tool_call);
 }
 
+test "processEvent ignores deltas without corresponding start blocks" {
+    var recon = PartialReconstructor.init(std.testing.allocator);
+    defer recon.deinit();
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{ .input = 1, .output = 2 },
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    try recon.processEvent(.{ .text_delta = .{
+        .content_index = 9,
+        .delta = "orphan",
+        .partial = partial,
+    } });
+    try recon.processEvent(.{ .toolcall_delta = .{
+        .content_index = 10,
+        .delta = "{\"k\":1}",
+        .partial = partial,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 0), recon.content_blocks.count());
+    try std.testing.expectEqual(@as(u64, 2), recon.usage.input);
+    try std.testing.expectEqual(@as(u64, 4), recon.usage.output);
+}
+
 test "PartialReconstructor reuse after reset" {
     var recon = PartialReconstructor.init(std.testing.allocator);
     defer recon.deinit();

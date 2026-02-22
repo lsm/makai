@@ -433,3 +433,51 @@ pub fn registerAzureOpenAIResponsesApiProvider(registry: *api_registry.ApiRegist
         .stream_simple = streamSimpleAzureOpenAIResponses,
     }, null);
 }
+
+test "parseEvent appends output_text delta" {
+    var text = std.ArrayList(u8){};
+    defer text.deinit(std.testing.allocator);
+
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+
+    const payload =
+        \\{"type":"response.output_text.delta","delta":"hello"}
+    ;
+    try parseEvent(payload, &text, &usage, &stop_reason, std.testing.allocator);
+
+    try std.testing.expectEqualStrings("hello", text.items);
+    try std.testing.expectEqual(ai_types.StopReason.stop, stop_reason);
+}
+
+test "parseEvent extracts incomplete stop reason and usage from response.completed" {
+    var text = std.ArrayList(u8){};
+    defer text.deinit(std.testing.allocator);
+
+    var usage = ai_types.Usage{};
+    var stop_reason: ai_types.StopReason = .stop;
+
+    const payload =
+        \\{"type":"response.completed","response":{"status":"incomplete","usage":{"input_tokens":12,"output_tokens":34}}}
+    ;
+    try parseEvent(payload, &text, &usage, &stop_reason, std.testing.allocator);
+
+    try std.testing.expectEqual(ai_types.StopReason.length, stop_reason);
+    try std.testing.expectEqual(@as(u64, 12), usage.input);
+    try std.testing.expectEqual(@as(u64, 34), usage.output);
+    try std.testing.expectEqual(@as(u64, 46), usage.total_tokens);
+}
+
+test "parseEvent ignores done sentinel" {
+    var text = std.ArrayList(u8){};
+    defer text.deinit(std.testing.allocator);
+
+    var usage = ai_types.Usage{ .input = 1, .output = 2, .total_tokens = 3 };
+    var stop_reason: ai_types.StopReason = .stop;
+
+    try parseEvent("[DONE]", &text, &usage, &stop_reason, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), text.items.len);
+    try std.testing.expectEqual(@as(u64, 3), usage.total_tokens);
+    try std.testing.expectEqual(ai_types.StopReason.stop, stop_reason);
+}

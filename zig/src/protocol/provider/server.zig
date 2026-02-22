@@ -736,6 +736,69 @@ test "handleStreamRequest creates stream and returns ack" {
     // ack response doesn't allocate memory, so no need to deinit
 }
 
+test "handleStreamRequest rejects duplicate stream id" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const client_stream_id = protocol_types.generateUuid();
+    var req1 = protocol_types.Envelope{
+        .stream_id = client_stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer req1.deinit(std.testing.allocator);
+
+    const resp1 = try server.handleEnvelope(req1);
+    try std.testing.expect(resp1 != null);
+    try std.testing.expect(resp1.?.payload == .ack);
+
+    var req2 = protocol_types.Envelope{
+        .stream_id = client_stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer req2.deinit(std.testing.allocator);
+
+    var resp2 = try server.handleEnvelope(req2);
+    defer if (resp2) |*r| r.deinit(std.testing.allocator);
+    try std.testing.expect(resp2 != null);
+    try std.testing.expect(resp2.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.stream_already_exists, resp2.?.payload.nack.error_code.?);
+}
+
 test "handleAbortRequest cancels stream" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
@@ -796,6 +859,7 @@ test "handleAbortRequest cancels stream" {
     const abort_response = try server.handleEnvelope(abort_env);
     try std.testing.expect(abort_response != null);
     try std.testing.expect(abort_response.?.payload == .ack);
+    try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
 
     // Verify stream was removed
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());

@@ -1381,6 +1381,24 @@ test "deserializeEnvelope parses valid JSON" {
     try std.testing.expectEqualSlices(u8, &expected_stream_id, &envelope.stream_id);
 }
 
+test "deserializeEnvelope rejects invalid in_reply_to uuid" {
+    const allocator = std.testing.allocator;
+
+    const json =
+        \\{
+        \\  "type": "ping",
+        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
+        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "in_reply_to": "not-a-uuid",
+        \\  "payload": {}
+        \\}
+    ;
+
+    try std.testing.expectError(error.InvalidUuid, deserializeEnvelope(json, allocator));
+}
+
 test "serializeEnvelope and deserializeEnvelope roundtrip with ping" {
     const allocator = std.testing.allocator;
 

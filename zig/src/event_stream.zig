@@ -452,3 +452,52 @@ test "AssistantMessageStream deinit drains unpollled events" {
 
     // deinit() will drain events and clean up
 }
+
+test "EventStream push returns QueueFull when ring buffer exhausted" {
+    const TestStream = EventStream(u32, bool);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // Capacity is RING_BUFFER_SIZE - 1 because head==tail means empty.
+    for (0..255) |i| {
+        try stream.push(@intCast(i));
+    }
+    try std.testing.expectError(error.QueueFull, stream.push(255));
+}
+
+test "EventStream ring buffer wrap-around preserves order" {
+    const TestStream = EventStream(u32, bool);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // Force head/tail wrap-around across the 256-slot ring.
+    for (0..300) |i| {
+        try stream.push(@intCast(i));
+        const v = stream.poll().?;
+        try std.testing.expectEqual(@as(u32, @intCast(i)), v);
+    }
+
+    try std.testing.expect(stream.poll() == null);
+}
+
+const WaitPushCtx = struct {
+    stream: *EventStream(u32, bool),
+};
+
+fn pushEventAfterDelay(ctx: *WaitPushCtx) void {
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    ctx.stream.push(42) catch {};
+}
+
+test "EventStream wait wakes and returns pushed event" {
+    const TestStream = EventStream(u32, bool);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    var ctx = WaitPushCtx{ .stream = &stream };
+    const th = try std.Thread.spawn(.{}, pushEventAfterDelay, .{&ctx});
+    defer th.join();
+
+    const got = stream.wait();
+    try std.testing.expectEqual(@as(?u32, 42), got);
+}
