@@ -1,13 +1,25 @@
 {
   "name": "makai",
   "version": "0.0.1",
-  "description": "",
-  "main": "index.js",
+  "description": "TypeScript SDK for Makai stdio client transport",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build:sdk": "tsc -p tsconfig.json",
+    "test:sdk": "npm run build:sdk && node --test dist/test/**/*.test.js",
+    "test": "npm run test:sdk"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "makai",
+    "sdk",
+    "typescript",
+    "stdio"
+  ],
+  "author": "makai contributors",
   "license": "ISC",
-  "type": "commonjs"
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
 }
