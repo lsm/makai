@@ -89,6 +89,22 @@ Progress note:
   metrics and return GO only when reliability hard gates and performance
   thresholds are satisfied.
 
+### Batch H — Testing Gap Closure (Phase 1)
+- [x] Add consolidated testing-gap findings document
+- [x] Add streaming-core tests for queue saturation, wraparound, wait wake-up, and stream delegation
+- [x] Add protocol tests for duplicate stream-id reject path, abort ACK sequence, invalid in_reply_to UUID, and reconstructor orphan deltas
+- [x] Add agent-loop tests for strict lifecycle ordering, cancellation short-circuit, and max-iteration cap
+- [x] Add initial Azure Responses parser tests (text delta + completed usage/stop reason)
+- [ ] Add transport concurrency/backpressure stress coverage
+- [ ] Expand cross-provider parity coverage (cancellation + usage/tool-delta parity)
+
+Progress note:
+- Added `docs/testing-gaps.md` as the gap ledger and implemented the highest-priority
+  core/protocol/agent slices plus an initial provider slice.
+- Verified with `./scripts/check-zig-patterns.sh`, `zig build test-unit-core`,
+  `zig build test-unit-protocol`, `zig build test-unit-providers`, and
+  `zig build test-unit-agent`.
+
 ---
 
 ## Resume Notes (for provider/model switch)
