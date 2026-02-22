@@ -452,6 +452,14 @@ pub const Agent = struct {
     /// Blocks until the current operation completes.
     /// Returns immediately if not streaming.
     pub fn waitForIdle(self: *Agent) void {
+        self._mutex.lock();
+        const should_wait = self._state.is_streaming or self._thread != null;
+        self._mutex.unlock();
+
+        if (!should_wait) {
+            return;
+        }
+
         // Wait for the done event (blocks until set)
         self._done_event.wait();
 
