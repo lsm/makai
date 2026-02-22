@@ -3,6 +3,8 @@ const ai_types = @import("ai_types");
 const owned_slice_mod = @import("owned_slice");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
+pub const PROTOCOL_VERSION: u8 = 1;
+pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{"1"};
 
 /// UUID type for stream/message identification
 pub const Uuid = [16]u8;

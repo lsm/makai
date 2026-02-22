@@ -125,6 +125,10 @@ pub const ProtocolServer = struct {
 
     /// Handle incoming envelope, optionally return response envelope
     pub fn handleEnvelope(self: *ProtocolServer, env: protocol_types.Envelope) !?protocol_types.Envelope {
+        if (env.version != protocol_types.PROTOCOL_VERSION) {
+            return try envelope.createVersionMismatchNack(env, self.allocator);
+        }
+
         switch (env.payload) {
             .stream_request => |req| {
                 // Validate sequence - client should start at 1 for new streams
@@ -676,6 +680,33 @@ test "handleEnvelope returns nack for stream_request without provider" {
     try std.testing.expectEqualSlices(u8, &client_stream_id, &response.?.stream_id);
 
     stream_req_env.deinit(std.testing.allocator);
+    if (response) |*r| r.deinit(std.testing.allocator);
+}
+
+test "handleEnvelope returns version_mismatch nack for unsupported version" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const ping_env = protocol_types.Envelope{
+        .version = 2,
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .ping,
+    };
+
+    var response = try server.handleEnvelope(ping_env);
+    try std.testing.expect(response != null);
+    try std.testing.expect(response.?.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.version_mismatch, response.?.payload.nack.error_code.?);
+    const supported_versions = response.?.payload.nack.supported_versions.slice();
+    try std.testing.expectEqual(@as(usize, 1), supported_versions.len);
+    try std.testing.expectEqualStrings("1", supported_versions[0].slice());
+
     if (response) |*r| r.deinit(std.testing.allocator);
 }
 

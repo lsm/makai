@@ -1248,6 +1248,42 @@ pub fn createNack(
     };
 }
 
+/// Create a version-mismatch nack envelope that includes supported versions.
+pub fn createVersionMismatchNack(
+    original: protocol_types.Envelope,
+    allocator: std.mem.Allocator,
+) !protocol_types.Envelope {
+    const reason = try std.fmt.allocPrint(allocator, "Unsupported protocol version: {d}", .{original.version});
+    errdefer allocator.free(reason);
+
+    const supported_versions = try allocator.alloc(protocol_types.OwnedSlice(u8), protocol_types.SUPPORTED_PROTOCOL_VERSIONS.len);
+    var populated_count: usize = 0;
+    errdefer {
+        for (supported_versions[0..populated_count]) |*version| {
+            version.deinit(allocator);
+        }
+        allocator.free(supported_versions);
+    }
+    for (protocol_types.SUPPORTED_PROTOCOL_VERSIONS, 0..) |version, i| {
+        supported_versions[i] = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, version));
+        populated_count += 1;
+    }
+
+    return .{
+        .stream_id = original.stream_id,
+        .message_id = protocol_types.generateUuid(),
+        .sequence = original.sequence + 1,
+        .in_reply_to = original.message_id,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .nack = .{
+            .rejected_id = original.message_id,
+            .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
+            .error_code = .version_mismatch,
+            .supported_versions = protocol_types.OwnedSlice(protocol_types.OwnedSlice(u8)).initOwned(supported_versions),
+        } },
+    };
+}
+
 // Custom error set
 pub const EnvelopeError = error{
     InvalidUuid,
@@ -1524,7 +1560,7 @@ test "createReply sets in_reply_to correctly" {
 test "createAck creates valid ack" {
     const allocator = std.testing.allocator;
 
-    var original = protocol_types.Envelope{
+    const original = protocol_types.Envelope{
         .stream_id = protocol_types.generateUuid(),
         .message_id = protocol_types.generateUuid(),
         .sequence = 1,
@@ -1567,6 +1603,28 @@ test "createNack creates valid nack" {
     try std.testing.expectEqualStrings("Model gpt-5 not found", nack_env.payload.nack.reason.slice());
     try std.testing.expect(nack_env.in_reply_to != null);
     try std.testing.expectEqualSlices(u8, &original.message_id, &nack_env.in_reply_to.?);
+}
+
+test "createVersionMismatchNack includes supported versions" {
+    const allocator = std.testing.allocator;
+
+    const original = protocol_types.Envelope{
+        .version = 2,
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .ping,
+    };
+
+    var nack_env = try createVersionMismatchNack(original, allocator);
+    defer nack_env.deinit(allocator);
+
+    try std.testing.expect(nack_env.payload == .nack);
+    try std.testing.expectEqual(protocol_types.ErrorCode.version_mismatch, nack_env.payload.nack.error_code.?);
+    const supported_versions = nack_env.payload.nack.supported_versions.slice();
+    try std.testing.expectEqual(@as(usize, 1), supported_versions.len);
+    try std.testing.expectEqualStrings("1", supported_versions[0].slice());
 }
 
 test "serializeEnvelope with abort_request payload" {
