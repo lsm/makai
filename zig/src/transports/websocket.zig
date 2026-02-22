@@ -26,6 +26,11 @@ pub const WebSocketClient = struct {
     // Handshake key (stored for verification)
     handshake_key: [24]u8 = undefined,
 
+    // Ping/pong timeout tracking
+    ping_timeout_ms: u64 = 30_000,
+    waiting_for_pong: bool = false,
+    last_ping_at_ms: i64 = 0,
+
     const Self = @This();
 
     pub const ConnectionState = enum {
@@ -66,6 +71,7 @@ pub const WebSocketClient = struct {
         // Start each connection attempt from a clean session buffer state.
         self.send_buffer.clearRetainingCapacity();
         self.recv_buffer.clearRetainingCapacity();
+        self.resetPingState();
 
         self.state = .connecting;
 
@@ -162,7 +168,7 @@ pub const WebSocketClient = struct {
                         continue;
                     },
                     .pong => {
-                        // Ignore pong
+                        self.markPongReceived();
                         continue;
                     },
                     .text, .binary => {
@@ -216,6 +222,7 @@ pub const WebSocketClient = struct {
         }
         self.send_buffer.clearRetainingCapacity();
         self.recv_buffer.clearRetainingCapacity();
+        self.resetPingState();
         self.state = .closed;
     }
 
@@ -253,6 +260,27 @@ pub const WebSocketClient = struct {
         defer self.allocator.free(encoded);
 
         try stream.writeAll(encoded);
+    }
+
+    fn resetPingState(self: *Self) void {
+        self.waiting_for_pong = false;
+        self.last_ping_at_ms = 0;
+    }
+
+    fn markPingSent(self: *Self, now_ms: i64) void {
+        self.waiting_for_pong = true;
+        self.last_ping_at_ms = now_ms;
+    }
+
+    fn markPongReceived(self: *Self) void {
+        self.resetPingState();
+    }
+
+    fn hasPingTimedOut(self: *const Self, now_ms: i64) bool {
+        if (!self.waiting_for_pong) return false;
+        const elapsed = now_ms - self.last_ping_at_ms;
+        if (elapsed < 0) return false;
+        return @as(u64, @intCast(elapsed)) >= self.ping_timeout_ms;
     }
 
     // --- AsyncSender implementation ---
@@ -874,6 +902,78 @@ test "WebSocketClient reconnect attempts clear stale buffers and remain retryabl
 
     // First reconnect failure should not block subsequent reconnect attempts.
     try std.testing.expectError(error.InvalidUrl, client.connect("still-not-a-websocket-url", null));
+}
+
+test "WebSocketClient ping timeout triggers without pong" {
+    const allocator = std.testing.allocator;
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+
+    client.ping_timeout_ms = 50;
+    client.markPingSent(1_000);
+
+    try std.testing.expect(!client.hasPingTimedOut(1_049));
+    try std.testing.expect(client.hasPingTimedOut(1_050));
+}
+
+test "WebSocketClient pong clears timeout wait state" {
+    const allocator = std.testing.allocator;
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+
+    client.ping_timeout_ms = 50;
+    client.markPingSent(1_000);
+    client.markPongReceived();
+
+    try std.testing.expect(!client.waiting_for_pong);
+    try std.testing.expectEqual(@as(i64, 0), client.last_ping_at_ms);
+    try std.testing.expect(!client.hasPingTimedOut(9_999));
+}
+
+test "WebSocketClient receive close frame enters closing state" {
+    const allocator = std.testing.allocator;
+
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[1]);
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+    client.tcp_stream = std.net.Stream{ .handle = pipe[0] };
+    client.state = .connected;
+
+    const close_frame = Frame{ .opcode = .close, .payload = "bye", .fin = true, .masked = false };
+    const encoded = try encodeFrame(close_frame, allocator);
+    defer allocator.free(encoded);
+
+    try client.recv_buffer.appendSlice(allocator, encoded);
+    const msg = try client.receive(allocator);
+    try std.testing.expect(msg == null);
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closing, client.state);
+}
+
+test "WebSocketClient close from closing state finalizes cleanup" {
+    const allocator = std.testing.allocator;
+
+    const pipe = try std.posix.pipe();
+    defer std.posix.close(pipe[1]);
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+    client.tcp_stream = std.net.Stream{ .handle = pipe[0] };
+    client.state = .closing;
+    client.ping_timeout_ms = 50;
+    client.markPingSent(1_000);
+    try client.send_buffer.appendSlice(allocator, "queued");
+    try client.recv_buffer.appendSlice(allocator, "partial-close");
+
+    client.close();
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expect(client.tcp_stream == null);
+    try std.testing.expectEqual(@as(usize, 0), client.send_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
+    try std.testing.expect(!client.waiting_for_pong);
 }
 
 test "WebSocketClient init and deinit" {
