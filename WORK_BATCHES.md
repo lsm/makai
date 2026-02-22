@@ -30,13 +30,14 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [x] Add reconnect/resubscribe behavior tests
 - [x] Add ping/pong timeout behavior tests
 - [x] Add close-handshake robustness tests
-- [ ] Add CI job split for websocket-heavy test lanes (if needed)
+- [x] Add CI job split for websocket-heavy test lanes (if needed)
 
 Progress note:
 - Added reconnect precondition coverage (`closed` state can reconnect path), guard coverage for non-reconnectable states, and close idempotence test coverage.
 - Added reconnect retryability + stale-buffer clearing coverage for reconnect/resubscribe-ready attempts.
 - Added ping timeout state coverage (timeout threshold trigger and pong-reset behavior).
 - Added close-frame receive and closing->closed cleanup robustness coverage.
+- Evaluated CI split need: no extra websocket-only lane needed now (unit matrix already isolates transport; recent failures were external E2E Anthropic 429s).
 
 ### Batch C — Provider Client Multiplexing API Cleanup
 - [ ] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)
