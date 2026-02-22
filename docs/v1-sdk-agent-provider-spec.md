@@ -373,6 +373,7 @@ Type safety requirement:
 - Zig protocol model capabilities must use an enum (not string slices).
 - TS string union remains API-facing; mapping happens at serialization boundaries.
 - Wire format note: `capabilities` are string-encoded in JSON and deserialized into `ModelCapability` enums in Zig.
+- Wire format note: `metadata` serializes as a JSON object (`Record<string, string>` in TS) and maps to `MetadataEntry[]` in Zig.
 
 ### 3.3 Auth Cancellation Semantics (Normative)
 
@@ -394,6 +395,7 @@ Agent stream rules:
 - `agent_start` should be the first agent-level event for a run and may include resolved `session_id`.
 - Each agent stream must emit exactly one terminal event for the overall run: `agent_end` or `error`.
 - On success, `agent_end` must be the last event in the stream and should include aggregate `usage` and `stop_reason`.
+- Aggregate `usage` sums token counts across all provider turns; `cache_read` reflects total cache-hit tokens, not unique cached content.
 - `turn_end` marks per-turn boundaries only and must not be interpreted as overall stream completion.
 - `turn_end.stop_reason` is turn-scoped; `agent_end.stop_reason` may include agent-level reasons such as `max_turns`.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
@@ -451,6 +453,8 @@ pub const ModelDescriptor = struct {
     source: enum { dynamic, static_fallback },
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
+    reasoning_default: ?ReasoningLevel = null,
+    metadata: ?OwnedSlice(MetadataEntry) = null,
 };
 
 pub const ModelsResponse = struct {
@@ -469,6 +473,20 @@ pub const ModelCapability = enum {
     prompt_cache,
     audio_input,
     audio_output,
+};
+
+pub const ReasoningLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+pub const MetadataEntry = struct {
+    key: OwnedSlice(u8),
+    value: OwnedSlice(u8),
 };
 ```
 
