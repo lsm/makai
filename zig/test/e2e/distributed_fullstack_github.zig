@@ -216,9 +216,11 @@ test "distributed fullstack github: agent loop via provider+tool protocols witho
         .max_tokens = 200,
     };
 
-    const prompt_text =
+    const prompt_text = try allocator.dupe(
+        u8,
         "You must call tool remote_sum exactly once with arguments {\"a\":2,\"b\":3}. " ++
-        "After receiving the tool result, answer with exactly: final answer: sum=5";
+            "After receiving the tool result, answer with exactly: final answer: sum=5",
+    );
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
