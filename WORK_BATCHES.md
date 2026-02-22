@@ -49,9 +49,12 @@ Progress note:
 - Added explicit provider client stream lifecycle APIs (`closeStream`, `removeStreamState`) and tests for cleanup + interleaved stream terminal isolation; documented normative `startStream` per-stream flow in `DESIGN.md`.
 
 ### Batch D — Agent Client Multiplexing Ergonomics
-- [ ] Add explicit per-session helpers (query completion/error by session)
-- [ ] Add session lifecycle cleanup APIs
-- [ ] Add tests for multi-session stop/restart with strict per-session sequence continuity
+- [x] Add explicit per-session helpers (query completion/error by session)
+- [x] Add session lifecycle cleanup APIs
+- [x] Add tests for multi-session stop/restart with strict per-session sequence continuity
+
+Progress note:
+- Added per-session completion/result/error tracking and `removeSessionState` lifecycle cleanup API in `protocol/agent/client.zig`, plus continuity tests for independent per-session sequence counters across stop/restart.
 
 ### Batch E — Tool Protocol Design -> Implementation Slice 1
 - [ ] Define tool protocol message types (request/response/events)
