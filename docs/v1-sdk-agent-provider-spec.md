@@ -47,7 +47,11 @@ Caching rules:
 - `fetched_at_ms` is required for all responses.
 - `cache_max_age_ms` is required for all responses.
 - Clients treat cached data as stale when `now_ms > fetched_at_ms + cache_max_age_ms`.
-- `source` indicates origin: `"dynamic"` or `"static_fallback"`.
+- `source` is per-model metadata: `"dynamic"` or `"static_fallback"`.
+- Recommended server defaults:
+  - dynamic source: `cache_max_age_ms = 300_000` (5 minutes),
+  - static fallback: `cache_max_age_ms = 3_600_000` (1 hour).
+- Auth status can lag reality by up to `cache_max_age_ms` in cache-hit paths.
 
 Auth for listing:
 - Providers that require auth for model listing must return `auth_status = "login_required"` (or `"expired"` / `"failed"`).
@@ -88,6 +92,8 @@ export type ModelCapability =
   | "audio_input"
   | "audio_output";
 
+export type ModelSource = "dynamic" | "static_fallback";
+
 export interface ProviderAuthInfo {
   id: ProviderId;
   name: string;
@@ -96,7 +102,7 @@ export interface ProviderAuthInfo {
 }
 
 export interface ModelDescriptor {
-  model_ref: string; // stable ref: "<provider_id>/<api>:<model_id>"
+  model_ref: string; // opaque stable handle, server-issued
   model_id: string;
   display_name: string;
   provider_id: ProviderId;
@@ -105,6 +111,7 @@ export interface ModelDescriptor {
   auth_status: AuthStatus;
   lifecycle: ModelLifecycle;
   capabilities: ModelCapability[];
+  source: ModelSource;
   context_window?: number;
   max_output_tokens?: number;
   reasoning_default?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -122,12 +129,52 @@ export interface ListModelsResponse {
   models: ModelDescriptor[];
   fetched_at_ms: number;
   cache_max_age_ms: number;
-  source: "dynamic" | "static_fallback";
 }
+
+export type TextContentPart = {
+  type: "text";
+  text: string;
+  text_signature?: string;
+};
+
+export type ThinkingContentPart = {
+  type: "thinking";
+  thinking: string;
+  thinking_signature?: string;
+};
+
+export type ImageContentPart = {
+  type: "image";
+  data: string;
+  mime_type: string;
+};
+
+export type ToolCallContentPart = {
+  type: "tool_call";
+  tool_call_id: string;
+  name: string;
+  arguments_json: string;
+};
+
+export type ToolResultContentPart = {
+  type: "tool_result";
+  tool_call_id: string;
+  tool_name: string;
+  content: string | TextContentPart[]; // V1 minimal structured result
+  is_error?: boolean;
+  details_json?: string;
+};
+
+export type ContentPart =
+  | TextContentPart
+  | ThinkingContentPart
+  | ImageContentPart
+  | ToolCallContentPart
+  | ToolResultContentPart;
 
 export interface ChatMessage {
   role: "system" | "developer" | "user" | "assistant" | "tool";
-  content: string;
+  content: string | ContentPart[];
   name?: string;
   tool_call_id?: string;
 }
@@ -141,7 +188,7 @@ export interface ToolDefinition {
 export interface RunOptions {
   temperature?: number;
   max_tokens?: number;
-  reasoning_effort?: "minimal" | "low" | "medium" | "high" | "xhigh";
+  reasoning_effort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   session_id?: string;
   metadata?: Record<string, string>;
 }
@@ -156,7 +203,7 @@ export interface AgentRunRequest {
 export interface AgentRunResponse {
   message: {
     role: "assistant";
-    content: string;
+    content: string | ContentPart[];
   };
   usage?: {
     input: number;
@@ -169,16 +216,22 @@ export interface AgentRunResponse {
   model_id: string;
 }
 
-export type AgentStreamEvent =
+export type ProviderStreamEvent =
   | { type: "message_start" }
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
-  | { type: "tool_call"; name: string; arguments_json: string; id: string }
+  | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
   | { type: "message_end" }
   | { type: "error"; message: string; code?: string };
 
-export type ProviderStreamEvent = AgentStreamEvent;
+export type AgentStreamEvent =
+  | ProviderStreamEvent
+  | { type: "turn_start" }
+  | { type: "turn_end"; stop_reason?: string }
+  | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
+  | { type: "tool_execution_update"; tool_call_id: string; delta: string }
+  | { type: "tool_execution_end"; tool_call_id: string; is_error?: boolean };
 
 export interface ProviderCompleteRequest {
   model_ref: string;
@@ -189,7 +242,7 @@ export interface ProviderCompleteRequest {
 export interface ProviderCompleteResponse {
   message: {
     role: "assistant";
-    content: string;
+    content: string | ContentPart[];
   };
   usage?: {
     input: number;
@@ -207,7 +260,12 @@ export interface MakaiAuthApi {
   login(providerId: ProviderId, handlers?: {
     onEvent?: (event: unknown) => void;
     onPrompt?: (prompt: { message: string; allow_empty: boolean }) => Promise<string> | string;
-  }): Promise<void>;
+  }): Promise<{ status: "success" }>;
+}
+
+export class MakaiAuthError extends Error {
+  code?: string;
+  kind: "provider_error" | "cancelled" | "transport_error" | "unknown";
 }
 
 export interface MakaiModelsApi {
@@ -233,19 +291,49 @@ export interface MakaiClient {
 }
 ```
 
+### 3.3 Auth Cancellation Semantics (Normative)
+
+- User-cancelled OAuth must reject with `MakaiAuthError { kind: "cancelled" }`.
+- Successful login resolves with `{ status: "success" }`.
+
 ### 3.1 `model_ref` Format (Normative)
 
-Canonical format:
-- `model_ref = "<provider_id>/<api>:<model_id>"`
+`model_ref` is an opaque, server-issued stable handle. Clients must not parse it.
 
-Examples:
-- `anthropic/anthropic-messages:claude-sonnet-4-5`
-- `openai/openai-responses:gpt-4o`
+Server canonicalization requirement:
+- provider runtime defines canonical `formatModelRef(...)` and `parseModelRef(...)` helpers,
+- helpers must support model IDs containing `:` and other UTF-8 characters without ambiguity.
 
-Constraints:
-- `provider_id` and `api` must match `[a-z0-9][a-z0-9-]*`.
-- `model_id` must be non-empty UTF-8 and must not contain `:` (colon).
-- `model_ref` parsing must be deterministic and lossless.
+Recommended internal canonical form:
+- `<provider_id>/<api>@<percent-encoded-model-id>`
+- this is a server detail; clients still treat `model_ref` as opaque.
+
+Versioning/stability:
+- servers may remap legacy aliases to canonical refs,
+- once a ref is emitted by `models.list`, it must remain valid until model retirement policy removes it.
+
+Required helper surfaces:
+- Zig: `protocol/model_ref.zig` with parse/format + tests.
+- TS: `parseModelRef` utility for diagnostics only (not required for normal API usage).
+
+### 3.2 `ModelDescriptor` vs `ai_types.Model` (Normative)
+
+`ModelDescriptor` and `ai_types.Model` co-exist with distinct responsibilities:
+- `ModelDescriptor`: discovery-plane metadata for SDK/users.
+- `ai_types.Model`: execution-plane provider config used by stream/complete internals.
+
+Resolution model:
+1. External SDK requests carry `model_ref`.
+2. Binary resolves `model_ref -> ai_types.Model` via a model resolver.
+3. Existing internal provider protocol may continue using `ai_types.Model` payloads in V1.
+
+Normative implementation requirement:
+- introduce a single resolver component (`model_catalog` + `model_resolver`) that is the only conversion boundary.
+- do not duplicate ad-hoc `ModelDescriptor -> Model` conversions across handlers.
+
+Type safety requirement:
+- Zig protocol model capabilities must use an enum (not string slices).
+- TS string union remains API-facing; mapping happens at serialization boundaries.
 
 ## 4. Provider Protocol Changes (Normative)
 
@@ -278,7 +366,8 @@ pub const ModelDescriptor = struct {
     base_url: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     auth_status: enum { authenticated, login_required, expired, refreshing, login_in_progress, failed, unknown },
     lifecycle: enum { stable, preview, deprecated },
-    capabilities: OwnedSlice(OwnedSlice(u8)),
+    capabilities: OwnedSlice(ModelCapability),
+    source: enum { dynamic, static_fallback },
     context_window: ?u32 = null,
     max_output_tokens: ?u32 = null,
 };
@@ -287,8 +376,18 @@ pub const ModelsResponse = struct {
     models: OwnedSlice(ModelDescriptor),
     fetched_at_ms: i64,
     cache_max_age_ms: u64,
-    source: enum { dynamic, static_fallback },
     pub fn deinit(self: *ModelsResponse, allocator: std.mem.Allocator) void { ... }
+};
+
+pub const ModelCapability = enum {
+    chat,
+    streaming,
+    tools,
+    vision,
+    reasoning,
+    prompt_cache,
+    audio_input,
+    audio_output,
 };
 ```
 
@@ -312,9 +411,15 @@ File target: `zig/src/protocol/agent/types.zig`
 
 Add payload variants:
 - `models_request: struct { provider_id: OwnedSlice(u8), api: OwnedSlice(u8), include_deprecated: bool, include_login_required: bool }`
-- `models_response: struct { models_json: []const u8, fetched_at_ms: i64 }`
+- `models_response: SharedModelsResponse`
 
 Rationale: agent protocol carries passthrough model discovery for clients connected only to agent endpoint.
+`SharedModelsResponse` must reuse the same typed shape as provider protocol (no raw JSON blob passthrough).
+
+Required shared module:
+- `protocol/model_catalog_types.zig`
+  - contains `ModelCapability`, `ModelDescriptor`, `ModelsResponse`.
+- provider and agent protocol types import shared model catalog types.
 
 Normative rule: provider protocol remains canonical source; agent protocol passthrough must return the same model set and shape.
 
@@ -353,18 +458,18 @@ Provider models response:
     "fetched_at_ms": 1760000000198,
     "models": [
       {
-        "model_ref": "anthropic/anthropic-messages:claude-sonnet-4-5",
+        "model_ref": "anthropic/anthropic-messages@claude-sonnet-4-5",
         "model_id": "claude-sonnet-4-5",
         "display_name": "Claude Sonnet 4.5",
         "provider_id": "anthropic",
         "api": "anthropic-messages",
         "auth_status": "authenticated",
         "lifecycle": "stable",
-        "capabilities": ["chat", "streaming", "tools", "reasoning"]
+        "capabilities": ["chat", "streaming", "tools", "reasoning"],
+        "source": "dynamic"
       }
     ],
-    "cache_max_age_ms": 300000,
-    "source": "dynamic"
+    "cache_max_age_ms": 300000
   }
 }
 ```
@@ -374,15 +479,23 @@ Provider models response:
 Use existing `nack` / `agent_error` envelopes.
 
 Recommended error code mapping:
-- Missing/invalid auth: `provider_error` with reason prefix `auth:`
+- Missing/invalid auth: `auth_required`
 - Unsupported models list op: `not_implemented`
 - Provider timeout/upstream issue: `provider_error`
 - Invalid filter arguments: `invalid_request`
+- Refresh failure: `auth_refresh_failed`
+- Expired token without refresh path: `auth_expired`
+
+Provider protocol requirement:
+- extend provider `ErrorCode` enum with:
+  - `auth_required`
+  - `auth_refresh_failed`
+  - `auth_expired`
 
 Auth refresh semantics:
 - Refresh occurs in Zig binary request path.
 - On expired credentials, implementation may auto-refresh before request dispatch.
-- If refresh fails, return `provider_error` with reason prefix `auth:refresh_failed`.
+- If refresh fails, return typed code `auth_refresh_failed`.
 
 ## 8. Compatibility and Rollout
 
@@ -392,7 +505,7 @@ Auth refresh semantics:
 4. Phase D: switch demo to spec interfaces only.
 
 Backward compatibility:
-- Keep protocol version as `1`.
+- Keep envelope protocol version as `1`.
 - Feature detect by attempting models request and handling `not_implemented`.
 - V1 evolution rule: additive-only changes. Do not repurpose existing fields.
 - Unknown fields must be ignored by parsers.
@@ -408,7 +521,13 @@ Capability negotiation:
 3. Agent and provider execution accept the same `model_ref` format.
 4. Existing auth and stream/complete flows remain functional.
 
-## 10. Stream Recovery (V1)
+## 10. Model List Scope and Cancellation (V1)
+
+- V1 model list returns all matching models (no pagination).
+- Pagination (`next_cursor`/`limit`) and search semantics are deferred to a future revision.
+- `models_request` is not cancellable in V1.
+
+## 11. Stream Recovery (V1)
 
 - V1 streams are not resumable after transport interruption.
 - Client behavior on interruption: retry request with full context.

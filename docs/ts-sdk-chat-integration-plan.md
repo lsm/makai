@@ -26,7 +26,7 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Pump provider stream events/results/errors back to stdio.
 - Keep backward-compatible ready handshake semantics.
 
-### Phase 2: Add auth resolution in binary request path
+### Phase 2a: Add auth resolution in binary request path
 
 - Ownership:
   - Zig binary owns auth resolution and refresh.
@@ -34,16 +34,23 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Credential resolution for provider requests:
   - use explicit request API key when provided,
   - otherwise load from auth storage by provider ID.
+
+### Phase 2b: Add refresh and retry behavior
+
 - Refresh flow:
   - if stored credentials are expired, perform refresh before upstream call,
   - if upstream returns auth failure and credentials are refreshable, refresh and retry once.
-- Concurrency:
-  - apply per-provider refresh lock to prevent concurrent refresh storms.
 - Persistence:
   - write refreshed credentials atomically back to auth storage.
 - Failure behavior:
-  - return protocol error with `provider_error` and reason prefix `auth:refresh_failed`.
+  - return typed protocol error (`auth_refresh_failed`) for refresh failures.
   - if failure occurs before terminal event in streaming path, terminate stream with error envelope.
+
+### Phase 2c: Harden concurrency and storage races
+
+- Concurrency:
+  - apply per-provider refresh lock to prevent concurrent refresh storms.
+- Ensure refresh + persistence is race-safe under concurrent traffic.
 
 ### Phase 3: Add high-level TS SDK APIs
 
