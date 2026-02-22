@@ -1587,6 +1587,36 @@ test "parseResponseEventFromValue handles function_call_arguments.delta" {
     }
 }
 
+test "parseResponseEventFromValue maintains function_call delta continuity" {
+    const allocator = std.testing.allocator;
+    const data1 = "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_123\",\"delta\":\"{\\\"cmd\\\":\\\"ls\"}";
+    const data2 = "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_123\",\"delta\":\" -la\\\"}\"}";
+
+    const result1 = parseEventForTest(data1, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result1.parsed.deinit();
+
+    const result2 = parseEventForTest(data2, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer result2.parsed.deinit();
+
+    switch (result1.event.event_type) {
+        .function_call_args_delta => |args1| switch (result2.event.event_type) {
+            .function_call_args_delta => |args2| {
+                try std.testing.expectEqualStrings(args1.item_id, args2.item_id);
+                try std.testing.expectEqual(@as(usize, 0), result1.event.output_index);
+                try std.testing.expectEqual(@as(usize, 0), result2.event.output_index);
+            },
+            else => try std.testing.expect(false),
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
 test "parseResponseEventFromValue handles function_call_arguments.done" {
     const allocator = std.testing.allocator;
     const data = "{\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"item_id\":\"fc_123\",\"arguments\":\"{\\\"cmd\\\": \\\"ls -la\\\"}\"}";
@@ -1877,4 +1907,41 @@ test "ReasoningSummary enum values are correct" {
     try std.testing.expectEqual(ai_types.ReasoningSummary.auto, .auto);
     try std.testing.expectEqual(ai_types.ReasoningSummary.concise, .concise);
     try std.testing.expectEqual(ai_types.ReasoningSummary.detailed, .detailed);
+}
+
+test "streamSimpleOpenAIResponses exits early when pre-cancelled" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-4o-mini",
+        .name = "gpt-4o-mini",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+    const context: ai_types.Context = .{ .messages = &.{} };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    const stream = try streamSimpleOpenAIResponses(model, context, .{
+        .api_key = "test-key",
+        .cancel_token = cancel_token,
+    }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
+
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }

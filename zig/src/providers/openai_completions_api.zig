@@ -2735,3 +2735,42 @@ test "buildRequestBody includes reasoning_details for tool calls with thought_si
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning.encrypted") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "call_abc123") != null);
 }
+
+test "streamSimpleOpenAICompletions exits early when pre-cancelled" {
+    const allocator = std.testing.allocator;
+    const model = ai_types.Model{
+        .id = "gpt-4o-mini",
+        .name = "GPT-4o Mini",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+    const context = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+    };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    const stream = try streamSimpleOpenAICompletions(model, context, .{
+        .api_key = "test-key",
+        .cancel_token = cancel_token,
+    }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
+
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}

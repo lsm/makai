@@ -95,8 +95,8 @@ Progress note:
 - [x] Add protocol tests for duplicate stream-id reject path, abort ACK sequence, invalid in_reply_to UUID, and reconstructor orphan deltas
 - [x] Add agent-loop tests for strict lifecycle ordering, cancellation short-circuit, and max-iteration cap
 - [x] Add initial Azure Responses parser tests (text delta + completed usage/stop reason)
-- [ ] Add transport concurrency/backpressure stress coverage
-- [ ] Expand cross-provider parity coverage (cancellation + usage/tool-delta parity)
+- [x] Add transport concurrency/backpressure stress coverage
+- [x] Expand cross-provider parity coverage (cancellation + usage/tool-delta parity)
 
 Progress note:
 - Added `docs/testing-gaps.md` as the gap ledger and implemented the highest-priority
@@ -108,6 +108,11 @@ Progress note:
   cross-provider usage parity checks.
 - Added in-process transport burst backpressure test and fixed event cleanup on
   `QueueFull` in `InProcessTransport.writeFn` to prevent leaked parsed events.
+- Added provider cancellation parity tests for pre-cancelled paths in
+  `streamSimpleOpenAIResponses`, `streamSimpleOpenAICompletions`, and
+  `streamSimpleGoogleGenerativeAI`.
+- Added OpenAI Responses tool-argument delta continuity coverage and in-process
+  transport concurrent write/read + close-error propagation coverage.
 
 ---
 

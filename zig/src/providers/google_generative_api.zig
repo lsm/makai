@@ -1691,3 +1691,42 @@ test "parseGoogleEventExtended - extracts usage and finish reason" {
         try std.testing.expect(false);
     }
 }
+
+test "streamSimpleGoogleGenerativeAI exits early when pre-cancelled" {
+    const allocator = std.testing.allocator;
+    const model = ai_types.Model{
+        .id = "gemini-2.5-flash",
+        .name = "Gemini 2.5 Flash",
+        .api = "google-generative-ai",
+        .provider = "google",
+        .base_url = "https://generativelanguage.googleapis.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1_000_000,
+        .max_tokens = 8192,
+    };
+    const context = ai_types.Context{
+        .messages = &[_]ai_types.Message{},
+    };
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    const stream = try streamSimpleGoogleGenerativeAI(model, context, .{
+        .api_key = "test-key",
+        .cancel_token = cancel_token,
+    }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    while (stream.wait()) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
+
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}

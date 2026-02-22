@@ -856,3 +856,93 @@ test "InProcessTransport applies queue backpressure under burst writes" {
         ai_types.deinitAssistantMessageEvent(allocator, &mut_leftover);
     }
 }
+
+test "InProcessTransport sender close propagates terminal error" {
+    const allocator = std.testing.allocator;
+
+    var ip_transport = try InProcessTransport.init(allocator);
+    defer ip_transport.deinit();
+
+    var sender = ip_transport.asyncSender();
+    sender.close();
+
+    try std.testing.expect(ip_transport.stream.isDone());
+    try std.testing.expect(ip_transport.stream.getError() != null);
+    try std.testing.expectEqualStrings("Transport closed", ip_transport.stream.getError().?);
+}
+
+const ConcurrentWriteCtx = struct {
+    transport: *InProcessTransport,
+    allocator: std.mem.Allocator,
+    count: usize,
+    failed: *std.atomic.Value(bool),
+};
+
+fn writeBurstThread(ctx: *ConcurrentWriteCtx) void {
+    var sender = ctx.transport.asyncSender();
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "",
+        .provider = "",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    for (0..ctx.count) |_| {
+        const event_json = transport_mod.serializeEvent(
+            .{ .start = .{ .partial = partial } },
+            ctx.allocator,
+        ) catch {
+            ctx.failed.store(true, .release);
+            return;
+        };
+        sender.write(event_json) catch {
+            ctx.allocator.free(event_json);
+            ctx.failed.store(true, .release);
+            return;
+        };
+        ctx.allocator.free(event_json);
+    }
+
+    ctx.transport.stream.complete(.{
+        .content = &.{},
+        .usage = .{},
+        .stop_reason = .stop,
+        .model = "",
+        .api = "",
+        .provider = "",
+        .timestamp = 0,
+    });
+}
+
+test "InProcessTransport concurrent write/read drains all events" {
+    const allocator = std.testing.allocator;
+
+    var ip_transport = try InProcessTransport.init(allocator);
+    defer ip_transport.deinit();
+
+    var failed = std.atomic.Value(bool).init(false);
+    var ctx = ConcurrentWriteCtx{
+        .transport = ip_transport,
+        .allocator = allocator,
+        .count = 64,
+        .failed = &failed,
+    };
+
+    const th = try std.Thread.spawn(.{}, writeBurstThread, .{&ctx});
+    defer th.join();
+
+    var received: usize = 0;
+    while (ip_transport.stream.wait()) |ev| {
+        if (ev == .start) {
+            received += 1;
+        }
+        var mut_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mut_ev);
+    }
+
+    try std.testing.expect(!failed.load(.acquire));
+    try std.testing.expectEqual(ctx.count, received);
+}
