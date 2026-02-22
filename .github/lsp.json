@@ -1,0 +1,13 @@
+{
+  "lspServers": {
+    "zig": {
+      "command": "zls",
+      "args": [
+      ],
+      "fileExtensions": {
+        ".zig": "zig",
+        ".zon": "zig"
+      }
+    }
+  }
+}
