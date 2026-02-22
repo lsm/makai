@@ -163,6 +163,48 @@ At minimum:
 - evaluate Bun-inspired lower-level networking approach (C/C++ interop) where it materially improves websocket robustness/perf
 - keep transport interfaces stable (`Sender/Receiver`, async sender/receiver abstraction)
 
+### 8.3 Low-level socket/C-C++ interop options (Batch G note)
+
+1. **Option A (default): pure Zig + `libxev` hardening**
+   - continue improving current websocket transport and tests
+   - lowest integration risk and simplest ownership model
+
+2. **Option B: hybrid C socket engine + Zig protocol/runtime**
+   - wrap battle-tested C/C++ socket stack (for example uSockets/libuv-family)
+   - keep Makai protocol/agent/tool layers in Zig
+   - highest potential perf upside, highest build/debug complexity
+
+3. **Option C: focused interop slices only**
+   - keep websocket state machine in Zig, offload narrow hot paths
+   - examples: parser/TLS or socket poll primitives only
+   - medium complexity, medium upside
+
+Evaluation rule: stay on Option A unless the objective gate in 8.5 passes.
+
+### 8.4 Objective benchmark + reliability criteria
+
+A candidate interop path must be measured against current websocket transport on
+the same host class and workload profile.
+
+Required reliability thresholds (hard gate):
+- crash_count = 0
+- leak_count = 0
+- ordering_violations = 0
+- backpressure_failures = 0
+- reconnect_success_rate >= 99.9%
+
+Required performance thresholds (at least one):
+- p99_latency_ms <= baseline * 0.80, **or**
+- throughput_msgs_per_sec >= baseline * 1.25
+
+### 8.5 Minimal POC decision gate (go/no-go)
+
+- Collect baseline + candidate metrics JSON with the fields above.
+- Run `./scripts/websocket-poc-gate.sh <metrics.json>`.
+- **GO** only when all reliability thresholds pass and at least one performance
+  threshold passes; otherwise **NO-GO**.
+- Default decision without complete metrics is **NO-GO**.
+
 ---
 
 ## 9) Test Strategy (Normative)

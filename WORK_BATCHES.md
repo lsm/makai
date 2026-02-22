@@ -77,9 +77,17 @@ Progress note:
 - Split non-mock distributed fullstack into its own CI lane: `E2E - Distributed Fullstack (GitHub Copilot)`.
 
 ### Batch G — Bun-inspired WebSocket Evaluation
-- [ ] Add short design note on low-level socket/C-C++ interop options
-- [ ] Define objective benchmark + reliability criteria
-- [ ] Build minimal POC decision gate (go/no-go)
+- [x] Add short design note on low-level socket/C-C++ interop options
+- [x] Define objective benchmark + reliability criteria
+- [x] Build minimal POC decision gate (go/no-go)
+
+Progress note:
+- Added a short Batch G design note in `DESIGN.md` with three interop options
+  (pure Zig default, hybrid C engine, focused interop slices), objective
+  reliability/performance thresholds, and explicit go/no-go policy.
+- Added `scripts/websocket-poc-gate.sh` to evaluate baseline vs candidate JSON
+  metrics and return GO only when reliability hard gates and performance
+  thresholds are satisfied.
 
 ---
 
