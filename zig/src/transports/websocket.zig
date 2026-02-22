@@ -63,6 +63,10 @@ pub const WebSocketClient = struct {
             return error.AlreadyConnected;
         }
 
+        // Start each connection attempt from a clean session buffer state.
+        self.send_buffer.clearRetainingCapacity();
+        self.recv_buffer.clearRetainingCapacity();
+
         self.state = .connecting;
 
         // Parse URL
@@ -210,6 +214,8 @@ pub const WebSocketClient = struct {
             stream.close();
             self.tcp_stream = null;
         }
+        self.send_buffer.clearRetainingCapacity();
+        self.recv_buffer.clearRetainingCapacity();
         self.state = .closed;
     }
 
@@ -849,6 +855,25 @@ test "WebSocketClient close is idempotent" {
 
     try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
     try std.testing.expect(client.tcp_stream == null);
+}
+
+test "WebSocketClient reconnect attempts clear stale buffers and remain retryable" {
+    const allocator = std.testing.allocator;
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+
+    try client.send_buffer.appendSlice(allocator, "stale-subscribe");
+    try client.recv_buffer.appendSlice(allocator, "stale-event");
+
+    client.state = .closed;
+    try std.testing.expectError(error.InvalidUrl, client.connect("not-a-websocket-url", null));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.disconnected, client.state);
+    try std.testing.expectEqual(@as(usize, 0), client.send_buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
+
+    // First reconnect failure should not block subsequent reconnect attempts.
+    try std.testing.expectError(error.InvalidUrl, client.connect("still-not-a-websocket-url", null));
 }
 
 test "WebSocketClient init and deinit" {

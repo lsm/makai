@@ -27,13 +27,14 @@ Purpose: track remaining work in small CI-friendly batches and keep this file up
 - [x] Add websocket backpressure behavior tests
 
 ### Batch B — WebSocket Transport Hardening Tests (Phase 2)
-- [ ] Add reconnect/resubscribe behavior tests
+- [x] Add reconnect/resubscribe behavior tests
 - [ ] Add ping/pong timeout behavior tests
 - [ ] Add close-handshake robustness tests
 - [ ] Add CI job split for websocket-heavy test lanes (if needed)
 
 Progress note:
 - Added reconnect precondition coverage (`closed` state can reconnect path), guard coverage for non-reconnectable states, and close idempotence test coverage.
+- Added reconnect retryability + stale-buffer clearing coverage for reconnect/resubscribe-ready attempts.
 
 ### Batch C — Provider Client Multiplexing API Cleanup
 - [ ] Add explicit stream lifecycle helpers (`closeStream`, `removeStreamState`)
@@ -70,5 +71,5 @@ Progress note:
 - Preserve CI-first policy.
 
 ## Last Updated
-- 2026-02-21
+- 2026-02-22
 - By: coding agent
