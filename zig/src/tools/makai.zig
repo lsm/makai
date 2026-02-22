@@ -7,7 +7,7 @@ fn printUsage(file: std.fs.File) !void {
         \\Usage: makai [--version] [--stdio]
         \\
         \\  --version  Print binary version
-        \\  --stdio    Start stdio mode (placeholder)
+        \\  --stdio    Start stdio mode
         \\
     );
 }
@@ -35,6 +35,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, args[1], "--stdio")) {
+        try stdout.writeAll("{\"type\":\"ready\",\"protocol_version\":\"1\"}\n");
         var buffer: [4096]u8 = undefined;
         while (true) {
             const n = try stdin.read(&buffer);
