@@ -197,8 +197,9 @@ test "agentLoop: basic single turn with text response" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
+    const prompt_text = try allocator.dupe(u8, "Hello");
     const prompt = ai_types.Message{ .user = .{
-        .content = .{ .text = "Hello" },
+        .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
     } };
 
@@ -229,8 +230,9 @@ test "agentLoop: collects events in correct order" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
+    const prompt_text = try allocator.dupe(u8, "Hi");
     const prompt = ai_types.Message{ .user = .{
-        .content = .{ .text = "Hi" },
+        .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
     } };
 
@@ -271,8 +273,9 @@ test "agentLoop: handles provider error" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
+    const prompt_text = try allocator.dupe(u8, "Fail please");
     const prompt = ai_types.Message{ .user = .{
-        .content = .{ .text = "Fail please" },
+        .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
     } };
 
@@ -302,8 +305,9 @@ test "ProtocolOptions: passed through to protocol client" {
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
 
+    const prompt_text = try allocator.dupe(u8, "options test");
     const prompt = ai_types.Message{ .user = .{
-        .content = .{ .text = "options test" },
+        .content = .{ .text = prompt_text },
         .timestamp = std.time.milliTimestamp(),
     } };
 

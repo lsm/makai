@@ -81,9 +81,8 @@ fn streamViaProtocol(
 }
 
 fn pushEventBlocking(stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
-    var event_to_push = ev;
     while (true) {
-        stream.push(event_to_push) catch |err| switch (err) {
+        stream.push(ev) catch |err| switch (err) {
             error.QueueFull => {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
                 continue;
@@ -139,7 +138,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
     const timeout_ms: i64 = 120_000;
 
     while (!client.isComplete()) {
-        runtime.pumpOnce(&client) catch |err| {
+        _ = runtime.pumpOnce(&client) catch |err| {
             ctx.out_stream.completeWithError(@errorName(err));
             return;
         };
@@ -164,8 +163,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         return;
     };
 
-    const final_result = client.waitResult(1) catch |err| {
-        _ = err;
+    const final_result = client.waitResult(1) catch {
         if (client.getLastError()) |last_err| {
             ctx.out_stream.completeWithError(last_err);
         } else {

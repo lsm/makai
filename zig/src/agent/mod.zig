@@ -31,42 +31,44 @@
 /// });
 /// ```
 const std = @import("std");
+const types = @import("agent_types");
+const agent_loop_mod = @import("agent_loop");
 
 // Re-export all public types from types.zig
-pub const AgentEvent = @import("types.zig").AgentEvent;
-pub const AgentEndPayload = @import("types.zig").AgentEndPayload;
-pub const TurnEndPayload = @import("types.zig").TurnEndPayload;
-pub const MessageStartPayload = @import("types.zig").MessageStartPayload;
-pub const MessageUpdatePayload = @import("types.zig").MessageUpdatePayload;
-pub const MessageEndPayload = @import("types.zig").MessageEndPayload;
-pub const ToolExecutionStartPayload = @import("types.zig").ToolExecutionStartPayload;
-pub const ToolExecutionUpdatePayload = @import("types.zig").ToolExecutionUpdatePayload;
-pub const ToolExecutionEndPayload = @import("types.zig").ToolExecutionEndPayload;
-pub const AgentTool = @import("types.zig").AgentTool;
-pub const AgentToolResult = @import("types.zig").AgentToolResult;
-pub const ToolUpdateCallback = @import("types.zig").ToolUpdateCallback;
-pub const ToolExecuteFn = @import("types.zig").ToolExecuteFn;
-pub const AgentStreamFn = @import("types.zig").AgentStreamFn;
-pub const TransformContextFn = @import("types.zig").TransformContextFn;
-pub const GetSteeringMessagesFn = @import("types.zig").GetSteeringMessagesFn;
-pub const GetFollowUpMessagesFn = @import("types.zig").GetFollowUpMessagesFn;
-pub const ConvertToLlmFn = @import("types.zig").ConvertToLlmFn;
-pub const GetApiKeyFn = @import("types.zig").GetApiKeyFn;
-pub const AgentLoopConfig = @import("types.zig").AgentLoopConfig;
-pub const AgentContext = @import("types.zig").AgentContext;
-pub const AgentState = @import("types.zig").AgentState;
-pub const AgentLoopResult = @import("types.zig").AgentLoopResult;
-pub const AgentEventStream = @import("types.zig").AgentEventStream;
-pub const QueueMode = @import("types.zig").QueueMode;
+pub const AgentEvent = types.AgentEvent;
+pub const AgentEndPayload = types.AgentEndPayload;
+pub const TurnEndPayload = types.TurnEndPayload;
+pub const MessageStartPayload = types.MessageStartPayload;
+pub const MessageUpdatePayload = types.MessageUpdatePayload;
+pub const MessageEndPayload = types.MessageEndPayload;
+pub const ToolExecutionStartPayload = types.ToolExecutionStartPayload;
+pub const ToolExecutionUpdatePayload = types.ToolExecutionUpdatePayload;
+pub const ToolExecutionEndPayload = types.ToolExecutionEndPayload;
+pub const AgentTool = types.AgentTool;
+pub const AgentToolResult = types.AgentToolResult;
+pub const ToolUpdateCallback = types.ToolUpdateCallback;
+pub const ToolExecuteFn = types.ToolExecuteFn;
+pub const AgentStreamFn = types.AgentStreamFn;
+pub const TransformContextFn = types.TransformContextFn;
+pub const GetSteeringMessagesFn = types.GetSteeringMessagesFn;
+pub const GetFollowUpMessagesFn = types.GetFollowUpMessagesFn;
+pub const ConvertToLlmFn = types.ConvertToLlmFn;
+pub const GetApiKeyFn = types.GetApiKeyFn;
+pub const AgentLoopConfig = types.AgentLoopConfig;
+pub const AgentContext = types.AgentContext;
+pub const AgentState = types.AgentState;
+pub const AgentLoopResult = types.AgentLoopResult;
+pub const AgentEventStream = types.AgentEventStream;
+pub const QueueMode = types.QueueMode;
 
 // Re-export ProtocolClient types
-pub const ProtocolClient = @import("types.zig").ProtocolClient;
-pub const ProtocolOptions = @import("types.zig").ProtocolOptions;
-pub const ProtocolStreamFn = @import("types.zig").ProtocolStreamFn;
+pub const ProtocolClient = types.ProtocolClient;
+pub const ProtocolOptions = types.ProtocolOptions;
+pub const ProtocolStreamFn = types.ProtocolStreamFn;
 
 // Re-export low-level functions from agent_loop.zig
-pub const agentLoop = @import("agent_loop.zig").agentLoop;
-pub const agentLoopContinue = @import("agent_loop.zig").agentLoopContinue;
+pub const agentLoop = agent_loop_mod.agentLoop;
+pub const agentLoopContinue = agent_loop_mod.agentLoopContinue;
 
 // Re-export high-level Agent class from agent.zig
 pub const Agent = @import("agent.zig").Agent;
@@ -84,8 +86,8 @@ pub const event_stream = @import("event_stream");
 
 test {
     // Run all tests in the module
-    _ = @import("types.zig");
-    _ = @import("agent_loop.zig");
+    _ = types;
+    _ = agent_loop_mod;
     _ = @import("agent.zig");
     _ = @import("provider_protocol_bridge.zig");
 }
