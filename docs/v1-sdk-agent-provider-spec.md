@@ -47,6 +47,7 @@ Caching rules:
 - `fetched_at_ms` is required for all responses.
 - `cache_max_age_ms` is required for all responses.
 - Clients treat cached data as stale when `now_ms > fetched_at_ms + cache_max_age_ms`.
+- If `cache_max_age_ms` is missing from a non-conformant server response, clients should default to `300_000` (5 minutes).
 - `source` is per-model metadata: `"dynamic"` or `"static_fallback"`.
 - Recommended server defaults:
   - dynamic source: `cache_max_age_ms = 300_000` (5 minutes),
@@ -303,6 +304,7 @@ export interface MakaiClient {
 Server canonicalization requirement:
 - provider runtime defines canonical `formatModelRef(...)` and `parseModelRef(...)` helpers,
 - helpers must support model IDs containing `:` and other UTF-8 characters without ambiguity.
+- provider-returned `model_id` values are preserved as-is in `ModelDescriptor.model_id` (including colons).
 
 Recommended internal canonical form:
 - `<provider_id>/<api>@<percent-encoded-model-id>`
@@ -415,6 +417,7 @@ Add payload variants:
 
 Rationale: agent protocol carries passthrough model discovery for clients connected only to agent endpoint.
 `SharedModelsResponse` must reuse the same typed shape as provider protocol (no raw JSON blob passthrough).
+Passthrough requirement includes all `ModelsResponse` fields (`models`, `fetched_at_ms`, `cache_max_age_ms`) and per-model `source`.
 
 Required shared module:
 - `protocol/model_catalog_types.zig`

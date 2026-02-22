@@ -49,7 +49,11 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 ### Phase 2c: Harden concurrency and storage races
 
 - Concurrency:
-  - apply per-provider refresh lock to prevent concurrent refresh storms.
+  - apply refresh lock per `(provider_id, user_id)` in multi-tenant contexts.
+  - for single-tenant contexts, fallback lock key is `(provider_id)`.
+- Lock timeout:
+  - if refresh lock is held for more than 30s, release lock ownership and fail waiting requests.
+  - fail pending requests with typed `auth_refresh_failed` error.
 - Ensure refresh + persistence is race-safe under concurrent traffic.
 
 ### Phase 3: Add high-level TS SDK APIs
