@@ -1,5 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
+import { BinaryResolverOptions, resolveMakaiBinary } from "./binary_resolver";
 
 export type StdioFrame = {
   type: string;
@@ -206,4 +207,24 @@ export class MakaiStdioClient {
     this.lineReader = null;
     this.child = null;
   }
+}
+
+export type CreateMakaiClientOptions = Omit<MakaiClientOptions, "command"> & {
+  command?: string;
+  resolver?: BinaryResolverOptions;
+};
+
+export async function createMakaiStdioClient(
+  options: CreateMakaiClientOptions = {},
+): Promise<MakaiStdioClient> {
+  const command = options.command ?? (await resolveMakaiBinary(options.resolver));
+  const args = options.args ?? ["--stdio"];
+  return new MakaiStdioClient({
+    command,
+    args,
+    cwd: options.cwd,
+    env: options.env,
+    expectedProtocolVersion: options.expectedProtocolVersion,
+    handshakeTimeoutMs: options.handshakeTimeoutMs,
+  });
 }
