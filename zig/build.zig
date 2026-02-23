@@ -113,6 +113,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const auth_provider_defs_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/providers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const provider_caps_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/provider_caps.zig"),
         .target = target,
@@ -565,6 +571,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "auth_types", .module = protocol_auth_types_mod },
+            .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
@@ -1030,6 +1037,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_server", .module = protocol_auth_server_mod },
             .{ .name = "auth_runtime", .module = protocol_auth_runtime_mod },
             .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
+            .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
         },

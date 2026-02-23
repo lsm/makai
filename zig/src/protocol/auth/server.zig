@@ -1,4 +1,5 @@
 const std = @import("std");
+const auth_providers = @import("auth/providers");
 const auth_types = @import("auth_types");
 const anthropic_oauth = @import("oauth/anthropic");
 const github_oauth = @import("oauth/github_copilot");
@@ -381,17 +382,7 @@ pub const AuthProtocolServer = struct {
     }
 
     fn buildProvidersResponse(self: *Self) !auth_types.AuthProvidersResponse {
-        const ProviderDefinition = struct {
-            id: []const u8,
-            name: []const u8,
-        };
-        const definitions = [_]ProviderDefinition{
-            .{ .id = "anthropic", .name = "Anthropic" },
-            .{ .id = "github-copilot", .name = "GitHub Copilot" },
-            .{ .id = "test-fixture", .name = "Test Fixture (CI)" },
-        };
-
-        const providers = try self.allocator.alloc(auth_types.AuthProviderInfo, definitions.len);
+        const providers = try self.allocator.alloc(auth_types.AuthProviderInfo, auth_providers.AUTH_PROVIDER_DEFINITIONS.len);
         errdefer {
             for (providers) |*provider| provider.deinit(self.allocator);
             self.allocator.free(providers);
@@ -402,7 +393,7 @@ pub const AuthProtocolServer = struct {
 
         const now_ms = std.time.milliTimestamp();
 
-        for (definitions, 0..) |definition, index| {
+        for (auth_providers.AUTH_PROVIDER_DEFINITIONS, 0..) |definition, index| {
             var status: auth_types.AuthStatus = .login_required;
             if (storage) |*auth_storage| {
                 if (auth_storage.providers.get(definition.id)) |provider_auth| {
@@ -837,15 +828,21 @@ const OAuthThreadContext = struct {
 };
 
 threadlocal var g_oauth_thread_context: ?*OAuthThreadContext = null;
+// OAuth callback signatures do not carry user context, so the auth runtime uses
+// a thread-local bridge while a flow is executing on that worker thread.
 
 fn anthropicOnAuth(info: anthropic_oauth.AuthInfo) void {
     const context = g_oauth_thread_context orelse return;
     context.server.emitAuthUrl(context.flow, info.url, info.instructions) catch {};
 }
 
+fn emptyPromptAnswer(allocator: std.mem.Allocator) []const u8 {
+    return allocator.alloc(u8, 0) catch @panic("OOM");
+}
+
 fn anthropicOnPrompt(prompt: anthropic_oauth.Prompt) []const u8 {
     const context = g_oauth_thread_context orelse @panic("missing oauth context");
-    return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch context.server.allocator.alloc(u8, 0) catch @panic("OOM");
+    return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch emptyPromptAnswer(context.server.allocator);
 }
 
 fn githubOnAuth(info: github_oauth.AuthInfo) void {
@@ -855,7 +852,7 @@ fn githubOnAuth(info: github_oauth.AuthInfo) void {
 
 fn githubOnPrompt(prompt: github_oauth.Prompt) []const u8 {
     const context = g_oauth_thread_context orelse @panic("missing oauth context");
-    return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch context.server.allocator.alloc(u8, 0) catch @panic("OOM");
+    return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch emptyPromptAnswer(context.server.allocator);
 }
 
 fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !void {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
+const auth_providers = @import("auth/providers");
 const anthropic_oauth = @import("oauth/anthropic");
 const github_oauth = @import("oauth/github_copilot");
 const oauth_storage = @import("oauth/storage");
@@ -502,14 +503,7 @@ fn printUsage(file: std.fs.File) !void {
 
 fn listAuthProviders(file: std.fs.File, allocator: std.mem.Allocator, json_mode: bool) !void {
     if (json_mode) {
-        const providers = .{
-            .type = "providers",
-            .providers = [_]struct { id: []const u8, name: []const u8 }{
-                .{ .id = "anthropic", .name = "Anthropic" },
-                .{ .id = "github-copilot", .name = "GitHub Copilot" },
-                .{ .id = "test-fixture", .name = "Test Fixture (CI)" },
-            },
-        };
+        const providers = .{ .type = "providers", .providers = auth_providers.AUTH_PROVIDER_DEFINITIONS };
         const payload = try std.json.Stringify.valueAlloc(allocator, providers, .{});
         defer allocator.free(payload);
         try file.writeAll(payload);
@@ -517,9 +511,10 @@ fn listAuthProviders(file: std.fs.File, allocator: std.mem.Allocator, json_mode:
         return;
     }
 
-    try file.writeAll("anthropic\n");
-    try file.writeAll("github-copilot\n");
-    try file.writeAll("test-fixture\n");
+    for (auth_providers.AUTH_PROVIDER_DEFINITIONS) |provider| {
+        try file.writeAll(provider.id);
+        try file.writeAll("\n");
+    }
 }
 
 fn runTestFixtureLogin(allocator: std.mem.Allocator) !oauth_storage.Credentials {
