@@ -6,9 +6,11 @@ Scope: architecture, protocol boundaries, ownership model, sequencing, transport
 ## 1) Purpose
 
 Makai is a Zig-first streaming AI runtime with:
+- distributed auth protocol,
 - multi-provider streaming abstraction,
 - distributed provider protocol,
 - distributed agent protocol,
+- distributed tool protocol,
 - agent loop + tool execution bridge,
 - pluggable transports.
 
@@ -27,11 +29,13 @@ Makai is organized into four runtime layers:
 
 2. **Provider Layer**
    - implementations for Anthropic/OpenAI/Google/Azure/Ollama/etc.
-   - provider auth and provider-specific request/response translation
+   - provider credential resolution/refresh and provider-specific request/response translation
 
 3. **Protocol Layer**
+   - **auth protocol** (`protocol/auth/*`)
    - **provider protocol** (`protocol/provider/*`)
    - **agent protocol** (`protocol/agent/*`)
+   - **tool protocol** (`protocol/tool/*`)
    - envelope serialization, sequence validation, client/server handlers
 
 4. **Agent Layer**
@@ -41,7 +45,8 @@ Makai is organized into four runtime layers:
 
 Design boundary:
 - Agent layer is auth-agnostic.
-- Provider layer owns credentials/auth behavior.
+- Auth protocol/runtime owns interactive OAuth flows + credential persistence.
+- Provider layer owns request-time credential consumption/refresh for model calls.
 
 ---
 
@@ -53,6 +58,11 @@ Design boundary:
   - pumps client->server messages
   - forwards provider stream events/results/errors server->client
   - used in production integration paths (not test-only)
+
+- `protocol/auth/runtime.zig`
+  - pumps auth protocol client/server messages
+  - routes interactive auth flow events (`auth_url`, `prompt`, `progress`, terminal result)
+  - used for SDK auth APIs and CLI wrapper mode
 
 - `protocol/agent/runtime.zig`
   - pumps agent protocol client/server messages and outbox
@@ -68,6 +78,7 @@ These runtimes are typically hosted on the **server side** of each protocol boun
 Sequence is **per session/stream**, never global across all sessions.
 
 - Provider protocol: sequence scope = `stream_id`
+- Auth protocol: sequence scope = `flow_id`
 - Agent protocol: sequence scope = `session_id`
 
 ### 4.2 Rules
@@ -84,14 +95,15 @@ Client implementations must maintain a sequence counter map keyed by session/str
 
 ## 5) Multiplexing Model (Normative)
 
-Both protocols are designed for multi-session multiplexing:
+Auth/provider/agent protocols are designed for multi-session multiplexing:
+- multiple active auth flows concurrently
 - multiple active provider streams concurrently
 - multiple active agent sessions concurrently
 - envelopes interleaved by transport
 - ordering guaranteed only within a session/stream, not globally
 
 Implementation objective:
-- provider and agent clients/servers must support true concurrent multiplexing.
+- auth, provider, and agent clients/servers must support true concurrent multiplexing.
 
 ### 5.1 Provider protocol client lifecycle API (normative usage)
 
@@ -157,6 +169,7 @@ At minimum:
 - in-process transport: core path for local/protocol integration
 - stdio transport: supported
 - websocket transport: functional but requires hardening + expanded test depth
+- auth/provider/agent/tool protocols must share the same transport posture and semantics
 
 ### 8.2 Direction
 - increase websocket test rigor (framing, backpressure, reconnects, malformed frames, ordering)
@@ -211,16 +224,19 @@ Required performance thresholds (at least one):
 
 ### 9.1 Required categories
 1. Unit tests per module
-2. Protocol negative tests (sequence/unknown session/malformed payload)
-3. Runtime multi-session tests (agent + provider)
+2. Protocol negative tests (sequence/unknown session/malformed payload) across auth/provider/agent/tool
+3. Runtime multi-session tests (auth + agent + provider)
 4. Chain integration tests:
-   - Client -> protocol/agent -> agent_loop -> protocol/provider -> provider
+   - Auth: Client -> protocol/auth -> OAuth provider integration -> credential storage
+   - Inference: Client -> protocol/agent -> agent_loop -> protocol/provider -> provider
 5. Transport stress/hardening tests (especially websocket)
 
 ### 9.2 CI expectations
 - all grouped unit jobs green
 - protocol E2E mock lane green
+- auth protocol flow lane green (including prompt/cancel/terminal semantics)
 - provider fullstack lanes monitored for external flake patterns
+- CLI auth wrapper compatibility lane green (`makai auth providers/login` over auth protocol runtime)
 
 ---
 
@@ -228,11 +244,12 @@ Required performance thresholds (at least one):
 
 Target end-to-end topology:
 
-1. User/client connects to **agent protocol server**
-2. Agent loop executes on agent node
-3. Agent connects to **provider protocol server** for model streaming
-4. Agent executes tools via local or remote **tool protocol executors**
-5. Events/results stream back through protocol boundaries to client
+1. User/client connects to **auth/agent protocol servers** (same process or distributed)
+2. OAuth flows execute through **auth protocol server** when login is required
+3. Agent loop executes on agent node
+4. Agent connects to **provider protocol server** for model streaming
+5. Agent executes tools via local or remote **tool protocol executors**
+6. Events/results stream back through protocol boundaries to client
 
 This is the canonical architecture for distributed operation.
 
@@ -241,6 +258,7 @@ This is the canonical architecture for distributed operation.
 ## 11) Non-Goals / Deferred Areas
 
 - provider-specific auth logic in agent layer (explicitly forbidden)
+- CLI-subprocess-as-primary auth path in SDKs (explicitly forbidden)
 - weakening ownership guarantees for convenience
 - global-sequence semantics across sessions
 

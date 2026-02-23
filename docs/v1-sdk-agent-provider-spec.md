@@ -41,6 +41,7 @@ Normative rule: end users do not manage provider-specific headers, token files, 
 ### 2.2 Auth Path and Transport (Normative)
 
 - `client.auth.*` is a protocol client surface at the same level as `client.agent.*` and `client.provider.*`.
+- Auth is a dedicated protocol surface, not a sub-mode of provider protocol.
 - SDK auth operations must use the same configured transport stack (stdio now, HTTP/WS later) as other APIs.
 - SDK implementations must not spawn `makai auth ...` subprocesses as the primary auth path.
 - OAuth credentials and refresh tokens remain binary-managed and are never returned to SDK callers.
