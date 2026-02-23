@@ -733,6 +733,8 @@ pub fn build(b: *std.Build) void {
 
     const pre_transform_test = b.addTest(.{ .root_module = pre_transform_mod });
 
+    const auth_provider_defs_test = b.addTest(.{ .root_module = auth_provider_defs_mod });
+
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
     const openai_responses_api_test = b.addTest(.{ .root_module = openai_responses_api_mod });
@@ -1088,6 +1090,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+    test_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
@@ -1167,6 +1170,7 @@ pub fn build(b: *std.Build) void {
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
 
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
