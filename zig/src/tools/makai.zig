@@ -190,6 +190,8 @@ const StdioProtocolLoop = struct {
             self.registry.deinit();
             self.allocator.destroy(self.registry);
         }
+
+        self.* = undefined;
     }
 
     pub fn dispatchInboundLine(self: *Self, line: []const u8) !bool {
@@ -242,7 +244,7 @@ const StdioProtocolLoop = struct {
         return forwarded;
     }
 
-    pub fn drainOutbound(self: *Self, lines: *std.ArrayList([]u8)) !usize {
+    pub fn drainOutbound(self: *Self, lines: *std.ArrayList([]const u8)) !usize {
         var drained: usize = 0;
         drained += try self.drainPipeOutbound(&self.provider_pipe, lines);
         drained += try self.drainPipeOutbound(&self.agent_pipe, lines);
@@ -274,19 +276,19 @@ const StdioProtocolLoop = struct {
     fn drainPipeOutbound(
         self: *Self,
         pipe: *in_process.SerializedPipe,
-        lines: *std.ArrayList([]u8),
+        lines: *std.ArrayList([]const u8),
     ) !usize {
         var drained: usize = 0;
         var receiver = pipe.clientReceiver();
         while (try receiver.readLine(self.allocator)) |line| {
-            try lines.append(self.allocator, @constCast(line));
+            try lines.append(self.allocator, line);
             drained += 1;
         }
         return drained;
     }
 };
 
-fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
+fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]const u8)) void {
     for (lines.items) |line| allocator.free(line);
     lines.clearRetainingCapacity();
 }
@@ -294,14 +296,30 @@ fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) vo
 fn writeOwnedLinesAndClear(
     file: std.fs.File,
     allocator: std.mem.Allocator,
-    lines: *std.ArrayList([]u8),
+    lines: *std.ArrayList([]const u8),
 ) !void {
+    defer clearOwnedLines(allocator, lines);
+
     for (lines.items) |line| {
-        defer allocator.free(line);
         try file.writeAll(line);
         try file.writeAll("\n");
     }
-    lines.clearRetainingCapacity();
+}
+
+fn emitRuntimeError(
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const payload = try std.json.Stringify.valueAlloc(allocator, .{
+        .type = "error",
+        .code = code,
+        .message = message,
+    }, .{});
+    defer allocator.free(payload);
+    try file.writeAll(payload);
+    try file.writeAll("\n");
 }
 
 fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File) !void {
@@ -315,7 +333,7 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
     defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
 
     const stdin_stream = stdin_handle.getStream();
-    var outbound_lines = std.ArrayList([]u8){};
+    var outbound_lines = std.ArrayList([]const u8){};
     defer {
         clearOwnedLines(allocator, &outbound_lines);
         outbound_lines.deinit(allocator);
@@ -331,16 +349,29 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
 
-            const dispatched = try stdio_loop.dispatchInboundLine(line);
+            const dispatched = stdio_loop.dispatchInboundLine(line) catch |err| {
+                try emitRuntimeError(stdout, allocator, "dispatch_error", @errorName(err));
+                did_work = true;
+                continue;
+            };
             if (dispatched) {
+                did_work = true;
+            } else {
+                try emitRuntimeError(stdout, allocator, "unknown_envelope", "unrecognized or ambiguous stdio envelope");
                 did_work = true;
             }
         }
 
-        const forwarded = try stdio_loop.pumpBackground();
+        const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
+            try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+            break :blk 0;
+        };
         if (forwarded > 0) did_work = true;
 
-        const drained = try stdio_loop.drainOutbound(&outbound_lines);
+        const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
+            try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+            break :blk 0;
+        };
         if (drained > 0) {
             try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
             did_work = true;
@@ -362,10 +393,22 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
 
         const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
         if (line.len == 0) continue;
-        _ = try stdio_loop.dispatchInboundLine(line);
+        const dispatched = stdio_loop.dispatchInboundLine(line) catch |err| {
+            try emitRuntimeError(stdout, allocator, "dispatch_error", @errorName(err));
+            continue;
+        };
+        if (!dispatched) {
+            try emitRuntimeError(stdout, allocator, "unknown_envelope", "unrecognized or ambiguous stdio envelope");
+        }
     }
-    _ = try stdio_loop.pumpBackground();
-    const drained = try stdio_loop.drainOutbound(&outbound_lines);
+    _ = stdio_loop.pumpBackground() catch |err| blk: {
+        try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+        break :blk 0;
+    };
+    const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
+        try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+        break :blk 0;
+    };
     if (drained > 0) {
         try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
     }
@@ -718,7 +761,7 @@ test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]u8){};
+    var outbound = std.ArrayList([]const u8){};
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -767,7 +810,27 @@ test "stdio protocol loop rejects ambiguous dispatch envelope with both ids" {
 
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(ambiguous)));
 
-    var outbound = std.ArrayList([]u8){};
+    var outbound = std.ArrayList([]const u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expectEqual(@as(usize, 0), outbound.items.len);
+}
+
+test "stdio protocol loop rejects malformed json dispatch line" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine("{not-json")));
+
+    var outbound = std.ArrayList([]const u8){};
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -795,7 +858,7 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]u8){};
+    var outbound = std.ArrayList([]const u8){};
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -835,6 +898,30 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
     try std.testing.expect(saw_event);
     try std.testing.expect(saw_result);
     try std.testing.expect(saw_stream_error);
+}
+
+test "writeOwnedLinesAndClear clears owned lines on write failure" {
+    const allocator = std.testing.allocator;
+    const pipe = try std.posix.pipe();
+    const read_file = std.fs.File{ .handle = pipe[0] };
+    const write_file = std.fs.File{ .handle = pipe[1] };
+    defer read_file.close();
+
+    // Force write error path.
+    write_file.close();
+
+    var lines = std.ArrayList([]const u8){};
+    defer lines.deinit(allocator);
+    try lines.append(allocator, try allocator.dupe(u8, "line-1"));
+    try lines.append(allocator, try allocator.dupe(u8, "line-2"));
+
+    var saw_error = false;
+    writeOwnedLinesAndClear(write_file, allocator, &lines) catch {
+        saw_error = true;
+    };
+
+    try std.testing.expect(saw_error);
+    try std.testing.expectEqual(@as(usize, 0), lines.items.len);
 }
 
 test "stdio mode preserves ready handshake compatibility" {
@@ -898,6 +985,86 @@ test "stdio mode preserves ready handshake compatibility" {
     const response_line = (try receiver.read(allocator)).?;
     defer allocator.free(response_line);
     var pong = try provider_protocol_envelope.deserializeEnvelope(response_line, allocator);
+    defer pong.deinit(allocator);
+    try std.testing.expect(pong.payload == .pong);
+
+    stdin_write.close();
+    stdin_write_closed = true;
+    try std.testing.expect(runner.err == null);
+}
+
+test "stdio mode emits unknown_envelope error and continues processing" {
+    const allocator = std.testing.allocator;
+
+    const stdin_pipe = try std.posix.pipe();
+    const stdout_pipe = try std.posix.pipe();
+
+    var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
+    var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
+    var stdout_read = std.fs.File{ .handle = stdout_pipe[0] };
+    var stdout_write = std.fs.File{ .handle = stdout_pipe[1] };
+    errdefer {
+        stdin_read.close();
+        stdin_write.close();
+        stdout_read.close();
+        stdout_write.close();
+    }
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        stdin_file: std.fs.File,
+        stdout_file: std.fs.File,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            runStdioMode(self.allocator, self.stdin_file, self.stdout_file) catch |err| {
+                self.err = err;
+            };
+            self.stdin_file.close();
+            self.stdout_file.close();
+        }
+    };
+
+    var runner = Runner{
+        .allocator = allocator,
+        .stdin_file = stdin_read,
+        .stdout_file = stdout_write,
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    defer thread.join();
+
+    var stdin_write_closed = false;
+    defer if (!stdin_write_closed) stdin_write.close();
+
+    var out_receiver = stdio.StdioReceiver.initWithFile(stdout_read, allocator);
+    defer out_receiver.deinit();
+    defer stdout_read.close();
+
+    var receiver = out_receiver.receiver();
+
+    const ready_line = (try receiver.read(allocator)).?;
+    defer allocator.free(ready_line);
+    try std.testing.expectEqualStrings("{\"type\":\"ready\",\"protocol_version\":\"1\"}", ready_line);
+
+    try stdin_write.writeAll("{\"type\":\"unknown\",\"payload\":{}}\n");
+
+    const ping = try makeProviderPingEnvelopeJson(allocator);
+    defer allocator.free(ping);
+    try stdin_write.writeAll(ping);
+    try stdin_write.writeAll("\n");
+
+    const error_line = (try receiver.read(allocator)).?;
+    defer allocator.free(error_line);
+    const error_parsed = try std.json.parseFromSlice(std.json.Value, allocator, error_line, .{});
+    defer error_parsed.deinit();
+    try std.testing.expect(error_parsed.value == .object);
+    const obj = error_parsed.value.object;
+    try std.testing.expectEqualStrings("error", obj.get("type").?.string);
+    try std.testing.expectEqualStrings("unknown_envelope", obj.get("code").?.string);
+
+    const pong_line = (try receiver.read(allocator)).?;
+    defer allocator.free(pong_line);
+    var pong = try provider_protocol_envelope.deserializeEnvelope(pong_line, allocator);
     defer pong.deinit(allocator);
     try std.testing.expect(pong.payload == .pong);
 
