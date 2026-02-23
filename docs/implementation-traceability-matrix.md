@@ -31,7 +31,7 @@ This matrix is keyed by integration-plan phases and explicitly mapped to spec ro
 | Row ID | Phase | Clause | Requirement Summary | Code Paths | Tests | Issue | PR | Status |
 |---|---|---|---|---|---|---|---|---|
 | M-001 | 1 | `DESIGN.md §3`; `docs/ts-sdk-chat-integration-plan.md` Phase 1 | Wire protocol runtimes under `makai --stdio` with ready handshake compatibility. | TBD | TBD | TBD | TBD | not started |
-| M-002 | 1.25 | `docs/v1-sdk-agent-provider-spec.md §4`; `DESIGN.md §4.1`; `docs/ts-sdk-chat-integration-plan.md` Phase 1.25 | Implement auth protocol runtime (`types`, `envelope`, `server`, `runtime`) and stdio integration. | TBD | TBD | TBD | TBD | not started |
+| M-002 | 1.25 | `docs/v1-sdk-agent-provider-spec.md §4`; `DESIGN.md §3`; `docs/ts-sdk-chat-integration-plan.md` Phase 1.25 | Implement auth protocol runtime (`types`, `envelope`, `server`, `runtime`) and stdio integration. | TBD | TBD | TBD | TBD | not started |
 | M-003 | 1.5 | `docs/v1-sdk-agent-provider-spec.md §3.1`; `docs/ts-sdk-chat-integration-plan.md` Phase 1.5 | Implement `model_ref` parse/format helpers (`protocol/model_ref.zig`) and validation tests; TS diagnostic parser utility. | TBD | TBD | TBD | TBD | not started |
 | M-004 | 1.5 | `docs/v1-sdk-agent-provider-spec.md §2.3`, `§5`; `docs/ts-sdk-chat-integration-plan.md` Phase 1.5 | Implement provider model catalog sources, caching metadata, and `models_request/models_response`. | TBD | TBD | TBD | TBD | not started |
 | M-005 | 1.5 | `docs/v1-sdk-agent-provider-spec.md §6`; `docs/ts-sdk-chat-integration-plan.md` Phase 1.5 | Implement agent passthrough model discovery with shared response shape. | TBD | TBD | TBD | TBD | not started |
