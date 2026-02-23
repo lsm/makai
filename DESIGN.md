@@ -264,7 +264,7 @@ This is the canonical architecture for distributed operation.
 ```mermaid
 flowchart LR
   U["App or User"] --> SDK["TS SDK Client"]
-  SDK --> TR["Transport (stdio or HTTP/WS)"]
+  SDK --> TP["Transport (stdio or HTTP/WS)"]
 
   subgraph M["Makai Binary Runtime"]
     AR["Auth Protocol Runtime"]
@@ -274,10 +274,10 @@ flowchart LR
     ST["Credential Storage"]
   end
 
-  TR --> AR
-  TR --> PR
-  TR --> GR
-  TR --> TRR
+  TP --> AR
+  TP --> PR
+  TP --> GR
+  TP --> TRR
 
   AR --> ST
   PR --> ST
@@ -304,12 +304,17 @@ sequenceDiagram
   A->>O: "start OAuth exchange"
   O-->>A: "requires user code"
   A-->>C: "auth_event prompt(prompt_id)"
-  C->>A: "auth_prompt_response(flow_id,prompt_id,answer)"
-  A->>O: "continue OAuth exchange"
-  O-->>A: "tokens"
-  A->>S: "persist credentials"
-  A-->>C: "auth_event success"
-  A-->>C: "auth_login_result status=success"
+  alt "user cancels flow"
+    C->>A: "auth_cancel(flow_id)"
+    A-->>C: "auth_login_result status=cancelled"
+  else "user continues"
+    C->>A: "auth_prompt_response(flow_id,prompt_id,answer)"
+    A->>O: "continue OAuth exchange"
+    O-->>A: "tokens"
+    A->>S: "persist credentials"
+    A-->>C: "auth_event success"
+    A-->>C: "auth_login_result status=success"
+  end
 ```
 
 ### 11.3 Provider Direct Sequence
@@ -349,41 +354,53 @@ sequenceDiagram
   C->>G: "agent stream request"
   G-->>C: "agent_start"
   G->>P: "provider stream request"
-  P->>U: "model stream call"
-  U-->>P: "text and thinking and tool_call"
-  P-->>G: "provider stream events"
-  G-->>C: "turn_start and deltas and turn_end"
-  opt "tool call needed"
-    G-->>C: "tool_execution_start"
-    G->>T: "tool_request"
-    T-->>G: "tool_response or tool error"
-    G-->>C: "tool_execution_end"
-    G->>P: "next provider turn with tool result"
+  alt "provider returns auth_required"
+    P-->>G: "nack auth_required"
+    G-->>C: "error terminal event (auth_required)"
+  else "provider stream succeeds"
+    P->>U: "model stream call"
+    U-->>P: "text and thinking and tool_call"
+    P-->>G: "provider stream events"
+    G-->>C: "turn_start and deltas and turn_end"
+    opt "tool call needed"
+      G-->>C: "tool_execution_start"
+      G->>T: "tool_request"
+      T-->>G: "tool_response or tool error"
+      G-->>C: "tool_execution_end"
+      G->>P: "next provider turn with tool result"
+    end
+    G-->>C: "agent_end with usage and stop_reason"
   end
-  G-->>C: "agent_end with usage and stop_reason"
 ```
 
-### 11.5 Auth and Stream Lifecycle States
+### 11.5 Auth, Provider, and Agent Lifecycle States
 
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
 
   Idle --> AuthFlow: "auth_login_start"
+  Idle --> ReadyForInference: "credentials already valid"
   AuthFlow --> AwaitPrompt: "auth_event prompt"
   AwaitPrompt --> AuthFlow: "auth_prompt_response"
+  AwaitPrompt --> AuthCancelled: "auth_cancel"
+  AuthFlow --> AuthCancelled: "auth_cancel"
   AuthFlow --> AuthSuccess: "auth_login_result success"
-  AuthFlow --> AuthCancelled: "auth_login_result cancelled"
+  AuthCancelled --> [*]
   AuthFlow --> AuthFailed: "auth_event error and auth_login_result failed"
 
   AuthSuccess --> ReadyForInference
   ReadyForInference --> ProviderStreaming: "provider stream request"
+  ReadyForInference --> AgentStreaming: "agent stream request"
   ProviderStreaming --> ProviderCompleted: "message_end"
   ProviderStreaming --> ProviderFailed: "error terminal event"
+  AgentStreaming --> AgentCompleted: "agent_end"
+  AgentStreaming --> AgentFailed: "error terminal event"
 
   ProviderCompleted --> [*]
   ProviderFailed --> [*]
-  AuthCancelled --> [*]
+  AgentCompleted --> [*]
+  AgentFailed --> [*]
   AuthFailed --> [*]
 ```
 
