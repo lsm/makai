@@ -341,6 +341,7 @@ export type ProviderCompleteResponse = CompletionResponse;
 
 export interface MakaiAuthApi {
   listProviders(): Promise<ProviderAuthInfo[]>;
+  // Handler precedence: per-call handlers > client-level defaults > none.
   login(providerId: ProviderId, handlers?: AuthFlowHandlers): Promise<{ status: "success" }>;
 }
 
@@ -483,6 +484,7 @@ SDK behavior:
 
 - `MakaiAuthApi.listProviders` and `MakaiAuthApi.login` must map to auth protocol envelopes over the active transport.
 - `login(...)` must maintain a single active auth flow, route prompt events to `onPrompt`, and publish all auth events to `onEvent`.
+- Handler resolution order for `login(...)` is normative: per-call handlers first, then `MakaiClientOptions.auth.handlers`, then none.
 - SDK must not read `~/.makai/auth.json` directly and must not return token material to callers.
 - CLI-subprocess auth wiring is prohibited in the V1 protocol-only implementation.
 - On `auth_required` from provider/agent calls:
