@@ -11,6 +11,9 @@ const provider_protocol_envelope = @import("protocol_envelope");
 const agent_protocol_server = @import("agent_server");
 const agent_protocol_runtime = @import("agent_runtime");
 const agent_protocol_envelope = @import("agent_envelope");
+const auth_protocol_server = @import("auth_server");
+const auth_protocol_runtime = @import("auth_runtime");
+const auth_protocol_envelope = @import("auth_envelope");
 const event_stream = @import("event_stream");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
@@ -23,6 +26,9 @@ const ProviderProtocolTypes = provider_protocol_envelope.protocol_types;
 const AgentProtocolServer = agent_protocol_server.AgentProtocolServer;
 const AgentProtocolRuntime = agent_protocol_runtime.AgentProtocolRuntime;
 const AgentProtocolTypes = agent_protocol_envelope.protocol_types;
+const AuthProtocolServer = auth_protocol_server.AuthProtocolServer;
+const AuthProtocolRuntime = auth_protocol_runtime.AuthProtocolRuntime;
+const AuthProtocolTypes = auth_protocol_envelope.protocol_types;
 const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
 const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
@@ -150,14 +156,17 @@ const StdioProtocolLoop = struct {
     provider_pipe: in_process.SerializedPipe,
     agent_server: AgentProtocolServer,
     agent_pipe: in_process.SerializedPipe,
+    auth_server: AuthProtocolServer,
+    auth_pipe: in_process.SerializedPipe,
 
     const Self = @This();
-    const DispatchTarget = enum { provider, agent };
+    const DispatchTarget = enum { provider, agent, auth };
 
     fn initWithRegistry(
         allocator: std.mem.Allocator,
         registry: *api_registry.ApiRegistry,
         owns_registry: bool,
+        auth_options: AuthProtocolServer.Options,
     ) Self {
         const self = Self{
             .allocator = allocator,
@@ -167,6 +176,8 @@ const StdioProtocolLoop = struct {
             .provider_pipe = in_process.createSerializedPipe(allocator),
             .agent_server = AgentProtocolServer.init(allocator),
             .agent_pipe = in_process.createSerializedPipe(allocator),
+            .auth_server = AuthProtocolServer.init(allocator, auth_options),
+            .auth_pipe = in_process.createSerializedPipe(allocator),
         };
 
         return self;
@@ -180,11 +191,14 @@ const StdioProtocolLoop = struct {
         errdefer registry.deinit();
 
         try register_builtins.registerBuiltInApiProviders(registry);
-        return initWithRegistry(allocator, registry, true);
+        return initWithRegistry(allocator, registry, true, .{});
     }
 
     fn initForTesting(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry) Self {
-        return initWithRegistry(allocator, registry, false);
+        return initWithRegistry(allocator, registry, false, .{
+            .persist_credentials = false,
+            .enable_real_oauth = false,
+        });
     }
 
     pub fn deinit(self: *Self) void {
@@ -192,6 +206,8 @@ const StdioProtocolLoop = struct {
         self.provider_pipe.deinit();
         self.agent_server.deinit();
         self.agent_pipe.deinit();
+        self.auth_server.deinit();
+        self.auth_pipe.deinit();
 
         if (self.owns_registry) {
             self.registry.deinit();
@@ -227,6 +243,17 @@ const StdioProtocolLoop = struct {
                 };
                 try runtime.pumpClientMessages();
             },
+            .auth => {
+                var sender = self.auth_pipe.clientSender();
+                try sender.write(line);
+                try sender.flush();
+                var runtime = AuthProtocolRuntime{
+                    .server = &self.auth_server,
+                    .pipe = &self.auth_pipe,
+                    .allocator = self.allocator,
+                };
+                try runtime.pumpClientMessages();
+            },
         }
 
         return true;
@@ -248,6 +275,13 @@ const StdioProtocolLoop = struct {
             .allocator = self.allocator,
         };
         forwarded += try agent_runtime.pumpServerOutbox();
+
+        var auth_runtime = AuthProtocolRuntime{
+            .server = &self.auth_server,
+            .pipe = &self.auth_pipe,
+            .allocator = self.allocator,
+        };
+        forwarded += try auth_runtime.pumpServerOutbox();
         return forwarded;
     }
 
@@ -255,11 +289,16 @@ const StdioProtocolLoop = struct {
         var drained: usize = 0;
         drained += try self.drainPipeOutbound(&self.provider_pipe, lines);
         drained += try self.drainPipeOutbound(&self.agent_pipe, lines);
+        drained += try self.drainPipeOutbound(&self.auth_pipe, lines);
         return drained;
     }
 
     pub fn hasActiveProviderStreams(self: *Self) bool {
         return self.provider_server.activeStreamCount() > 0;
+    }
+
+    pub fn hasActiveAuthFlows(self: *Self) bool {
+        return self.auth_server.activeFlowCount() > 0;
     }
 
     fn detectDispatchTarget(self: *Self, line: []const u8) ?DispatchTarget {
@@ -269,15 +308,35 @@ const StdioProtocolLoop = struct {
         if (parsed.value != .object) return null;
         const obj = parsed.value.object;
 
+        const envelope_type = if (obj.get("type")) |value|
+            if (value == .string) value.string else null
+        else
+            null;
+
         const stream_id = obj.get("stream_id");
         const session_id = obj.get("session_id");
         const has_stream_id = stream_id != null and stream_id.? == .string;
         const has_session_id = session_id != null and session_id.? == .string;
 
         if (has_stream_id and has_session_id) return null;
-        if (has_stream_id) return .provider;
+        if (has_stream_id) {
+            if (envelope_type) |ty| {
+                if (isAuthEnvelopeType(ty)) return .auth;
+            }
+            return .provider;
+        }
         if (has_session_id) return .agent;
         return null;
+    }
+
+    fn isAuthEnvelopeType(envelope_type: []const u8) bool {
+        return std.mem.eql(u8, envelope_type, "auth_providers_request") or
+            std.mem.eql(u8, envelope_type, "auth_providers_response") or
+            std.mem.eql(u8, envelope_type, "auth_login_start") or
+            std.mem.eql(u8, envelope_type, "auth_prompt_response") or
+            std.mem.eql(u8, envelope_type, "auth_cancel") or
+            std.mem.eql(u8, envelope_type, "auth_event") or
+            std.mem.eql(u8, envelope_type, "auth_login_result");
     }
 
     fn drainPipeOutbound(
@@ -385,7 +444,7 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
             did_work = true;
         }
 
-        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams()) {
+        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams() and !stdio_loop.hasActiveAuthFlows()) {
             break;
         }
 
@@ -742,6 +801,75 @@ fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
 }
 
+fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: AuthProtocolTypes.Uuid, sequence: u64) ![]u8 {
+    const env = AuthProtocolTypes.Envelope{
+        .stream_id = flow_id,
+        .message_id = AuthProtocolTypes.generateUuid(),
+        .sequence = sequence,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .auth_providers_request = .{} },
+    };
+    return auth_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAuthLoginStartEnvelopeJson(
+    allocator: std.mem.Allocator,
+    flow_id: AuthProtocolTypes.Uuid,
+    sequence: u64,
+    provider_id: []const u8,
+) ![]u8 {
+    var env = AuthProtocolTypes.Envelope{
+        .stream_id = flow_id,
+        .message_id = AuthProtocolTypes.generateUuid(),
+        .sequence = sequence,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .auth_login_start = .{
+            .provider_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
+        } },
+    };
+    defer env.deinit(allocator);
+    return auth_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAuthPromptResponseEnvelopeJson(
+    allocator: std.mem.Allocator,
+    flow_id: AuthProtocolTypes.Uuid,
+    sequence: u64,
+    prompt_id: []const u8,
+    answer: []const u8,
+) ![]u8 {
+    var env = AuthProtocolTypes.Envelope{
+        .stream_id = flow_id,
+        .message_id = AuthProtocolTypes.generateUuid(),
+        .sequence = sequence,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .auth_prompt_response = .{
+            .flow_id = flow_id,
+            .prompt_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
+            .answer = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, answer)),
+        } },
+    };
+    defer env.deinit(allocator);
+    return auth_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAuthCancelEnvelopeJson(
+    allocator: std.mem.Allocator,
+    flow_id: AuthProtocolTypes.Uuid,
+    sequence: u64,
+) ![]u8 {
+    const env = AuthProtocolTypes.Envelope{
+        .stream_id = flow_id,
+        .message_id = AuthProtocolTypes.generateUuid(),
+        .sequence = sequence,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .auth_cancel = .{
+            .flow_id = flow_id,
+        } },
+    };
+    return auth_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
 fn makeProviderStreamRequestEnvelopeJson(
     allocator: std.mem.Allocator,
     api: []const u8,
@@ -758,6 +886,14 @@ fn makeProviderStreamRequestEnvelopeJson(
     };
     defer env.deinit(allocator);
     return provider_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn pumpAndDrainStdioLoop(
+    stdio_loop: *StdioProtocolLoop,
+    outbound: *std.ArrayList([]const u8),
+) !void {
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(outbound);
 }
 
 test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
@@ -801,6 +937,321 @@ test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
         defer env.deinit(allocator);
         try std.testing.expect(env.payload == .pong);
     }
+}
+
+test "stdio protocol loop decodes and dispatches auth providers request and emits ack then response" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const flow_id = AuthProtocolTypes.generateUuid();
+    const request = try makeAuthProvidersRequestEnvelopeJson(allocator, flow_id, 1);
+    defer allocator.free(request);
+
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(request));
+
+    for (0..20) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        if (outbound.items.len >= 2) break;
+        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), outbound.items.len);
+
+    var ack_env = try auth_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+    defer ack_env.deinit(allocator);
+    try std.testing.expect(ack_env.payload == .ack);
+
+    var response_env = try auth_protocol_envelope.deserializeEnvelope(outbound.items[1], allocator);
+    defer response_env.deinit(allocator);
+    try std.testing.expect(response_env.payload == .auth_providers_response);
+    try std.testing.expect(response_env.payload.auth_providers_response.providers.slice().len >= 1);
+}
+
+test "stdio auth login flow supports prompt loop terminal ordering and no secret leakage" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const flow_id = AuthProtocolTypes.generateUuid();
+    const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "test-fixture");
+    defer allocator.free(login_start);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
+
+    var next_client_sequence: u64 = 2;
+    var prompt_count: usize = 0;
+    var saw_auth_url = false;
+    var saw_progress = false;
+    var saw_success = false;
+    var saw_secret_leak = false;
+    var success_index: ?usize = null;
+    var result_index: ?usize = null;
+    var result_status: ?AuthProtocolTypes.AuthLoginStatus = null;
+    var order_counter: usize = 0;
+
+    for (0..600) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+
+        if (outbound.items.len == 0) {
+            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+            continue;
+        }
+
+        for (outbound.items) |line| {
+            if (std.mem.indexOf(u8, line, "fixture-refresh-token") != null or
+                std.mem.indexOf(u8, line, "fixture-access-token") != null)
+            {
+                saw_secret_leak = true;
+            }
+
+            var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
+            defer env.deinit(allocator);
+
+            switch (env.payload) {
+                .auth_event => |event| {
+                    switch (event) {
+                        .auth_url => saw_auth_url = true,
+                        .progress => saw_progress = true,
+                        .prompt => |prompt| {
+                            const answer = if (prompt_count == 0) "bad-code" else "ok";
+                            const prompt_response = try makeAuthPromptResponseEnvelopeJson(
+                                allocator,
+                                flow_id,
+                                next_client_sequence,
+                                prompt.prompt_id.slice(),
+                                answer,
+                            );
+                            defer allocator.free(prompt_response);
+                            try std.testing.expect(try stdio_loop.dispatchInboundLine(prompt_response));
+                            next_client_sequence += 1;
+                            prompt_count += 1;
+                        },
+                        .success => {
+                            saw_success = true;
+                            if (success_index == null) {
+                                success_index = order_counter;
+                                order_counter += 1;
+                            }
+                        },
+                        .@"error" => {
+                            if (success_index == null) {
+                                success_index = order_counter;
+                                order_counter += 1;
+                            }
+                        },
+                    }
+                },
+                .auth_login_result => |result| {
+                    result_status = result.status;
+                    if (result_index == null) {
+                        result_index = order_counter;
+                        order_counter += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        clearOwnedLines(allocator, &outbound);
+
+        if (result_index != null) break;
+        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+    }
+
+    try std.testing.expect(!saw_secret_leak);
+    try std.testing.expect(saw_auth_url);
+    try std.testing.expect(saw_progress);
+    try std.testing.expect(prompt_count >= 2);
+    try std.testing.expect(saw_success);
+    try std.testing.expect(result_status != null);
+    try std.testing.expectEqual(AuthProtocolTypes.AuthLoginStatus.success, result_status.?);
+    try std.testing.expect(success_index != null);
+    try std.testing.expect(result_index != null);
+    try std.testing.expect(success_index.? < result_index.?);
+}
+
+test "stdio auth login flow cancellation emits cancelled result and ignores late prompt responses" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const flow_id = AuthProtocolTypes.generateUuid();
+    const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "test-fixture");
+    defer allocator.free(login_start);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
+
+    var next_client_sequence: u64 = 2;
+    var cancel_sent = false;
+    var saved_prompt_id: ?[]u8 = null;
+    defer if (saved_prompt_id) |prompt_id| allocator.free(prompt_id);
+    var saw_cancelled_result = false;
+
+    for (0..600) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+
+        if (outbound.items.len == 0) {
+            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+            continue;
+        }
+
+        for (outbound.items) |line| {
+            var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
+            defer env.deinit(allocator);
+
+            switch (env.payload) {
+                .auth_event => |event| {
+                    switch (event) {
+                        .prompt => |prompt| {
+                            if (!cancel_sent) {
+                                if (saved_prompt_id == null) {
+                                    saved_prompt_id = try allocator.dupe(u8, prompt.prompt_id.slice());
+                                }
+                                const cancel = try makeAuthCancelEnvelopeJson(allocator, flow_id, next_client_sequence);
+                                defer allocator.free(cancel);
+                                try std.testing.expect(try stdio_loop.dispatchInboundLine(cancel));
+                                next_client_sequence += 1;
+                                cancel_sent = true;
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                .auth_login_result => |result| {
+                    if (result.status == .cancelled) {
+                        saw_cancelled_result = true;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        clearOwnedLines(allocator, &outbound);
+
+        if (saw_cancelled_result) break;
+        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+    }
+
+    try std.testing.expect(cancel_sent);
+    try std.testing.expect(saw_cancelled_result);
+    try std.testing.expect(saved_prompt_id != null);
+
+    const late_prompt_response = try makeAuthPromptResponseEnvelopeJson(
+        allocator,
+        flow_id,
+        next_client_sequence,
+        saved_prompt_id.?,
+        "late-answer",
+    );
+    defer allocator.free(late_prompt_response);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(late_prompt_response));
+
+    var late_terminal_messages: usize = 0;
+    for (0..30) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
+            defer env.deinit(allocator);
+
+            switch (env.payload) {
+                .auth_event, .auth_login_result => late_terminal_messages += 1,
+                else => {},
+            }
+        }
+        clearOwnedLines(allocator, &outbound);
+        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), late_terminal_messages);
+}
+
+test "stdio auth login failure emits auth_event.error before auth_login_result" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const flow_id = AuthProtocolTypes.generateUuid();
+    const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "unknown-provider");
+    defer allocator.free(login_start);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
+
+    var error_index: ?usize = null;
+    var result_index: ?usize = null;
+    var result_status: ?AuthProtocolTypes.AuthLoginStatus = null;
+    var order_counter: usize = 0;
+
+    for (0..200) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
+            defer env.deinit(allocator);
+
+            switch (env.payload) {
+                .auth_event => |event| {
+                    if (event == .@"error" and error_index == null) {
+                        error_index = order_counter;
+                        order_counter += 1;
+                    }
+                },
+                .auth_login_result => |result| {
+                    result_status = result.status;
+                    if (result_index == null) {
+                        result_index = order_counter;
+                        order_counter += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+        clearOwnedLines(allocator, &outbound);
+        if (result_index != null) break;
+        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+    }
+
+    try std.testing.expect(error_index != null);
+    try std.testing.expect(result_index != null);
+    try std.testing.expect(error_index.? < result_index.?);
+    try std.testing.expect(result_status != null);
+    try std.testing.expectEqual(AuthProtocolTypes.AuthLoginStatus.failed, result_status.?);
 }
 
 test "stdio protocol loop rejects ambiguous dispatch envelope with both ids" {
