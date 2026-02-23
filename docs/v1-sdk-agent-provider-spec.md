@@ -1,6 +1,6 @@
 # Makai V1 SDK + Protocol Spec
 
-Status: draft for implementation review
+Status: approved for implementation
 
 ## 1. Scope
 
@@ -799,6 +799,7 @@ Auth protocol requirement:
 - auth flow failures must emit both:
   - `auth_event.error` for user-visible detail, and
   - terminal `auth_login_result.status = failed`.
+- SDK implementations must capture the terminal `auth_event.error` (`code`, `message`) and propagate it into `MakaiAuthError` when the terminal login result is `failed`.
 
 Auth refresh semantics:
 - Refresh occurs in Zig binary request path.
