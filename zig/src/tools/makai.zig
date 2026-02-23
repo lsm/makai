@@ -24,8 +24,15 @@ const AgentProtocolServer = agent_protocol_server.AgentProtocolServer;
 const AgentProtocolRuntime = agent_protocol_runtime.AgentProtocolRuntime;
 const AgentProtocolTypes = agent_protocol_envelope.protocol_types;
 const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
+const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
 const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
+
+const RuntimeErrorCode = enum {
+    dispatch_error,
+    unknown_envelope,
+    runtime_error,
+};
 
 const AuthContext = struct {
     allocator: std.mem.Allocator,
@@ -309,12 +316,13 @@ fn writeOwnedLinesAndClear(
 fn emitRuntimeError(
     file: std.fs.File,
     allocator: std.mem.Allocator,
-    code: []const u8,
+    code: RuntimeErrorCode,
     message: []const u8,
 ) !void {
     const payload = try std.json.Stringify.valueAlloc(allocator, .{
         .type = "error",
-        .code = code,
+        .code = @tagName(code),
+        .protocol_version = STDIO_PROTOCOL_VERSION,
         .message = message,
     }, .{});
     defer allocator.free(payload);
@@ -350,26 +358,26 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
             if (line.len == 0) continue;
 
             const dispatched = stdio_loop.dispatchInboundLine(line) catch |err| {
-                try emitRuntimeError(stdout, allocator, "dispatch_error", @errorName(err));
+                try emitRuntimeError(stdout, allocator, .dispatch_error, @errorName(err));
                 did_work = true;
                 continue;
             };
             if (dispatched) {
                 did_work = true;
             } else {
-                try emitRuntimeError(stdout, allocator, "unknown_envelope", "unrecognized or ambiguous stdio envelope");
+                try emitRuntimeError(stdout, allocator, .unknown_envelope, "unrecognized or ambiguous stdio envelope");
                 did_work = true;
             }
         }
 
         const forwarded = stdio_loop.pumpBackground() catch |err| blk: {
-            try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+            try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
             break :blk 0;
         };
         if (forwarded > 0) did_work = true;
 
         const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
-            try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+            try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
             break :blk 0;
         };
         if (drained > 0) {
@@ -394,19 +402,19 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
         const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
         if (line.len == 0) continue;
         const dispatched = stdio_loop.dispatchInboundLine(line) catch |err| {
-            try emitRuntimeError(stdout, allocator, "dispatch_error", @errorName(err));
+            try emitRuntimeError(stdout, allocator, .dispatch_error, @errorName(err));
             continue;
         };
         if (!dispatched) {
-            try emitRuntimeError(stdout, allocator, "unknown_envelope", "unrecognized or ambiguous stdio envelope");
+            try emitRuntimeError(stdout, allocator, .unknown_envelope, "unrecognized or ambiguous stdio envelope");
         }
     }
     _ = stdio_loop.pumpBackground() catch |err| blk: {
-        try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+        try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
         break :blk 0;
     };
     const drained = stdio_loop.drainOutbound(&outbound_lines) catch |err| blk: {
-        try emitRuntimeError(stdout, allocator, "runtime_error", @errorName(err));
+        try emitRuntimeError(stdout, allocator, .runtime_error, @errorName(err));
         break :blk 0;
     };
     if (drained > 0) {
@@ -1061,6 +1069,7 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     const obj = error_parsed.value.object;
     try std.testing.expectEqualStrings("error", obj.get("type").?.string);
     try std.testing.expectEqualStrings("unknown_envelope", obj.get("code").?.string);
+    try std.testing.expectEqualStrings("1", obj.get("protocol_version").?.string);
 
     const pong_line = (try receiver.read(allocator)).?;
     defer allocator.free(pong_line);
