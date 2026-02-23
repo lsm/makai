@@ -21,14 +21,15 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 ### Phase 1: Implement stdio protocol runtime in `makai`
 
-- Wire auth/provider/agent protocol servers + runtimes into `makai --stdio`.
+- Wire provider/agent protocol servers + runtimes into `makai --stdio`.
 - Deserialize incoming envelopes, dispatch to protocol server, serialize replies.
-- Pump auth/provider/agent events/results/errors back to stdio.
+- Pump provider/agent events/results/errors back to stdio.
 - Keep backward-compatible ready handshake semantics.
 
 ### Phase 1.25: Implement auth protocol runtime
 
 - Add `protocol/auth` module (`types`, `envelope`, `server`, `runtime`).
+- Wire auth protocol server + runtime into `makai --stdio`.
 - Implement auth providers listing request/response path.
 - Implement interactive login flow:
   - `auth_login_start` -> auth events (`auth_url`, `prompt`, `progress`, `success`, `error`) -> terminal `auth_login_result`.
@@ -107,6 +108,7 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
   - auth resolution and refresh tests.
   - concurrent refresh tests (single refresh for N simultaneous requests).
   - auth CLI wrapper tests to ensure `makai auth providers` and `makai auth login` route through protocol runtime.
+  - CLI wrapper integration tests that execute `makai auth providers/login` end-to-end through wrapper path (not protocol runtime direct-call only).
 - TS tests:
   - high-level `auth.listProviders` / `auth.login` / `provider.complete` / `provider.stream` / `agent.run` / `agent.stream` integration tests with fixtures,
   - demo tests updated to assert provider-agnostic chat path.
@@ -127,6 +129,8 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 - Risk: protocol/runtime integration in `makai` introduces regressions in existing auth commands.
   - Mitigation: migrate auth commands to wrapper mode with compatibility tests for `auth providers` and `auth login`.
+- Risk: CLI auth wrappers now depend on protocol runtime stability (previously standalone commands).
+  - Mitigation: add dedicated wrapper-path integration tests that invoke CLI commands and validate protocol-backed execution end-to-end.
 - Risk: auth refresh behavior differs across providers.
   - Mitigation: provider-specific contract tests for refresh and base URL/token derivation.
 - Risk: cross-language protocol drift (Zig vs TS envelope assumptions).
