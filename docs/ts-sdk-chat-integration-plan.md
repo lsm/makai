@@ -87,6 +87,10 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Implement auth-required retry policy for provider/agent requests:
   - default `auth_retry_policy = "manual"`: surface typed `auth_required` with `provider_id`.
   - optional `auth_retry_policy = "auto_once"`: run `client.auth.login(provider_id)` and retry the request once.
+  - add client-level defaults in `createMakaiClient(...)` for:
+    - `auth_retry_policy` default value,
+    - auth handlers (`onEvent`, `onPrompt`) reused by `auto_once` for interactive OAuth.
+  - if `auto_once` requires interaction but no default handlers are configured, fail fast as `auth_required` (manual path) instead of hanging.
 
 ### Phase 4: Migrate demo to SDK chat APIs
 

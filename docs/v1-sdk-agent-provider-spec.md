@@ -46,6 +46,7 @@ Normative rule: end users do not manage provider-specific headers, token files, 
 - SDK implementations must not spawn `makai auth ...` subprocesses as the primary auth path.
 - OAuth credentials and refresh tokens remain binary-managed and are never returned to SDK callers.
 - CLI commands (`makai auth providers`, `makai auth login`) must be thin wrappers over the same auth protocol runtime.
+- SDKs should support client-level auth defaults (retry policy + interactive handlers) so apps configure auth UX once and reuse it across requests.
 
 ### 2.3 Model Data Source and Caching (Normative)
 
@@ -161,6 +162,11 @@ export type MakaiAuthEvent =
       message: string;
     };
 
+export interface AuthFlowHandlers {
+  onEvent?: (event: MakaiAuthEvent) => void;
+  onPrompt?: (prompt: Extract<MakaiAuthEvent, { type: "prompt" }>) => Promise<string> | string;
+}
+
 export interface ModelDescriptor {
   model_ref: string; // opaque stable handle, server-issued
   model_id: string;
@@ -266,7 +272,8 @@ export interface RunOptions {
   max_tokens?: number;
   // If the selected model lacks `reasoning` capability, server may ignore this field.
   reasoning_effort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  // Default is "manual": caller handles auth_required by invoking client.auth.login(...)
+  // Overrides client-level default when provided.
+  // Effective default remains "manual".
   auth_retry_policy?: AuthRetryPolicy;
   session_id?: string;
   metadata?: Record<string, string>;
@@ -334,10 +341,7 @@ export type ProviderCompleteResponse = CompletionResponse;
 
 export interface MakaiAuthApi {
   listProviders(): Promise<ProviderAuthInfo[]>;
-  login(providerId: ProviderId, handlers?: {
-    onEvent?: (event: MakaiAuthEvent) => void;
-    onPrompt?: (prompt: Extract<MakaiAuthEvent, { type: "prompt" }>) => Promise<string> | string;
-  }): Promise<{ status: "success" }>;
+  login(providerId: ProviderId, handlers?: AuthFlowHandlers): Promise<{ status: "success" }>;
 }
 
 export class MakaiAuthError extends Error {
@@ -353,6 +357,15 @@ export class MakaiStreamError extends Error {
 export interface MakaiModelsApi {
   list(request?: ListModelsRequest): Promise<ListModelsResponse>;
   resolve(request: ResolveModelRequest): Promise<ResolveModelResponse>;
+}
+
+export interface MakaiClientOptions {
+  auth?: {
+    // Client-level default for all provider/agent requests unless overridden in RunOptions.
+    auth_retry_policy?: AuthRetryPolicy;
+    // Default interactive handlers used by auth.login(...) and auto_once retry flows.
+    handlers?: AuthFlowHandlers;
+  };
 }
 
 export interface MakaiAgentApi {
@@ -372,6 +385,8 @@ export interface MakaiClient {
   provider: MakaiProviderApi;
   close(): Promise<void>;
 }
+
+export function createMakaiClient(options?: MakaiClientOptions): Promise<MakaiClient>;
 ```
 
 ### 3.1 `model_ref` Format (Normative)
@@ -473,6 +488,9 @@ SDK behavior:
 - On `auth_required` from provider/agent calls:
   - `auth_retry_policy = "manual"` (default): SDK throws typed error containing `provider_id`.
   - `auth_retry_policy = "auto_once"`: SDK runs `client.auth.login(provider_id)` then retries the original request once.
+  - `auto_once` uses client-level default auth handlers from `MakaiClientOptions.auth.handlers`.
+  - If `auto_once` is selected and interactive auth is required but no default handlers are configured, SDK must fail fast with typed `auth_required` (manual-login path), not silently hang.
+  - If provider auth can complete non-interactively, `auto_once` may succeed without handlers.
 
 ## 4. Auth Protocol Changes (Normative)
 
