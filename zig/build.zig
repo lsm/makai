@@ -955,20 +955,35 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const makai_cli_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/makai.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "register_builtins", .module = register_builtins_mod },
+            .{ .name = "protocol_server", .module = protocol_server_mod },
+            .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "agent_server", .module = protocol_agent_server_mod },
+            .{ .name = "agent_runtime", .module = protocol_agent_runtime_mod },
+            .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "stdio", .module = stdio_transport_mod },
+        },
+    });
+
     const makai_cli = b.addExecutable(.{
         .name = "makai",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tools/makai.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "ai_types", .module = ai_types_mod },
-                .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
-                .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
-                .{ .name = "oauth/storage", .module = oauth_storage_mod },
-            },
-        }),
+        .root_module = makai_cli_module,
     });
+    const makai_cli_test = b.addTest(.{ .root_module = makai_cli_module });
+    const makai_cli_test_run = b.addRunArtifact(makai_cli_test);
     b.installArtifact(makai_cli);
 
     const run_cmd = b.addRunArtifact(makai_cli);
@@ -1031,6 +1046,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_step.dependOn(&makai_cli_test_run.step);
 
     // Grouped unit test steps for parallel CI
     const test_unit_core_step = b.step("test-unit-core", "Run core types unit tests");
@@ -1088,6 +1104,9 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+
+    const test_unit_makai_cli_step = b.step("test-unit-makai-cli", "Run makai CLI unit tests");
+    test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
 
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
