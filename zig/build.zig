@@ -378,7 +378,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Shared protocol utility modules
+    // Standalone protocol helper modules (no runtime wiring in M-003 scope).
     const protocol_model_ref_mod = b.createModule(.{
         .root_source_file = b.path("src/protocol/model_ref.zig"),
         .target = target,

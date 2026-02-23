@@ -131,6 +131,9 @@ fn encodeModelId(allocator: std.mem.Allocator, model_id: []const u8) (std.mem.Al
 }
 
 fn decodeModelId(allocator: std.mem.Allocator, encoded_model_id: []const u8) (std.mem.Allocator.Error || ModelRefError)![]u8 {
+    // Keep decodeModelId defensive even though parseModelRef currently checks this first.
+    if (encoded_model_id.len == 0) return error.MissingModelId;
+
     var decoded = std.ArrayList(u8){};
     defer decoded.deinit(allocator);
 
@@ -238,6 +241,18 @@ test "model_ref supports UTF-8 model ids via percent encoding" {
     try std.testing.expectEqualStrings(original_model_id, parsed.model_id);
 }
 
+test "model_ref parse accepts lowercase escapes and format normalizes to uppercase" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try parseModelRef(allocator, "provider/api@model%2f");
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqualStrings("model/", parsed.model_id);
+
+    const reformatted = try formatModelRef(allocator, parsed.provider_id, parsed.api, parsed.model_id);
+    defer allocator.free(reformatted);
+    try std.testing.expectEqualStrings("provider/api@model%2F", reformatted);
+}
+
 test "model_ref parse rejects malformed refs" {
     const allocator = std.testing.allocator;
 
@@ -250,4 +265,6 @@ test "model_ref parse rejects malformed refs" {
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api/v1@model"));
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api@bad/model"));
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api@bad@model"));
+    try std.testing.expectError(error.InvalidProviderId, parseModelRef(allocator, "pro%vider/api@model"));
+    try std.testing.expectError(error.InvalidApi, parseModelRef(allocator, "provider/ap%i@model"));
 }
