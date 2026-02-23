@@ -1,0 +1,68 @@
+name: "V1 Phase Work Item"
+description: "Track a single implementation unit mapped to spec clauses."
+title: "[V1][Phase X] "
+labels: ["v1", "implementation"]
+body:
+  - type: input
+    id: phase
+    attributes:
+      label: Phase/Sub-phase
+      placeholder: "Phase 2b"
+    validations:
+      required: true
+
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies / Blocked by
+      placeholder: "#123, #124 or None"
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: "Define exactly what this issue includes and excludes."
+    validations:
+      required: true
+
+  - type: textarea
+    id: clauses
+    attributes:
+      label: Spec clauses (required)
+      description: "List exact clause references from spec/design docs."
+      placeholder: |
+        - docs/v1-sdk-agent-provider-spec.md §3.6
+        - docs/ts-sdk-chat-integration-plan.md Phase 2b
+        - DESIGN.md §4.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Test plan
+      description: "List tests to add/update (unit, integration, contract, concurrency if needed)."
+    validations:
+      required: true
+
+  - type: input
+    id: matrix
+    attributes:
+      label: Traceability row IDs
+      placeholder: "M-004, M-007"
+    validations:
+      required: true
+
+  - type: textarea
+    id: dod
+    attributes:
+      label: Definition of Done
+      value: |
+        - Code merged for scoped item only
+        - Tests added and passing
+        - Traceability matrix updated
+        - External review rounds completed (no unresolved P0/P1)
+    validations:
+      required: true

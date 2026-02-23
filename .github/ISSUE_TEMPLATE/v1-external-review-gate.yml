@@ -1,0 +1,58 @@
+name: "V1 External Review Gate"
+description: "Track multi-round external review findings for a PR."
+title: "[V1][Review Gate] PR #"
+labels: ["v1", "review-gate"]
+body:
+  - type: input
+    id: pr
+    attributes:
+      label: PR link
+      placeholder: "https://github.com/.../pull/123"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reviewers
+    attributes:
+      label: External reviewers
+      description: "List independent reviewers/agents (not the PR author). Human or independent AI reviewers are both valid."
+    validations:
+      required: true
+
+  - type: textarea
+    id: rounds
+    attributes:
+      label: Round log
+      value: |
+        - Round 1:
+          - Reviewer:
+          - Blocking findings (P0/P1):
+          - Follow-up commit(s):
+          - Status:
+        - Round 2:
+          - Reviewer:
+          - Blocking findings (P0/P1):
+          - Follow-up commit(s):
+          - Status:
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: criteria
+    attributes:
+      label: Gate criteria
+      options:
+        - label: At least 2 external rounds completed
+          required: true
+        - label: No unresolved P0/P1 findings
+          required: true
+        - label: Findings disposition documented (fixed/accepted/rejected with rationale)
+          required: true
+
+  - type: textarea
+    id: final
+    attributes:
+      label: Final decision
+      placeholder: "Approved / Changes requested"
+    validations:
+      required: true
