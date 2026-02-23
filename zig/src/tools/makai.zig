@@ -260,8 +260,14 @@ const StdioProtocolLoop = struct {
         if (parsed.value != .object) return null;
         const obj = parsed.value.object;
 
-        if (obj.get("stream_id") != null) return .provider;
-        if (obj.get("session_id") != null) return .agent;
+        const stream_id = obj.get("stream_id");
+        const session_id = obj.get("session_id");
+        const has_stream_id = stream_id != null and stream_id.? == .string;
+        const has_session_id = session_id != null and session_id.? == .string;
+
+        if (has_stream_id and has_session_id) return null;
+        if (has_stream_id) return .provider;
+        if (has_session_id) return .agent;
         return null;
     }
 
@@ -325,8 +331,10 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
             const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
             if (line.len == 0) continue;
 
-            _ = try stdio_loop.dispatchInboundLine(line);
-            did_work = true;
+            const dispatched = try stdio_loop.dispatchInboundLine(line);
+            if (dispatched) {
+                did_work = true;
+            }
         }
 
         const forwarded = try stdio_loop.pumpBackground();
@@ -742,6 +750,30 @@ test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
         defer env.deinit(allocator);
         try std.testing.expect(env.payload == .pong);
     }
+}
+
+test "stdio protocol loop rejects ambiguous dispatch envelope with both ids" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    const ambiguous =
+        \\{"type":"ping","stream_id":"11111111-1111-1111-1111-111111111111","session_id":"22222222-2222-2222-2222-222222222222","message_id":"33333333-3333-3333-3333-333333333333","sequence":1,"timestamp":1760000000000,"version":1,"payload":{}}
+    ;
+
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(ambiguous)));
+
+    var outbound = std.ArrayList([]u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expectEqual(@as(usize, 0), outbound.items.len);
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {

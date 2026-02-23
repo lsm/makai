@@ -1104,7 +1104,6 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
-    test_unit_utils_step.dependOn(&makai_cli_test_run.step);
 
     const test_unit_makai_cli_step = b.step("test-unit-makai-cli", "Run makai CLI unit tests");
     test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
