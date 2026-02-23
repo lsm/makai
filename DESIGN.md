@@ -255,7 +255,170 @@ This is the canonical architecture for distributed operation.
 
 ---
 
-## 11) Non-Goals / Deferred Areas
+## 11) Diagrams
+
+### 11.1 System Context
+
+```mermaid
+flowchart LR
+  U["App or User"] --> SDK["TS SDK Client"]
+  SDK --> TR["Transport (stdio or HTTP/WS)"]
+
+  subgraph M["Makai Binary Runtime"]
+    AR["Auth Protocol Runtime"]
+    PR["Provider Protocol Runtime"]
+    GR["Agent Protocol Runtime"]
+    TRR["Tool Protocol Runtime"]
+    ST["Credential Storage"]
+  end
+
+  TR --> AR
+  TR --> PR
+  TR --> GR
+  TR --> TRR
+
+  AR --> ST
+  PR --> ST
+  GR --> PR
+  GR --> TRR
+
+  PR --> AP["Upstream AI Providers"]
+  AR --> OP["OAuth Providers"]
+  TRR --> TX["Tool Executors"]
+```
+
+### 11.2 Auth Login Sequence
+
+```mermaid
+sequenceDiagram
+  participant C as "TS SDK auth client"
+  participant A as "Auth protocol runtime"
+  participant O as "OAuth provider"
+  participant S as "Credential storage"
+
+  C->>A: "auth_login_start(provider_id)"
+  A-->>C: "ack"
+  A-->>C: "auth_event auth_url"
+  A->>O: "start OAuth exchange"
+  O-->>A: "requires user code"
+  A-->>C: "auth_event prompt(prompt_id)"
+  C->>A: "auth_prompt_response(flow_id,prompt_id,answer)"
+  A->>O: "continue OAuth exchange"
+  O-->>A: "tokens"
+  A->>S: "persist credentials"
+  A-->>C: "auth_event success"
+  A-->>C: "auth_login_result status=success"
+```
+
+### 11.3 Provider Direct Sequence
+
+```mermaid
+sequenceDiagram
+  participant C as "TS SDK provider client"
+  participant P as "Provider protocol runtime"
+  participant S as "Credential storage"
+  participant U as "Upstream AI provider"
+  participant A as "Auth protocol runtime"
+
+  C->>P: "provider stream or complete request"
+  P->>S: "resolve credentials"
+  alt "credentials missing or expired"
+    P-->>C: "nack auth_required or auth_expired"
+    C->>A: "auth_login_start(provider_id)"
+    A-->>C: "auth events and auth_login_result"
+    C->>P: "retry request"
+    P->>S: "resolve credentials again"
+  end
+  P->>U: "provider API call"
+  U-->>P: "stream events and final usage"
+  P-->>C: "message_start and deltas and message_end"
+```
+
+### 11.4 Agent End-to-End Sequence
+
+```mermaid
+sequenceDiagram
+  participant C as "TS SDK agent client"
+  participant G as "Agent protocol runtime"
+  participant P as "Provider protocol runtime"
+  participant T as "Tool protocol runtime"
+  participant U as "Upstream AI provider"
+
+  C->>G: "agent stream request"
+  G-->>C: "agent_start"
+  G->>P: "provider stream request"
+  P->>U: "model stream call"
+  U-->>P: "text and thinking and tool_call"
+  P-->>G: "provider stream events"
+  G-->>C: "turn_start and deltas and turn_end"
+  opt "tool call needed"
+    G-->>C: "tool_execution_start"
+    G->>T: "tool_request"
+    T-->>G: "tool_response or tool error"
+    G-->>C: "tool_execution_end"
+    G->>P: "next provider turn with tool result"
+  end
+  G-->>C: "agent_end with usage and stop_reason"
+```
+
+### 11.5 Auth and Stream Lifecycle States
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+
+  Idle --> AuthFlow: "auth_login_start"
+  AuthFlow --> AwaitPrompt: "auth_event prompt"
+  AwaitPrompt --> AuthFlow: "auth_prompt_response"
+  AuthFlow --> AuthSuccess: "auth_login_result success"
+  AuthFlow --> AuthCancelled: "auth_login_result cancelled"
+  AuthFlow --> AuthFailed: "auth_event error and auth_login_result failed"
+
+  AuthSuccess --> ReadyForInference
+  ReadyForInference --> ProviderStreaming: "provider stream request"
+  ProviderStreaming --> ProviderCompleted: "message_end"
+  ProviderStreaming --> ProviderFailed: "error terminal event"
+
+  ProviderCompleted --> [*]
+  ProviderFailed --> [*]
+  AuthCancelled --> [*]
+  AuthFailed --> [*]
+```
+
+### 11.6 Credential Ownership Boundaries
+
+```mermaid
+flowchart TB
+  subgraph Client["Client Boundary"]
+    SDK["TS SDK"]
+  end
+
+  subgraph Server["Makai Runtime Boundary"]
+    AR["Auth Runtime"]
+    PR["Provider Runtime"]
+    ST["Credential Storage"]
+  end
+
+  subgraph External["External Services"]
+    OP["OAuth Providers"]
+    AP["AI Providers"]
+  end
+
+  SDK -->|"protocol events and requests only"| AR
+  SDK -->|"protocol requests only"| PR
+
+  AR -->|"token exchange"| OP
+  AR -->|"persist encrypted or local credentials"| ST
+  PR -->|"read and refresh credentials"| ST
+  PR -->|"inference calls with provider auth headers"| AP
+
+  SDK -.-|"no raw token access"| ST
+  SDK -.-|"no direct token exchange"| OP
+```
+
+---
+
+## 12) Non-Goals / Deferred Areas
 
 - provider-specific auth logic in agent layer (explicitly forbidden)
 - CLI-subprocess-as-primary auth path in SDKs (explicitly forbidden)
