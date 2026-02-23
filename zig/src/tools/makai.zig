@@ -1,9 +1,31 @@
 const std = @import("std");
+const ai_types = @import("ai_types");
+const api_registry = @import("api_registry");
 const anthropic_oauth = @import("oauth/anthropic");
 const github_oauth = @import("oauth/github_copilot");
 const oauth_storage = @import("oauth/storage");
+const register_builtins = @import("register_builtins");
+const provider_protocol_server = @import("protocol_server");
+const provider_protocol_runtime = @import("protocol_runtime");
+const provider_protocol_envelope = @import("protocol_envelope");
+const agent_protocol_server = @import("agent_server");
+const agent_protocol_runtime = @import("agent_runtime");
+const agent_protocol_envelope = @import("agent_envelope");
+const event_stream = @import("event_stream");
+const in_process = @import("transports/in_process");
+const stdio = @import("stdio");
 
 pub const VERSION = "0.0.1";
+
+const ProviderProtocolServer = provider_protocol_server.ProtocolServer;
+const ProviderProtocolRuntime = provider_protocol_runtime.ProviderProtocolRuntime;
+const ProviderProtocolTypes = provider_protocol_envelope.protocol_types;
+const AgentProtocolServer = agent_protocol_server.AgentProtocolServer;
+const AgentProtocolRuntime = agent_protocol_runtime.AgentProtocolRuntime;
+const AgentProtocolTypes = agent_protocol_envelope.protocol_types;
+const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
+const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
+const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
 
 const AuthContext = struct {
     allocator: std.mem.Allocator,
@@ -111,6 +133,234 @@ fn githubOnAuth(info: github_oauth.AuthInfo) void {
 
 fn githubOnPrompt(prompt: github_oauth.Prompt) []const u8 {
     return readPromptInput(prompt.message, prompt.allow_empty);
+}
+
+const StdioProtocolLoop = struct {
+    allocator: std.mem.Allocator,
+    registry: *api_registry.ApiRegistry,
+    owns_registry: bool,
+    provider_server: ProviderProtocolServer,
+    provider_pipe: in_process.SerializedPipe,
+    agent_server: AgentProtocolServer,
+    agent_pipe: in_process.SerializedPipe,
+
+    const Self = @This();
+    const DispatchTarget = enum { provider, agent };
+
+    fn initWithRegistry(
+        allocator: std.mem.Allocator,
+        registry: *api_registry.ApiRegistry,
+        owns_registry: bool,
+    ) Self {
+        const self = Self{
+            .allocator = allocator,
+            .registry = registry,
+            .owns_registry = owns_registry,
+            .provider_server = ProviderProtocolServer.init(allocator, registry, .{}),
+            .provider_pipe = in_process.createSerializedPipe(allocator),
+            .agent_server = AgentProtocolServer.init(allocator),
+            .agent_pipe = in_process.createSerializedPipe(allocator),
+        };
+
+        return self;
+    }
+
+    pub fn initWithBuiltins(allocator: std.mem.Allocator) !Self {
+        const registry = try allocator.create(api_registry.ApiRegistry);
+        errdefer allocator.destroy(registry);
+
+        registry.* = api_registry.ApiRegistry.init(allocator);
+        errdefer registry.deinit();
+
+        try register_builtins.registerBuiltInApiProviders(registry);
+        return initWithRegistry(allocator, registry, true);
+    }
+
+    fn initForTesting(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry) Self {
+        return initWithRegistry(allocator, registry, false);
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.provider_server.deinit();
+        self.provider_pipe.deinit();
+        self.agent_server.deinit();
+        self.agent_pipe.deinit();
+
+        if (self.owns_registry) {
+            self.registry.deinit();
+            self.allocator.destroy(self.registry);
+        }
+    }
+
+    pub fn dispatchInboundLine(self: *Self, line: []const u8) !bool {
+        const target = self.detectDispatchTarget(line) orelse return false;
+
+        switch (target) {
+            .provider => {
+                var sender = self.provider_pipe.clientSender();
+                try sender.write(line);
+                try sender.flush();
+                var runtime = ProviderProtocolRuntime{
+                    .server = &self.provider_server,
+                    .pipe = &self.provider_pipe,
+                    .allocator = self.allocator,
+                };
+                try runtime.pumpClientMessages();
+            },
+            .agent => {
+                var sender = self.agent_pipe.clientSender();
+                try sender.write(line);
+                try sender.flush();
+                var runtime = AgentProtocolRuntime{
+                    .server = &self.agent_server,
+                    .pipe = &self.agent_pipe,
+                    .allocator = self.allocator,
+                };
+                try runtime.pumpClientMessages();
+            },
+        }
+
+        return true;
+    }
+
+    pub fn pumpBackground(self: *Self) !usize {
+        var forwarded: usize = 0;
+        var provider_runtime = ProviderProtocolRuntime{
+            .server = &self.provider_server,
+            .pipe = &self.provider_pipe,
+            .allocator = self.allocator,
+        };
+        forwarded += try provider_runtime.pumpProviderEvents();
+        self.provider_server.cleanupCompletedStreams();
+
+        var agent_runtime = AgentProtocolRuntime{
+            .server = &self.agent_server,
+            .pipe = &self.agent_pipe,
+            .allocator = self.allocator,
+        };
+        forwarded += try agent_runtime.pumpServerOutbox();
+        return forwarded;
+    }
+
+    pub fn drainOutbound(self: *Self, lines: *std.ArrayList([]u8)) !usize {
+        var drained: usize = 0;
+        drained += try self.drainPipeOutbound(&self.provider_pipe, lines);
+        drained += try self.drainPipeOutbound(&self.agent_pipe, lines);
+        return drained;
+    }
+
+    pub fn hasActiveProviderStreams(self: *Self) bool {
+        return self.provider_server.activeStreamCount() > 0;
+    }
+
+    fn detectDispatchTarget(self: *Self, line: []const u8) ?DispatchTarget {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch return null;
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return null;
+        const obj = parsed.value.object;
+
+        if (obj.get("stream_id") != null) return .provider;
+        if (obj.get("session_id") != null) return .agent;
+        return null;
+    }
+
+    fn drainPipeOutbound(
+        self: *Self,
+        pipe: *in_process.SerializedPipe,
+        lines: *std.ArrayList([]u8),
+    ) !usize {
+        var drained: usize = 0;
+        var receiver = pipe.clientReceiver();
+        while (try receiver.readLine(self.allocator)) |line| {
+            try lines.append(self.allocator, @constCast(line));
+            drained += 1;
+        }
+        return drained;
+    }
+};
+
+fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
+    for (lines.items) |line| allocator.free(line);
+    lines.clearRetainingCapacity();
+}
+
+fn writeOwnedLinesAndClear(
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList([]u8),
+) !void {
+    for (lines.items) |line| {
+        defer allocator.free(line);
+        try file.writeAll(line);
+        try file.writeAll("\n");
+    }
+    lines.clearRetainingCapacity();
+}
+
+fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File) !void {
+    var stdio_loop = try StdioProtocolLoop.initWithBuiltins(allocator);
+    defer stdio_loop.deinit();
+
+    try stdout.writeAll(READY_FRAME);
+
+    var async_receiver = stdio.AsyncStdioReceiver.initWithFile(stdin);
+    var stdin_handle = try async_receiver.receiveStreamWithHandle(allocator);
+    defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
+
+    const stdin_stream = stdin_handle.getStream();
+    var outbound_lines = std.ArrayList([]u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound_lines);
+        outbound_lines.deinit(allocator);
+    }
+
+    while (true) {
+        var did_work = false;
+
+        while (stdin_stream.poll()) |chunk| {
+            var mutable_chunk = chunk;
+            defer mutable_chunk.deinit(allocator);
+
+            const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
+            if (line.len == 0) continue;
+
+            _ = try stdio_loop.dispatchInboundLine(line);
+            did_work = true;
+        }
+
+        const forwarded = try stdio_loop.pumpBackground();
+        if (forwarded > 0) did_work = true;
+
+        const drained = try stdio_loop.drainOutbound(&outbound_lines);
+        if (drained > 0) {
+            try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
+            did_work = true;
+        }
+
+        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams()) {
+            break;
+        }
+
+        if (!did_work) {
+            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        }
+    }
+
+    // Drain any final buffered input/output before shutdown.
+    while (stdin_stream.poll()) |chunk| {
+        var mutable_chunk = chunk;
+        defer mutable_chunk.deinit(allocator);
+
+        const line = std.mem.trim(u8, mutable_chunk.data, " \t\r\n");
+        if (line.len == 0) continue;
+        _ = try stdio_loop.dispatchInboundLine(line);
+    }
+    _ = try stdio_loop.pumpBackground();
+    const drained = try stdio_loop.drainOutbound(&outbound_lines);
+    if (drained > 0) {
+        try writeOwnedLinesAndClear(stdout, allocator, &outbound_lines);
+    }
 }
 
 fn printUsage(file: std.fs.File) !void {
@@ -321,6 +571,309 @@ fn handleAuth(args: []const []const u8, allocator: std.mem.Allocator, stdin: std
     return error.InvalidArgument;
 }
 
+fn fixtureModel(api: []const u8) ai_types.Model {
+    return .{
+        .id = "fixture-model",
+        .name = "Fixture Model",
+        .api = api,
+        .provider = "fixture",
+        .base_url = "https://fixture.invalid",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 16_384,
+        .max_tokens = 2_048,
+    };
+}
+
+fn makeFixtureStream(
+    allocator: std.mem.Allocator,
+    fail_with_error: bool,
+) !*event_stream.AssistantMessageEventStream {
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+
+    if (fail_with_error) {
+        s.completeWithError("fixture stream failure");
+        s.markThreadDone();
+        return s;
+    }
+
+    try s.push(.keepalive);
+    s.complete(.{
+        .content = &.{},
+        .api = "fixture-api",
+        .provider = "fixture-provider",
+        .model = "fixture-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    });
+    s.markThreadDone();
+    return s;
+}
+
+fn fixtureOkStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+    _ = options;
+    return makeFixtureStream(allocator, false);
+}
+
+fn fixtureOkStreamSimple(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.SimpleStreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+    _ = options;
+    return makeFixtureStream(allocator, false);
+}
+
+fn fixtureErrorStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+    _ = options;
+    return makeFixtureStream(allocator, true);
+}
+
+fn fixtureErrorStreamSimple(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.SimpleStreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+    _ = options;
+    return makeFixtureStream(allocator, true);
+}
+
+fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
+    const env = ProviderProtocolTypes.Envelope{
+        .stream_id = ProviderProtocolTypes.generateUuid(),
+        .message_id = ProviderProtocolTypes.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .ping,
+    };
+    return provider_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
+    const env = AgentProtocolTypes.Envelope{
+        .session_id = AgentProtocolTypes.generateUuid(),
+        .message_id = AgentProtocolTypes.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .ping,
+    };
+    return agent_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeProviderStreamRequestEnvelopeJson(
+    allocator: std.mem.Allocator,
+    api: []const u8,
+) ![]u8 {
+    var env = ProviderProtocolTypes.Envelope{
+        .stream_id = ProviderProtocolTypes.generateUuid(),
+        .message_id = ProviderProtocolTypes.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = fixtureModel(api),
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer env.deinit(allocator);
+    return provider_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const provider_ping = try makeProviderPingEnvelopeJson(allocator);
+    defer allocator.free(provider_ping);
+
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(provider_ping));
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expectEqual(@as(usize, 1), outbound.items.len);
+    {
+        var env = try provider_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+        defer env.deinit(allocator);
+        try std.testing.expect(env.payload == .pong);
+    }
+    clearOwnedLines(allocator, &outbound);
+
+    const agent_ping = try makeAgentPingEnvelopeJson(allocator);
+    defer allocator.free(agent_ping);
+
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(agent_ping));
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expectEqual(@as(usize, 1), outbound.items.len);
+    {
+        var env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+        defer env.deinit(allocator);
+        try std.testing.expect(env.payload == .pong);
+    }
+}
+
+test "stdio protocol loop forwards provider event result and error envelopes" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-ok-api",
+        .stream = fixtureOkStream,
+        .stream_simple = fixtureOkStreamSimple,
+    }, "test-fixtures");
+    try registry.registerApiProvider(.{
+        .api = "fixture-error-api",
+        .stream = fixtureErrorStream,
+        .stream_simple = fixtureErrorStreamSimple,
+    }, "test-fixtures");
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]u8){};
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const ok_req = try makeProviderStreamRequestEnvelopeJson(allocator, "fixture-ok-api");
+    defer allocator.free(ok_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(ok_req));
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+
+    const err_req = try makeProviderStreamRequestEnvelopeJson(allocator, "fixture-error-api");
+    defer allocator.free(err_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(err_req));
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+
+    var ack_count: usize = 0;
+    var saw_event = false;
+    var saw_result = false;
+    var saw_stream_error = false;
+
+    for (outbound.items) |line| {
+        var env = try provider_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+
+        switch (env.payload) {
+            .ack => ack_count += 1,
+            .event => saw_event = true,
+            .result => saw_result = true,
+            .stream_error => saw_stream_error = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expect(ack_count >= 2);
+    try std.testing.expect(saw_event);
+    try std.testing.expect(saw_result);
+    try std.testing.expect(saw_stream_error);
+}
+
+test "stdio mode preserves ready handshake compatibility" {
+    const allocator = std.testing.allocator;
+
+    const stdin_pipe = try std.posix.pipe();
+    const stdout_pipe = try std.posix.pipe();
+
+    var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
+    var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
+    var stdout_read = std.fs.File{ .handle = stdout_pipe[0] };
+    var stdout_write = std.fs.File{ .handle = stdout_pipe[1] };
+    errdefer {
+        stdin_read.close();
+        stdin_write.close();
+        stdout_read.close();
+        stdout_write.close();
+    }
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        stdin_file: std.fs.File,
+        stdout_file: std.fs.File,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            runStdioMode(self.allocator, self.stdin_file, self.stdout_file) catch |err| {
+                self.err = err;
+            };
+            self.stdin_file.close();
+            self.stdout_file.close();
+        }
+    };
+
+    var runner = Runner{
+        .allocator = allocator,
+        .stdin_file = stdin_read,
+        .stdout_file = stdout_write,
+    };
+    const thread = try std.Thread.spawn(.{}, Runner.run, .{&runner});
+    defer thread.join();
+
+    var stdin_write_closed = false;
+    defer if (!stdin_write_closed) stdin_write.close();
+
+    var out_receiver = stdio.StdioReceiver.initWithFile(stdout_read, allocator);
+    defer out_receiver.deinit();
+    defer stdout_read.close();
+
+    var receiver = out_receiver.receiver();
+
+    const ready_line = (try receiver.read(allocator)).?;
+    defer allocator.free(ready_line);
+    try std.testing.expectEqualStrings("{\"type\":\"ready\",\"protocol_version\":\"1\"}", ready_line);
+
+    const ping = try makeProviderPingEnvelopeJson(allocator);
+    defer allocator.free(ping);
+    try stdin_write.writeAll(ping);
+    try stdin_write.writeAll("\n");
+
+    const response_line = (try receiver.read(allocator)).?;
+    defer allocator.free(response_line);
+    var pong = try provider_protocol_envelope.deserializeEnvelope(response_line, allocator);
+    defer pong.deinit(allocator);
+    try std.testing.expect(pong.payload == .pong);
+
+    stdin_write.close();
+    stdin_write_closed = true;
+    try std.testing.expect(runner.err == null);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -344,12 +897,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, args[1], "--stdio")) {
-        try stdout.writeAll("{\"type\":\"ready\",\"protocol_version\":\"1\"}\n");
-        var buffer: [4096]u8 = undefined;
-        while (true) {
-            const n = try stdin.read(&buffer);
-            if (n == 0) break;
-        }
+        try runStdioMode(allocator, stdin, stdout);
         return;
     }
 
