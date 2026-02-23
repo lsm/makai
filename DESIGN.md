@@ -78,7 +78,9 @@ These runtimes are typically hosted on the **server side** of each protocol boun
 Sequence is **per session/stream**, never global across all sessions.
 
 - Provider protocol: sequence scope = `stream_id`
-- Auth protocol: sequence scope = `flow_id`
+- Auth protocol:
+  - standalone query scope = envelope `stream_id` (for example `auth_providers_request`)
+  - interactive login scope = `flow_id` (`auth_login_start` -> `auth_event` -> `auth_login_result`)
 - Agent protocol: sequence scope = `session_id`
 
 ### 4.2 Rules

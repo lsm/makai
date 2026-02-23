@@ -108,6 +108,7 @@ export type ModelCapability =
   | "audio_output";
 
 export type ModelSource = "dynamic" | "static_fallback";
+export type AuthRetryPolicy = "manual" | "auto_once";
 
 // Known values are standardized; the union stays open-ended for forward compatibility.
 export type StopReason =
@@ -265,6 +266,8 @@ export interface RunOptions {
   max_tokens?: number;
   // If the selected model lacks `reasoning` capability, server may ignore this field.
   reasoning_effort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  // Default is "manual": caller handles auth_required by invoking client.auth.login(...)
+  auth_retry_policy?: AuthRetryPolicy;
   session_id?: string;
   metadata?: Record<string, string>;
 }
@@ -467,6 +470,9 @@ SDK behavior:
 - `login(...)` must maintain a single active auth flow, route prompt events to `onPrompt`, and publish all auth events to `onEvent`.
 - SDK must not read `~/.makai/auth.json` directly and must not return token material to callers.
 - CLI-subprocess auth wiring is prohibited in the V1 protocol-only implementation.
+- On `auth_required` from provider/agent calls:
+  - `auth_retry_policy = "manual"` (default): SDK throws typed error containing `provider_id`.
+  - `auth_retry_policy = "auto_once"`: SDK runs `client.auth.login(provider_id)` then retries the original request once.
 
 ## 4. Auth Protocol Changes (Normative)
 
@@ -539,11 +545,20 @@ Server behavior:
 3. If a login flow emits `prompt`, server waits for matching `auth_prompt_response` (`flow_id`, `prompt_id`) before continuing.
 4. `auth_cancel` must terminate the targeted flow and emit `auth_login_result.status = cancelled`.
 5. Credentials are persisted by auth runtime; token/refresh secrets must never be emitted in protocol payloads.
+6. Standalone auth queries (`auth_providers_request`) are sequenced by envelope `stream_id`; login flow messages are sequenced by `flow_id`.
+7. Terminal auth event ordering is required: emit `auth_event.success` or `auth_event.error` before `auth_login_result`.
+8. `auth_prompt_response` received after flow termination/cancellation must be ignored.
+9. Provider adapters that require manual code fallback (for example Google `onManualCodeInput`) must surface it as a normal `auth_event.prompt` (message-driven).
 
 Client behavior:
 1. SDK auth APIs must use this protocol over the active transport (stdio/HTTP/WS).
 2. SDK auth APIs must not shell out to `makai auth ...`.
 3. CLI auth commands (`makai auth providers/login`) must call the same auth protocol runtime (wrapper mode), not duplicate OAuth logic.
+4. SDK event adapters must flatten auth event wire shape for TS API consumers.
+
+Wire format note:
+- Auth events on the wire are Zig union objects (for example `{ "prompt": { ... } }`).
+- TS SDK presents flattened events (`{ type: "prompt", ... }`) via `MakaiAuthEvent`.
 
 ## 5. Provider Protocol Changes (Normative)
 

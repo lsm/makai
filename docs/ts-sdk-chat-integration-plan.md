@@ -33,6 +33,7 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Implement interactive login flow:
   - `auth_login_start` -> auth events (`auth_url`, `prompt`, `progress`, `success`, `error`) -> terminal `auth_login_result`.
   - prompt loop (`auth_prompt_response`) and cancellation (`auth_cancel`).
+  - map provider-specific manual-code callbacks (for example Google `onManualCodeInput`) into standard `auth_event.prompt`.
 - Persist credentials through existing auth storage and never expose token/refresh secrets via protocol payloads.
 
 ### Phase 1.5: Implement model discovery and resolution primitives
@@ -82,6 +83,9 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 - Keep `MakaiStdioClient` as low-level transport primitive.
 - Add ergonomic request/response types that hide provider-specific headers and parsing.
 - Replace TS auth subprocess execution path with auth protocol transport path.
+- Implement auth-required retry policy for provider/agent requests:
+  - default `auth_retry_policy = "manual"`: surface typed `auth_required` with `provider_id`.
+  - optional `auth_retry_policy = "auto_once"`: run `client.auth.login(provider_id)` and retry the request once.
 
 ### Phase 4: Migrate demo to SDK chat APIs
 
