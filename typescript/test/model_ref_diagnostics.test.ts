@@ -25,6 +25,7 @@ test("parseModelRef rejects malformed refs with Zig-matching error categories", 
   expectParseError("provider-api-model", "missing_separators");
   expectParseError("provider/api@bad%2", "invalid_percent_escape");
   expectParseError("provider/api@bad%GG", "invalid_percent_escape");
+  expectParseError("prov@ider/api@model", "ambiguous_separators");
   expectParseError("provider/api/v1@model", "ambiguous_separators");
   expectParseError("provider/api@bad/model", "ambiguous_separators");
   expectParseError("provider/api@bad@model", "ambiguous_separators");

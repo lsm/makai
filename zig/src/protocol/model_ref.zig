@@ -262,9 +262,22 @@ test "model_ref parse rejects malformed refs" {
     try std.testing.expectError(error.MissingSeparators, parseModelRef(allocator, "provider-api-model"));
     try std.testing.expectError(error.InvalidPercentEscape, parseModelRef(allocator, "provider/api@bad%2"));
     try std.testing.expectError(error.InvalidPercentEscape, parseModelRef(allocator, "provider/api@bad%GG"));
+    try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "prov@ider/api@model"));
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api/v1@model"));
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api@bad/model"));
     try std.testing.expectError(error.AmbiguousSeparators, parseModelRef(allocator, "provider/api@bad@model"));
     try std.testing.expectError(error.InvalidProviderId, parseModelRef(allocator, "pro%vider/api@model"));
     try std.testing.expectError(error.InvalidApi, parseModelRef(allocator, "provider/ap%i@model"));
+}
+
+test "model_ref format rejects invalid segments and model ids" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.MissingModelId, formatModelRef(allocator, "p", "a", ""));
+
+    const invalid_utf8 = [_]u8{ 0xFF, 0xFE };
+    try std.testing.expectError(error.InvalidUtf8ModelId, formatModelRef(allocator, "p", "a", &invalid_utf8));
+
+    try std.testing.expectError(error.InvalidProviderId, formatModelRef(allocator, "pro/vider", "a", "m"));
+    try std.testing.expectError(error.InvalidApi, formatModelRef(allocator, "p", "ap@i", "m"));
 }
