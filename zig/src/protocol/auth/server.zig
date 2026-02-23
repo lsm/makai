@@ -97,7 +97,6 @@ pub const AuthProtocolServer = struct {
         }
 
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
@@ -114,6 +113,9 @@ pub const AuthProtocolServer = struct {
             env.deinit(self.allocator);
         }
         self.outbox.deinit(self.allocator);
+
+        self.mutex.unlock();
+        self.* = undefined;
     }
 
     pub fn handleEnvelope(self: *Self, env: auth_types.Envelope) !?auth_types.Envelope {
@@ -242,18 +244,32 @@ pub const AuthProtocolServer = struct {
     }
 
     fn handlePromptResponseLocked(self: *Self, env: auth_types.Envelope, response: auth_types.AuthPromptResponse) !?auth_types.Envelope {
-        const ack = self.makeAckLocked(env.stream_id, env.message_id);
-        const flow = self.flows.get(response.flow_id) orelse return ack;
+        if (!std.mem.eql(u8, env.stream_id[0..], response.flow_id[0..])) {
+            return try self.makeNackLocked(
+                env.stream_id,
+                env.message_id,
+                .invalid_request,
+                "stream_id must match flow_id for auth_prompt_response",
+            );
+        }
+
+        const flow = self.flows.get(response.flow_id) orelse {
+            return self.makeAckLocked(env.stream_id, env.message_id);
+        };
 
         flow.mutex.lock();
         const terminal = flow.terminal_emitted;
         const cancelled = flow.cancelled;
         flow.mutex.unlock();
-        if (terminal or cancelled) return ack;
+        if (terminal or cancelled) {
+            return self.makeAckLocked(env.stream_id, env.message_id);
+        }
 
         self.validateAndUpdateSequenceLocked(.flow, response.flow_id, env.sequence) catch |err| {
             return try self.sequenceNackLocked(env.stream_id, env.message_id, err);
         };
+
+        const ack = self.makeAckLocked(env.stream_id, env.message_id);
 
         flow.mutex.lock();
         defer flow.mutex.unlock();
@@ -271,18 +287,32 @@ pub const AuthProtocolServer = struct {
     }
 
     fn handleCancelLocked(self: *Self, env: auth_types.Envelope, request: auth_types.AuthCancelRequest) !?auth_types.Envelope {
-        const ack = self.makeAckLocked(env.stream_id, env.message_id);
-        const flow = self.flows.get(request.flow_id) orelse return ack;
+        if (!std.mem.eql(u8, env.stream_id[0..], request.flow_id[0..])) {
+            return try self.makeNackLocked(
+                env.stream_id,
+                env.message_id,
+                .invalid_request,
+                "stream_id must match flow_id for auth_cancel",
+            );
+        }
+
+        const flow = self.flows.get(request.flow_id) orelse {
+            return self.makeAckLocked(env.stream_id, env.message_id);
+        };
 
         flow.mutex.lock();
         const terminal = flow.terminal_emitted;
         const cancelled = flow.cancelled;
         flow.mutex.unlock();
-        if (!terminal and !cancelled) {
-            self.validateAndUpdateSequenceLocked(.flow, request.flow_id, env.sequence) catch |err| {
-                return try self.sequenceNackLocked(env.stream_id, env.message_id, err);
-            };
+        if (terminal or cancelled) {
+            return self.makeAckLocked(env.stream_id, env.message_id);
         }
+
+        self.validateAndUpdateSequenceLocked(.flow, request.flow_id, env.sequence) catch |err| {
+            return try self.sequenceNackLocked(env.stream_id, env.message_id, err);
+        };
+
+        const ack = self.makeAckLocked(env.stream_id, env.message_id);
 
         flow.mutex.lock();
         flow.cancelled = true;
@@ -457,6 +487,8 @@ pub const AuthProtocolServer = struct {
 
     fn loginWorkerMain(server: *Self, flow: *FlowState) void {
         defer {
+            // INVARIANT: this defer must never lock server.mutex.
+            // cleanupCompletedFlowsLocked() joins worker threads while holding it.
             flow.mutex.lock();
             flow.worker_done = true;
             flow.cond.broadcast();

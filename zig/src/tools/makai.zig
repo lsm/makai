@@ -33,6 +33,10 @@ const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
 const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
 const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
+const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
+const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
+const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
+const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30; // ~30ms with STDIO_IDLE_SLEEP_NS.
 
 const RuntimeErrorCode = enum {
     dispatch_error,
@@ -320,6 +324,7 @@ const StdioProtocolLoop = struct {
 
         if (has_stream_id and has_session_id) return null;
         if (has_stream_id) {
+            // Auth and provider envelopes both use `stream_id`; refine by type first.
             if (envelope_type) |ty| {
                 if (isAuthEnvelopeType(ty)) return .auth;
             }
@@ -331,12 +336,9 @@ const StdioProtocolLoop = struct {
 
     fn isAuthEnvelopeType(envelope_type: []const u8) bool {
         return std.mem.eql(u8, envelope_type, "auth_providers_request") or
-            std.mem.eql(u8, envelope_type, "auth_providers_response") or
             std.mem.eql(u8, envelope_type, "auth_login_start") or
             std.mem.eql(u8, envelope_type, "auth_prompt_response") or
-            std.mem.eql(u8, envelope_type, "auth_cancel") or
-            std.mem.eql(u8, envelope_type, "auth_event") or
-            std.mem.eql(u8, envelope_type, "auth_login_result");
+            std.mem.eql(u8, envelope_type, "auth_cancel");
     }
 
     fn drainPipeOutbound(
@@ -960,7 +962,7 @@ test "stdio protocol loop decodes and dispatches auth providers request and emit
 
     try std.testing.expect(try stdio_loop.dispatchInboundLine(request));
 
-    for (0..20) |_| {
+    for (0..TEST_AUTH_POLL_ITERS_SHORT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
         if (outbound.items.len >= 2) break;
         std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
@@ -1009,7 +1011,7 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
     var result_status: ?AuthProtocolTypes.AuthLoginStatus = null;
     var order_counter: usize = 0;
 
-    for (0..600) |_| {
+    for (0..TEST_AUTH_POLL_ITERS_DEFAULT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
         if (outbound.items.len == 0) {
@@ -1116,7 +1118,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
     defer if (saved_prompt_id) |prompt_id| allocator.free(prompt_id);
     var saw_cancelled_result = false;
 
-    for (0..600) |_| {
+    for (0..TEST_AUTH_POLL_ITERS_DEFAULT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
         if (outbound.items.len == 0) {
@@ -1176,7 +1178,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
     try std.testing.expect(try stdio_loop.dispatchInboundLine(late_prompt_response));
 
     var late_terminal_messages: usize = 0;
-    for (0..30) |_| {
+    for (0..TEST_AUTH_POLL_ITERS_POST_CANCEL) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
         for (outbound.items) |line| {
             var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
@@ -1219,7 +1221,7 @@ test "stdio auth login failure emits auth_event.error before auth_login_result" 
     var result_status: ?AuthProtocolTypes.AuthLoginStatus = null;
     var order_counter: usize = 0;
 
-    for (0..200) |_| {
+    for (0..TEST_AUTH_POLL_ITERS_FAILURE) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
         for (outbound.items) |line| {
             var env = auth_protocol_envelope.deserializeEnvelope(line, allocator) catch continue;
