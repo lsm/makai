@@ -21,6 +21,16 @@
   - [ ] `in progress`
   - [ ] `done`
 
+## Backward Compatibility (Required)
+
+- Compatibility impact:
+  - [ ] Backward-compatible (no existing behavior changed)
+  - [ ] Behavior changed (documented below)
+- If behavior changed, migration notes provided:
+  - [ ] Yes
+- Notes:
+  - [ ] `...`
+
 ## Tests (Required)
 
 - Unit tests:

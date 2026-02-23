@@ -11,7 +11,10 @@ Ship V1 protocol + SDK in small, auditable increments with strict alignment to:
 
 ## 2. Scope
 
-This process is required for all implementation PRs tied to the V1 phases (Phase 1 through Phase 5).
+This process is required for all V1 implementation PRs across all phases and sub-phases:
+- Phase 1, 1.25, 1.5,
+- Phase 2a, 2b, 2c,
+- Phase 3, 4, 5, 6.
 
 ## 3. Required Workflow
 
@@ -29,6 +32,11 @@ This process is required for all implementation PRs tied to the V1 phases (Phase
 Minimum review rounds:
 - at least 2 external rounds, or
 - until a round returns no blocking findings (P0/P1), whichever is greater.
+
+External reviewer definition:
+- must be independent from the PR author,
+- may be a human reviewer or an independent AI reviewer/agent,
+- must review the PR diff and linked spec clauses.
 
 Per round, PR author must:
 1. Capture findings grouped by severity (P0-P3).
@@ -65,7 +73,8 @@ Blocking policy:
 1. Spec clauses implemented.
 2. Test evidence (unit/integration/contract/concurrency as applicable).
 3. Matrix row IDs updated.
-4. External review rounds log:
+4. Backward-compatibility impact assessment.
+5. External review rounds log:
    - reviewer
    - round number
    - blocking findings count

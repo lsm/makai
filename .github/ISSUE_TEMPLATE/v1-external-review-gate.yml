@@ -15,7 +15,7 @@ body:
     id: reviewers
     attributes:
       label: External reviewers
-      description: "List reviewers/agents to use in this gate."
+      description: "List independent reviewers/agents (not the PR author). Human or independent AI reviewers are both valid."
     validations:
       required: true
 

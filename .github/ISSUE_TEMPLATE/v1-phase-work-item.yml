@@ -11,6 +11,14 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies / Blocked by
+      placeholder: "#123, #124 or None"
+    validations:
+      required: true
+
   - type: textarea
     id: scope
     attributes:
