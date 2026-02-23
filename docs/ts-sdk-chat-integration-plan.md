@@ -2,13 +2,13 @@
 
 ## Objective
 
-Replace demo-level provider-specific chat HTTP logic with a high-level TypeScript SDK API that routes chat and streaming through the `makai` binary over stdio.
+Replace demo-level provider-specific chat/auth logic with a high-level TypeScript SDK API that routes auth, chat, and streaming through the `makai` protocol runtime.
 
 Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 ## Verified Current State
 
-- OAuth login/list flows are already abstracted in TS SDK (`loginWithMakaiAuth`, `listMakaiAuthProviders`).
+- TS OAuth login/list APIs exist, but currently shell out to CLI auth commands.
 - Demo chat still manually:
   - reads `~/.makai/auth.json`,
   - builds provider-specific HTTP headers/requests,
@@ -21,10 +21,19 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 
 ### Phase 1: Implement stdio protocol runtime in `makai`
 
-- Wire provider protocol server + runtime into `makai --stdio`.
+- Wire auth/provider/agent protocol servers + runtimes into `makai --stdio`.
 - Deserialize incoming envelopes, dispatch to protocol server, serialize replies.
-- Pump provider stream events/results/errors back to stdio.
+- Pump auth/provider/agent events/results/errors back to stdio.
 - Keep backward-compatible ready handshake semantics.
+
+### Phase 1.25: Implement auth protocol runtime
+
+- Add `protocol/auth` module (`types`, `envelope`, `server`, `runtime`).
+- Implement auth providers listing request/response path.
+- Implement interactive login flow:
+  - `auth_login_start` -> auth events (`auth_url`, `prompt`, `progress`, `success`, `error`) -> terminal `auth_login_result`.
+  - prompt loop (`auth_prompt_response`) and cancellation (`auth_cancel`).
+- Persist credentials through existing auth storage and never expose token/refresh secrets via protocol payloads.
 
 ### Phase 1.5: Implement model discovery and resolution primitives
 
@@ -67,26 +76,35 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 ### Phase 3: Add high-level TS SDK APIs
 
 - Implement spec-aligned high-level APIs on top of stdio protocol envelopes:
+  - `client.auth.listProviders()` / `client.auth.login()`
   - `client.provider.complete()` / `client.provider.stream()`
   - `client.agent.run()` / `client.agent.stream()`
 - Keep `MakaiStdioClient` as low-level transport primitive.
 - Add ergonomic request/response types that hide provider-specific headers and parsing.
+- Replace TS auth subprocess execution path with auth protocol transport path.
 
 ### Phase 4: Migrate demo to SDK chat APIs
 
 - Replace `chatWithGitHubCopilot`, `chatWithAnthropic`, and related parsing helpers with a single SDK call path.
 - Remove direct auth-file reads from demo chat request handling.
-- Keep existing auth session HTTP polling flow for browser UX.
+- Keep existing browser auth session HTTP polling UX, but back it with SDK `client.auth.*` over protocol runtime.
 
-### Phase 5: Testing and hardening
+### Phase 5: Migrate CLI auth commands to protocol-wrapper mode
+
+- Re-implement `makai auth providers` and `makai auth login` as thin wrappers over local auth protocol runtime.
+- Ensure CLI wrapper output shape remains backward-compatible for current scripts.
+- Remove duplicated OAuth orchestration logic from CLI command handlers.
+
+### Phase 6: Testing and hardening
 
 - Zig tests:
-  - stdio protocol request/response loop tests,
+  - stdio protocol request/response loop tests across auth/provider/agent,
+  - auth protocol flow tests (providers, login, prompt response, cancel, terminal result),
   - auth resolution and refresh tests.
   - concurrent refresh tests (single refresh for N simultaneous requests).
-  - auth/stdio coexistence tests to ensure `makai auth providers` and `makai auth login` still work.
+  - auth CLI wrapper tests to ensure `makai auth providers` and `makai auth login` route through protocol runtime.
 - TS tests:
-  - high-level `provider.complete` / `provider.stream` / `agent.run` / `agent.stream` integration tests with fixtures,
+  - high-level `auth.listProviders` / `auth.login` / `provider.complete` / `provider.stream` / `agent.run` / `agent.stream` integration tests with fixtures,
   - demo tests updated to assert provider-agnostic chat path.
 - End-to-end:
   - run binary smoke/e2e tests with `MAKAI_BINARY_PATH` configured in CI.
@@ -94,15 +112,17 @@ Reference spec: `docs/v1-sdk-agent-provider-spec.md`
 ## Acceptance Criteria
 
 - Demo chat code no longer contains provider-specific HTTP headers/request/parsing logic.
-- TS SDK exposes provider-agnostic high-level chat APIs.
-- `makai --stdio` handles provider protocol envelopes end-to-end.
+- TS SDK exposes protocol-backed auth + provider-agnostic chat APIs.
+- `makai --stdio` handles auth/provider/agent protocol envelopes end-to-end.
+- TS auth APIs do not shell out to CLI commands.
+- `makai auth` commands function as wrapper commands over auth protocol runtime.
 - Token refresh works transparently when using stored OAuth credentials.
 - CI covers both fixture-based and real-binary integration paths.
 
 ## Risks and Mitigations
 
 - Risk: protocol/runtime integration in `makai` introduces regressions in existing auth commands.
-  - Mitigation: keep auth command paths isolated; add regression tests for `auth providers` and `auth login`.
+  - Mitigation: migrate auth commands to wrapper mode with compatibility tests for `auth providers` and `auth login`.
 - Risk: auth refresh behavior differs across providers.
   - Mitigation: provider-specific contract tests for refresh and base URL/token derivation.
 - Risk: cross-language protocol drift (Zig vs TS envelope assumptions).

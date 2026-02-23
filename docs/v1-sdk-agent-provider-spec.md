@@ -7,6 +7,7 @@ Status: draft for implementation review
 This spec defines:
 - End-user OAuth and model-selection flow.
 - TypeScript SDK public interfaces for auth, model discovery, agent execution, and provider-direct execution.
+- Auth protocol schema for interactive OAuth flows.
 - Provider protocol schema additions for model discovery.
 - Agent protocol schema additions for model-discovery passthrough.
 
@@ -37,7 +38,15 @@ Normative rule: end users do not manage provider-specific headers, token files, 
   - supports provider-native tool/function calling via request `tools` when available,
   - preferred for simple passthrough chat/completion workloads.
 
-### 2.2 Model Data Source and Caching (Normative)
+### 2.2 Auth Path and Transport (Normative)
+
+- `client.auth.*` is a protocol client surface at the same level as `client.agent.*` and `client.provider.*`.
+- SDK auth operations must use the same configured transport stack (stdio now, HTTP/WS later) as other APIs.
+- SDK implementations must not spawn `makai auth ...` subprocesses as the primary auth path.
+- OAuth credentials and refresh tokens remain binary-managed and are never returned to SDK callers.
+- CLI commands (`makai auth providers`, `makai auth login`) must be thin wrappers over the same auth protocol runtime.
+
+### 2.3 Model Data Source and Caching (Normative)
 
 Model discovery is provider-owned and auth-aware.
 
@@ -114,6 +123,41 @@ export interface ProviderAuthInfo {
   auth_status: AuthStatus;
   last_error?: string;
 }
+
+export type MakaiAuthEvent =
+  | {
+      type: "auth_url";
+      flow_id: string;
+      provider_id: ProviderId;
+      url: string;
+      instructions?: string;
+    }
+  | {
+      type: "prompt";
+      flow_id: string;
+      prompt_id: string;
+      provider_id: ProviderId;
+      message: string;
+      allow_empty: boolean;
+    }
+  | {
+      type: "progress";
+      flow_id: string;
+      provider_id: ProviderId;
+      message: string;
+    }
+  | {
+      type: "success";
+      flow_id: string;
+      provider_id: ProviderId;
+    }
+  | {
+      type: "error";
+      flow_id: string;
+      provider_id: ProviderId;
+      code?: string;
+      message: string;
+    };
 
 export interface ModelDescriptor {
   model_ref: string; // opaque stable handle, server-issued
@@ -287,8 +331,8 @@ export type ProviderCompleteResponse = CompletionResponse;
 export interface MakaiAuthApi {
   listProviders(): Promise<ProviderAuthInfo[]>;
   login(providerId: ProviderId, handlers?: {
-    onEvent?: (event: unknown) => void;
-    onPrompt?: (prompt: { message: string; allow_empty: boolean }) => Promise<string> | string;
+    onEvent?: (event: MakaiAuthEvent) => void;
+    onPrompt?: (prompt: Extract<MakaiAuthEvent, { type: "prompt" }>) => Promise<string> | string;
   }): Promise<{ status: "success" }>;
 }
 
@@ -377,7 +421,7 @@ Type safety requirement:
 
 ### 3.3 Auth Cancellation Semantics (Normative)
 
-- User-cancelled OAuth must reject with `MakaiAuthError { kind: "cancelled" }`.
+- User-cancelled OAuth (`auth_login_result.status = cancelled`) must reject with `MakaiAuthError { kind: "cancelled" }`.
 - Successful login resolves with `{ status: "success" }`.
 
 ### 3.4 Stream Lifecycle and Error Propagation (Normative)
@@ -416,7 +460,91 @@ SDK behavior:
 - If runtime returns more than one result for a resolve request, SDK must treat it as an `invalid_request` error.
 - If runtime returns no result for a resolve request, SDK must surface `invalid_request` with a "model not found" message.
 
-## 4. Provider Protocol Changes (Normative)
+### 3.6 Auth Transport Semantics (Normative)
+
+- `MakaiAuthApi.listProviders` and `MakaiAuthApi.login` must map to auth protocol envelopes over the active transport.
+- `login(...)` must maintain a single active auth flow, route prompt events to `onPrompt`, and publish all auth events to `onEvent`.
+- SDK must not read `~/.makai/auth.json` directly and must not return token material to callers.
+- CLI-subprocess auth wiring is prohibited in the V1 protocol-only implementation.
+
+## 4. Auth Protocol Changes (Normative)
+
+File target: `zig/src/protocol/auth/types.zig`
+
+Add payload variants:
+- `auth_providers_request: struct {}`
+- `auth_providers_response: AuthProvidersResponse`
+- `auth_login_start: AuthLoginStartRequest`
+- `auth_prompt_response: AuthPromptResponse`
+- `auth_cancel: AuthCancelRequest`
+- `auth_event: AuthEvent`
+- `auth_login_result: AuthLoginResult`
+
+Add request/response structs:
+
+```zig
+pub const AuthProviderInfo = struct {
+    id: OwnedSlice(u8),
+    name: OwnedSlice(u8),
+    auth_status: enum { authenticated, login_required, expired, refreshing, login_in_progress, failed, unknown },
+    last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+};
+
+pub const AuthProvidersResponse = struct {
+    providers: OwnedSlice(AuthProviderInfo),
+};
+
+pub const AuthLoginStartRequest = struct {
+    provider_id: OwnedSlice(u8),
+};
+
+pub const AuthPromptResponse = struct {
+    flow_id: Uuid,
+    prompt_id: OwnedSlice(u8),
+    answer: OwnedSlice(u8),
+};
+
+pub const AuthCancelRequest = struct {
+    flow_id: Uuid,
+};
+
+pub const AuthEvent = union(enum) {
+    auth_url: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), url: OwnedSlice(u8), instructions: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed("") },
+    prompt: struct { flow_id: Uuid, prompt_id: OwnedSlice(u8), provider_id: OwnedSlice(u8), message: OwnedSlice(u8), allow_empty: bool = false },
+    progress: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), message: OwnedSlice(u8) },
+    success: struct { flow_id: Uuid, provider_id: OwnedSlice(u8) },
+    error: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), code: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), message: OwnedSlice(u8) },
+};
+
+pub const AuthLoginResult = struct {
+    flow_id: Uuid,
+    provider_id: OwnedSlice(u8),
+    status: enum { success, cancelled, failed },
+};
+```
+
+Envelope type values:
+- `"auth_providers_request"`
+- `"auth_providers_response"`
+- `"auth_login_start"`
+- `"auth_prompt_response"`
+- `"auth_cancel"`
+- `"auth_event"`
+- `"auth_login_result"`
+
+Server behavior:
+1. On `auth_providers_request`, return `ack` then `auth_providers_response`.
+2. On `auth_login_start`, return `ack`, then zero or more `auth_event`, then exactly one terminal `auth_login_result`.
+3. If a login flow emits `prompt`, server waits for matching `auth_prompt_response` (`flow_id`, `prompt_id`) before continuing.
+4. `auth_cancel` must terminate the targeted flow and emit `auth_login_result.status = cancelled`.
+5. Credentials are persisted by auth runtime; token/refresh secrets must never be emitted in protocol payloads.
+
+Client behavior:
+1. SDK auth APIs must use this protocol over the active transport (stdio/HTTP/WS).
+2. SDK auth APIs must not shell out to `makai auth ...`.
+3. CLI auth commands (`makai auth providers/login`) must call the same auth protocol runtime (wrapper mode), not duplicate OAuth logic.
+
+## 5. Provider Protocol Changes (Normative)
 
 File target: `zig/src/protocol/provider/types.zig`
 
@@ -508,7 +636,7 @@ Client behavior:
 2. Preserve existing behavior for `stream_request` and `complete_request`.
 3. `models.resolve(...)` should issue `models_request` with `provider_id` + exact `model_id` filter (and optional `api`).
 
-## 5. Agent Protocol Changes (Normative)
+## 6. Agent Protocol Changes (Normative)
 
 File target: `zig/src/protocol/agent/types.zig`
 
@@ -527,7 +655,43 @@ Required shared module:
 
 Normative rule: provider protocol remains canonical source; agent protocol passthrough must return the same model set and shape.
 
-## 6. JSON Envelope Examples (Normative)
+## 7. JSON Envelope Examples (Normative)
+
+Auth providers request:
+
+```json
+{
+  "type": "auth_providers_request",
+  "stream_id": "89ef1cb9-9d15-4f5a-8cb6-8659e1986f01",
+  "message_id": "89ef1cb9-9d15-4f5a-8cb6-8659e1986f01",
+  "sequence": 1,
+  "timestamp": 1760000000000,
+  "version": 1,
+  "payload": {}
+}
+```
+
+Auth prompt event:
+
+```json
+{
+  "type": "auth_event",
+  "stream_id": "89ef1cb9-9d15-4f5a-8cb6-8659e1986f01",
+  "message_id": "f642f5d0-30d1-4df2-8c5f-0fbc7b5f4fc2",
+  "sequence": 3,
+  "timestamp": 1760000000500,
+  "version": 1,
+  "payload": {
+    "prompt": {
+      "flow_id": "89ef1cb9-9d15-4f5a-8cb6-8659e1986f01",
+      "prompt_id": "device_code",
+      "provider_id": "anthropic",
+      "message": "Enter the code shown in browser",
+      "allow_empty": false
+    }
+  }
+}
+```
 
 Provider models request:
 
@@ -597,9 +761,9 @@ Provider models response:
 }
 ```
 
-## 7. Error Model (Normative)
+## 8. Error Model (Normative)
 
-Use existing `nack` / `agent_error` envelopes.
+Use existing `nack` / `agent_error` / `auth_event.error` envelopes.
 
 Recommended error code mapping:
 - Missing/invalid auth: `auth_required`
@@ -615,17 +779,24 @@ Provider protocol requirement:
   - `auth_refresh_failed`
   - `auth_expired`
 
+Auth protocol requirement:
+- auth flow failures must emit both:
+  - `auth_event.error` for user-visible detail, and
+  - terminal `auth_login_result.status = failed`.
+
 Auth refresh semantics:
 - Refresh occurs in Zig binary request path.
 - On expired credentials, implementation may auto-refresh before request dispatch.
 - If refresh fails, return typed code `auth_refresh_failed`.
 
-## 8. Compatibility and Rollout
+## 9. Compatibility and Rollout
 
-1. Phase A: ship provider `models_request/models_response` first.
-2. Phase B: ship TS `client.models.list` against provider protocol.
-3. Phase C: ship agent passthrough `models_request/models_response`.
-4. Phase D: switch demo to spec interfaces only.
+1. Phase A: ship auth protocol (`auth_providers_request`, `auth_login_start`, auth event loop) first.
+2. Phase B: ship TS `client.auth.*` over protocol transport (remove CLI-subprocess primary path).
+3. Phase C: migrate `makai auth providers/login` CLI commands to wrapper mode over auth protocol runtime.
+4. Phase D: ship provider `models_request/models_response` and TS `client.models.*`.
+5. Phase E: ship agent passthrough `models_request/models_response`.
+6. Phase F: switch demo to spec interfaces only.
 
 Backward compatibility:
 - Keep envelope protocol version as `1`.
@@ -637,14 +808,16 @@ Capability negotiation:
 - V1 uses implicit feature detection (`not_implemented` probing).
 - Optional explicit capability advertisement may be added in a future protocol revision.
 
-## 9. Acceptance Criteria
+## 10. Acceptance Criteria
 
 1. TS client can complete OAuth + list models + execute selected model without provider-specific app code.
 2. Model list output shape is identical whether called via provider endpoint or agent passthrough.
 3. Agent and provider execution accept the same `model_ref` format.
-4. Existing auth and stream/complete flows remain functional.
+4. SDK auth APIs run over protocol transport without shelling out to CLI commands.
+5. `makai auth providers/login` remains functional as wrapper commands over auth protocol runtime.
+6. Existing stream/complete flows remain functional.
 
-## 10. Model List Scope and Cancellation (V1)
+## 11. Model List Scope and Cancellation (V1)
 
 - V1 model list returns all matching models (no pagination).
 - Expected V1 scale target is O(100) models in a single response.
@@ -652,7 +825,7 @@ Capability negotiation:
 - Pagination (`next_cursor`/`limit`) and search semantics are deferred to a future revision.
 - `models_request` is not cancellable in V1.
 
-## 11. Stream Recovery (V1)
+## 12. Stream Recovery (V1)
 
 - V1 streams are not resumable after transport interruption.
 - Client behavior on interruption: retry request with full context.
