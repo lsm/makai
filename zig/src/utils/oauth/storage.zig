@@ -67,7 +67,8 @@ pub const AuthStorage = struct {
         const root = parsed.value.object;
         var iter = root.iterator();
         while (iter.next()) |entry| {
-            const provider_id = entry.key_ptr.*;
+            const provider_id = try allocator.dupe(u8, entry.key_ptr.*);
+            errdefer allocator.free(provider_id);
             const provider_obj = entry.value_ptr.*.object;
 
             if (provider_obj.get("api_key")) |api_key_val| {

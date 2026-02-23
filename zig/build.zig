@@ -113,6 +113,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const auth_provider_defs_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth/providers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const provider_caps_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/provider_caps.zig"),
         .target = target,
@@ -536,6 +542,55 @@ pub fn build(b: *std.Build) void {
     });
 
     // =========================================================================
+    // Protocol Auth Modules (protocol/auth/)
+    // =========================================================================
+    const protocol_auth_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/auth/types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const protocol_auth_envelope_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/auth/envelope.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "auth_types", .module = protocol_auth_types_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const protocol_auth_server_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/auth/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "auth_types", .module = protocol_auth_types_mod },
+            .{ .name = "auth/providers", .module = auth_provider_defs_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const protocol_auth_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/auth/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "auth_server", .module = protocol_auth_server_mod },
+            .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+        },
+    });
+
+    // =========================================================================
     // Protocol Tool Modules (protocol/tool/)
     // =========================================================================
     const protocol_tool_types_mod = b.createModule(.{
@@ -677,6 +732,8 @@ pub fn build(b: *std.Build) void {
     const sanitize_test = b.addTest(.{ .root_module = sanitize_mod });
 
     const pre_transform_test = b.addTest(.{ .root_module = pre_transform_mod });
+
+    const auth_provider_defs_test = b.addTest(.{ .root_module = auth_provider_defs_mod });
 
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
@@ -907,6 +964,12 @@ pub fn build(b: *std.Build) void {
     const protocol_agent_client_test = b.addTest(.{ .root_module = protocol_agent_client_mod });
     const protocol_agent_runtime_test = b.addTest(.{ .root_module = protocol_agent_runtime_mod });
 
+    // Protocol Auth tests
+    const protocol_auth_types_test = b.addTest(.{ .root_module = protocol_auth_types_mod });
+    const protocol_auth_envelope_test = b.addTest(.{ .root_module = protocol_auth_envelope_mod });
+    const protocol_auth_server_test = b.addTest(.{ .root_module = protocol_auth_server_mod });
+    const protocol_auth_runtime_test = b.addTest(.{ .root_module = protocol_auth_runtime_mod });
+
     // Protocol Tool tests
     const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
     const protocol_tool_envelope_test = b.addTest(.{ .root_module = protocol_tool_envelope_mod });
@@ -973,6 +1036,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_server", .module = protocol_agent_server_mod },
             .{ .name = "agent_runtime", .module = protocol_agent_runtime_mod },
             .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
+            .{ .name = "auth_server", .module = protocol_auth_server_mod },
+            .{ .name = "auth_runtime", .module = protocol_auth_runtime_mod },
+            .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
+            .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
         },
@@ -1023,6 +1090,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+    test_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
@@ -1043,6 +1111,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_agent_server_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_client_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_runtime_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_auth_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_auth_envelope_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_auth_server_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_auth_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
@@ -1079,6 +1151,10 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_server_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_client_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_agent_runtime_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_auth_types_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_auth_envelope_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_auth_server_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_auth_runtime_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
@@ -1094,6 +1170,7 @@ pub fn build(b: *std.Build) void {
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
 
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
