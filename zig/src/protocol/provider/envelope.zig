@@ -180,6 +180,29 @@ fn serializePayload(
             try w.writeStringField("code", @tagName(err.code));
             try w.writeStringField("message", err.message.slice());
         },
+        .models_request => |req| {
+            if (req.getProviderId()) |provider_id| {
+                try w.writeStringField("provider_id", provider_id);
+            }
+            if (req.getApi()) |api| {
+                try w.writeStringField("api", api);
+            }
+            if (req.getModelId()) |model_id| {
+                try w.writeStringField("model_id", model_id);
+            }
+            try w.writeBoolField("include_deprecated", req.include_deprecated);
+            try w.writeBoolField("include_login_required", req.include_login_required);
+        },
+        .models_response => |res| {
+            try w.writeIntField("fetched_at_ms", res.fetched_at_ms);
+            try w.writeIntField("cache_max_age_ms", res.cache_max_age_ms);
+            try w.writeKey("models");
+            try w.beginArray();
+            for (res.models.slice()) |model| {
+                try serializeModelDescriptor(w, model);
+            }
+            try w.endArray();
+        },
     }
 
     try w.endObject();
@@ -474,6 +497,52 @@ fn serializeResultPayload(
     }
 }
 
+fn serializeModelDescriptor(
+    w: *json_writer.JsonWriter,
+    model: protocol_types.ModelDescriptor,
+) !void {
+    try w.beginObject();
+
+    try w.writeStringField("model_ref", model.model_ref.slice());
+    try w.writeStringField("model_id", model.model_id.slice());
+    try w.writeStringField("display_name", model.display_name.slice());
+    try w.writeStringField("provider_id", model.provider_id.slice());
+    try w.writeStringField("api", model.api.slice());
+    if (model.base_url.slice().len > 0) {
+        try w.writeStringField("base_url", model.base_url.slice());
+    }
+    try w.writeStringField("auth_status", @tagName(model.auth_status));
+    try w.writeStringField("lifecycle", @tagName(model.lifecycle));
+    try w.writeStringField("source", @tagName(model.source));
+
+    try w.writeKey("capabilities");
+    try w.beginArray();
+    for (model.capabilities.slice()) |capability| {
+        try w.writeString(@tagName(capability));
+    }
+    try w.endArray();
+
+    if (model.context_window) |value| {
+        try w.writeIntField("context_window", value);
+    }
+    if (model.max_output_tokens) |value| {
+        try w.writeIntField("max_output_tokens", value);
+    }
+    if (model.reasoning_default) |value| {
+        try w.writeStringField("reasoning_default", @tagName(value));
+    }
+    if (model.metadata) |metadata_entries| {
+        try w.writeKey("metadata");
+        try w.beginObject();
+        for (metadata_entries.slice()) |entry| {
+            try w.writeStringField(entry.key.slice(), entry.value.slice());
+        }
+        try w.endObject();
+    }
+
+    try w.endObject();
+}
+
 /// Write a json.Value to JsonWriter
 fn writeJsonValue(
     w: *json_writer.JsonWriter,
@@ -598,6 +667,9 @@ fn deserializePayload(
     if (std.mem.eql(u8, type_str, "abort_request")) {
         return .{ .abort_request = try deserializeAbortRequest(obj, allocator) };
     }
+    if (std.mem.eql(u8, type_str, "models_request")) {
+        return .{ .models_request = try deserializeModelsRequest(obj, allocator) };
+    }
     if (std.mem.eql(u8, type_str, "ack")) {
         return .{ .ack = try deserializeAck(obj) };
     }
@@ -610,6 +682,9 @@ fn deserializePayload(
     }
     if (std.mem.eql(u8, type_str, "stream_error")) {
         return .{ .stream_error = try deserializeStreamError(obj, allocator) };
+    }
+    if (std.mem.eql(u8, type_str, "models_response")) {
+        return .{ .models_response = try deserializeModelsResponse(obj, allocator) };
     }
 
     // Check if type_str is an event type - the type is at top level per PROTOCOL.md
@@ -774,6 +849,172 @@ fn deserializeAbortRequest(
     };
 }
 
+fn deserializeModelsRequest(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.ModelsRequest {
+    const provider_id = if (obj.get("provider_id")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        protocol_types.OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = provider_id;
+        mutable.deinit(allocator);
+    }
+
+    const api = if (obj.get("api")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        protocol_types.OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = api;
+        mutable.deinit(allocator);
+    }
+
+    const model_id = if (obj.get("model_id")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        protocol_types.OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = model_id;
+        mutable.deinit(allocator);
+    }
+
+    const include_deprecated = if (obj.get("include_deprecated")) |value|
+        value.bool
+    else
+        false;
+    const include_login_required = if (obj.get("include_login_required")) |value|
+        value.bool
+    else
+        true;
+
+    return .{
+        .provider_id = provider_id,
+        .api = api,
+        .model_id = model_id,
+        .include_deprecated = include_deprecated,
+        .include_login_required = include_login_required,
+    };
+}
+
+fn deserializeModelsResponse(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.ModelsResponse {
+    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
+    const cache_max_age_ms: u64 = @intCast(obj.get("cache_max_age_ms").?.integer);
+    const models_array = obj.get("models").?.array;
+
+    const models = try allocator.alloc(protocol_types.ModelDescriptor, models_array.items.len);
+    var allocated_count: usize = 0;
+    errdefer {
+        for (models[0..allocated_count]) |*model| model.deinit(allocator);
+        allocator.free(models);
+    }
+
+    for (models_array.items, 0..) |item, idx| {
+        models[idx] = try deserializeModelDescriptor(item.object, allocator);
+        allocated_count += 1;
+    }
+
+    return .{
+        .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(models),
+        .fetched_at_ms = fetched_at_ms,
+        .cache_max_age_ms = cache_max_age_ms,
+    };
+}
+
+fn deserializeModelDescriptor(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !protocol_types.ModelDescriptor {
+    const model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    errdefer {
+        var mutable = model_ref;
+        mutable.deinit(allocator);
+    }
+
+    const model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    errdefer {
+        var mutable = model_id;
+        mutable.deinit(allocator);
+    }
+
+    const display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    errdefer {
+        var mutable = display_name;
+        mutable.deinit(allocator);
+    }
+
+    const provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    errdefer {
+        var mutable = provider_id;
+        mutable.deinit(allocator);
+    }
+
+    const api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    errdefer {
+        var mutable = api;
+        mutable.deinit(allocator);
+    }
+
+    const base_url = if (obj.get("base_url")) |value|
+        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        protocol_types.OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = base_url;
+        mutable.deinit(allocator);
+    }
+
+    const capabilities_array = obj.get("capabilities").?.array;
+    const capabilities = try allocator.alloc(protocol_types.ModelCapability, capabilities_array.items.len);
+    errdefer allocator.free(capabilities);
+    for (capabilities_array.items, 0..) |item, idx| {
+        capabilities[idx] = parseModelCapability(item.string);
+    }
+
+    var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
+    if (obj.get("metadata")) |metadata_value| {
+        const metadata_obj = metadata_value.object;
+        const metadata_items = try allocator.alloc(protocol_types.MetadataEntry, metadata_obj.count());
+        var metadata_count: usize = 0;
+        errdefer {
+            for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
+            allocator.free(metadata_items);
+        }
+
+        var iter = metadata_obj.iterator();
+        while (iter.next()) |entry| {
+            metadata_items[metadata_count] = .{
+                .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
+                .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+            };
+            metadata_count += 1;
+        }
+
+        metadata = protocol_types.OwnedSlice(protocol_types.MetadataEntry).initOwned(metadata_items);
+    }
+
+    return .{
+        .model_ref = model_ref,
+        .model_id = model_id,
+        .display_name = display_name,
+        .provider_id = provider_id,
+        .api = api,
+        .base_url = base_url,
+        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
+        .lifecycle = parseModelLifecycle(obj.get("lifecycle").?.string),
+        .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
+        .source = parseModelSource(obj.get("source").?.string),
+        .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
+        .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
+        .reasoning_default = if (obj.get("reasoning_default")) |value| parseReasoningLevel(value.string) else null,
+        .metadata = metadata,
+    };
+}
+
 /// Deserialize ack
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
     const acknowledged_id_str = obj.get("acknowledged_id").?.string;
@@ -892,6 +1133,47 @@ fn deserializeSync(
     };
 }
 
+fn parseAuthStatus(str: []const u8) protocol_types.AuthStatus {
+    if (std.mem.eql(u8, str, "authenticated")) return .authenticated;
+    if (std.mem.eql(u8, str, "login_required")) return .login_required;
+    if (std.mem.eql(u8, str, "expired")) return .expired;
+    if (std.mem.eql(u8, str, "refreshing")) return .refreshing;
+    if (std.mem.eql(u8, str, "login_in_progress")) return .login_in_progress;
+    if (std.mem.eql(u8, str, "failed")) return .failed;
+    return .unknown;
+}
+
+fn parseModelLifecycle(str: []const u8) protocol_types.ModelLifecycle {
+    if (std.mem.eql(u8, str, "stable")) return .stable;
+    if (std.mem.eql(u8, str, "preview")) return .preview;
+    return .deprecated;
+}
+
+fn parseModelCapability(str: []const u8) protocol_types.ModelCapability {
+    if (std.mem.eql(u8, str, "chat")) return .chat;
+    if (std.mem.eql(u8, str, "streaming")) return .streaming;
+    if (std.mem.eql(u8, str, "tools")) return .tools;
+    if (std.mem.eql(u8, str, "vision")) return .vision;
+    if (std.mem.eql(u8, str, "reasoning")) return .reasoning;
+    if (std.mem.eql(u8, str, "prompt_cache")) return .prompt_cache;
+    if (std.mem.eql(u8, str, "audio_input")) return .audio_input;
+    return .audio_output;
+}
+
+fn parseModelSource(str: []const u8) protocol_types.ModelSource {
+    if (std.mem.eql(u8, str, "dynamic")) return .dynamic;
+    return .static_fallback;
+}
+
+fn parseReasoningLevel(str: []const u8) protocol_types.ReasoningLevel {
+    if (std.mem.eql(u8, str, "off")) return .off;
+    if (std.mem.eql(u8, str, "minimal")) return .minimal;
+    if (std.mem.eql(u8, str, "low")) return .low;
+    if (std.mem.eql(u8, str, "medium")) return .medium;
+    if (std.mem.eql(u8, str, "high")) return .high;
+    return .xhigh;
+}
+
 /// Parse error code from string
 fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "invalid_request")) return .invalid_request;
@@ -905,6 +1187,7 @@ fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "invalid_sequence")) return .invalid_sequence;
     if (std.mem.eql(u8, str, "duplicate_sequence")) return .duplicate_sequence;
     if (std.mem.eql(u8, str, "sequence_gap")) return .sequence_gap;
+    if (std.mem.eql(u8, str, "not_implemented")) return .not_implemented;
     return .internal_error;
 }
 
@@ -2141,6 +2424,99 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
 
     try std.testing.expect(parsed.payload == .goodbye);
     try std.testing.expectEqualStrings("Graceful shutdown", parsed.payload.goodbye.getReason().?);
+
+    original.deinit(allocator);
+}
+
+test "serializeEnvelope and deserializeEnvelope roundtrip with models_request" {
+    const allocator = std.testing.allocator;
+
+    var original = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .models_request = .{
+            .provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+            .api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+            .model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude:sonnet-4-5")),
+            .include_deprecated = false,
+            .include_login_required = true,
+        } },
+    };
+
+    const json = try serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .models_request);
+    try std.testing.expectEqualStrings("anthropic", parsed.payload.models_request.getProviderId().?);
+    try std.testing.expectEqualStrings("anthropic-messages", parsed.payload.models_request.getApi().?);
+    try std.testing.expectEqualStrings("claude:sonnet-4-5", parsed.payload.models_request.getModelId().?);
+    try std.testing.expect(parsed.payload.models_request.include_login_required);
+
+    original.deinit(allocator);
+}
+
+test "serializeEnvelope and deserializeEnvelope roundtrip with models_response" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(protocol_types.ModelCapability, 3);
+    capabilities[0] = .chat;
+    capabilities[1] = .streaming;
+    capabilities[2] = .reasoning;
+
+    const metadata = try allocator.alloc(protocol_types.MetadataEntry, 1);
+    metadata[0] = .{
+        .key = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "tier")),
+        .value = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "premium")),
+    };
+
+    const models = try allocator.alloc(protocol_types.ModelDescriptor, 1);
+    models[0] = .{
+        .model_ref = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude%3Asonnet-4-5")),
+        .model_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude:sonnet-4-5")),
+        .display_name = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .base_url = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "https://api.anthropic.com")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+        .reasoning_default = .high,
+        .metadata = protocol_types.OwnedSlice(protocol_types.MetadataEntry).initOwned(metadata),
+    };
+
+    var original = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 2,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .models_response = .{
+            .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(models),
+            .fetched_at_ms = 1_760_000_000_198,
+            .cache_max_age_ms = 300_000,
+        } },
+    };
+
+    const json = try serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .models_response);
+    try std.testing.expectEqual(@as(usize, 1), parsed.payload.models_response.models.slice().len);
+    const parsed_model = parsed.payload.models_response.models.slice()[0];
+    try std.testing.expectEqualStrings("claude:sonnet-4-5", parsed_model.model_id.slice());
+    try std.testing.expectEqual(protocol_types.ModelSource.dynamic, parsed_model.source);
+    try std.testing.expectEqualStrings("premium", parsed_model.metadata.?.slice()[0].value.slice());
+    try std.testing.expectEqual(protocol_types.ErrorCode.not_implemented, parseErrorCode("not_implemented"));
 
     original.deinit(allocator);
 }
