@@ -119,6 +119,23 @@ pub const ProviderProtocolRuntime = struct {
         }
     }
 
+    pub fn pumpServerOutbox(self: *Self) !usize {
+        var count: usize = 0;
+        while (self.server.popOutbound()) |outbound| {
+            var env = outbound;
+            defer env.deinit(self.allocator);
+
+            const json = try envelope.serializeEnvelope(env, self.allocator);
+            defer self.allocator.free(json);
+
+            var sender = self.pipe.serverSender();
+            try sender.write(json);
+            try sender.flush();
+            count += 1;
+        }
+        return count;
+    }
+
     /// Process pending server->client envelopes through ProtocolClient.
     pub fn pumpServerMessagesIntoClient(self: *Self, client: *ProtocolClient) !void {
         var receiver = self.pipe.clientReceiver();
@@ -136,7 +153,8 @@ pub const ProviderProtocolRuntime = struct {
     /// client->server, provider events->client, server->client processing.
     pub fn pumpOnce(self: *Self, client: *ProtocolClient) !usize {
         try self.pumpClientMessages();
-        const forwarded = try self.pumpProviderEvents();
+        var forwarded = try self.pumpServerOutbox();
+        forwarded += try self.pumpProviderEvents();
         try self.pumpServerMessagesIntoClient(client);
         return forwarded;
     }

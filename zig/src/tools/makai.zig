@@ -236,6 +236,7 @@ const StdioProtocolLoop = struct {
                     .allocator = self.allocator,
                 };
                 try runtime.pumpClientMessages();
+                _ = try runtime.pumpServerOutbox();
             },
             .agent => {
                 var sender = self.agent_pipe.clientSender();
@@ -271,6 +272,7 @@ const StdioProtocolLoop = struct {
             .pipe = &self.provider_pipe,
             .allocator = self.allocator,
         };
+        forwarded += try provider_runtime.pumpServerOutbox();
         forwarded += try provider_runtime.pumpProviderEvents();
         self.provider_server.cleanupCompletedStreams();
 

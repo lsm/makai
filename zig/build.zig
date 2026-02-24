@@ -384,6 +384,14 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const protocol_model_catalog_types_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/model_catalog_types.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
 
     // =========================================================================
     // Protocol Provider Modules (protocol/provider/)
@@ -416,6 +424,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
         },
     });
 
@@ -456,6 +465,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "model_ref", .module = protocol_model_ref_mod },
+            .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "hive_array", .module = hive_array_mod },
         },
     });
@@ -949,6 +960,7 @@ pub fn build(b: *std.Build) void {
     const in_process_transport_test = b.addTest(.{ .root_module = in_process_transport_mod });
 
     const protocol_model_ref_test = b.addTest(.{ .root_module = protocol_model_ref_mod });
+    const protocol_model_catalog_types_test = b.addTest(.{ .root_module = protocol_model_catalog_types_mod });
 
     const content_partial_test = b.addTest(.{ .root_module = content_partial_mod });
 
@@ -1085,6 +1097,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(in_process_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
     test_step.dependOn(&b.addRunArtifact(content_partial_test).step);
     test_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
@@ -1149,6 +1162,7 @@ pub fn build(b: *std.Build) void {
 
     const test_unit_protocol_step = b.step("test-unit-protocol", "Run protocol layer unit tests");
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(content_partial_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(partial_serializer_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
