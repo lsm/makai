@@ -1,10 +1,19 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const owned_slice_mod = @import("owned_slice");
+const model_catalog_types = @import("model_catalog_types");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const SUPPORTED_PROTOCOL_VERSIONS = [_][]const u8{"1"};
+pub const AuthStatus = model_catalog_types.AuthStatus;
+pub const ModelLifecycle = model_catalog_types.ModelLifecycle;
+pub const ModelSource = model_catalog_types.ModelSource;
+pub const ModelCapability = model_catalog_types.ModelCapability;
+pub const ReasoningLevel = model_catalog_types.ReasoningLevel;
+pub const MetadataEntry = model_catalog_types.MetadataEntry;
+pub const ModelDescriptor = model_catalog_types.ModelDescriptor;
+pub const ModelsResponse = model_catalog_types.ModelsResponse;
 
 /// UUID type for stream/message identification
 pub const Uuid = [16]u8;
@@ -162,6 +171,7 @@ pub const Payload = union(enum) {
     stream_request: StreamRequest,
     complete_request: CompleteRequest,
     abort_request: AbortRequest,
+    models_request: ModelsRequest,
 
     // Server -> Client
     ack: Ack,
@@ -169,6 +179,7 @@ pub const Payload = union(enum) {
     event: ai_types.AssistantMessageEvent,
     result: ai_types.AssistantMessage,
     stream_error: StreamError,
+    models_response: ModelsResponse,
 
     // Keepalive
     ping: void,
@@ -184,10 +195,12 @@ pub const Payload = union(enum) {
             .stream_request => |*req| req.deinit(allocator),
             .complete_request => |*req| req.deinit(allocator),
             .abort_request => |*req| req.deinit(allocator),
+            .models_request => |*req| req.deinit(allocator),
             .nack => |*n| n.deinit(allocator),
             .event => |*e| deinitEvent(allocator, e),
             .result => |*r| r.deinit(allocator),
             .stream_error => |*err| err.deinit(allocator),
+            .models_response => |*res| res.deinit(allocator),
             .pong => |*p| p.deinit(allocator),
             .goodbye => |*g| g.deinit(allocator),
             .sync => |*s| s.deinit(allocator),
@@ -345,7 +358,59 @@ pub const Sync = struct {
     }
 };
 
+pub const ModelsRequest = struct {
+    provider_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    api: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    model_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    include_deprecated: bool = false,
+    include_login_required: bool = true,
+
+    pub fn getProviderId(self: *const ModelsRequest) ?[]const u8 {
+        const value = self.provider_id.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getApi(self: *const ModelsRequest) ?[]const u8 {
+        const value = self.api.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getModelId(self: *const ModelsRequest) ?[]const u8 {
+        const value = self.model_id.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ModelsRequest, allocator: std.mem.Allocator) void {
+        self.provider_id.deinit(allocator);
+        self.api.deinit(allocator);
+        self.model_id.deinit(allocator);
+    }
+};
+
 // Tests
+
+test "ModelsRequest getters return null for empty borrowed filters" {
+    const req = ModelsRequest{};
+    try std.testing.expect(req.getProviderId() == null);
+    try std.testing.expect(req.getApi() == null);
+    try std.testing.expect(req.getModelId() == null);
+}
+
+test "ModelsRequest deinit frees owned filter strings" {
+    const allocator = std.testing.allocator;
+
+    var req = ModelsRequest{
+        .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude:sonnet-4-5")),
+    };
+
+    try std.testing.expectEqualStrings("anthropic", req.getProviderId().?);
+    try std.testing.expectEqualStrings("anthropic-messages", req.getApi().?);
+    try std.testing.expectEqualStrings("claude:sonnet-4-5", req.getModelId().?);
+
+    req.deinit(allocator);
+}
 
 test "generateUuid produces valid UUID" {
     const uuid = generateUuid();
