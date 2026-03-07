@@ -972,7 +972,7 @@ fn deserializeModelDescriptor(
     const capabilities = try allocator.alloc(protocol_types.ModelCapability, capabilities_array.items.len);
     errdefer allocator.free(capabilities);
     for (capabilities_array.items, 0..) |item, idx| {
-        capabilities[idx] = parseModelCapability(item.string);
+        capabilities[idx] = try parseModelCapability(item.string);
     }
 
     var metadata: ?protocol_types.OwnedSlice(protocol_types.MetadataEntry) = null;
@@ -1005,12 +1005,12 @@ fn deserializeModelDescriptor(
         .api = api,
         .base_url = base_url,
         .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
-        .lifecycle = parseModelLifecycle(obj.get("lifecycle").?.string),
+        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
         .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
-        .source = parseModelSource(obj.get("source").?.string),
+        .source = try parseModelSource(obj.get("source").?.string),
         .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
         .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
-        .reasoning_default = if (obj.get("reasoning_default")) |value| parseReasoningLevel(value.string) else null,
+        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
         .metadata = metadata,
     };
 }
@@ -1143,13 +1143,14 @@ fn parseAuthStatus(str: []const u8) protocol_types.AuthStatus {
     return .unknown;
 }
 
-fn parseModelLifecycle(str: []const u8) protocol_types.ModelLifecycle {
+fn parseModelLifecycle(str: []const u8) error{InvalidEnumValue}!protocol_types.ModelLifecycle {
     if (std.mem.eql(u8, str, "stable")) return .stable;
     if (std.mem.eql(u8, str, "preview")) return .preview;
-    return .deprecated;
+    if (std.mem.eql(u8, str, "deprecated")) return .deprecated;
+    return error.InvalidEnumValue;
 }
 
-fn parseModelCapability(str: []const u8) protocol_types.ModelCapability {
+fn parseModelCapability(str: []const u8) error{InvalidEnumValue}!protocol_types.ModelCapability {
     if (std.mem.eql(u8, str, "chat")) return .chat;
     if (std.mem.eql(u8, str, "streaming")) return .streaming;
     if (std.mem.eql(u8, str, "tools")) return .tools;
@@ -1157,21 +1158,24 @@ fn parseModelCapability(str: []const u8) protocol_types.ModelCapability {
     if (std.mem.eql(u8, str, "reasoning")) return .reasoning;
     if (std.mem.eql(u8, str, "prompt_cache")) return .prompt_cache;
     if (std.mem.eql(u8, str, "audio_input")) return .audio_input;
-    return .audio_output;
+    if (std.mem.eql(u8, str, "audio_output")) return .audio_output;
+    return error.InvalidEnumValue;
 }
 
-fn parseModelSource(str: []const u8) protocol_types.ModelSource {
+fn parseModelSource(str: []const u8) error{InvalidEnumValue}!protocol_types.ModelSource {
     if (std.mem.eql(u8, str, "dynamic")) return .dynamic;
-    return .static_fallback;
+    if (std.mem.eql(u8, str, "static_fallback")) return .static_fallback;
+    return error.InvalidEnumValue;
 }
 
-fn parseReasoningLevel(str: []const u8) protocol_types.ReasoningLevel {
+fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!protocol_types.ReasoningLevel {
     if (std.mem.eql(u8, str, "off")) return .off;
     if (std.mem.eql(u8, str, "minimal")) return .minimal;
     if (std.mem.eql(u8, str, "low")) return .low;
     if (std.mem.eql(u8, str, "medium")) return .medium;
     if (std.mem.eql(u8, str, "high")) return .high;
-    return .xhigh;
+    if (std.mem.eql(u8, str, "xhigh")) return .xhigh;
+    return error.InvalidEnumValue;
 }
 
 /// Parse error code from string
@@ -1575,6 +1579,7 @@ pub const EnvelopeError = error{
     InvalidUserContent,
     UnknownContentPartType,
     MissingContent,
+    InvalidEnumValue,
 };
 
 // Tests

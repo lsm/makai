@@ -83,7 +83,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "claude-sonnet-4-5",
         .display_name = "Claude Sonnet 4.5",
         .base_url = "https://api.anthropic.com",
-        .auth_status = .authenticated,
+        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING_TOOLS_REASONING,
         .context_window = 200_000,
@@ -96,7 +96,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-4o",
         .display_name = "GPT-4o (Responses)",
         .base_url = "https://api.openai.com",
-        .auth_status = .authenticated,
+        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING_REASONING,
         .context_window = 128_000,
@@ -109,7 +109,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-4o",
         .display_name = "GPT-4o (Completions)",
         .base_url = "https://api.openai.com",
-        .auth_status = .authenticated,
+        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 128_000,
@@ -121,7 +121,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "qwen2.5:7b",
         .display_name = "Qwen2.5 7B",
         .base_url = "http://localhost:11434",
-        .auth_status = .login_required,
+        .auth_status = .unknown, // Local server, auth status unknown without runtime check
         .lifecycle = .stable,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 32_768,
@@ -133,7 +133,7 @@ const STATIC_MODEL_CATALOG = [_]StaticCatalogEntry{
         .model_id = "gpt-3.5-turbo",
         .display_name = "GPT-3.5 Turbo",
         .base_url = "https://api.openai.com",
-        .auth_status = .authenticated,
+        .auth_status = .unknown, // Static fallback cannot know auth status without runtime check
         .lifecycle = .deprecated,
         .capabilities = &CAP_CHAT_STREAMING,
         .context_window = 16_384,
@@ -749,8 +749,11 @@ fn resolveModelsRequest(
 ) anyerror!protocol_types.ModelsResponse {
     if (server.options.dynamic_catalog_fetcher) |fetcher| {
         const dynamic_response = fetcher(server.options.dynamic_catalog_ctx, server.allocator, request) catch |err| switch (err) {
+            // Only fall back to static catalog for capability-not-supported errors
+            error.NotImplemented => null,
             error.OutOfMemory => return error.OutOfMemory,
-            else => null,
+            // Propagate all other errors (provider error, rate limit, auth, etc.)
+            else => return err,
         };
 
         if (dynamic_response) |response| {
