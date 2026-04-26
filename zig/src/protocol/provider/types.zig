@@ -303,6 +303,13 @@ pub const ErrorCode = enum {
     duplicate_sequence,
     sequence_gap,
     not_implemented,
+    /// Missing or invalid authentication credentials. The TS SDK uses this code
+    /// to drive the auth-required retry policy (manual login or auto_once).
+    auth_required,
+    /// OAuth refresh attempt failed (e.g., refresh token rejected by IdP).
+    auth_refresh_failed,
+    /// Stored credentials are expired and cannot be refreshed (no refresh token).
+    auth_expired,
 };
 
 /// Stream error payload
@@ -489,10 +496,13 @@ test "ErrorCode enum values match protocol spec" {
         .duplicate_sequence,
         .sequence_gap,
         .not_implemented,
+        .auth_required,
+        .auth_refresh_failed,
+        .auth_expired,
     };
 
-    // Verify enum has exactly 12 values
-    try std.testing.expectEqual(@as(usize, 12), codes.len);
+    // Verify enum has exactly 15 values
+    try std.testing.expectEqual(@as(usize, 15), codes.len);
 
     // Verify each can be instantiated
     inline for (codes) |code| {

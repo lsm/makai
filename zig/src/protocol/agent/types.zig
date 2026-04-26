@@ -58,6 +58,12 @@ pub const AgentErrorCode = enum {
     internal_error,
     agent_busy,
     session_expired,
+    /// No credentials available for the upstream provider; client must
+    /// authenticate. Mirrors `protocol/provider` `auth_required` so the
+    /// agent surface can propagate auth-required signals from the request
+    /// path. M-007 will add `auth_refresh_failed` and `auth_expired` as
+    /// refresh-on-expiry semantics land.
+    auth_required,
 };
 
 /// Request to start an agent session

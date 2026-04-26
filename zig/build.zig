@@ -113,6 +113,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const auth_resolver_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/auth_resolver.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+        },
+    });
+
     const auth_provider_defs_mod = b.createModule(.{
         .root_source_file = b.path("src/auth/providers.zig"),
         .target = target,
@@ -468,6 +477,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "hive_array", .module = hive_array_mod },
+            .{ .name = "auth_resolver", .module = auth_resolver_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
         },
     });
 
@@ -754,6 +765,8 @@ pub fn build(b: *std.Build) void {
     const pre_transform_test = b.addTest(.{ .root_module = pre_transform_mod });
 
     const auth_provider_defs_test = b.addTest(.{ .root_module = auth_provider_defs_mod });
+
+    const auth_resolver_test = b.addTest(.{ .root_module = auth_resolver_mod });
 
     const openai_completions_api_test = b.addTest(.{ .root_module = openai_completions_api_mod });
     const anthropic_messages_api_test = b.addTest(.{ .root_module = anthropic_messages_api_mod });
@@ -1137,6 +1150,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
     test_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
+    test_step.dependOn(&b.addRunArtifact(auth_resolver_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_completions_api_test).step);
     test_step.dependOn(&b.addRunArtifact(anthropic_messages_api_test).step);
     test_step.dependOn(&b.addRunArtifact(openai_responses_api_test).step);
@@ -1230,6 +1244,7 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(oom_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(sanitize_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(auth_resolver_test).step);
 
     const test_unit_makai_cli_step = b.step("test-unit-makai-cli", "Run makai CLI unit tests");
     test_unit_makai_cli_step.dependOn(&auth_cli_test_run.step);
