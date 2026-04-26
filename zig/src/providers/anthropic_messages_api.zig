@@ -1269,6 +1269,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
+        std.debug.print("[ANTHROPIC-DBG] http_status={d}\n", .{@intFromEnum(response.head.status)});
         if (response.head.status == .ok) {
             // Success - break out of retry loop
             break;
@@ -1439,6 +1440,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         if (n == 0) break;
+        std.debug.print("[ANTHROPIC-DBG] read n={d}\n", .{n});
 
         const events = parser.feed(read_buf[0..n]) catch {
             allocator.free(api_key);
@@ -1459,6 +1461,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 return;
             };
 
+            std.debug.print("[ANTHROPIC-DBG] event tag={s}\n", .{@tagName(result)});
             switch (result) {
                 .none => {},
                 .message_start => |ms| {
@@ -1643,6 +1646,7 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     // If still no content, this indicates an unexpected empty response
+    std.debug.print("[ANTHROPIC-DBG] post-loop blocks={d} text_len={d}\n", .{ content_blocks.items.len, current_text.items.len });
     if (content_blocks.items.len == 0) {
         allocator.free(api_key);
         allocator.free(request_body);
