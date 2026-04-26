@@ -1440,7 +1440,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         if (n == 0) break;
-        std.debug.print("[ANTHROPIC-DBG] read n={d}\n", .{n});
+        std.debug.print("[ANTHROPIC-DBG] read n={d} body={s}\n", .{ n, read_buf[0..@min(n, 512)] });
 
         const events = parser.feed(read_buf[0..n]) catch {
             allocator.free(api_key);
