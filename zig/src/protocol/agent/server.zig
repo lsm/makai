@@ -21,8 +21,21 @@ pub const ProviderModelsDelegateFn = *const fn (
 ) anyerror!agent_types.ModelsResponse;
 
 pub const Options = struct {
-    /// When false, `models_request` always returns a `not_implemented` nack
-    /// regardless of whether a delegate is configured.
+    /// Explicit kill-switch for the model catalog feature. When `false`,
+    /// `models_request` always returns a `not_implemented` nack regardless of
+    /// whether a delegate is configured.
+    ///
+    /// NOTE: this flag alone does not advertise the capability. A
+    /// `models_request` is only answered with a `models_response` when BOTH
+    /// `supports_model_catalog == true` AND `provider_models_delegate != null`.
+    /// All four combinations resolve as follows:
+    ///   * supports=true,  delegate=set  -> delegate is invoked.
+    ///   * supports=true,  delegate=null -> `not_implemented` nack (default).
+    ///   * supports=false, delegate=set  -> `not_implemented` nack (kill-switch).
+    ///   * supports=false, delegate=null -> `not_implemented` nack.
+    /// In other words, the default-constructed server is a NO-OP responder
+    /// until a delegate is wired; flipping this flag is only meaningful when
+    /// callers want to disable an otherwise-configured delegate at runtime.
     supports_model_catalog: bool = true,
     /// Provider-protocol passthrough for model discovery. When null, the agent
     /// server replies with `not_implemented` to advertise capability absence.
@@ -234,6 +247,11 @@ pub const AgentProtocolServer = struct {
                 .not_implemented,
                 "models catalog is not implemented for this runtime",
             ),
+            // Spec §6 step 7: when no models match the request filters the
+            // protocol mandates `error_code = invalid_request` (NOT
+            // `model_not_found`). The `ErrorCode.model_not_found` variant is
+            // reserved for future/SDK-internal use — do not "fix" this to use
+            // it without first updating the spec.
             error.ModelNotFound => return try self.makeModelsNack(
                 env.session_id,
                 env.message_id,
@@ -612,6 +630,7 @@ test "handleModelsRequest maps delegate NotImplemented error to not_implemented 
     defer request.deinit(allocator);
 
     const maybe_response = try server.handleEnvelope(request);
+    try std.testing.expect(maybe_response != null);
     var response = maybe_response.?;
     defer response.deinit(allocator);
 

@@ -359,6 +359,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "nack")) {
         const rejected_id = try parseUuidRequired(payload.get("rejected_id").?.string);
         const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
+        // forward-compat: unknown error codes degrade to null rather than
+        // failing deserialization. This is intentional asymmetry from the
+        // other enum parsers in this file (which fail with InvalidEnumValue):
+        // a newer peer may emit a code our build doesn't know about, and we
+        // would rather still surface the human-readable `reason` than reject
+        // the whole nack envelope. Callers MUST treat `null` as "unrecognised
+        // code" and fall back to `reason` for diagnostics.
         const error_code = if (payload.get("error_code")) |v|
             std.meta.stringToEnum(agent_types.ErrorCode, v.string)
         else
@@ -539,6 +546,12 @@ fn deserializeModelDescriptor(
     };
 }
 
+// `.unknown` is a forward-compatibility sentinel — auth states added in
+// future protocol versions degrade gracefully to `.unknown` rather than
+// failing deserialization (intentionally asymmetric with `parseModelLifecycle`
+// / `parseModelCapability` / `parseModelSource` / `parseReasoningLevel`,
+// which all fail hard on unknown strings because those enums have no
+// "unknown" sentinel and a missing variant indicates a real protocol bug).
 fn parseAuthStatus(str: []const u8) model_catalog_types.AuthStatus {
     if (std.mem.eql(u8, str, "authenticated")) return .authenticated;
     if (std.mem.eql(u8, str, "login_required")) return .login_required;
