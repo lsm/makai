@@ -814,6 +814,7 @@ const ParseResult = union(enum) {
     content_block_stop: struct { index: usize },
     message_delta: struct { stop_reason: ai_types.StopReason, output_tokens: u64 },
     message_stop: void,
+    api_error: []const u8,
 
     const ContentType = enum { text, thinking, tool_use };
     const ContentDelta = union(enum) {
@@ -918,19 +919,31 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
 
         if (std.mem.eql(u8, delta_type.string, "text_delta")) {
             if (delta_val.object.get("text")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .text = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .text = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "thinking_delta")) {
             if (delta_val.object.get("thinking")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .thinking = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .thinking = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "signature_delta")) {
             if (delta_val.object.get("signature")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .signature = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .signature = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "input_json_delta")) {
             if (delta_val.object.get("partial_json")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .input_json = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .input_json = duped } } };
+                }
             }
         }
 
@@ -971,6 +984,18 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
 
     if (std.mem.eql(u8, type_val.string, "message_stop")) {
         return .{ .message_stop = {} };
+    }
+
+    if (std.mem.eql(u8, type_val.string, "error")) {
+        var err_msg: []const u8 = "anthropic api error";
+        if (obj.get("error")) |ev| {
+            if (ev == .object) {
+                if (ev.object.get("message")) |m| {
+                    if (m == .string) err_msg = m.string;
+                }
+            }
+        }
+        return .{ .api_error = try allocator.dupe(u8, err_msg) };
     }
 
     return .{ .none = {} };
@@ -1358,6 +1383,20 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_thinking_signature = std.ArrayList(u8){};
     defer current_thinking_signature.deinit(allocator);
 
+    // Deferred frees for delta strings pushed to the stream.
+    // stream.push() stores borrowed references (owns_events=false); we must not free
+    // a delta string until AFTER the SSE loop exits to avoid a GPA timing issue where
+    // an in-flight free interleaves with subsequent GPA allocations in the same thread
+    // (content_blocks.append / block_map.put), which can silently fail under load.
+    // By collecting delta pointers here and freeing them all at thread exit we:
+    //   a) eliminate the leak the GPA would otherwise report, and
+    //   b) guarantee the frees only happen after all SSE processing is complete.
+    var pending_delta_frees = std.ArrayList([]const u8){};
+    defer {
+        for (pending_delta_frees.items) |s| allocator.free(s);
+        pending_delta_frees.deinit(allocator);
+    }
+
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
@@ -1469,15 +1508,24 @@ fn runThread(ctx: *ThreadCtx) void {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
                                 stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
+                                // Defer the free: freeing a duped delta while the SSE loop is still
+                                // running can interfere with subsequent GPA allocations (block_map.put,
+                                // content_blocks.append) causing them to silently fail. Track the pointer
+                                // and free the batch at thread exit via pending_delta_frees.
+                                pending_delta_frees.append(allocator, txt) catch allocator.free(txt);
                             },
                             .thinking => |thk| {
                                 current_thinking.appendSlice(allocator, thk) catch {};
                                 stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
+                                pending_delta_frees.append(allocator, thk) catch allocator.free(thk);
                             },
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
+                                // sig is not stored in the stream, so it is safe to free immediately.
+                                allocator.free(sig);
                             },
                             .input_json => |json_delta| {
+                                // appendDelta copies json_delta into its accumulator.
                                 tc_tracker.appendDelta(cbd.index, json_delta) catch {};
 
                                 if (tc_tracker.getContentIndex(cbd.index)) |content_idx| {
@@ -1487,7 +1535,12 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .partial = createPartialMessage(model),
                                     } }) catch {};
                                 }
+                                pending_delta_frees.append(allocator, json_delta) catch allocator.free(json_delta);
                             },
+                        }
+                    } else {
+                        switch (cbd.delta) {
+                            inline else => |s| allocator.free(s),
                         }
                     }
                 },
@@ -1560,6 +1613,15 @@ fn runThread(ctx: *ThreadCtx) void {
                     usage.calculateCost(model.cost);
                 },
                 .message_stop => {},
+                .api_error => |err| {
+                    defer allocator.free(err);
+                    allocator.free(api_key);
+                    allocator.free(request_body);
+                    allocator.destroy(ctx);
+                    stream.markThreadDone();
+                    stream.completeWithError(err);
+                    return;
+                },
             }
         }
     }
@@ -1580,9 +1642,14 @@ fn runThread(ctx: *ThreadCtx) void {
         content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
     }
 
-    // If still no content, add an empty text block
+    // If still no content, this indicates an unexpected empty response
     if (content_blocks.items.len == 0) {
-        content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.markThreadDone();
+        stream.completeWithError("anthropic returned empty response with no content blocks");
+        return;
     }
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
