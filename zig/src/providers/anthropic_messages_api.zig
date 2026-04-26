@@ -1451,9 +1451,6 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         if (n == 0) break;
 
-        // TEMP DIAG: dump raw bytes so we can see what the API actually returns
-        std.debug.print("[ANTHROPIC-DBG] raw({d})={s}\n", .{ n, read_buf[0..n] });
-
         const events = parser.feed(read_buf[0..n]) catch {
             allocator.free(api_key);
             allocator.free(request_body);
