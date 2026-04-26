@@ -510,6 +510,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
@@ -521,6 +522,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "agent_types", .module = protocol_agent_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
