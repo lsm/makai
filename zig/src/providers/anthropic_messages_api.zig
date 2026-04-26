@@ -1161,6 +1161,17 @@ fn runThread(ctx: *ThreadCtx) void {
         stream.completeWithError("oom headers");
         return;
     };
+    // SSE streams must not be gzip-compressed: compression buffers the entire
+    // stream before delivery, so the CDN/proxy sends one gzip block instead of
+    // individual SSE events.  Explicitly request identity (no) encoding.
+    headers.append(allocator, .{ .name = "accept-encoding", .value = "identity" }) catch {
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.markThreadDone();
+        stream.completeWithError("oom headers");
+        return;
+    };
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1269,7 +1280,6 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
-        std.debug.print("[ANTHROPIC-DBG] http_status={d}\n", .{@intFromEnum(response.head.status)});
         if (response.head.status == .ok) {
             // Success - break out of retry loop
             break;
@@ -1440,10 +1450,9 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         if (n == 0) break;
-        const diag_len = @min(n, 32);
-        std.debug.print("[ANTHROPIC-DBG] read n={d} hex=", .{n});
-        for (read_buf[0..diag_len]) |b| std.debug.print("{x:0>2}", .{b});
-        std.debug.print("\n", .{});
+
+        // TEMP DIAG: dump raw bytes so we can see what the API actually returns
+        std.debug.print("[ANTHROPIC-DBG] raw({d})={s}\n", .{ n, read_buf[0..n] });
 
         const events = parser.feed(read_buf[0..n]) catch {
             allocator.free(api_key);
@@ -1464,7 +1473,6 @@ fn runThread(ctx: *ThreadCtx) void {
                 return;
             };
 
-            std.debug.print("[ANTHROPIC-DBG] event tag={s}\n", .{@tagName(result)});
             switch (result) {
                 .none => {},
                 .message_start => |ms| {
@@ -1649,7 +1657,6 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     // If still no content, this indicates an unexpected empty response
-    std.debug.print("[ANTHROPIC-DBG] post-loop blocks={d} text_len={d}\n", .{ content_blocks.items.len, current_text.items.len });
     if (content_blocks.items.len == 0) {
         allocator.free(api_key);
         allocator.free(request_body);
