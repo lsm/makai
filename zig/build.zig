@@ -1039,6 +1039,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Auth CLI wrapper module — drives the auth protocol runtime in-process so
+    // `makai auth providers` and `makai auth login` are thin wrappers over the
+    // protocol layer (M-013). Lives separately from the CLI entry point so
+    // tests can exercise it with in-memory IO without dragging in the entire
+    // `makai.zig` surface.
+    const auth_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/auth_cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "auth_server", .module = protocol_auth_server_mod },
+            .{ .name = "auth_runtime", .module = protocol_auth_runtime_mod },
+            .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
     const makai_cli_module = b.createModule(.{
         .root_source_file = b.path("src/tools/makai.zig"),
         .target = target,
@@ -1061,6 +1079,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_runtime", .module = protocol_auth_runtime_mod },
             .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
             .{ .name = "auth/providers", .module = auth_provider_defs_mod },
+            .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
         },
@@ -1072,6 +1091,8 @@ pub fn build(b: *std.Build) void {
     });
     const makai_cli_test = b.addTest(.{ .root_module = makai_cli_module });
     const makai_cli_test_run = b.addRunArtifact(makai_cli_test);
+    const auth_cli_test = b.addTest(.{ .root_module = auth_cli_mod });
+    const auth_cli_test_run = b.addRunArtifact(auth_cli_test);
     b.installArtifact(makai_cli);
 
     const run_cmd = b.addRunArtifact(makai_cli);
@@ -1141,6 +1162,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_step.dependOn(&auth_cli_test_run.step);
     test_step.dependOn(&makai_cli_test_run.step);
 
     // Grouped unit test steps for parallel CI
@@ -1208,6 +1230,7 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(pre_transform_test).step);
 
     const test_unit_makai_cli_step = b.step("test-unit-makai-cli", "Run makai CLI unit tests");
+    test_unit_makai_cli_step.dependOn(&auth_cli_test_run.step);
     test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
 
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
