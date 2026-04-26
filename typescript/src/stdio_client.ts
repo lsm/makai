@@ -7,7 +7,7 @@ export type StdioFrame = {
   [key: string]: unknown;
 };
 
-export type MakaiClientOptions = {
+export type MakaiStdioClientOptions = {
   command: string;
   args?: string[];
   cwd?: string;
@@ -15,6 +15,9 @@ export type MakaiClientOptions = {
   expectedProtocolVersion?: string;
   handshakeTimeoutMs?: number;
 };
+
+/** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
+export type MakaiClientOptions = MakaiStdioClientOptions;
 
 export class StdioProtocolError extends Error {
   constructor(
@@ -39,15 +42,15 @@ type PendingHandshake = {
 };
 
 export class MakaiStdioClient {
-  private readonly options: Required<Pick<MakaiClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">> &
-    Omit<MakaiClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">;
+  private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">> &
+    Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: ReadlineInterface | null = null;
   private pendingHandshake: PendingHandshake | null = null;
   private frameQueue: StdioFrame[] = [];
   private frameWaiters: PendingFrameWaiter[] = [];
 
-  constructor(options: MakaiClientOptions) {
+  constructor(options: MakaiStdioClientOptions) {
     this.options = {
       ...options,
       args: options.args ?? [],
@@ -209,13 +212,16 @@ export class MakaiStdioClient {
   }
 }
 
-export type CreateMakaiClientOptions = Omit<MakaiClientOptions, "command"> & {
+export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {
   command?: string;
   resolver?: BinaryResolverOptions;
 };
 
+/** @deprecated Use CreateMakaiStdioClientOptions. Kept for backward compatibility. */
+export type CreateMakaiClientOptions = CreateMakaiStdioClientOptions;
+
 export async function createMakaiStdioClient(
-  options: CreateMakaiClientOptions = {},
+  options: CreateMakaiStdioClientOptions = {},
 ): Promise<MakaiStdioClient> {
   const command = options.command ?? (await resolveMakaiBinary(options.resolver));
   const args = options.args ?? ["--stdio"];

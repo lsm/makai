@@ -2,9 +2,14 @@ import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { listMakaiAuthProviders, loginWithMakaiAuth, type LoginWithMakaiAuthOptions, type MakaiAuthEvent } from "../src";
+import {
+  createMakaiAuthClient,
+  type CreateMakaiAuthClientOptions,
+  type MakaiAuthEvent,
+  type ProviderAuthInfo,
+} from "../src";
 
-type AuthProviderInfo = {
+type DemoOAuthProvider = {
   id: string;
   name: string;
 };
@@ -67,7 +72,7 @@ const CHAT_PROVIDERS: ChatProviderConfig[] = [
   },
 ];
 
-const FALLBACK_AUTH_PROVIDERS: AuthProviderInfo[] = [
+const FALLBACK_AUTH_PROVIDERS: DemoOAuthProvider[] = [
   { id: "test-fixture", name: "Test Fixture (CI)" },
   { id: "github-copilot", name: "GitHub Copilot" },
   { id: "anthropic", name: "Anthropic" },
@@ -267,12 +272,26 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
   const homeDir = options.homeDir ?? process.env.HOME ?? "";
   const binaryPath = options.binaryPath ?? process.env.MAKAI_BINARY_PATH;
 
-  async function resolveOAuthProviders(): Promise<AuthProviderInfo[]> {
-    const authOptions: LoginWithMakaiAuthOptions = binaryPath ? { resolver: { binaryPath } } : {};
+  function authClientOptions(extra?: Partial<CreateMakaiAuthClientOptions>): CreateMakaiAuthClientOptions {
+    return {
+      ...(binaryPath ? { resolver: { binaryPath } } : {}),
+      ...(homeDir ? { env: { ...process.env, HOME: homeDir } } : { env: process.env }),
+      ...extra,
+    };
+  }
+
+  async function resolveOAuthProviders(): Promise<DemoOAuthProvider[]> {
+    let client: { auth: { listProviders(): Promise<ProviderAuthInfo[]> }; close: () => Promise<void> } | undefined;
     try {
-      return await listMakaiAuthProviders(authOptions);
+      client = await createMakaiAuthClient(authClientOptions());
+      const providers = await client.auth.listProviders();
+      return providers.map((provider) => ({ id: provider.id, name: provider.name }));
     } catch {
       return FALLBACK_AUTH_PROVIDERS;
+    } finally {
+      if (client) {
+        await client.close().catch(() => undefined);
+      }
     }
   }
 
@@ -306,47 +325,50 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
       };
       authSessions.set(session.id, session);
 
-      const loginOptions: LoginWithMakaiAuthOptions = {
-        provider: body.provider,
-        env: homeDir ? { ...process.env, HOME: homeDir } : process.env,
-        resolver: binaryPath ? { binaryPath } : undefined,
-        onEvent: (event) => {
-          session.events.push(event);
-          session.updatedAt = Date.now();
-          if (event.type === "error") {
-            session.status = "error";
-            session.error = event.message;
-          } else if (event.type === "success") {
-            session.status = "success";
-          }
-        },
-        onPrompt: async (prompt) => {
-          session.pendingPrompt = prompt;
-          session.status = "waiting_for_input";
-          session.updatedAt = Date.now();
-          return await new Promise<string>((resolve, reject) => {
-            session.resolvePrompt = resolve;
-            session.rejectPrompt = reject;
+      const provider = body.provider;
+      void (async () => {
+        let client: Awaited<ReturnType<typeof createMakaiAuthClient>> | undefined;
+        try {
+          client = await createMakaiAuthClient(authClientOptions());
+          await client.auth.login(provider, {
+            onEvent: (event) => {
+              session.events.push(event);
+              session.updatedAt = Date.now();
+              if (event.type === "error") {
+                session.status = "error";
+                session.error = event.message;
+              } else if (event.type === "success") {
+                session.status = "success";
+              }
+            },
+            onPrompt: async (prompt) => {
+              session.pendingPrompt = prompt;
+              session.status = "waiting_for_input";
+              session.updatedAt = Date.now();
+              return await new Promise<string>((resolve, reject) => {
+                session.resolvePrompt = resolve;
+                session.rejectPrompt = reject;
+              });
+            },
           });
-        },
-      };
-
-      void loginWithMakaiAuth(loginOptions)
-        .then(() => {
           session.pendingPrompt = undefined;
           session.resolvePrompt = undefined;
           session.rejectPrompt = undefined;
           session.status = "success";
           session.updatedAt = Date.now();
-        })
-        .catch((error: unknown) => {
+        } catch (error: unknown) {
           session.pendingPrompt = undefined;
           session.resolvePrompt = undefined;
           session.rejectPrompt = undefined;
           session.status = "error";
           session.error = error instanceof Error ? error.message : String(error);
           session.updatedAt = Date.now();
-        });
+        } finally {
+          if (client) {
+            await client.close().catch(() => undefined);
+          }
+        }
+      })();
 
       json(res, 200, { sessionId: session.id });
       return true;
