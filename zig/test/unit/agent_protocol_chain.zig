@@ -117,6 +117,10 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
     const loop_stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, .{
         .model = model,
         .protocol = bridge.protocolClient(),
+        // M-006: provide an explicit api_key so the binary's credential
+        // resolver does not reject the upstream stream_request with
+        // `auth_required`. The mock provider does not validate the key value.
+        .api_key = "test-key",
     });
     defer {
         loop_stream.deinit();
