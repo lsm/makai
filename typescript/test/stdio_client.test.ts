@@ -9,6 +9,8 @@ test("connect succeeds with ready handshake and receives event frame", async () 
   const client = new MakaiStdioClient({
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "ready-server.js")],
+    // Generous timeout so cold-start jitter from concurrent test-file workers
+    // (each spawning their own node fixture) does not flake this test.
     handshakeTimeoutMs: 5000,
   });
 
