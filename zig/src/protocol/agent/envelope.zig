@@ -1,6 +1,7 @@
 const std = @import("std");
 const agent_types = @import("agent_types");
 const json_writer = @import("json_writer");
+const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const protocol_types = agent_types;
@@ -134,6 +135,83 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
         .goodbye => |p| {
             if (p.getReason()) |reason| try w.writeStringField("reason", reason);
         },
+        .ack => |p| {
+            const ack_id = try agent_types.uuidToString(p.acknowledged_id, allocator);
+            defer allocator.free(ack_id);
+            try w.writeStringField("acknowledged_id", ack_id);
+        },
+        .nack => |p| {
+            const rejected_id = try agent_types.uuidToString(p.rejected_id, allocator);
+            defer allocator.free(rejected_id);
+            try w.writeStringField("rejected_id", rejected_id);
+            try w.writeStringField("reason", p.reason.slice());
+            if (p.error_code) |code| {
+                try w.writeStringField("error_code", @tagName(code));
+            }
+        },
+        .models_request => |p| {
+            if (p.getProviderId()) |provider_id| try w.writeStringField("provider_id", provider_id);
+            if (p.getApi()) |api| try w.writeStringField("api", api);
+            if (p.getModelId()) |model_id| try w.writeStringField("model_id", model_id);
+            try w.writeBoolField("include_deprecated", p.include_deprecated);
+            try w.writeBoolField("include_login_required", p.include_login_required);
+        },
+        .models_response => |p| {
+            try w.writeIntField("fetched_at_ms", p.fetched_at_ms);
+            try w.writeIntField("cache_max_age_ms", p.cache_max_age_ms);
+            try w.writeKey("models");
+            try w.beginArray();
+            for (p.models.slice()) |descriptor| {
+                try serializeModelDescriptor(w, descriptor);
+            }
+            try w.endArray();
+        },
+    }
+
+    try w.endObject();
+}
+
+fn serializeModelDescriptor(
+    w: *json_writer.JsonWriter,
+    model: model_catalog_types.ModelDescriptor,
+) !void {
+    try w.beginObject();
+
+    try w.writeStringField("model_ref", model.model_ref.slice());
+    try w.writeStringField("model_id", model.model_id.slice());
+    try w.writeStringField("display_name", model.display_name.slice());
+    try w.writeStringField("provider_id", model.provider_id.slice());
+    try w.writeStringField("api", model.api.slice());
+    if (model.base_url.slice().len > 0) {
+        try w.writeStringField("base_url", model.base_url.slice());
+    }
+    try w.writeStringField("auth_status", @tagName(model.auth_status));
+    try w.writeStringField("lifecycle", @tagName(model.lifecycle));
+    try w.writeStringField("source", @tagName(model.source));
+
+    try w.writeKey("capabilities");
+    try w.beginArray();
+    for (model.capabilities.slice()) |capability| {
+        try w.writeString(@tagName(capability));
+    }
+    try w.endArray();
+
+    if (model.context_window) |value| {
+        try w.writeIntField("context_window", value);
+    }
+    if (model.max_output_tokens) |value| {
+        try w.writeIntField("max_output_tokens", value);
+    }
+    if (model.reasoning_default) |value| {
+        try w.writeStringField("reasoning_default", @tagName(value));
+    }
+    if (model.metadata) |entries| {
+        try w.writeKey("metadata");
+        try w.beginObject();
+        for (entries.slice()) |entry| {
+            try w.writeStringField(entry.key.slice(), entry.value.slice());
+        }
+        try w.endObject();
     }
 
     try w.endObject();
@@ -275,8 +353,235 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         if (payload.get("reason")) |v| g.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .goodbye = g };
     }
+    if (std.mem.eql(u8, type_str, "ack")) {
+        return .{ .ack = .{ .acknowledged_id = try parseUuidRequired(payload.get("acknowledged_id").?.string) } };
+    }
+    if (std.mem.eql(u8, type_str, "nack")) {
+        const rejected_id = try parseUuidRequired(payload.get("rejected_id").?.string);
+        const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
+        const error_code = if (payload.get("error_code")) |v|
+            std.meta.stringToEnum(agent_types.ErrorCode, v.string)
+        else
+            null;
+        return .{ .nack = .{
+            .rejected_id = rejected_id,
+            .reason = reason,
+            .error_code = error_code,
+        } };
+    }
+    if (std.mem.eql(u8, type_str, "models_request")) {
+        return .{ .models_request = try deserializeModelsRequest(payload, allocator) };
+    }
+    if (std.mem.eql(u8, type_str, "models_response")) {
+        return .{ .models_response = try deserializeModelsResponse(payload, allocator) };
+    }
 
     return error.InvalidPayloadType;
+}
+
+fn deserializeModelsRequest(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !agent_types.ModelsRequest {
+    const provider_id = if (obj.get("provider_id")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = provider_id;
+        mutable.deinit(allocator);
+    }
+
+    const api = if (obj.get("api")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = api;
+        mutable.deinit(allocator);
+    }
+
+    const model_id = if (obj.get("model_id")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = model_id;
+        mutable.deinit(allocator);
+    }
+
+    const include_deprecated = if (obj.get("include_deprecated")) |value| value.bool else false;
+    const include_login_required = if (obj.get("include_login_required")) |value| value.bool else true;
+
+    return .{
+        .provider_id = provider_id,
+        .api = api,
+        .model_id = model_id,
+        .include_deprecated = include_deprecated,
+        .include_login_required = include_login_required,
+    };
+}
+
+fn deserializeModelsResponse(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !agent_types.ModelsResponse {
+    const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
+    const cache_max_age_ms: u64 = @intCast(obj.get("cache_max_age_ms").?.integer);
+    const models_array = obj.get("models").?.array;
+
+    const descriptors = try allocator.alloc(model_catalog_types.ModelDescriptor, models_array.items.len);
+    var allocated_count: usize = 0;
+    errdefer {
+        for (descriptors[0..allocated_count]) |*descriptor| descriptor.deinit(allocator);
+        allocator.free(descriptors);
+    }
+
+    for (models_array.items, 0..) |item, idx| {
+        descriptors[idx] = try deserializeModelDescriptor(item.object, allocator);
+        allocated_count += 1;
+    }
+
+    return .{
+        .models = OwnedSlice(model_catalog_types.ModelDescriptor).initOwned(descriptors),
+        .fetched_at_ms = fetched_at_ms,
+        .cache_max_age_ms = cache_max_age_ms,
+    };
+}
+
+fn deserializeModelDescriptor(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !model_catalog_types.ModelDescriptor {
+    const model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_ref").?.string));
+    errdefer {
+        var mutable = model_ref;
+        mutable.deinit(allocator);
+    }
+
+    const model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("model_id").?.string));
+    errdefer {
+        var mutable = model_id;
+        mutable.deinit(allocator);
+    }
+
+    const display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("display_name").?.string));
+    errdefer {
+        var mutable = display_name;
+        mutable.deinit(allocator);
+    }
+
+    const provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("provider_id").?.string));
+    errdefer {
+        var mutable = provider_id;
+        mutable.deinit(allocator);
+    }
+
+    const api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("api").?.string));
+    errdefer {
+        var mutable = api;
+        mutable.deinit(allocator);
+    }
+
+    const base_url = if (obj.get("base_url")) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = base_url;
+        mutable.deinit(allocator);
+    }
+
+    const capabilities_array = obj.get("capabilities").?.array;
+    const capabilities = try allocator.alloc(model_catalog_types.ModelCapability, capabilities_array.items.len);
+    errdefer allocator.free(capabilities);
+    for (capabilities_array.items, 0..) |item, idx| {
+        capabilities[idx] = try parseModelCapability(item.string);
+    }
+
+    var metadata: ?OwnedSlice(model_catalog_types.MetadataEntry) = null;
+    if (obj.get("metadata")) |metadata_value| {
+        const metadata_obj = metadata_value.object;
+        const metadata_items = try allocator.alloc(model_catalog_types.MetadataEntry, metadata_obj.count());
+        var metadata_count: usize = 0;
+        errdefer {
+            for (metadata_items[0..metadata_count]) |*entry| entry.deinit(allocator);
+            allocator.free(metadata_items);
+        }
+
+        var iter = metadata_obj.iterator();
+        while (iter.next()) |entry| {
+            metadata_items[metadata_count] = .{
+                .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.key_ptr.*)),
+                .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, entry.value_ptr.string)),
+            };
+            metadata_count += 1;
+        }
+
+        metadata = OwnedSlice(model_catalog_types.MetadataEntry).initOwned(metadata_items);
+    }
+
+    return .{
+        .model_ref = model_ref,
+        .model_id = model_id,
+        .display_name = display_name,
+        .provider_id = provider_id,
+        .api = api,
+        .base_url = base_url,
+        .auth_status = parseAuthStatus(obj.get("auth_status").?.string),
+        .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
+        .capabilities = OwnedSlice(model_catalog_types.ModelCapability).initOwned(capabilities),
+        .source = try parseModelSource(obj.get("source").?.string),
+        .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
+        .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
+        .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
+        .metadata = metadata,
+    };
+}
+
+fn parseAuthStatus(str: []const u8) model_catalog_types.AuthStatus {
+    if (std.mem.eql(u8, str, "authenticated")) return .authenticated;
+    if (std.mem.eql(u8, str, "login_required")) return .login_required;
+    if (std.mem.eql(u8, str, "expired")) return .expired;
+    if (std.mem.eql(u8, str, "refreshing")) return .refreshing;
+    if (std.mem.eql(u8, str, "login_in_progress")) return .login_in_progress;
+    if (std.mem.eql(u8, str, "failed")) return .failed;
+    return .unknown;
+}
+
+fn parseModelLifecycle(str: []const u8) error{InvalidEnumValue}!model_catalog_types.ModelLifecycle {
+    if (std.mem.eql(u8, str, "stable")) return .stable;
+    if (std.mem.eql(u8, str, "preview")) return .preview;
+    if (std.mem.eql(u8, str, "deprecated")) return .deprecated;
+    return error.InvalidEnumValue;
+}
+
+fn parseModelCapability(str: []const u8) error{InvalidEnumValue}!model_catalog_types.ModelCapability {
+    if (std.mem.eql(u8, str, "chat")) return .chat;
+    if (std.mem.eql(u8, str, "streaming")) return .streaming;
+    if (std.mem.eql(u8, str, "tools")) return .tools;
+    if (std.mem.eql(u8, str, "vision")) return .vision;
+    if (std.mem.eql(u8, str, "reasoning")) return .reasoning;
+    if (std.mem.eql(u8, str, "prompt_cache")) return .prompt_cache;
+    if (std.mem.eql(u8, str, "audio_input")) return .audio_input;
+    if (std.mem.eql(u8, str, "audio_output")) return .audio_output;
+    return error.InvalidEnumValue;
+}
+
+fn parseModelSource(str: []const u8) error{InvalidEnumValue}!model_catalog_types.ModelSource {
+    if (std.mem.eql(u8, str, "dynamic")) return .dynamic;
+    if (std.mem.eql(u8, str, "static_fallback")) return .static_fallback;
+    return error.InvalidEnumValue;
+}
+
+fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!model_catalog_types.ReasoningLevel {
+    if (std.mem.eql(u8, str, "off")) return .off;
+    if (std.mem.eql(u8, str, "minimal")) return .minimal;
+    if (std.mem.eql(u8, str, "low")) return .low;
+    if (std.mem.eql(u8, str, "medium")) return .medium;
+    if (std.mem.eql(u8, str, "high")) return .high;
+    if (std.mem.eql(u8, str, "xhigh")) return .xhigh;
+    return error.InvalidEnumValue;
 }
 
 test "deserializeEnvelope rejects invalid uuid" {
@@ -323,4 +628,158 @@ test "agent envelope roundtrip" {
 
     try std.testing.expect(parsed.payload == .agent_message);
     try std.testing.expectEqualStrings("{\"role\":\"user\"}", parsed.payload.agent_message.message_json);
+}
+
+test "agent envelope roundtrip for models_request" {
+    const allocator = std.testing.allocator;
+
+    var env = agent_types.Envelope{
+        .session_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .models_request = .{
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+            .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+            .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+            .include_deprecated = false,
+            .include_login_required = true,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .models_request);
+    try std.testing.expectEqualStrings("anthropic", parsed.payload.models_request.getProviderId().?);
+    try std.testing.expectEqualStrings("anthropic-messages", parsed.payload.models_request.getApi().?);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", parsed.payload.models_request.getModelId().?);
+    try std.testing.expect(!parsed.payload.models_request.include_deprecated);
+    try std.testing.expect(parsed.payload.models_request.include_login_required);
+}
+
+test "agent envelope roundtrip for models_response preserves shape" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(agent_types.ModelCapability, 3);
+    capabilities[0] = .chat;
+    capabilities[1] = .streaming;
+    capabilities[2] = .reasoning;
+
+    const metadata = try allocator.alloc(agent_types.MetadataEntry, 1);
+    metadata[0] = .{
+        .key = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "tier")),
+        .value = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "standard")),
+    };
+
+    const descriptors = try allocator.alloc(agent_types.ModelDescriptor, 1);
+    descriptors[0] = .{
+        .model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude-sonnet-4-5")),
+        .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+        .display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .base_url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "https://api.anthropic.com")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = OwnedSlice(agent_types.ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+        .context_window = 200_000,
+        .max_output_tokens = 8_192,
+        .reasoning_default = .medium,
+        .metadata = OwnedSlice(agent_types.MetadataEntry).initOwned(metadata),
+    };
+
+    var env = agent_types.Envelope{
+        .session_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUuid(),
+        .sequence = 2,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .models_response = .{
+            .models = OwnedSlice(agent_types.ModelDescriptor).initOwned(descriptors),
+            .fetched_at_ms = 1_700_000_000_000,
+            .cache_max_age_ms = 300_000,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .models_response);
+    try std.testing.expectEqual(@as(i64, 1_700_000_000_000), parsed.payload.models_response.fetched_at_ms);
+    try std.testing.expectEqual(@as(u64, 300_000), parsed.payload.models_response.cache_max_age_ms);
+
+    const parsed_models = parsed.payload.models_response.models.slice();
+    try std.testing.expectEqual(@as(usize, 1), parsed_models.len);
+    try std.testing.expectEqualStrings("claude-sonnet-4-5", parsed_models[0].model_id.slice());
+    try std.testing.expectEqualStrings("anthropic", parsed_models[0].provider_id.slice());
+    try std.testing.expectEqualStrings("anthropic-messages", parsed_models[0].api.slice());
+    try std.testing.expectEqual(agent_types.ModelSource.dynamic, parsed_models[0].source);
+    try std.testing.expectEqual(@as(u32, 200_000), parsed_models[0].context_window.?);
+    try std.testing.expectEqual(@as(u32, 8_192), parsed_models[0].max_output_tokens.?);
+    try std.testing.expectEqual(agent_types.ReasoningLevel.medium, parsed_models[0].reasoning_default.?);
+    try std.testing.expectEqual(@as(usize, 3), parsed_models[0].capabilities.slice().len);
+    try std.testing.expectEqual(agent_types.ModelCapability.chat, parsed_models[0].capabilities.slice()[0]);
+    try std.testing.expectEqual(agent_types.ModelCapability.reasoning, parsed_models[0].capabilities.slice()[2]);
+    try std.testing.expectEqualStrings("tier", parsed_models[0].metadata.?.slice()[0].key.slice());
+    try std.testing.expectEqualStrings("standard", parsed_models[0].metadata.?.slice()[0].value.slice());
+}
+
+test "agent envelope roundtrip for ack and nack" {
+    const allocator = std.testing.allocator;
+
+    const acked_id = agent_types.generateUuid();
+    var ack_env = agent_types.Envelope{
+        .session_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .ack = .{ .acknowledged_id = acked_id } },
+    };
+    defer ack_env.deinit(allocator);
+
+    const ack_json = try serializeEnvelope(ack_env, allocator);
+    defer allocator.free(ack_json);
+
+    var parsed_ack = try deserializeEnvelope(ack_json, allocator);
+    defer parsed_ack.deinit(allocator);
+
+    try std.testing.expect(parsed_ack.payload == .ack);
+    try std.testing.expectEqualSlices(u8, &acked_id, &parsed_ack.payload.ack.acknowledged_id);
+
+    const rejected_id = agent_types.generateUuid();
+    var nack_env = agent_types.Envelope{
+        .session_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .nack = .{
+            .rejected_id = rejected_id,
+            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "models catalog is not implemented for this runtime")),
+            .error_code = .not_implemented,
+        } },
+    };
+    defer nack_env.deinit(allocator);
+
+    const nack_json = try serializeEnvelope(nack_env, allocator);
+    defer allocator.free(nack_json);
+
+    var parsed_nack = try deserializeEnvelope(nack_json, allocator);
+    defer parsed_nack.deinit(allocator);
+
+    try std.testing.expect(parsed_nack.payload == .nack);
+    try std.testing.expectEqualSlices(u8, &rejected_id, &parsed_nack.payload.nack.rejected_id);
+    try std.testing.expectEqualStrings(
+        "models catalog is not implemented for this runtime",
+        parsed_nack.payload.nack.reason.slice(),
+    );
+    try std.testing.expectEqual(agent_types.ErrorCode.not_implemented, parsed_nack.payload.nack.error_code.?);
 }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const provider_types = @import("protocol_types");
+const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 /// Re-export Uuid from provider types for convenience
@@ -7,6 +8,28 @@ pub const Uuid = provider_types.Uuid;
 pub const generateUuid = provider_types.generateUuid;
 pub const uuidToString = provider_types.uuidToString;
 pub const parseUuid = provider_types.parseUuid;
+
+/// Re-export provider ack/nack/error-code envelope types so that the agent
+/// passthrough emits the same shape as the provider protocol.
+pub const Ack = provider_types.Ack;
+pub const Nack = provider_types.Nack;
+pub const ErrorCode = provider_types.ErrorCode;
+
+/// Re-export shared model catalog types — the agent passthrough must return
+/// the same typed shape as the provider protocol (no raw JSON blob passthrough).
+/// See `docs/v1-sdk-agent-provider-spec.md §6`.
+pub const ModelDescriptor = model_catalog_types.ModelDescriptor;
+pub const ModelCapability = model_catalog_types.ModelCapability;
+pub const ModelLifecycle = model_catalog_types.ModelLifecycle;
+pub const ModelSource = model_catalog_types.ModelSource;
+pub const ReasoningLevel = model_catalog_types.ReasoningLevel;
+pub const AuthStatus = model_catalog_types.AuthStatus;
+pub const MetadataEntry = model_catalog_types.MetadataEntry;
+pub const ModelsResponse = model_catalog_types.ModelsResponse;
+
+/// Reuse provider's `ModelsRequest` shape verbatim so the agent passthrough is
+/// indistinguishable from the canonical provider protocol on the wire.
+pub const ModelsRequest = provider_types.ModelsRequest;
 
 // ============================================================================
 // Agent Protocol Types
@@ -193,6 +216,9 @@ pub const Payload = union(enum) {
     agent_stop: AgentStopRequest,
     agent_status: struct { session_id: Uuid },
     tool_list: ToolListRequest,
+    /// Passthrough model discovery request — delegates to the provider protocol
+    /// and returns the same `ModelsResponse` shape. See spec §6.
+    models_request: ModelsRequest,
 
     // Agent Server -> Client
     agent_started: struct { session_id: Uuid },
@@ -202,6 +228,13 @@ pub const Payload = union(enum) {
     agent_error: struct { code: AgentErrorCode, message: []const u8 },
     session_info: AgentSessionInfo,
     tool_list_response: ToolListResponse,
+    /// Acknowledgment for two-step request/response flows (e.g. models_request).
+    ack: Ack,
+    /// Negative acknowledgment used to surface typed protocol errors such as
+    /// `not_implemented` for capability probes.
+    nack: Nack,
+    /// Passthrough models response — same typed shape as provider protocol.
+    models_response: ModelsResponse,
 
     // Agent -> Tool Server
     tool_execute: ToolExecuteRequest,
@@ -263,7 +296,10 @@ pub const Payload = union(enum) {
                 allocator.free(t.partial_json);
             },
             .session_info => |*s| allocator.free(s.model),
-            .agent_started, .agent_status, .ping => {},
+            .models_request => |*req| req.deinit(allocator),
+            .models_response => |*res| res.deinit(allocator),
+            .nack => |*n| n.deinit(allocator),
+            .ack, .agent_started, .agent_status, .ping => {},
         }
     }
 };
@@ -314,4 +350,64 @@ test "Payload deinit for agent_start" {
 
     payload.deinit(allocator);
     // Should not leak
+}
+
+test "Payload deinit for models_request frees owned filters" {
+    const allocator = std.testing.allocator;
+
+    var payload = Payload{
+        .models_request = .{
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+            .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+            .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+            .include_deprecated = false,
+            .include_login_required = true,
+        },
+    };
+
+    payload.deinit(allocator);
+}
+
+test "Payload deinit for models_response frees descriptors" {
+    const allocator = std.testing.allocator;
+
+    const capabilities = try allocator.alloc(ModelCapability, 1);
+    capabilities[0] = .chat;
+
+    const descriptors = try allocator.alloc(ModelDescriptor, 1);
+    descriptors[0] = .{
+        .model_ref = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic/anthropic-messages@claude-sonnet-4-5")),
+        .model_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "claude-sonnet-4-5")),
+        .display_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "Claude Sonnet 4.5")),
+        .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
+        .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
+        .auth_status = .authenticated,
+        .lifecycle = .stable,
+        .capabilities = OwnedSlice(ModelCapability).initOwned(capabilities),
+        .source = .dynamic,
+    };
+
+    var payload = Payload{
+        .models_response = .{
+            .models = OwnedSlice(ModelDescriptor).initOwned(descriptors),
+            .fetched_at_ms = 0,
+            .cache_max_age_ms = 0,
+        },
+    };
+
+    payload.deinit(allocator);
+}
+
+test "Payload deinit for nack frees reason" {
+    const allocator = std.testing.allocator;
+
+    var payload = Payload{
+        .nack = .{
+            .rejected_id = generateUuid(),
+            .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "not implemented")),
+            .error_code = .not_implemented,
+        },
+    };
+
+    payload.deinit(allocator);
 }
