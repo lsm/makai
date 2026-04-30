@@ -61,8 +61,8 @@ test "ProviderProtocol: GitHub Copilot streaming through ProtocolServer and Prot
     // Create model and context
     // GitHub Copilot uses openai-completions API with github-copilot provider
     const model = ai_types.Model{
-        .id = "gpt-5-mini",
-        .name = "gpt-5-mini",
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
         .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = base_url,
@@ -190,8 +190,8 @@ test "ProviderProtocol: GitHub Copilot abort through protocol layer" {
     // Create model and context
     // GitHub Copilot uses openai-completions API with github-copilot provider
     const model = ai_types.Model{
-        .id = "gpt-5-mini",
-        .name = "gpt-5-mini",
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
         .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = base_url,

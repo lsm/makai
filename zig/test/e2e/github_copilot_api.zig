@@ -22,8 +22,8 @@ test "github_copilot e2e: basic text generation" {
     try register_builtins.registerBuiltInApiProviders(&registry);
 
     const model = ai_types.Model{
-        .id = "gpt-5-mini",
-        .name = "gpt-5-mini",
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
         .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = base_url,
@@ -87,8 +87,8 @@ test "github_copilot e2e: streaming events sequence" {
     try register_builtins.registerBuiltInApiProviders(&registry);
 
     const model = ai_types.Model{
-        .id = "gpt-5-mini",
-        .name = "gpt-5-mini",
+        .id = "gpt-4.1",
+        .name = "GPT-4.1",
         .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = base_url,
