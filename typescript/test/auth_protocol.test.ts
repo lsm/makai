@@ -81,6 +81,22 @@ test("client.auth.listProviders parses providers payload", async () => {
   }
 });
 
+test("client.auth.listProviders preserves frames for concurrent auth streams", async () => {
+  const client = await createMakaiAuthClient(
+    fixtureClientOptions("auth-protocol-concurrent-server.js"),
+  );
+  try {
+    const [first, second] = await Promise.all([
+      client.auth.listProviders(),
+      client.auth.listProviders(),
+    ]);
+    assert.equal(first[0]?.id, "anthropic");
+    assert.equal(second[0]?.id, "anthropic");
+  } finally {
+    await client.close();
+  }
+});
+
 test("client.auth.login resolves on success after prompt loop", async () => {
   const client = await createMakaiAuthClient(
     fixtureClientOptions("auth-protocol-login-success-server.js"),
