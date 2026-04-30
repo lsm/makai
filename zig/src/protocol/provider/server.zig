@@ -545,16 +545,19 @@ fn streamWithRefresh(
         break :blk &loaded_storage.?;
     };
 
-    if (!storage.hasRefreshableCredentials(provider_id)) return error.AuthRequired;
+    if (!storage.hasRefreshableCredentials(provider_id)) {
+        if (storage.credentialsExpired(provider_id)) return error.AuthExpired;
+        return error.AuthRequired;
+    }
 
     if (storage.credentialsExpired(provider_id)) {
         storage.refreshCredentials(provider_id, oauth_provider) catch return error.AuthRefreshFailed;
     }
 
-    var api_key = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
-    defer server.allocator.free(api_key);
+    var api_key_opt: ?[]const u8 = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
+    defer if (api_key_opt) |key| server.allocator.free(key);
 
-    var resolved_options = try injectApiKey(server.allocator, options, api_key);
+    var resolved_options = try injectApiKey(server.allocator, options, api_key_opt.?);
     defer deinitInjectedApiKey(server.allocator, &resolved_options);
 
     var stream = provider.stream(model, context, resolved_options, server.allocator) catch |err| {
@@ -567,15 +570,15 @@ fn streamWithRefresh(
     const is_auth_failure = if (provider.is_auth_failure) |detector| detector(err_msg) else defaultAuthFailureDetector(err_msg);
     if (!is_auth_failure) return stream;
 
-    server.allocator.free(api_key);
-    api_key = "";
+    server.allocator.free(api_key_opt.?);
+    api_key_opt = null;
     stream.deinit();
     server.allocator.destroy(stream);
 
     storage.refreshCredentials(provider_id, oauth_provider) catch return error.AuthRefreshFailed;
-    api_key = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
+    api_key_opt = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
 
-    var retry_options = try injectApiKey(server.allocator, options, api_key);
+    var retry_options = try injectApiKey(server.allocator, options, api_key_opt.?);
     defer deinitInjectedApiKey(server.allocator, &retry_options);
     return provider.stream(model, context, retry_options, server.allocator);
 }
@@ -1178,9 +1181,13 @@ fn authTestGetApiKey(credentials: oauth_storage.Credentials, allocator: std.mem.
     return allocator.dupe(u8, credentials.access);
 }
 
+fn authTestSaveStorage(storage: *const oauth_storage.AuthStorage) anyerror!void {
+    _ = storage;
+}
+
 fn authTestLoadStorage(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
     const state: *AuthTestState = @ptrCast(@alignCast(ctx.?));
-    var storage = oauth_storage.AuthStorage{ .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(allocator), .allocator = allocator };
+    var storage = oauth_storage.AuthStorage{ .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(allocator), .allocator = allocator, .save_fn = authTestSaveStorage };
     try storage.providers.put(try allocator.dupe(u8, "test-auth"), .{ .oauth = .{
         .refresh = try allocator.dupe(u8, "refresh"),
         .access = try allocator.dupe(u8, "access-0"),
@@ -1511,14 +1518,7 @@ test "expired stored credentials refresh before upstream call" {
 
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
-    try registry.registerApiProvider(.{
-        .api = "test-api",
-        .stream = authTestStream,
-        .stream_simple = mockStreamSimple,
-        .auth_provider_id = "test-auth",
-        .auth_refresh_fn = authTestRefresh,
-        .auth_get_api_key_fn = authTestGetApiKey,
-    }, null);
+    try registerAuthTestProvider(&registry);
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
@@ -1540,14 +1540,7 @@ test "upstream auth failure refreshes and retries once" {
 
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
-    try registry.registerApiProvider(.{
-        .api = "test-api",
-        .stream = authTestStream,
-        .stream_simple = mockStreamSimple,
-        .auth_provider_id = "test-auth",
-        .auth_refresh_fn = authTestRefresh,
-        .auth_get_api_key_fn = authTestGetApiKey,
-    }, null);
+    try registerAuthTestProvider(&registry);
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
@@ -1562,13 +1555,7 @@ test "upstream auth failure refreshes and retries once" {
     try std.testing.expect(stream.getResult() != null);
 }
 
-test "refresh failure returns auth_refresh_failed nack" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1, .fail_refresh = true };
-    auth_test_state = &state;
-    defer auth_test_state = null;
-
-    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
-    defer registry.deinit();
+fn registerAuthTestProvider(registry: *api_registry.ApiRegistry) !void {
     try registry.registerApiProvider(.{
         .api = "test-api",
         .stream = authTestStream,
@@ -1577,13 +1564,32 @@ test "refresh failure returns auth_refresh_failed nack" {
         .auth_refresh_fn = authTestRefresh,
         .auth_get_api_key_fn = authTestGetApiKey,
     }, null);
+}
 
-    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
+fn expectAuthRefreshFailedNack(state: *AuthTestState) !void {
+    auth_test_state = state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registerAuthTestProvider(&registry);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = state });
     defer server.deinit();
     const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUuid(), .message_id = protocol_types.generateUuid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_refresh_failed, response.payload.nack.error_code.?);
+}
+
+test "pre-call refresh failure returns auth_refresh_failed nack" {
+    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1, .fail_refresh = true };
+    try expectAuthRefreshFailedNack(&state);
+}
+
+test "retry refresh failure returns auth_refresh_failed nack" {
+    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .fail_refresh = true, .auth_fail_first_call = true };
+    try expectAuthRefreshFailedNack(&state);
 }
 
 test "stream refresh failure maps to error envelope code" {

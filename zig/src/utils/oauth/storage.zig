@@ -35,10 +35,13 @@ pub const ProviderAuth = union(enum) {
     }
 };
 
+pub const SaveFn = *const fn (storage: *const AuthStorage) anyerror!void;
+
 /// Authentication storage for multiple providers
 pub const AuthStorage = struct {
     providers: std.StringHashMap(ProviderAuth),
     allocator: std.mem.Allocator,
+    save_fn: ?SaveFn = null,
 
     /// Load auth storage from ~/.makai/auth.json
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
@@ -51,6 +54,7 @@ pub const AuthStorage = struct {
             return .{
                 .providers = std.StringHashMap(ProviderAuth).init(allocator),
                 .allocator = allocator,
+                .save_fn = null,
             };
         };
         defer file.close();
@@ -100,6 +104,7 @@ pub const AuthStorage = struct {
         return .{
             .providers = providers,
             .allocator = allocator,
+            .save_fn = null,
         };
     }
 
@@ -203,6 +208,11 @@ pub const AuthStorage = struct {
         };
     }
 
+    pub fn persist(self: *const AuthStorage) !void {
+        if (self.save_fn) |save| return save(self);
+        return self.saveToFile();
+    }
+
     pub fn refreshCredentials(self: *AuthStorage, provider_id: []const u8, oauth_provider: OAuthProvider) !void {
         const auth = self.providers.get(provider_id) orelse return error.AuthRequired;
         const credentials = switch (auth) {
@@ -216,13 +226,23 @@ pub const AuthStorage = struct {
         const provider_id_copy = try self.allocator.dupe(u8, provider_id);
         errdefer self.allocator.free(provider_id_copy);
 
-        if (self.providers.fetchRemove(provider_id)) |removed| {
-            self.allocator.free(removed.key);
-            removed.value.deinit(self.allocator);
+        const removed = self.providers.fetchRemove(provider_id) orelse return error.AuthRequired;
+        errdefer {
+            if (self.providers.fetchRemove(provider_id_copy)) |new_removed| {
+                self.allocator.free(new_removed.key);
+                new_removed.value.deinit(self.allocator);
+            }
+            self.providers.put(removed.key, removed.value) catch {
+                self.allocator.free(removed.key);
+                removed.value.deinit(self.allocator);
+            };
         }
 
         try self.providers.put(provider_id_copy, .{ .oauth = new_credentials });
-        try self.saveToFile();
+        try self.persist();
+
+        self.allocator.free(removed.key);
+        removed.value.deinit(self.allocator);
     }
 
     /// Get API key for provider (refreshing if needed)

@@ -35,6 +35,16 @@ fn anthropicGetApiKey(credentials: oauth_storage.Credentials, allocator: std.mem
     }, allocator);
 }
 
+fn anthropicIsAuthFailure(err_msg: []const u8) bool {
+    return std.mem.indexOf(u8, err_msg, "401") != null or
+        std.mem.indexOf(u8, err_msg, "403") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "unauthorized") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "forbidden") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "authentication_error") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "permission_error") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "invalid api key") != null;
+}
+
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
     // Check ANTHROPIC_AUTH_TOKEN first (OAuth), then ANTHROPIC_API_KEY
@@ -1910,6 +1920,7 @@ pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry)
         .auth_provider_id = "anthropic",
         .auth_refresh_fn = anthropicRefresh,
         .auth_get_api_key_fn = anthropicGetApiKey,
+        .is_auth_failure = anthropicIsAuthFailure,
     }, null);
 }
 
