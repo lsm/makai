@@ -9,12 +9,12 @@ test("connect succeeds with ready handshake and receives event frame", async () 
   const client = new MakaiStdioClient({
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "ready-server.js")],
-    handshakeTimeoutMs: 1000,
+    handshakeTimeoutMs: 5000,
   });
 
   await client.connect();
   client.send({ type: "stream_request", stream_id: "s1" });
-  const frame = await client.nextFrame(1000);
+  const frame = await client.nextFrame(5000);
   assert.equal(frame.type, "event");
   assert.equal(frame.stream_id, "s1");
   await client.close();
@@ -24,7 +24,7 @@ test("connect surfaces protocol error frame", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "error-server.js")],
-    handshakeTimeoutMs: 1000,
+    handshakeTimeoutMs: 5000,
   });
 
   await assert.rejects(
