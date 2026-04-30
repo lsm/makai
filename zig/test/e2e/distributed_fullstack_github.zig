@@ -204,8 +204,8 @@ test "distributed fullstack github: agent loop via provider+tool protocols witho
     defer context.deinit();
 
     const model = ai_types.Model{
-        .id = "gpt-4.1",
-        .name = "GPT-4.1",
+        .id = "gpt-4o",
+        .name = "GPT-4o",
         .api = "openai-completions",
         .provider = "github-copilot",
         .base_url = creds.base_url orelse "https://api.individual.githubcopilot.com",
