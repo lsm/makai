@@ -72,6 +72,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const oauth_storage_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/storage.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const api_registry_mod = b.createModule(.{
         .root_source_file = b.path("src/api_registry.zig"),
         .target = target,
@@ -79,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
         },
     });
 
@@ -105,12 +112,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
         },
-    });
-
-    const oauth_storage_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/storage.zig"),
-        .target = target,
-        .optimize = optimize,
     });
 
     const auth_provider_defs_mod = b.createModule(.{
@@ -211,6 +212,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "tool_call_tracker", .module = tool_call_tracker_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "sanitize", .module = sanitize_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
@@ -468,6 +471,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "hive_array", .module = hive_array_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
         },
     });
 
@@ -722,6 +726,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "oauth/storage", .module = oauth_storage_mod },
             },
         }),
     });

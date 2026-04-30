@@ -303,6 +303,9 @@ pub const ErrorCode = enum {
     duplicate_sequence,
     sequence_gap,
     not_implemented,
+    auth_required,
+    auth_refresh_failed,
+    auth_expired,
 };
 
 /// Stream error payload
@@ -489,10 +492,13 @@ test "ErrorCode enum values match protocol spec" {
         .duplicate_sequence,
         .sequence_gap,
         .not_implemented,
+        .auth_required,
+        .auth_refresh_failed,
+        .auth_expired,
     };
 
-    // Verify enum has exactly 12 values
-    try std.testing.expectEqual(@as(usize, 12), codes.len);
+    // Verify enum has exactly 15 values
+    try std.testing.expectEqual(@as(usize, 15), codes.len);
 
     // Verify each can be instantiated
     inline for (codes) |code| {

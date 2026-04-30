@@ -1,6 +1,7 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
+const oauth_storage = @import("oauth/storage");
 
 pub const ApiStreamFunction = *const fn (
     model: ai_types.Model,
@@ -16,10 +17,28 @@ pub const ApiStreamSimpleFunction = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!*event_stream.AssistantMessageEventStream;
 
+pub const AuthStorageRefreshFunction = *const fn (
+    credentials: oauth_storage.Credentials,
+    allocator: std.mem.Allocator,
+) anyerror!oauth_storage.Credentials;
+
+pub const AuthStorageApiKeyFunction = *const fn (
+    credentials: oauth_storage.Credentials,
+    allocator: std.mem.Allocator,
+) anyerror![]const u8;
+
+pub const AuthFailureDetector = *const fn (err_msg: []const u8) bool;
+
 pub const ApiProvider = struct {
     api: []const u8,
     stream: ApiStreamFunction,
     stream_simple: ApiStreamSimpleFunction,
+    /// Optional storage provider ID used to resolve and refresh OAuth credentials.
+    auth_provider_id: ?[]const u8 = null,
+    auth_refresh_fn: ?AuthStorageRefreshFunction = null,
+    auth_get_api_key_fn: ?AuthStorageApiKeyFunction = null,
+    /// Optional provider-specific detector for terminal auth failures from stream errors.
+    is_auth_failure: ?AuthFailureDetector = null,
 };
 
 const RegisteredApiProvider = struct {

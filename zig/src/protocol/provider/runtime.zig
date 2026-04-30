@@ -77,7 +77,7 @@ pub const ProviderProtocolRuntime = struct {
                         .sequence = seq,
                         .timestamp = std.time.milliTimestamp(),
                         .payload = .{ .stream_error = .{
-                            .code = .provider_error,
+                            .code = protocol_server.streamErrorCode(err_msg),
                             .message = protocol_types.OwnedSlice(u8).initOwned(err_copy),
                         } },
                     };
