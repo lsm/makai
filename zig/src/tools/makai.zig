@@ -672,6 +672,10 @@ fn makeProviderStreamRequestEnvelopeJson(
         .payload = .{ .stream_request = .{
             .model = fixtureModel(api),
             .context = .{ .messages = &.{} },
+            // Provide an explicit api_key so the binary's credential resolver
+            // (M-006) does not reject the request with `auth_required`. The
+            // fixture providers do not validate the key value.
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-fixture-key") },
         } },
     };
     defer env.deinit(allocator);

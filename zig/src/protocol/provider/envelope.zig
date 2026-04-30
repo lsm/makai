@@ -1192,6 +1192,9 @@ fn parseErrorCode(str: []const u8) protocol_types.ErrorCode {
     if (std.mem.eql(u8, str, "duplicate_sequence")) return .duplicate_sequence;
     if (std.mem.eql(u8, str, "sequence_gap")) return .sequence_gap;
     if (std.mem.eql(u8, str, "not_implemented")) return .not_implemented;
+    if (std.mem.eql(u8, str, "auth_required")) return .auth_required;
+    if (std.mem.eql(u8, str, "auth_refresh_failed")) return .auth_refresh_failed;
+    if (std.mem.eql(u8, str, "auth_expired")) return .auth_expired;
     return .internal_error;
 }
 

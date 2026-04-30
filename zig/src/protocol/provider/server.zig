@@ -8,6 +8,10 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const event_stream = @import("event_stream");
 const hive_array = @import("hive_array");
+const auth_resolver = @import("auth_resolver");
+const oauth_storage = @import("oauth/storage");
+
+pub const AuthStorage = oauth_storage.AuthStorage;
 
 /// Errors for sequence validation
 pub const SequenceError = error{
@@ -199,6 +203,11 @@ pub const ProtocolServer = struct {
         enable_static_catalog_fallback: bool = true,
         dynamic_catalog_fetcher: ?DynamicCatalogFetchFn = null,
         dynamic_catalog_ctx: ?*anyopaque = null,
+        /// Auth storage used to resolve credentials when the request does not
+        /// supply an explicit `api_key`. When null, only requests carrying an
+        /// explicit key will succeed; the rest are rejected with
+        /// `auth_required`.
+        auth_storage: ?*AuthStorage = null,
     };
 
     pub fn init(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry, options: Options) ProtocolServer {
@@ -417,18 +426,75 @@ pub const ProtocolServer = struct {
     }
 };
 
+/// Build a one-off envelope template suitable for `envelope.createNack`.
+fn nackTemplate(stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid) protocol_types.Envelope {
+    return .{
+        .stream_id = stream_id,
+        .message_id = in_reply_to,
+        .sequence = 0,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .ping,
+    };
+}
+
+/// Resolve credentials for an upstream provider request and inject the API
+/// key into a copy of the request's StreamOptions. The caller owns the
+/// returned options and must call `deinit` on them once the provider stream
+/// has been created (the provider dupes the api_key internally).
+///
+/// On `error.AuthRequired`, returns a typed nack with `auth_required` so the
+/// TS SDK can surface it to clients (and, in M-007+, drive auto-login retry).
+fn resolveAndInjectCredentials(
+    server: *ProtocolServer,
+    options: ?ai_types.StreamOptions,
+    provider_id: []const u8,
+    stream_id: protocol_types.Uuid,
+    in_reply_to: protocol_types.Uuid,
+) !union(enum) {
+    ok: ai_types.StreamOptions,
+    nack: protocol_types.Envelope,
+} {
+    const provided = if (options) |o| o.getApiKey() else null;
+
+    const resolved = auth_resolver.resolveApiKey(
+        server.allocator,
+        server.options.auth_storage,
+        provider_id,
+        provided,
+    ) catch |err| switch (err) {
+        error.AuthRequired => {
+            return .{ .nack = try envelope.createNack(
+                nackTemplate(stream_id, in_reply_to),
+                "No credentials available for provider; client must authenticate",
+                .auth_required,
+                server.allocator,
+            ) };
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+
+    // Build a shallow copy of options with the resolved api_key injected as
+    // an owned slice. We must not free the original options' fields here —
+    // the caller still owns them and will deinit the original request later.
+    var injected: ai_types.StreamOptions = if (options) |o| o else ai_types.StreamOptions{};
+    injected.api_key = ai_types.OwnedSlice(u8).initOwned(resolved.api_key);
+    return .{ .ok = injected };
+}
+
+/// Free only the api_key field that `resolveAndInjectCredentials` allocated.
+/// Leaves the rest of the options untouched (they remain owned by the
+/// original request envelope).
+fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.StreamOptions) void {
+    injected.api_key.deinit(allocator);
+    injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
+}
+
 /// Handle stream_request - create stream, return ack with stream_id
 fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
     // Reject duplicate stream_id
     if (server.active_streams.contains(stream_id)) {
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             "Stream ID already in use",
             .stream_already_exists,
             server.allocator,
@@ -438,13 +504,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Check max streams limit
     if (server.active_streams.count() >= server.options.max_streams) {
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             "Maximum concurrent streams limit reached",
             .rate_limited,
             server.allocator,
@@ -454,33 +514,36 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Look up provider in registry using model.api
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             "Provider not found for API",
             .provider_error,
             server.allocator,
         );
     };
 
+    // Resolve credentials. On AuthRequired, return a typed nack so the TS SDK
+    // can drive its auth-required retry policy (M-007+).
+    const resolution = try resolveAndInjectCredentials(
+        server,
+        request.options,
+        request.model.provider,
+        stream_id,
+        in_reply_to,
+    );
+    var injected_options = switch (resolution) {
+        .nack => |n| return n,
+        .ok => |o| o,
+    };
+    defer deinitInjectedApiKey(server.allocator, &injected_options);
+
     // Create new stream via provider.stream()
-    const stream = provider.stream(request.model, request.context, request.options, server.allocator) catch |err| {
+    const stream = provider.stream(request.model, request.context, injected_options, server.allocator) catch |err| {
         const err_msg = switch (err) {
             error.OutOfMemory => "Out of memory",
             else => "Failed to create stream",
         };
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             err_msg,
             .provider_error,
             server.allocator,
@@ -584,33 +647,36 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
     // Look up provider
     const provider = server.registry.getApiProvider(request.model.api) orelse {
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             "Provider not found for API",
             .provider_error,
             server.allocator,
         );
     };
 
+    // Resolve credentials. Mirrors the stream_request path so both streaming
+    // and non-streaming entry points share identical auth semantics.
+    const resolution = try resolveAndInjectCredentials(
+        server,
+        request.options,
+        request.model.provider,
+        stream_id,
+        in_reply_to,
+    );
+    var injected_options = switch (resolution) {
+        .nack => |n| return n,
+        .ok => |o| o,
+    };
+    defer deinitInjectedApiKey(server.allocator, &injected_options);
+
     // Create a stream for non-streaming completion
-    const stream = provider.stream(request.model, request.context, request.options, server.allocator) catch |err| {
+    const stream = provider.stream(request.model, request.context, injected_options, server.allocator) catch |err| {
         const err_msg = switch (err) {
             error.OutOfMemory => "Out of memory",
             else => "Failed to create stream",
         };
         return try envelope.createNack(
-            .{
-                .stream_id = stream_id,
-                .message_id = in_reply_to,
-                .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
-                .payload = .ping,
-            },
+            nackTemplate(stream_id, in_reply_to),
             err_msg,
             .provider_error,
             server.allocator,
@@ -1365,6 +1431,7 @@ test "handleEnvelope returns nack for stream_request without provider" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1443,6 +1510,7 @@ test "handleStreamRequest creates stream and returns ack" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1499,6 +1567,7 @@ test "handleStreamRequest rejects duplicate stream id" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
     defer req1.deinit(std.testing.allocator);
@@ -1515,6 +1584,7 @@ test "handleStreamRequest rejects duplicate stream id" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
     defer req2.deinit(std.testing.allocator);
@@ -1562,6 +1632,7 @@ test "handleAbortRequest cancels stream" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1654,6 +1725,7 @@ test "cleanupCompletedStreams removes done streams" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1706,6 +1778,7 @@ test "max streams limit enforced" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
     const resp1 = try server.handleEnvelope(req1);
@@ -1725,6 +1798,7 @@ test "max streams limit enforced" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
     const resp2 = try server.handleEnvelope(req2);
@@ -1744,6 +1818,7 @@ test "max streams limit enforced" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
     var resp3 = try server.handleEnvelope(req3);
@@ -1813,6 +1888,7 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1834,6 +1910,7 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1927,6 +2004,7 @@ test "handleAbortRequest rejects duplicate sequence" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -1993,6 +2071,7 @@ test "handleAbortRequest rejects sequence gap" {
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
     };
 
@@ -2021,4 +2100,299 @@ test "handleAbortRequest rejects sequence gap" {
         var mutable_resp = r;
         mutable_resp.deinit(std.testing.allocator);
     }
+}
+
+// ===========================================================================
+// M-006: Credential resolution tests
+// ===========================================================================
+//
+// These tests cover the binary's request-path auth resolution:
+//   1. Explicit API key on the request bypasses storage entirely.
+//   2. Missing API key triggers a storage lookup by `model.provider` and uses
+//      the stored credential (api_key or oauth access token).
+//   3. With neither an explicit key nor a stored credential, the server
+//      returns a `nack` carrying `auth_required` so the TS SDK can drive its
+//      auth retry policy.
+
+/// Stream provider that captures the api_key seen in StreamOptions so tests
+/// can assert that the binary forwarded the resolved credential to the
+/// upstream call. The captured slice is duplicated using the provided
+/// allocator and must be freed by the test.
+// SERIAL-ONLY: these fields are mutable globals. Tests that write CapturedCreds
+// must run serially (the default for `zig test` / `zig build test`). Do not add
+// concurrent tests against this struct without per-test synchronisation.
+const CapturedCreds = struct {
+    var captured_key: ?[]u8 = null;
+    var captured_allocator: ?std.mem.Allocator = null;
+
+    fn reset() void {
+        if (captured_key) |k| {
+            captured_allocator.?.free(k);
+        }
+        captured_key = null;
+        captured_allocator = null;
+    }
+};
+
+fn capturingStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    if (options) |opts| {
+        if (opts.getApiKey()) |key| {
+            CapturedCreds.captured_key = try allocator.dupe(u8, key);
+            CapturedCreds.captured_allocator = allocator;
+        }
+    }
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    const result = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = std.time.milliTimestamp(),
+    };
+    s.complete(result);
+    s.markThreadDone();
+    return s;
+}
+
+test "credential resolution: explicit api_key bypasses storage lookup" {
+    CapturedCreds.reset();
+    defer CapturedCreds.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "test-api",
+        .stream = capturingStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    // Storage HAS a different key for this provider — the explicit key on
+    // the request must win, and the stored key must NOT be observed.
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    {
+        const provider_id = try std.testing.allocator.dupe(u8, "test-provider");
+        const stored = try std.testing.allocator.dupe(u8, "stored-key-MUST-NOT-BE-USED");
+        try storage.providers.put(provider_id, .{ .api_key = stored });
+    }
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var stream_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("explicit-from-client") },
+        } },
+    };
+    defer stream_req_env.deinit(std.testing.allocator);
+
+    const response = try server.handleEnvelope(stream_req_env);
+    try std.testing.expect(response != null);
+    try std.testing.expect(response.?.payload == .ack);
+
+    try std.testing.expect(CapturedCreds.captured_key != null);
+    try std.testing.expectEqualStrings("explicit-from-client", CapturedCreds.captured_key.?);
+}
+
+test "credential resolution: missing api_key loads credentials from storage by provider_id" {
+    CapturedCreds.reset();
+    defer CapturedCreds.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "test-api",
+        .stream = capturingStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    {
+        const provider_id = try std.testing.allocator.dupe(u8, "test-provider");
+        const stored = try std.testing.allocator.dupe(u8, "sk-from-storage");
+        try storage.providers.put(provider_id, .{ .api_key = stored });
+    }
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    // No options → no explicit api_key; resolver must hit storage.
+    var stream_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer stream_req_env.deinit(std.testing.allocator);
+
+    const response = try server.handleEnvelope(stream_req_env);
+    try std.testing.expect(response != null);
+    try std.testing.expect(response.?.payload == .ack);
+
+    try std.testing.expect(CapturedCreds.captured_key != null);
+    try std.testing.expectEqualStrings("sk-from-storage", CapturedCreds.captured_key.?);
+}
+
+test "credential resolution: missing api_key and missing storage entry returns auth_required nack" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    // Empty auth storage — no credentials for this provider.
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var stream_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer stream_req_env.deinit(std.testing.allocator);
+
+    var response = try server.handleEnvelope(stream_req_env);
+    defer if (response) |*r| r.deinit(std.testing.allocator);
+
+    try std.testing.expect(response != null);
+    try std.testing.expect(response.?.payload == .nack);
+    try std.testing.expectEqual(
+        protocol_types.ErrorCode.auth_required,
+        response.?.payload.nack.error_code.?,
+    );
+    // Server must NOT have created a stream when auth fails.
+    try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+}
+
+test "credential resolution: complete_request without credentials returns auth_required nack" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.registerApiProvider(.{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    }, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    var complete_req_env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUuid(),
+        .sequence = 1,
+        .timestamp = std.time.milliTimestamp(),
+        .payload = .{ .complete_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+        } },
+    };
+    defer complete_req_env.deinit(std.testing.allocator);
+
+    var response = try server.handleEnvelope(complete_req_env);
+    defer if (response) |*r| r.deinit(std.testing.allocator);
+
+    try std.testing.expect(response != null);
+    try std.testing.expect(response.?.payload == .nack);
+    try std.testing.expectEqual(
+        protocol_types.ErrorCode.auth_required,
+        response.?.payload.nack.error_code.?,
+    );
 }
