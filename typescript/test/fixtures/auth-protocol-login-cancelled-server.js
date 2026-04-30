@@ -1,6 +1,6 @@
 // Fixture stdio server that emulates a cancelled auth login flow.
-// Emits ack + terminal `auth_login_result.status = cancelled` with no
-// preceding auth events. Used by the SDK auth client tests.
+// Emits ack, `auth_event.error`, then terminal
+// `auth_login_result.status = cancelled`. Used by the SDK auth client tests.
 const readline = require("node:readline");
 const crypto = require("node:crypto");
 
@@ -37,6 +37,24 @@ rl.on("line", (line) => {
       timestamp: Date.now(),
       version: 1,
       payload: { acknowledged_id: envelope.message_id },
+    }) + "\n",
+  );
+  process.stdout.write(
+    JSON.stringify({
+      type: "auth_event",
+      stream_id: flowId,
+      message_id: crypto.randomUUID(),
+      sequence: nextSeq(flowId),
+      timestamp: Date.now(),
+      version: 1,
+      payload: {
+        error: {
+          flow_id: flowId,
+          provider_id: providerId,
+          code: "cancelled",
+          message: "fixture auth cancelled",
+        },
+      },
     }) + "\n",
   );
   process.stdout.write(

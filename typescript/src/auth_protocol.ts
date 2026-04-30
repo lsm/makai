@@ -13,14 +13,19 @@ import {
 
 export type ProviderId = string;
 
-export type AuthStatus =
-  | "authenticated"
-  | "login_required"
-  | "expired"
-  | "refreshing"
-  | "login_in_progress"
-  | "failed"
-  | "unknown";
+export const AUTH_STATUSES = [
+  "authenticated",
+  "login_required",
+  "expired",
+  "refreshing",
+  "login_in_progress",
+  "failed",
+  "unknown",
+] as const;
+
+export type AuthStatus = (typeof AUTH_STATUSES)[number];
+
+const VALID_AUTH_STATUSES = new Set<string>(AUTH_STATUSES);
 
 export interface ProviderAuthInfo {
   id: ProviderId;
@@ -288,6 +293,9 @@ export class MakaiAuthClient implements MakaiAuthApi {
     handlers?: AuthFlowHandlers,
   ): Promise<{ status: "success" }> {
     // Spec §3.6: per-call handlers > client-level defaults > none.
+    // Whole-object replacement: per-call handlers entirely replace defaults
+    // (not per-property merge), so `{ onPrompt }` intentionally drops a
+    // client-level `onEvent`.
     const effective = handlers ?? this.defaultHandlers;
     const flowId = randomUUID();
     let outboundSequence = 1;
@@ -495,7 +503,10 @@ function parseProvider(entry: unknown, index: number): ProviderAuthInfo {
   const provider: ProviderAuthInfo = {
     id,
     name,
-    auth_status: typeof status === "string" ? (status as AuthStatus) : "unknown",
+    auth_status:
+      typeof status === "string" && VALID_AUTH_STATUSES.has(status)
+        ? (status as AuthStatus)
+        : "unknown",
   };
   const lastError = data["last_error"];
   if (typeof lastError === "string" && lastError.length > 0) {
