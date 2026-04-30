@@ -456,7 +456,7 @@ fn resolveAndInjectCredentials(
 } {
     const provided = if (options) |o| o.getApiKey() else null;
 
-    var resolved = auth_resolver.resolveApiKey(
+    const resolved = auth_resolver.resolveApiKey(
         server.allocator,
         server.options.auth_storage,
         provider_id,
@@ -472,7 +472,6 @@ fn resolveAndInjectCredentials(
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
-    errdefer resolved.deinit(server.allocator);
 
     // Build a shallow copy of options with the resolved api_key injected as
     // an owned slice. We must not free the original options' fields here —
@@ -2119,6 +2118,9 @@ test "handleAbortRequest rejects sequence gap" {
 /// can assert that the binary forwarded the resolved credential to the
 /// upstream call. The captured slice is duplicated using the provided
 /// allocator and must be freed by the test.
+// SERIAL-ONLY: these fields are mutable globals. Tests that write CapturedCreds
+// must run serially (the default for `zig test` / `zig build test`). Do not add
+// concurrent tests against this struct without per-test synchronisation.
 const CapturedCreds = struct {
     var captured_key: ?[]u8 = null;
     var captured_allocator: ?std.mem.Allocator = null;
