@@ -355,6 +355,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
             answer = await effective.onPrompt(event);
           } catch (err) {
             this.bestEffortCancel(flowId, outboundSequence++);
+            await this.drainLoginResult(flowId);
             throw new MakaiAuthError(
               err instanceof Error ? err.message : String(err),
               { kind: "unknown" },
@@ -409,6 +410,13 @@ export class MakaiAuthClient implements MakaiAuthApi {
         `unexpected envelope type during login flow: ${String(frame.type)}`,
         { kind: "transport_error" },
       );
+    }
+  }
+
+  private async drainLoginResult(flowId: string): Promise<void> {
+    while (true) {
+      const frame = await this.nextFrameForStream(flowId);
+      if (frame.type === "auth_login_result") return;
     }
   }
 

@@ -121,6 +121,30 @@ test("client.auth.login resolves on success after prompt loop", async () => {
   }
 });
 
+test("client.auth.login drains cancellation after prompt handler throws", async () => {
+  const client = await createMakaiAuthClient(
+    fixtureClientOptions("auth-protocol-prompt-throw-cleanup-server.js"),
+  );
+  try {
+    await assert.rejects(
+      () =>
+        client.auth.login("test-fixture", {
+          onPrompt: () => {
+            throw new Error("prompt handler failed");
+          },
+        }),
+      /prompt handler failed/,
+    );
+
+    const result = await client.auth.login("test-fixture", {
+      onPrompt: () => "letmein",
+    });
+    assert.deepEqual(result, { status: "success" });
+  } finally {
+    await client.close();
+  }
+});
+
 test("client.auth.login rejects with cancelled error on cancelled login result", async () => {
   const client = await createMakaiAuthClient(
     fixtureClientOptions("auth-protocol-login-cancelled-server.js"),
