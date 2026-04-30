@@ -296,6 +296,10 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
         .tools = &tools,
         .max_iterations = 4,
         .transform_context_fn = filterContextForProtocol,
+        // M-006: provide an explicit api_key so the binary's credential
+        // resolver does not reject the upstream stream_request with
+        // `auth_required`. The mock provider does not validate the key.
+        .api_key = "test-key",
     });
     defer {
         stream.deinit();

@@ -303,8 +303,12 @@ pub const ErrorCode = enum {
     duplicate_sequence,
     sequence_gap,
     not_implemented,
+    /// Missing or invalid authentication credentials. The TS SDK uses this code
+    /// to drive the auth-required retry policy (manual login or auto_once).
     auth_required,
+    /// OAuth refresh attempt failed (e.g., refresh token rejected by IdP).
     auth_refresh_failed,
+    /// Stored credentials are expired and cannot be refreshed (no refresh token).
     auth_expired,
 };
 

@@ -839,6 +839,7 @@ const ParseResult = union(enum) {
     content_block_stop: struct { index: usize },
     message_delta: struct { stop_reason: ai_types.StopReason, output_tokens: u64 },
     message_stop: void,
+    api_error: []const u8,
 
     const ContentType = enum { text, thinking, tool_use };
     const ContentDelta = union(enum) {
@@ -943,19 +944,31 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
 
         if (std.mem.eql(u8, delta_type.string, "text_delta")) {
             if (delta_val.object.get("text")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .text = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .text = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "thinking_delta")) {
             if (delta_val.object.get("thinking")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .thinking = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .thinking = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "signature_delta")) {
             if (delta_val.object.get("signature")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .signature = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .signature = duped } } };
+                }
             }
         } else if (std.mem.eql(u8, delta_type.string, "input_json_delta")) {
             if (delta_val.object.get("partial_json")) |v| {
-                if (v == .string) return .{ .content_block_delta = .{ .index = index, .delta = .{ .input_json = v.string } } };
+                if (v == .string) {
+                    const duped = try allocator.dupe(u8, v.string);
+                    return .{ .content_block_delta = .{ .index = index, .delta = .{ .input_json = duped } } };
+                }
             }
         }
 
@@ -996,6 +1009,18 @@ fn parseAnthropicEventType(data: []const u8, allocator: std.mem.Allocator) !Pars
 
     if (std.mem.eql(u8, type_val.string, "message_stop")) {
         return .{ .message_stop = {} };
+    }
+
+    if (std.mem.eql(u8, type_val.string, "error")) {
+        var err_msg: []const u8 = "anthropic api error";
+        if (obj.get("error")) |ev| {
+            if (ev == .object) {
+                if (ev.object.get("message")) |m| {
+                    if (m == .string) err_msg = m.string;
+                }
+            }
+        }
+        return .{ .api_error = try allocator.dupe(u8, err_msg) };
     }
 
     return .{ .none = {} };
@@ -1195,7 +1220,15 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
-        req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+        // SSE streams must not be gzip-compressed — gzip buffers the entire
+        // stream before delivery, breaking real-time event delivery.
+        // Use .headers.accept_encoding = .{ .override = "identity" } to
+        // replace the Zig HTTP client's built-in "accept-encoding: gzip, deflate"
+        // with "accept-encoding: identity" (no compression).
+        req = client.request(.POST, uri, .{
+            .extra_headers = headers.items,
+            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+        }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1383,6 +1416,25 @@ fn runThread(ctx: *ThreadCtx) void {
     var current_thinking_signature = std.ArrayList(u8){};
     defer current_thinking_signature.deinit(allocator);
 
+    // Deferred frees for delta strings pushed to the stream.
+    // stream.push() stores borrowed references (owns_events=false); we must not free
+    // a delta string until AFTER the SSE loop exits to avoid a GPA timing issue where
+    // an in-flight free interleaves with subsequent GPA allocations in the same thread
+    // (content_blocks.append / block_map.put), which can silently fail under load.
+    // By collecting delta pointers here and freeing them all at thread exit we:
+    //   a) eliminate the leak the GPA would otherwise report, and
+    //   b) guarantee the frees only happen after all SSE processing is complete.
+    var pending_delta_frees = std.ArrayList([]const u8){};
+    defer {
+        for (pending_delta_frees.items) |s| allocator.free(s);
+        pending_delta_frees.deinit(allocator);
+    }
+
+    // Accumulate raw response bytes for error diagnosis (up to 8 KB).
+    // Used to detect non-SSE JSON error bodies returned with HTTP 200.
+    var raw_body = std.ArrayList(u8){};
+    defer raw_body.deinit(allocator);
+
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
 
@@ -1425,6 +1477,12 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         if (n == 0) break;
+
+        // Accumulate raw bytes for error diagnosis (capped at 8 KB)
+        if (raw_body.items.len < 8192) {
+            const cap = 8192 - raw_body.items.len;
+            raw_body.appendSlice(allocator, read_buf[0..@min(n, cap)]) catch {};
+        }
 
         const events = parser.feed(read_buf[0..n]) catch {
             allocator.free(api_key);
@@ -1494,15 +1552,24 @@ fn runThread(ctx: *ThreadCtx) void {
                             .text => |txt| {
                                 current_text.appendSlice(allocator, txt) catch {};
                                 stream.push(.{ .text_delta = .{ .content_index = block_info.content_index, .delta = txt, .partial = partial } }) catch {};
+                                // Defer the free: freeing a duped delta while the SSE loop is still
+                                // running can interfere with subsequent GPA allocations (block_map.put,
+                                // content_blocks.append) causing them to silently fail. Track the pointer
+                                // and free the batch at thread exit via pending_delta_frees.
+                                pending_delta_frees.append(allocator, txt) catch allocator.free(txt);
                             },
                             .thinking => |thk| {
                                 current_thinking.appendSlice(allocator, thk) catch {};
                                 stream.push(.{ .thinking_delta = .{ .content_index = block_info.content_index, .delta = thk, .partial = partial } }) catch {};
+                                pending_delta_frees.append(allocator, thk) catch allocator.free(thk);
                             },
                             .signature => |sig| {
                                 current_thinking_signature.appendSlice(allocator, sig) catch {};
+                                // sig is not stored in the stream, so it is safe to free immediately.
+                                allocator.free(sig);
                             },
                             .input_json => |json_delta| {
+                                // appendDelta copies json_delta into its accumulator.
                                 tc_tracker.appendDelta(cbd.index, json_delta) catch {};
 
                                 if (tc_tracker.getContentIndex(cbd.index)) |content_idx| {
@@ -1512,7 +1579,12 @@ fn runThread(ctx: *ThreadCtx) void {
                                         .partial = createPartialMessage(model),
                                     } }) catch {};
                                 }
+                                pending_delta_frees.append(allocator, json_delta) catch allocator.free(json_delta);
                             },
+                        }
+                    } else {
+                        switch (cbd.delta) {
+                            inline else => |s| allocator.free(s),
                         }
                     }
                 },
@@ -1585,6 +1657,38 @@ fn runThread(ctx: *ThreadCtx) void {
                     usage.calculateCost(model.cost);
                 },
                 .message_stop => {},
+                .api_error => |err| {
+                    defer allocator.free(err);
+                    allocator.free(api_key);
+                    allocator.free(request_body);
+                    allocator.destroy(ctx);
+                    stream.markThreadDone();
+                    stream.completeWithError(err);
+                    return;
+                },
+            }
+        }
+    }
+
+    // Flush SSE parser: finalizes any partial event that was missing its trailing \n\n.
+    // This handles truncated SSE responses where the API closes the connection before
+    // sending the final blank line.  Only api_error is actionable here; other events
+    // from a genuinely truncated stream are incomplete and best ignored.
+    {
+        const tail = parser.feed("\n\n") catch &.{};
+        for (tail) |ev| {
+            const result = parseAnthropicEventType(ev.data, allocator) catch continue;
+            switch (result) {
+                .api_error => |err| {
+                    defer allocator.free(err);
+                    allocator.free(api_key);
+                    allocator.free(request_body);
+                    allocator.destroy(ctx);
+                    stream.markThreadDone();
+                    stream.completeWithError(err);
+                    return;
+                },
+                else => {},
             }
         }
     }
@@ -1605,9 +1709,48 @@ fn runThread(ctx: *ThreadCtx) void {
         content_blocks.append(allocator, .{ .text = .{ .text = text_copy } }) catch {};
     }
 
-    // If still no content, add an empty text block
+    // If still no content, try to detect a plain JSON error body (no SSE framing)
+    // that Anthropic sometimes returns with HTTP 200 under load.
     if (content_blocks.items.len == 0) {
-        content_blocks.append(allocator, .{ .text = .{ .text = "" } }) catch {};
+        var err_text: []const u8 = "anthropic returned empty response with no content blocks";
+        var err_owned: ?[]u8 = null;
+        defer if (err_owned) |e| allocator.free(e);
+
+        if (raw_body.items.len > 0) {
+            // Attempt to parse the entire raw body as a JSON error object
+            if (std.json.parseFromSlice(std.json.Value, allocator, raw_body.items, .{})) |body_json| {
+                defer body_json.deinit();
+                if (body_json.value == .object) {
+                    if (body_json.value.object.get("type")) |bt| {
+                        if (bt == .string and std.mem.eql(u8, bt.string, "error")) {
+                            var emsg: []const u8 = "anthropic api error";
+                            if (body_json.value.object.get("error")) |e| {
+                                if (e == .object) {
+                                    if (e.object.get("message")) |m| {
+                                        if (m == .string) emsg = m.string;
+                                    }
+                                }
+                            }
+                            err_owned = allocator.dupe(u8, emsg) catch null;
+                            if (err_owned) |e| err_text = e;
+                        }
+                    }
+                }
+            } else |_| {}
+
+            // If not a JSON error body, include the byte count for self-diagnosing failures
+            if (err_owned == null) {
+                err_owned = std.fmt.allocPrint(allocator, "anthropic: empty response ({d} raw bytes, no SSE events)", .{raw_body.items.len}) catch null;
+                if (err_owned) |e| err_text = e;
+            }
+        }
+
+        allocator.free(api_key);
+        allocator.free(request_body);
+        allocator.destroy(ctx);
+        stream.markThreadDone();
+        stream.completeWithError(err_text);
+        return; // defer fires, freeing err_owned after completeWithError has duped err_text
     }
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {

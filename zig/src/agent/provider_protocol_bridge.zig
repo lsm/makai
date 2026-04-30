@@ -284,7 +284,10 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
-    const stream = try protocol.stream(model, ctx, .{}, allocator);
+    // Provide an explicit api_key so the binary-side credential resolver
+    // (M-006) does not reject the request with `auth_required`. The mock
+    // provider does not validate the key value.
+    const stream = try protocol.stream(model, ctx, .{ .api_key = "test-key" }, allocator);
     defer {
         stream.deinit();
         allocator.destroy(stream);

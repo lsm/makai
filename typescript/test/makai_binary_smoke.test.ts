@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createMakaiStdioClient, loginWithMakaiAuth, StdioProtocolError } from "../src";
+import { createMakaiAuthClient, createMakaiStdioClient, StdioProtocolError } from "../src";
 
 const binaryPath = process.env.MAKAI_BINARY_PATH;
 
@@ -65,11 +65,13 @@ test("e2e: auth login persists credentials", async (t) => {
   }
 
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-auth-home-"));
+  const client = await createMakaiAuthClient({
+    resolver: { binaryPath },
+    env: { ...process.env, HOME: tempHome },
+    handshakeTimeoutMs: 1000,
+  });
   try {
-    await loginWithMakaiAuth({
-      resolver: { binaryPath },
-      provider: "test-fixture",
-      env: { ...process.env, HOME: tempHome },
+    await client.auth.login("test-fixture", {
       onPrompt: async () => "ok",
     });
     const authPath = path.join(tempHome, ".makai", "auth.json");
@@ -78,6 +80,7 @@ test("e2e: auth login persists credentials", async (t) => {
     assert.equal(typeof parsed["test-fixture"]?.refresh, "string");
     assert.equal(typeof parsed["test-fixture"]?.access, "string");
   } finally {
+    await client.close();
     await fs.rm(tempHome, { recursive: true, force: true });
   }
 });

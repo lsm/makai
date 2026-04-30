@@ -1,10 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
-const auth_providers = @import("auth/providers");
-const anthropic_oauth = @import("oauth/anthropic");
-const github_oauth = @import("oauth/github_copilot");
-const oauth_storage = @import("oauth/storage");
 const register_builtins = @import("register_builtins");
 const provider_protocol_server = @import("protocol_server");
 const provider_protocol_runtime = @import("protocol_runtime");
@@ -15,6 +11,7 @@ const agent_protocol_envelope = @import("agent_envelope");
 const auth_protocol_server = @import("auth_server");
 const auth_protocol_runtime = @import("auth_runtime");
 const auth_protocol_envelope = @import("auth_envelope");
+const auth_cli = @import("auth_cli");
 const event_stream = @import("event_stream");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
@@ -45,113 +42,12 @@ const RuntimeErrorCode = enum {
     runtime_error,
 };
 
-const AuthContext = struct {
-    allocator: std.mem.Allocator,
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    provider_id: []const u8,
-    json_mode: bool,
-
-    fn emitJson(self: *const AuthContext, value: anytype) !void {
-        const payload = try std.json.Stringify.valueAlloc(self.allocator, value, .{});
-        defer self.allocator.free(payload);
-        try self.stdout.writeAll(payload);
-        try self.stdout.writeAll("\n");
-    }
-
-    fn emitProgress(self: *const AuthContext, message: []const u8) !void {
-        if (self.json_mode) {
-            try self.emitJson(.{
-                .type = "progress",
-                .provider = self.provider_id,
-                .message = message,
-            });
-            return;
-        }
-        try self.stdout.writeAll(message);
-        try self.stdout.writeAll("\n");
-    }
-
-    fn emitAuthInfo(self: *const AuthContext, url: []const u8, instructions: ?[]const u8) !void {
-        if (self.json_mode) {
-            try self.emitJson(.{
-                .type = "auth_url",
-                .provider = self.provider_id,
-                .url = url,
-                .instructions = instructions,
-            });
-            return;
-        }
-        try self.stdout.writeAll(url);
-        try self.stdout.writeAll("\n");
-        if (instructions) |msg| {
-            try self.stdout.writeAll(msg);
-            try self.stdout.writeAll("\n");
-        }
-    }
-
-    fn emitPrompt(self: *const AuthContext, message: []const u8, allow_empty: bool) !void {
-        if (self.json_mode) {
-            try self.emitJson(.{
-                .type = "prompt",
-                .provider = self.provider_id,
-                .message = message,
-                .allow_empty = allow_empty,
-            });
-            return;
-        }
-        try self.stdout.writeAll(message);
-        try self.stdout.writeAll(" ");
-    }
-};
-
-var g_auth_ctx: ?*AuthContext = null;
-var g_stdin_buf: [4096]u8 = undefined;
-
-fn readInput(allocator: std.mem.Allocator, stdin: std.fs.File) ![]const u8 {
-    var reader = stdin.reader(&g_stdin_buf);
-    const line = (try reader.interface.takeDelimiter('\n')) orelse "";
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    return try allocator.dupe(u8, trimmed);
-}
-
-fn readPromptInput(message: []const u8, allow_empty: bool) []const u8 {
-    const ctx = g_auth_ctx orelse unreachable;
-    const empty = struct {
-        fn make(allocator: std.mem.Allocator) []const u8 {
-            return allocator.alloc(u8, 0) catch @panic("OOM");
-        }
-    }.make;
-    while (true) {
-        ctx.emitPrompt(message, allow_empty) catch return empty(ctx.allocator);
-        const value = readInput(ctx.allocator, ctx.stdin) catch return empty(ctx.allocator);
-        if (allow_empty or value.len > 0) {
-            return value;
-        }
-        ctx.allocator.free(value);
-        ctx.emitProgress("Input cannot be empty.") catch {};
-    }
-}
-
-fn anthropicOnAuth(info: anthropic_oauth.AuthInfo) void {
-    if (g_auth_ctx) |ctx| {
-        ctx.emitAuthInfo(info.url, info.instructions) catch {};
-    }
-}
-
-fn anthropicOnPrompt(prompt: anthropic_oauth.Prompt) []const u8 {
-    return readPromptInput(prompt.message, prompt.allow_empty);
-}
-
-fn githubOnAuth(info: github_oauth.AuthInfo) void {
-    if (g_auth_ctx) |ctx| {
-        ctx.emitAuthInfo(info.url, info.instructions) catch {};
-    }
-}
-
-fn githubOnPrompt(prompt: github_oauth.Prompt) []const u8 {
-    return readPromptInput(prompt.message, prompt.allow_empty);
-}
+// NOTE: legacy auth-context globals (`g_auth_ctx`, `AuthContext`, OAuth-callback
+// bridges, fixture/anthropic/github login helpers, `saveOAuthCredentials`) were
+// removed in M-013 when the CLI auth commands were migrated to thin wrappers
+// over the auth protocol runtime. The orchestration now lives in
+// `src/tools/auth_cli.zig` (driving `AuthProtocolServer` in-process) and is
+// shared with the `--stdio` mode below.
 
 const StdioProtocolLoop = struct {
     allocator: std.mem.Allocator,
@@ -503,169 +399,42 @@ fn printUsage(file: std.fs.File) !void {
     );
 }
 
-fn listAuthProviders(file: std.fs.File, allocator: std.mem.Allocator, json_mode: bool) !void {
-    if (json_mode) {
-        const providers = .{ .type = "providers", .providers = auth_providers.AUTH_PROVIDER_DEFINITIONS };
-        const payload = try std.json.Stringify.valueAlloc(allocator, providers, .{});
-        defer allocator.free(payload);
-        try file.writeAll(payload);
-        try file.writeAll("\n");
-        return;
-    }
+/// Production auth-server options for the CLI wrapper. Real OAuth flows are
+/// enabled and credentials are persisted to ~/.makai/auth.json by the runtime.
+const PRODUCTION_AUTH_SERVER_OPTIONS = auth_protocol_server.AuthProtocolServer.Options{
+    .persist_credentials = true,
+    .enable_real_oauth = true,
+};
 
-    for (auth_providers.AUTH_PROVIDER_DEFINITIONS) |provider| {
-        try file.writeAll(provider.id);
-        try file.writeAll("\n");
-    }
+fn handleAuth(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stdin: std.fs.File,
+    stdout: std.fs.File,
+    stderr: std.fs.File,
+) !void {
+    return handleAuthWithOptions(args, allocator, stdin, stdout, stderr, PRODUCTION_AUTH_SERVER_OPTIONS);
 }
 
-fn runTestFixtureLogin(allocator: std.mem.Allocator) !oauth_storage.Credentials {
-    const ctx = g_auth_ctx orelse unreachable;
-    try ctx.emitAuthInfo(
-        "https://example.invalid/makai-test-fixture-login",
-        "Enter code 'ok' to complete fixture login.",
-    );
-    const code = readPromptInput("Enter fixture code:", false);
-    defer allocator.free(code);
-
-    if (!std.mem.eql(u8, code, "ok")) {
-        return error.InvalidAuthCode;
-    }
-
-    return .{
-        .refresh = try allocator.dupe(u8, "fixture-refresh-token"),
-        .access = try allocator.dupe(u8, "fixture-access-token"),
-        .expires = std.time.milliTimestamp() + (60 * 60 * 1000),
-        .provider_data = try allocator.dupe(u8, "{\"provider\":\"test-fixture\"}"),
-    };
-}
-
-fn loginAnthropic(allocator: std.mem.Allocator) !oauth_storage.Credentials {
-    const credentials = try anthropic_oauth.login(.{
-        .onAuth = anthropicOnAuth,
-        .onPrompt = anthropicOnPrompt,
-    }, allocator);
-    return .{
-        .refresh = credentials.refresh,
-        .access = credentials.access,
-        .expires = credentials.expires,
-    };
-}
-
-fn loginGitHubCopilot(allocator: std.mem.Allocator) !oauth_storage.Credentials {
-    const credentials = try github_oauth.login(.{
-        .onAuth = githubOnAuth,
-        .onPrompt = githubOnPrompt,
-    }, allocator);
-
-    if (credentials.enabled_models) |models| {
-        for (models) |m| allocator.free(m);
-        allocator.free(models);
-    }
-    if (credentials.base_url) |url| allocator.free(url);
-
-    return .{
-        .refresh = credentials.refresh,
-        .access = credentials.access,
-        .expires = credentials.expires,
-        .provider_data = credentials.provider_data,
-    };
-}
-
-fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !void {
-    var storage = try oauth_storage.AuthStorage.loadFromFile(allocator);
-    defer storage.deinit();
-
-    if (storage.providers.fetchRemove(provider_id)) |existing| {
-        allocator.free(existing.key);
-        existing.value.deinit(allocator);
-    }
-
-    const key = try allocator.dupe(u8, provider_id);
-    try storage.providers.put(key, .{
-        .oauth = .{
-            .refresh = credentials.refresh,
-            .access = credentials.access,
-            .expires = credentials.expires,
-            .provider_data = credentials.provider_data,
-        },
-    });
-    try storage.saveToFile();
-}
-
-fn loginAuthProvider(args: []const []const u8, allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File, stderr: std.fs.File) !void {
-    var provider_id: ?[]const u8 = null;
-    var json_mode = false;
-
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--provider")) {
-            i += 1;
-            if (i >= args.len) return error.InvalidArgument;
-            provider_id = args[i];
-            continue;
-        }
-        if (std.mem.eql(u8, args[i], "--json")) {
-            json_mode = true;
-            continue;
-        }
-        return error.InvalidArgument;
-    }
-
-    const provider = provider_id orelse return error.InvalidArgument;
-    var ctx = AuthContext{
-        .allocator = allocator,
-        .stdin = stdin,
-        .stdout = stdout,
-        .provider_id = provider,
-        .json_mode = json_mode,
-    };
-
-    g_auth_ctx = &ctx;
-    defer g_auth_ctx = null;
-
-    var credentials = (if (std.mem.eql(u8, provider, "test-fixture"))
-        runTestFixtureLogin(allocator)
-    else if (std.mem.eql(u8, provider, "anthropic"))
-        loginAnthropic(allocator)
-    else if (std.mem.eql(u8, provider, "github-copilot"))
-        loginGitHubCopilot(allocator)
-    else
-        error.UnknownProvider) catch |err| {
-        if (json_mode) {
-            try ctx.emitJson(.{
-                .type = "error",
-                .provider = provider,
-                .code = @errorName(err),
-                .message = "auth login failed",
-            });
-        } else {
-            try stderr.writeAll("auth login failed: ");
-            try stderr.writeAll(@errorName(err));
-            try stderr.writeAll("\n");
-        }
-        return err;
-    };
-    var credentials_consumed = false;
-    defer if (!credentials_consumed) credentials.deinit(allocator);
-
-    try saveOAuthCredentials(provider, credentials, allocator);
-    credentials_consumed = true;
-
-    if (json_mode) {
-        try ctx.emitJson(.{
-            .type = "success",
-            .provider = provider,
-        });
-    } else {
-        try stdout.writeAll("Login successful.\n");
-    }
-}
-
-fn handleAuth(args: []const []const u8, allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File, stderr: std.fs.File) !void {
+/// Drive the auth protocol runtime in-process to service `makai auth providers`
+/// and `makai auth login`. Output shape matches the pre-M-013 CLI so existing
+/// scripts/tooling continue to work unchanged. Tests inject options that
+/// disable real OAuth and credential persistence.
+fn handleAuthWithOptions(
+    args: []const []const u8,
+    allocator: std.mem.Allocator,
+    stdin: std.fs.File,
+    stdout: std.fs.File,
+    stderr: std.fs.File,
+    server_options: auth_protocol_server.AuthProtocolServer.Options,
+) !void {
     if (args.len == 0) {
         return error.InvalidArgument;
     }
+
+    var file_io = auth_cli.FileIo.init(allocator, stdin, stdout, stderr);
+    defer file_io.deinit();
+    const io = file_io.io();
 
     if (std.mem.eql(u8, args[0], "providers")) {
         var json_mode = false;
@@ -676,12 +445,34 @@ fn handleAuth(args: []const []const u8, allocator: std.mem.Allocator, stdin: std
                 return error.InvalidArgument;
             }
         }
-        try listAuthProviders(stdout, allocator, json_mode);
+        try auth_cli.runProvidersCommand(allocator, io, server_options, .{ .json_mode = json_mode });
         return;
     }
 
     if (std.mem.eql(u8, args[0], "login")) {
-        try loginAuthProvider(args[1..], allocator, stdin, stdout, stderr);
+        var provider_id: ?[]const u8 = null;
+        var json_mode = false;
+
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--provider")) {
+                i += 1;
+                if (i >= args.len) return error.InvalidArgument;
+                provider_id = args[i];
+                continue;
+            }
+            if (std.mem.eql(u8, args[i], "--json")) {
+                json_mode = true;
+                continue;
+            }
+            return error.InvalidArgument;
+        }
+
+        const provider = provider_id orelse return error.InvalidArgument;
+        try auth_cli.runLoginCommand(allocator, io, server_options, .{
+            .provider_id = provider,
+            .json_mode = json_mode,
+        });
         return;
     }
 
@@ -881,6 +672,10 @@ fn makeProviderStreamRequestEnvelopeJson(
         .payload = .{ .stream_request = .{
             .model = fixtureModel(api),
             .context = .{ .messages = &.{} },
+            // Provide an explicit api_key so the binary's credential resolver
+            // (M-006) does not reject the request with `auth_required`. The
+            // fixture providers do not validate the key value.
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-fixture-key") },
         } },
     };
     defer env.deinit(allocator);
@@ -1530,6 +1325,199 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     stdin_write.close();
     stdin_write_closed = true;
     try std.testing.expect(runner.err == null);
+}
+
+// =============================================================================
+// CLI wrapper integration tests (end-to-end via handleAuthWithOptions)
+//
+// These tests exercise the full `makai auth ...` CLI wrapper path: argv
+// parsing, in-process auth protocol runtime, and pipe-backed stdio. They
+// inject server options that disable real OAuth + credential persistence so
+// the wrapper never touches `~/.makai/auth.json` or external services.
+// =============================================================================
+
+const TEST_AUTH_SERVER_OPTIONS = auth_protocol_server.AuthProtocolServer.Options{
+    .persist_credentials = false,
+    .enable_real_oauth = false,
+};
+
+/// Spawn `handleAuthWithOptions` on a worker thread fed by pipe-backed stdio
+/// so tests can stream input and read output without touching real fds.
+const AuthCliHarness = struct {
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+
+    stdin_read: std.fs.File,
+    stdin_write: std.fs.File,
+    stdout_read: std.fs.File,
+    stdout_write: std.fs.File,
+    stderr_read: std.fs.File,
+    stderr_write: std.fs.File,
+
+    err: ?anyerror = null,
+
+    fn init(allocator: std.mem.Allocator, args: []const []const u8) !AuthCliHarness {
+        const stdin_pipe = try std.posix.pipe();
+        const stdout_pipe = try std.posix.pipe();
+        const stderr_pipe = try std.posix.pipe();
+
+        return .{
+            .allocator = allocator,
+            .args = args,
+            .stdin_read = std.fs.File{ .handle = stdin_pipe[0] },
+            .stdin_write = std.fs.File{ .handle = stdin_pipe[1] },
+            .stdout_read = std.fs.File{ .handle = stdout_pipe[0] },
+            .stdout_write = std.fs.File{ .handle = stdout_pipe[1] },
+            .stderr_read = std.fs.File{ .handle = stderr_pipe[0] },
+            .stderr_write = std.fs.File{ .handle = stderr_pipe[1] },
+        };
+    }
+
+    fn run(self: *AuthCliHarness) void {
+        defer {
+            // The wrapper does not own these fds; closing them here lets the
+            // reader side observe EOF after the command finishes.
+            self.stdout_write.close();
+            self.stderr_write.close();
+            self.stdin_read.close();
+        }
+
+        handleAuthWithOptions(
+            self.args,
+            self.allocator,
+            self.stdin_read,
+            self.stdout_write,
+            self.stderr_write,
+            TEST_AUTH_SERVER_OPTIONS,
+        ) catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn readAll(file: std.fs.File, allocator: std.mem.Allocator) ![]u8 {
+        var buf = std.ArrayList(u8){};
+        defer buf.deinit(allocator);
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            const n = file.read(&chunk) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                else => return err,
+            };
+            if (n == 0) break;
+            try buf.appendSlice(allocator, chunk[0..n]);
+        }
+        return try allocator.dupe(u8, buf.items);
+    }
+};
+
+test "handleAuth providers end-to-end through CLI wrapper emits provider ids" {
+    const allocator = std.testing.allocator;
+
+    var harness = try AuthCliHarness.init(allocator, &.{"providers"});
+    const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
+
+    // No stdin needed; close immediately so the worker doesn't block on read.
+    harness.stdin_write.close();
+
+    const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
+    defer allocator.free(stdout_bytes);
+    const stderr_bytes = try AuthCliHarness.readAll(harness.stderr_read, allocator);
+    defer allocator.free(stderr_bytes);
+
+    thread.join();
+    harness.stdout_read.close();
+    harness.stderr_read.close();
+
+    try std.testing.expect(harness.err == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "anthropic\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "github-copilot\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "test-fixture\n") != null);
+    try std.testing.expectEqual(@as(usize, 0), stderr_bytes.len);
+}
+
+test "handleAuth providers --json end-to-end emits backward-compatible shape" {
+    const allocator = std.testing.allocator;
+
+    var harness = try AuthCliHarness.init(allocator, &.{ "providers", "--json" });
+    const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
+
+    harness.stdin_write.close();
+
+    const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
+    defer allocator.free(stdout_bytes);
+    const stderr_bytes = try AuthCliHarness.readAll(harness.stderr_read, allocator);
+    defer allocator.free(stderr_bytes);
+
+    thread.join();
+    harness.stdout_read.close();
+    harness.stderr_read.close();
+
+    try std.testing.expect(harness.err == null);
+
+    const trimmed = std.mem.trim(u8, stdout_bytes, " \t\r\n");
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("providers", root.get("type").?.string);
+    const providers = root.get("providers").?.array;
+    try std.testing.expect(providers.items.len >= 3);
+    try std.testing.expectEqual(@as(usize, 0), stderr_bytes.len);
+}
+
+test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
+    const allocator = std.testing.allocator;
+
+    var harness = try AuthCliHarness.init(allocator, &.{ "login", "--provider", "test-fixture" });
+    const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
+
+    // Reject first attempt to force the prompt loop to iterate, then accept.
+    try harness.stdin_write.writeAll("not-the-answer\nok\n");
+    harness.stdin_write.close();
+
+    const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
+    defer allocator.free(stdout_bytes);
+    const stderr_bytes = try AuthCliHarness.readAll(harness.stderr_read, allocator);
+    defer allocator.free(stderr_bytes);
+
+    thread.join();
+    harness.stdout_read.close();
+    harness.stderr_read.close();
+
+    try std.testing.expect(harness.err == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout_bytes,
+        "https://example.invalid/makai-test-fixture-login",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "Login successful.") != null);
+
+    // Tokens must never appear in CLI-visible streams.
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "fixture-access-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "fixture-access-token") == null);
+}
+
+test "handleAuth login surfaces typed error for unknown provider via CLI wrapper" {
+    const allocator = std.testing.allocator;
+
+    var harness = try AuthCliHarness.init(allocator, &.{ "login", "--provider", "no-such-provider" });
+    const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
+
+    harness.stdin_write.close();
+
+    const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
+    defer allocator.free(stdout_bytes);
+    const stderr_bytes = try AuthCliHarness.readAll(harness.stderr_read, allocator);
+    defer allocator.free(stderr_bytes);
+
+    thread.join();
+    harness.stdout_read.close();
+    harness.stderr_read.close();
+
+    try std.testing.expectEqual(auth_cli.AuthCliError.AuthLoginFailed, harness.err.?);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "auth login failed") != null);
 }
 
 pub fn main() !void {
