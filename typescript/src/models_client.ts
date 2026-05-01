@@ -21,12 +21,16 @@
 
 import { randomUUID } from "node:crypto";
 import {
+  AuthStatus,
   ListModelsRequest,
   ListModelsResponse,
   MakaiModelsApi,
   MakaiProtocolError,
   ModelCapability,
   ModelDescriptor,
+  ModelLifecycle,
+  ModelSource,
+  ReasoningLevel,
   ResolveModelRequest,
   ResolveModelResponse,
 } from "./models_types";
@@ -35,6 +39,22 @@ import { MakaiStdioClient, StdioFrame } from "./stdio_client";
 const ENVELOPE_VERSION = 1;
 const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omits
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
+
+const KNOWN_AUTH_STATUSES: ReadonlySet<string> = new Set([
+  "authenticated",
+  "login_required",
+  "expired",
+  "refreshing",
+  "login_in_progress",
+  "failed",
+  "unknown",
+]);
+
+const KNOWN_LIFECYCLES: ReadonlySet<string> = new Set([
+  "stable",
+  "preview",
+  "deprecated",
+]);
 
 const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
   "chat",
@@ -45,6 +65,20 @@ const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set([
   "prompt_cache",
   "audio_input",
   "audio_output",
+]);
+
+const KNOWN_SOURCES: ReadonlySet<string> = new Set([
+  "dynamic",
+  "static_fallback",
+]);
+
+const KNOWN_REASONING_LEVELS: ReadonlySet<string> = new Set([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
 ]);
 
 export interface ModelsApiOptions {
@@ -68,6 +102,7 @@ export function createMakaiModelsApi(
 
 class StdioModelsApi implements MakaiModelsApi {
   private readonly responseTimeoutMs: number;
+  private dispatchLock: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly client: MakaiStdioClient,
@@ -107,6 +142,24 @@ class StdioModelsApi implements MakaiModelsApi {
   }
 
   private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
+    return this.withDispatchLock(() => this.dispatchLocked(request));
+  }
+
+  private async withDispatchLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.dispatchLock;
+    let release!: () => void;
+    this.dispatchLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async dispatchLocked(request: ListModelsRequest): Promise<ListModelsResponse> {
     const streamId = randomUUID();
     const envelope: StdioFrame = {
       type: "models_request",
@@ -129,11 +182,14 @@ class StdioModelsApi implements MakaiModelsApi {
       }
       const frame = await this.client.nextFrame(remaining);
 
-      // V1 sequencing: requests are issued one at a time per client. We still
-      // skip frames belonging to a different stream so a stale event from a
-      // prior request cannot poison the next.
+      // `withDispatchLock` serializes client.models.* calls so this request's
+      // read loop cannot consume another models_request response. A foreign
+      // stream here indicates another API is sharing the same raw stdio
+      // transport concurrently; fail loudly rather than silently dropping it.
       if (typeof frame.stream_id === "string" && frame.stream_id !== streamId) {
-        continue;
+        throw new MakaiProtocolError(
+          `received frame for unexpected stream ${frame.stream_id} while awaiting ${streamId}`,
+        );
       }
 
       switch (frame.type) {
@@ -221,9 +277,21 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
   const displayName = requireString(raw.display_name, `models[${idx}].display_name`);
   const providerId = requireString(raw.provider_id, `models[${idx}].provider_id`);
   const api = requireString(raw.api, `models[${idx}].api`);
-  const authStatus = requireString(raw.auth_status, `models[${idx}].auth_status`);
-  const lifecycle = requireString(raw.lifecycle, `models[${idx}].lifecycle`);
-  const source = requireString(raw.source, `models[${idx}].source`);
+  const authStatus = requireKnownString(
+    raw.auth_status,
+    `models[${idx}].auth_status`,
+    KNOWN_AUTH_STATUSES,
+  ) as AuthStatus;
+  const lifecycle = requireKnownString(
+    raw.lifecycle,
+    `models[${idx}].lifecycle`,
+    KNOWN_LIFECYCLES,
+  ) as ModelLifecycle;
+  const source = requireKnownString(
+    raw.source,
+    `models[${idx}].source`,
+    KNOWN_SOURCES,
+  ) as ModelSource;
 
   if (!Array.isArray(raw.capabilities)) {
     throw new MakaiProtocolError(`models[${idx}].capabilities must be an array`);
@@ -251,10 +319,10 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
     display_name: displayName,
     provider_id: providerId,
     api,
-    auth_status: authStatus as ModelDescriptor["auth_status"],
-    lifecycle: lifecycle as ModelDescriptor["lifecycle"],
+    auth_status: authStatus,
+    lifecycle,
     capabilities,
-    source: source as ModelDescriptor["source"],
+    source,
   };
 
   if (typeof raw.base_url === "string" && raw.base_url.length > 0) {
@@ -266,8 +334,12 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
   if (typeof raw.max_output_tokens === "number" && Number.isFinite(raw.max_output_tokens)) {
     descriptor.max_output_tokens = raw.max_output_tokens;
   }
-  if (typeof raw.reasoning_default === "string" && raw.reasoning_default.length > 0) {
-    descriptor.reasoning_default = raw.reasoning_default as ModelDescriptor["reasoning_default"];
+  if (raw.reasoning_default !== undefined) {
+    descriptor.reasoning_default = requireKnownString(
+      raw.reasoning_default,
+      `models[${idx}].reasoning_default`,
+      KNOWN_REASONING_LEVELS,
+    ) as ReasoningLevel;
   }
   if (isObject(raw.metadata)) {
     const metadata: Record<string, string> = {};
@@ -291,6 +363,18 @@ function requireString(value: unknown, fieldName: string): string {
     throw new MakaiProtocolError(`${fieldName} must be a string`);
   }
   return value;
+}
+
+function requireKnownString(
+  value: unknown,
+  fieldName: string,
+  knownValues: ReadonlySet<string>,
+): string {
+  const text = requireString(value, fieldName);
+  if (!knownValues.has(text)) {
+    throw new MakaiProtocolError(`${fieldName} has unknown value: ${text}`);
+  }
+  return text;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

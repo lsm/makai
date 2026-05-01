@@ -63,6 +63,26 @@ emit({ type: "ready", protocol_version: "1" });
 const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
 const modelsResponse = loadJson(process.env.MAKAI_TEST_RESPONSE_PATH);
 const nackPayload = loadJson(process.env.MAKAI_TEST_NACK_PATH);
+const responseDelayMs = Number(process.env.MAKAI_TEST_RESPONSE_DELAY_MS || "0");
+
+function respond(env) {
+  if (nackPayload) {
+    emit(
+      buildResponse(env, "nack", {
+        rejected_id: env.message_id,
+        ...nackPayload,
+      }),
+    );
+    return;
+  }
+
+  if (!modelsResponse) {
+    process.stderr.write("fixture: no MAKAI_TEST_RESPONSE_PATH or MAKAI_TEST_NACK_PATH set\n");
+    process.exit(1);
+  }
+
+  emit(buildResponse(env, "models_response", modelsResponse));
+}
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -88,22 +108,11 @@ rl.on("line", (line) => {
 
   emit(buildAck(env));
 
-  if (nackPayload) {
-    emit(
-      buildResponse(env, "nack", {
-        rejected_id: env.message_id,
-        ...nackPayload,
-      }),
-    );
-    return;
+  if (Number.isFinite(responseDelayMs) && responseDelayMs > 0) {
+    setTimeout(() => respond(env), responseDelayMs);
+  } else {
+    respond(env);
   }
-
-  if (!modelsResponse) {
-    process.stderr.write("fixture: no MAKAI_TEST_RESPONSE_PATH or MAKAI_TEST_NACK_PATH set\n");
-    process.exit(1);
-  }
-
-  emit(buildResponse(env, "models_response", modelsResponse));
 });
 
 rl.on("close", () => {

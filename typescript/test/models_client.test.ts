@@ -48,6 +48,7 @@ type Harness = {
 async function setupHarness(opts: {
   response?: ListModelsResponse;
   nack?: { reason: string; error_code?: string };
+  responseDelayMs?: number;
 }): Promise<Harness> {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-models-test-"));
   const responsePath = path.join(tmpDir, "response.json");
@@ -58,6 +59,9 @@ async function setupHarness(opts: {
     ...process.env,
     MAKAI_TEST_REQUEST_LOG: logPath,
   };
+  if (opts.responseDelayMs !== undefined) {
+    env.MAKAI_TEST_RESPONSE_DELAY_MS = String(opts.responseDelayMs);
+  }
 
   if (opts.nack) {
     fs.writeFileSync(nackPath, JSON.stringify(opts.nack));
@@ -193,6 +197,65 @@ test("models.list passes filter fields through on the wire", async () => {
     assert.equal(payload.include_login_required, false);
     // Resolve-only fields must not leak into a regular list.
     assert.equal(payload.model_id, undefined);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.list serializes concurrent calls on the shared transport", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([makeDescriptor()]),
+    responseDelayMs: 50,
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await Promise.all([
+      api.list({ provider_id: "anthropic" }),
+      api.list({ provider_id: "openai" }),
+    ]);
+
+    const logged = readLoggedRequests(harness.logPath);
+    assert.equal(logged.length, 2);
+    assert.equal((logged[0]!.payload as Record<string, unknown>).provider_id, "anthropic");
+    assert.equal((logged[1]!.payload as Record<string, unknown>).provider_id, "openai");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.list rejects unknown descriptor enum values", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([
+      makeDescriptor({ auth_status: "mystery" as ModelDescriptor["auth_status"] }),
+    ]),
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await assert.rejects(
+      () => api.list(),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.message === "models[0].auth_status has unknown value: mystery",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.list rejects unknown reasoning_default values", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([
+      makeDescriptor({ reasoning_default: "extreme" as ModelDescriptor["reasoning_default"] }),
+    ]),
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await assert.rejects(
+      () => api.list(),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.message === "models[0].reasoning_default has unknown value: extreme",
+    );
   } finally {
     await harness.cleanup();
   }

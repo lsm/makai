@@ -229,9 +229,7 @@ jobs:
   e2e-github-copilot:
     name: E2E - GitHub Copilot
     needs: [unit-tests, check-secrets]
-    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
-    # rotated; the current token returns quota-exceeded for all tested models.
-    if: false
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -296,9 +294,7 @@ jobs:
   e2e-protocol-fullstack-github:
     name: E2E - Provider Protocol Fullstack (GitHub Copilot)
     needs: [unit-tests, check-secrets]
-    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
-    # rotated; the current token returns quota-exceeded for all tested models.
-    if: false
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -321,9 +317,7 @@ jobs:
   e2e-distributed-fullstack-github:
     name: E2E - Distributed Fullstack (GitHub Copilot)
     needs: [unit-tests, check-secrets]
-    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
-    # rotated; the current token returns quota-exceeded for all tested models.
-    if: false
+    if: needs.check-secrets.outputs.has_github_copilot == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
