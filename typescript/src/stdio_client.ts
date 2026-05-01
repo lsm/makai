@@ -14,6 +14,7 @@ export type MakaiStdioClientOptions = {
   env?: NodeJS.ProcessEnv;
   expectedProtocolVersion?: string;
   handshakeTimeoutMs?: number;
+  streamFrameQueueTtlMs?: number;
 };
 
 /** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
@@ -41,15 +42,22 @@ type PendingHandshake = {
   timer: NodeJS.Timeout;
 };
 
+type StreamQueueEntry = {
+  frame: StdioFrame;
+  expiresAt: number;
+};
+
+const STREAM_FRAME_QUEUE_TTL_MS = 30_000;
+
 export class MakaiStdioClient {
-  private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">> &
-    Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">;
+  private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">> &
+    Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: ReadlineInterface | null = null;
   private pendingHandshake: PendingHandshake | null = null;
   private frameQueue: StdioFrame[] = [];
   private frameWaiters: PendingFrameWaiter[] = [];
-  private streamFrameQueues = new Map<string, StdioFrame[]>();
+  private streamFrameQueues = new Map<string, StreamQueueEntry[]>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
@@ -58,6 +66,7 @@ export class MakaiStdioClient {
       args: options.args ?? [],
       expectedProtocolVersion: options.expectedProtocolVersion ?? "1",
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? 1500,
+      streamFrameQueueTtlMs: options.streamFrameQueueTtlMs ?? STREAM_FRAME_QUEUE_TTL_MS,
     };
   }
 
@@ -177,17 +186,32 @@ export class MakaiStdioClient {
   }
 
   private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
+    this.pruneExpiredStreamFrames();
     const queued = this.streamFrameQueues.get(streamId);
     if (!queued || queued.length === 0) return undefined;
-    const frame = queued.shift()!;
+    const entry = queued.shift()!;
     if (queued.length === 0) this.streamFrameQueues.delete(streamId);
-    return frame;
+    return entry.frame;
   }
 
   private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
+    this.pruneExpiredStreamFrames();
     const queued = this.streamFrameQueues.get(streamId) ?? [];
-    queued.push(frame);
+    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
     this.streamFrameQueues.set(streamId, queued);
+  }
+
+  private pruneExpiredStreamFrames(now = Date.now()): void {
+    for (const [streamId, queued] of this.streamFrameQueues) {
+      const unexpired = queued.filter((entry) => entry.expiresAt > now);
+      if (unexpired.length > 0) {
+        if (unexpired.length !== queued.length) {
+          this.streamFrameQueues.set(streamId, unexpired);
+        }
+      } else {
+        this.streamFrameQueues.delete(streamId);
+      }
+    }
   }
 
   private async withStreamReadLock<T>(operation: () => Promise<T>): Promise<T> {

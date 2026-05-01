@@ -49,6 +49,32 @@ test("nextFrameForStream preserves foreign frames for their owner", async () => 
   }
 });
 
+test("nextFrameForStream evicts late orphaned frames from the shared buffer", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "one-stream-server.js")],
+    handshakeTimeoutMs: 5000,
+    streamFrameQueueTtlMs: 20,
+  });
+
+  await client.connect();
+  try {
+    const orphanedWaiter = client.nextFrameForStream("s2", 30);
+    await assert.rejects(orphanedWaiter, /timed out waiting for frame for stream s2 after 30ms/);
+
+    const blocked = client.nextFrameForStream("s1", 80);
+    client.send({ type: "stream_request", stream_id: "s2" });
+    await assert.rejects(blocked, /timed out waiting for frame for stream s1 after 80ms/);
+
+    await assert.rejects(
+      () => client.nextFrameForStream("s2", 20),
+      /timed out waiting for frame for stream s2 after 20ms/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
 test("nextFrameForStream timeout includes time waiting for read lock", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,
