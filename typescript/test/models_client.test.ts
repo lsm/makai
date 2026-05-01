@@ -169,6 +169,26 @@ test("models.list defaults missing cache_max_age_ms to 5 minutes", async () => {
   }
 });
 
+test("models.list tags malformed response errors with a synthetic code", async () => {
+  const malformedResponse = {
+    models: "not-an-array",
+    fetched_at_ms: 1_760_000_000_500,
+  } as unknown as ListModelsResponse;
+  const harness = await setupHarness({ response: malformedResponse });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await assert.rejects(
+      () => api.list(),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "malformed_response" &&
+        err.message === "models_response missing 'models' array",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("models.list passes filter fields through on the wire", async () => {
   const harness = await setupHarness({
     response: makeResponse([makeDescriptor()]),

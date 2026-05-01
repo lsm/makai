@@ -15,11 +15,38 @@ test("connect succeeds with ready handshake and receives event frame", async () 
   });
 
   await client.connect();
-  client.send({ type: "stream_request", stream_id: "s1" });
-  const frame = await client.nextFrame(5000);
-  assert.equal(frame.type, "event");
-  assert.equal(frame.stream_id, "s1");
-  await client.close();
+  try {
+    client.send({ type: "stream_request", stream_id: "s1" });
+    const frame = await client.nextFrame(5000);
+    assert.equal(frame.type, "event");
+    assert.equal(frame.stream_id, "s1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("nextFrameForStream preserves foreign frames for their owner", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "ready-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    client.send({ type: "stream_request", stream_id: "s1" });
+    client.send({ type: "stream_request", stream_id: "s2" });
+
+    const secondFrame = await client.nextFrameForStream("s2", 5000);
+    assert.equal(secondFrame.type, "event");
+    assert.equal(secondFrame.stream_id, "s2");
+
+    const firstFrame = await client.nextFrameForStream("s1", 5000);
+    assert.equal(firstFrame.type, "event");
+    assert.equal(firstFrame.stream_id, "s1");
+  } finally {
+    await client.close();
+  }
 });
 
 test("connect surfaces protocol error frame", async () => {

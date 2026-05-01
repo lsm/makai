@@ -49,6 +49,8 @@ export class MakaiStdioClient {
   private pendingHandshake: PendingHandshake | null = null;
   private frameQueue: StdioFrame[] = [];
   private frameWaiters: PendingFrameWaiter[] = [];
+  private streamFrameQueues = new Map<string, StdioFrame[]>();
+  private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
     this.options = {
@@ -114,6 +116,36 @@ export class MakaiStdioClient {
     });
   }
 
+  async nextFrameForStream(streamId: string, timeoutMs = 1000): Promise<StdioFrame> {
+    if (streamId.length === 0) {
+      throw new Error("streamId is required");
+    }
+
+    const queued = this.dequeueStreamFrame(streamId);
+    if (queued) return queued;
+
+    return this.withStreamReadLock(async () => {
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const queued = this.dequeueStreamFrame(streamId);
+        if (queued) return queued;
+
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
+        }
+
+        const frame = await this.nextFrame(remainingMs);
+        const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
+        if (frameStreamId === streamId) return frame;
+        if (frameStreamId) {
+          this.enqueueStreamFrame(frameStreamId, frame);
+        }
+        // Frames without stream_id cannot be routed to a stream-specific waiter.
+      }
+    });
+  }
+
   async close(): Promise<void> {
     if (!this.child) return;
 
@@ -134,6 +166,34 @@ export class MakaiStdioClient {
     ]);
 
     this.cleanupProcessHandles();
+  }
+
+  private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
+    const queued = this.streamFrameQueues.get(streamId);
+    if (!queued || queued.length === 0) return undefined;
+    const frame = queued.shift()!;
+    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
+    return frame;
+  }
+
+  private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
+    const queued = this.streamFrameQueues.get(streamId) ?? [];
+    queued.push(frame);
+    this.streamFrameQueues.set(streamId, queued);
+  }
+
+  private async withStreamReadLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.streamReadLock;
+    let release!: () => void;
+    this.streamReadLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private handleLine(line: string): void {

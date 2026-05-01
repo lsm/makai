@@ -100,10 +100,10 @@ export function createMakaiModelsApi(
   return new StdioModelsApi(client, options);
 }
 
+const MALFORMED_RESPONSE_CODE = "malformed_response";
+
 class StdioModelsApi implements MakaiModelsApi {
   private readonly responseTimeoutMs: number;
-  private readonly streamFrameQueues = new Map<string, StdioFrame[]>();
-  private readLock: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly client: MakaiStdioClient,
@@ -142,54 +142,14 @@ class StdioModelsApi implements MakaiModelsApi {
     return { model: response.models[0]! };
   }
 
-  private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
-    const queued = this.streamFrameQueues.get(streamId);
-    if (!queued || queued.length === 0) return undefined;
-    const frame = queued.shift()!;
-    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
-    return frame;
-  }
-
-  private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
-    const queued = this.streamFrameQueues.get(streamId) ?? [];
-    queued.push(frame);
-    this.streamFrameQueues.set(streamId, queued);
-  }
-
-  private async withReadLock<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.readLock;
-    let release!: () => void;
-    this.readLock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
+  private async nextFrameForStream(streamId: string, timeoutMs: number): Promise<StdioFrame> {
     try {
-      return await operation();
-    } finally {
-      release();
+      return await this.client.nextFrameForStream(streamId, timeoutMs);
+    } catch (error) {
+      throw new MakaiProtocolError(
+        error instanceof Error ? error.message : String(error),
+      );
     }
-  }
-
-  private async readUntilStreamFrame(streamId: string, timeoutMs: number): Promise<StdioFrame> {
-    return this.withReadLock(async () => {
-      const queued = this.dequeueStreamFrame(streamId);
-      if (queued) return queued;
-
-      const deadline = Date.now() + timeoutMs;
-      while (true) {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) {
-          throw new MakaiProtocolError(
-            `models_request timed out after ${this.responseTimeoutMs}ms`,
-          );
-        }
-
-        const frame = await this.client.nextFrame(remaining);
-        const foreignStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
-        if (!foreignStreamId || foreignStreamId === streamId) return frame;
-        this.enqueueStreamFrame(foreignStreamId, frame);
-      }
-    });
   }
 
   private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
@@ -213,7 +173,7 @@ class StdioModelsApi implements MakaiModelsApi {
           `models_request timed out after ${this.responseTimeoutMs}ms`,
         );
       }
-      const frame = await this.readUntilStreamFrame(streamId, remaining);
+      const frame = await this.nextFrameForStream(streamId, remaining);
 
       switch (frame.type) {
         case "ack":
@@ -223,7 +183,7 @@ class StdioModelsApi implements MakaiModelsApi {
         case "models_response":
           return parseModelsResponse(frame);
         default:
-          throw new MakaiProtocolError(
+          throw malformedResponseError(
             `unexpected frame type while awaiting models_response: ${frame.type}`,
           );
       }
@@ -260,19 +220,23 @@ function nackToError(frame: StdioFrame): MakaiProtocolError {
   return new MakaiProtocolError(reason, code);
 }
 
+function malformedResponseError(message: string): MakaiProtocolError {
+  return new MakaiProtocolError(message, MALFORMED_RESPONSE_CODE);
+}
+
 function parseModelsResponse(frame: StdioFrame): ListModelsResponse {
   if (!isObject(frame.payload)) {
-    throw new MakaiProtocolError("models_response missing payload object");
+    throw malformedResponseError("models_response missing payload object");
   }
   const payload = frame.payload;
 
   const modelsRaw = payload.models;
   if (!Array.isArray(modelsRaw)) {
-    throw new MakaiProtocolError("models_response missing 'models' array");
+    throw malformedResponseError("models_response missing 'models' array");
   }
 
   if (typeof payload.fetched_at_ms !== "number" || !Number.isFinite(payload.fetched_at_ms)) {
-    throw new MakaiProtocolError("models_response missing numeric 'fetched_at_ms'");
+    throw malformedResponseError("models_response missing numeric 'fetched_at_ms'");
   }
 
   // Spec §2.3: clients should default to 300_000ms when the server omits it.
@@ -292,7 +256,7 @@ function parseModelsResponse(frame: StdioFrame): ListModelsResponse {
 
 function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
   if (!isObject(raw)) {
-    throw new MakaiProtocolError(`models[${idx}] is not an object`);
+    throw malformedResponseError(`models[${idx}] is not an object`);
   }
 
   const modelRef = requireString(raw.model_ref, `models[${idx}].model_ref`);
@@ -317,11 +281,11 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
   ) as ModelSource;
 
   if (!Array.isArray(raw.capabilities)) {
-    throw new MakaiProtocolError(`models[${idx}].capabilities must be an array`);
+    throw malformedResponseError(`models[${idx}].capabilities must be an array`);
   }
   const capabilities: ModelCapability[] = raw.capabilities.map((cap, capIdx) => {
     if (typeof cap !== "string") {
-      throw new MakaiProtocolError(
+      throw malformedResponseError(
         `models[${idx}].capabilities[${capIdx}] must be a string`,
       );
     }
@@ -329,7 +293,7 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
       // Spec §9: unknown fields/values are not fatal — but capability values
       // are an enum on the wire. Surface as protocol error so we do not
       // silently accept future capabilities as the closed TS union.
-      throw new MakaiProtocolError(
+      throw malformedResponseError(
         `models[${idx}].capabilities[${capIdx}] has unknown value: ${cap}`,
       );
     }
@@ -370,7 +334,7 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
       if (typeof value === "string") {
         metadata[key] = value;
       } else {
-        throw new MakaiProtocolError(
+        throw malformedResponseError(
           `models[${idx}].metadata.${key} must be a string`,
         );
       }
@@ -383,7 +347,7 @@ function parseModelDescriptor(raw: unknown, idx: number): ModelDescriptor {
 
 function requireString(value: unknown, fieldName: string): string {
   if (typeof value !== "string") {
-    throw new MakaiProtocolError(`${fieldName} must be a string`);
+    throw malformedResponseError(`${fieldName} must be a string`);
   }
   return value;
 }
@@ -395,7 +359,7 @@ function requireKnownString(
 ): string {
   const text = requireString(value, fieldName);
   if (!knownValues.has(text)) {
-    throw new MakaiProtocolError(`${fieldName} has unknown value: ${text}`);
+    throw malformedResponseError(`${fieldName} has unknown value: ${text}`);
   }
   return text;
 }
