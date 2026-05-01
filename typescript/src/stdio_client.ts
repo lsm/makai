@@ -124,18 +124,26 @@ export class MakaiStdioClient {
     const queued = this.dequeueStreamFrame(streamId);
     if (queued) return queued;
 
+    const deadline = Date.now() + timeoutMs;
     return this.withStreamReadLock(async () => {
-      const deadline = Date.now() + timeoutMs;
       while (true) {
-        const queued = this.dequeueStreamFrame(streamId);
-        if (queued) return queued;
-
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
           throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
         }
 
-        const frame = await this.nextFrame(remainingMs);
+        const queued = this.dequeueStreamFrame(streamId);
+        if (queued) return queued;
+
+        let frame: StdioFrame;
+        try {
+          frame = await this.nextFrame(remainingMs);
+        } catch (error) {
+          if (deadline - Date.now() <= 0) {
+            throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
+          }
+          throw error;
+        }
         const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
         if (frameStreamId === streamId) return frame;
         if (frameStreamId) {

@@ -49,6 +49,39 @@ test("nextFrameForStream preserves foreign frames for their owner", async () => 
   }
 });
 
+test("nextFrameForStream timeout includes time waiting for read lock", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "one-stream-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const blocked = client.nextFrameForStream("s1", 160);
+    const delayed = new Promise((resolve) => setTimeout(resolve, 40))
+      .then(() => client.nextFrameForStream("s2", 80));
+
+    setTimeout(() => {
+      client.send({ type: "stream_request", stream_id: "s2" });
+    }, 110);
+
+    const [delayedResult, blockedResult] = await Promise.allSettled([delayed, blocked]);
+    assert.equal(delayedResult.status, "rejected");
+    assert.match(
+      delayedResult.reason instanceof Error ? delayedResult.reason.message : String(delayedResult.reason),
+      /timed out waiting for frame for stream s2 after 80ms/,
+    );
+    assert.equal(blockedResult.status, "rejected");
+    assert.match(
+      blockedResult.reason instanceof Error ? blockedResult.reason.message : String(blockedResult.reason),
+      /timed out waiting for frame for stream s1 after 160ms/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
 test("connect surfaces protocol error frame", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,
