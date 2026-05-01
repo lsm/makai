@@ -121,7 +121,12 @@ class StdioModelsApi implements MakaiModelsApi {
 
     const deadline = Date.now() + this.responseTimeoutMs;
     while (true) {
-      const remaining = Math.max(deadline - Date.now(), 1);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new MakaiProtocolError(
+          `models_request timed out after ${this.responseTimeoutMs}ms`,
+        );
+      }
       const frame = await this.client.nextFrame(remaining);
 
       // V1 sequencing: requests are issued one at a time per client. We still

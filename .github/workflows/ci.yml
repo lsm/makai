@@ -229,9 +229,8 @@ jobs:
   e2e-github-copilot:
     name: E2E - GitHub Copilot
     needs: [unit-tests, check-secrets]
-    # Temporarily disabled: the CI Copilot token is returning quota-exceeded
-    # for all tested models, so this live-provider check cannot pass until the
-    # quota resets or credentials are rotated.
+    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
+    # rotated; the current token returns quota-exceeded for all tested models.
     if: false
     runs-on: ubuntu-latest
     steps:
@@ -297,9 +296,8 @@ jobs:
   e2e-protocol-fullstack-github:
     name: E2E - Provider Protocol Fullstack (GitHub Copilot)
     needs: [unit-tests, check-secrets]
-    # Temporarily disabled: the CI Copilot token is returning quota-exceeded
-    # for all tested models, so this live-provider check cannot pass until the
-    # quota resets or credentials are rotated.
+    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
+    # rotated; the current token returns quota-exceeded for all tested models.
     if: false
     runs-on: ubuntu-latest
     steps:
@@ -323,9 +321,8 @@ jobs:
   e2e-distributed-fullstack-github:
     name: E2E - Distributed Fullstack (GitHub Copilot)
     needs: [unit-tests, check-secrets]
-    # Temporarily disabled: the CI Copilot token is returning quota-exceeded
-    # for all tested models, so this live-provider check cannot pass until the
-    # quota resets or credentials are rotated.
+    # TODO(#32): Re-enable once the CI Copilot quota resets or credentials are
+    # rotated; the current token returns quota-exceeded for all tested models.
     if: false
     runs-on: ubuntu-latest
     steps:
