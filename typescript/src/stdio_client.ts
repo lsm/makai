@@ -324,5 +324,6 @@ export async function createMakaiStdioClient(
     env: options.env,
     expectedProtocolVersion: options.expectedProtocolVersion,
     handshakeTimeoutMs: options.handshakeTimeoutMs,
+    streamFrameQueueTtlMs: options.streamFrameQueueTtlMs,
   });
 }

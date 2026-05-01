@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { MakaiStdioClient, StdioProtocolError } from "../src";
+import { createMakaiStdioClient, MakaiStdioClient, StdioProtocolError } from "../src";
 
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
 
@@ -51,6 +51,32 @@ test("nextFrameForStream preserves foreign frames for their owner", async () => 
 
 test("nextFrameForStream evicts late orphaned frames from the shared buffer", async () => {
   const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "one-stream-server.js")],
+    handshakeTimeoutMs: 5000,
+    streamFrameQueueTtlMs: 20,
+  });
+
+  await client.connect();
+  try {
+    const orphanedWaiter = client.nextFrameForStream("s2", 30);
+    await assert.rejects(orphanedWaiter, /timed out waiting for frame for stream s2 after 30ms/);
+
+    const blocked = client.nextFrameForStream("s1", 80);
+    client.send({ type: "stream_request", stream_id: "s2" });
+    await assert.rejects(blocked, /timed out waiting for frame for stream s1 after 80ms/);
+
+    await assert.rejects(
+      () => client.nextFrameForStream("s2", 20),
+      /timed out waiting for frame for stream s2 after 20ms/,
+    );
+  } finally {
+    await client.close();
+  }
+});
+
+test("createMakaiStdioClient forwards streamFrameQueueTtlMs", async () => {
+  const client = await createMakaiStdioClient({
     command: process.execPath,
     args: [path.join(sourceFixturesDir, "one-stream-server.js")],
     handshakeTimeoutMs: 5000,
