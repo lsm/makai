@@ -102,7 +102,8 @@ export function createMakaiModelsApi(
 
 class StdioModelsApi implements MakaiModelsApi {
   private readonly responseTimeoutMs: number;
-  private dispatchLock: Promise<void> = Promise.resolve();
+  private readonly streamFrameQueues = new Map<string, StdioFrame[]>();
+  private readLock: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly client: MakaiStdioClient,
@@ -141,14 +142,24 @@ class StdioModelsApi implements MakaiModelsApi {
     return { model: response.models[0]! };
   }
 
-  private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
-    return this.withDispatchLock(() => this.dispatchLocked(request));
+  private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
+    const queued = this.streamFrameQueues.get(streamId);
+    if (!queued || queued.length === 0) return undefined;
+    const frame = queued.shift()!;
+    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
+    return frame;
   }
 
-  private async withDispatchLock<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.dispatchLock;
+  private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
+    const queued = this.streamFrameQueues.get(streamId) ?? [];
+    queued.push(frame);
+    this.streamFrameQueues.set(streamId, queued);
+  }
+
+  private async withReadLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.readLock;
     let release!: () => void;
-    this.dispatchLock = new Promise<void>((resolve) => {
+    this.readLock = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;
@@ -159,7 +170,29 @@ class StdioModelsApi implements MakaiModelsApi {
     }
   }
 
-  private async dispatchLocked(request: ListModelsRequest): Promise<ListModelsResponse> {
+  private async readUntilStreamFrame(streamId: string, timeoutMs: number): Promise<StdioFrame> {
+    return this.withReadLock(async () => {
+      const queued = this.dequeueStreamFrame(streamId);
+      if (queued) return queued;
+
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new MakaiProtocolError(
+            `models_request timed out after ${this.responseTimeoutMs}ms`,
+          );
+        }
+
+        const frame = await this.client.nextFrame(remaining);
+        const foreignStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
+        if (!foreignStreamId || foreignStreamId === streamId) return frame;
+        this.enqueueStreamFrame(foreignStreamId, frame);
+      }
+    });
+  }
+
+  private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
     const streamId = randomUUID();
     const envelope: StdioFrame = {
       type: "models_request",
@@ -180,17 +213,7 @@ class StdioModelsApi implements MakaiModelsApi {
           `models_request timed out after ${this.responseTimeoutMs}ms`,
         );
       }
-      const frame = await this.client.nextFrame(remaining);
-
-      // `withDispatchLock` serializes client.models.* calls so this request's
-      // read loop cannot consume another models_request response. A foreign
-      // stream here indicates another API is sharing the same raw stdio
-      // transport concurrently; fail loudly rather than silently dropping it.
-      if (typeof frame.stream_id === "string" && frame.stream_id !== streamId) {
-        throw new MakaiProtocolError(
-          `received frame for unexpected stream ${frame.stream_id} while awaiting ${streamId}`,
-        );
-      }
+      const frame = await this.readUntilStreamFrame(streamId, remaining);
 
       switch (frame.type) {
         case "ack":
