@@ -139,7 +139,19 @@ class StdioModelsApi implements MakaiModelsApi {
         "invalid_request",
       );
     }
-    return { model: response.models[0]! };
+
+    const model = response.models[0]!;
+    if (model.provider_id !== request.provider_id) {
+      throw new MakaiProtocolError("resolved model provider_id mismatch", "invalid_request");
+    }
+    if (model.model_id !== request.model_id) {
+      throw new MakaiProtocolError("resolved model_id mismatch", "invalid_request");
+    }
+    if (request.api !== undefined && model.api !== request.api) {
+      throw new MakaiProtocolError("resolved model api mismatch", "invalid_request");
+    }
+
+    return { model };
   }
 
   private async nextFrameForStream(streamId: string, timeoutMs: number): Promise<StdioFrame> {

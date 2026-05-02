@@ -148,7 +148,7 @@ export class MakaiStdioClient {
         try {
           frame = await this.nextFrame(remainingMs);
         } catch (error) {
-          if (deadline - Date.now() <= 0) {
+          if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
             throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
           }
           throw error;
@@ -302,6 +302,10 @@ export class MakaiStdioClient {
     this.lineReader = null;
     this.child = null;
   }
+}
+
+function isNextFrameTimeout(error: unknown, timeoutMs: number): boolean {
+  return error instanceof Error && error.message === `timed out waiting for frame after ${timeoutMs}ms`;
 }
 
 export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {

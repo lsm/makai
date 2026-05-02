@@ -306,6 +306,63 @@ test("models.resolve issues models_request with exact model_id filter", async ()
   }
 });
 
+test("models.resolve throws invalid_request when the single result does not match", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([
+      makeDescriptor({
+        provider_id: "openai",
+        model_id: "gpt-4o-mini",
+        model_ref: "openai/openai-responses@gpt-4o-mini",
+      }),
+    ]),
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await assert.rejects(
+      () =>
+        api.resolve({
+          provider_id: "anthropic",
+          api: "anthropic-messages",
+          model_id: "claude-sonnet-4-5",
+        }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "resolved model provider_id mismatch",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.resolve throws invalid_request when runtime ignores requested api", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([
+      makeDescriptor({
+        api: "openai-completions",
+        model_ref: "anthropic/openai-completions@claude-sonnet-4-5",
+      }),
+    ]),
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await assert.rejects(
+      () =>
+        api.resolve({
+          provider_id: "anthropic",
+          api: "anthropic-messages",
+          model_id: "claude-sonnet-4-5",
+        }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "resolved model api mismatch",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("models.resolve throws invalid_request when runtime returns multiple matches", async () => {
   const harness = await setupHarness({
     response: makeResponse([
