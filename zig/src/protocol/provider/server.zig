@@ -579,10 +579,16 @@ fn streamWithRefresh(
     }
 
     if (storage.credentialsExpired(provider_id)) {
-        storage.refreshCredentials(provider_id, oauth_provider) catch return error.AuthRefreshFailed;
+        storage.refreshCredentials(provider_id, oauth_provider) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.AuthRefreshFailed,
+        };
     }
 
-    var api_key_opt: ?[]const u8 = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
+    var api_key_opt: ?[]const u8 = (storage.getApiKey(provider_id, oauth_provider) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AuthRefreshFailed,
+    }) orelse return error.AuthRequired;
     defer if (api_key_opt) |key| server.allocator.free(key);
 
     var resolved_options = try injectApiKey(server.allocator, options, api_key_opt.?);
@@ -603,8 +609,14 @@ fn streamWithRefresh(
     stream.deinit();
     server.allocator.destroy(stream);
 
-    storage.refreshCredentials(provider_id, oauth_provider) catch return error.AuthRefreshFailed;
-    api_key_opt = (storage.getApiKey(provider_id, oauth_provider) catch return error.AuthRefreshFailed) orelse return error.AuthRequired;
+    storage.refreshCredentials(provider_id, oauth_provider) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AuthRefreshFailed,
+    };
+    api_key_opt = (storage.getApiKey(provider_id, oauth_provider) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AuthRefreshFailed,
+    }) orelse return error.AuthRequired;
 
     var retry_options = try injectApiKey(server.allocator, options, api_key_opt.?);
     defer deinitInjectedApiKey(server.allocator, &retry_options);
