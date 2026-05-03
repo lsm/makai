@@ -565,12 +565,9 @@ fn streamWithRefresh(
         // use it directly — streamWithResolvedKey cannot see the locally-loaded
         // storage (it only consults server.options.auth_storage which may be null).
         if (storage.getApiKey(provider_id, null) catch null) |key| {
-            errdefer server.allocator.free(key);
+            defer server.allocator.free(key);
             var resolved_options = try injectApiKey(server.allocator, options, key);
-            defer {
-                server.allocator.free(key);
-                deinitInjectedApiKey(server.allocator, &resolved_options);
-            }
+            defer deinitInjectedApiKey(server.allocator, &resolved_options);
             return provider.stream(model, context, resolved_options, server.allocator);
         }
         // No key in loaded storage; fall back to env-key resolution.
