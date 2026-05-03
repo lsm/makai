@@ -564,7 +564,10 @@ fn streamWithRefresh(
         // Non-OAuth entry or missing entry. If the loaded storage has an api_key,
         // use it directly — streamWithResolvedKey cannot see the locally-loaded
         // storage (it only consults server.options.auth_storage which may be null).
-        if (storage.getApiKey(provider_id, null) catch null) |key| {
+        const stored_key = storage.getApiKey(provider_id, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        if (stored_key) |key| {
             defer server.allocator.free(key);
             var resolved_options = try injectApiKey(server.allocator, options, key);
             defer deinitInjectedApiKey(server.allocator, &resolved_options);
