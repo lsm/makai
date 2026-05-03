@@ -561,9 +561,18 @@ fn streamWithRefresh(
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
-        // No OAuth credentials; fall back to env-key resolution.
-        // auth_expired is not emitted here because api_key entries never expire
-        // in the current ProviderAuth model (emitted only via streamErrorCode).
+        // Non-OAuth entry or missing entry. If the loaded storage has an api_key,
+        // use it directly — streamWithResolvedKey cannot see the locally-loaded
+        // storage (it only consults server.options.auth_storage which may be null).
+        if (storage.getApiKey(provider_id, null) catch null) |key| {
+            var resolved_options = try injectApiKey(server.allocator, options, key);
+            defer {
+                server.allocator.free(key);
+                deinitInjectedApiKey(server.allocator, &resolved_options);
+            }
+            return provider.stream(model, context, resolved_options, server.allocator);
+        }
+        // No key in loaded storage; fall back to env-key resolution.
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
     }
 
@@ -597,7 +606,23 @@ fn streamWithRefresh(
 
     var retry_options = try injectApiKey(server.allocator, options, api_key_opt.?);
     defer deinitInjectedApiKey(server.allocator, &retry_options);
-    return provider.stream(model, context, retry_options, server.allocator);
+    var retry_stream = provider.stream(model, context, retry_options, server.allocator) catch |err| {
+        if (err == error.MissingApiKey) return error.AuthRequired;
+        return err;
+    };
+    // If the retry stream completed synchronously with another auth failure,
+    // map it to a terminal auth error so clients get the correct error code.
+    if (retry_stream.isDone()) {
+        if (retry_stream.getError()) |retry_err_msg| {
+            const retry_auth_failure = if (provider.is_auth_failure) |detector| detector(retry_err_msg) else defaultAuthFailureDetector(retry_err_msg);
+            if (retry_auth_failure) {
+                retry_stream.deinit();
+                server.allocator.destroy(retry_stream);
+                return error.AuthExpired;
+            }
+        }
+    }
+    return retry_stream;
 }
 
 /// Handle stream_request - create stream, return ack with stream_id
