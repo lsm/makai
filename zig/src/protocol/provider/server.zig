@@ -566,6 +566,7 @@ fn streamWithRefresh(
         // storage (it only consults server.options.auth_storage which may be null).
         const stored_key = storage.getApiKey(provider_id, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            else => return err,
         };
         if (stored_key) |key| {
             defer server.allocator.free(key);
