@@ -249,8 +249,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
   private readonly transport: MakaiStdioClient;
   private readonly defaultHandlers?: AuthFlowHandlers;
   private readonly frameTimeoutMs: number;
-  private readonly streamFrameQueues = new Map<string, RawEnvelope[]>();
-  private readLock: Promise<void> = Promise.resolve();
 
   constructor(transport: MakaiStdioClient, options: MakaiAuthClientOptions = {}) {
     this.transport = transport;
@@ -421,65 +419,8 @@ export class MakaiAuthClient implements MakaiAuthApi {
   }
 
   private async nextFrameForStream(streamId: string): Promise<RawEnvelope> {
-    const queued = this.dequeueStreamFrame(streamId);
-    if (queued) return queued;
-
-    return this.withReadLock(() => this.readUntilStreamFrame(streamId));
-  }
-
-  private dequeueStreamFrame(streamId: string): RawEnvelope | undefined {
-    const queued = this.streamFrameQueues.get(streamId);
-    if (!queued || queued.length === 0) return undefined;
-    const frame = queued.shift()!;
-    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
-    return frame;
-  }
-
-  private async withReadLock<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = this.readLock;
-    let release!: () => void;
-    this.readLock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
     try {
-      return await operation();
-    } finally {
-      release();
-    }
-  }
-
-  private async readUntilStreamFrame(streamId: string): Promise<RawEnvelope> {
-    const deadline = Date.now() + this.frameTimeoutMs;
-    while (true) {
-      const queued = this.dequeueStreamFrame(streamId);
-      if (queued) return queued;
-
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) {
-        throw new MakaiAuthError(
-          `timed out waiting for frame for stream ${streamId} after ${this.frameTimeoutMs}ms`,
-          { kind: "transport_error" },
-        );
-      }
-
-      const frame = await this.nextTransportFrame(remainingMs);
-      if (frameMatchesStream(frame, streamId)) return frame;
-
-      const foreignStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
-      if (foreignStreamId) {
-        const queue = this.streamFrameQueues.get(foreignStreamId) ?? [];
-        queue.push(frame);
-        this.streamFrameQueues.set(foreignStreamId, queue);
-      }
-      // Frames without stream_id (e.g. handshake leftovers) are foreign to auth
-      // flows and cannot be routed to a stream-specific waiter.
-    }
-  }
-
-  private async nextTransportFrame(timeoutMs: number): Promise<RawEnvelope> {
-    try {
-      return (await this.transport.nextFrame(timeoutMs)) as RawEnvelope;
+      return (await this.transport.nextFrameForStream(streamId, this.frameTimeoutMs)) as RawEnvelope;
     } catch (error) {
       throw new MakaiAuthError(
         error instanceof Error ? error.message : String(error),
@@ -515,14 +456,6 @@ export class MakaiAuthClient implements MakaiAuthApi {
       // surfacing the original failure to the caller.
     }
   }
-}
-
-function frameMatchesStream(frame: RawEnvelope, streamId: string): boolean {
-  if (typeof frame.stream_id !== "string") {
-    // Frames without stream_id (e.g. handshake) are foreign to our flow.
-    return false;
-  }
-  return frame.stream_id === streamId;
 }
 
 function readPayload(frame: RawEnvelope): Record<string, unknown> {

@@ -14,6 +14,7 @@ export type MakaiStdioClientOptions = {
   env?: NodeJS.ProcessEnv;
   expectedProtocolVersion?: string;
   handshakeTimeoutMs?: number;
+  streamFrameQueueTtlMs?: number;
 };
 
 /** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
@@ -41,14 +42,23 @@ type PendingHandshake = {
   timer: NodeJS.Timeout;
 };
 
+type StreamQueueEntry = {
+  frame: StdioFrame;
+  expiresAt: number;
+};
+
+const STREAM_FRAME_QUEUE_TTL_MS = 30_000;
+
 export class MakaiStdioClient {
-  private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">> &
-    Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs">;
+  private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">> &
+    Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: ReadlineInterface | null = null;
   private pendingHandshake: PendingHandshake | null = null;
   private frameQueue: StdioFrame[] = [];
   private frameWaiters: PendingFrameWaiter[] = [];
+  private streamFrameQueues = new Map<string, StreamQueueEntry[]>();
+  private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
     this.options = {
@@ -56,6 +66,7 @@ export class MakaiStdioClient {
       args: options.args ?? [],
       expectedProtocolVersion: options.expectedProtocolVersion ?? "1",
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? 1500,
+      streamFrameQueueTtlMs: options.streamFrameQueueTtlMs ?? STREAM_FRAME_QUEUE_TTL_MS,
     };
   }
 
@@ -114,6 +125,44 @@ export class MakaiStdioClient {
     });
   }
 
+  async nextFrameForStream(streamId: string, timeoutMs = 1000): Promise<StdioFrame> {
+    if (streamId.length === 0) {
+      throw new Error("streamId is required");
+    }
+
+    const queued = this.dequeueStreamFrame(streamId);
+    if (queued) return queued;
+
+    const deadline = Date.now() + timeoutMs;
+    return this.withStreamReadLock(async () => {
+      while (true) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
+        }
+
+        const queued = this.dequeueStreamFrame(streamId);
+        if (queued) return queued;
+
+        let frame: StdioFrame;
+        try {
+          frame = await this.nextFrame(remainingMs);
+        } catch (error) {
+          if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
+            throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
+          }
+          throw error;
+        }
+        const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
+        if (frameStreamId === streamId) return frame;
+        if (frameStreamId) {
+          this.enqueueStreamFrame(frameStreamId, frame);
+        }
+        // Frames without stream_id cannot be routed to a stream-specific waiter.
+      }
+    });
+  }
+
   async close(): Promise<void> {
     if (!this.child) return;
 
@@ -134,6 +183,49 @@ export class MakaiStdioClient {
     ]);
 
     this.cleanupProcessHandles();
+  }
+
+  private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
+    this.pruneExpiredStreamFrames();
+    const queued = this.streamFrameQueues.get(streamId);
+    if (!queued || queued.length === 0) return undefined;
+    const entry = queued.shift()!;
+    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
+    return entry.frame;
+  }
+
+  private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
+    this.pruneExpiredStreamFrames();
+    const queued = this.streamFrameQueues.get(streamId) ?? [];
+    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
+    this.streamFrameQueues.set(streamId, queued);
+  }
+
+  private pruneExpiredStreamFrames(now = Date.now()): void {
+    for (const [streamId, queued] of this.streamFrameQueues) {
+      const unexpired = queued.filter((entry) => entry.expiresAt > now);
+      if (unexpired.length > 0) {
+        if (unexpired.length !== queued.length) {
+          this.streamFrameQueues.set(streamId, unexpired);
+        }
+      } else {
+        this.streamFrameQueues.delete(streamId);
+      }
+    }
+  }
+
+  private async withStreamReadLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.streamReadLock;
+    let release!: () => void;
+    this.streamReadLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private handleLine(line: string): void {
@@ -212,6 +304,10 @@ export class MakaiStdioClient {
   }
 }
 
+function isNextFrameTimeout(error: unknown, timeoutMs: number): boolean {
+  return error instanceof Error && error.message === `timed out waiting for frame after ${timeoutMs}ms`;
+}
+
 export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {
   command?: string;
   resolver?: BinaryResolverOptions;
@@ -232,5 +328,6 @@ export async function createMakaiStdioClient(
     env: options.env,
     expectedProtocolVersion: options.expectedProtocolVersion,
     handshakeTimeoutMs: options.handshakeTimeoutMs,
+    streamFrameQueueTtlMs: options.streamFrameQueueTtlMs,
   });
 }
