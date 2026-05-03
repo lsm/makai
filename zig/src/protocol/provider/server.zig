@@ -561,7 +561,9 @@ fn streamWithRefresh(
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
-        if (storage.credentialsExpired(provider_id)) return error.AuthExpired;
+        // No OAuth credentials; fall back to env-key resolution.
+        // auth_expired is not emitted here because api_key entries never expire
+        // in the current ProviderAuth model (emitted only via streamErrorCode).
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
     }
 
