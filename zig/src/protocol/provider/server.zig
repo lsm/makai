@@ -511,6 +511,29 @@ fn authProvider(provider: api_registry.ApiProvider) ?oauth_storage.OAuthProvider
     };
 }
 
+/// Stream using standard key resolution (env-key / non-OAuth path).
+/// Called when no OAuth provider is registered or when stored OAuth credentials
+/// are unavailable, so that env-key workflows continue to work.
+fn streamWithResolvedKey(
+    server: *ProtocolServer,
+    provider: api_registry.ApiProvider,
+    provider_id: []const u8,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+) !*event_stream.AssistantMessageEventStream {
+    const resolved = auth_resolver.resolveApiKey(server.allocator, server.options.auth_storage, provider_id, null) catch |err| switch (err) {
+        error.AuthRequired => return error.AuthRequired,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    var resolved_options = try injectApiKey(server.allocator, options, resolved.api_key);
+    defer {
+        server.allocator.free(resolved.api_key);
+        deinitInjectedApiKey(server.allocator, &resolved_options);
+    }
+    return provider.stream(model, context, resolved_options, server.allocator);
+}
+
 fn streamWithRefresh(
     server: *ProtocolServer,
     provider: api_registry.ApiProvider,
@@ -523,31 +546,23 @@ fn streamWithRefresh(
     }
 
     const provider_id = provider.auth_provider_id orelse model.provider;
-    const oauth_provider = authProvider(provider) orelse {
-        const resolved = auth_resolver.resolveApiKey(server.allocator, server.options.auth_storage, provider_id, null) catch |err| switch (err) {
-            error.AuthRequired => return error.AuthRequired,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        var resolved_options = try injectApiKey(server.allocator, options, resolved.api_key);
-        defer {
-            server.allocator.free(resolved.api_key);
-            deinitInjectedApiKey(server.allocator, &resolved_options);
-        }
-        return provider.stream(model, context, resolved_options, server.allocator);
-    };
+    const oauth_provider = authProvider(provider) orelse
+        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
     else blk: {
-        loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch return error.AuthRequired;
-        break :blk &loaded_storage.?;
-    };
+        loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch
+            break :blk null;
+        break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+    } orelse
+        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
         if (storage.credentialsExpired(provider_id)) return error.AuthExpired;
-        return error.AuthRequired;
+        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
     }
 
     if (storage.credentialsExpired(provider_id)) {

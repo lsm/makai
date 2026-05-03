@@ -220,14 +220,16 @@ pub const AuthStorage = struct {
             .oauth => |credentials| credentials,
         };
 
+        var ownership_transferred = false;
         const new_credentials = try oauth_provider.refresh_fn(credentials, self.allocator);
-        errdefer new_credentials.deinit(self.allocator);
+        errdefer if (!ownership_transferred) new_credentials.deinit(self.allocator);
 
         const provider_id_copy = try self.allocator.dupe(u8, provider_id);
-        errdefer self.allocator.free(provider_id_copy);
+        errdefer if (!ownership_transferred) self.allocator.free(provider_id_copy);
 
         const removed = self.providers.fetchRemove(provider_id) orelse return error.AuthRequired;
         errdefer {
+            // Rollback: remove the new entry and restore the old one
             if (self.providers.fetchRemove(provider_id_copy)) |new_removed| {
                 self.allocator.free(new_removed.key);
                 new_removed.value.deinit(self.allocator);
@@ -239,6 +241,7 @@ pub const AuthStorage = struct {
         }
 
         try self.providers.put(provider_id_copy, .{ .oauth = new_credentials });
+        ownership_transferred = true;
         try self.persist();
 
         self.allocator.free(removed.key);
