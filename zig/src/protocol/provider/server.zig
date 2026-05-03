@@ -565,6 +565,7 @@ fn streamWithRefresh(
         // use it directly — streamWithResolvedKey cannot see the locally-loaded
         // storage (it only consults server.options.auth_storage which may be null).
         if (storage.getApiKey(provider_id, null) catch null) |key| {
+            errdefer server.allocator.free(key);
             var resolved_options = try injectApiKey(server.allocator, options, key);
             defer {
                 server.allocator.free(key);
@@ -618,7 +619,7 @@ fn streamWithRefresh(
             if (retry_auth_failure) {
                 retry_stream.deinit();
                 server.allocator.destroy(retry_stream);
-                return error.AuthExpired;
+                return error.AuthRequired;
             }
         }
     }
@@ -1182,6 +1183,8 @@ const AuthTestState = struct {
     stream_calls: usize = 0,
     fail_refresh: bool = false,
     auth_fail_first_call: bool = false,
+    auth_fail_all_calls: bool = false,
+    use_api_key_storage: bool = false,
     last_api_key: [64]u8 = undefined,
     last_api_key_len: usize = 0,
 };
@@ -1230,11 +1233,15 @@ fn authTestSaveStorage(storage: *const oauth_storage.AuthStorage) anyerror!void 
 fn authTestLoadStorage(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
     const state: *AuthTestState = @ptrCast(@alignCast(ctx.?));
     var storage = oauth_storage.AuthStorage{ .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(allocator), .allocator = allocator, .save_fn = authTestSaveStorage };
-    try storage.providers.put(try allocator.dupe(u8, "test-auth"), .{ .oauth = .{
-        .refresh = try allocator.dupe(u8, "refresh"),
-        .access = try allocator.dupe(u8, "access-0"),
-        .expires = state.expires,
-    } });
+    if (state.use_api_key_storage) {
+        try storage.providers.put(try allocator.dupe(u8, "test-auth"), .{ .api_key = try allocator.dupe(u8, "stored-test-key") });
+    } else {
+        try storage.providers.put(try allocator.dupe(u8, "test-auth"), .{ .oauth = .{
+            .refresh = try allocator.dupe(u8, "refresh"),
+            .access = try allocator.dupe(u8, "access-0"),
+            .expires = state.expires,
+        } });
+    }
     return storage;
 }
 
@@ -1257,7 +1264,7 @@ fn authTestStream(
     }
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
-    if (state.auth_fail_first_call and state.stream_calls == 1) {
+    if (state.auth_fail_all_calls or (state.auth_fail_first_call and state.stream_calls == 1)) {
         s.completeWithError("401 unauthorized");
     } else {
         s.complete(.{ .content = &.{}, .api = "test-api", .provider = "test-provider", .model = "test-model", .usage = .{}, .stop_reason = .stop, .timestamp = std.time.milliTimestamp() });
@@ -1632,6 +1639,49 @@ test "pre-call refresh failure returns auth_refresh_failed nack" {
 test "retry refresh failure returns auth_refresh_failed nack" {
     var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .fail_refresh = true, .auth_fail_first_call = true };
     try expectAuthRefreshFailedNack(&state);
+}
+
+test "stored api_key used when provider has OAuth hook but storage has non-OAuth entry" {
+    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .use_api_key_storage = true };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registerAuthTestProvider(&registry);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
+    defer server.deinit();
+    const stream = try streamWithRefresh(&server, registry.getApiProvider("test-api").?, testModel(), testContext(), null);
+    defer {
+        stream.deinit();
+        std.testing.allocator.destroy(stream);
+    }
+
+    // The stored api_key should have been used (not env key), stream should succeed
+    try std.testing.expectEqual(@as(usize, 0), state.refresh_count);
+    try std.testing.expectEqual(@as(usize, 1), state.stream_calls);
+    try std.testing.expectEqualStrings("stored-test-key", state.last_api_key[0..state.last_api_key_len]);
+}
+
+test "retry auth failure returns auth_required nack" {
+    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .auth_fail_all_calls = true };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registerAuthTestProvider(&registry);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
+    defer server.deinit();
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUuid(), .message_id = protocol_types.generateUuid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    var response = (try server.handleEnvelope(env)).?;
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(protocol_types.ErrorCode.auth_required, response.payload.nack.error_code.?);
+    // Should have refreshed once and called stream twice
+    try std.testing.expectEqual(@as(usize, 1), state.refresh_count);
+    try std.testing.expectEqual(@as(usize, 2), state.stream_calls);
 }
 
 test "stream refresh failure maps to error envelope code" {
