@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
+const oauth_storage = @import("oauth/storage");
 const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 const tool_call_tracker = @import("tool_call_tracker");
@@ -9,6 +10,40 @@ const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
+
+fn anthropicRefresh(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) anyerror!oauth_storage.Credentials {
+    const oauth = @import("oauth/anthropic");
+    const refreshed = try oauth.refreshToken(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+    return .{
+        .refresh = refreshed.refresh,
+        .access = refreshed.access,
+        .expires = refreshed.expires,
+        .provider_data = null,
+    };
+}
+
+fn anthropicGetApiKey(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) anyerror![]const u8 {
+    const oauth = @import("oauth/anthropic");
+    return oauth.getApiKey(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+}
+
+fn anthropicIsAuthFailure(err_msg: []const u8) bool {
+    return std.mem.indexOf(u8, err_msg, "401") != null or
+        std.mem.indexOf(u8, err_msg, "403") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "unauthorized") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "forbidden") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "authentication_error") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "permission_error") != null or
+        std.ascii.indexOfIgnoreCase(err_msg, "invalid api key") != null;
+}
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
@@ -1882,6 +1917,10 @@ pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry)
         .api = "anthropic-messages",
         .stream = streamAnthropicMessages,
         .stream_simple = streamSimpleAnthropicMessages,
+        .auth_provider_id = "anthropic",
+        .auth_refresh_fn = anthropicRefresh,
+        .auth_get_api_key_fn = anthropicGetApiKey,
+        .is_auth_failure = anthropicIsAuthFailure,
     }, null);
 }
 

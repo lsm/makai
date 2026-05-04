@@ -17,7 +17,7 @@ pub const Credentials = struct {
 
 pub const OAuthProvider = struct {
     id: []const u8,
-    name: []const u8,
+    name: []const u8 = "",
     refresh_fn: *const fn (credentials: Credentials, allocator: std.mem.Allocator) anyerror!Credentials,
     get_api_key_fn: *const fn (credentials: Credentials, allocator: std.mem.Allocator) anyerror![]const u8,
 };
@@ -35,10 +35,13 @@ pub const ProviderAuth = union(enum) {
     }
 };
 
+pub const SaveFn = *const fn (storage: *const AuthStorage) anyerror!void;
+
 /// Authentication storage for multiple providers
 pub const AuthStorage = struct {
     providers: std.StringHashMap(ProviderAuth),
     allocator: std.mem.Allocator,
+    save_fn: ?SaveFn = null,
 
     /// Load auth storage from ~/.makai/auth.json
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
@@ -51,6 +54,7 @@ pub const AuthStorage = struct {
             return .{
                 .providers = std.StringHashMap(ProviderAuth).init(allocator),
                 .allocator = allocator,
+                .save_fn = null,
             };
         };
         defer file.close();
@@ -100,6 +104,7 @@ pub const AuthStorage = struct {
         return .{
             .providers = providers,
             .allocator = allocator,
+            .save_fn = null,
         };
     }
 
@@ -187,6 +192,62 @@ pub const AuthStorage = struct {
         try file_handle.chmod(0o600);
     }
 
+    pub fn hasRefreshableCredentials(self: *const AuthStorage, provider_id: []const u8) bool {
+        const auth = self.providers.get(provider_id) orelse return false;
+        return switch (auth) {
+            .api_key => false,
+            .oauth => true,
+        };
+    }
+
+    pub fn credentialsExpired(self: *const AuthStorage, provider_id: []const u8) bool {
+        const auth = self.providers.get(provider_id) orelse return false;
+        return switch (auth) {
+            .api_key => false,
+            .oauth => |credentials| std.time.milliTimestamp() >= credentials.expires,
+        };
+    }
+
+    pub fn persist(self: *const AuthStorage) !void {
+        if (self.save_fn) |save| return save(self);
+        return self.saveToFile();
+    }
+
+    pub fn refreshCredentials(self: *AuthStorage, provider_id: []const u8, oauth_provider: OAuthProvider) !void {
+        const auth = self.providers.get(provider_id) orelse return error.AuthRequired;
+        const credentials = switch (auth) {
+            .api_key => return error.NotRefreshable,
+            .oauth => |credentials| credentials,
+        };
+
+        var ownership_transferred = false;
+        const new_credentials = try oauth_provider.refresh_fn(credentials, self.allocator);
+        errdefer if (!ownership_transferred) new_credentials.deinit(self.allocator);
+
+        const provider_id_copy = try self.allocator.dupe(u8, provider_id);
+        errdefer if (!ownership_transferred) self.allocator.free(provider_id_copy);
+
+        const removed = self.providers.fetchRemove(provider_id) orelse return error.AuthRequired;
+        errdefer {
+            // Rollback: remove the new entry and restore the old one
+            if (self.providers.fetchRemove(provider_id_copy)) |new_removed| {
+                self.allocator.free(new_removed.key);
+                new_removed.value.deinit(self.allocator);
+            }
+            self.providers.put(removed.key, removed.value) catch {
+                self.allocator.free(removed.key);
+                removed.value.deinit(self.allocator);
+            };
+        }
+
+        try self.providers.put(provider_id_copy, .{ .oauth = new_credentials });
+        ownership_transferred = true;
+        try self.persist();
+
+        self.allocator.free(removed.key);
+        removed.value.deinit(self.allocator);
+    }
+
     /// Get API key for provider (refreshing if needed)
     /// Note: Refresh logic requires oauth provider registry which is in parent module
     pub fn getApiKey(self: *AuthStorage, provider_id: []const u8, oauth_provider: ?OAuthProvider) !?[]const u8 {
@@ -195,20 +256,16 @@ pub const AuthStorage = struct {
         switch (auth) {
             .api_key => |key| return try self.allocator.dupe(u8, key),
             .oauth => |credentials| {
-                // Check expiry
+                const provider = oauth_provider orelse return error.UnknownProvider;
                 if (std.time.milliTimestamp() >= credentials.expires) {
-                    // Refresh needed
-                    const provider = oauth_provider orelse return error.UnknownProvider;
-                    const new_credentials = try provider.refresh_fn(credentials, self.allocator);
-
-                    // Update storage
-                    try self.providers.put(provider_id, .{ .oauth = new_credentials });
-                    try self.saveToFile();
-
-                    return try provider.get_api_key_fn(new_credentials, self.allocator);
+                    try self.refreshCredentials(provider_id, provider);
+                    const refreshed_auth = self.providers.get(provider_id) orelse return error.AuthRequired;
+                    return switch (refreshed_auth) {
+                        .api_key => |key| try self.allocator.dupe(u8, key),
+                        .oauth => |refreshed| try provider.get_api_key_fn(refreshed, self.allocator),
+                    };
                 }
 
-                const provider = oauth_provider orelse return error.UnknownProvider;
                 return try provider.get_api_key_fn(credentials, self.allocator);
             },
         }
