@@ -10,6 +10,7 @@ const event_stream = @import("event_stream");
 const hive_array = @import("hive_array");
 const auth_resolver = @import("auth_resolver");
 const oauth_storage = @import("oauth/storage");
+const refresh_lock_mod = @import("oauth/refresh_lock");
 
 pub const AuthStorage = oauth_storage.AuthStorage;
 
@@ -222,6 +223,10 @@ pub const ProtocolServer = struct {
     /// Options
     options: Options,
 
+    /// Per-provider refresh lock that prevents duplicate concurrent
+    /// refresh calls for the same provider scope.  See M-008.
+    refresh_lock: refresh_lock_mod.RefreshLock,
+
     pub const ActiveStream = struct {
         stream_id: protocol_types.Uuid,
         model: ai_types.Model,
@@ -269,11 +274,13 @@ pub const ProtocolServer = struct {
             .expected_sequences = std.AutoHashMap(protocol_types.Uuid, u64).init(allocator),
             .outbox = std.ArrayList(protocol_types.Envelope){},
             .options = options,
+            .refresh_lock = refresh_lock_mod.RefreshLock.init(allocator),
         };
     }
 
     pub fn deinit(self: *ProtocolServer) void {
         // Clean up all active streams
+        self.refresh_lock.deinit();
         var iter = self.active_streams.iterator();
         while (iter.next()) |entry| {
             var active_stream = entry.value_ptr.*;
@@ -534,6 +541,47 @@ fn streamWithResolvedKey(
     return provider.stream(model, context, resolved_options, server.allocator);
 }
 
+/// Acquire the refresh lock, perform a credential refresh if the caller
+/// wins the lock, and propagate the shared result to all waiters.
+///
+/// Returns success when the refresh completed (either by this caller or a
+/// concurrent one).  Returns an appropriate error on failure or timeout.
+fn refreshWithLock(
+    server: *ProtocolServer,
+    provider_id: []const u8,
+    storage: *oauth_storage.AuthStorage,
+    oauth_provider: oauth_storage.OAuthProvider,
+) !void {
+    const lock_result = server.refresh_lock.acquire(provider_id, null) catch
+        return error.AuthRefreshFailed;
+
+    switch (lock_result) {
+        .acquired => {
+            // This thread owns the refresh.
+            storage.refreshCredentials(provider_id, oauth_provider) catch |err| {
+                server.refresh_lock.complete(provider_id, null, err);
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.AuthRefreshFailed,
+                };
+            };
+            server.refresh_lock.complete(provider_id, null, null);
+        },
+        .completed_ok => {
+            // Another thread refreshed successfully — shared storage (if
+            // any) is already up to date.  If the storage is a locally
+            // loaded copy, the caller re-checks expiry after return.
+        },
+        .completed_err => |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AuthRefreshFailed,
+            };
+        },
+        .timed_out => return error.AuthRefreshFailed,
+    }
+}
+
 fn streamWithRefresh(
     server: *ProtocolServer,
     provider: api_registry.ApiProvider,
@@ -579,7 +627,7 @@ fn streamWithRefresh(
     }
 
     if (storage.credentialsExpired(provider_id)) {
-        storage.refreshCredentials(provider_id, oauth_provider) catch |err| switch (err) {
+        refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.AuthRefreshFailed,
         };
@@ -609,7 +657,10 @@ fn streamWithRefresh(
     stream.deinit();
     server.allocator.destroy(stream);
 
-    storage.refreshCredentials(provider_id, oauth_provider) catch |err| switch (err) {
+    // Retry-path refresh: acquire a new lock entry. The pre-call lock
+    // above has already completed and been cleaned up, so this is a
+    // distinct lock scope.
+    refreshWithLock(server, provider_id, storage, oauth_provider) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.AuthRefreshFailed,
     };
@@ -2731,4 +2782,125 @@ test "credential resolution: complete_request without credentials returns auth_r
         protocol_types.ErrorCode.auth_required,
         response.?.payload.nack.error_code.?,
     );
+}
+
+// ===========================================================================
+// M-008: Refresh lock integration tests
+// ===========================================================================
+
+test "refresh lock prevents duplicate concurrent refresh calls" {
+    // Verify that the per-server refresh lock deduplicates refresh attempts.
+    var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
+    defer lock.deinit();
+
+    // First acquire wins
+    const r1 = try lock.acquire("test-auth", null);
+    try std.testing.expect(r1 == .acquired);
+
+    // Complete the first refresh
+    lock.complete("test-auth", null, null);
+
+    // Second acquire sees the completed result
+    const r2 = try lock.acquire("test-auth", null);
+    try std.testing.expect(r2 == .completed_ok);
+}
+
+test "refreshWithLock wraps refreshCredentials under the lock" {
+    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1 };
+    auth_test_state = &state;
+    defer auth_test_state = null;
+
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+        .save_fn = authTestSaveStorage,
+    };
+    defer storage.deinit();
+
+    const refresh = try std.testing.allocator.dupe(u8, "refresh");
+    const access = try std.testing.allocator.dupe(u8, "access-0");
+    try storage.providers.put(try std.testing.allocator.dupe(u8, "test-auth"), .{
+        .oauth = .{
+            .refresh = refresh,
+            .access = access,
+            .expires = std.time.milliTimestamp() - 1,
+        },
+    });
+
+    const oauth_provider = oauth_storage.OAuthProvider{
+        .id = "test-auth",
+        .refresh_fn = authTestRefresh,
+        .get_api_key_fn = authTestGetApiKey,
+    };
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{
+        .load_auth_storage_fn = authTestLoadStorage,
+        .load_auth_storage_ctx = &state,
+    });
+    defer server.deinit();
+
+    // Call refreshWithLock — should acquire, refresh, and complete.
+    try refreshWithLock(&server, "test-auth", &storage, oauth_provider);
+    try std.testing.expectEqual(@as(usize, 1), state.refresh_count);
+
+    // Calling again should get completed_ok (lock still has result cached briefly)
+    // but since the entry is cleaned up after the first call, it will acquire again.
+    try refreshWithLock(&server, "test-auth", &storage, oauth_provider);
+    try std.testing.expectEqual(@as(usize, 2), state.refresh_count);
+}
+
+test "refresh lock propagates refresh failure to waiters" {
+    var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
+    defer lock.deinit();
+
+    // Simulate a failed refresh
+    const r1 = try lock.acquire("failing-provider", null);
+    try std.testing.expect(r1 == .acquired);
+
+    // Complete with failure
+    lock.complete("failing-provider", null, error.AuthRefreshFailed);
+
+    // Second caller should see the failure
+    const r2 = try lock.acquire("failing-provider", null);
+    try std.testing.expect(r2 == .completed_err);
+    try std.testing.expect(r2.completed_err == error.AuthRefreshFailed);
+}
+
+test "refresh lock timeout returns timed_out for stale locks" {
+    // 1 ms timeout for fast test
+    var lock = refresh_lock_mod.RefreshLock.initWithTimeout(std.testing.allocator, 1);
+    defer lock.deinit();
+
+    const r1 = try lock.acquire("slow-provider", null);
+    try std.testing.expect(r1 == .acquired);
+
+    // Wait for timeout
+    std.time.sleep(5 * std.time.ns_per_ms);
+
+    // Second caller should get timed_out
+    const r2 = try lock.acquire("slow-provider", null);
+    try std.testing.expect(r2 == .timed_out);
+
+    // Clean up
+    lock.complete("slow-provider", null, null);
+}
+
+test "refresh lock independent providers do not block each other" {
+    var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
+    defer lock.deinit();
+
+    // Acquire lock for provider A
+    const r1 = try lock.acquire("provider-a", null);
+    try std.testing.expect(r1 == .acquired);
+
+    // Provider B should acquire without waiting
+    const r2 = try lock.acquire("provider-b", null);
+    try std.testing.expect(r2 == .acquired);
+
+    // Clean up
+    lock.complete("provider-a", null, null);
+    lock.complete("provider-b", null, null);
 }

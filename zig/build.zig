@@ -78,6 +78,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const refresh_lock_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const api_registry_mod = b.createModule(.{
         .root_source_file = b.path("src/api_registry.zig"),
         .target = target,
@@ -482,6 +488,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hive_array", .module = hive_array_mod },
             .{ .name = "auth_resolver", .module = auth_resolver_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/refresh_lock", .module = refresh_lock_mod },
         },
     });
 
@@ -781,6 +788,8 @@ pub fn build(b: *std.Build) void {
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
 
     const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
+
+    const refresh_lock_test = b.addTest(.{ .root_module = refresh_lock_mod });
 
     const oauth_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1163,6 +1172,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
@@ -1242,6 +1252,7 @@ pub fn build(b: *std.Build) void {
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(retry_test).step);
