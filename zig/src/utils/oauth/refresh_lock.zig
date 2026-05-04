@@ -62,11 +62,42 @@ pub const RefreshLock = struct {
     }
 
     pub fn deinit(self: *RefreshLock) void {
+        // Hold the mutex while marking entries completed so any threads
+        // inside acquire() see a consistent state.  Marking completed
+        // before broadcast ensures waiters wake to a terminal result
+        // rather than accessing freed memory.
+        self.mutex.lock();
+
+        // Collect entries so we can free them after releasing the mutex.
+        var to_free = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
+            // OOM during deinit — still mark completed and broadcast so
+            // waiters don't deadlock, even if we can't collect for free.
+            var fallback_iter = self.entries.iterator();
+            while (fallback_iter.next()) |he| {
+                const e = he.value_ptr.*;
+                e.completed = true;
+                e.result = error.AuthRefreshFailed;
+                e.cond.broadcast();
+            }
+            self.mutex.unlock();
+            self.entries.deinit();
+            return;
+        };
+        defer to_free.deinit(self.allocator);
+
         var iter = self.entries.iterator();
         while (iter.next()) |hashmap_entry| {
             const entry = hashmap_entry.value_ptr.*;
-            // Wake any remaining waiters so they don't deadlock.
+            entry.completed = true;
+            entry.result = error.AuthRefreshFailed;
             entry.cond.broadcast();
+            to_free.appendAssumeCapacity(entry);
+        }
+        self.mutex.unlock();
+
+        // Now safe to free — no thread can be inside acquire() with a
+        // reference to these entries (they all see completed=true).
+        for (to_free.items) |entry| {
             self.allocator.free(entry.key_owned);
             self.allocator.destroy(entry);
         }
@@ -99,7 +130,6 @@ pub const RefreshLock = struct {
     /// and receives the shared result.
     pub fn acquire(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8) !AcquireResult {
         const key = try buildLockKey(self.allocator, provider_id, user_id);
-        errdefer self.allocator.free(key);
 
         self.mutex.lock();
 
@@ -156,7 +186,11 @@ pub const RefreshLock = struct {
         }
 
         // No entry — create one.  Caller owns the refresh.
-        const entry = try self.allocator.create(Entry);
+        const entry = self.allocator.create(Entry) catch |err| {
+            self.allocator.free(key);
+            self.mutex.unlock();
+            return err;
+        };
         entry.* = .{
             .key_owned = key,
             .acquired_at = std.time.milliTimestamp(),
@@ -165,7 +199,14 @@ pub const RefreshLock = struct {
             .completed = false,
             .ref_count = 1,
         };
-        try self.entries.put(key, entry);
+        self.entries.put(key, entry) catch |err| {
+            // Entry was created but not added to the map.
+            // Free key via entry.key_owned then destroy the entry.
+            self.allocator.free(entry.key_owned);
+            self.allocator.destroy(entry);
+            self.mutex.unlock();
+            return err;
+        };
         self.mutex.unlock();
         return .acquired;
     }
@@ -356,9 +397,6 @@ const ConcurrencyCtx = struct {
     err_count: std.atomic.Value(usize),
     timeout_count: std.atomic.Value(usize),
     provider: []const u8,
-    /// Barrier: first thread to acquire signals this; others start
-    /// trying to acquire only after the signal.
-    start_barrier: std.Thread.ResetEvent,
 };
 
 fn concurrentWorker(ctx: *ConcurrencyCtx) void {
@@ -398,15 +436,12 @@ test "concurrent requests for same provider trigger only one refresh" {
         .err_count = std.atomic.Value(usize).init(0),
         .timeout_count = std.atomic.Value(usize).init(0),
         .provider = "test-provider",
-        .start_barrier = .{},
     };
 
-    // First thread acquires and signals barrier; other threads start
-    // trying to acquire only after the barrier fires, guaranteeing
-    // they see the in-flight entry.
+    // Pre-acquire the lock so all worker threads block on the
+    // in-flight entry rather than racing to create new ones.
     const first_result = try lock.acquire("test-provider", null);
     try testing.expect(first_result == .acquired);
-    ctx.start_barrier.set();
 
     const num_waiters = 4;
     var threads: [num_waiters]std.Thread = undefined;
@@ -442,13 +477,11 @@ test "all waiting requests succeed after a single shared refresh completes" {
         .err_count = std.atomic.Value(usize).init(0),
         .timeout_count = std.atomic.Value(usize).init(0),
         .provider = "prov-ok",
-        .start_barrier = .{},
     };
 
     // Pre-acquire so all workers block.
     const first = try lock.acquire("prov-ok", null);
     try testing.expect(first == .acquired);
-    ctx.start_barrier.set();
 
     const num_waiters = 5;
     var threads: [num_waiters]std.Thread = undefined;
