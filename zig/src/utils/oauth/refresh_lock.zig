@@ -32,6 +32,10 @@ pub const RefreshLock = struct {
     mutex: std.Thread.Mutex,
     entries: std.StringHashMap(*Entry),
     timeout_ms: u64,
+    /// When true, `acquire()` returns immediately with
+    /// `error.AuthRefreshFailed`.  Set by `deinit()` before freeing
+    /// entries so waiters never dereference freed memory.
+    shutdown: bool = false,
 
     pub const AcquireResult = union(enum) {
         /// Lock acquired — caller owns the refresh and **must** call `complete()`.
@@ -62,11 +66,14 @@ pub const RefreshLock = struct {
     }
 
     pub fn deinit(self: *RefreshLock) void {
-        // Hold the mutex while marking entries completed so any threads
-        // inside acquire() see a consistent state.  Marking completed
-        // before broadcast ensures waiters wake to a terminal result
-        // rather than accessing freed memory.
+        // Hold the mutex while setting shutdown and marking entries
+        // completed so any threads inside acquire() see a consistent
+        // state.  Setting shutdown first ensures waiters that wake from
+        // cond.wait() check self.shutdown before touching entry data.
+        // Marking completed before broadcast ensures waiters wake to a
+        // terminal result rather than accessing freed memory.
         self.mutex.lock();
+        self.shutdown = true;
 
         // Collect entries so we can free them after releasing the mutex.
         var to_free = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
@@ -95,8 +102,10 @@ pub const RefreshLock = struct {
         }
         self.mutex.unlock();
 
-        // Now safe to free — no thread can be inside acquire() with a
-        // reference to these entries (they all see completed=true).
+        // Now safe to free — shutdown=true prevents any new acquire()
+        // from touching entries, and existing waiters that wake see
+        // self.shutdown first (via short-circuit evaluation) and bail
+        // without dereferencing entry data.
         for (to_free.items) |entry| {
             self.allocator.free(entry.key_owned);
             self.allocator.destroy(entry);
@@ -133,6 +142,13 @@ pub const RefreshLock = struct {
 
         self.mutex.lock();
 
+        // Fast exit if the lock has been shut down.
+        if (self.shutdown) {
+            self.allocator.free(key);
+            self.mutex.unlock();
+            return error.AuthRefreshFailed;
+        }
+
         if (self.entries.getPtr(key)) |entry_ptr| {
             // Entry already exists.
             const entry = entry_ptr.*;
@@ -161,10 +177,30 @@ pub const RefreshLock = struct {
                 return .timed_out;
             }
 
-            // Wait for the in-flight refresh.
+            // Wait for the in-flight refresh.  The `self.shutdown` check
+            // uses short-circuit `and` so entry fields are never accessed
+            // after deinit() frees the entry.
             entry.ref_count += 1;
-            while (!entry.completed) {
+            while (!self.shutdown and !entry.completed) {
                 entry.cond.wait(&self.mutex);
+            }
+
+            // If the lock was shut down while we were waiting, bail out
+            // without touching entry data — deinit() may have freed it.
+            if (self.shutdown) {
+                entry.ref_count -= 1;
+                if (entry.ref_count == 0) {
+                    // We're the last reference; deinit() skipped this
+                    // entry because we held a ref, so we must free it.
+                    const owned = entry.key_owned;
+                    _ = self.entries.remove(owned);
+                    self.mutex.unlock();
+                    self.allocator.free(owned);
+                    self.allocator.destroy(entry);
+                } else {
+                    self.mutex.unlock();
+                }
+                return error.AuthRefreshFailed;
             }
 
             // Woken — read shared result.
@@ -257,7 +293,7 @@ pub const RefreshLock = struct {
 
         self.mutex.lock();
         // Collect entries to expire so we don't invalidate the iterator.
-        var to_expire = std.ArrayList(*Entry).initCapacity(self.allocator, 4) catch {
+        var to_expire = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
             self.mutex.unlock();
             return;
         };
