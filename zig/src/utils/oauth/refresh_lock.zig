@@ -79,6 +79,10 @@ pub const RefreshLock = struct {
         var to_free = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
             // OOM during deinit — still mark completed and broadcast so
             // waiters don't deadlock, even if we can't collect for free.
+            // Do NOT deinit the map here — waiters woken by the broadcast
+            // may still be running their shutdown paths (accessing entries
+            // via ref_count).  Entries and map buckets will leak, which is
+            // acceptable under OOM during teardown.
             var fallback_iter = self.entries.iterator();
             while (fallback_iter.next()) |he| {
                 const e = he.value_ptr.*;
@@ -87,7 +91,6 @@ pub const RefreshLock = struct {
                 e.cond.broadcast();
             }
             self.mutex.unlock();
-            self.entries.deinit();
             return;
         };
         defer to_free.deinit(self.allocator);
@@ -126,6 +129,22 @@ pub const RefreshLock = struct {
             return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ provider_id, uid });
         }
         return allocator.dupe(u8, provider_id);
+    }
+
+    /// Check whether a stored lock key matches the given provider_id
+    /// and optional user_id.  Used by `complete()` to avoid allocating
+    /// a temporary lookup key.
+    fn keyMatches(key: []const u8, provider_id: []const u8, user_id: ?[]const u8) bool {
+        if (user_id) |uid| {
+            // Multi-tenant key: "provider_id\x00user_id"
+            const null_pos = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+            return std.mem.eql(u8, key[0..null_pos], provider_id) and
+                std.mem.eql(u8, key[null_pos + 1 ..], uid);
+        } else {
+            // Single-tenant: key must be exactly provider_id with no null byte.
+            if (std.mem.indexOfScalar(u8, key, 0) != null) return false;
+            return std.mem.eql(u8, key, provider_id);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -185,21 +204,14 @@ pub const RefreshLock = struct {
                 entry.cond.wait(&self.mutex);
             }
 
-            // If the lock was shut down while we were waiting, bail out
-            // without touching entry data — deinit() may have freed it.
+            // If the lock was shut down while we were waiting, just
+            // decrement our ref and bail.  Do NOT free the entry or
+            // remove it from the map — deinit() collects and frees
+            // all entries regardless of ref_count, so freeing here
+            // would cause a double-free.
             if (self.shutdown) {
                 entry.ref_count -= 1;
-                if (entry.ref_count == 0) {
-                    // We're the last reference; deinit() skipped this
-                    // entry because we held a ref, so we must free it.
-                    const owned = entry.key_owned;
-                    _ = self.entries.remove(owned);
-                    self.mutex.unlock();
-                    self.allocator.free(owned);
-                    self.allocator.destroy(entry);
-                } else {
-                    self.mutex.unlock();
-                }
+                self.mutex.unlock();
                 return error.AuthRefreshFailed;
             }
 
@@ -250,18 +262,29 @@ pub const RefreshLock = struct {
     /// Complete a refresh and wake all waiters.
     ///
     /// `err` is `null` for success, or the error that caused the failure.
+    /// This method does not allocate — it finds the entry by linear scan
+    /// so that OOM cannot prevent completion.
     pub fn complete(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8, err: ?anyerror) void {
-        const key = buildLockKey(self.allocator, provider_id, user_id) catch return;
-        defer self.allocator.free(key);
-
         self.mutex.lock();
 
-        const entry_ptr = self.entries.getPtr(key) orelse {
+        // Find matching entry by linear scan.  This avoids allocating a
+        // temporary lookup key (which can fail under memory pressure and
+        // would leave the entry permanently locked).  The entry count is
+        // typically in the single digits.
+        var match: ?*Entry = null;
+        var iter = self.entries.iterator();
+        while (iter.next()) |hashmap_entry| {
+            if (keyMatches(hashmap_entry.key_ptr.*, provider_id, user_id)) {
+                match = hashmap_entry.value_ptr.*;
+                break;
+            }
+        }
+
+        const entry = match orelse {
             self.mutex.unlock();
             return;
         };
 
-        const entry = entry_ptr.*;
         entry.result = err;
         entry.completed = true;
         entry.cond.broadcast();
