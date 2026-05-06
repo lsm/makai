@@ -62,7 +62,7 @@ const defaultProviderEvents = [
 ];
 
 const defaultAgentEvents = [
-  { type: "agent_start", session_id: "session-1" },
+  { type: "agent_start", session_id: "11111111-1111-4111-8111-111111111111" },
   { type: "turn_start" },
   { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
   { type: "text_delta", delta: "agent" },

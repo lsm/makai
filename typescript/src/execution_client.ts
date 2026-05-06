@@ -277,7 +277,16 @@ function executionContext(request: ProviderCompleteRequest | AgentRunRequest): R
 }
 
 function agentSessionId(request: AgentRunRequest): string {
-  return request.options?.session_id ?? randomUUID();
+  const sessionId = request.options?.session_id;
+  if (sessionId === undefined) return randomUUID();
+  if (!isUuid(sessionId)) {
+    throw new TypeError("request.options.session_id must be a UUID for agent transport");
+  }
+  return sessionId;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
 
 function serializeChatMessage(message: ChatMessage): Record<string, unknown> {

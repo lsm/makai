@@ -48,7 +48,7 @@ function request() {
   return {
     model_ref: "opaque-model-ref-with:colon",
     messages: [{ role: "user" as const, content: "hello" }],
-    options: { temperature: 0.2, session_id: "session-1" },
+    options: { temperature: 0.2, session_id: "11111111-1111-4111-8111-111111111111" },
   };
 }
 
@@ -178,6 +178,34 @@ test("client.agent.run resolves with correct AgentRunResponse", async () => {
   }
 });
 
+test("client.agent.run rejects non-UUID session IDs before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run({ ...request(), options: { ...request().options, session_id: "session-1" } }),
+      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a UUID for agent transport",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.stream rejects non-UUID session IDs before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      async () => collect(agent.stream({ ...request(), options: { ...request().options, session_id: "session-1" } })),
+      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a UUID for agent transport",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("client.agent.stream yields agent lifecycle events in order", async () => {
   const harness = await setupHarness();
   try {
@@ -193,7 +221,7 @@ test("client.agent.stream yields agent lifecycle events in order", async () => {
       "turn_end",
       "agent_end",
     ]);
-    assert.deepEqual(events[0], { type: "agent_start", session_id: "session-1" } satisfies AgentStreamEvent);
+    assert.deepEqual(events[0], { type: "agent_start", session_id: "11111111-1111-4111-8111-111111111111" } satisfies AgentStreamEvent);
     assert.deepEqual(events.at(-1), { type: "agent_end", usage: { input: 7, output: 9 }, stop_reason: "end_turn" } satisfies AgentStreamEvent);
 
     const logged = readLoggedRequests(harness.logPath);
