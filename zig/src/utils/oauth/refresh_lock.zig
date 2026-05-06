@@ -8,7 +8,8 @@
 //!
 //! Timeout: if a refresh lock is held for more than `timeout_ms` (default
 //! 30 000 ms), any waiter that observes the expiry releases the lock and
-//! all waiters receive `error.AuthRefreshFailed`.
+//! all waiters receive `error.AuthRefreshFailed`. Later callers can start a
+//! fresh lock generation; stale owner completions are ignored.
 
 const std = @import("std");
 
@@ -26,6 +27,10 @@ pub const RefreshLock = struct {
         /// True when completion was caused by refresh-lock timeout rather
         /// than owner-provided completion.
         timed_out: bool,
+        /// Monotonic ownership token for this lock generation. Owner
+        /// completion must present the same generation so stale owners from
+        /// timed-out generations cannot complete a newer refresh.
+        generation: u64,
         /// Reference count: 1 for the owner + N waiters.
         /// Whoever decrements to 0 removes and frees the entry.
         ref_count: usize,
@@ -39,14 +44,15 @@ pub const RefreshLock = struct {
     mutex: std.Thread.Mutex,
     entries: std.StringHashMap(*Entry),
     timeout_ms: u64,
+    next_generation: u64,
     /// When true, `acquire()` returns immediately with
-    /// `error.AuthRefreshFailed`.  Set by `deinit()` before freeing
-    /// entries so waiters never dereference freed memory.
+    /// `error.AuthRefreshFailed`. Set by `deinit()` before broadcasting
+    /// waiters; deinit waits for waiter refs to drain before freeing entries.
     shutdown: bool = false,
 
     pub const AcquireResult = union(enum) {
         /// Lock acquired — caller owns the refresh and **must** call `complete()`.
-        acquired,
+        acquired: u64,
         /// Another refresh completed successfully — proceed.
         completed_ok,
         /// Another refresh completed with an error — propagate.
@@ -69,59 +75,45 @@ pub const RefreshLock = struct {
             .mutex = .{},
             .entries = std.StringHashMap(*Entry).init(allocator),
             .timeout_ms = timeout_ms,
+            .next_generation = 1,
         };
     }
 
     pub fn deinit(self: *RefreshLock) void {
         // Hold the mutex while setting shutdown and marking entries
         // completed so any threads inside acquire() see a consistent
-        // state.  Setting shutdown first ensures waiters that wake from
-        // cond.wait() check self.shutdown before touching entry data.
-        // Marking completed before broadcast ensures waiters wake to a
-        // terminal result rather than accessing freed memory.
+        // state. Setting shutdown first ensures waiters wake into the
+        // shutdown path instead of interpreting the result as a normal
+        // refresh completion.
         self.mutex.lock();
         self.shutdown = true;
-
-        // Collect entries so we can free them after releasing the mutex.
-        var to_free = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
-            // OOM during deinit — still mark completed and broadcast so
-            // waiters don't deadlock, even if we can't collect for free.
-            // Do NOT deinit the map here — waiters woken by the broadcast
-            // may still be running their shutdown paths (accessing entries
-            // via ref_count).  Entries and map buckets will leak, which is
-            // acceptable under OOM during teardown.
-            var fallback_iter = self.entries.iterator();
-            while (fallback_iter.next()) |he| {
-                const e = he.value_ptr.*;
-                e.completed = true;
-                e.result = error.AuthRefreshFailed;
-                e.timed_out = false;
-                e.cond.broadcast();
-            }
-            self.mutex.unlock();
-            return;
-        };
-        defer to_free.deinit(self.allocator);
 
         var iter = self.entries.iterator();
         while (iter.next()) |hashmap_entry| {
             const entry = hashmap_entry.value_ptr.*;
+            if (!entry.owner_released) {
+                entry.owner_released = true;
+                entry.ref_count -= 1;
+            }
             entry.completed = true;
             entry.result = error.AuthRefreshFailed;
             entry.timed_out = false;
             entry.cond.broadcast();
-            to_free.appendAssumeCapacity(entry);
         }
-        self.mutex.unlock();
 
-        // Now safe to free — shutdown=true prevents any new acquire()
-        // from touching entries, and existing waiters that wake see
-        // self.shutdown first (via short-circuit evaluation) and bail
-        // without dereferencing entry data.
-        for (to_free.items) |entry| {
-            self.allocator.free(entry.key_owned);
-            self.allocator.destroy(entry);
+        // Wait for any woken waiters to release their refs before freeing.
+        // Entries stay allocated while waiters unwind, so the shutdown branch
+        // can safely decrement ref_count after reacquiring the mutex.
+        while (self.entries.count() > 0) {
+            var first_iter = self.entries.iterator();
+            const entry = first_iter.next().?.value_ptr.*;
+            while (entry.ref_count > 0) {
+                entry.cond.wait(&self.mutex);
+            }
+            self.freeEntry(entry);
         }
+
+        self.mutex.unlock();
         self.entries.deinit();
     }
 
@@ -159,7 +151,17 @@ pub const RefreshLock = struct {
             self.freeEntry(entry);
             return false;
         }
+        entry.cond.broadcast();
         return true;
+    }
+
+    fn releaseWaiterRef(self: *RefreshLock, entry: *Entry) void {
+        entry.ref_count -= 1;
+        if (self.shutdown) {
+            entry.cond.broadcast();
+        } else if (entry.ref_count == 0) {
+            self.freeEntry(entry);
+        }
     }
 
     fn tryRecoverTimedOutEntry(self: *RefreshLock, entry: *Entry) void {
@@ -245,17 +247,13 @@ pub const RefreshLock = struct {
                     // the failure immediately, and release the owner's ref so
                     // future acquires can recover with a fresh refresh instead
                     // of being poisoned by a stuck owner forever.
-                    if (self.timeoutEntry(entry)) {
-                        entry.cond.broadcast();
-                    }
+                    _ = self.timeoutEntry(entry);
                     self.allocator.free(key);
                     self.mutex.unlock();
                     return .timed_out;
                 }
 
-                // Wait for the in-flight refresh.  The `self.shutdown` check
-                // uses short-circuit `and` so entry fields are never accessed
-                // after deinit() frees the entry.  Use timed waits so a
+                // Wait for the in-flight refresh. Use timed waits so a
                 // waiter can enforce the refresh timeout even if no later
                 // caller arrives to observe expiry.
                 entry.ref_count += 1;
@@ -264,6 +262,7 @@ pub const RefreshLock = struct {
                     const remaining_ms = @as(i64, @intCast(self.timeout_ms)) - elapsed_ms;
                     if (remaining_ms <= 0) {
                         _ = self.timeoutEntry(entry);
+                        self.releaseWaiterRef(entry);
                         self.allocator.free(key);
                         self.mutex.unlock();
                         return .timed_out;
@@ -273,6 +272,7 @@ pub const RefreshLock = struct {
                         error.Timeout => {
                             if (!entry.completed) {
                                 _ = self.timeoutEntry(entry);
+                                self.releaseWaiterRef(entry);
                                 self.allocator.free(key);
                                 self.mutex.unlock();
                                 return .timed_out;
@@ -282,13 +282,12 @@ pub const RefreshLock = struct {
                     };
                 }
 
-                // If the lock was shut down while we were waiting, just
-                // decrement our ref and bail.  Do NOT free the entry or
-                // remove it from the map — deinit() collects and frees
-                // all entries regardless of ref_count, so freeing here
-                // would cause a double-free.
+                // If the lock was shut down while we were waiting, release
+                // our waiter ref and wake deinit() if this was the last waiter.
+                // deinit() waits for refs to drain before freeing entries, so
+                // this cannot race with entry destruction.
                 if (self.shutdown) {
-                    entry.ref_count -= 1;
+                    self.releaseWaiterRef(entry);
                     self.allocator.free(key);
                     self.mutex.unlock();
                     return error.AuthRefreshFailed;
@@ -297,10 +296,7 @@ pub const RefreshLock = struct {
                 // Woken — read shared result.
                 const result = entry.result;
                 const timed_out = entry.timed_out;
-                entry.ref_count -= 1;
-                if (entry.ref_count == 0) {
-                    self.freeEntry(entry);
-                }
+                self.releaseWaiterRef(entry);
                 self.allocator.free(key);
                 self.mutex.unlock();
                 if (timed_out) return .timed_out;
@@ -317,6 +313,10 @@ pub const RefreshLock = struct {
             self.mutex.unlock();
             return err;
         };
+        const generation = self.next_generation;
+        self.next_generation +%= 1;
+        if (self.next_generation == 0) self.next_generation = 1;
+
         entry.* = .{
             .key_owned = key,
             .acquired_at = std.time.milliTimestamp(),
@@ -324,6 +324,7 @@ pub const RefreshLock = struct {
             .result = null,
             .completed = false,
             .timed_out = false,
+            .generation = generation,
             .ref_count = 1,
             .owner_released = false,
         };
@@ -336,7 +337,7 @@ pub const RefreshLock = struct {
             return err;
         };
         self.mutex.unlock();
-        return .acquired;
+        return .{ .acquired = generation };
     }
 
     /// Complete a refresh and wake all waiters.
@@ -344,7 +345,7 @@ pub const RefreshLock = struct {
     /// `err` is `null` for success, or the error that caused the failure.
     /// This method does not allocate — it finds the entry by linear scan
     /// so that OOM cannot prevent completion.
-    pub fn complete(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8, err: ?anyerror) void {
+    pub fn complete(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8, generation: u64, err: ?anyerror) void {
         self.mutex.lock();
 
         // Find matching entry by linear scan.  This avoids allocating a
@@ -364,6 +365,11 @@ pub const RefreshLock = struct {
             self.mutex.unlock();
             return;
         };
+
+        if (entry.generation != generation) {
+            self.mutex.unlock();
+            return;
+        }
 
         entry.result = err;
         entry.completed = true;
@@ -438,6 +444,13 @@ pub const RefreshLock = struct {
 
 const testing = std.testing;
 
+fn expectAcquired(result: RefreshLock.AcquireResult) !u64 {
+    return switch (result) {
+        .acquired => |generation| generation,
+        else => error.TestUnexpectedResult,
+    };
+}
+
 // -- Basic lifecycle --------------------------------------------------------
 
 test "RefreshLock init/deinit" {
@@ -449,9 +462,8 @@ test "RefreshLock acquire returns acquired for new key" {
     var lock = RefreshLock.init(testing.allocator);
     defer lock.deinit();
 
-    const result = try lock.acquire("test-provider", null);
-    try testing.expect(result == .acquired);
-    lock.complete("test-provider", null, null);
+    const gen = try expectAcquired(try lock.acquire("test-provider", null));
+    lock.complete("test-provider", null, gen, null);
 }
 
 test "RefreshLock acquire returns completed_ok after successful refresh" {
@@ -459,64 +471,55 @@ test "RefreshLock acquire returns completed_ok after successful refresh" {
     defer lock.deinit();
 
     // Simulate: first acquire owns and completes successfully.
-    const r1 = try lock.acquire("prov", null);
-    try testing.expect(r1 == .acquired);
-    lock.complete("prov", null, null);
+    const gen1 = try expectAcquired(try lock.acquire("prov", null));
+    lock.complete("prov", null, gen1, null);
 
     // Once the owner completes with no waiters, the entry is removed.
     // A later acquire starts a new refresh.
-    const r2 = try lock.acquire("prov", null);
-    try testing.expect(r2 == .acquired);
-    lock.complete("prov", null, null);
+    const gen2 = try expectAcquired(try lock.acquire("prov", null));
+    lock.complete("prov", null, gen2, null);
 }
 
 test "RefreshLock acquire returns completed_err after failed refresh" {
     var lock = RefreshLock.init(testing.allocator);
     defer lock.deinit();
 
-    const r1 = try lock.acquire("prov", null);
-    try testing.expect(r1 == .acquired);
-    lock.complete("prov", null, error.AuthRefreshFailed);
+    const gen1 = try expectAcquired(try lock.acquire("prov", null));
+    lock.complete("prov", null, gen1, error.AuthRefreshFailed);
 
     // Once the owner completes with no waiters, the entry is removed.
     // A later acquire starts a new refresh.
-    const r2 = try lock.acquire("prov", null);
-    try testing.expect(r2 == .acquired);
-    lock.complete("prov", null, error.AuthRefreshFailed);
+    const gen2 = try expectAcquired(try lock.acquire("prov", null));
+    lock.complete("prov", null, gen2, error.AuthRefreshFailed);
 }
 
 test "RefreshLock different providers are independent" {
     var lock = RefreshLock.init(testing.allocator);
     defer lock.deinit();
 
-    const r1 = try lock.acquire("prov-a", null);
-    try testing.expect(r1 == .acquired);
+    const gen1 = try expectAcquired(try lock.acquire("prov-a", null));
 
-    const r2 = try lock.acquire("prov-b", null);
-    try testing.expect(r2 == .acquired);
+    const gen2 = try expectAcquired(try lock.acquire("prov-b", null));
 
-    lock.complete("prov-a", null, null);
-    lock.complete("prov-b", null, error.AuthRefreshFailed);
+    lock.complete("prov-a", null, gen1, null);
+    lock.complete("prov-b", null, gen2, error.AuthRefreshFailed);
 }
 
 test "RefreshLock user_id creates separate scope" {
     var lock = RefreshLock.init(testing.allocator);
     defer lock.deinit();
 
-    const r1 = try lock.acquire("prov", "user1");
-    try testing.expect(r1 == .acquired);
+    const gen1 = try expectAcquired(try lock.acquire("prov", "user1"));
 
-    const r2 = try lock.acquire("prov", "user2");
-    try testing.expect(r2 == .acquired);
+    const gen2 = try expectAcquired(try lock.acquire("prov", "user2"));
 
-    lock.complete("prov", "user1", null);
-    lock.complete("prov", "user2", null);
+    lock.complete("prov", "user1", gen1, null);
+    lock.complete("prov", "user2", gen2, null);
 
     // Completed entries with no waiters are removed, so a later acquire
     // starts a fresh scoped refresh.
-    const r3 = try lock.acquire("prov", "user1");
-    try testing.expect(r3 == .acquired);
-    lock.complete("prov", "user1", null);
+    const gen3 = try expectAcquired(try lock.acquire("prov", "user1"));
+    lock.complete("prov", "user1", gen3, null);
 }
 
 test "RefreshLock buildLockKey single-tenant is just provider_id" {
@@ -550,11 +553,11 @@ fn concurrentWorker(ctx: *ConcurrencyCtx) void {
     };
     _ = ctx.acquire_count.fetchAdd(1, .monotonic);
     switch (result) {
-        .acquired => {
+        .acquired => |generation| {
             _ = ctx.refresh_count.fetchAdd(1, .monotonic);
             // Simulate a short refresh delay
             std.Thread.sleep(5 * std.time.ns_per_ms);
-            ctx.lock.complete(ctx.provider, null, null);
+            ctx.lock.complete(ctx.provider, null, generation, null);
         },
         .completed_ok => {
             _ = ctx.ok_count.fetchAdd(1, .monotonic);
@@ -584,8 +587,7 @@ test "concurrent requests for same provider trigger only one refresh" {
 
     // Pre-acquire the lock so all worker threads block on the
     // in-flight entry rather than racing to create new ones.
-    const first_result = try lock.acquire("test-provider", null);
-    try testing.expect(first_result == .acquired);
+    const first_gen = try expectAcquired(try lock.acquire("test-provider", null));
 
     const num_waiters = 4;
     var threads: [num_waiters]std.Thread = undefined;
@@ -595,7 +597,7 @@ test "concurrent requests for same provider trigger only one refresh" {
 
     // Hold the lock a moment so waiters actually block.
     std.Thread.sleep(10 * std.time.ns_per_ms);
-    lock.complete("test-provider", null, null);
+    lock.complete("test-provider", null, first_gen, null);
 
     for (&threads) |t| {
         t.join();
@@ -624,8 +626,7 @@ test "all waiting requests succeed after a single shared refresh completes" {
     };
 
     // Pre-acquire so all workers block.
-    const first = try lock.acquire("prov-ok", null);
-    try testing.expect(first == .acquired);
+    const first_gen = try expectAcquired(try lock.acquire("prov-ok", null));
 
     const num_waiters = 5;
     var threads: [num_waiters]std.Thread = undefined;
@@ -635,7 +636,7 @@ test "all waiting requests succeed after a single shared refresh completes" {
 
     // Complete with success.
     std.Thread.sleep(5 * std.time.ns_per_ms);
-    lock.complete("prov-ok", null, null);
+    lock.complete("prov-ok", null, first_gen, null);
 
     for (&threads) |t| {
         t.join();
@@ -654,8 +655,7 @@ test "lock held beyond timeout returns timed_out" {
     defer lock.deinit();
 
     // Acquire and hold — do NOT complete.
-    const first = try lock.acquire("slow-provider", null);
-    try testing.expect(first == .acquired);
+    const first_gen = try expectAcquired(try lock.acquire("slow-provider", null));
 
     // Wait for the timeout to elapse.
     std.Thread.sleep(80 * std.time.ns_per_ms);
@@ -665,24 +665,94 @@ test "lock held beyond timeout returns timed_out" {
     try testing.expect(second == .timed_out);
 
     // Clean up: complete the stale entry so deinit doesn't deadlock.
-    lock.complete("slow-provider", null, null);
+    lock.complete("slow-provider", null, first_gen, null);
 }
 
 test "expireTimedOut marks stale entries as completed" {
     var lock = RefreshLock.initWithTimeout(testing.allocator, 50);
     defer lock.deinit();
 
-    const first = try lock.acquire("expired-provider", null);
-    try testing.expect(first == .acquired);
+    _ = try expectAcquired(try lock.acquire("expired-provider", null));
 
     std.Thread.sleep(80 * std.time.ns_per_ms);
     lock.expireTimedOut();
 
     // No waiters were holding refs, so expireTimedOut removes the stale
     // entry and a later acquire can recover with a fresh refresh.
-    const second = try lock.acquire("expired-provider", null);
-    try testing.expect(second == .acquired);
-    lock.complete("expired-provider", null, null);
+    const second_gen = try expectAcquired(try lock.acquire("expired-provider", null));
+    lock.complete("expired-provider", null, second_gen, null);
+}
+
+const WaiterTimeoutCtx = struct {
+    lock: *RefreshLock,
+    provider: []const u8,
+    timed_out_count: std.atomic.Value(usize),
+};
+
+fn timeoutWaiter(ctx: *WaiterTimeoutCtx) void {
+    const result = ctx.lock.acquire(ctx.provider, null) catch return;
+    if (result == .timed_out) {
+        _ = ctx.timed_out_count.fetchAdd(1, .monotonic);
+    }
+}
+
+fn shutdownWaiter(ctx: *WaiterTimeoutCtx) void {
+    _ = ctx.lock.acquire(ctx.provider, null) catch return;
+}
+
+const DeinitCtx = struct {
+    lock: *RefreshLock,
+};
+
+fn deinitWorker(ctx: *DeinitCtx) void {
+    ctx.lock.deinit();
+}
+
+test "waiter timeout releases waiter ref and allows recovery" {
+    var lock = RefreshLock.initWithTimeout(testing.allocator, 20);
+    defer lock.deinit();
+
+    const stale_gen = try expectAcquired(try lock.acquire("recover-provider", null));
+
+    var ctx = WaiterTimeoutCtx{
+        .lock = &lock,
+        .provider = "recover-provider",
+        .timed_out_count = std.atomic.Value(usize).init(0),
+    };
+    const waiter = try std.Thread.spawn(.{}, timeoutWaiter, .{&ctx});
+    waiter.join();
+
+    try testing.expectEqual(@as(usize, 1), ctx.timed_out_count.load(.seq_cst));
+
+    const recovered_gen = try expectAcquired(try lock.acquire("recover-provider", null));
+
+    // The stale owner completion uses the old generation and must not corrupt
+    // the recovered in-flight refresh.
+    lock.complete("recover-provider", null, stale_gen, null);
+    try testing.expectEqual(@as(usize, 1), lock.activeCount());
+
+    lock.complete("recover-provider", null, recovered_gen, null);
+    try testing.expectEqual(@as(usize, 0), lock.activeCount());
+}
+
+test "shutdown with waiter does not dereference freed entries" {
+    var lock = RefreshLock.init(testing.allocator);
+
+    _ = try expectAcquired(try lock.acquire("shutdown-provider", null));
+
+    var ctx = WaiterTimeoutCtx{
+        .lock = &lock,
+        .provider = "shutdown-provider",
+        .timed_out_count = std.atomic.Value(usize).init(0),
+    };
+    const waiter = try std.Thread.spawn(.{}, shutdownWaiter, .{&ctx});
+
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    var deinit_ctx = DeinitCtx{ .lock = &lock };
+    const deinit_thread = try std.Thread.spawn(.{}, deinitWorker, .{&deinit_ctx});
+
+    waiter.join();
+    deinit_thread.join();
 }
 
 // -- Diagnostics ------------------------------------------------------------
@@ -693,15 +763,15 @@ test "activeCount reports in-flight entries" {
 
     try testing.expectEqual(@as(usize, 0), lock.activeCount());
 
-    _ = try lock.acquire("a", null);
+    const gen_a = try expectAcquired(try lock.acquire("a", null));
     try testing.expectEqual(@as(usize, 1), lock.activeCount());
 
-    _ = try lock.acquire("b", null);
+    const gen_b = try expectAcquired(try lock.acquire("b", null));
     try testing.expectEqual(@as(usize, 2), lock.activeCount());
 
-    lock.complete("a", null, null);
+    lock.complete("a", null, gen_a, null);
     try testing.expectEqual(@as(usize, 1), lock.activeCount());
 
-    lock.complete("b", null, null);
+    lock.complete("b", null, gen_b, null);
     try testing.expectEqual(@as(usize, 0), lock.activeCount());
 }

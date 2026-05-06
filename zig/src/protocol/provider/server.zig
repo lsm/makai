@@ -558,16 +558,16 @@ fn refreshWithLock(
     };
 
     switch (lock_result) {
-        .acquired => {
+        .acquired => |generation| {
             // This thread owns the refresh.
             storage.refreshCredentials(provider_id, oauth_provider) catch |err| {
-                server.refresh_lock.complete(provider_id, null, err);
+                server.refresh_lock.complete(provider_id, null, generation, err);
                 return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.AuthRefreshFailed,
                 };
             };
-            server.refresh_lock.complete(provider_id, null, null);
+            server.refresh_lock.complete(provider_id, null, generation, null);
         },
         .completed_ok => {
             // Another thread refreshed successfully — shared storage (if
@@ -2791,23 +2791,28 @@ test "credential resolution: complete_request without credentials returns auth_r
 // M-008: Refresh lock integration tests
 // ===========================================================================
 
+fn expectRefreshLockAcquired(result: refresh_lock_mod.RefreshLock.AcquireResult) !u64 {
+    return switch (result) {
+        .acquired => |generation| generation,
+        else => error.TestUnexpectedResult,
+    };
+}
+
 test "refresh lock prevents duplicate concurrent refresh calls" {
     // Verify that the per-server refresh lock deduplicates refresh attempts.
     var lock = refresh_lock_mod.RefreshLock.init(std.testing.allocator);
     defer lock.deinit();
 
     // First acquire wins
-    const r1 = try lock.acquire("test-auth", null);
-    try std.testing.expect(r1 == .acquired);
+    const gen1 = try expectRefreshLockAcquired(try lock.acquire("test-auth", null));
 
     // Complete the first refresh
-    lock.complete("test-auth", null, null);
+    lock.complete("test-auth", null, gen1, null);
 
     // Completed entries with no waiters are removed, so a later acquire
     // starts a fresh refresh.
-    const r2 = try lock.acquire("test-auth", null);
-    try std.testing.expect(r2 == .acquired);
-    lock.complete("test-auth", null, null);
+    const gen2 = try expectRefreshLockAcquired(try lock.acquire("test-auth", null));
+    lock.complete("test-auth", null, gen2, null);
 }
 
 test "refreshWithLock wraps refreshCredentials under the lock" {
@@ -2862,17 +2867,15 @@ test "refresh lock propagates refresh failure to waiters" {
     defer lock.deinit();
 
     // Simulate a failed refresh
-    const r1 = try lock.acquire("failing-provider", null);
-    try std.testing.expect(r1 == .acquired);
+    const gen1 = try expectRefreshLockAcquired(try lock.acquire("failing-provider", null));
 
     // Complete with failure
-    lock.complete("failing-provider", null, error.AuthRefreshFailed);
+    lock.complete("failing-provider", null, gen1, error.AuthRefreshFailed);
 
     // Completed entries with no waiters are removed, so a later acquire
     // starts a fresh refresh.
-    const r2 = try lock.acquire("failing-provider", null);
-    try std.testing.expect(r2 == .acquired);
-    lock.complete("failing-provider", null, error.AuthRefreshFailed);
+    const gen2 = try expectRefreshLockAcquired(try lock.acquire("failing-provider", null));
+    lock.complete("failing-provider", null, gen2, error.AuthRefreshFailed);
 }
 
 test "refresh lock timeout returns timed_out for stale locks" {
@@ -2880,8 +2883,7 @@ test "refresh lock timeout returns timed_out for stale locks" {
     var lock = refresh_lock_mod.RefreshLock.initWithTimeout(std.testing.allocator, 1);
     defer lock.deinit();
 
-    const r1 = try lock.acquire("slow-provider", null);
-    try std.testing.expect(r1 == .acquired);
+    const gen1 = try expectRefreshLockAcquired(try lock.acquire("slow-provider", null));
 
     // Wait for timeout
     std.Thread.sleep(5 * std.time.ns_per_ms);
@@ -2891,7 +2893,7 @@ test "refresh lock timeout returns timed_out for stale locks" {
     try std.testing.expect(r2 == .timed_out);
 
     // Clean up
-    lock.complete("slow-provider", null, null);
+    lock.complete("slow-provider", null, gen1, null);
 }
 
 test "refresh lock independent providers do not block each other" {
@@ -2899,14 +2901,12 @@ test "refresh lock independent providers do not block each other" {
     defer lock.deinit();
 
     // Acquire lock for provider A
-    const r1 = try lock.acquire("provider-a", null);
-    try std.testing.expect(r1 == .acquired);
+    const gen1 = try expectRefreshLockAcquired(try lock.acquire("provider-a", null));
 
     // Provider B should acquire without waiting
-    const r2 = try lock.acquire("provider-b", null);
-    try std.testing.expect(r2 == .acquired);
+    const gen2 = try expectRefreshLockAcquired(try lock.acquire("provider-b", null));
 
     // Clean up
-    lock.complete("provider-a", null, null);
-    lock.complete("provider-b", null, null);
+    lock.complete("provider-a", null, gen1, null);
+    lock.complete("provider-b", null, gen2, null);
 }
