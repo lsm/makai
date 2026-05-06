@@ -29,6 +29,10 @@ pub const RefreshLock = struct {
         /// Reference count: 1 for the owner + N waiters.
         /// Whoever decrements to 0 removes and frees the entry.
         ref_count: usize,
+        /// When true, the original owner is no longer counted in
+        /// ref_count because a waiter expired the entry.  A later owner
+        /// complete() becomes a no-op instead of decrementing below zero.
+        owner_released: bool,
     };
 
     allocator: std.mem.Allocator,
@@ -136,6 +140,38 @@ pub const RefreshLock = struct {
         return allocator.dupe(u8, provider_id);
     }
 
+    fn freeEntry(self: *RefreshLock, entry: *Entry) void {
+        const owned = entry.key_owned;
+        _ = self.entries.remove(owned);
+        self.allocator.free(owned);
+        self.allocator.destroy(entry);
+    }
+
+    fn timeoutEntry(self: *RefreshLock, entry: *Entry) bool {
+        if (!entry.owner_released) {
+            entry.owner_released = true;
+            entry.ref_count -= 1;
+        }
+        entry.completed = true;
+        entry.result = error.AuthRefreshFailed;
+        entry.timed_out = true;
+        if (entry.ref_count == 0) {
+            self.freeEntry(entry);
+            return false;
+        }
+        return true;
+    }
+
+    fn tryRecoverTimedOutEntry(self: *RefreshLock, entry: *Entry) void {
+        if (!entry.owner_released) {
+            entry.owner_released = true;
+            entry.ref_count -= 1;
+        }
+        if (entry.ref_count == 0) {
+            self.freeEntry(entry);
+        }
+    }
+
     /// Check whether a stored lock key matches the given provider_id
     /// and optional user_id.  Used by `complete()` to avoid allocating
     /// a temporary lookup key.
@@ -176,12 +212,96 @@ pub const RefreshLock = struct {
         if (self.entries.getPtr(key)) |entry_ptr| {
             // Entry already exists.
             const entry = entry_ptr.*;
-            // key no longer needed — lookup was by content.
-            self.allocator.free(key);
 
             if (entry.completed) {
+                // Timed-out entries are terminal only for the current
+                // waiters. Later callers should recover by starting a
+                // fresh refresh rather than failing forever.
+                if (entry.timed_out) {
+                    self.tryRecoverTimedOutEntry(entry);
+                    if (self.entries.getPtr(key) != null) {
+                        // Current waiters still hold refs; don't start a
+                        // second overlapping refresh for the same scope.
+                        self.allocator.free(key);
+                        self.mutex.unlock();
+                        return .timed_out;
+                    }
+                    // Fall through below and create a fresh entry for
+                    // this caller. Keep `key` as the new owned map key.
+                } else {
+                    const result = entry.result;
+                    self.allocator.free(key);
+                    self.mutex.unlock();
+                    return if (result) |err|
+                        .{ .completed_err = err }
+                    else
+                        .completed_ok;
+                }
+            } else {
+                // Check timeout.
+                const now = std.time.milliTimestamp();
+                if (now - entry.acquired_at > @as(i64, @intCast(self.timeout_ms))) {
+                    // Timed out — mark completed so all current waiters see
+                    // the failure immediately, and release the owner's ref so
+                    // future acquires can recover with a fresh refresh instead
+                    // of being poisoned by a stuck owner forever.
+                    if (self.timeoutEntry(entry)) {
+                        entry.cond.broadcast();
+                    }
+                    self.allocator.free(key);
+                    self.mutex.unlock();
+                    return .timed_out;
+                }
+
+                // Wait for the in-flight refresh.  The `self.shutdown` check
+                // uses short-circuit `and` so entry fields are never accessed
+                // after deinit() frees the entry.  Use timed waits so a
+                // waiter can enforce the refresh timeout even if no later
+                // caller arrives to observe expiry.
+                entry.ref_count += 1;
+                while (!self.shutdown and !entry.completed) {
+                    const elapsed_ms = std.time.milliTimestamp() - entry.acquired_at;
+                    const remaining_ms = @as(i64, @intCast(self.timeout_ms)) - elapsed_ms;
+                    if (remaining_ms <= 0) {
+                        _ = self.timeoutEntry(entry);
+                        self.allocator.free(key);
+                        self.mutex.unlock();
+                        return .timed_out;
+                    }
+                    const timeout_ns = @as(u64, @intCast(remaining_ms)) * std.time.ns_per_ms;
+                    entry.cond.timedWait(&self.mutex, timeout_ns) catch |err| switch (err) {
+                        error.Timeout => {
+                            if (!entry.completed) {
+                                _ = self.timeoutEntry(entry);
+                                self.allocator.free(key);
+                                self.mutex.unlock();
+                                return .timed_out;
+                            }
+                            break;
+                        },
+                    };
+                }
+
+                // If the lock was shut down while we were waiting, just
+                // decrement our ref and bail.  Do NOT free the entry or
+                // remove it from the map — deinit() collects and frees
+                // all entries regardless of ref_count, so freeing here
+                // would cause a double-free.
+                if (self.shutdown) {
+                    entry.ref_count -= 1;
+                    self.allocator.free(key);
+                    self.mutex.unlock();
+                    return error.AuthRefreshFailed;
+                }
+
+                // Woken — read shared result.
                 const result = entry.result;
                 const timed_out = entry.timed_out;
+                entry.ref_count -= 1;
+                if (entry.ref_count == 0) {
+                    self.freeEntry(entry);
+                }
+                self.allocator.free(key);
                 self.mutex.unlock();
                 if (timed_out) return .timed_out;
                 return if (result) |err|
@@ -189,58 +309,6 @@ pub const RefreshLock = struct {
                 else
                     .completed_ok;
             }
-
-            // Check timeout.
-            const now = std.time.milliTimestamp();
-            if (now - entry.acquired_at > @as(i64, @intCast(self.timeout_ms))) {
-                // Timed out — mark completed so all current and future
-                // waiters see the failure immediately.
-                entry.completed = true;
-                entry.result = error.AuthRefreshFailed;
-                entry.timed_out = true;
-                entry.cond.broadcast();
-                // This waiter never incremented ref_count, so just return.
-                self.mutex.unlock();
-                return .timed_out;
-            }
-
-            // Wait for the in-flight refresh.  The `self.shutdown` check
-            // uses short-circuit `and` so entry fields are never accessed
-            // after deinit() frees the entry.
-            entry.ref_count += 1;
-            while (!self.shutdown and !entry.completed) {
-                entry.cond.wait(&self.mutex);
-            }
-
-            // If the lock was shut down while we were waiting, just
-            // decrement our ref and bail.  Do NOT free the entry or
-            // remove it from the map — deinit() collects and frees
-            // all entries regardless of ref_count, so freeing here
-            // would cause a double-free.
-            if (self.shutdown) {
-                entry.ref_count -= 1;
-                self.mutex.unlock();
-                return error.AuthRefreshFailed;
-            }
-
-            // Woken — read shared result.
-            const result = entry.result;
-            const timed_out = entry.timed_out;
-            entry.ref_count -= 1;
-            if (entry.ref_count == 0) {
-                const owned = entry.key_owned;
-                _ = self.entries.remove(owned);
-                self.mutex.unlock();
-                self.allocator.free(owned);
-                self.allocator.destroy(entry);
-            } else {
-                self.mutex.unlock();
-            }
-            if (timed_out) return .timed_out;
-            return if (result) |err|
-                .{ .completed_err = err }
-            else
-                .completed_ok;
         }
 
         // No entry — create one.  Caller owns the refresh.
@@ -257,6 +325,7 @@ pub const RefreshLock = struct {
             .completed = false,
             .timed_out = false,
             .ref_count = 1,
+            .owner_released = false,
         };
         self.entries.put(key, entry) catch |err| {
             // Entry was created but not added to the map.
@@ -300,17 +369,15 @@ pub const RefreshLock = struct {
         entry.completed = true;
         entry.timed_out = false;
         entry.cond.broadcast();
-        entry.ref_count -= 1;
+        if (!entry.owner_released) {
+            entry.owner_released = true;
+            entry.ref_count -= 1;
+        }
 
         if (entry.ref_count == 0) {
-            const owned = entry.key_owned;
-            _ = self.entries.remove(owned);
-            self.mutex.unlock();
-            self.allocator.free(owned);
-            self.allocator.destroy(entry);
-        } else {
-            self.mutex.unlock();
+            self.freeEntry(entry);
         }
+        self.mutex.unlock();
     }
 
     // ------------------------------------------------------------------
@@ -342,12 +409,12 @@ pub const RefreshLock = struct {
             }
         }
         for (to_expire.items) |entry| {
-            entry.completed = true;
-            entry.result = error.AuthRefreshFailed;
-            entry.timed_out = true;
-            entry.cond.broadcast();
-            // Don't remove here — waiters (or the holder's complete call)
-            // will clean up when ref_count hits 0.
+            if (self.timeoutEntry(entry)) {
+                entry.cond.broadcast();
+            }
+            // timeoutEntry releases the owner's ref. Waiters clean up
+            // when ref_count hits 0, or timeoutEntry frees immediately
+            // if no waiters remain.
         }
         self.mutex.unlock();
     }

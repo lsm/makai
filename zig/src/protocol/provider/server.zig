@@ -552,8 +552,10 @@ fn refreshWithLock(
     storage: *oauth_storage.AuthStorage,
     oauth_provider: oauth_storage.OAuthProvider,
 ) !void {
-    const lock_result = server.refresh_lock.acquire(provider_id, null) catch
-        return error.AuthRefreshFailed;
+    const lock_result = server.refresh_lock.acquire(provider_id, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.AuthRefreshFailed,
+    };
 
     switch (lock_result) {
         .acquired => {
