@@ -1,11 +1,19 @@
 // Fixture stdio server that emulates the auth protocol path of `makai --stdio`
 // for the `auth_providers_request` envelope. Used by typescript SDK tests.
+const fs = require("node:fs");
 const readline = require("node:readline");
 const { ulid } = require("ulid");
 
 process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + "\n");
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
+const frameLog = process.env.MAKAI_TEST_FRAME_LOG || "";
+
+function appendLog(path, line) {
+  if (!path) return;
+  fs.appendFileSync(path, line + "\n");
+}
 
 const outboundSequences = new Map();
 function nextSeq(streamId) {
@@ -15,6 +23,7 @@ function nextSeq(streamId) {
 }
 
 function send(envelope) {
+  appendLog(frameLog, JSON.stringify(envelope));
   process.stdout.write(JSON.stringify(envelope) + "\n");
 }
 
@@ -27,6 +36,7 @@ rl.on("line", (line) => {
   }
 
   if (envelope.type === "auth_providers_request") {
+    appendLog(requestLog, JSON.stringify(envelope));
     send({
       type: "ack",
       stream_id: envelope.stream_id,
