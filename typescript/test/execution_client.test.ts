@@ -46,7 +46,7 @@ async function setupHarness(envOverrides: NodeJS.ProcessEnv = {}): Promise<Harne
 
 function request() {
   return {
-    model_ref: "opaque-model-ref-with:colon",
+    model_ref: "anthropic/anthropic-messages@opaque-model-ref-with%3Acolon",
     messages: [{ role: "user" as const, content: "hello" }],
     options: { temperature: 0.2, session_id: "11111111-1111-4111-8111-111111111111" },
   };
@@ -83,10 +83,11 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
     assert.deepEqual(payload.model, {
       id: "opaque-model-ref-with:colon",
       name: "opaque-model-ref-with:colon",
-      api: "",
-      provider: "",
+      api: "anthropic-messages",
+      provider: "anthropic",
       base_url: "",
     });
+    assert.equal(payload.model_ref, request().model_ref);
     assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
   } finally {
     await harness.cleanup();
@@ -98,7 +99,7 @@ test("client.provider.complete maps system prompts and tool messages into provid
   try {
     const provider = createMakaiProviderApi(harness.client);
     await provider.complete({
-      model_ref: "opaque-model-ref-with:colon",
+      model_ref: "anthropic/anthropic-messages@opaque-model-ref-with%3Acolon",
       messages: [
         { role: "system", content: "You are helpful." },
         { role: "developer", content: [{ type: "text", text: "Prefer concise answers." }] },
@@ -296,7 +297,13 @@ test("client.provider.stream buffers incremental tool calls into one tool_call e
 
     const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
     assert.equal(payload.include_partial, false);
-    assert.equal((payload.model as Record<string, unknown>).id, "opaque-model-ref-with:colon");
+    assert.deepEqual(payload.model, {
+      id: "opaque-model-ref-with:colon",
+      name: "opaque-model-ref-with:colon",
+      api: "anthropic-messages",
+      provider: "anthropic",
+      base_url: "",
+    });
     assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
   } finally {
     await harness.cleanup();
@@ -378,7 +385,7 @@ test("createMakaiClient wires all namespaces correctly", async () => {
     await collect(handle.provider.stream(request()));
     const streamRequest = readLoggedRequests(logPath).find((entry) => entry.type === "stream_request");
     assert.equal(((streamRequest?.payload as Record<string, unknown>).options as Record<string, unknown>).auth_retry_policy, "auto_once");
-    assert.equal(((streamRequest?.payload as Record<string, unknown>).model as Record<string, unknown>).id, "opaque-model-ref-with:colon");
+    assert.equal(((streamRequest?.payload as Record<string, unknown>).model as Record<string, unknown>).api, "anthropic-messages");
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

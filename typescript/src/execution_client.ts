@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MakaiAuthClient, type MakaiAuthApi } from "./auth_protocol";
+import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
@@ -212,6 +213,7 @@ function buildExecutionPayload(
   const payload: Record<string, unknown> = {
     model,
     context: executionContext(request),
+    model_ref: request.model_ref,
   };
   const serializedOptions = serializeOptionsWithDefaults(request.options, options.authRetryPolicy);
   if (Object.keys(serializedOptions).length > 0) payload.options = serializedOptions;
@@ -250,11 +252,12 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
 }
 
 function modelFromRef(modelRef: string): Record<string, unknown> {
+  const parsed = parseModelRef(modelRef);
   return {
-    id: modelRef,
-    name: modelRef,
-    api: "",
-    provider: "",
+    id: parsed.modelId,
+    name: parsed.modelId,
+    api: parsed.api,
+    provider: parsed.providerId,
     base_url: "",
   };
 }
