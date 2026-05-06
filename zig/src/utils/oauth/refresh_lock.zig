@@ -678,9 +678,11 @@ test "expireTimedOut marks stale entries as completed" {
     std.Thread.sleep(80 * std.time.ns_per_ms);
     lock.expireTimedOut();
 
-    // New acquire should see the expired entry.
+    // No waiters were holding refs, so expireTimedOut removes the stale
+    // entry and a later acquire can recover with a fresh refresh.
     const second = try lock.acquire("expired-provider", null);
-    try testing.expect(second == .timed_out);
+    try testing.expect(second == .acquired);
+    lock.complete("expired-provider", null, null);
 }
 
 // -- Diagnostics ------------------------------------------------------------
