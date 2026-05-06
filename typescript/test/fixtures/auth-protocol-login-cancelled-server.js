@@ -2,7 +2,7 @@
 // Emits ack, `auth_event.error`, then terminal
 // `auth_login_result.status = cancelled`. Used by the SDK auth client tests.
 const readline = require("node:readline");
-const crypto = require("node:crypto");
+const { ulid } = require("ulid");
 
 process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + "\n");
 
@@ -31,7 +31,7 @@ rl.on("line", (line) => {
     JSON.stringify({
       type: "ack",
       stream_id: flowId,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(flowId),
       in_reply_to: envelope.message_id,
       timestamp: Date.now(),
@@ -43,7 +43,7 @@ rl.on("line", (line) => {
     JSON.stringify({
       type: "auth_event",
       stream_id: flowId,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(flowId),
       timestamp: Date.now(),
       version: 1,
@@ -61,7 +61,7 @@ rl.on("line", (line) => {
     JSON.stringify({
       type: "auth_login_result",
       stream_id: flowId,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(flowId),
       timestamp: Date.now(),
       version: 1,

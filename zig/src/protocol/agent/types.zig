@@ -3,11 +3,11 @@ const provider_types = @import("protocol_types");
 const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Re-export Uuid from provider types for convenience
-pub const Uuid = provider_types.Uuid;
-pub const generateUuid = provider_types.generateUuid;
-pub const uuidToString = provider_types.uuidToString;
-pub const parseUuid = provider_types.parseUuid;
+/// Re-export Ulid from provider types for convenience
+pub const Ulid = provider_types.Ulid;
+pub const generateUlid = provider_types.generateUlid;
+pub const ulidToString = provider_types.ulidToString;
+pub const parseUlid = provider_types.parseUlid;
 
 /// Re-export provider ack/nack/error-code envelope types so that the agent
 /// passthrough emits the same shape as the provider protocol.
@@ -73,7 +73,7 @@ pub const AgentStartRequest = struct {
     /// Initial system prompt
     system_prompt: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Session ID for resumption (null for new session)
-    session_id: ?Uuid = null,
+    session_id: ?Ulid = null,
 
     pub fn getSystemPrompt(self: *const AgentStartRequest) ?[]const u8 {
         const prompt = self.system_prompt.slice();
@@ -84,7 +84,7 @@ pub const AgentStartRequest = struct {
 /// Request to send a message to an agent
 pub const AgentMessageRequest = struct {
     /// Target agent session
-    session_id: Uuid,
+    session_id: Ulid,
     /// Message to send
     message_json: []const u8,
     /// Options for this message
@@ -99,7 +99,7 @@ pub const AgentMessageRequest = struct {
 /// Request to stop an agent session
 pub const AgentStopRequest = struct {
     /// Target agent session
-    session_id: Uuid,
+    session_id: Ulid,
     /// Reason for stopping
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
@@ -179,7 +179,7 @@ pub const AgentStatus = enum {
 
 /// Agent session info
 pub const AgentSessionInfo = struct {
-    session_id: Uuid,
+    session_id: Ulid,
     status: AgentStatus,
     model: []const u8,
     message_count: u32,
@@ -188,7 +188,7 @@ pub const AgentSessionInfo = struct {
 };
 
 pub const AgentStopped = struct {
-    session_id: Uuid,
+    session_id: Ulid,
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getReason(self: *const AgentStopped) ?[]const u8 {
@@ -220,14 +220,14 @@ pub const Payload = union(enum) {
     agent_start: AgentStartRequest,
     agent_message: AgentMessageRequest,
     agent_stop: AgentStopRequest,
-    agent_status: struct { session_id: Uuid },
+    agent_status: struct { session_id: Ulid },
     tool_list: ToolListRequest,
     /// Passthrough model discovery request — delegates to the provider protocol
     /// and returns the same `ModelsResponse` shape. See spec §6.
     models_request: ModelsRequest,
 
     // Agent Server -> Client
-    agent_started: struct { session_id: Uuid },
+    agent_started: struct { session_id: Ulid },
     agent_event: []const u8, // JSON-encoded AgentEvent
     agent_result: []const u8, // JSON-encoded AgentLoopResult
     agent_stopped: AgentStopped,
@@ -315,13 +315,13 @@ pub const Envelope = struct {
     /// Protocol version
     version: u8 = 1,
     /// Session identifier (stable for session lifecycle)
-    session_id: Uuid,
+    session_id: Ulid,
     /// Message ID (unique per message)
-    message_id: Uuid,
+    message_id: Ulid,
     /// Sequence number within session (starts at 1)
     sequence: u64,
     /// For request/response correlation
-    in_reply_to: ?Uuid = null,
+    in_reply_to: ?Ulid = null,
     /// Unix timestamp in milliseconds
     timestamp: i64,
     /// The actual payload
@@ -409,7 +409,7 @@ test "Payload deinit for nack frees reason" {
 
     var payload = Payload{
         .nack = .{
-            .rejected_id = generateUuid(),
+            .rejected_id = generateUlid(),
             .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "not implemented")),
             .error_code = .not_implemented,
         },

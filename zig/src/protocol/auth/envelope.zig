@@ -13,11 +13,11 @@ pub fn serializeEnvelope(env: auth_types.Envelope, allocator: std.mem.Allocator)
     try writer.beginObject();
     try writer.writeStringField("type", @tagName(env.payload));
 
-    const stream_id = try auth_types.uuidToString(env.stream_id, allocator);
+    const stream_id = try auth_types.ulidToString(env.stream_id, allocator);
     defer allocator.free(stream_id);
     try writer.writeStringField("stream_id", stream_id);
 
-    const message_id = try auth_types.uuidToString(env.message_id, allocator);
+    const message_id = try auth_types.ulidToString(env.message_id, allocator);
     defer allocator.free(message_id);
     try writer.writeStringField("message_id", message_id);
 
@@ -26,7 +26,7 @@ pub fn serializeEnvelope(env: auth_types.Envelope, allocator: std.mem.Allocator)
     try writer.writeIntField("version", env.version);
 
     if (env.in_reply_to) |reply_to| {
-        const in_reply_to = try auth_types.uuidToString(reply_to, allocator);
+        const in_reply_to = try auth_types.ulidToString(reply_to, allocator);
         defer allocator.free(in_reply_to);
         try writer.writeStringField("in_reply_to", in_reply_to);
     }
@@ -49,24 +49,24 @@ fn serializePayload(writer: *json_writer.JsonWriter, payload: auth_types.Payload
             try writer.writeStringField("provider_id", request.provider_id.slice());
         },
         .auth_prompt_response => |response| {
-            const flow_id = try auth_types.uuidToString(response.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(response.flow_id, allocator);
             defer allocator.free(flow_id);
             try writer.writeStringField("flow_id", flow_id);
             try writer.writeStringField("prompt_id", response.prompt_id.slice());
             try writer.writeStringField("answer", response.answer.slice());
         },
         .auth_cancel => |request| {
-            const flow_id = try auth_types.uuidToString(request.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(request.flow_id, allocator);
             defer allocator.free(flow_id);
             try writer.writeStringField("flow_id", flow_id);
         },
         .ack => |ack| {
-            const acknowledged_id = try auth_types.uuidToString(ack.acknowledged_id, allocator);
+            const acknowledged_id = try auth_types.ulidToString(ack.acknowledged_id, allocator);
             defer allocator.free(acknowledged_id);
             try writer.writeStringField("acknowledged_id", acknowledged_id);
         },
         .nack => |nack| {
-            const rejected_id = try auth_types.uuidToString(nack.rejected_id, allocator);
+            const rejected_id = try auth_types.ulidToString(nack.rejected_id, allocator);
             defer allocator.free(rejected_id);
             try writer.writeStringField("rejected_id", rejected_id);
             try writer.writeStringField("reason", nack.reason.slice());
@@ -93,7 +93,7 @@ fn serializePayload(writer: *json_writer.JsonWriter, payload: auth_types.Payload
             try serializeAuthEvent(writer, event, allocator);
         },
         .auth_login_result => |result| {
-            const flow_id = try auth_types.uuidToString(result.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(result.flow_id, allocator);
             defer allocator.free(flow_id);
             try writer.writeStringField("flow_id", flow_id);
             try writer.writeStringField("provider_id", result.provider_id.slice());
@@ -116,7 +116,7 @@ fn serializePayload(writer: *json_writer.JsonWriter, payload: auth_types.Payload
 fn serializeAuthEvent(writer: *json_writer.JsonWriter, event: auth_types.AuthEvent, allocator: std.mem.Allocator) !void {
     switch (event) {
         .auth_url => |payload| {
-            const flow_id = try auth_types.uuidToString(payload.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(payload.flow_id, allocator);
             defer allocator.free(flow_id);
 
             try writer.writeKey("auth_url");
@@ -130,7 +130,7 @@ fn serializeAuthEvent(writer: *json_writer.JsonWriter, event: auth_types.AuthEve
             try writer.endObject();
         },
         .prompt => |payload| {
-            const flow_id = try auth_types.uuidToString(payload.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(payload.flow_id, allocator);
             defer allocator.free(flow_id);
 
             try writer.writeKey("prompt");
@@ -143,7 +143,7 @@ fn serializeAuthEvent(writer: *json_writer.JsonWriter, event: auth_types.AuthEve
             try writer.endObject();
         },
         .progress => |payload| {
-            const flow_id = try auth_types.uuidToString(payload.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(payload.flow_id, allocator);
             defer allocator.free(flow_id);
 
             try writer.writeKey("progress");
@@ -154,7 +154,7 @@ fn serializeAuthEvent(writer: *json_writer.JsonWriter, event: auth_types.AuthEve
             try writer.endObject();
         },
         .success => |payload| {
-            const flow_id = try auth_types.uuidToString(payload.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(payload.flow_id, allocator);
             defer allocator.free(flow_id);
 
             try writer.writeKey("success");
@@ -164,7 +164,7 @@ fn serializeAuthEvent(writer: *json_writer.JsonWriter, event: auth_types.AuthEve
             try writer.endObject();
         },
         .@"error" => |payload| {
-            const flow_id = try auth_types.uuidToString(payload.flow_id, allocator);
+            const flow_id = try auth_types.ulidToString(payload.flow_id, allocator);
             defer allocator.free(flow_id);
 
             try writer.writeKey("error");
@@ -186,15 +186,15 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !auth
 
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
-    const stream_id = try parseUuidRequired(root.get("stream_id").?.string);
-    const message_id = try parseUuidRequired(root.get("message_id").?.string);
+    const stream_id = try parseUlidRequired(root.get("stream_id").?.string);
+    const message_id = try parseUlidRequired(root.get("message_id").?.string);
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
     const version = @as(u8, @intCast(root.get("version").?.integer));
 
-    var in_reply_to: ?auth_types.Uuid = null;
+    var in_reply_to: ?auth_types.Ulid = null;
     if (root.get("in_reply_to")) |value| {
-        in_reply_to = try parseUuidRequired(value.string);
+        in_reply_to = try parseUlidRequired(value.string);
     }
 
     const payload = try deserializePayload(type_str, root.get("payload").?.object, allocator);
@@ -210,8 +210,8 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !auth
     };
 }
 
-fn parseUuidRequired(value: []const u8) !auth_types.Uuid {
-    return auth_types.parseUuid(value) orelse error.InvalidUuid;
+fn parseUlidRequired(value: []const u8) !auth_types.Ulid {
+    return auth_types.parseUlid(value) orelse error.InvalidUlid;
 }
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !auth_types.Payload {
@@ -227,7 +227,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "auth_prompt_response")) {
         return .{ .auth_prompt_response = .{
-            .flow_id = try parseUuidRequired(payload.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
             .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("prompt_id").?.string)),
             .answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("answer").?.string)),
         } };
@@ -235,19 +235,19 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "auth_cancel")) {
         return .{ .auth_cancel = .{
-            .flow_id = try parseUuidRequired(payload.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "ack")) {
         return .{ .ack = .{
-            .acknowledged_id = try parseUuidRequired(payload.get("acknowledged_id").?.string),
+            .acknowledged_id = try parseUlidRequired(payload.get("acknowledged_id").?.string),
         } };
     }
 
     if (std.mem.eql(u8, type_str, "nack")) {
         var nack = auth_types.Nack{
-            .rejected_id = try parseUuidRequired(payload.get("rejected_id").?.string),
+            .rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string),
             .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string)),
         };
 
@@ -296,7 +296,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
 
     if (std.mem.eql(u8, type_str, "auth_login_result")) {
         return .{ .auth_login_result = .{
-            .flow_id = try parseUuidRequired(payload.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(payload.get("flow_id").?.string),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("provider_id").?.string)),
             .status = std.meta.stringToEnum(auth_types.AuthLoginStatus, payload.get("status").?.string) orelse .failed,
         } };
@@ -329,7 +329,7 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const auth_url = auth_url_value.object;
 
         var result: auth_types.AuthEvent = .{ .auth_url = .{
-            .flow_id = try parseUuidRequired(auth_url.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(auth_url.get("flow_id").?.string),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, auth_url.get("provider_id").?.string)),
             .url = OwnedSlice(u8).initOwned(try allocator.dupe(u8, auth_url.get("url").?.string)),
         } };
@@ -345,7 +345,7 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         if (prompt_value != .object) return error.InvalidPayloadType;
         const prompt = prompt_value.object;
         return .{ .prompt = .{
-            .flow_id = try parseUuidRequired(prompt.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(prompt.get("flow_id").?.string),
             .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("prompt_id").?.string)),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("provider_id").?.string)),
             .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt.get("message").?.string)),
@@ -357,7 +357,7 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         if (progress_value != .object) return error.InvalidPayloadType;
         const progress = progress_value.object;
         return .{ .progress = .{
-            .flow_id = try parseUuidRequired(progress.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(progress.get("flow_id").?.string),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, progress.get("provider_id").?.string)),
             .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, progress.get("message").?.string)),
         } };
@@ -367,7 +367,7 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         if (success_value != .object) return error.InvalidPayloadType;
         const success = success_value.object;
         return .{ .success = .{
-            .flow_id = try parseUuidRequired(success.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(success.get("flow_id").?.string),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, success.get("provider_id").?.string)),
         } };
     }
@@ -377,7 +377,7 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
         const event_error = error_value.object;
 
         var result: auth_types.AuthEvent = .{ .@"error" = .{
-            .flow_id = try parseUuidRequired(event_error.get("flow_id").?.string),
+            .flow_id = try parseUlidRequired(event_error.get("flow_id").?.string),
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, event_error.get("provider_id").?.string)),
             .message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, event_error.get("message").?.string)),
         } };
@@ -394,11 +394,11 @@ fn deserializeAuthEvent(payload: std.json.ObjectMap, allocator: std.mem.Allocato
 
 test "auth envelope roundtrip with auth_event prompt" {
     const allocator = std.testing.allocator;
-    const flow_id = auth_types.generateUuid();
+    const flow_id = auth_types.generateUlid();
 
     var envelope = auth_types.Envelope{
         .stream_id = flow_id,
-        .message_id = auth_types.generateUuid(),
+        .message_id = auth_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_event = .{ .prompt = .{
@@ -426,6 +426,6 @@ test "auth envelope roundtrip with auth_event prompt" {
 test "auth envelope rejects unknown payload type" {
     const allocator = std.testing.allocator;
     const bad =
-        "{\"type\":\"not_real\",\"stream_id\":\"00000000-0000-0000-0000-000000000001\",\"message_id\":\"00000000-0000-0000-0000-000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
+        "{\"type\":\"not_real\",\"stream_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(bad, allocator));
 }

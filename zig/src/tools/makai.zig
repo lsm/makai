@@ -571,8 +571,8 @@ fn fixtureErrorStreamSimple(
 
 fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     const env = ProviderProtocolTypes.Envelope{
-        .stream_id = ProviderProtocolTypes.generateUuid(),
-        .message_id = ProviderProtocolTypes.generateUuid(),
+        .stream_id = ProviderProtocolTypes.generateUlid(),
+        .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -582,8 +582,8 @@ fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
 
 fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     const env = AgentProtocolTypes.Envelope{
-        .session_id = AgentProtocolTypes.generateUuid(),
-        .message_id = AgentProtocolTypes.generateUuid(),
+        .session_id = AgentProtocolTypes.generateUlid(),
+        .message_id = AgentProtocolTypes.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -591,10 +591,10 @@ fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
 }
 
-fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: AuthProtocolTypes.Uuid, sequence: u64) ![]u8 {
+fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: AuthProtocolTypes.Ulid, sequence: u64) ![]u8 {
     const env = AuthProtocolTypes.Envelope{
         .stream_id = flow_id,
-        .message_id = AuthProtocolTypes.generateUuid(),
+        .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_providers_request = .{} },
@@ -604,13 +604,13 @@ fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: A
 
 fn makeAuthLoginStartEnvelopeJson(
     allocator: std.mem.Allocator,
-    flow_id: AuthProtocolTypes.Uuid,
+    flow_id: AuthProtocolTypes.Ulid,
     sequence: u64,
     provider_id: []const u8,
 ) ![]u8 {
     var env = AuthProtocolTypes.Envelope{
         .stream_id = flow_id,
-        .message_id = AuthProtocolTypes.generateUuid(),
+        .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_login_start = .{
@@ -623,14 +623,14 @@ fn makeAuthLoginStartEnvelopeJson(
 
 fn makeAuthPromptResponseEnvelopeJson(
     allocator: std.mem.Allocator,
-    flow_id: AuthProtocolTypes.Uuid,
+    flow_id: AuthProtocolTypes.Ulid,
     sequence: u64,
     prompt_id: []const u8,
     answer: []const u8,
 ) ![]u8 {
     var env = AuthProtocolTypes.Envelope{
         .stream_id = flow_id,
-        .message_id = AuthProtocolTypes.generateUuid(),
+        .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_prompt_response = .{
@@ -645,12 +645,12 @@ fn makeAuthPromptResponseEnvelopeJson(
 
 fn makeAuthCancelEnvelopeJson(
     allocator: std.mem.Allocator,
-    flow_id: AuthProtocolTypes.Uuid,
+    flow_id: AuthProtocolTypes.Ulid,
     sequence: u64,
 ) ![]u8 {
     const env = AuthProtocolTypes.Envelope{
         .stream_id = flow_id,
-        .message_id = AuthProtocolTypes.generateUuid(),
+        .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_cancel = .{
@@ -665,18 +665,20 @@ fn makeProviderStreamRequestEnvelopeJson(
     api: []const u8,
 ) ![]u8 {
     var env = ProviderProtocolTypes.Envelope{
-        .stream_id = ProviderProtocolTypes.generateUuid(),
-        .message_id = ProviderProtocolTypes.generateUuid(),
+        .stream_id = ProviderProtocolTypes.generateUlid(),
+        .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
-        .payload = .{ .stream_request = .{
-            .model = fixtureModel(api),
-            .context = .{ .messages = &.{} },
-            // Provide an explicit api_key so the binary's credential resolver
-            // (M-006) does not reject the request with `auth_required`. The
-            // fixture providers do not validate the key value.
-            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-fixture-key") },
-        } },
+        .payload = .{
+            .stream_request = .{
+                .model = fixtureModel(api),
+                .context = .{ .messages = &.{} },
+                // Provide an explicit api_key so the binary's credential resolver
+                // (M-006) does not reject the request with `auth_required`. The
+                // fixture providers do not validate the key value.
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-fixture-key") },
+            },
+        },
     };
     defer env.deinit(allocator);
     return provider_protocol_envelope.serializeEnvelope(env, allocator);
@@ -748,7 +750,7 @@ test "stdio protocol loop decodes and dispatches auth providers request and emit
         outbound.deinit(allocator);
     }
 
-    const flow_id = AuthProtocolTypes.generateUuid();
+    const flow_id = AuthProtocolTypes.generateUlid();
     const request = try makeAuthProvidersRequestEnvelopeJson(allocator, flow_id, 1);
     defer allocator.free(request);
 
@@ -787,7 +789,7 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
         outbound.deinit(allocator);
     }
 
-    const flow_id = AuthProtocolTypes.generateUuid();
+    const flow_id = AuthProtocolTypes.generateUlid();
     const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "test-fixture");
     defer allocator.free(login_start);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
@@ -899,7 +901,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
         outbound.deinit(allocator);
     }
 
-    const flow_id = AuthProtocolTypes.generateUuid();
+    const flow_id = AuthProtocolTypes.generateUlid();
     const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "test-fixture");
     defer allocator.free(login_start);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
@@ -1003,7 +1005,7 @@ test "stdio auth login failure emits auth_event.error before auth_login_result" 
         outbound.deinit(allocator);
     }
 
-    const flow_id = AuthProtocolTypes.generateUuid();
+    const flow_id = AuthProtocolTypes.generateUlid();
     const login_start = try makeAuthLoginStartEnvelopeJson(allocator, flow_id, 1, "unknown-provider");
     defer allocator.free(login_start);
     try std.testing.expect(try stdio_loop.dispatchInboundLine(login_start));
@@ -1058,7 +1060,7 @@ test "stdio protocol loop rejects ambiguous dispatch envelope with both ids" {
     defer stdio_loop.deinit();
 
     const ambiguous =
-        \\{"type":"ping","stream_id":"11111111-1111-1111-1111-111111111111","session_id":"22222222-2222-2222-2222-222222222222","message_id":"33333333-3333-3333-3333-333333333333","sequence":1,"timestamp":1760000000000,"version":1,"payload":{}}
+        \\{"type":"ping","stream_id":"0H248H248H248H248H248H248H","session_id":"test-session","message_id":"1K6CSK6CSK6CSK6CSK6CSK6CSK","sequence":1,"timestamp":1760000000000,"version":1,"payload":{}}
     ;
 
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(ambiguous)));

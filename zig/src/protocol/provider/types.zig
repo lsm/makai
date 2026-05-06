@@ -15,132 +15,119 @@ pub const MetadataEntry = model_catalog_types.MetadataEntry;
 pub const ModelDescriptor = model_catalog_types.ModelDescriptor;
 pub const ModelsResponse = model_catalog_types.ModelsResponse;
 
-/// UUID type for stream/message identification
-pub const Uuid = [16]u8;
+/// ULID type for stream/message identification.
+/// Internally this is the canonical 128-bit ULID payload: 48-bit
+/// millisecond timestamp followed by 80 bits of randomness.
+pub const Ulid = [16]u8;
 
-/// Generate a random UUID v4
-pub fn generateUuid() Uuid {
-    var uuid: Uuid = undefined;
-    std.crypto.random.bytes(&uuid);
+const ULID_ENCODE = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-    // Set version to 4 (random UUID)
-    uuid[6] = (uuid[6] & 0x0f) | 0x40;
-    // Set variant to RFC 4122
-    uuid[8] = (uuid[8] & 0x3f) | 0x80;
-
-    return uuid;
+fn ulidDecode(c: u8) ?u5 {
+    return switch (c) {
+        '0', 'O', 'o' => 0,
+        '1', 'I', 'i', 'L', 'l' => 1,
+        '2'...'9' => @intCast(c - '0'),
+        'A', 'a' => 10,
+        'B', 'b' => 11,
+        'C', 'c' => 12,
+        'D', 'd' => 13,
+        'E', 'e' => 14,
+        'F', 'f' => 15,
+        'G', 'g' => 16,
+        'H', 'h' => 17,
+        'J', 'j' => 18,
+        'K', 'k' => 19,
+        'M', 'm' => 20,
+        'N', 'n' => 21,
+        'P', 'p' => 22,
+        'Q', 'q' => 23,
+        'R', 'r' => 24,
+        'S', 's' => 25,
+        'T', 't' => 26,
+        'V', 'v' => 27,
+        'W', 'w' => 28,
+        'X', 'x' => 29,
+        'Y', 'y' => 30,
+        'Z', 'z' => 31,
+        else => null,
+    };
 }
 
-/// Convert UUID to string representation (36 chars: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
-pub fn uuidToString(uuid: Uuid, allocator: std.mem.Allocator) ![]const u8 {
-    const result = try allocator.alloc(u8, 36);
+/// Generate a ULID with the current millisecond timestamp and 80 random bits.
+pub fn generateUlid() Ulid {
+    var ulid: Ulid = undefined;
 
-    const hex_chars = "0123456789abcdef";
-    var idx: usize = 0;
+    const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+    ulid[0] = @intCast((now_ms >> 40) & 0xff);
+    ulid[1] = @intCast((now_ms >> 32) & 0xff);
+    ulid[2] = @intCast((now_ms >> 24) & 0xff);
+    ulid[3] = @intCast((now_ms >> 16) & 0xff);
+    ulid[4] = @intCast((now_ms >> 8) & 0xff);
+    ulid[5] = @intCast(now_ms & 0xff);
+    std.crypto.random.bytes(ulid[6..16]);
 
-    for (uuid[0..4], 0..) |byte, i| {
-        result[idx] = hex_chars[byte >> 4];
-        result[idx + 1] = hex_chars[byte & 0x0f];
-        idx += 2;
-        if (i == 3) {
-            result[idx] = '-';
-            idx += 1;
-        }
-    }
+    return ulid;
+}
 
-    for (uuid[4..6], 0..) |byte, i| {
-        result[idx] = hex_chars[byte >> 4];
-        result[idx + 1] = hex_chars[byte & 0x0f];
-        idx += 2;
-        if (i == 1) {
-            result[idx] = '-';
-            idx += 1;
-        }
-    }
-
-    for (uuid[6..8], 0..) |byte, i| {
-        result[idx] = hex_chars[byte >> 4];
-        result[idx + 1] = hex_chars[byte & 0x0f];
-        idx += 2;
-        if (i == 1) {
-            result[idx] = '-';
-            idx += 1;
-        }
-    }
-
-    for (uuid[8..10], 0..) |byte, i| {
-        result[idx] = hex_chars[byte >> 4];
-        result[idx + 1] = hex_chars[byte & 0x0f];
-        idx += 2;
-        if (i == 1) {
-            result[idx] = '-';
-            idx += 1;
-        }
-    }
-
-    for (uuid[10..16]) |byte| {
-        result[idx] = hex_chars[byte >> 4];
-        result[idx + 1] = hex_chars[byte & 0x0f];
-        idx += 2;
-    }
-
+/// Convert ULID to Crockford Base32 string representation (26 chars).
+pub fn ulidToString(ulid: Ulid, allocator: std.mem.Allocator) ![]const u8 {
+    const result = try allocator.alloc(u8, 26);
+    result[0] = ULID_ENCODE[(ulid[0] & 0b11100000) >> 5];
+    result[1] = ULID_ENCODE[ulid[0] & 0b00011111];
+    result[2] = ULID_ENCODE[(ulid[1] & 0b11111000) >> 3];
+    result[3] = ULID_ENCODE[((ulid[1] & 0b00000111) << 2) | ((ulid[2] & 0b11000000) >> 6)];
+    result[4] = ULID_ENCODE[(ulid[2] & 0b00111110) >> 1];
+    result[5] = ULID_ENCODE[((ulid[2] & 0b00000001) << 4) | ((ulid[3] & 0b11110000) >> 4)];
+    result[6] = ULID_ENCODE[((ulid[3] & 0b00001111) << 1) | ((ulid[4] & 0b10000000) >> 7)];
+    result[7] = ULID_ENCODE[(ulid[4] & 0b01111100) >> 2];
+    result[8] = ULID_ENCODE[((ulid[4] & 0b00000011) << 3) | ((ulid[5] & 0b11100000) >> 5)];
+    result[9] = ULID_ENCODE[ulid[5] & 0b00011111];
+    result[10] = ULID_ENCODE[(ulid[6] & 0b11111000) >> 3];
+    result[11] = ULID_ENCODE[((ulid[6] & 0b00000111) << 2) | ((ulid[7] & 0b11000000) >> 6)];
+    result[12] = ULID_ENCODE[(ulid[7] & 0b00111110) >> 1];
+    result[13] = ULID_ENCODE[((ulid[7] & 0b00000001) << 4) | ((ulid[8] & 0b11110000) >> 4)];
+    result[14] = ULID_ENCODE[((ulid[8] & 0b00001111) << 1) | ((ulid[9] & 0b10000000) >> 7)];
+    result[15] = ULID_ENCODE[(ulid[9] & 0b01111100) >> 2];
+    result[16] = ULID_ENCODE[((ulid[9] & 0b00000011) << 3) | ((ulid[10] & 0b11100000) >> 5)];
+    result[17] = ULID_ENCODE[ulid[10] & 0b00011111];
+    result[18] = ULID_ENCODE[(ulid[11] & 0b11111000) >> 3];
+    result[19] = ULID_ENCODE[((ulid[11] & 0b00000111) << 2) | ((ulid[12] & 0b11000000) >> 6)];
+    result[20] = ULID_ENCODE[(ulid[12] & 0b00111110) >> 1];
+    result[21] = ULID_ENCODE[((ulid[12] & 0b00000001) << 4) | ((ulid[13] & 0b11110000) >> 4)];
+    result[22] = ULID_ENCODE[((ulid[13] & 0b00001111) << 1) | ((ulid[14] & 0b10000000) >> 7)];
+    result[23] = ULID_ENCODE[(ulid[14] & 0b01111100) >> 2];
+    result[24] = ULID_ENCODE[((ulid[14] & 0b00000011) << 3) | ((ulid[15] & 0b11100000) >> 5)];
+    result[25] = ULID_ENCODE[ulid[15] & 0b00011111];
     return result;
 }
 
-/// Parse UUID from string
-pub fn parseUuid(str: []const u8) ?Uuid {
-    // Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
-    if (str.len != 36) return null;
+/// Parse ULID from a 26-character Crockford Base32 string.
+pub fn parseUlid(str: []const u8) ?Ulid {
+    if (str.len != 26) return null;
 
-    // Check hyphen positions
-    if (str[8] != '-' or str[13] != '-' or str[18] != '-' or str[23] != '-') return null;
+    var v: [26]u5 = undefined;
+    for (str, 0..) |c, i| v[i] = ulidDecode(c) orelse return null;
+    // 26 Base32 digits encode 130 bits; the top two overflow bits must be zero.
+    if (v[0] > 7) return null;
 
-    var uuid: Uuid = undefined;
-
-    const parseHexByte = struct {
-        fn parseHexByte(s: []const u8) ?u8 {
-            const hi = charToHex(s[0]) orelse return null;
-            const lo = charToHex(s[1]) orelse return null;
-            return (@as(u8, hi) << 4) | @as(u8, lo);
-        }
-
-        fn charToHex(c: u8) ?u4 {
-            return switch (c) {
-                '0'...'9' => @intCast(c - '0'),
-                'a'...'f' => @intCast(c - 'a' + 10),
-                'A'...'F' => @intCast(c - 'A' + 10),
-                else => null,
-            };
-        }
-    }.parseHexByte;
-
-    // Parse first group (8 hex chars = 4 bytes)
-    uuid[0] = parseHexByte(str[0..2]) orelse return null;
-    uuid[1] = parseHexByte(str[2..4]) orelse return null;
-    uuid[2] = parseHexByte(str[4..6]) orelse return null;
-    uuid[3] = parseHexByte(str[6..8]) orelse return null;
-
-    // Parse second group (4 hex chars = 2 bytes)
-    uuid[4] = parseHexByte(str[9..11]) orelse return null;
-    uuid[5] = parseHexByte(str[11..13]) orelse return null;
-
-    // Parse third group (4 hex chars = 2 bytes)
-    uuid[6] = parseHexByte(str[14..16]) orelse return null;
-    uuid[7] = parseHexByte(str[16..18]) orelse return null;
-
-    // Parse fourth group (4 hex chars = 2 bytes)
-    uuid[8] = parseHexByte(str[19..21]) orelse return null;
-    uuid[9] = parseHexByte(str[21..23]) orelse return null;
-
-    // Parse fifth group (12 hex chars = 6 bytes)
-    uuid[10] = parseHexByte(str[24..26]) orelse return null;
-    uuid[11] = parseHexByte(str[26..28]) orelse return null;
-    uuid[12] = parseHexByte(str[28..30]) orelse return null;
-    uuid[13] = parseHexByte(str[30..32]) orelse return null;
-    uuid[14] = parseHexByte(str[32..34]) orelse return null;
-    uuid[15] = parseHexByte(str[34..36]) orelse return null;
-
-    return uuid;
+    var ulid: Ulid = undefined;
+    ulid[0] = (@as(u8, v[0]) << 5) | @as(u8, v[1]);
+    ulid[1] = (@as(u8, v[2]) << 3) | (@as(u8, v[3]) >> 2);
+    ulid[2] = (@as(u8, v[3] & 0b00011) << 6) | (@as(u8, v[4]) << 1) | (@as(u8, v[5]) >> 4);
+    ulid[3] = (@as(u8, v[5] & 0b01111) << 4) | (@as(u8, v[6]) >> 1);
+    ulid[4] = (@as(u8, v[6] & 0b00001) << 7) | (@as(u8, v[7]) << 2) | (@as(u8, v[8]) >> 3);
+    ulid[5] = (@as(u8, v[8] & 0b00111) << 5) | @as(u8, v[9]);
+    ulid[6] = (@as(u8, v[10]) << 3) | (@as(u8, v[11]) >> 2);
+    ulid[7] = (@as(u8, v[11] & 0b00011) << 6) | (@as(u8, v[12]) << 1) | (@as(u8, v[13]) >> 4);
+    ulid[8] = (@as(u8, v[13] & 0b01111) << 4) | (@as(u8, v[14]) >> 1);
+    ulid[9] = (@as(u8, v[14] & 0b00001) << 7) | (@as(u8, v[15]) << 2) | (@as(u8, v[16]) >> 3);
+    ulid[10] = (@as(u8, v[16] & 0b00111) << 5) | @as(u8, v[17]);
+    ulid[11] = (@as(u8, v[18]) << 3) | (@as(u8, v[19]) >> 2);
+    ulid[12] = (@as(u8, v[19] & 0b00011) << 6) | (@as(u8, v[20]) << 1) | (@as(u8, v[21]) >> 4);
+    ulid[13] = (@as(u8, v[21] & 0b01111) << 4) | (@as(u8, v[22]) >> 1);
+    ulid[14] = (@as(u8, v[22] & 0b00001) << 7) | (@as(u8, v[23]) << 2) | (@as(u8, v[24]) >> 3);
+    ulid[15] = (@as(u8, v[24] & 0b00111) << 5) | @as(u8, v[25]);
+    return ulid;
 }
 
 /// Protocol envelope wrapping all messages
@@ -148,13 +135,13 @@ pub const Envelope = struct {
     /// Protocol version
     version: u8 = 1,
     /// Unique stream identifier (stable for stream lifecycle)
-    stream_id: Uuid,
+    stream_id: Ulid,
     /// Message ID (unique per message)
-    message_id: Uuid,
+    message_id: Ulid,
     /// Sequence number within stream (starts at 1)
     sequence: u64,
     /// For request/response correlation
-    in_reply_to: ?Uuid = null,
+    in_reply_to: ?Ulid = null,
     /// Unix timestamp in milliseconds
     timestamp: i64,
     /// The actual payload
@@ -251,7 +238,7 @@ pub const CompleteRequest = struct {
 
 /// Request to abort a stream
 pub const AbortRequest = struct {
-    target_stream_id: Uuid,
+    target_stream_id: Ulid,
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getReason(self: *const AbortRequest) ?[]const u8 {
@@ -268,13 +255,13 @@ pub const AbortRequest = struct {
 /// Acknowledgment response
 pub const Ack = struct {
     /// The message_id being acknowledged
-    acknowledged_id: Uuid,
+    acknowledged_id: Ulid,
 };
 
 /// Negative acknowledgment response
 pub const Nack = struct {
     /// The message_id that was rejected
-    rejected_id: Uuid,
+    rejected_id: Ulid,
     /// Human-readable reason for rejection
     reason: OwnedSlice(u8),
     /// Optional error code
@@ -350,12 +337,12 @@ pub const Goodbye = struct {
 
 /// Request full state resync
 pub const SyncRequest = struct {
-    target_stream_id: Uuid,
+    target_stream_id: Ulid,
 };
 
 /// Full partial state resync response
 pub const Sync = struct {
-    target_stream_id: Uuid, // renamed from stream_id per spec
+    target_stream_id: Ulid, // renamed from stream_id per spec
     partial: ?ai_types.AssistantMessage = null, // AssistantMessage object, not string
 
     pub fn deinit(self: *Sync, allocator: std.mem.Allocator) void {
@@ -419,66 +406,68 @@ test "ModelsRequest deinit frees owned filter strings" {
     req.deinit(allocator);
 }
 
-test "generateUuid produces valid UUID" {
-    const uuid = generateUuid();
+test "generateUlid produces valid ULID" {
+    const ulid = generateUlid();
+    const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+    const ulid_ms = (@as(u64, ulid[0]) << 40) |
+        (@as(u64, ulid[1]) << 32) |
+        (@as(u64, ulid[2]) << 24) |
+        (@as(u64, ulid[3]) << 16) |
+        (@as(u64, ulid[4]) << 8) |
+        @as(u64, ulid[5]);
 
-    // Check version bits (should be 0x4X for version 4)
-    try std.testing.expectEqual(@as(u8, 0x40), uuid[6] & 0xf0);
+    try std.testing.expect(ulid_ms <= now_ms);
+    try std.testing.expect(now_ms - ulid_ms < 1_000);
 
-    // Check variant bits (should be 0x8X or 0x9X, 0xaX, or 0xbX for RFC 4122)
-    try std.testing.expect(uuid[8] >= 0x80 and uuid[8] <= 0xbf);
-
-    // Generate multiple UUIDs and ensure they're different
-    const uuid2 = generateUuid();
-    try std.testing.expect(!std.mem.eql(u8, &uuid, &uuid2));
+    // Generate multiple ULIDs and ensure they're different
+    const ulid2 = generateUlid();
+    try std.testing.expect(!std.mem.eql(u8, &ulid, &ulid2));
 }
 
-test "uuidToString and parseUuid roundtrip" {
-    const uuid = generateUuid();
-    const str = try uuidToString(uuid, std.testing.allocator);
+test "ulidToString and parseUlid roundtrip" {
+    const ulid = generateUlid();
+    const str = try ulidToString(ulid, std.testing.allocator);
     defer std.testing.allocator.free(str);
 
-    // Check format: 36 chars with hyphens at correct positions
-    try std.testing.expectEqual(@as(usize, 36), str.len);
-    try std.testing.expectEqual(@as(u8, '-'), str[8]);
-    try std.testing.expectEqual(@as(u8, '-'), str[13]);
-    try std.testing.expectEqual(@as(u8, '-'), str[18]);
-    try std.testing.expectEqual(@as(u8, '-'), str[23]);
+    // Check format: 26 Crockford Base32 characters.
+    try std.testing.expectEqual(@as(usize, 26), str.len);
+    for (str) |c| {
+        try std.testing.expect(ulidDecode(c) != null);
+    }
 
     // Roundtrip
-    const parsed = parseUuid(str);
+    const parsed = parseUlid(str);
     try std.testing.expect(parsed != null);
-    try std.testing.expectEqualSlices(u8, &uuid, &parsed.?);
+    try std.testing.expectEqualSlices(u8, &ulid, &parsed.?);
 
-    // Test with known UUID
-    const known_uuid: Uuid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
-    const known_str = try uuidToString(known_uuid, std.testing.allocator);
+    // Test with known ULID
+    const known_ulid: Ulid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    const known_str = try ulidToString(known_ulid, std.testing.allocator);
     defer std.testing.allocator.free(known_str);
-    try std.testing.expectEqualStrings("01234567-89ab-cdef-fedc-ba9876543210", known_str);
+    try std.testing.expectEqualStrings("018D2PF2DBSQQZWQ5TK1V58CGG", known_str);
 
-    const parsed_known = parseUuid(known_str);
+    const parsed_known = parseUlid(known_str);
     try std.testing.expect(parsed_known != null);
-    try std.testing.expectEqualSlices(u8, &known_uuid, &parsed_known.?);
+    try std.testing.expectEqualSlices(u8, &known_ulid, &parsed_known.?);
 }
 
-test "parseUuid returns null for invalid strings" {
+test "parseUlid returns null for invalid strings" {
     // Wrong length
-    try std.testing.expect(parseUuid("01234567-89ab-cdef-fedc-ba987654321") == null); // 35 chars
-    try std.testing.expect(parseUuid("01234567-89ab-cdef-fedc-ba98765432100") == null); // 37 chars
+    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG") == null); // 25 chars
+    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CGG0") == null); // 27 chars
 
-    // Missing hyphens
-    try std.testing.expect(parseUuid("0123456789abcdef0123456789abcdef0123") == null);
+    // Invalid Crockford Base32 characters
+    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CGU") == null);
+    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG-") == null);
 
-    // Invalid hex characters
-    try std.testing.expect(parseUuid("01234567-89ab-cdef-xxxx-ba9876543210") == null);
-    try std.testing.expect(parseUuid("g1234567-89ab-cdef-fedc-ba9876543210") == null);
+    // Overflow in the 130-bit representation
+    try std.testing.expect(parseUlid("8ZZZZZZZZZZZZZZZZZZZZZZZZZ") == null);
 
-    // Hyphens in wrong positions
-    try std.testing.expect(parseUuid("0123456-789a-bcde-ffed-cba9876543210") == null);
-    try std.testing.expect(parseUuid("012345678-9ab-cdef-fedc-ba9876543210") == null);
+    // Ambiguous Crockford aliases are accepted
+    try std.testing.expect(parseUlid("0I8D2PF2DBSQQZWQ5TK1V58CGG") != null);
 
     // Empty string
-    try std.testing.expect(parseUuid("") == null);
+    try std.testing.expect(parseUlid("") == null);
 }
 
 test "ErrorCode enum values match protocol spec" {
@@ -511,10 +500,10 @@ test "ErrorCode enum values match protocol spec" {
 }
 
 test "Envelope with ping payload" {
-    const uuid = generateUuid();
+    const ulid = generateUlid();
     var envelope = Envelope{
-        .stream_id = uuid,
-        .message_id = generateUuid(),
+        .stream_id = ulid,
+        .message_id = generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -527,7 +516,7 @@ test "Envelope with ping payload" {
 test "Nack deinit frees reason and supported_versions" {
     const reason = try std.testing.allocator.dupe(u8, "Test error reason");
     var nack = Nack{
-        .rejected_id = generateUuid(),
+        .rejected_id = generateUlid(),
         .reason = OwnedSlice(u8).initOwned(reason),
         .error_code = .invalid_request,
     };
@@ -550,7 +539,7 @@ test "StreamError deinit frees message" {
 test "AbortRequest deinit frees reason" {
     const reason = try std.testing.allocator.dupe(u8, "User cancelled");
     var abort = AbortRequest{
-        .target_stream_id = generateUuid(),
+        .target_stream_id = generateUlid(),
         .reason = OwnedSlice(u8).initOwned(reason),
     };
 
@@ -560,7 +549,7 @@ test "AbortRequest deinit frees reason" {
 
 test "AbortRequest deinit handles empty reason" {
     var abort = AbortRequest{
-        .target_stream_id = generateUuid(),
+        .target_stream_id = generateUlid(),
     };
 
     abort.deinit(std.testing.allocator);
@@ -578,7 +567,7 @@ test "Payload deinit handles all variants" {
     pong_payload.deinit(std.testing.allocator);
 
     // Test ack
-    var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUuid() } };
+    var ack_payload: Payload = .{ .ack = .{ .acknowledged_id = generateUlid() } };
     ack_payload.deinit(std.testing.allocator);
 }
 
@@ -615,7 +604,7 @@ test "Sync deinit handles partial" {
         .is_owned = false,
     };
     var sync = Sync{
-        .target_stream_id = generateUuid(),
+        .target_stream_id = generateUlid(),
         .partial = partial,
     };
     sync.deinit(std.testing.allocator);
@@ -624,7 +613,7 @@ test "Sync deinit handles partial" {
 
 test "Sync deinit handles null partial" {
     var sync = Sync{
-        .target_stream_id = generateUuid(),
+        .target_stream_id = generateUlid(),
         .partial = null,
     };
     sync.deinit(std.testing.allocator);
@@ -632,7 +621,7 @@ test "Sync deinit handles null partial" {
 }
 
 test "SyncRequest has target_stream_id" {
-    const target_id = generateUuid();
+    const target_id = generateUlid();
     const sync_req = SyncRequest{ .target_stream_id = target_id };
     try std.testing.expectEqualSlices(u8, &target_id, &sync_req.target_stream_id);
 }

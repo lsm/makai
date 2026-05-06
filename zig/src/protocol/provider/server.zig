@@ -31,8 +31,8 @@ fn validateSequence(expected: u64, received: u64) SequenceError!void {
 /// Helper to create a NACK for sequence errors
 fn createSequenceNack(
     allocator: std.mem.Allocator,
-    stream_id: protocol_types.Uuid,
-    message_id: protocol_types.Uuid,
+    stream_id: protocol_types.Ulid,
+    message_id: protocol_types.Ulid,
     err: SequenceError,
 ) !protocol_types.Envelope {
     const reason: []const u8 = switch (err) {
@@ -205,16 +205,16 @@ pub const ProtocolServer = struct {
     /// NOTE: While this map supports multiple streams, event forwarding is not
     /// yet implemented. The server currently handles stream creation/abortion
     /// but does not poll and forward events from provider streams.
-    active_streams: std.AutoHashMap(protocol_types.Uuid, ActiveStream),
+    active_streams: std.AutoHashMap(protocol_types.Ulid, ActiveStream),
 
     /// API registry for provider lookup
     registry: *api_registry.ApiRegistry,
 
     /// Sequence counter per stream (outgoing)
-    sequence_counters: std.AutoHashMap(protocol_types.Uuid, u64),
+    sequence_counters: std.AutoHashMap(protocol_types.Ulid, u64),
 
     /// Expected next sequence number per stream (incoming)
-    expected_sequences: std.AutoHashMap(protocol_types.Uuid, u64),
+    expected_sequences: std.AutoHashMap(protocol_types.Ulid, u64),
 
     /// Queued outbound server envelopes that must be emitted after immediate ACK.
     outbox: std.ArrayList(protocol_types.Envelope),
@@ -223,7 +223,7 @@ pub const ProtocolServer = struct {
     options: Options,
 
     pub const ActiveStream = struct {
-        stream_id: protocol_types.Uuid,
+        stream_id: protocol_types.Ulid,
         model: ai_types.Model,
         event_stream: *event_stream.AssistantMessageEventStream,
         partial_state: partial_serializer.PartialState,
@@ -263,10 +263,10 @@ pub const ProtocolServer = struct {
     pub fn init(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry, options: Options) ProtocolServer {
         return .{
             .allocator = allocator,
-            .active_streams = std.AutoHashMap(protocol_types.Uuid, ActiveStream).init(allocator),
+            .active_streams = std.AutoHashMap(protocol_types.Ulid, ActiveStream).init(allocator),
             .registry = registry,
-            .sequence_counters = std.AutoHashMap(protocol_types.Uuid, u64).init(allocator),
-            .expected_sequences = std.AutoHashMap(protocol_types.Uuid, u64).init(allocator),
+            .sequence_counters = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
+            .expected_sequences = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
             .outbox = std.ArrayList(protocol_types.Envelope){},
             .options = options,
         };
@@ -332,7 +332,7 @@ pub const ProtocolServer = struct {
             },
             .ping => {
                 // Respond with pong containing the ping's message_id as ping_id
-                const ping_id_str = try protocol_types.uuidToString(env.message_id, self.allocator);
+                const ping_id_str = try protocol_types.ulidToString(env.message_id, self.allocator);
                 const pong_payload: protocol_types.Payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id_str) } };
                 return envelope.createReply(env, pong_payload, self.allocator);
             },
@@ -366,14 +366,14 @@ pub const ProtocolServer = struct {
     pub fn cleanupCompletedStreams(self: *ProtocolServer) void {
         // Common path: avoid heap allocation by collecting IDs in a fixed pool.
         const CleanupNode = struct {
-            stream_id: protocol_types.Uuid,
+            stream_id: protocol_types.Ulid,
             next: ?*@This() = null,
         };
         var remove_pool = hive_array.HiveArray(CleanupNode, 128).init();
         var remove_head: ?*CleanupNode = null;
 
         // Overflow path for unusually large batches in a single cleanup pass.
-        var overflow = std.ArrayList(protocol_types.Uuid).initCapacity(self.allocator, 8) catch return;
+        var overflow = std.ArrayList(protocol_types.Ulid).initCapacity(self.allocator, 8) catch return;
         defer overflow.deinit(self.allocator);
 
         var iter = self.active_streams.iterator();
@@ -430,10 +430,10 @@ pub const ProtocolServer = struct {
 
     /// Public access to active streams for event polling
     pub const ActiveStreamIterator = struct {
-        iter: std.AutoHashMap(protocol_types.Uuid, ActiveStream).Iterator,
+        iter: std.AutoHashMap(protocol_types.Ulid, ActiveStream).Iterator,
 
         pub fn next(self: *ActiveStreamIterator) ?struct {
-            stream_id: protocol_types.Uuid,
+            stream_id: protocol_types.Ulid,
             stream: *ActiveStream,
         } {
             if (self.iter.next()) |entry| {
@@ -454,12 +454,12 @@ pub const ProtocolServer = struct {
     }
 
     /// Get next sequence number for a stream (public for event forwarding)
-    pub fn getNextSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid) u64 {
+    pub fn getNextSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid) u64 {
         return self.nextSequence(stream_id);
     }
 
     /// Get next sequence number for a stream
-    fn nextSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid) u64 {
+    fn nextSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid) u64 {
         const current = self.sequence_counters.get(stream_id) orelse 0;
         const next = current + 1;
         self.sequence_counters.put(stream_id, next) catch return next;
@@ -468,7 +468,7 @@ pub const ProtocolServer = struct {
 
     /// Validates and updates expected sequence for a stream/query scope.
     /// Used by request payloads that accept per-stream incremental sequencing.
-    fn validateAndUpdateSequence(self: *ProtocolServer, stream_id: protocol_types.Uuid, received: u64) SequenceError!void {
+    fn validateAndUpdateSequence(self: *ProtocolServer, stream_id: protocol_types.Ulid, received: u64) SequenceError!void {
         const expected = self.expected_sequences.get(stream_id) orelse 1;
         try validateSequence(expected, received);
         // Update expected sequence for next message
@@ -477,7 +477,7 @@ pub const ProtocolServer = struct {
 };
 
 /// Build a one-off envelope template suitable for `envelope.createNack`.
-fn nackTemplate(stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid) protocol_types.Envelope {
+fn nackTemplate(stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid) protocol_types.Envelope {
     return .{
         .stream_id = stream_id,
         .message_id = in_reply_to,
@@ -553,12 +553,13 @@ fn streamWithRefresh(
     defer if (loaded_storage) |*storage| storage.deinit();
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
-    else blk: {
-        loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch
-            break :blk null;
-        break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
-    } orelse
-        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
+    else
+        blk: {
+            loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch
+                break :blk null;
+            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+        } orelse
+            return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
         // Non-OAuth entry or missing entry. If the loaded storage has an api_key,
@@ -640,7 +641,7 @@ fn streamWithRefresh(
 }
 
 /// Handle stream_request - create stream, return ack with stream_id
-fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
     // Reject duplicate stream_id
     if (server.active_streams.contains(stream_id)) {
         return try envelope.createNack(
@@ -706,7 +707,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Return ack with acknowledged_id
     return .{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .in_reply_to = in_reply_to,
         .timestamp = std.time.milliTimestamp(),
@@ -717,7 +718,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
 }
 
 /// Handle abort_request - cancel stream, return ack
-fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
     // Validate sequence for existing stream using validateAndUpdateSequence
     server.validateAndUpdateSequence(request.target_stream_id, received_seq) catch |err| {
         return try createSequenceNack(server.allocator, stream_id, in_reply_to, err);
@@ -743,7 +744,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         // Return ack
         return .{
             .stream_id = request.target_stream_id,
-            .message_id = protocol_types.generateUuid(),
+            .message_id = protocol_types.generateUlid(),
             .sequence = seq,
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -756,7 +757,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         // Per spec, abort is idempotent - return ACK even if stream not found
         return .{
             .stream_id = request.target_stream_id,
-            .message_id = protocol_types.generateUuid(),
+            .message_id = protocol_types.generateUlid(),
             .sequence = 0,
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -768,7 +769,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
 }
 
 /// Handle complete_request - get final result
-fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, stream_id: protocol_types.Uuid, in_reply_to: protocol_types.Uuid, received_seq: u64) !protocol_types.Envelope {
+fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.CompleteRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
     _ = received_seq; // Sequence validation is done in handleEnvelope
 
     // For complete_request, we use the stream_id from the envelope
@@ -807,7 +808,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
 
         return .{
             .stream_id = stream_id,
-            .message_id = protocol_types.generateUuid(),
+            .message_id = protocol_types.generateUlid(),
             .sequence = 1,
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -847,8 +848,8 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
 fn handleModelsRequest(
     server: *ProtocolServer,
     request: protocol_types.ModelsRequest,
-    stream_id: protocol_types.Uuid,
-    in_reply_to: protocol_types.Uuid,
+    stream_id: protocol_types.Ulid,
+    in_reply_to: protocol_types.Ulid,
     received_seq: u64,
 ) !protocol_types.Envelope {
     if (!server.options.supports_model_catalog) {
@@ -900,7 +901,7 @@ fn handleModelsRequest(
 
     const ack = protocol_types.Envelope{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
         .timestamp = std.time.milliTimestamp(),
@@ -911,7 +912,7 @@ fn handleModelsRequest(
 
     try server.outbox.append(server.allocator, .{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
         .timestamp = std.time.milliTimestamp(),
@@ -1114,14 +1115,14 @@ fn matchesModelFilters(
 
 fn makeModelsNack(
     server: *ProtocolServer,
-    stream_id: protocol_types.Uuid,
-    in_reply_to: protocol_types.Uuid,
+    stream_id: protocol_types.Ulid,
+    in_reply_to: protocol_types.Ulid,
     code: protocol_types.ErrorCode,
     reason: []const u8,
 ) !protocol_types.Envelope {
     return .{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
         .timestamp = std.time.milliTimestamp(),
@@ -1346,8 +1347,8 @@ test "handleModelsRequest emits ack then models_response from static fallback" {
     defer server.deinit();
 
     var request = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -1385,8 +1386,8 @@ test "handleModelsRequest returns not_implemented nack when unsupported" {
     defer server.deinit();
 
     var request = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -1410,8 +1411,8 @@ test "handleModelsRequest applies provider api and exact model filters" {
     defer server.deinit();
 
     var by_provider = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -1432,8 +1433,8 @@ test "handleModelsRequest applies provider api and exact model filters" {
     }
 
     var by_api = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -1453,8 +1454,8 @@ test "handleModelsRequest applies provider api and exact model filters" {
     }
 
     var by_model_id = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -1481,8 +1482,8 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
     defer server.deinit();
 
     var ambiguous = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -1501,8 +1502,8 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
     try std.testing.expect(std.mem.indexOf(u8, ambiguous_nack.payload.nack.reason.slice(), "multiple APIs") != null);
 
     var missing = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -1533,8 +1534,8 @@ test "handleModelsRequest prefers dynamic fetch and falls back to static catalog
     defer server.deinit();
 
     var dynamic_request = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -1555,8 +1556,8 @@ test "handleModelsRequest prefers dynamic fetch and falls back to static catalog
     dynamic_ctx.mode = .unavailable;
 
     var fallback_request = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -1638,7 +1639,7 @@ fn expectAuthRefreshFailedNack(state: *AuthTestState) !void {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUuid(), .message_id = protocol_types.generateUuid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_refresh_failed, response.payload.nack.error_code.?);
@@ -1688,7 +1689,7 @@ test "retry auth failure returns auth_required nack" {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUuid(), .message_id = protocol_types.generateUuid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_required, response.payload.nack.error_code.?);
@@ -1720,8 +1721,8 @@ test "handleEnvelope returns pong for ping" {
     defer server.deinit();
 
     const ping_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -1758,10 +1759,10 @@ test "handleEnvelope returns nack for stream_request without provider" {
         .max_tokens = 4096,
     };
 
-    const client_stream_id = protocol_types.generateUuid();
+    const client_stream_id = protocol_types.generateUlid();
     var stream_req_env = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1791,8 +1792,8 @@ test "handleEnvelope returns version_mismatch nack for unsupported version" {
 
     const ping_env = protocol_types.Envelope{
         .version = 2,
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -1836,8 +1837,8 @@ test "handleStreamRequest creates stream and returns ack" {
         .max_tokens = 4096,
     };
 
-    const client_stream_id = protocol_types.generateUuid();
-    const msg_id = protocol_types.generateUuid();
+    const client_stream_id = protocol_types.generateUlid();
+    const msg_id = protocol_types.generateUlid();
     var stream_req_env = protocol_types.Envelope{
         .stream_id = client_stream_id,
         .message_id = msg_id,
@@ -1894,10 +1895,10 @@ test "handleStreamRequest rejects duplicate stream id" {
         .max_tokens = 4096,
     };
 
-    const client_stream_id = protocol_types.generateUuid();
+    const client_stream_id = protocol_types.generateUlid();
     var req1 = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1914,7 +1915,7 @@ test "handleStreamRequest rejects duplicate stream id" {
 
     var req2 = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1961,8 +1962,8 @@ test "handleAbortRequest cancels stream" {
 
     // First create a stream
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1981,7 +1982,7 @@ test "handleAbortRequest cancels stream" {
     // Now abort the stream
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
@@ -2006,11 +2007,11 @@ test "handleAbortRequest returns ack for unknown stream (idempotent)" {
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
     defer server.deinit();
 
-    const unknown_stream_id = protocol_types.generateUuid();
+    const unknown_stream_id = protocol_types.generateUlid();
 
     const abort_env = protocol_types.Envelope{
         .stream_id = unknown_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
@@ -2054,8 +2055,8 @@ test "cleanupCompletedStreams removes done streams" {
 
     // Create a stream
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2105,10 +2106,10 @@ test "max streams limit enforced" {
     };
 
     // Create first stream - should succeed
-    const client_stream_id_1 = protocol_types.generateUuid();
+    const client_stream_id_1 = protocol_types.generateUlid();
     var req1 = protocol_types.Envelope{
         .stream_id = client_stream_id_1,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2125,10 +2126,10 @@ test "max streams limit enforced" {
     req1.deinit(std.testing.allocator);
 
     // Create second stream - should succeed
-    const client_stream_id_2 = protocol_types.generateUuid();
+    const client_stream_id_2 = protocol_types.generateUlid();
     var req2 = protocol_types.Envelope{
         .stream_id = client_stream_id_2,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Each new stream starts at sequence 1
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2145,10 +2146,10 @@ test "max streams limit enforced" {
     req2.deinit(std.testing.allocator);
 
     // Create third stream - should fail with rate_limited
-    const client_stream_id_3 = protocol_types.generateUuid();
+    const client_stream_id_3 = protocol_types.generateUlid();
     var req3 = protocol_types.Envelope{
         .stream_id = client_stream_id_3,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Each new stream starts at sequence 1
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2213,12 +2214,12 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         .max_tokens = 4096,
     };
 
-    const client_stream_id = protocol_types.generateUuid();
+    const client_stream_id = protocol_types.generateUlid();
 
     // Test with sequence = 0 (invalid)
     const req_seq0 = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 0,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2240,7 +2241,7 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
     // Test with sequence = 2 (should be 1 for new stream)
     const req_seq2 = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2280,12 +2281,12 @@ test "handleEnvelope rejects complete_request with invalid sequence" {
         .max_tokens = 4096,
     };
 
-    const client_stream_id = protocol_types.generateUuid();
+    const client_stream_id = protocol_types.generateUlid();
 
     // Test with sequence = 5 (should be 1 for complete_request)
     const req = protocol_types.Envelope{
         .stream_id = client_stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 5,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .complete_request = .{
@@ -2333,8 +2334,8 @@ test "handleAbortRequest rejects duplicate sequence" {
 
     // First create a stream with sequence 1
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2352,7 +2353,7 @@ test "handleAbortRequest rejects duplicate sequence" {
     // Now try to abort with duplicate sequence (should be 2, not 1)
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Duplicate - should be 2
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
@@ -2400,8 +2401,8 @@ test "handleAbortRequest rejects sequence gap" {
 
     // First create a stream with sequence 1
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2419,7 +2420,7 @@ test "handleAbortRequest rejects sequence gap" {
     // Now try to abort with a sequence gap (should be 2, not 10)
     const abort_env = protocol_types.Envelope{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 10, // Gap - expected 2
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
@@ -2545,8 +2546,8 @@ test "credential resolution: explicit api_key bypasses storage lookup" {
     };
 
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2607,8 +2608,8 @@ test "credential resolution: missing api_key loads credentials from storage by p
 
     // No options → no explicit api_key; resolver must hit storage.
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2660,8 +2661,8 @@ test "credential resolution: missing api_key and missing storage entry returns a
     };
 
     var stream_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -2711,8 +2712,8 @@ test "credential resolution: complete_request without credentials returns auth_r
     };
 
     var complete_req_env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .complete_request = .{

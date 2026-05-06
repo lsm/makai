@@ -3,7 +3,7 @@ const agent_types = @import("agent_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const SessionState = struct {
-    session_id: agent_types.Uuid,
+    session_id: agent_types.SessionId,
     status: agent_types.AgentStatus,
     model: []const u8,
     message_count: u32,
@@ -46,9 +46,9 @@ pub const Options = struct {
 
 pub const AgentProtocolServer = struct {
     allocator: std.mem.Allocator,
-    sessions: std.AutoHashMap(agent_types.Uuid, SessionState),
-    expected_sequences: std.AutoHashMap(agent_types.Uuid, u64),
-    outgoing_sequences: std.AutoHashMap(agent_types.Uuid, u64),
+    sessions: std.AutoHashMap(agent_types.Ulid, SessionState),
+    expected_sequences: std.AutoHashMap(agent_types.Ulid, u64),
+    outgoing_sequences: std.AutoHashMap(agent_types.Ulid, u64),
     outbox: std.ArrayList(agent_types.Envelope),
     options: Options,
 
@@ -61,9 +61,9 @@ pub const AgentProtocolServer = struct {
     pub fn initWithOptions(allocator: std.mem.Allocator, options: Options) Self {
         return .{
             .allocator = allocator,
-            .sessions = std.AutoHashMap(agent_types.Uuid, SessionState).init(allocator),
-            .expected_sequences = std.AutoHashMap(agent_types.Uuid, u64).init(allocator),
-            .outgoing_sequences = std.AutoHashMap(agent_types.Uuid, u64).init(allocator),
+            .sessions = std.AutoHashMap(agent_types.Ulid, SessionState).init(allocator),
+            .expected_sequences = std.AutoHashMap(agent_types.Ulid, u64).init(allocator),
+            .outgoing_sequences = std.AutoHashMap(agent_types.Ulid, u64).init(allocator),
             .outbox = std.ArrayList(agent_types.Envelope){},
             .options = options,
         };
@@ -98,7 +98,7 @@ pub const AgentProtocolServer = struct {
             .tool_list => |_| {
                 return .{
                     .session_id = env.session_id,
-                    .message_id = agent_types.generateUuid(),
+                    .message_id = agent_types.generateUlid(),
                     .sequence = env.sequence,
                     .in_reply_to = env.message_id,
                     .timestamp = std.time.milliTimestamp(),
@@ -106,10 +106,10 @@ pub const AgentProtocolServer = struct {
                 };
             },
             .ping => {
-                const ping_id = try agent_types.uuidToString(env.message_id, self.allocator);
+                const ping_id = try agent_types.ulidToString(env.message_id, self.allocator);
                 return .{
                     .session_id = env.session_id,
-                    .message_id = agent_types.generateUuid(),
+                    .message_id = agent_types.generateUlid(),
                     .sequence = env.sequence,
                     .in_reply_to = env.message_id,
                     .timestamp = std.time.milliTimestamp(),
@@ -128,7 +128,7 @@ pub const AgentProtocolServer = struct {
             return try self.makeError(env.session_id, env.message_id, .invalid_request, "agent_start sequence must be 1");
         }
 
-        const session_id = req.session_id orelse agent_types.generateUuid();
+        const session_id = req.session_id orelse agent_types.generateUlid();
         if (self.sessions.contains(session_id)) {
             return try self.makeError(env.session_id, env.message_id, .agent_busy, "session already exists");
         }
@@ -147,7 +147,7 @@ pub const AgentProtocolServer = struct {
 
         return .{
             .session_id = session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
             .in_reply_to = env.message_id,
             .timestamp = now,
@@ -184,7 +184,7 @@ pub const AgentProtocolServer = struct {
         const reason = if (req.getReason()) |r| try self.allocator.dupe(u8, r) else try self.allocator.dupe(u8, "stopped");
         return .{
             .session_id = req.session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = env.sequence,
             .in_reply_to = env.message_id,
             .timestamp = std.time.milliTimestamp(),
@@ -202,7 +202,7 @@ pub const AgentProtocolServer = struct {
 
         return .{
             .session_id = req.session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = env.sequence,
             .in_reply_to = env.message_id,
             .timestamp = std.time.milliTimestamp(),
@@ -277,7 +277,7 @@ pub const AgentProtocolServer = struct {
         const ack_seq = self.nextOutgoingSequence(env.session_id);
         const ack_envelope = agent_types.Envelope{
             .session_id = env.session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = ack_seq,
             .in_reply_to = env.message_id,
             .timestamp = std.time.milliTimestamp(),
@@ -287,7 +287,7 @@ pub const AgentProtocolServer = struct {
         const response_seq = self.nextOutgoingSequence(env.session_id);
         try self.outbox.append(self.allocator, .{
             .session_id = env.session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = response_seq,
             .in_reply_to = env.message_id,
             .timestamp = std.time.milliTimestamp(),
@@ -299,15 +299,15 @@ pub const AgentProtocolServer = struct {
 
     fn makeModelsNack(
         self: *Self,
-        session_id: agent_types.Uuid,
-        in_reply_to: agent_types.Uuid,
+        session_id: agent_types.SessionId,
+        in_reply_to: agent_types.SessionId,
         code: agent_types.ErrorCode,
         msg: []const u8,
     ) !agent_types.Envelope {
         const reason = try self.allocator.dupe(u8, msg);
         return .{
             .session_id = session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -319,10 +319,10 @@ pub const AgentProtocolServer = struct {
         };
     }
 
-    fn makeError(self: *Self, session_id: agent_types.Uuid, in_reply_to: agent_types.Uuid, code: agent_types.AgentErrorCode, msg: []const u8) !agent_types.Envelope {
+    fn makeError(self: *Self, session_id: agent_types.SessionId, in_reply_to: agent_types.SessionId, code: agent_types.AgentErrorCode, msg: []const u8) !agent_types.Envelope {
         return .{
             .session_id = session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = 0,
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -333,29 +333,29 @@ pub const AgentProtocolServer = struct {
         };
     }
 
-    fn nextOutgoingSequence(self: *Self, session_id: agent_types.Uuid) u64 {
+    fn nextOutgoingSequence(self: *Self, session_id: agent_types.SessionId) u64 {
         const cur = self.outgoing_sequences.get(session_id) orelse 0;
         const next = cur + 1;
         self.outgoing_sequences.put(session_id, next) catch {};
         return next;
     }
 
-    pub fn publishAgentEvent(self: *Self, session_id: agent_types.Uuid, event_json: []const u8) !void {
+    pub fn publishAgentEvent(self: *Self, session_id: agent_types.SessionId, event_json: []const u8) !void {
         if (!self.sessions.contains(session_id)) return error.SessionNotFound;
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .agent_event = try self.allocator.dupe(u8, event_json) },
         });
     }
 
-    pub fn publishAgentResult(self: *Self, session_id: agent_types.Uuid, result_json: []const u8) !void {
+    pub fn publishAgentResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
         if (!self.sessions.contains(session_id)) return error.SessionNotFound;
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
-            .message_id = agent_types.generateUuid(),
+            .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .agent_result = try self.allocator.dupe(u8, result_json) },
@@ -374,8 +374,8 @@ test "AgentProtocolServer rejects invalid start sequence" {
     defer server.deinit();
 
     var start = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
@@ -394,10 +394,10 @@ test "AgentProtocolServer rejects unknown session message" {
     var server = AgentProtocolServer.init(allocator);
     defer server.deinit();
 
-    const sid = agent_types.generateUuid();
+    const sid = agent_types.generateUlid();
     var msg = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_message = .{
@@ -505,8 +505,8 @@ test "handleModelsRequest emits ack then models_response with same shape as prov
     defer server.deinit();
 
     var request = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -559,8 +559,8 @@ test "handleModelsRequest returns not_implemented nack when unsupported" {
     defer server.deinit();
 
     var request = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -586,8 +586,8 @@ test "handleModelsRequest returns not_implemented nack when delegate is missing"
     defer server.deinit();
 
     var request = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -621,8 +621,8 @@ test "handleModelsRequest maps delegate NotImplemented error to not_implemented 
     defer server.deinit();
 
     var request = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{} },
@@ -645,8 +645,8 @@ test "AgentProtocolServer start message status stop" {
     defer server.deinit();
 
     var start = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
-        .message_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateUlid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
@@ -661,7 +661,7 @@ test "AgentProtocolServer start message status stop" {
 
     var msg = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_message = .{
@@ -674,7 +674,7 @@ test "AgentProtocolServer start message status stop" {
 
     var status = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 3,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_status = .{ .session_id = sid } },
@@ -688,7 +688,7 @@ test "AgentProtocolServer start message status stop" {
 
     var stop = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 4,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_stop = .{ .session_id = sid } },
