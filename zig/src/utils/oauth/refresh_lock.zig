@@ -18,7 +18,7 @@ pub const RefreshLock = struct {
 
     const Entry = struct {
         key_owned: []const u8,
-        acquired_at: i64,
+        acquired_at: std.time.Instant,
         cond: std.Thread.Condition,
         /// null  = refresh succeeded
         /// error = refresh failed with this error
@@ -190,6 +190,14 @@ pub const RefreshLock = struct {
         }
     }
 
+    fn nowInstant() !std.time.Instant {
+        return std.time.Instant.now();
+    }
+
+    fn elapsedMs(entry: *const Entry, now: std.time.Instant) u64 {
+        return @intCast(now.since(entry.acquired_at) / std.time.ns_per_ms);
+    }
+
     // ------------------------------------------------------------------
     // Acquire / Complete
     // ------------------------------------------------------------------
@@ -241,8 +249,8 @@ pub const RefreshLock = struct {
                 }
             } else {
                 // Check timeout.
-                const now = std.time.milliTimestamp();
-                if (now - entry.acquired_at > @as(i64, @intCast(self.timeout_ms))) {
+                const now = try nowInstant();
+                if (elapsedMs(entry, now) > self.timeout_ms) {
                     // Timed out — mark completed so all current waiters see
                     // the failure immediately, and release the owner's ref so
                     // future acquires can recover with a fresh refresh instead
@@ -258,16 +266,16 @@ pub const RefreshLock = struct {
                 // caller arrives to observe expiry.
                 entry.ref_count += 1;
                 while (!self.shutdown and !entry.completed) {
-                    const elapsed_ms = std.time.milliTimestamp() - entry.acquired_at;
-                    const remaining_ms = @as(i64, @intCast(self.timeout_ms)) - elapsed_ms;
-                    if (remaining_ms <= 0) {
+                    const elapsed_ms = elapsedMs(entry, try nowInstant());
+                    if (elapsed_ms >= self.timeout_ms) {
                         _ = self.timeoutEntry(entry);
                         self.releaseWaiterRef(entry);
                         self.allocator.free(key);
                         self.mutex.unlock();
                         return .timed_out;
                     }
-                    const timeout_ns = @as(u64, @intCast(remaining_ms)) * std.time.ns_per_ms;
+                    const remaining_ms = self.timeout_ms - elapsed_ms;
+                    const timeout_ns = remaining_ms * std.time.ns_per_ms;
                     entry.cond.timedWait(&self.mutex, timeout_ns) catch |err| switch (err) {
                         error.Timeout => {
                             if (!entry.completed) {
@@ -319,7 +327,7 @@ pub const RefreshLock = struct {
 
         entry.* = .{
             .key_owned = key,
-            .acquired_at = std.time.milliTimestamp(),
+            .acquired_at = try nowInstant(),
             .cond = .{},
             .result = null,
             .completed = false,
@@ -397,7 +405,7 @@ pub const RefreshLock = struct {
     /// and all waiters are woken.  The holder's `complete()` call will be a
     /// no-op (entry already removed or marked completed).
     pub fn expireTimedOut(self: *RefreshLock) void {
-        const now = std.time.milliTimestamp();
+        const now = nowInstant() catch return;
 
         self.mutex.lock();
         // Collect entries to expire so we don't invalidate the iterator.
@@ -410,7 +418,7 @@ pub const RefreshLock = struct {
         var iter = self.entries.iterator();
         while (iter.next()) |hashmap_entry| {
             const entry = hashmap_entry.value_ptr.*;
-            if (!entry.completed and now - entry.acquired_at > @as(i64, @intCast(self.timeout_ms))) {
+            if (!entry.completed and elapsedMs(entry, now) > self.timeout_ms) {
                 to_expire.appendAssumeCapacity(entry);
             }
         }
