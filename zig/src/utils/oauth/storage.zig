@@ -125,9 +125,9 @@ pub const AuthStorage = struct {
         const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", "auth.json" });
         defer self.allocator.free(file_path);
 
-        // Write to temporary file with a unique suffix (timestamp + PID)
+        // Write to temporary file with a unique suffix (timestamp + random)
         // to avoid collisions when two processes write concurrently.
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}.{d}", .{ file_path, std.time.milliTimestamp(), std.posix.getpid() });
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}.{x}", .{ file_path, std.time.milliTimestamp(), std.crypto.random.int(u64) });
         defer self.allocator.free(tmp_path);
 
         // Create with restrictive permissions BEFORE writing any data.

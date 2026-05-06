@@ -460,15 +460,15 @@ const ConcurrencyCtx = struct {
 
 fn concurrentWorker(ctx: *ConcurrencyCtx) void {
     const result = ctx.lock.acquire(ctx.provider, null) catch {
-        ctx.err_count.fetchAdd(1, .monotonic);
+        _ = ctx.err_count.fetchAdd(1, .monotonic);
         return;
     };
-    ctx.acquire_count.fetchAdd(1, .monotonic);
+    _ = ctx.acquire_count.fetchAdd(1, .monotonic);
     switch (result) {
         .acquired => {
             _ = ctx.refresh_count.fetchAdd(1, .monotonic);
             // Simulate a short refresh delay
-            std.time.sleep(5 * std.time.ns_per_ms);
+            std.Thread.sleep(5 * std.time.ns_per_ms);
             ctx.lock.complete(ctx.provider, null, null);
         },
         .completed_ok => {
@@ -509,7 +509,7 @@ test "concurrent requests for same provider trigger only one refresh" {
     }
 
     // Hold the lock a moment so waiters actually block.
-    std.time.sleep(10 * std.time.ns_per_ms);
+    std.Thread.sleep(10 * std.time.ns_per_ms);
     lock.complete("test-provider", null, null);
 
     for (&threads) |t| {
@@ -549,7 +549,7 @@ test "all waiting requests succeed after a single shared refresh completes" {
     }
 
     // Complete with success.
-    std.time.sleep(5 * std.time.ns_per_ms);
+    std.Thread.sleep(5 * std.time.ns_per_ms);
     lock.complete("prov-ok", null, null);
 
     for (&threads) |t| {
@@ -573,7 +573,7 @@ test "lock held beyond timeout returns timed_out" {
     try testing.expect(first == .acquired);
 
     // Wait for the timeout to elapse.
-    std.time.sleep(80 * std.time.ns_per_ms);
+    std.Thread.sleep(80 * std.time.ns_per_ms);
 
     // A second acquire should observe the timeout.
     const second = try lock.acquire("slow-provider", null);
@@ -590,7 +590,7 @@ test "expireTimedOut marks stale entries as completed" {
     const first = try lock.acquire("expired-provider", null);
     try testing.expect(first == .acquired);
 
-    std.time.sleep(80 * std.time.ns_per_ms);
+    std.Thread.sleep(80 * std.time.ns_per_ms);
     lock.expireTimedOut();
 
     // New acquire should see the expired entry.

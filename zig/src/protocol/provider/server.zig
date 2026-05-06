@@ -601,12 +601,13 @@ fn streamWithRefresh(
     defer if (loaded_storage) |*storage| storage.deinit();
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
-    else blk: {
-        loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch
-            break :blk null;
-        break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
-    } orelse
-        return streamWithResolvedKey(server, provider, provider_id, model, context, options);
+    else
+        blk: {
+            loaded_storage = server.options.load_auth_storage_fn(server.options.load_auth_storage_ctx, server.allocator) catch
+                break :blk null;
+            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+        } orelse
+            return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
     if (!storage.hasRefreshableCredentials(provider_id)) {
         // Non-OAuth entry or missing entry. If the loaded storage has an api_key,
@@ -2878,7 +2879,7 @@ test "refresh lock timeout returns timed_out for stale locks" {
     try std.testing.expect(r1 == .acquired);
 
     // Wait for timeout
-    std.time.sleep(5 * std.time.ns_per_ms);
+    std.Thread.sleep(5 * std.time.ns_per_ms);
 
     // Second caller should get timed_out
     const r2 = try lock.acquire("slow-provider", null);
