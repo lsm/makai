@@ -332,7 +332,7 @@ pub const RefreshLock = struct {
             return err;
         };
         const acquired_at = nowInstant() catch |err| {
-            self.allocator.free(entry.key_owned);
+            self.allocator.free(key);
             self.allocator.destroy(entry);
             self.mutex.unlock();
             return err;
