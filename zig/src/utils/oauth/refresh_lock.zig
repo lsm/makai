@@ -366,7 +366,7 @@ pub const RefreshLock = struct {
             return;
         };
 
-        if (entry.generation != generation) {
+        if (entry.generation != generation or entry.timed_out) {
             self.mutex.unlock();
             return;
         }
@@ -733,6 +733,29 @@ test "waiter timeout releases waiter ref and allows recovery" {
 
     lock.complete("recover-provider", null, recovered_gen, null);
     try testing.expectEqual(@as(usize, 0), lock.activeCount());
+}
+
+test "owner completion after timeout does not rewrite timeout result" {
+    var lock = RefreshLock.initWithTimeout(testing.allocator, 20);
+    defer lock.deinit();
+
+    const gen = try expectAcquired(try lock.acquire("timed-result-provider", null));
+
+    var ctx = WaiterTimeoutCtx{
+        .lock = &lock,
+        .provider = "timed-result-provider",
+        .timed_out_count = std.atomic.Value(usize).init(0),
+    };
+    const waiter = try std.Thread.spawn(.{}, timeoutWaiter, .{&ctx});
+    waiter.join();
+
+    // A late owner completion for the same generation must not clear
+    // timed_out=false or replace the timeout with a success result.
+    lock.complete("timed-result-provider", null, gen, null);
+
+    try testing.expectEqual(@as(usize, 1), ctx.timed_out_count.load(.seq_cst));
+    const recovered_gen = try expectAcquired(try lock.acquire("timed-result-provider", null));
+    lock.complete("timed-result-provider", null, recovered_gen, null);
 }
 
 test "shutdown with waiter does not dereference freed entries" {
