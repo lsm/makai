@@ -249,7 +249,11 @@ pub const RefreshLock = struct {
                 }
             } else {
                 // Check timeout.
-                const now = try nowInstant();
+                const now = nowInstant() catch |err| {
+                    self.allocator.free(key);
+                    self.mutex.unlock();
+                    return err;
+                };
                 if (elapsedMs(entry, now) > self.timeout_ms) {
                     // Timed out — mark completed so all current waiters see
                     // the failure immediately, and release the owner's ref so
@@ -266,7 +270,13 @@ pub const RefreshLock = struct {
                 // caller arrives to observe expiry.
                 entry.ref_count += 1;
                 while (!self.shutdown and !entry.completed) {
-                    const elapsed_ms = elapsedMs(entry, try nowInstant());
+                    const instant = nowInstant() catch |err| {
+                        self.releaseWaiterRef(entry);
+                        self.allocator.free(key);
+                        self.mutex.unlock();
+                        return err;
+                    };
+                    const elapsed_ms = elapsedMs(entry, instant);
                     if (elapsed_ms >= self.timeout_ms) {
                         _ = self.timeoutEntry(entry);
                         self.releaseWaiterRef(entry);
@@ -321,13 +331,20 @@ pub const RefreshLock = struct {
             self.mutex.unlock();
             return err;
         };
+        const acquired_at = nowInstant() catch |err| {
+            self.allocator.free(entry.key_owned);
+            self.allocator.destroy(entry);
+            self.mutex.unlock();
+            return err;
+        };
+
         const generation = self.next_generation;
         self.next_generation +%= 1;
         if (self.next_generation == 0) self.next_generation = 1;
 
         entry.* = .{
             .key_owned = key,
-            .acquired_at = try nowInstant(),
+            .acquired_at = acquired_at,
             .cond = .{},
             .result = null,
             .completed = false,
