@@ -582,7 +582,7 @@ fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
 
 fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
     const env = AgentProtocolTypes.Envelope{
-        .session_id = AgentProtocolTypes.generateUuid(),
+        .session_id = AgentProtocolTypes.generateSessionId(),
         .message_id = AgentProtocolTypes.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
