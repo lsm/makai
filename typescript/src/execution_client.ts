@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MakaiAuthClient, type MakaiAuthApi } from "./auth_protocol";
+import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
@@ -114,15 +115,23 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
-    const streamId = randomUUID();
-    this.transport.send(buildEnvelope("agent_run_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
+    const sessionId = agentSessionId(request);
+    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
+    let messageSent = false;
     while (true) {
-      const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
+      const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
       if (frame.type === "ack") continue;
       if (frame.type === "nack") throw nackToStreamError(frame);
       if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
+      if (frame.type === "agent_started") {
+        if (!messageSent) {
+          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, this.authRetryPolicy)));
+          messageSent = true;
+        }
+        continue;
+      }
       if (frame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(frame, "result_json"));
       if (frame.type === "result" || frame.type === "complete_response") return parseCompletionResponse(frame.payload ?? frame);
 
@@ -139,15 +148,21 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
-    const streamId = randomUUID();
-    this.transport.send(buildEnvelope("agent_run_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
+    const sessionId = agentSessionId(request);
+    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
     let terminal = false;
+    let messageSent = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
       while (!terminal) {
-        const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
+        const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame);
+        if (frame.type === "agent_started" && !messageSent) {
+          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, this.authRetryPolicy)));
+          messageSent = true;
+          continue;
+        }
         const events = normalizeAgentFrame(frame, toolBuffers);
         for (const event of events) {
           if (event.type === "error") {
@@ -177,27 +192,83 @@ function buildEnvelope(type: string, streamId: string, payload: Record<string, u
   };
 }
 
+function buildAgentEnvelope(type: string, sessionId: string, sequence: number, payload: Record<string, unknown>): StdioFrame {
+  return {
+    type,
+    session_id: sessionId,
+    message_id: randomUUID(),
+    sequence,
+    timestamp: Date.now(),
+    version: ENVELOPE_VERSION,
+    payload,
+  };
+}
+
 function buildExecutionPayload(
   request: ProviderCompleteRequest | AgentRunRequest,
   options: { suppressPartial?: boolean; authRetryPolicy?: RunOptions["auth_retry_policy"] } = {},
 ): Record<string, unknown> {
-  if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
-    throw new TypeError("request requires opaque model_ref");
-  }
-  if (!Array.isArray(request.messages)) {
-    throw new TypeError("request requires messages array");
-  }
+  validateExecutionRequest(request);
+  const model = modelFromRef(request.model_ref);
   const payload: Record<string, unknown> = {
-    model_ref: request.model_ref,
-    messages: request.messages.map(serializeChatMessage),
+    model,
+    context: executionContext(request),
   };
-  if (request.tools) payload.tools = request.tools.map(serializeTool);
   const serializedOptions = serializeOptionsWithDefaults(request.options, options.authRetryPolicy);
   if (Object.keys(serializedOptions).length > 0) payload.options = serializedOptions;
   // V1 streams emit fully-buffered tool calls, so ask capable runtimes not to
   // include heavy partial message snapshots on stream deltas.
   if (options.suppressPartial) payload.include_partial = false;
   return payload;
+}
+
+function buildAgentStartPayload(request: AgentRunRequest): Record<string, unknown> {
+  validateExecutionRequest(request);
+  return { config_json: JSON.stringify({ model_ref: request.model_ref, tools: request.tools ?? [] }) };
+}
+
+function buildAgentMessagePayload(
+  request: AgentRunRequest,
+  sessionId: string,
+  authRetryPolicy: RunOptions["auth_retry_policy"] | undefined,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    session_id: sessionId,
+    message_json: JSON.stringify({ model_ref: request.model_ref, messages: request.messages, tools: request.tools ?? [] }),
+  };
+  const serializedOptions = serializeOptionsWithDefaults(request.options, authRetryPolicy);
+  if (Object.keys(serializedOptions).length > 0) payload.options_json = JSON.stringify(serializedOptions);
+  return payload;
+}
+
+function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunRequest): void {
+  if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
+    throw new TypeError("request requires opaque model_ref");
+  }
+  if (!Array.isArray(request.messages)) {
+    throw new TypeError("request requires messages array");
+  }
+}
+
+function modelFromRef(modelRef: string): Record<string, unknown> {
+  const parsed = parseModelRef(modelRef);
+  return {
+    id: parsed.modelId,
+    name: parsed.modelId,
+    api: parsed.api,
+    provider: parsed.providerId,
+    base_url: "",
+  };
+}
+
+function executionContext(request: ProviderCompleteRequest | AgentRunRequest): Record<string, unknown> {
+  const context: Record<string, unknown> = { messages: request.messages.map(serializeChatMessage) };
+  if (request.tools) context.tools = request.tools.map(serializeTool);
+  return context;
+}
+
+function agentSessionId(request: AgentRunRequest): string {
+  return request.options?.session_id ?? randomUUID();
 }
 
 function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
@@ -231,6 +302,20 @@ function serializeOptionsWithDefaults(
 async function nextFrame(transport: MakaiStdioClient, streamId: string, timeoutMs: number): Promise<StdioFrame> {
   try {
     return await transport.nextFrameForStream(streamId, timeoutMs);
+  } catch (error) {
+    throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
+  }
+}
+
+async function nextAgentFrame(transport: MakaiStdioClient, sessionId: string, timeoutMs: number): Promise<StdioFrame> {
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
+      const frame = await transport.nextFrame(remainingMs);
+      if (frame.session_id === sessionId) return frame;
+    }
   } catch (error) {
     throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
   }

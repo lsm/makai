@@ -46,7 +46,7 @@ async function setupHarness(envOverrides: NodeJS.ProcessEnv = {}): Promise<Harne
 
 function request() {
   return {
-    model_ref: "opaque-model-ref-with:colon",
+    model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
     messages: [{ role: "user" as const, content: "hello" }],
     options: { temperature: 0.2, session_id: "session-1" },
   };
@@ -79,7 +79,15 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
 
     const logged = readLoggedRequests(harness.logPath);
     assert.equal(logged[0]?.type, "complete_request");
-    assert.equal((logged[0]?.payload as Record<string, unknown>).model_ref, "opaque-model-ref-with:colon");
+    const payload = logged[0]?.payload as Record<string, unknown>;
+    assert.deepEqual(payload.model, {
+      id: "claude-sonnet-4-5",
+      name: "claude-sonnet-4-5",
+      api: "anthropic-messages",
+      provider: "anthropic",
+      base_url: "",
+    });
+    assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
   } finally {
     await harness.cleanup();
   }
@@ -155,6 +163,15 @@ test("client.agent.stream yields agent lifecycle events in order", async () => {
     ]);
     assert.deepEqual(events[0], { type: "agent_start", session_id: "session-1" } satisfies AgentStreamEvent);
     assert.deepEqual(events.at(-1), { type: "agent_end", usage: { input: 7, output: 9 }, stop_reason: "end_turn" } satisfies AgentStreamEvent);
+
+    const logged = readLoggedRequests(harness.logPath);
+    assert.equal(logged[0]?.type, "agent_start");
+    assert.equal(typeof logged[0]?.session_id, "string");
+    assert.equal(logged[0]?.stream_id, undefined);
+    assert.equal(logged[1]?.type, "agent_message");
+    assert.equal(logged[1]?.session_id, logged[0]?.session_id);
+    assert.equal(logged[1]?.stream_id, undefined);
+    assert.deepEqual(JSON.parse(((logged[1]?.payload as Record<string, unknown>).message_json as string)).messages, request().messages);
   } finally {
     await harness.cleanup();
   }
@@ -219,6 +236,8 @@ test("client.provider.stream buffers incremental tool calls into one tool_call e
 
     const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
     assert.equal(payload.include_partial, false);
+    assert.equal((payload.model as Record<string, unknown>).api, "anthropic-messages");
+    assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -299,6 +318,7 @@ test("createMakaiClient wires all namespaces correctly", async () => {
     await collect(handle.provider.stream(request()));
     const streamRequest = readLoggedRequests(logPath).find((entry) => entry.type === "stream_request");
     assert.equal(((streamRequest?.payload as Record<string, unknown>).options as Record<string, unknown>).auth_retry_policy, "auto_once");
+    assert.equal(((streamRequest?.payload as Record<string, unknown>).model as Record<string, unknown>).id, "claude-sonnet-4-5");
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

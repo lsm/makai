@@ -16,10 +16,11 @@ function appendLog(path, line) {
 }
 
 function ack(env) {
+  const id = env.stream_id || env.session_id;
   return {
     type: "ack",
-    stream_id: env.stream_id,
-    message_id: `${env.stream_id}-ack`,
+    ...(env.stream_id ? { stream_id: env.stream_id } : { session_id: env.session_id }),
+    message_id: `${id}-ack`,
     sequence: 2,
     timestamp: Date.now(),
     version: 1,
@@ -29,10 +30,11 @@ function ack(env) {
 }
 
 function frame(env, type, payload, sequence) {
+  const id = env.stream_id || env.session_id;
   return {
     type,
-    stream_id: env.stream_id,
-    message_id: `${env.stream_id}-${sequence}`,
+    ...(env.stream_id ? { stream_id: env.stream_id } : { session_id: env.session_id }),
+    message_id: `${id}-${sequence}`,
     sequence,
     timestamp: Date.now(),
     version: 1,
@@ -103,7 +105,9 @@ rl.on("line", (line) => {
       const event = providerEvents[i];
       emit(frame(env, event.type, event, i + 3));
     }
-  } else if (env.type === "agent_run_request") {
+  } else if (env.type === "agent_start") {
+    emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
+  } else if (env.type === "agent_message") {
     if (agentError) {
       emit(frame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
