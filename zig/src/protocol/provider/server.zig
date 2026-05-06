@@ -2801,9 +2801,11 @@ test "refresh lock prevents duplicate concurrent refresh calls" {
     // Complete the first refresh
     lock.complete("test-auth", null, null);
 
-    // Second acquire sees the completed result
+    // Completed entries with no waiters are removed, so a later acquire
+    // starts a fresh refresh.
     const r2 = try lock.acquire("test-auth", null);
-    try std.testing.expect(r2 == .completed_ok);
+    try std.testing.expect(r2 == .acquired);
+    lock.complete("test-auth", null, null);
 }
 
 test "refreshWithLock wraps refreshCredentials under the lock" {
@@ -2864,10 +2866,11 @@ test "refresh lock propagates refresh failure to waiters" {
     // Complete with failure
     lock.complete("failing-provider", null, error.AuthRefreshFailed);
 
-    // Second caller should see the failure
+    // Completed entries with no waiters are removed, so a later acquire
+    // starts a fresh refresh.
     const r2 = try lock.acquire("failing-provider", null);
-    try std.testing.expect(r2 == .completed_err);
-    try std.testing.expect(r2.completed_err == error.AuthRefreshFailed);
+    try std.testing.expect(r2 == .acquired);
+    lock.complete("failing-provider", null, error.AuthRefreshFailed);
 }
 
 test "refresh lock timeout returns timed_out for stale locks" {

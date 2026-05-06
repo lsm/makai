@@ -23,6 +23,9 @@ pub const RefreshLock = struct {
         /// error = refresh failed with this error
         result: ?anyerror,
         completed: bool,
+        /// True when completion was caused by refresh-lock timeout rather
+        /// than owner-provided completion.
+        timed_out: bool,
         /// Reference count: 1 for the owner + N waiters.
         /// Whoever decrements to 0 removes and frees the entry.
         ref_count: usize,
@@ -88,6 +91,7 @@ pub const RefreshLock = struct {
                 const e = he.value_ptr.*;
                 e.completed = true;
                 e.result = error.AuthRefreshFailed;
+                e.timed_out = false;
                 e.cond.broadcast();
             }
             self.mutex.unlock();
@@ -100,6 +104,7 @@ pub const RefreshLock = struct {
             const entry = hashmap_entry.value_ptr.*;
             entry.completed = true;
             entry.result = error.AuthRefreshFailed;
+            entry.timed_out = false;
             entry.cond.broadcast();
             to_free.appendAssumeCapacity(entry);
         }
@@ -176,7 +181,9 @@ pub const RefreshLock = struct {
 
             if (entry.completed) {
                 const result = entry.result;
+                const timed_out = entry.timed_out;
                 self.mutex.unlock();
+                if (timed_out) return .timed_out;
                 return if (result) |err|
                     .{ .completed_err = err }
                 else
@@ -190,6 +197,7 @@ pub const RefreshLock = struct {
                 // waiters see the failure immediately.
                 entry.completed = true;
                 entry.result = error.AuthRefreshFailed;
+                entry.timed_out = true;
                 entry.cond.broadcast();
                 // This waiter never incremented ref_count, so just return.
                 self.mutex.unlock();
@@ -217,6 +225,7 @@ pub const RefreshLock = struct {
 
             // Woken — read shared result.
             const result = entry.result;
+            const timed_out = entry.timed_out;
             entry.ref_count -= 1;
             if (entry.ref_count == 0) {
                 const owned = entry.key_owned;
@@ -227,6 +236,7 @@ pub const RefreshLock = struct {
             } else {
                 self.mutex.unlock();
             }
+            if (timed_out) return .timed_out;
             return if (result) |err|
                 .{ .completed_err = err }
             else
@@ -245,6 +255,7 @@ pub const RefreshLock = struct {
             .cond = .{},
             .result = null,
             .completed = false,
+            .timed_out = false,
             .ref_count = 1,
         };
         self.entries.put(key, entry) catch |err| {
@@ -287,6 +298,7 @@ pub const RefreshLock = struct {
 
         entry.result = err;
         entry.completed = true;
+        entry.timed_out = false;
         entry.cond.broadcast();
         entry.ref_count -= 1;
 
@@ -332,6 +344,7 @@ pub const RefreshLock = struct {
         for (to_expire.items) |entry| {
             entry.completed = true;
             entry.result = error.AuthRefreshFailed;
+            entry.timed_out = true;
             entry.cond.broadcast();
             // Don't remove here — waiters (or the holder's complete call)
             // will clean up when ref_count hits 0.
@@ -378,14 +391,16 @@ test "RefreshLock acquire returns completed_ok after successful refresh" {
     var lock = RefreshLock.init(testing.allocator);
     defer lock.deinit();
 
-    // Simulate: first acquire completes successfully
+    // Simulate: first acquire owns and completes successfully.
     const r1 = try lock.acquire("prov", null);
     try testing.expect(r1 == .acquired);
     lock.complete("prov", null, null);
 
-    // Second acquire should see completed result
+    // Once the owner completes with no waiters, the entry is removed.
+    // A later acquire starts a new refresh.
     const r2 = try lock.acquire("prov", null);
-    try testing.expect(r2 == .completed_ok);
+    try testing.expect(r2 == .acquired);
+    lock.complete("prov", null, null);
 }
 
 test "RefreshLock acquire returns completed_err after failed refresh" {
@@ -396,9 +411,11 @@ test "RefreshLock acquire returns completed_err after failed refresh" {
     try testing.expect(r1 == .acquired);
     lock.complete("prov", null, error.AuthRefreshFailed);
 
+    // Once the owner completes with no waiters, the entry is removed.
+    // A later acquire starts a new refresh.
     const r2 = try lock.acquire("prov", null);
-    try testing.expect(r2 == .completed_err);
-    try testing.expect(r2.completed_err == error.AuthRefreshFailed);
+    try testing.expect(r2 == .acquired);
+    lock.complete("prov", null, error.AuthRefreshFailed);
 }
 
 test "RefreshLock different providers are independent" {
@@ -425,13 +442,14 @@ test "RefreshLock user_id creates separate scope" {
     const r2 = try lock.acquire("prov", "user2");
     try testing.expect(r2 == .acquired);
 
-    // Same provider, same user → should see completed
-    // (But we haven't completed user1 yet, so user1 acquire would block)
     lock.complete("prov", "user1", null);
     lock.complete("prov", "user2", null);
 
+    // Completed entries with no waiters are removed, so a later acquire
+    // starts a fresh scoped refresh.
     const r3 = try lock.acquire("prov", "user1");
-    try testing.expect(r3 == .completed_ok);
+    try testing.expect(r3 == .acquired);
+    lock.complete("prov", "user1", null);
 }
 
 test "RefreshLock buildLockKey single-tenant is just provider_id" {
@@ -516,8 +534,8 @@ test "concurrent requests for same provider trigger only one refresh" {
         t.join();
     }
 
-    // Exactly one refresh (the initial acquire).
-    try testing.expectEqual(@as(usize, 1), ctx.refresh_count.load(.seq_cst));
+    // Workers were waiters only; the initial acquire owned the refresh.
+    try testing.expectEqual(@as(usize, 0), ctx.refresh_count.load(.seq_cst));
     // All waiters got completed_ok.
     try testing.expectEqual(@as(usize, num_waiters), ctx.ok_count.load(.seq_cst));
     try testing.expectEqual(@as(usize, 0), ctx.err_count.load(.seq_cst));
@@ -556,7 +574,7 @@ test "all waiting requests succeed after a single shared refresh completes" {
         t.join();
     }
 
-    try testing.expectEqual(@as(usize, 1), ctx.refresh_count.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), ctx.refresh_count.load(.seq_cst));
     try testing.expectEqual(@as(usize, num_waiters), ctx.ok_count.load(.seq_cst));
     try testing.expectEqual(@as(usize, 0), ctx.err_count.load(.seq_cst));
 }
