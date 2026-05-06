@@ -135,7 +135,7 @@ Ownership and auth boundary:
 **`transport.zig`** - Defines transport interfaces (`Sender`, `Receiver`, `AsyncSender`, `AsyncReceiver`) and wire message types (`MessageOrControl`, `ControlMessage`). Also defines `ByteStream = EventStream(ByteChunk, void)` for async byte-level I/O. Transports implement these interfaces over different backends.
 
 **`protocol/provider/`** - Client-server wire protocol:
-- `types.zig`: ULID generation, `Envelope` (stream_id, message_id, sequence, timestamp, payload), `ErrorCode` enum
+- `types.zig`: protocol ID generation (ULID stream_id/message_id), `Envelope` (stream_id, message_id, sequence, timestamp, payload), `ErrorCode` enum
 - `envelope.zig`: JSON serialization/deserialization of protocol envelopes, creation helpers (createStreamStart, createAck, createNack, etc.)
 - `server.zig`: Server-side protocol handler — validates sequences, manages streams, routes envelopes to providers
 - `client.zig`: Client-side `ProtocolClient` — sends requests via transport, reconstructs `AssistantMessage` from streamed events, manages pending requests. v1.0: single-stream only
