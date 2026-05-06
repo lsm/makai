@@ -27,7 +27,7 @@ function fixtureClientOptions(
 test("flattenAuthEvent normalizes Zig union wire shape", () => {
   const flatPrompt = flattenAuthEvent({
     prompt: {
-      flow_id: "00000000-0000-0000-0000-000000000001",
+      flow_id: "00000000000000000000000001",
       prompt_id: "device_code",
       provider_id: "fixture",
       message: "enter code",
@@ -36,7 +36,7 @@ test("flattenAuthEvent normalizes Zig union wire shape", () => {
   });
   assert.deepEqual(flatPrompt, {
     type: "prompt",
-    flow_id: "00000000-0000-0000-0000-000000000001",
+    flow_id: "00000000000000000000000001",
     prompt_id: "device_code",
     provider_id: "fixture",
     message: "enter code",
@@ -45,7 +45,7 @@ test("flattenAuthEvent normalizes Zig union wire shape", () => {
 
   const flatError = flattenAuthEvent({
     error: {
-      flow_id: "00000000-0000-0000-0000-000000000002",
+      flow_id: "00000000000000000000000002",
       provider_id: "fixture",
       code: "auth_failed",
       message: "boom",
@@ -53,7 +53,7 @@ test("flattenAuthEvent normalizes Zig union wire shape", () => {
   });
   assert.deepEqual(flatError, {
     type: "error",
-    flow_id: "00000000-0000-0000-0000-000000000002",
+    flow_id: "00000000000000000000000002",
     provider_id: "fixture",
     code: "auth_failed",
     message: "boom",

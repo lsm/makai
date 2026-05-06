@@ -37,7 +37,7 @@ pub const ProtocolPump = struct {
                 const seq = self.server.getNextSequence(stream_id);
                 const env = protocol_types.Envelope{
                     .stream_id = stream_id,
-                    .message_id = protocol_types.generateUuid(),
+                    .message_id = protocol_types.generateUlid(),
                     .sequence = seq,
                     .timestamp = std.time.milliTimestamp(),
                     .payload = .{ .event = event },
@@ -63,7 +63,7 @@ pub const ProtocolPump = struct {
                     const seq = self.server.getNextSequence(stream_id);
                     const env = protocol_types.Envelope{
                         .stream_id = stream_id,
-                        .message_id = protocol_types.generateUuid(),
+                        .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
                         .timestamp = std.time.milliTimestamp(),
                         .payload = .{ .result = result },
@@ -83,7 +83,7 @@ pub const ProtocolPump = struct {
                     const err_copy = try self.allocator.dupe(u8, err_msg);
                     var env = protocol_types.Envelope{
                         .stream_id = stream_id,
-                        .message_id = protocol_types.generateUuid(),
+                        .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
                         .timestamp = std.time.milliTimestamp(),
                         .payload = .{ .stream_error = .{

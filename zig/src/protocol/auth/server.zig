@@ -7,7 +7,7 @@ const oauth_storage = @import("oauth/storage");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 const FlowState = struct {
-    flow_id: auth_types.Uuid,
+    flow_id: auth_types.Ulid,
     provider_id: []u8,
     cancelled: bool = false,
     terminal_emitted: bool = false,
@@ -19,7 +19,7 @@ const FlowState = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
 
-    fn init(allocator: std.mem.Allocator, flow_id: auth_types.Uuid, provider_id: []const u8) !FlowState {
+    fn init(allocator: std.mem.Allocator, flow_id: auth_types.Ulid, provider_id: []const u8) !FlowState {
         return .{
             .flow_id = flow_id,
             .provider_id = try allocator.dupe(u8, provider_id),
@@ -42,9 +42,9 @@ const FlowState = struct {
 
 pub const AuthProtocolServer = struct {
     allocator: std.mem.Allocator,
-    expected_sequences: std.AutoHashMap(auth_types.Uuid, u64),
-    outgoing_sequences: std.AutoHashMap(auth_types.Uuid, u64),
-    flows: std.AutoHashMap(auth_types.Uuid, *FlowState),
+    expected_sequences: std.AutoHashMap(auth_types.Ulid, u64),
+    outgoing_sequences: std.AutoHashMap(auth_types.Ulid, u64),
+    flows: std.AutoHashMap(auth_types.Ulid, *FlowState),
     outbox: std.ArrayList(auth_types.Envelope),
     mutex: std.Thread.Mutex = .{},
     options: Options,
@@ -60,9 +60,9 @@ pub const AuthProtocolServer = struct {
     pub fn init(allocator: std.mem.Allocator, options: Options) Self {
         return .{
             .allocator = allocator,
-            .expected_sequences = std.AutoHashMap(auth_types.Uuid, u64).init(allocator),
-            .outgoing_sequences = std.AutoHashMap(auth_types.Uuid, u64).init(allocator),
-            .flows = std.AutoHashMap(auth_types.Uuid, *FlowState).init(allocator),
+            .expected_sequences = std.AutoHashMap(auth_types.Ulid, u64).init(allocator),
+            .outgoing_sequences = std.AutoHashMap(auth_types.Ulid, u64).init(allocator),
+            .flows = std.AutoHashMap(auth_types.Ulid, *FlowState).init(allocator),
             .outbox = std.ArrayList(auth_types.Envelope){},
             .options = options,
         };
@@ -139,10 +139,10 @@ pub const AuthProtocolServer = struct {
             .auth_prompt_response => |response| return try self.handlePromptResponseLocked(env, response),
             .auth_cancel => |request| return try self.handleCancelLocked(env, request),
             .ping => {
-                const ping_id = try auth_types.uuidToString(env.message_id, self.allocator);
+                const ping_id = try auth_types.ulidToString(env.message_id, self.allocator);
                 return .{
                     .stream_id = env.stream_id,
-                    .message_id = auth_types.generateUuid(),
+                    .message_id = auth_types.generateUlid(),
                     .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
                     .in_reply_to = env.message_id,
                     .timestamp = std.time.milliTimestamp(),
@@ -194,7 +194,7 @@ pub const AuthProtocolServer = struct {
         const providers = try self.buildProvidersResponse();
         const response = auth_types.Envelope{
             .stream_id = env.stream_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
             .in_reply_to = env.message_id,
             .timestamp = std.time.milliTimestamp(),
@@ -338,7 +338,7 @@ pub const AuthProtocolServer = struct {
         if (should_emit_cancel_result) {
             try self.outbox.append(self.allocator, auth_types.Envelope{
                 .stream_id = request.flow_id,
-                .message_id = auth_types.generateUuid(),
+                .message_id = auth_types.generateUlid(),
                 .sequence = self.nextOutgoingSequenceLocked(request.flow_id),
                 .timestamp = std.time.milliTimestamp(),
                 .payload = .{ .auth_login_result = .{
@@ -353,7 +353,7 @@ pub const AuthProtocolServer = struct {
     }
 
     fn cleanupCompletedFlowsLocked(self: *Self) void {
-        var completed = std.ArrayList(auth_types.Uuid){};
+        var completed = std.ArrayList(auth_types.Ulid){};
         defer completed.deinit(self.allocator);
 
         var iter = self.flows.iterator();
@@ -418,7 +418,7 @@ pub const AuthProtocolServer = struct {
         };
     }
 
-    fn validateAndUpdateSequenceLocked(self: *Self, _: ScopeKind, scope_id: auth_types.Uuid, received: u64) !void {
+    fn validateAndUpdateSequenceLocked(self: *Self, _: ScopeKind, scope_id: auth_types.Ulid, received: u64) !void {
         if (received == 0) return error.InvalidSequence;
         const expected = self.expected_sequences.get(scope_id) orelse 1;
         if (received < expected) return error.DuplicateSequence;
@@ -426,17 +426,17 @@ pub const AuthProtocolServer = struct {
         try self.expected_sequences.put(scope_id, received + 1);
     }
 
-    fn nextOutgoingSequenceLocked(self: *Self, scope_id: auth_types.Uuid) u64 {
+    fn nextOutgoingSequenceLocked(self: *Self, scope_id: auth_types.Ulid) u64 {
         const current = self.outgoing_sequences.get(scope_id) orelse 0;
         const next = current + 1;
         self.outgoing_sequences.put(scope_id, next) catch {};
         return next;
     }
 
-    fn makeAckLocked(self: *Self, scope_id: auth_types.Uuid, in_reply_to: auth_types.Uuid) auth_types.Envelope {
+    fn makeAckLocked(self: *Self, scope_id: auth_types.Ulid, in_reply_to: auth_types.Ulid) auth_types.Envelope {
         return .{
             .stream_id = scope_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -446,7 +446,7 @@ pub const AuthProtocolServer = struct {
         };
     }
 
-    fn sequenceNackLocked(self: *Self, scope_id: auth_types.Uuid, in_reply_to: auth_types.Uuid, err: anyerror) !auth_types.Envelope {
+    fn sequenceNackLocked(self: *Self, scope_id: auth_types.Ulid, in_reply_to: auth_types.Ulid, err: anyerror) !auth_types.Envelope {
         return switch (err) {
             error.InvalidSequence => try self.makeNackLocked(scope_id, in_reply_to, .invalid_sequence, "invalid sequence"),
             error.DuplicateSequence => try self.makeNackLocked(scope_id, in_reply_to, .duplicate_sequence, "duplicate sequence"),
@@ -457,14 +457,14 @@ pub const AuthProtocolServer = struct {
 
     fn makeNackLocked(
         self: *Self,
-        scope_id: auth_types.Uuid,
-        in_reply_to: auth_types.Uuid,
+        scope_id: auth_types.Ulid,
+        in_reply_to: auth_types.Ulid,
         error_code: auth_types.ErrorCode,
         reason: []const u8,
     ) !auth_types.Envelope {
         return .{
             .stream_id = scope_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
             .timestamp = std.time.milliTimestamp(),
@@ -670,7 +670,7 @@ pub const AuthProtocolServer = struct {
 
         const env = auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_event = .{ .prompt = .{
@@ -694,7 +694,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_event = .{ .progress = .{
@@ -724,7 +724,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_event = event },
@@ -748,7 +748,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_event = .{ .success = .{
@@ -759,7 +759,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_login_result = .{
@@ -778,7 +778,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_event = .{ .@"error" = .{
@@ -791,7 +791,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_login_result = .{
@@ -810,7 +810,7 @@ pub const AuthProtocolServer = struct {
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_login_result = .{
