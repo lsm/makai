@@ -189,8 +189,10 @@ pub const AuthStorage = struct {
         try json_buf.appendSlice(self.allocator, "\n}\n");
 
         // Write full content then fsync before rename for durability.
+        // If sync fails, do not commit the temp file over the last known-good
+        // auth file: callers must see the persistence failure.
         try file.writeAll(json_buf.items);
-        file.sync() catch {};
+        try file.sync();
 
         // Atomic rename — readers see old or new file, never partial.
         try std.fs.cwd().rename(tmp_path, file_path);
