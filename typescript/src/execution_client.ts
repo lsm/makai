@@ -71,15 +71,16 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   async complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
+    const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
-      () => this.completeOnce(request),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: this.authRetryPolicy },
+      () => this.completeOnce(request, effectivePolicy),
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy },
     );
   }
 
-  private async completeOnce(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
+  private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<ProviderCompleteResponse> {
     const streamId = randomUUID();
-    this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
+    this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     while (true) {
       const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
       if (frame.type === "ack") continue;
@@ -93,7 +94,8 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   async *stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
-    let attempt = this.streamAttempt(request);
+    const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
+    let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
 
@@ -102,13 +104,13 @@ class StdioProviderApi implements MakaiProviderApi {
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && this.authRetryPolicy === "auto_once" && this.auth && error.provider_id) {
+        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth && error.provider_id) {
           try {
             await this.auth.login(error.provider_id, this.authHandlers);
           } catch {
             throw error;
           }
-          attempt = this.streamAttempt(request);
+          attempt = this.streamAttempt(request, effectivePolicy);
           iterator = attempt[Symbol.asyncIterator]();
           continue;
         }
@@ -120,9 +122,9 @@ class StdioProviderApi implements MakaiProviderApi {
     }
   }
 
-  private async *streamAttempt(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
+  private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<ProviderStreamEvent> {
     const streamId = randomUUID();
-    this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: this.authRetryPolicy })));
+    this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
@@ -160,15 +162,16 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
+    const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
-      () => this.runOnce(request),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: this.authRetryPolicy },
+      () => this.runOnce(request, effectivePolicy),
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy },
     );
   }
 
-  private async runOnce(request: AgentRunRequest): Promise<AgentRunResponse> {
+  private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<AgentRunResponse> {
     const sessionId = agentSessionId(request);
-    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
+    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
@@ -179,7 +182,7 @@ class StdioAgentApi implements MakaiAgentApi {
       if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
       if (frame.type === "agent_started") {
         if (!messageSent) {
-          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, this.authRetryPolicy)));
+          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy)));
           messageSent = true;
         }
         continue;
@@ -200,7 +203,8 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
-    let attempt = this.streamAttempt(request);
+    const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
+    let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
 
@@ -209,13 +213,13 @@ class StdioAgentApi implements MakaiAgentApi {
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && this.authRetryPolicy === "auto_once" && this.auth && error.provider_id) {
+        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth && error.provider_id) {
           try {
             await this.auth.login(error.provider_id, this.authHandlers);
           } catch {
             throw error;
           }
-          attempt = this.streamAttempt(request);
+          attempt = this.streamAttempt(request, effectivePolicy);
           iterator = attempt[Symbol.asyncIterator]();
           continue;
         }
@@ -227,9 +231,9 @@ class StdioAgentApi implements MakaiAgentApi {
     }
   }
 
-  private async *streamAttempt(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
+  private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<AgentStreamEvent> {
     const sessionId = agentSessionId(request);
-    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
+    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     let terminal = false;
     let messageSent = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -239,7 +243,7 @@ class StdioAgentApi implements MakaiAgentApi {
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame);
         if (frame.type === "agent_started" && !messageSent) {
-          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, this.authRetryPolicy)));
+          this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy)));
           messageSent = true;
           continue;
         }
@@ -303,9 +307,12 @@ function buildExecutionPayload(
   return payload;
 }
 
-function buildAgentStartPayload(request: AgentRunRequest): Record<string, unknown> {
+function buildAgentStartPayload(request: AgentRunRequest, sessionId: string): Record<string, unknown> {
   validateExecutionRequest(request);
-  return { config_json: JSON.stringify({ model_ref: request.model_ref, tools: request.tools ?? [] }) };
+  return {
+    resume_session_id: sessionId,
+    config_json: JSON.stringify({ model_ref: request.model_ref, tools: request.tools ?? [] }),
+  };
 }
 
 function buildAgentMessagePayload(

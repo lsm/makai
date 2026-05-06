@@ -602,3 +602,66 @@ test("auto_once falls back to original auth_required error when login fails", as
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("per-request manual auth_retry_policy overrides client auto_once", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-override-manual-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.provider.complete({ ...request(), options: { auth_retry_policy: "manual" } }),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "complete_request").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("per-request auto_once auth_retry_policy overrides client manual", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-override-auto-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    const result = await handle.provider.complete({ ...request(), options: { auth_retry_policy: "auto_once" } });
+    assert.deepEqual(result.message.content, [{ type: "text", text: "hello" }]);
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "complete_request").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("agent_start payload includes resume_session_id", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await collect(agent.stream(request()));
+    const logged = readLoggedRequests(harness.logPath);
+    const start = logged.find((entry) => entry.type === "agent_start");
+    assert.ok(start);
+    const payload = start?.payload as Record<string, unknown>;
+    assert.equal(payload.resume_session_id, "11111111-1111-4111-8111-111111111111");
+  } finally {
+    await harness.cleanup();
+  }
+});
