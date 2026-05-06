@@ -74,7 +74,7 @@ class StdioProviderApi implements MakaiProviderApi {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
       () => this.completeOnce(request, effectivePolicy),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy },
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request) },
     );
   }
 
@@ -95,6 +95,7 @@ class StdioProviderApi implements MakaiProviderApi {
 
   async *stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
+    const fallbackProviderId = providerIdFromRequest(request);
     let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
@@ -104,15 +105,18 @@ class StdioProviderApi implements MakaiProviderApi {
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth && error.provider_id) {
-          try {
-            await this.auth.login(error.provider_id, this.authHandlers);
-          } catch {
-            throw error;
+        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+          const providerId = error.provider_id ?? fallbackProviderId;
+          if (providerId) {
+            try {
+              await this.auth.login(providerId, this.authHandlers);
+            } catch {
+              throw error;
+            }
+            attempt = this.streamAttempt(request, effectivePolicy);
+            iterator = attempt[Symbol.asyncIterator]();
+            continue;
           }
-          attempt = this.streamAttempt(request, effectivePolicy);
-          iterator = attempt[Symbol.asyncIterator]();
-          continue;
         }
         throw error;
       }
@@ -165,7 +169,7 @@ class StdioAgentApi implements MakaiAgentApi {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
       () => this.runOnce(request, effectivePolicy),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy },
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request) },
     );
   }
 
@@ -204,6 +208,7 @@ class StdioAgentApi implements MakaiAgentApi {
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
+    const fallbackProviderId = providerIdFromRequest(request);
     let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
@@ -213,15 +218,18 @@ class StdioAgentApi implements MakaiAgentApi {
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth && error.provider_id) {
-          try {
-            await this.auth.login(error.provider_id, this.authHandlers);
-          } catch {
-            throw error;
+        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+          const providerId = error.provider_id ?? fallbackProviderId;
+          if (providerId) {
+            try {
+              await this.auth.login(providerId, this.authHandlers);
+            } catch {
+              throw error;
+            }
+            attempt = this.streamAttempt(request, effectivePolicy);
+            iterator = attempt[Symbol.asyncIterator]();
+            continue;
           }
-          attempt = this.streamAttempt(request, effectivePolicy);
-          iterator = attempt[Symbol.asyncIterator]();
-          continue;
         }
         throw error;
       }
@@ -787,20 +795,35 @@ function isRetryableAuthError(error: unknown): error is MakaiStreamError {
   return error instanceof MakaiStreamError && error.code === "auth_required";
 }
 
+function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunRequest): string | undefined {
+  // model_ref is opaque per spec, but canonical refs carry provider info.
+  // We derive a fallback provider_id for auth retry only when the runtime
+  // error frame does not include one.
+  try {
+    const parsed = parseModelRef(request.model_ref);
+    return parsed.providerId;
+  } catch {
+    return undefined;
+  }
+}
+
 async function withAuthRetry<T>(
   operation: () => Promise<T>,
   options: {
     auth?: MakaiAuthApi;
     authHandlers?: AuthFlowHandlers;
     authRetryPolicy?: RunOptions["auth_retry_policy"];
+    fallbackProviderId?: string;
   },
 ): Promise<T> {
   try {
     return await operation();
   } catch (error) {
-    if (isRetryableAuthError(error) && options.authRetryPolicy === "auto_once" && options.auth && error.provider_id) {
+    if (isRetryableAuthError(error) && options.authRetryPolicy === "auto_once" && options.auth) {
+      const providerId = error.provider_id ?? options.fallbackProviderId;
+      if (!providerId) throw error;
       try {
-        await options.auth.login(error.provider_id, options.authHandlers);
+        await options.auth.login(providerId, options.authHandlers);
       } catch {
         throw error;
       }

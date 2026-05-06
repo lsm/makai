@@ -95,6 +95,14 @@ function shouldAuthReject(envType) {
   return count === 0;
 }
 
+function authRequiredPayload() {
+  const payload = { error_code: "auth_required", reason: "login required" };
+  if (!process.env.MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID) {
+    payload.provider_id = "anthropic";
+  }
+  return payload;
+}
+
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 rl.on("line", (line) => {
@@ -109,13 +117,13 @@ rl.on("line", (line) => {
 
   if (env.type === "complete_request") {
     if (shouldAuthReject("complete_request")) {
-      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
     emit(frame(env, "result", providerResult, 3));
   } else if (env.type === "stream_request") {
     if (shouldAuthReject("stream_request")) {
-      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
     for (let i = 0; i < providerEvents.length; i += 1) {
@@ -124,7 +132,7 @@ rl.on("line", (line) => {
     }
   } else if (env.type === "agent_start") {
     if (shouldAuthReject("agent_start")) {
-      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
