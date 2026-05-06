@@ -603,14 +603,19 @@ fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!model_catalog_ty
 
 test "deserializeEnvelope rejects invalid ulid" {
     const allocator = std.testing.allocator;
-    const bad =
-        "{\"type\":\"ping\",\"session_id\":\"not-a-ulid\",\"message_id\":\"not-a-ulid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
+    const sid = "000000000000000000000";
+    const bad = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"not-a-ulid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{sid},
+    );
+    defer allocator.free(bad);
     try std.testing.expectError(error.InvalidUlid, deserializeEnvelope(bad, allocator));
 }
 
 test "deserializeEnvelope rejects unknown payload type" {
     const allocator = std.testing.allocator;
-    const sid = "00000000000000000000000001";
+    const sid = "000000000000000000000";
     const mid = "00000000000000000000000002";
     const bad = try std.fmt.allocPrint(
         allocator,
