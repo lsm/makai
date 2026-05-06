@@ -469,7 +469,6 @@ test "parseSessionId returns null for invalid strings" {
     try std.testing.expect(parseSessionId("") == null);
 }
 
-
 test "ModelsRequest getters return null for empty borrowed filters" {
     const req = ModelsRequest{};
     try std.testing.expect(req.getProviderId() == null);
