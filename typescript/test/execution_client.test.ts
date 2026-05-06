@@ -207,6 +207,31 @@ test("client.agent.stream rejects non-UUID session IDs before transport I/O", as
   }
 });
 
+test("client.agent.run accepts UUID v7 session IDs", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-v7-session-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: "ok",
+      usage: { input: 1, output: 1 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+    }],
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await agent.run({ ...request(), options: { ...request().options, session_id: "01890f3e-7b62-7cc4-8f68-7a6f6a1b1234" } });
+    assert.equal(readLoggedRequests(harness.logPath)[0]?.session_id, "01890f3e-7b62-7cc4-8f68-7a6f6a1b1234");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.agent.stream yields agent lifecycle events in order", async () => {
   const harness = await setupHarness();
   try {
