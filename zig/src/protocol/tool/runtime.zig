@@ -115,7 +115,7 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
 
             return protocol_types.Envelope{
                 .server_id = env.server_id,
-                .message_id = protocol_types.generateUuid(),
+                .message_id = protocol_types.generateUlid(),
                 .sequence = env.sequence + 1,
                 .in_reply_to = env.message_id,
                 .timestamp = std.time.milliTimestamp(),
@@ -135,12 +135,12 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
             server.outbox_sent = true;
 
             return protocol_types.Envelope{
-                .server_id = protocol_types.generateUuid(),
-                .message_id = protocol_types.generateUuid(),
+                .server_id = protocol_types.generateUlid(),
+                .message_id = protocol_types.generateUlid(),
                 .sequence = 99,
                 .timestamp = std.time.milliTimestamp(),
                 .payload = .{ .tool_stream = .{
-                    .execution_id = protocol_types.generateUuid(),
+                    .execution_id = protocol_types.generateUlid(),
                     .tool_call_id = try test_allocator.dupe(u8, "call_1"),
                     .partial_result_json = try test_allocator.dupe(u8, "{\"progress\":50}"),
                     .progress = 50,
@@ -176,12 +176,12 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
     };
 
     const request = protocol_types.Envelope{
-        .server_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .server_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .tool_status = .{
-            .execution_id = protocol_types.generateUuid(),
+            .execution_id = protocol_types.generateUlid(),
         } },
     };
     const request_json = try tool_envelope.serializeEnvelope(request, allocator);

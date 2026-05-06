@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { ulid } from "ulid";
 import { BinaryResolverOptions } from "./binary_resolver";
 import {
   MakaiStdioClient,
@@ -257,8 +257,8 @@ export class MakaiAuthClient implements MakaiAuthApi {
   }
 
   async listProviders(): Promise<ProviderAuthInfo[]> {
-    const streamId = randomUUID();
-    const messageId = randomUUID();
+    const streamId = ulid();
+    const messageId = ulid();
     const envelope = {
       type: "auth_providers_request",
       stream_id: streamId,
@@ -296,13 +296,13 @@ export class MakaiAuthClient implements MakaiAuthApi {
     // (not per-property merge), so `{ onPrompt }` intentionally drops a
     // client-level `onEvent`.
     const effective = handlers ?? this.defaultHandlers;
-    const flowId = randomUUID();
+    const flowId = ulid();
     let outboundSequence = 1;
 
     this.sendOrThrow({
       type: "auth_login_start",
       stream_id: flowId,
-      message_id: randomUUID(),
+      message_id: ulid(),
       sequence: outboundSequence++,
       timestamp: Date.now(),
       version: PROTOCOL_VERSION,
@@ -362,7 +362,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
           this.sendOrThrow({
             type: "auth_prompt_response",
             stream_id: flowId,
-            message_id: randomUUID(),
+            message_id: ulid(),
             sequence: outboundSequence++,
             timestamp: Date.now(),
             version: PROTOCOL_VERSION,
@@ -445,7 +445,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       this.transport.send({
         type: "auth_cancel",
         stream_id: flowId,
-        message_id: randomUUID(),
+        message_id: ulid(),
         sequence,
         timestamp: Date.now(),
         version: PROTOCOL_VERSION,

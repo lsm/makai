@@ -19,7 +19,7 @@
  * - If the runtime omits `cache_max_age_ms` (non-conformant), default to 5 min.
  */
 
-import { randomUUID } from "node:crypto";
+import { ulid } from "ulid";
 import {
   AuthStatus,
   ListModelsRequest,
@@ -165,7 +165,7 @@ class StdioModelsApi implements MakaiModelsApi {
   }
 
   private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
-    const streamId = randomUUID();
+    const streamId = ulid();
     const envelope: StdioFrame = {
       type: "models_request",
       stream_id: streamId,

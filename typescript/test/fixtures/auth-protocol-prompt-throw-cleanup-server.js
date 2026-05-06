@@ -4,7 +4,7 @@
 // the same transport, proving the first flow did not leave orphaned frames that
 // poison future calls.
 const readline = require("node:readline");
-const crypto = require("node:crypto");
+const { ulid } = require("ulid");
 
 process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + "\n");
 
@@ -25,7 +25,7 @@ function ack(envelope) {
   send({
     type: "ack",
     stream_id: envelope.stream_id,
-    message_id: crypto.randomUUID(),
+    message_id: ulid(),
     sequence: nextSeq(envelope.stream_id),
     in_reply_to: envelope.message_id,
     timestamp: Date.now(),
@@ -52,7 +52,7 @@ rl.on("line", (line) => {
     send({
       type: "auth_event",
       stream_id: flowId,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(flowId),
       timestamp: Date.now(),
       version: 1,
@@ -76,7 +76,7 @@ rl.on("line", (line) => {
     send({
       type: "auth_event",
       stream_id: envelope.stream_id,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(envelope.stream_id),
       timestamp: Date.now(),
       version: 1,
@@ -92,7 +92,7 @@ rl.on("line", (line) => {
     send({
       type: "auth_login_result",
       stream_id: envelope.stream_id,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(envelope.stream_id),
       timestamp: Date.now(),
       version: 1,
@@ -113,7 +113,7 @@ rl.on("line", (line) => {
     send({
       type: "auth_event",
       stream_id: envelope.stream_id,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(envelope.stream_id),
       timestamp: Date.now(),
       version: 1,
@@ -124,7 +124,7 @@ rl.on("line", (line) => {
     send({
       type: "auth_login_result",
       stream_id: envelope.stream_id,
-      message_id: crypto.randomUUID(),
+      message_id: ulid(),
       sequence: nextSeq(envelope.stream_id),
       timestamp: Date.now(),
       version: 1,

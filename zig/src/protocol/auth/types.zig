@@ -2,10 +2,10 @@ const std = @import("std");
 const provider_types = @import("protocol_types");
 pub const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-pub const Uuid = provider_types.Uuid;
-pub const generateUuid = provider_types.generateUuid;
-pub const uuidToString = provider_types.uuidToString;
-pub const parseUuid = provider_types.parseUuid;
+pub const Ulid = provider_types.Ulid;
+pub const generateUlid = provider_types.generateUlid;
+pub const ulidToString = provider_types.ulidToString;
+pub const parseUlid = provider_types.parseUlid;
 
 pub const PROTOCOL_VERSION: u8 = 1;
 
@@ -52,7 +52,7 @@ pub const AuthLoginStartRequest = struct {
 };
 
 pub const AuthPromptResponse = struct {
-    flow_id: Uuid,
+    flow_id: Ulid,
     prompt_id: OwnedSlice(u8),
     answer: OwnedSlice(u8),
 
@@ -64,34 +64,34 @@ pub const AuthPromptResponse = struct {
 };
 
 pub const AuthCancelRequest = struct {
-    flow_id: Uuid,
+    flow_id: Ulid,
 };
 
 pub const AuthEvent = union(enum) {
     auth_url: struct {
-        flow_id: Uuid,
+        flow_id: Ulid,
         provider_id: OwnedSlice(u8),
         url: OwnedSlice(u8),
         instructions: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     },
     prompt: struct {
-        flow_id: Uuid,
+        flow_id: Ulid,
         prompt_id: OwnedSlice(u8),
         provider_id: OwnedSlice(u8),
         message: OwnedSlice(u8),
         allow_empty: bool = false,
     },
     progress: struct {
-        flow_id: Uuid,
+        flow_id: Ulid,
         provider_id: OwnedSlice(u8),
         message: OwnedSlice(u8),
     },
     success: struct {
-        flow_id: Uuid,
+        flow_id: Ulid,
         provider_id: OwnedSlice(u8),
     },
     @"error": struct {
-        flow_id: Uuid,
+        flow_id: Ulid,
         provider_id: OwnedSlice(u8),
         code: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         message: OwnedSlice(u8),
@@ -134,7 +134,7 @@ pub const AuthLoginStatus = enum {
 };
 
 pub const AuthLoginResult = struct {
-    flow_id: Uuid,
+    flow_id: Ulid,
     provider_id: OwnedSlice(u8),
     status: AuthLoginStatus,
 
@@ -145,7 +145,7 @@ pub const AuthLoginResult = struct {
 };
 
 pub const Ack = struct {
-    acknowledged_id: Uuid,
+    acknowledged_id: Ulid,
 };
 
 pub const ErrorCode = enum {
@@ -160,7 +160,7 @@ pub const ErrorCode = enum {
 };
 
 pub const Nack = struct {
-    rejected_id: Uuid,
+    rejected_id: Ulid,
     reason: OwnedSlice(u8),
     error_code: ?ErrorCode = null,
 
@@ -224,10 +224,10 @@ pub const Payload = union(enum) {
 
 pub const Envelope = struct {
     version: u8 = PROTOCOL_VERSION,
-    stream_id: Uuid,
-    message_id: Uuid,
+    stream_id: Ulid,
+    message_id: Ulid,
     sequence: u64,
-    in_reply_to: ?Uuid = null,
+    in_reply_to: ?Ulid = null,
     timestamp: i64,
     payload: Payload,
 

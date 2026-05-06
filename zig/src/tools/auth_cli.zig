@@ -83,12 +83,12 @@ pub fn runProvidersCommand(
     var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
-    const stream_id = auth_types.generateUuid();
+    const stream_id = auth_types.generateUlid();
 
     {
         const env = auth_types.Envelope{
             .stream_id = stream_id,
-            .message_id = auth_types.generateUuid(),
+            .message_id = auth_types.generateUlid(),
             .sequence = 1,
             .timestamp = std.time.milliTimestamp(),
             .payload = .{ .auth_providers_request = .{} },
@@ -154,7 +154,7 @@ pub fn runLoginCommand(
     var pipe = in_process.createSerializedPipe(allocator);
     defer pipe.deinit();
 
-    const flow_id = auth_types.generateUuid();
+    const flow_id = auth_types.generateUlid();
     var next_client_seq: u64 = 1;
 
     try sendLoginStart(allocator, &pipe, flow_id, options.provider_id, next_client_seq);
@@ -238,13 +238,13 @@ pub fn runLoginCommand(
 fn sendLoginStart(
     allocator: std.mem.Allocator,
     pipe: *SerializedPipe,
-    flow_id: auth_types.Uuid,
+    flow_id: auth_types.Ulid,
     provider_id: []const u8,
     sequence: u64,
 ) !void {
     var env = auth_types.Envelope{
         .stream_id = flow_id,
-        .message_id = auth_types.generateUuid(),
+        .message_id = auth_types.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_login_start = .{
@@ -264,14 +264,14 @@ fn sendLoginStart(
 fn sendPromptResponse(
     allocator: std.mem.Allocator,
     pipe: *SerializedPipe,
-    flow_id: auth_types.Uuid,
+    flow_id: auth_types.Ulid,
     sequence: u64,
     prompt_id: []const u8,
     answer: []const u8,
 ) !void {
     var env = auth_types.Envelope{
         .stream_id = flow_id,
-        .message_id = auth_types.generateUuid(),
+        .message_id = auth_types.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .auth_prompt_response = .{
@@ -296,7 +296,7 @@ fn handleAuthEvent(
     options: LoginOptions,
     event: auth_types.AuthEvent,
     pipe: *SerializedPipe,
-    flow_id: auth_types.Uuid,
+    flow_id: auth_types.Ulid,
     next_client_seq: *u64,
     captured_error_code: *?[]u8,
     captured_error_message: *?[]u8,

@@ -2,7 +2,7 @@
 // auth protocol streams. Used to verify the SDK routes frames by stream_id
 // instead of discarding frames that belong to another in-flight auth call.
 const readline = require("node:readline");
-const crypto = require("node:crypto");
+const { ulid } = require("ulid");
 
 process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + "\n");
 
@@ -25,7 +25,7 @@ function providerResponseEnvelope(envelope) {
   return {
     type: "auth_providers_response",
     stream_id: envelope.stream_id,
-    message_id: crypto.randomUUID(),
+    message_id: ulid(),
     sequence: nextSeq(envelope.stream_id),
     in_reply_to: envelope.message_id,
     timestamp: Date.now(),
@@ -52,7 +52,7 @@ rl.on("line", (line) => {
   send({
     type: "ack",
     stream_id: envelope.stream_id,
-    message_id: crypto.randomUUID(),
+    message_id: ulid(),
     sequence: nextSeq(envelope.stream_id),
     in_reply_to: envelope.message_id,
     timestamp: Date.now(),

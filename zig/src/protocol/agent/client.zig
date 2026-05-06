@@ -65,9 +65,9 @@ pub const AgentProtocolClient = struct {
         return next;
     }
 
-    pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Uuid {
+    pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const sid = agent_types.generateSessionId();
-        const msg_id = agent_types.generateUuid();
+        const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(sid);
 
         var payload = agent_types.Payload{ .agent_start = .{ .config_json = try self.allocator.dupe(u8, config_json), .session_id = sid } };
@@ -87,8 +87,8 @@ pub const AgentProtocolClient = struct {
         return msg_id;
     }
 
-    pub fn sendAgentMessage(self: *Self, session_id: agent_types.SessionId, message_json: []const u8, options_json: ?[]const u8) !agent_types.Uuid {
-        const msg_id = agent_types.generateUuid();
+    pub fn sendAgentMessage(self: *Self, session_id: agent_types.SessionId, message_json: []const u8, options_json: ?[]const u8) !agent_types.Ulid {
+        const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(session_id);
 
         var payload = agent_types.Payload{ .agent_message = .{
@@ -108,8 +108,8 @@ pub const AgentProtocolClient = struct {
         return msg_id;
     }
 
-    pub fn sendAgentStop(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !agent_types.Uuid {
-        const msg_id = agent_types.generateUuid();
+    pub fn sendAgentStop(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !agent_types.Ulid {
+        const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(session_id);
 
         var payload = agent_types.Payload{ .agent_stop = .{ .session_id = session_id } };
@@ -263,7 +263,7 @@ test "AgentProtocolClient processes events and results" {
 
     try client.processEnvelope(.{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_started = .{ .session_id = sid } },
@@ -271,7 +271,7 @@ test "AgentProtocolClient processes events and results" {
 
     var event_env = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_event = try allocator.dupe(u8, "{\"type\":\"turn_start\"}") },
@@ -281,7 +281,7 @@ test "AgentProtocolClient processes events and results" {
 
     var result_env = agent_types.Envelope{
         .session_id = sid,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 3,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
@@ -362,7 +362,7 @@ test "AgentProtocolClient maintains per-session sequence continuity across stop 
 
     var stopped_env = agent_types.Envelope{
         .session_id = sid1,
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 10,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_stopped = .{ .session_id = sid1 } },
