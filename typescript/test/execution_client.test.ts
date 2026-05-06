@@ -94,6 +94,26 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
   }
 });
 
+test("client.provider.complete preserves non-canonical model_ref with fallback model fields", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    await provider.complete({ ...request(), model_ref: "opaque-model-ref-with:colon" });
+
+    const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
+    assert.deepEqual(payload.model, {
+      id: "opaque-model-ref-with:colon",
+      name: "opaque-model-ref-with:colon",
+      api: "",
+      provider: "",
+      base_url: "",
+    });
+    assert.equal(payload.model_ref, "opaque-model-ref-with:colon");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("client.provider.complete maps system prompts and tool messages into provider context", async () => {
   const harness = await setupHarness();
   try {
@@ -302,10 +322,10 @@ test("client.provider.stream buffers incremental tool calls into one tool_call e
   const eventsPath = path.join(tmpDir, "events.json");
   fs.writeFileSync(eventsPath, JSON.stringify([
     { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
-    { type: "event", event_type: "toolcall_start", content_index: 0, id: "call-1", name: "lookup" },
-    { type: "event", event_type: "toolcall_delta", content_index: 0, delta: "{\"q\":" },
-    { type: "event", event_type: "toolcall_delta", content_index: 0, delta: "\"makai\"}" },
-    { type: "event", event_type: "toolcall_end", content_index: 0 },
+    { type: "toolcall_start", content_index: 0, id: "call-1", name: "lookup" },
+    { type: "toolcall_delta", content_index: 0, delta: "{\"q\":" },
+    { type: "toolcall_delta", content_index: 0, delta: "\"makai\"}" },
+    { type: "toolcall_end", content_index: 0 },
     { type: "message_end", usage: { input: 3, output: 5 }, stop_reason: "tool_use" },
   ]));
   const harness = await setupHarness({ MAKAI_TEST_PROVIDER_EVENTS_PATH: eventsPath });

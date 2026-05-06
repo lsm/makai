@@ -252,12 +252,26 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
 }
 
 function modelFromRef(modelRef: string): Record<string, unknown> {
-  const parsed = parseModelRef(modelRef);
+  try {
+    const parsed = parseModelRef(modelRef);
+    return {
+      id: parsed.modelId,
+      name: parsed.modelId,
+      api: parsed.api,
+      provider: parsed.providerId,
+      base_url: "",
+    };
+  } catch {
+    return opaqueModel(modelRef);
+  }
+}
+
+function opaqueModel(modelRef: string): Record<string, unknown> {
   return {
-    id: parsed.modelId,
-    name: parsed.modelId,
-    api: parsed.api,
-    provider: parsed.providerId,
+    id: modelRef,
+    name: modelRef,
+    api: "",
+    provider: "",
     base_url: "",
   };
 }
@@ -377,6 +391,9 @@ function normalizeProviderFrame(
     return { type: "thinking_delta", delta: stringValue(readPayloadOrFrame(frame).delta ?? readPayloadOrFrame(frame).reasoning) };
   }
   if (frame.type === "tool_call") return parseToolCall(readPayloadOrFrame(frame));
+  if (frame.type === "toolcall_start" || frame.type === "toolcall_delta" || frame.type === "toolcall_end") {
+    return normalizeProviderEvent(readPayloadOrFrame(frame), toolBuffers);
+  }
   if (frame.type === "message_end" || frame.type === "done" || frame.type === "result") return messageEndFrom(readPayloadOrFrame(frame));
   if (frame.type === "error") return parseError(readPayloadOrFrame(frame));
   return undefined;
