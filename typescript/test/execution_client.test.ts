@@ -46,7 +46,7 @@ async function setupHarness(envOverrides: NodeJS.ProcessEnv = {}): Promise<Harne
 
 function request() {
   return {
-    model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
+    model_ref: "opaque-model-ref-with:colon",
     messages: [{ role: "user" as const, content: "hello" }],
     options: { temperature: 0.2, session_id: "session-1" },
   };
@@ -81,10 +81,10 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
     assert.equal(logged[0]?.type, "complete_request");
     const payload = logged[0]?.payload as Record<string, unknown>;
     assert.deepEqual(payload.model, {
-      id: "claude-sonnet-4-5",
-      name: "claude-sonnet-4-5",
-      api: "anthropic-messages",
-      provider: "anthropic",
+      id: "opaque-model-ref-with:colon",
+      name: "opaque-model-ref-with:colon",
+      api: "",
+      provider: "",
       base_url: "",
     });
     assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
@@ -236,7 +236,7 @@ test("client.provider.stream buffers incremental tool calls into one tool_call e
 
     const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
     assert.equal(payload.include_partial, false);
-    assert.equal((payload.model as Record<string, unknown>).api, "anthropic-messages");
+    assert.equal((payload.model as Record<string, unknown>).id, "opaque-model-ref-with:colon");
     assert.deepEqual((payload.context as Record<string, unknown>).messages, request().messages);
   } finally {
     await harness.cleanup();
@@ -318,7 +318,7 @@ test("createMakaiClient wires all namespaces correctly", async () => {
     await collect(handle.provider.stream(request()));
     const streamRequest = readLoggedRequests(logPath).find((entry) => entry.type === "stream_request");
     assert.equal(((streamRequest?.payload as Record<string, unknown>).options as Record<string, unknown>).auth_retry_policy, "auto_once");
-    assert.equal(((streamRequest?.payload as Record<string, unknown>).model as Record<string, unknown>).id, "claude-sonnet-4-5");
+    assert.equal(((streamRequest?.payload as Record<string, unknown>).model as Record<string, unknown>).id, "opaque-model-ref-with:colon");
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

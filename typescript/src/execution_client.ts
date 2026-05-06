@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { MakaiAuthClient, type MakaiAuthApi } from "./auth_protocol";
-import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
@@ -251,12 +250,11 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
 }
 
 function modelFromRef(modelRef: string): Record<string, unknown> {
-  const parsed = parseModelRef(modelRef);
   return {
-    id: parsed.modelId,
-    name: parsed.modelId,
-    api: parsed.api,
-    provider: parsed.providerId,
+    id: modelRef,
+    name: modelRef,
+    api: "",
+    provider: "",
     base_url: "",
   };
 }
@@ -309,13 +307,7 @@ async function nextFrame(transport: MakaiStdioClient, streamId: string, timeoutM
 
 async function nextAgentFrame(transport: MakaiStdioClient, sessionId: string, timeoutMs: number): Promise<StdioFrame> {
   try {
-    const deadline = Date.now() + timeoutMs;
-    while (true) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
-      const frame = await transport.nextFrame(remainingMs);
-      if (frame.session_id === sessionId) return frame;
-    }
+    return await transport.nextFrameForSession(sessionId, timeoutMs);
   } catch (error) {
     throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
   }

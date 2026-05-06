@@ -28,7 +28,7 @@ test("connect succeeds with ready handshake and receives event frame", async () 
 test("nextFrameForStream preserves foreign frames for their owner", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,
-    args: [path.join(sourceFixturesDir, "ready-server.js")],
+    args: [path.join(sourceFixturesDir, "route-server.js")],
     handshakeTimeoutMs: 5000,
   });
 
@@ -44,6 +44,54 @@ test("nextFrameForStream preserves foreign frames for their owner", async () => 
     const firstFrame = await client.nextFrameForStream("s1", 5000);
     assert.equal(firstFrame.type, "event");
     assert.equal(firstFrame.stream_id, "s1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("nextFrameForSession preserves foreign session frames for their owner", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "route-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    client.send({ type: "agent_message", session_id: "a1" });
+    client.send({ type: "agent_message", session_id: "a2" });
+
+    const secondFrame = await client.nextFrameForSession("a2", 5000);
+    assert.equal(secondFrame.type, "agent_event");
+    assert.equal(secondFrame.session_id, "a2");
+
+    const firstFrame = await client.nextFrameForSession("a1", 5000);
+    assert.equal(firstFrame.type, "agent_event");
+    assert.equal(firstFrame.session_id, "a1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("targeted frame reads preserve frames across stream and session owners", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "route-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    client.send({ type: "stream_request", stream_id: "s1" });
+    client.send({ type: "agent_message", session_id: "a1" });
+
+    const agentFrame = await client.nextFrameForSession("a1", 5000);
+    assert.equal(agentFrame.type, "agent_event");
+    assert.equal(agentFrame.session_id, "a1");
+
+    const streamFrame = await client.nextFrameForStream("s1", 5000);
+    assert.equal(streamFrame.type, "event");
+    assert.equal(streamFrame.stream_id, "s1");
   } finally {
     await client.close();
   }
