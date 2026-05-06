@@ -373,8 +373,9 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
   const reversed = [...events].reverse();
   const terminal = reversed.find((event) => event.type === "message_end" || event.type === "agent_end");
   const messageEnd = reversed.find((event) => event.type === "message_end");
-  const start = events.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
-  const content = contentFromEvents(events);
+  const finalMessageEvents = finalAssistantMessageEvents(events);
+  const start = finalMessageEvents.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
+  const content = contentFromEvents(finalMessageEvents);
   return {
     message: { role: "assistant", content },
     usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
@@ -383,6 +384,14 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
     model_id: start?.model_id ?? "",
     stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
   };
+}
+
+function finalAssistantMessageEvents(events: AgentStreamEvent[]): AgentStreamEvent[] {
+  const startIndex = events.map((event) => event.type).lastIndexOf("message_start");
+  if (startIndex < 0) return events;
+  const endOffset = events.slice(startIndex + 1).findIndex((event) => event.type === "message_end");
+  const endIndex = endOffset < 0 ? events.length : startIndex + 1 + endOffset + 1;
+  return events.slice(startIndex, endIndex);
 }
 
 function buildCompletionResponseFromMessage(

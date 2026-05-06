@@ -160,6 +160,40 @@ test("client.agent.stream yields agent lifecycle events in order", async () => {
   }
 });
 
+test("client.agent.run event fallback returns only final assistant turn content", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-final-turn-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "session-1" },
+    { type: "turn_start" },
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "text_delta", delta: "lookup first" },
+    { type: "tool_call", tool_call_id: "call-1", name: "lookup", arguments_json: "{\"q\":\"makai\"}" },
+    { type: "message_end", usage: { input: 5, output: 6 }, stop_reason: "tool_use" },
+    { type: "turn_end", stop_reason: "tool_use" },
+    { type: "turn_start" },
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "text_delta", delta: "final answer" },
+    { type: "message_end", usage: { input: 7, output: 9 }, stop_reason: "end_turn" },
+    { type: "turn_end", stop_reason: "end_turn" },
+    { type: "agent_end", usage: { input: 7, output: 9 }, stop_reason: "end_turn" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.message.content, "final answer");
+    assert.deepEqual(result.usage, { input: 7, output: 9 });
+    assert.equal(result.provider_id, "anthropic");
+    assert.equal(result.api, "anthropic-messages");
+    assert.equal(result.model_id, "claude-sonnet-4-5");
+    assert.equal(result.stop_reason, "end_turn");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-tool-buffer-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
