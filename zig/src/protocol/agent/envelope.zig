@@ -224,7 +224,7 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
     const session_id = parseSessionIdOrError(root.get("session_id").?.string) orelse return error.InvalidSessionId;
-    const message_id = parseUlidOrError(root.get("message_id").?.string) orelse return error.InvalidUlid;
+    const message_id = try parseUlidRequired(root.get("message_id").?.string);
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
     const version = @as(u8, @intCast(root.get("version").?.integer));
