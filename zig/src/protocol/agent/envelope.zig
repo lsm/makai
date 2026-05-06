@@ -14,7 +14,7 @@ pub fn serializeEnvelope(env: agent_types.Envelope, allocator: std.mem.Allocator
     try w.beginObject();
     try w.writeStringField("type", @tagName(env.payload));
 
-    const session_id_str = try agent_types.uuidToString(env.session_id, allocator);
+    const session_id_str = try agent_types.sessionIdToString(env.session_id, allocator);
     defer allocator.free(session_id_str);
     try w.writeStringField("session_id", session_id_str);
 
@@ -49,26 +49,26 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
             try w.writeStringField("config_json", p.config_json);
             if (p.getSystemPrompt()) |prompt| try w.writeStringField("system_prompt", prompt);
             if (p.session_id) |id| {
-                const id_str = try agent_types.uuidToString(id, allocator);
+                const id_str = try agent_types.sessionIdToString(id, allocator);
                 defer allocator.free(id_str);
                 try w.writeStringField("resume_session_id", id_str);
             }
         },
         .agent_message => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
             try w.writeStringField("message_json", p.message_json);
             if (p.getOptionsJson()) |opts| try w.writeStringField("options_json", opts);
         },
         .agent_stop => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
             if (p.getReason()) |reason| try w.writeStringField("reason", reason);
         },
         .agent_status => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
         },
@@ -76,14 +76,14 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
             if (p.getPrefix()) |prefix| try w.writeStringField("prefix", prefix);
         },
         .agent_started => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
         },
         .agent_event => |p| try w.writeStringField("event_json", p),
         .agent_result => |p| try w.writeStringField("result_json", p),
         .agent_stopped => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
             if (p.getReason()) |reason| try w.writeStringField("reason", reason);
@@ -93,7 +93,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
             try w.writeStringField("message", p.message);
         },
         .session_info => |p| {
-            const session_id = try agent_types.uuidToString(p.session_id, allocator);
+            const session_id = try agent_types.sessionIdToString(p.session_id, allocator);
             defer allocator.free(session_id);
             try w.writeStringField("session_id", session_id);
             try w.writeStringField("status", @tagName(p.status));
@@ -223,7 +223,7 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
 
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
-    const session_id = parseUuidOrError(root.get("session_id").?.string) orelse return error.InvalidUuid;
+    const session_id = try parseSessionIdRequired(root.get("session_id").?.string);
     const message_id = parseUuidOrError(root.get("message_id").?.string) orelse return error.InvalidUuid;
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
@@ -250,6 +250,10 @@ fn parseUuidRequired(str: []const u8) !agent_types.Uuid {
     return agent_types.parseUuid(str) orelse error.InvalidUuid;
 }
 
+fn parseSessionIdRequired(str: []const u8) !agent_types.SessionId {
+    return agent_types.parseSessionId(str) orelse error.InvalidSessionId;
+}
+
 fn parseUuidOrError(str: []const u8) ?agent_types.Uuid {
     return agent_types.parseUuid(str);
 }
@@ -259,25 +263,25 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         const config = try allocator.dupe(u8, payload.get("config_json").?.string);
         var result = agent_types.AgentStartRequest{ .config_json = config };
         if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("resume_session_id")) |v| result.session_id = try parseUuidRequired(v.string);
+        if (payload.get("resume_session_id")) |v| result.session_id = try parseSessionIdRequired(v.string);
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
         const msg = try allocator.dupe(u8, payload.get("message_json").?.string);
         var req = agent_types.AgentMessageRequest{
-            .session_id = try parseUuidRequired(payload.get("session_id").?.string),
+            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
             .message_json = msg,
         };
         if (payload.get("options_json")) |v| req.options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_message = req };
     }
     if (std.mem.eql(u8, type_str, "agent_stop")) {
-        var req = agent_types.AgentStopRequest{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) };
+        var req = agent_types.AgentStopRequest{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
         if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_stop = req };
     }
     if (std.mem.eql(u8, type_str, "agent_status")) {
-        return .{ .agent_status = .{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_status = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
     }
     if (std.mem.eql(u8, type_str, "tool_list")) {
         var req = agent_types.ToolListRequest{};
@@ -285,12 +289,12 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .tool_list = req };
     }
     if (std.mem.eql(u8, type_str, "agent_started")) {
-        return .{ .agent_started = .{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) } };
+        return .{ .agent_started = .{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) } };
     }
     if (std.mem.eql(u8, type_str, "agent_event")) return .{ .agent_event = try allocator.dupe(u8, payload.get("event_json").?.string) };
     if (std.mem.eql(u8, type_str, "agent_result")) return .{ .agent_result = try allocator.dupe(u8, payload.get("result_json").?.string) };
     if (std.mem.eql(u8, type_str, "agent_stopped")) {
-        var stopped = agent_types.AgentStopped{ .session_id = try parseUuidRequired(payload.get("session_id").?.string) };
+        var stopped = agent_types.AgentStopped{ .session_id = try parseSessionIdRequired(payload.get("session_id").?.string) };
         if (payload.get("reason")) |v| stopped.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .agent_stopped = stopped };
     }
@@ -302,7 +306,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "session_info")) {
         return .{ .session_info = .{
-            .session_id = try parseUuidRequired(payload.get("session_id").?.string),
+            .session_id = try parseSessionIdRequired(payload.get("session_id").?.string),
             .status = std.meta.stringToEnum(agent_types.AgentStatus, payload.get("status").?.string) orelse .@"error",
             .model = try allocator.dupe(u8, payload.get("model").?.string),
             .message_count = @as(u32, @intCast(payload.get("message_count").?.integer)),
@@ -600,13 +604,13 @@ fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!model_catalog_ty
 test "deserializeEnvelope rejects invalid uuid" {
     const allocator = std.testing.allocator;
     const bad =
-        "{\"type\":\"ping\",\"session_id\":\"not-a-uuid\",\"message_id\":\"not-a-uuid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
-    try std.testing.expectError(error.InvalidUuid, deserializeEnvelope(bad, allocator));
+        "{\"type\":\"ping\",\"session_id\":\"not-a-session-id\",\"message_id\":\"not-a-uuid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
+    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad, allocator));
 }
 
 test "deserializeEnvelope rejects unknown payload type" {
     const allocator = std.testing.allocator;
-    const sid = "00000000-0000-0000-0000-000000000001";
+    const sid = "0123456789ABCDEabcdeF";
     const mid = "00000000-0000-0000-0000-000000000002";
     const bad = try std.fmt.allocPrint(
         allocator,
@@ -621,12 +625,12 @@ test "agent envelope roundtrip" {
     const allocator = std.testing.allocator;
 
     var env = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_message = .{
-            .session_id = agent_types.generateUuid(),
+            .session_id = agent_types.generateSessionId(),
             .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
             .options_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"temperature\":0.5}")),
         } },
@@ -647,7 +651,7 @@ test "agent envelope roundtrip for models_request" {
     const allocator = std.testing.allocator;
 
     var env = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
@@ -708,7 +712,7 @@ test "agent envelope roundtrip for models_response preserves shape" {
     };
 
     var env = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUuid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
@@ -751,7 +755,7 @@ test "agent envelope roundtrip for ack and nack" {
 
     const acked_id = agent_types.generateUuid();
     var ack_env = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
@@ -770,7 +774,7 @@ test "agent envelope roundtrip for ack and nack" {
 
     const rejected_id = agent_types.generateUuid();
     var nack_env = agent_types.Envelope{
-        .session_id = agent_types.generateUuid(),
+        .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUuid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),

@@ -18,6 +18,39 @@ pub const ModelsResponse = model_catalog_types.ModelsResponse;
 /// UUID type for stream/message identification
 pub const Uuid = [16]u8;
 
+/// NanoID-compatible session identifier for agent sessions.
+pub const SESSION_ID_LENGTH: usize = 21;
+pub const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+pub const SessionId = [SESSION_ID_LENGTH]u8;
+
+/// Generate a random NanoID-style session ID with an alphanumeric alphabet.
+pub fn generateSessionId() SessionId {
+    var session_id: SessionId = undefined;
+    for (&session_id) |*byte| {
+        const idx = std.crypto.random.intRangeLessThan(usize, 0, SESSION_ID_ALPHABET.len);
+        byte.* = SESSION_ID_ALPHABET[idx];
+    }
+    return session_id;
+}
+
+/// Convert session ID to string representation (21 alphanumeric chars).
+pub fn sessionIdToString(session_id: SessionId, allocator: std.mem.Allocator) ![]const u8 {
+    return allocator.dupe(u8, session_id[0..]);
+}
+
+/// Parse session ID from string.
+pub fn parseSessionId(str: []const u8) ?SessionId {
+    if (str.len != SESSION_ID_LENGTH) return null;
+    var session_id: SessionId = undefined;
+    for (str, 0..) |c, i| {
+        switch (c) {
+            '0'...'9', 'A'...'Z', 'a'...'z' => session_id[i] = c,
+            else => return null,
+        }
+    }
+    return session_id;
+}
+
 /// Generate a random UUID v4
 pub fn generateUuid() Uuid {
     var uuid: Uuid = undefined;
@@ -395,6 +428,46 @@ pub const ModelsRequest = struct {
 };
 
 // Tests
+
+test "generateSessionId produces valid NanoID session IDs" {
+    const session_id = generateSessionId();
+    const str = try sessionIdToString(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(str);
+
+    try std.testing.expectEqual(@as(usize, SESSION_ID_LENGTH), str.len);
+    for (str) |c| {
+        try std.testing.expect(std.ascii.isAlphanumeric(c));
+        try std.testing.expect(c != '_' and c != '-');
+    }
+
+    const session_id2 = generateSessionId();
+    try std.testing.expect(!std.mem.eql(u8, session_id[0..], session_id2[0..]));
+}
+
+test "sessionIdToString and parseSessionId roundtrip" {
+    const session_id = generateSessionId();
+    const str = try sessionIdToString(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(str);
+
+    const parsed = parseSessionId(str);
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualSlices(u8, session_id[0..], parsed.?[0..]);
+
+    const known = "0123456789ABCDEabcdeF";
+    const parsed_known = parseSessionId(known);
+    try std.testing.expect(parsed_known != null);
+    const known_str = try sessionIdToString(parsed_known.?, std.testing.allocator);
+    defer std.testing.allocator.free(known_str);
+    try std.testing.expectEqualStrings(known, known_str);
+}
+
+test "parseSessionId returns null for invalid strings" {
+    try std.testing.expect(parseSessionId("0123456789ABCDEabcde") == null);
+    try std.testing.expect(parseSessionId("0123456789ABCDEabcdeFG") == null);
+    try std.testing.expect(parseSessionId("0123456789ABCDEabcd-") == null);
+    try std.testing.expect(parseSessionId("0123456789ABCDEabcd_") == null);
+    try std.testing.expect(parseSessionId("") == null);
+}
 
 test "ModelsRequest getters return null for empty borrowed filters" {
     const req = ModelsRequest{};

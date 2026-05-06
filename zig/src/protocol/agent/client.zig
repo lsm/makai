@@ -9,14 +9,14 @@ pub const AgentProtocolClient = struct {
     sender: ?transport.AsyncSender = null,
     /// Deprecated compatibility field; sequence is now tracked per session.
     sequence: u64 = 0,
-    session_id: ?agent_types.Uuid = null,
+    session_id: ?agent_types.SessionId = null,
     last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     last_result_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     event_queue: std.ArrayList(OwnedSlice(u8)),
-    next_sequence_by_session: std.AutoHashMap(agent_types.Uuid, u64),
-    session_complete_flags: std.AutoHashMap(agent_types.Uuid, bool),
-    session_last_errors: std.AutoHashMap(agent_types.Uuid, OwnedSlice(u8)),
-    session_last_results: std.AutoHashMap(agent_types.Uuid, OwnedSlice(u8)),
+    next_sequence_by_session: std.AutoHashMap(agent_types.SessionId, u64),
+    session_complete_flags: std.AutoHashMap(agent_types.SessionId, bool),
+    session_last_errors: std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)),
+    session_last_results: std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)),
 
     const Self = @This();
 
@@ -24,10 +24,10 @@ pub const AgentProtocolClient = struct {
         return .{
             .allocator = allocator,
             .event_queue = std.ArrayList(OwnedSlice(u8)){},
-            .next_sequence_by_session = std.AutoHashMap(agent_types.Uuid, u64).init(allocator),
-            .session_complete_flags = std.AutoHashMap(agent_types.Uuid, bool).init(allocator),
-            .session_last_errors = std.AutoHashMap(agent_types.Uuid, OwnedSlice(u8)).init(allocator),
-            .session_last_results = std.AutoHashMap(agent_types.Uuid, OwnedSlice(u8)).init(allocator),
+            .next_sequence_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
+            .session_complete_flags = std.AutoHashMap(agent_types.SessionId, bool).init(allocator),
+            .session_last_errors = std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)).init(allocator),
+            .session_last_results = std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)).init(allocator),
         };
     }
 
@@ -58,7 +58,7 @@ pub const AgentProtocolClient = struct {
         self.sender = sender;
     }
 
-    fn nextSequence(self: *Self, session_id: agent_types.Uuid) !u64 {
+    fn nextSequence(self: *Self, session_id: agent_types.SessionId) !u64 {
         const next = if (self.next_sequence_by_session.get(session_id)) |cur| cur + 1 else 1;
         try self.next_sequence_by_session.put(session_id, next);
         self.sequence = next; // compatibility mirror
@@ -66,7 +66,7 @@ pub const AgentProtocolClient = struct {
     }
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Uuid {
-        const sid = agent_types.generateUuid();
+        const sid = agent_types.generateSessionId();
         const msg_id = agent_types.generateUuid();
         const seq = try self.nextSequence(sid);
 
@@ -87,7 +87,7 @@ pub const AgentProtocolClient = struct {
         return msg_id;
     }
 
-    pub fn sendAgentMessage(self: *Self, session_id: agent_types.Uuid, message_json: []const u8, options_json: ?[]const u8) !agent_types.Uuid {
+    pub fn sendAgentMessage(self: *Self, session_id: agent_types.SessionId, message_json: []const u8, options_json: ?[]const u8) !agent_types.Uuid {
         const msg_id = agent_types.generateUuid();
         const seq = try self.nextSequence(session_id);
 
@@ -108,7 +108,7 @@ pub const AgentProtocolClient = struct {
         return msg_id;
     }
 
-    pub fn sendAgentStop(self: *Self, session_id: agent_types.Uuid, reason: ?[]const u8) !agent_types.Uuid {
+    pub fn sendAgentStop(self: *Self, session_id: agent_types.SessionId, reason: ?[]const u8) !agent_types.Uuid {
         const msg_id = agent_types.generateUuid();
         const seq = try self.nextSequence(session_id);
 
@@ -134,7 +134,7 @@ pub const AgentProtocolClient = struct {
         try self.sender.?.flush();
     }
 
-    fn setSessionError(self: *Self, session_id: agent_types.Uuid, msg: []const u8) !void {
+    fn setSessionError(self: *Self, session_id: agent_types.SessionId, msg: []const u8) !void {
         if (self.session_last_errors.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
@@ -144,7 +144,7 @@ pub const AgentProtocolClient = struct {
         try self.session_complete_flags.put(session_id, true);
     }
 
-    fn setSessionResult(self: *Self, session_id: agent_types.Uuid, result_json: []const u8) !void {
+    fn setSessionResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
         if (self.session_last_results.getPtr(session_id)) |existing| {
             existing.deinit(self.allocator);
             existing.* = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, result_json));
@@ -154,7 +154,7 @@ pub const AgentProtocolClient = struct {
         try self.session_complete_flags.put(session_id, true);
     }
 
-    fn clearSessionTerminalState(self: *Self, session_id: agent_types.Uuid) void {
+    fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
             err.deinit(self.allocator);
@@ -209,11 +209,11 @@ pub const AgentProtocolClient = struct {
         return if (json.len == 0) null else json;
     }
 
-    pub fn isSessionComplete(self: *Self, session_id: agent_types.Uuid) bool {
+    pub fn isSessionComplete(self: *Self, session_id: agent_types.SessionId) bool {
         return self.session_complete_flags.get(session_id) orelse false;
     }
 
-    pub fn getLastErrorForSession(self: *Self, session_id: agent_types.Uuid) ?[]const u8 {
+    pub fn getLastErrorForSession(self: *Self, session_id: agent_types.SessionId) ?[]const u8 {
         if (self.session_last_errors.get(session_id)) |err| {
             const msg = err.slice();
             if (msg.len > 0) return msg;
@@ -221,7 +221,7 @@ pub const AgentProtocolClient = struct {
         return null;
     }
 
-    pub fn getLastResultJsonForSession(self: *Self, session_id: agent_types.Uuid) ?[]const u8 {
+    pub fn getLastResultJsonForSession(self: *Self, session_id: agent_types.SessionId) ?[]const u8 {
         if (self.session_last_results.get(session_id)) |result| {
             const json = result.slice();
             if (json.len > 0) return json;
@@ -229,7 +229,7 @@ pub const AgentProtocolClient = struct {
         return null;
     }
 
-    pub fn removeSessionState(self: *Self, session_id: agent_types.Uuid) void {
+    pub fn removeSessionState(self: *Self, session_id: agent_types.SessionId) void {
         _ = self.next_sequence_by_session.remove(session_id);
         _ = self.session_complete_flags.remove(session_id);
 
@@ -259,7 +259,7 @@ test "AgentProtocolClient processes events and results" {
     var client = AgentProtocolClient.init(allocator);
     defer client.deinit();
 
-    const sid = agent_types.generateUuid();
+    const sid = agent_types.generateSessionId();
 
     try client.processEnvelope(.{
         .session_id = sid,
@@ -302,7 +302,7 @@ test "AgentProtocolClient removeSessionState clears per-session and legacy curre
     var client = AgentProtocolClient.init(allocator);
     defer client.deinit();
 
-    const sid = agent_types.generateUuid();
+    const sid = agent_types.generateSessionId();
     client.session_id = sid;
     try client.session_complete_flags.put(sid, true);
     try client.session_last_errors.put(sid, OwnedSlice(u8).initOwned(try allocator.dupe(u8, "session err")));
@@ -353,8 +353,8 @@ test "AgentProtocolClient maintains per-session sequence continuity across stop 
     defer client.deinit();
     client.setSender(sender);
 
-    const sid1 = agent_types.generateUuid();
-    const sid2 = agent_types.generateUuid();
+    const sid1 = agent_types.generateSessionId();
+    const sid2 = agent_types.generateSessionId();
 
     _ = try client.sendAgentMessage(sid1, "{\"m\":1}", null); // sid1 seq 1
     _ = try client.sendAgentMessage(sid2, "{\"m\":2}", null); // sid2 seq 1
