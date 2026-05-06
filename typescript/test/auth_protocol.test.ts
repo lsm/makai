@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
@@ -10,6 +12,7 @@ import {
 } from "../src";
 
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
+const ULID_RE = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 
 function fixtureClientOptions(
   fixture: string,
@@ -94,6 +97,28 @@ test("client.auth.listProviders preserves frames for concurrent auth streams", a
     assert.equal(second[0]?.id, "anthropic");
   } finally {
     await client.close();
+  }
+});
+
+test("client.auth.listProviders emits ULID stream and message IDs on stdio", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-wire-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const client = await createMakaiAuthClient(
+    fixtureClientOptions("auth-protocol-providers-server.js", {
+      env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath },
+    }),
+  );
+  try {
+    await client.auth.listProviders();
+    const request = JSON.parse(fs.readFileSync(logPath, "utf8").trim()) as Record<string, unknown>;
+    assert.equal(request.type, "auth_providers_request");
+    assert.equal(typeof request.stream_id, "string");
+    assert.equal(typeof request.message_id, "string");
+    assert.match(request.stream_id as string, ULID_RE);
+    assert.match(request.message_id as string, ULID_RE);
+  } finally {
+    await client.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 

@@ -13,6 +13,7 @@ import {
 
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
 const fixtureScript = path.join(sourceFixturesDir, "models-server.js");
+const ULID_RE = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 
 function makeDescriptor(overrides: Partial<ModelDescriptor> = {}): ModelDescriptor {
   return {
@@ -208,6 +209,8 @@ test("models.list passes filter fields through on the wire", async () => {
     assert.equal(env.type, "models_request");
     assert.equal(env.version, 1);
     assert.equal(typeof env.stream_id, "string");
+    assert.equal(typeof env.message_id, "string");
+    assert.match(env.stream_id as string, ULID_RE);
     assert.equal(env.message_id, env.stream_id);
 
     const payload = env.payload as Record<string, unknown>;

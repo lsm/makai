@@ -17,6 +17,7 @@
 
 const fs = require("node:fs");
 const readline = require("node:readline");
+const { ulid } = require("ulid");
 
 function emit(frame) {
   process.stdout.write(JSON.stringify(frame) + "\n");
@@ -36,7 +37,7 @@ function buildResponse(env, type, payload) {
   return {
     type,
     stream_id: env.stream_id,
-    message_id: `${env.stream_id}-reply`,
+    message_id: ulid(),
     sequence: (env.sequence || 0) + 1,
     timestamp: Date.now(),
     version: 1,
@@ -49,7 +50,7 @@ function buildAck(env) {
   return {
     type: "ack",
     stream_id: env.stream_id,
-    message_id: `${env.stream_id}-ack`,
+    message_id: ulid(),
     sequence: (env.sequence || 0) + 1,
     timestamp: Date.now(),
     version: 1,
