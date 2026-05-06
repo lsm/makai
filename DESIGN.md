@@ -77,11 +77,16 @@ These runtimes are typically hosted on the **server side** of each protocol boun
 ### 4.1 Scope
 Sequence is **per session/stream**, never global across all sessions.
 
-- Provider protocol: sequence scope = `stream_id`
+ID formats are normative:
+- `session_id`: 21-character alphanumeric NanoID (`[A-Za-z0-9]{21}`).
+- `message_id`, `stream_id`, and `flow_id`: 26-character Crockford's Base32 ULID (`[0-9A-HJKMNP-TV-Z]{26}`), serialized uppercase and treated as opaque.
+
+Sequence scopes:
+- Provider protocol: sequence scope = ULID `stream_id`
 - Auth protocol:
-  - standalone query scope = envelope `stream_id` (for example `auth_providers_request`)
-  - interactive login scope = `flow_id` (`auth_login_start` -> `auth_event` -> `auth_login_result`)
-- Agent protocol: sequence scope = `session_id`
+  - standalone query scope = envelope ULID `stream_id` (for example `auth_providers_request`)
+  - interactive login scope = ULID `flow_id` (`auth_login_start` -> `auth_event` -> `auth_login_result`)
+- Agent protocol: sequence scope = NanoID `session_id`
 
 ### 4.2 Rules
 For each session/stream independently:
