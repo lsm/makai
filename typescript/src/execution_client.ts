@@ -27,6 +27,7 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
 
 type ExecutionOptions = {
   responseTimeoutMs?: number;
+  authRetryPolicy?: RunOptions["auth_retry_policy"];
 };
 
 export interface MakaiClient {
@@ -55,14 +56,16 @@ export function createMakaiAgentApi(
 
 class StdioProviderApi implements MakaiProviderApi {
   private readonly responseTimeoutMs: number;
+  private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+    this.authRetryPolicy = options.authRetryPolicy;
   }
 
   async complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
     const streamId = randomUUID();
-    this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request)));
+    this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
     while (true) {
       const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
       if (frame.type === "ack") continue;
@@ -77,7 +80,7 @@ class StdioProviderApi implements MakaiProviderApi {
 
   async *stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
     const streamId = randomUUID();
-    this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, true)));
+    this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: this.authRetryPolicy })));
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
@@ -103,31 +106,41 @@ class StdioProviderApi implements MakaiProviderApi {
 
 class StdioAgentApi implements MakaiAgentApi {
   private readonly responseTimeoutMs: number;
+  private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+    this.authRetryPolicy = options.authRetryPolicy;
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
+    const streamId = randomUUID();
+    this.transport.send(buildEnvelope("agent_run_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
     const events: AgentStreamEvent[] = [];
-    for await (const event of this.stream(request)) events.push(event);
-    const terminal = [...events].reverse().find((event: AgentStreamEvent) => event.type === "message_end" || event.type === "agent_end");
-    const messageEnd = [...events].reverse().find((event: AgentStreamEvent) => event.type === "message_end");
-    const text = events.filter((event) => event.type === "text_delta").map((event) => event.delta).join("");
-    const start = events.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
-    return {
-      message: { role: "assistant", content: text },
-      usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
-      provider_id: start?.provider_id ?? "",
-      api: start?.api ?? "",
-      model_id: start?.model_id ?? "",
-      stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
-    };
+    const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
+    while (true) {
+      const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
+      if (frame.type === "ack") continue;
+      if (frame.type === "nack") throw nackToStreamError(frame);
+      if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
+      if (frame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(frame, "result_json"));
+      if (frame.type === "result" || frame.type === "complete_response") return parseCompletionResponse(frame.payload ?? frame);
+
+      const normalized = normalizeAgentFrame(frame, toolBuffers);
+      if (normalized.length === 0) {
+        throw new MakaiStreamError(`unexpected frame type while awaiting agent result: ${String(frame.type)}`, { kind: "transport_error" });
+      }
+      for (const event of normalized) {
+        if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code });
+        events.push(event);
+        if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
+      }
+    }
   }
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
     const streamId = randomUUID();
-    this.transport.send(buildEnvelope("agent_run_request", streamId, buildExecutionPayload(request)));
+    this.transport.send(buildEnvelope("agent_run_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
@@ -166,21 +179,24 @@ function buildEnvelope(type: string, streamId: string, payload: Record<string, u
 
 function buildExecutionPayload(
   request: ProviderCompleteRequest | AgentRunRequest,
-  includePartial = false,
+  options: { suppressPartial?: boolean; authRetryPolicy?: RunOptions["auth_retry_policy"] } = {},
 ): Record<string, unknown> {
   if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
-    throw new MakaiStreamError("request requires opaque model_ref", { kind: "transport_error", code: "invalid_request" });
+    throw new TypeError("request requires opaque model_ref");
   }
   if (!Array.isArray(request.messages)) {
-    throw new MakaiStreamError("request requires messages array", { kind: "transport_error", code: "invalid_request" });
+    throw new TypeError("request requires messages array");
   }
   const payload: Record<string, unknown> = {
     model_ref: request.model_ref,
     messages: request.messages.map(serializeChatMessage),
   };
   if (request.tools) payload.tools = request.tools.map(serializeTool);
-  if (request.options) payload.options = serializeOptions(request.options);
-  if (includePartial) payload.include_partial = false;
+  const serializedOptions = serializeOptionsWithDefaults(request.options, options.authRetryPolicy);
+  if (Object.keys(serializedOptions).length > 0) payload.options = serializedOptions;
+  // V1 streams emit fully-buffered tool calls, so ask capable runtimes not to
+  // include heavy partial message snapshots on stream deltas.
+  if (options.suppressPartial) payload.include_partial = false;
   return payload;
 }
 
@@ -199,8 +215,13 @@ function serializeTool(tool: ToolDefinition): Record<string, unknown> {
   };
 }
 
-function serializeOptions(options: RunOptions): Record<string, unknown> {
+function serializeOptionsWithDefaults(
+  options: RunOptions | undefined,
+  authRetryPolicy: RunOptions["auth_retry_policy"] | undefined,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
+  if (authRetryPolicy !== undefined) out.auth_retry_policy = authRetryPolicy;
+  if (!options) return out;
   for (const key of ["temperature", "max_tokens", "reasoning_effort", "auth_retry_policy", "session_id", "metadata"] as const) {
     if (options[key] !== undefined) out[key] = options[key];
   }
@@ -219,7 +240,13 @@ function normalizeProviderFrame(
   frame: StdioFrame,
   toolBuffers: Map<number, { id?: string; name?: string; args: string }>,
 ): ProviderStreamEvent | undefined {
-  if (frame.type === "event") return normalizeProviderEvent(readPayloadOrFrame(frame), toolBuffers);
+  if (frame.type === "event") {
+    const payload = readPayloadOrFrame(frame);
+    return normalizeProviderEvent(
+      payload.event && isObject(payload.event) ? payload.event as Record<string, unknown> : payload,
+      toolBuffers,
+    );
+  }
   if (frame.type === "stream_error") return { type: "error", message: stringValue(readPayloadOrFrame(frame).message, "stream error") };
   if (frame.type === "message_start") return messageStartFrom(readPayloadOrFrame(frame));
   if (frame.type === "text_delta") return { type: "text_delta", delta: stringValue(readPayloadOrFrame(frame).delta) };
@@ -236,7 +263,7 @@ function normalizeProviderEvent(
   payload: Record<string, unknown>,
   toolBuffers: Map<number, { id?: string; name?: string; args: string }>,
 ): ProviderStreamEvent | undefined {
-  const type = stringValue(payload.type ?? payload.event_type);
+  const type = stringValue(payload.type === "event" ? payload.event_type : payload.type ?? payload.event_type);
   if (type === "start") return messageStartFrom(payload.message && isObject(payload.message) ? payload.message : payload);
   if (type === "text_delta") return { type: "text_delta", delta: stringValue(payload.delta) };
   if (type === "thinking_delta" || type === "reasoning_delta" || type === "reasoning") {
@@ -332,6 +359,80 @@ function parseCompletionResponse(raw: unknown): CompletionResponse {
   };
 }
 
+function parseAgentRunResponse(raw: unknown): AgentRunResponse {
+  const data = isObject(raw) ? raw : {};
+  if (data.message && isObject(data.message)) return parseCompletionResponse(data);
+
+  const messages = Array.isArray(data.messages) ? data.messages.filter(isObject) : [];
+  const assistantMessage = [...messages].reverse().find((message) => message.role === "assistant") ?? data;
+  const terminal = data.result && isObject(data.result) ? data.result : data;
+  return buildCompletionResponseFromMessage(assistantMessage, terminal);
+}
+
+function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunResponse {
+  const reversed = [...events].reverse();
+  const terminal = reversed.find((event) => event.type === "message_end" || event.type === "agent_end");
+  const messageEnd = reversed.find((event) => event.type === "message_end");
+  const start = events.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
+  const content = contentFromEvents(events);
+  return {
+    message: { role: "assistant", content },
+    usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
+    provider_id: start?.provider_id ?? "",
+    api: start?.api ?? "",
+    model_id: start?.model_id ?? "",
+    stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
+  };
+}
+
+function buildCompletionResponseFromMessage(
+  message: Record<string, unknown>,
+  terminal: Record<string, unknown>,
+): CompletionResponse {
+  return {
+    message: { role: "assistant", content: parseContent(message.content) },
+    usage: parseUsage(message.usage ?? terminal.usage ?? terminal),
+    provider_id: stringValue(message.provider_id ?? message.provider ?? terminal.provider_id ?? terminal.provider),
+    api: stringValue(message.api ?? terminal.api),
+    model_id: stringValue(message.model_id ?? message.model ?? terminal.model_id ?? terminal.model),
+    stop_reason: optionalString(message.stop_reason ?? terminal.stop_reason ?? terminal.reason),
+  };
+}
+
+function contentFromEvents(events: AgentStreamEvent[]): string | ContentPart[] {
+  const parts: ContentPart[] = [];
+  let text = "";
+  for (const event of events) {
+    if (event.type === "text_delta") {
+      text += event.delta;
+      continue;
+    }
+    if (event.type === "thinking_delta") {
+      if (text.length > 0) {
+        parts.push({ type: "text", text });
+        text = "";
+      }
+      parts.push({ type: "thinking", thinking: event.delta });
+      continue;
+    }
+    if (event.type === "tool_call") {
+      if (text.length > 0) {
+        parts.push({ type: "text", text });
+        text = "";
+      }
+      parts.push({
+        type: "tool_call",
+        tool_call_id: event.tool_call_id,
+        name: event.name,
+        arguments_json: event.arguments_json,
+      });
+    }
+  }
+  if (parts.length === 0) return text;
+  if (text.length > 0) parts.push({ type: "text", text });
+  return parts;
+}
+
 function parseContent(raw: unknown): string | ContentPart[] {
   if (typeof raw === "string") return raw;
   if (!Array.isArray(raw)) return "";
@@ -375,7 +476,7 @@ function parseBufferedToolCall(
 }
 
 function parseError(data: Record<string, unknown>): ProviderStreamEvent {
-  return { type: "error", message: stringValue(data.message ?? data.error_message ?? data.reason, "stream error"), code: optionalString(data.code ?? data.error_code ?? data.reason) };
+  return { type: "error", message: stringValue(data.message ?? data.error_message ?? data.reason, "stream error"), code: optionalString(data.code ?? data.error_code) };
 }
 
 function parseUsage(raw: unknown): UsageSummary | undefined {
@@ -437,7 +538,10 @@ export async function createMakaiClient(options: CreateMakaiClientOptions = {}):
   const { auth: authOptions, responseTimeoutMs, frameTimeoutMs, ...transportOptions } = options;
   const transport = await createMakaiStdioClient(transportOptions);
   await transport.connect();
-  const executionOptions = { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs };
+  const executionOptions = {
+    responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs,
+    authRetryPolicy: authOptions?.auth_retry_policy,
+  };
   return {
     auth: new MakaiAuthClient(transport, { handlers: authOptions?.handlers, frameTimeoutMs }),
     models: createMakaiModelsApi(transport, { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs }),

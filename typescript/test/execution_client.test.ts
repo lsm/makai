@@ -103,18 +103,38 @@ test("client.provider.stream yields ProviderStreamEvent sequence including messa
 });
 
 test("client.agent.run resolves with correct AgentRunResponse", async () => {
-  const harness = await setupHarness();
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-result-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: [
+        { type: "text", text: "Use this tool" },
+        { type: "tool_call", id: "call-1", name: "lookup", arguments_json: "{\"q\":\"makai\"}" },
+      ],
+      usage: { input: 7, output: 9 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "tool_use",
+    }],
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
   try {
     const agent = createMakaiAgentApi(harness.client);
     const result = await agent.run(request());
-    assert.equal(result.message.content, "agent");
+    assert.deepEqual(result.message.content, [
+      { type: "text", text: "Use this tool" },
+      { type: "tool_call", tool_call_id: "call-1", name: "lookup", arguments_json: "{\"q\":\"makai\"}" },
+    ]);
     assert.deepEqual(result.usage, { input: 7, output: 9 });
     assert.equal(result.provider_id, "anthropic");
     assert.equal(result.api, "anthropic-messages");
     assert.equal(result.model_id, "claude-sonnet-4-5");
-    assert.equal(result.stop_reason, "end_turn");
+    assert.equal(result.stop_reason, "tool_use");
   } finally {
     await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
@@ -140,6 +160,37 @@ test("client.agent.stream yields agent lifecycle events in order", async () => {
   }
 });
 
+test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-tool-buffer-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "event", event_type: "toolcall_start", content_index: 0, id: "call-1", name: "lookup" },
+    { type: "event", event_type: "toolcall_delta", content_index: 0, delta: "{\"q\":" },
+    { type: "event", event_type: "toolcall_delta", content_index: 0, delta: "\"makai\"}" },
+    { type: "event", event_type: "toolcall_end", content_index: 0 },
+    { type: "message_end", usage: { input: 3, output: 5 }, stop_reason: "tool_use" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_PROVIDER_EVENTS_PATH: eventsPath });
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const events = await collect(provider.stream(request()));
+    assert.deepEqual(events.map((event) => event.type), ["message_start", "tool_call", "message_end"]);
+    assert.deepEqual(events[1], {
+      type: "tool_call",
+      tool_call_id: "call-1",
+      name: "lookup",
+      arguments_json: "{\"q\":\"makai\"}",
+    });
+
+    const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
+    assert.equal(payload.include_partial, false);
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("stream error paths throw MakaiStreamError", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-exec-error-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
@@ -157,12 +208,33 @@ test("stream error paths throw MakaiStreamError", async () => {
   }
 });
 
+test("agent stream error paths throw MakaiStreamError", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([{ type: "agent_start" }, { type: "error", message: "agent boom", code: "provider_error" }]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      async () => collect(agent.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "agent boom" && err.code === "provider_error",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("createMakaiClient wires all namespaces correctly", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-client-wiring-test-"));
+  const logPath = path.join(tmpDir, "request.log");
   const handle = await createMakaiClient({
     command: process.execPath,
     args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath },
     handshakeTimeoutMs: 5000,
     responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
   });
   try {
     assert.equal(typeof handle.auth.listProviders, "function");
@@ -173,7 +245,11 @@ test("createMakaiClient wires all namespaces correctly", async () => {
     assert.equal(typeof handle.agent.stream, "function");
     assert.deepEqual(await handle.auth.listProviders(), []);
     assert.deepEqual((await handle.models.list()).models, []);
+    await collect(handle.provider.stream(request()));
+    const streamRequest = readLoggedRequests(logPath).find((entry) => entry.type === "stream_request");
+    assert.equal(((streamRequest?.payload as Record<string, unknown>).options as Record<string, unknown>).auth_retry_policy, "auto_once");
   } finally {
     await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

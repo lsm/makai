@@ -76,6 +76,8 @@ const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
 const providerResult = loadJson(process.env.MAKAI_TEST_PROVIDER_RESULT_PATH, defaultProviderResult);
 const providerEvents = loadJson(process.env.MAKAI_TEST_PROVIDER_EVENTS_PATH, defaultProviderEvents);
 const agentEvents = loadJson(process.env.MAKAI_TEST_AGENT_EVENTS_PATH, defaultAgentEvents);
+const agentResult = loadJson(process.env.MAKAI_TEST_AGENT_RESULT_PATH, null);
+const agentError = loadJson(process.env.MAKAI_TEST_AGENT_ERROR_PATH, null);
 const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, {
   models: [],
   fetched_at_ms: 1,
@@ -102,8 +104,14 @@ rl.on("line", (line) => {
       emit(frame(env, event.type, event, i + 3));
     }
   } else if (env.type === "agent_run_request") {
-    for (let i = 0; i < agentEvents.length; i += 1) {
-      emit(frame(env, "agent_event", { event_json: JSON.stringify(agentEvents[i]) }, i + 3));
+    if (agentError) {
+      emit(frame(env, "agent_error", agentError, 3));
+    } else if (agentResult) {
+      emit(frame(env, "agent_result", { result_json: JSON.stringify(agentResult) }, 3));
+    } else {
+      for (let i = 0; i < agentEvents.length; i += 1) {
+        emit(frame(env, "agent_event", { event_json: JSON.stringify(agentEvents[i]) }, i + 3));
+      }
     }
   } else if (env.type === "auth_providers_request") {
     emit(frame(env, "auth_providers_response", { providers: [] }, 3));
