@@ -108,7 +108,7 @@ export type ProviderStreamEvent =
   | { type: "thinking_delta"; delta: string }
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
   | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason }
-  | { type: "error"; message: string; code?: string };
+  | { type: "error"; message: string; code?: string; provider_id?: string };
 
 export type AgentStreamEvent =
   | ProviderStreamEvent
@@ -143,12 +143,14 @@ export type MakaiStreamErrorKind = "provider_error" | "transport_error" | "abort
 export class MakaiStreamError extends Error {
   public readonly kind: MakaiStreamErrorKind;
   public readonly code?: string;
+  public readonly provider_id?: string;
 
-  constructor(message: string, options: { kind?: MakaiStreamErrorKind; code?: string } = {}) {
+  constructor(message: string, options: { kind?: MakaiStreamErrorKind; code?: string; provider_id?: string } = {}) {
     super(message);
     this.name = "MakaiStreamError";
     this.kind = options.kind ?? "unknown";
     this.code = options.code;
+    this.provider_id = options.provider_id;
   }
 }
 

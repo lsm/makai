@@ -86,6 +86,15 @@ const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, {
   cache_max_age_ms: 300000,
 });
 
+const requestCounts = new Map();
+
+function shouldAuthReject(envType) {
+  if (!process.env.MAKAI_TEST_AUTH_REQUIRED_ONCE) return false;
+  const count = requestCounts.get(envType) || 0;
+  requestCounts.set(envType, count + 1);
+  return count === 0;
+}
+
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
 rl.on("line", (line) => {
@@ -99,13 +108,25 @@ rl.on("line", (line) => {
   emit(ack(env));
 
   if (env.type === "complete_request") {
+    if (shouldAuthReject("complete_request")) {
+      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      return;
+    }
     emit(frame(env, "result", providerResult, 3));
   } else if (env.type === "stream_request") {
+    if (shouldAuthReject("stream_request")) {
+      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      return;
+    }
     for (let i = 0; i < providerEvents.length; i += 1) {
       const event = providerEvents[i];
       emit(frame(env, event.type, event, i + 3));
     }
   } else if (env.type === "agent_start") {
+    if (shouldAuthReject("agent_start")) {
+      emit(frame(env, "nack", { error_code: "auth_required", reason: "login required", provider_id: "anthropic" }, 3));
+      return;
+    }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
     if (agentError) {
@@ -119,6 +140,16 @@ rl.on("line", (line) => {
     }
   } else if (env.type === "auth_providers_request") {
     emit(frame(env, "auth_providers_response", { providers: [] }, 3));
+  } else if (env.type === "auth_login_start") {
+    const providerId = env.payload?.provider_id || "";
+    const flowId = env.stream_id || env.payload?.flow_id || "";
+    if (process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT) {
+      emit(frame(env, "auth_event", { prompt: { flow_id: flowId, prompt_id: "test-prompt", provider_id: providerId, message: "Enter code", allow_empty: false } }, 3));
+      emit(frame(env, "auth_login_result", { status: "cancelled", flow_id: flowId, provider_id: providerId }, 4));
+    } else {
+      emit(frame(env, "auth_event", { success: { flow_id: flowId, provider_id: providerId } }, 3));
+      emit(frame(env, "auth_login_result", { status: "success", flow_id: flowId, provider_id: providerId }, 4));
+    }
   } else if (env.type === "models_request") {
     emit(frame(env, "models_response", modelsResponse, 3));
   }

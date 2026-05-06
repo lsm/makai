@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MakaiAuthClient, type MakaiAuthApi } from "./auth_protocol";
+import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
@@ -29,6 +29,8 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
 type ExecutionOptions = {
   responseTimeoutMs?: number;
   authRetryPolicy?: RunOptions["auth_retry_policy"];
+  auth?: MakaiAuthApi;
+  authHandlers?: AuthFlowHandlers;
 };
 
 export interface MakaiClient {
@@ -58,13 +60,24 @@ export function createMakaiAgentApi(
 class StdioProviderApi implements MakaiProviderApi {
   private readonly responseTimeoutMs: number;
   private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
+  private readonly auth?: MakaiAuthApi;
+  private readonly authHandlers?: AuthFlowHandlers;
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     this.authRetryPolicy = options.authRetryPolicy;
+    this.auth = options.auth;
+    this.authHandlers = options.authHandlers;
   }
 
   async complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
+    return withAuthRetry(
+      () => this.completeOnce(request),
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: this.authRetryPolicy },
+    );
+  }
+
+  private async completeOnce(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
     const streamId = randomUUID();
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: this.authRetryPolicy })));
     while (true) {
@@ -80,6 +93,34 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   async *stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
+    let attempt = this.streamAttempt(request);
+    let iterator = attempt[Symbol.asyncIterator]();
+    let yielded = false;
+
+    while (true) {
+      let result;
+      try {
+        result = await iterator.next();
+      } catch (error) {
+        if (!yielded && isRetryableAuthError(error) && this.authRetryPolicy === "auto_once" && this.auth && error.provider_id) {
+          try {
+            await this.auth.login(error.provider_id, this.authHandlers);
+          } catch {
+            throw error;
+          }
+          attempt = this.streamAttempt(request);
+          iterator = attempt[Symbol.asyncIterator]();
+          continue;
+        }
+        throw error;
+      }
+      if (result.done) return;
+      yielded = true;
+      yield result.value;
+    }
+  }
+
+  private async *streamAttempt(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
     const streamId = randomUUID();
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: this.authRetryPolicy })));
     let terminal = false;
@@ -93,7 +134,7 @@ class StdioProviderApi implements MakaiProviderApi {
         if (!event) continue;
         if (event.type === "error") {
           terminal = true;
-          throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code });
+          throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
         }
         if (event.type === "message_end") terminal = true;
         yield event;
@@ -108,13 +149,24 @@ class StdioProviderApi implements MakaiProviderApi {
 class StdioAgentApi implements MakaiAgentApi {
   private readonly responseTimeoutMs: number;
   private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
+  private readonly auth?: MakaiAuthApi;
+  private readonly authHandlers?: AuthFlowHandlers;
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     this.authRetryPolicy = options.authRetryPolicy;
+    this.auth = options.auth;
+    this.authHandlers = options.authHandlers;
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
+    return withAuthRetry(
+      () => this.runOnce(request),
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: this.authRetryPolicy },
+    );
+  }
+
+  private async runOnce(request: AgentRunRequest): Promise<AgentRunResponse> {
     const sessionId = agentSessionId(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
     const events: AgentStreamEvent[] = [];
@@ -140,7 +192,7 @@ class StdioAgentApi implements MakaiAgentApi {
         throw new MakaiStreamError(`unexpected frame type while awaiting agent result: ${String(frame.type)}`, { kind: "transport_error" });
       }
       for (const event of normalized) {
-        if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code });
+        if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
         events.push(event);
         if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
       }
@@ -148,6 +200,34 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
+    let attempt = this.streamAttempt(request);
+    let iterator = attempt[Symbol.asyncIterator]();
+    let yielded = false;
+
+    while (true) {
+      let result;
+      try {
+        result = await iterator.next();
+      } catch (error) {
+        if (!yielded && isRetryableAuthError(error) && this.authRetryPolicy === "auto_once" && this.auth && error.provider_id) {
+          try {
+            await this.auth.login(error.provider_id, this.authHandlers);
+          } catch {
+            throw error;
+          }
+          attempt = this.streamAttempt(request);
+          iterator = attempt[Symbol.asyncIterator]();
+          continue;
+        }
+        throw error;
+      }
+      if (result.done) return;
+      yielded = true;
+      yield result.value;
+    }
+  }
+
+  private async *streamAttempt(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
     const sessionId = agentSessionId(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request)));
     let terminal = false;
@@ -167,7 +247,7 @@ class StdioAgentApi implements MakaiAgentApi {
         for (const event of events) {
           if (event.type === "error") {
             terminal = true;
-            throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code });
+            throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
           }
           if (event.type === "agent_end") terminal = true;
           yield event;
@@ -385,7 +465,7 @@ function normalizeProviderFrame(
     );
   }
   if (frame.type === "stream_error") return parseError(readPayloadOrFrame(frame));
-  if (frame.type === "message_start") return messageStartFrom(readPayloadOrFrame(frame));
+  if (frame.type === "start" || frame.type === "message_start") return messageStartFrom(readPayloadOrFrame(frame));
   if (frame.type === "text_delta") return { type: "text_delta", delta: stringValue(readPayloadOrFrame(frame).delta) };
   if (frame.type === "thinking_delta" || frame.type === "reasoning_delta" || frame.type === "reasoning") {
     return { type: "thinking_delta", delta: stringValue(readPayloadOrFrame(frame).delta ?? readPayloadOrFrame(frame).reasoning) };
@@ -625,7 +705,12 @@ function parseBufferedToolCall(
 }
 
 function parseError(data: Record<string, unknown>): ProviderStreamEvent {
-  return { type: "error", message: stringValue(data.message ?? data.error_message ?? data.reason, "stream error"), code: optionalString(data.code ?? data.error_code) };
+  return {
+    type: "error",
+    message: stringValue(data.message ?? data.error_message ?? data.reason, "stream error"),
+    code: optionalString(data.code ?? data.error_code),
+    ...(optionalString(data.provider_id) ? { provider_id: optionalString(data.provider_id) } : {}),
+  };
 }
 
 function parseUsage(raw: unknown): UsageSummary | undefined {
@@ -641,12 +726,20 @@ function parseUsage(raw: unknown): UsageSummary | undefined {
 
 function nackToStreamError(frame: StdioFrame): MakaiStreamError {
   const payload = readPayloadOrFrame(frame);
-  return new MakaiStreamError(stringValue(payload.reason, "request rejected"), { kind: "provider_error", code: optionalString(payload.error_code) });
+  return new MakaiStreamError(stringValue(payload.reason, "request rejected"), {
+    kind: "provider_error",
+    code: optionalString(payload.error_code),
+    provider_id: optionalString(payload.provider_id),
+  });
 }
 
 function streamErrorFrameToError(frame: StdioFrame): MakaiStreamError {
   const payload = readPayloadOrFrame(frame);
-  return new MakaiStreamError(stringValue(payload.message ?? payload.reason, "stream error"), { kind: "provider_error", code: optionalString(payload.code ?? payload.error_code) });
+  return new MakaiStreamError(stringValue(payload.message ?? payload.reason, "stream error"), {
+    kind: "provider_error",
+    code: optionalString(payload.code ?? payload.error_code),
+    provider_id: optionalString(payload.provider_id),
+  });
 }
 
 function readPayloadOrFrame(frame: StdioFrame): Record<string, unknown> {
@@ -683,16 +776,46 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isRetryableAuthError(error: unknown): error is MakaiStreamError {
+  return error instanceof MakaiStreamError && error.code === "auth_required";
+}
+
+async function withAuthRetry<T>(
+  operation: () => Promise<T>,
+  options: {
+    auth?: MakaiAuthApi;
+    authHandlers?: AuthFlowHandlers;
+    authRetryPolicy?: RunOptions["auth_retry_policy"];
+  },
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isRetryableAuthError(error) && options.authRetryPolicy === "auto_once" && options.auth && error.provider_id) {
+      try {
+        await options.auth.login(error.provider_id, options.authHandlers);
+      } catch {
+        throw error;
+      }
+      return await operation();
+    }
+    throw error;
+  }
+}
+
 export async function createMakaiClient(options: CreateMakaiClientOptions = {}): Promise<MakaiClient> {
   const { auth: authOptions, responseTimeoutMs, frameTimeoutMs, ...transportOptions } = options;
   const transport = await createMakaiStdioClient(transportOptions);
   await transport.connect();
+  const authClient = new MakaiAuthClient(transport, { handlers: authOptions?.handlers, frameTimeoutMs });
   const executionOptions = {
     responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs,
     authRetryPolicy: authOptions?.auth_retry_policy,
+    auth: authClient,
+    authHandlers: authOptions?.handlers,
   };
   return {
-    auth: new MakaiAuthClient(transport, { handlers: authOptions?.handlers, frameTimeoutMs }),
+    auth: authClient,
     models: createMakaiModelsApi(transport, { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs }),
     agent: createMakaiAgentApi(transport, executionOptions),
     provider: createMakaiProviderApi(transport, executionOptions),
