@@ -1686,7 +1686,7 @@ test "deserializeEnvelope parses valid JSON" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -1714,7 +1714,7 @@ test "deserializeEnvelope rejects invalid in_reply_to ulid" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -1978,7 +1978,7 @@ test "deserializeEnvelope with version field defaults to 1" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -1999,7 +1999,7 @@ test "deserializeEnvelope with explicit version" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -2022,7 +2022,7 @@ test "deserializeEnvelope with stream_request frees all memory" {
     const json =
         \\{
         \\  "type": "stream_request",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -2079,7 +2079,7 @@ test "deserializeEnvelope with complete_request frees all memory" {
     const json =
         \\{
         \\  "type": "complete_request",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -2119,7 +2119,7 @@ test "deserializeEnvelope with complex context frees all memory" {
     const json =
         \\{
         \\  "type": "stream_request",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -2269,7 +2269,7 @@ test "deserializeEnvelope with pong payload" {
     const json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
@@ -2292,7 +2292,7 @@ test "deserializeEnvelope with goodbye payload" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
@@ -2315,7 +2315,7 @@ test "deserializeEnvelope with goodbye payload (no reason)" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
@@ -2336,12 +2336,12 @@ test "deserializeEnvelope with sync_request payload" {
     const json =
         \\{
         \\  "type": "sync_request",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 50,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "55QKQG28T5CY4TQKFF04HMASW9"
+        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -2361,12 +2361,12 @@ test "deserializeEnvelope with sync payload" {
     const json =
         \\{
         \\  "type": "sync",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 60,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "55QKQG28T5CY4TQKFF04HMASW9",
+        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9",
         \\    "partial": {
         \\      "stop_reason": "stop",
         \\      "model": "test-model",

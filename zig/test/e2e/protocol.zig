@@ -90,7 +90,7 @@ test "Envelope serialization roundtrip with ping" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -118,7 +118,7 @@ test "Envelope serialization roundtrip with pong" {
     const json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
@@ -145,13 +145,13 @@ test "Envelope roundtrip preserves ACK structure" {
     const json =
         \\{
         \\  "type": "ack",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "acknowledged_id": "55QKQG28T5CY4TQKFF04HMASW9"
+        \\    "acknowledged_id": "2NWQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -173,13 +173,13 @@ test "Envelope roundtrip preserves NACK structure" {
     const json =
         \\{
         \\  "type": "nack",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 3,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "rejected_id": "55QKQG28T5CY4TQKFF04HMASW9",
+        \\    "rejected_id": "2NWQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "Model not found",
         \\    "error_code": "model_not_found"
         \\  }
@@ -202,13 +202,13 @@ test "Envelope roundtrip preserves abort_request" {
     const json =
         \\{
         \\  "type": "abort_request",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 10,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "target_stream_id": "55QKQG28T5CY4TQKFF04HMASW9",
+        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "User cancelled"
         \\  }
         \\}
@@ -227,7 +227,7 @@ test "Envelope roundtrip preserves stream_error" {
     const json =
         \\{
         \\  "type": "stream_error",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 20,
         \\  "timestamp": 1708234567900,
@@ -252,7 +252,7 @@ test "Envelope roundtrip preserves goodbye" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
@@ -503,7 +503,7 @@ test "Event streaming through byte stream with envelope framing" {
     const ping_json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567900,
@@ -517,7 +517,7 @@ test "Event streaming through byte stream with envelope framing" {
     const pong_json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGH",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567901,
@@ -709,7 +709,7 @@ test "Envelope defaults version to 1 when not specified" {
     const json_without_version =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -729,7 +729,7 @@ test "Envelope preserves explicit version" {
     const json_with_version =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
@@ -754,14 +754,14 @@ test "Envelope preserves in_reply_to field" {
     const json =
         \\{
         \\  "type": "ack",
-        \\  "stream_id": "018D2PF2DBSQQZWQ5TK1V58CGG",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
         \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
-        \\  "in_reply_to": "55QKQG28T5CY4TQKFF04HMASW9",
+        \\  "in_reply_to": "2NWQQG28T5CY4TQKFF04HMASW9",
         \\  "payload": {
-        \\    "acknowledged_id": "55QKQG28T5CY4TQKFF04HMASW9"
+        \\    "acknowledged_id": "2NWQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;

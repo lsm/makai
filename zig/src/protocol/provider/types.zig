@@ -461,7 +461,7 @@ test "ulidToString and parseUlid roundtrip" {
     const known_ulid: Ulid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
     const known_str = try ulidToString(known_ulid, std.testing.allocator);
     defer std.testing.allocator.free(known_str);
-    try std.testing.expectEqualStrings("018D2PF2DBSQQZWQ5TK1V58CGG", known_str);
+    try std.testing.expectEqualStrings("014D2PF2DBSQQZXQ5TK1V58CGG", known_str);
 
     const parsed_known = parseUlid(known_str);
     try std.testing.expect(parsed_known != null);
@@ -471,7 +471,7 @@ test "ulidToString and parseUlid roundtrip" {
 test "parseUlid returns null for invalid strings" {
     // Wrong length
     try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CG") == null); // 25 chars
-    try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CGG0") == null); // 27 chars
+    try std.testing.expect(parseUlid("014D2PF2DBSQQZXQ5TK1V58CGG0") == null); // 27 chars
 
     // Invalid Crockford Base32 characters
     try std.testing.expect(parseUlid("018D2PF2DBSQQZWQ5TK1V58CGU") == null);
