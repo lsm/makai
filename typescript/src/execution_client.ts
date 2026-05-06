@@ -260,7 +260,18 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
 }
 
 function executionContext(request: ProviderCompleteRequest | AgentRunRequest): Record<string, unknown> {
-  const context: Record<string, unknown> = { messages: request.messages.map(serializeChatMessage) };
+  const messages: Record<string, unknown>[] = [];
+  const systemPrompts: string[] = [];
+  for (const message of request.messages) {
+    if (message.role === "system" || message.role === "developer") {
+      systemPrompts.push(contentAsPromptText(message.content));
+    } else {
+      messages.push(serializeChatMessage(message));
+    }
+  }
+
+  const context: Record<string, unknown> = { messages };
+  if (systemPrompts.length > 0) context.system_prompt = systemPrompts.join("\n\n");
   if (request.tools) context.tools = request.tools.map(serializeTool);
   return context;
 }
@@ -270,10 +281,33 @@ function agentSessionId(request: AgentRunRequest): string {
 }
 
 function serializeChatMessage(message: ChatMessage): Record<string, unknown> {
-  const out: Record<string, unknown> = { role: message.role, content: message.content };
+  const out: Record<string, unknown> = { role: message.role, content: serializeMessageContent(message) };
   if (message.name) out.name = message.name;
+  if (message.role === "tool") out.tool_name = message.name ?? "";
   if (message.tool_call_id) out.tool_call_id = message.tool_call_id;
   return out;
+}
+
+function serializeMessageContent(message: ChatMessage): string | ContentPart[] {
+  if (message.role === "tool") return contentAsUserParts(message.content);
+  return message.content;
+}
+
+function contentAsPromptText(content: ChatMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content.map(contentPartText).filter((part) => part.length > 0).join("\n");
+}
+
+function contentPartText(part: ContentPart): string {
+  if (part.type === "text") return part.text;
+  if (part.type === "thinking") return part.thinking;
+  if (part.type === "tool_result") return typeof part.content === "string" ? part.content : contentAsPromptText(part.content);
+  return "";
+}
+
+function contentAsUserParts(content: ChatMessage["content"]): ContentPart[] {
+  if (typeof content === "string") return [{ type: "text", text: content }];
+  return content;
 }
 
 function serializeTool(tool: ToolDefinition): Record<string, unknown> {

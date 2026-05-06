@@ -93,6 +93,38 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
   }
 });
 
+test("client.provider.complete maps system prompts and tool messages into provider context", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    await provider.complete({
+      model_ref: "opaque-model-ref-with:colon",
+      messages: [
+        { role: "system", content: "You are helpful." },
+        { role: "developer", content: [{ type: "text", text: "Prefer concise answers." }] },
+        { role: "user", content: "hello" },
+        { role: "tool", tool_call_id: "call-1", name: "lookup", content: "tool result" },
+      ],
+    });
+
+    const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
+    const context = payload.context as Record<string, unknown>;
+    assert.equal(context.system_prompt, "You are helpful.\n\nPrefer concise answers.");
+    assert.deepEqual(context.messages, [
+      { role: "user", content: "hello" },
+      {
+        role: "tool",
+        content: [{ type: "text", text: "tool result" }],
+        name: "lookup",
+        tool_name: "lookup",
+        tool_call_id: "call-1",
+      },
+    ]);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("client.provider.stream yields ProviderStreamEvent sequence including message_end", async () => {
   const harness = await setupHarness();
   try {
