@@ -603,6 +603,31 @@ test("auto_once falls back to original auth_required error when login fails", as
   }
 });
 
+test("client.agent.stream auto_once retries on auth_required nack and yields events", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-stream-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    const events = await collect(handle.agent.stream(request()));
+    assert.equal(events[0]?.type, "agent_start");
+    const logged = readLoggedRequests(logPath);
+    const agentStarts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(agentStarts.length, 2);
+    const loginStarts = logged.filter((entry) => entry.type === "auth_login_start");
+    assert.equal(loginStarts.length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("per-request manual auth_retry_policy overrides client auto_once", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-override-manual-test-"));
   const logPath = path.join(tmpDir, "request.log");
