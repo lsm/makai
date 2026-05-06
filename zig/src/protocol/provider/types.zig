@@ -423,6 +423,26 @@ test "ModelsRequest deinit frees owned filter strings" {
     req.deinit(allocator);
 }
 
+test "generateSessionId produces 21-character alphanumeric NanoID" {
+    const session_id = generateSessionId();
+    const str = try sessionIdToString(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(str);
+
+    try std.testing.expectEqual(@as(usize, SESSION_ID_LENGTH), str.len);
+    for (str) |c| {
+        switch (c) {
+            '0'...'9', 'A'...'Z', 'a'...'z' => {},
+            else => return error.InvalidSessionIdCharacter,
+        }
+        try std.testing.expect(c != '_');
+        try std.testing.expect(c != '-');
+    }
+
+    const parsed = parseSessionId(str);
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualSlices(u8, &session_id, &parsed.?);
+}
+
 test "generateUlid produces valid ULID" {
     const ulid = generateUlid();
     const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));

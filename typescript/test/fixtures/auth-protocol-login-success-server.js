@@ -1,10 +1,17 @@
 // Fixture stdio server that emulates a successful auth login flow.
+const fs = require("node:fs");
 const readline = require("node:readline");
 const { ulid } = require("ulid");
 
 process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + "\n");
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
+
+function appendLog(path, line) {
+  if (!path) return;
+  fs.appendFileSync(path, line + "\n");
+}
 
 const outboundSequences = new Map();
 function nextSeq(streamId) {
@@ -41,6 +48,7 @@ rl.on("line", (line) => {
   }
 
   if (envelope.type === "auth_login_start") {
+    appendLog(requestLog, JSON.stringify(envelope));
     const flowId = envelope.stream_id;
     const providerId = envelope.payload?.provider_id ?? "fixture";
     flowState = { flowId, providerId };

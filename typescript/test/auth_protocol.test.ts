@@ -103,15 +103,54 @@ test("client.auth.listProviders preserves frames for concurrent auth streams", a
 test("client.auth.listProviders emits ULID stream and message IDs on stdio", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-wire-test-"));
   const logPath = path.join(tmpDir, "request.log");
+  const frameLogPath = path.join(tmpDir, "frames.log");
   const client = await createMakaiAuthClient(
     fixtureClientOptions("auth-protocol-providers-server.js", {
-      env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath },
+      env: {
+        ...process.env,
+        MAKAI_TEST_REQUEST_LOG: logPath,
+        MAKAI_TEST_FRAME_LOG: frameLogPath,
+      },
     }),
   );
   try {
     await client.auth.listProviders();
     const request = JSON.parse(fs.readFileSync(logPath, "utf8").trim()) as Record<string, unknown>;
     assert.equal(request.type, "auth_providers_request");
+    assert.equal(typeof request.stream_id, "string");
+    assert.equal(typeof request.message_id, "string");
+    assert.match(request.stream_id as string, ULID_RE);
+    assert.match(request.message_id as string, ULID_RE);
+
+    const frames = fs.readFileSync(frameLogPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    assert.equal(frames.length, 2);
+    for (const frame of frames) {
+      assert.equal(frame.stream_id, request.stream_id);
+      assert.equal(frame.in_reply_to, request.message_id);
+      assert.equal(typeof frame.message_id, "string");
+      assert.match(frame.message_id as string, ULID_RE);
+    }
+  } finally {
+    await client.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.auth.login emits ULID flow IDs on stdio", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-login-wire-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const client = await createMakaiAuthClient(
+    fixtureClientOptions("auth-protocol-login-success-server.js", {
+      env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath },
+    }),
+  );
+  try {
+    await client.auth.login("test-fixture", { onPrompt: () => "letmein" });
+    const request = JSON.parse(fs.readFileSync(logPath, "utf8").trim()) as Record<string, unknown>;
+    assert.equal(request.type, "auth_login_start");
     assert.equal(typeof request.stream_id, "string");
     assert.equal(typeof request.message_id, "string");
     assert.match(request.stream_id as string, ULID_RE);

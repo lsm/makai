@@ -8,6 +8,7 @@ process.stdout.write(JSON.stringify({ type: "ready", protocol_version: "1" }) + 
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
+const frameLog = process.env.MAKAI_TEST_FRAME_LOG || "";
 
 function appendLog(path, line) {
   if (!path) return;
@@ -22,6 +23,7 @@ function nextSeq(streamId) {
 }
 
 function send(envelope) {
+  appendLog(frameLog, JSON.stringify(envelope));
   process.stdout.write(JSON.stringify(envelope) + "\n");
 }
 
