@@ -90,8 +90,8 @@ test "Envelope serialization roundtrip with ping" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
@@ -118,8 +118,8 @@ test "Envelope serialization roundtrip with pong" {
     const json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
@@ -145,13 +145,13 @@ test "Envelope roundtrip preserves ACK structure" {
     const json =
         \\{
         \\  "type": "ack",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "acknowledged_id": "abcdef01-2345-6789-abcd-ef0123456789"
+        \\    "acknowledged_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -173,13 +173,13 @@ test "Envelope roundtrip preserves NACK structure" {
     const json =
         \\{
         \\  "type": "nack",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 3,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "rejected_id": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\    "rejected_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "Model not found",
         \\    "error_code": "model_not_found"
         \\  }
@@ -202,13 +202,13 @@ test "Envelope roundtrip preserves abort_request" {
     const json =
         \\{
         \\  "type": "abort_request",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 10,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "target_stream_id": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "User cancelled"
         \\  }
         \\}
@@ -227,8 +227,8 @@ test "Envelope roundtrip preserves stream_error" {
     const json =
         \\{
         \\  "type": "stream_error",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 20,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
@@ -252,8 +252,8 @@ test "Envelope roundtrip preserves goodbye" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
@@ -503,8 +503,8 @@ test "Event streaming through byte stream with envelope framing" {
     const ping_json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
@@ -517,8 +517,8 @@ test "Event streaming through byte stream with envelope framing" {
     const pong_json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543211",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGH",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567901,
         \\  "version": 1,
@@ -709,8 +709,8 @@ test "Envelope defaults version to 1 when not specified" {
     const json_without_version =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "payload": {}
@@ -729,8 +729,8 @@ test "Envelope preserves explicit version" {
     const json_with_version =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 2,
@@ -754,14 +754,14 @@ test "Envelope preserves in_reply_to field" {
     const json =
         \\{
         \\  "type": "ack",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
-        \\  "in_reply_to": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\  "in_reply_to": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\  "payload": {
-        \\    "acknowledged_id": "abcdef01-2345-6789-abcd-ef0123456789"
+        \\    "acknowledged_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;

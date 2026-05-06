@@ -2,11 +2,11 @@ const std = @import("std");
 const provider_types = @import("protocol_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Re-export Uuid from provider types for convenience
-pub const Uuid = provider_types.Uuid;
-pub const generateUuid = provider_types.generateUuid;
-pub const uuidToString = provider_types.uuidToString;
-pub const parseUuid = provider_types.parseUuid;
+/// Re-export Ulid from provider types for convenience
+pub const Ulid = provider_types.Ulid;
+pub const generateUlid = provider_types.generateUlid;
+pub const ulidToString = provider_types.ulidToString;
+pub const parseUlid = provider_types.parseUlid;
 
 // ============================================================================
 // Tool Protocol Types
@@ -104,7 +104,7 @@ pub const ToolListResponse = struct {
 /// Request to execute a tool
 pub const ToolExecuteRequest = struct {
     /// Execution ID for correlation
-    execution_id: Uuid,
+    execution_id: Ulid,
     /// Tool call ID (from LLM)
     tool_call_id: []const u8,
     /// Tool name
@@ -124,7 +124,7 @@ pub const ToolExecuteRequest = struct {
 
 /// Streaming update during tool execution
 pub const ToolStreamUpdate = struct {
-    execution_id: Uuid,
+    execution_id: Ulid,
     tool_call_id: []const u8,
     /// Partial result as JSON
     partial_result_json: []const u8,
@@ -141,7 +141,7 @@ pub const ToolStreamUpdate = struct {
 
 /// Final result from tool execution
 pub const ToolExecuteResult = struct {
-    execution_id: Uuid,
+    execution_id: Ulid,
     tool_call_id: []const u8,
     /// Result content as JSON array of UserContentPart
     result_json: []const u8,
@@ -167,7 +167,7 @@ pub const ToolExecuteResult = struct {
 
 /// Request to cancel a tool execution
 pub const ToolCancelRequest = struct {
-    execution_id: Uuid,
+    execution_id: Ulid,
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
     pub fn getReason(self: *const ToolCancelRequest) ?[]const u8 {
@@ -189,7 +189,7 @@ pub const ToolExecutionStatus = enum {
 
 /// Tool execution info
 pub const ToolExecutionInfo = struct {
-    execution_id: Uuid,
+    execution_id: Ulid,
     tool_name: []const u8,
     status: ToolExecutionStatus,
     started_at: i64,
@@ -226,9 +226,9 @@ pub const Payload = union(enum) {
     tool_stream: ToolStreamUpdate,
     tool_result: ToolExecuteResult,
     tool_cancel: ToolCancelRequest,
-    tool_cancelled: struct { execution_id: Uuid },
-    tool_error: struct { execution_id: Uuid, code: ToolErrorCode, message: []const u8 },
-    tool_status: struct { execution_id: Uuid },
+    tool_cancelled: struct { execution_id: Ulid },
+    tool_error: struct { execution_id: Ulid, code: ToolErrorCode, message: []const u8 },
+    tool_status: struct { execution_id: Ulid },
     tool_status_response: ToolExecutionInfo,
 
     // Keepalive
@@ -301,13 +301,13 @@ pub const Envelope = struct {
     /// Protocol version
     version: u8 = 1,
     /// Tool server identifier
-    server_id: Uuid,
+    server_id: Ulid,
     /// Message ID (unique per message)
-    message_id: Uuid,
+    message_id: Ulid,
     /// Sequence number within connection
     sequence: u64,
     /// For request/response correlation
-    in_reply_to: ?Uuid = null,
+    in_reply_to: ?Ulid = null,
     /// Unix timestamp in milliseconds
     timestamp: i64,
     /// The actual payload

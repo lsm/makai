@@ -3,11 +3,11 @@ const provider_types = @import("protocol_types");
 const model_catalog_types = @import("model_catalog_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-/// Re-export Uuid from provider types for convenience
-pub const Uuid = provider_types.Uuid;
-pub const generateUuid = provider_types.generateUuid;
-pub const uuidToString = provider_types.uuidToString;
-pub const parseUuid = provider_types.parseUuid;
+/// Re-export Ulid from provider types for convenience
+pub const Ulid = provider_types.Ulid;
+pub const generateUlid = provider_types.generateUlid;
+pub const ulidToString = provider_types.ulidToString;
+pub const parseUlid = provider_types.parseUlid;
 pub const SessionId = provider_types.SessionId;
 pub const generateSessionId = provider_types.generateSessionId;
 pub const sessionIdToString = provider_types.sessionIdToString;
@@ -321,11 +321,11 @@ pub const Envelope = struct {
     /// Session identifier (stable for session lifecycle)
     session_id: SessionId,
     /// Message ID (unique per message)
-    message_id: Uuid,
+    message_id: Ulid,
     /// Sequence number within session (starts at 1)
     sequence: u64,
     /// For request/response correlation
-    in_reply_to: ?Uuid = null,
+    in_reply_to: ?Ulid = null,
     /// Unix timestamp in milliseconds
     timestamp: i64,
     /// The actual payload
@@ -413,7 +413,7 @@ test "Payload deinit for nack frees reason" {
 
     var payload = Payload{
         .nack = .{
-            .rejected_id = generateUuid(),
+            .rejected_id = generateUlid(),
             .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "not implemented")),
             .error_code = .not_implemented,
         },

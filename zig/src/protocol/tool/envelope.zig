@@ -13,11 +13,11 @@ pub fn serializeEnvelope(env: tool_types.Envelope, allocator: std.mem.Allocator)
     try w.beginObject();
     try w.writeStringField("type", @tagName(env.payload));
 
-    const server_id_str = try tool_types.uuidToString(env.server_id, allocator);
+    const server_id_str = try tool_types.ulidToString(env.server_id, allocator);
     defer allocator.free(server_id_str);
     try w.writeStringField("server_id", server_id_str);
 
-    const message_id_str = try tool_types.uuidToString(env.message_id, allocator);
+    const message_id_str = try tool_types.ulidToString(env.message_id, allocator);
     defer allocator.free(message_id_str);
     try w.writeStringField("message_id", message_id_str);
 
@@ -26,7 +26,7 @@ pub fn serializeEnvelope(env: tool_types.Envelope, allocator: std.mem.Allocator)
     try w.writeIntField("version", env.version);
 
     if (env.in_reply_to) |reply_to| {
-        const reply_to_str = try tool_types.uuidToString(reply_to, allocator);
+        const reply_to_str = try tool_types.ulidToString(reply_to, allocator);
         defer allocator.free(reply_to_str);
         try w.writeStringField("in_reply_to", reply_to_str);
     }
@@ -68,7 +68,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             try w.endArray();
         },
         .tool_execute => |req| {
-            const execution_id_str = try tool_types.uuidToString(req.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(req.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             try w.writeStringField("tool_call_id", req.tool_call_id);
@@ -78,7 +78,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             if (req.getStreamCallbackUrl()) |url| try w.writeStringField("stream_callback_url", url);
         },
         .tool_stream => |update| {
-            const execution_id_str = try tool_types.uuidToString(update.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(update.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             try w.writeStringField("tool_call_id", update.tool_call_id);
@@ -87,7 +87,7 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             if (update.getStatus()) |status| try w.writeStringField("status", status);
         },
         .tool_result => |res| {
-            const execution_id_str = try tool_types.uuidToString(res.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(res.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             try w.writeStringField("tool_call_id", res.tool_call_id);
@@ -98,30 +98,30 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             try w.writeIntField("duration_ms", res.duration_ms);
         },
         .tool_cancel => |req| {
-            const execution_id_str = try tool_types.uuidToString(req.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(req.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             if (req.getReason()) |reason| try w.writeStringField("reason", reason);
         },
         .tool_cancelled => |cancelled| {
-            const execution_id_str = try tool_types.uuidToString(cancelled.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(cancelled.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
         },
         .tool_error => |err| {
-            const execution_id_str = try tool_types.uuidToString(err.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(err.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             try w.writeStringField("code", @tagName(err.code));
             try w.writeStringField("message", err.message);
         },
         .tool_status => |req| {
-            const execution_id_str = try tool_types.uuidToString(req.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(req.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
         },
         .tool_status_response => |info| {
-            const execution_id_str = try tool_types.uuidToString(info.execution_id, allocator);
+            const execution_id_str = try tool_types.ulidToString(info.execution_id, allocator);
             defer allocator.free(execution_id_str);
             try w.writeStringField("execution_id", execution_id_str);
             try w.writeStringField("tool_name", info.tool_name);
@@ -165,14 +165,14 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
 
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
-    const server_id = try parseUuidRequired(root.get("server_id").?.string);
-    const message_id = try parseUuidRequired(root.get("message_id").?.string);
+    const server_id = try parseUlidRequired(root.get("server_id").?.string);
+    const message_id = try parseUlidRequired(root.get("message_id").?.string);
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
     const version = @as(u8, @intCast(root.get("version").?.integer));
 
-    var in_reply_to: ?tool_types.Uuid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUuidRequired(v.string);
+    var in_reply_to: ?tool_types.Ulid = null;
+    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
 
     const payload_obj = root.get("payload").?.object;
     const payload = try deserializePayload(type_str, payload_obj, allocator);
@@ -188,8 +188,8 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
     };
 }
 
-fn parseUuidRequired(str: []const u8) !tool_types.Uuid {
-    return tool_types.parseUuid(str) orelse error.InvalidUuid;
+fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
+    return tool_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
@@ -235,7 +235,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         try validateJson(args_json, allocator);
 
         var req = tool_types.ToolExecuteRequest{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
             .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
             .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
             .args_json = args_json,
@@ -246,7 +246,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "tool_stream")) {
         var update = tool_types.ToolStreamUpdate{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
             .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
             .partial_result_json = try allocator.dupe(u8, payload.get("partial_result_json").?.string),
         };
@@ -256,7 +256,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "tool_result")) {
         var result = tool_types.ToolExecuteResult{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
             .tool_call_id = try allocator.dupe(u8, payload.get("tool_call_id").?.string),
             .result_json = try allocator.dupe(u8, payload.get("result_json").?.string),
             .is_error = if (payload.get("is_error")) |v| v.bool else false,
@@ -268,31 +268,31 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
         var req = tool_types.ToolCancelRequest{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
         };
         if (payload.get("reason")) |v| req.reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .tool_cancel = req };
     }
     if (std.mem.eql(u8, type_str, "tool_cancelled")) {
         return .{ .tool_cancelled = .{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_error")) {
         return .{ .tool_error = .{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
             .code = std.meta.stringToEnum(tool_types.ToolErrorCode, payload.get("code").?.string) orelse return error.InvalidPayloadType,
             .message = try allocator.dupe(u8, payload.get("message").?.string),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status")) {
         return .{ .tool_status = .{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
         } };
     }
     if (std.mem.eql(u8, type_str, "tool_status_response")) {
         return .{ .tool_status_response = .{
-            .execution_id = try parseUuidRequired(payload.get("execution_id").?.string),
+            .execution_id = try parseUlidRequired(payload.get("execution_id").?.string),
             .tool_name = try allocator.dupe(u8, payload.get("tool_name").?.string),
             .status = std.meta.stringToEnum(tool_types.ToolExecutionStatus, payload.get("status").?.string) orelse return error.InvalidPayloadType,
             .started_at = payload.get("started_at").?.integer,
@@ -346,12 +346,12 @@ test "tool envelope roundtrip execute request" {
     const allocator = std.testing.allocator;
 
     var env = tool_types.Envelope{
-        .server_id = tool_types.generateUuid(),
-        .message_id = tool_types.generateUuid(),
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .tool_execute = .{
-            .execution_id = tool_types.generateUuid(),
+            .execution_id = tool_types.generateUlid(),
             .tool_call_id = try allocator.dupe(u8, "call_123"),
             .tool_name = try allocator.dupe(u8, "search"),
             .args_json = try allocator.dupe(u8, "{\"query\":\"zig\"}"),
@@ -390,8 +390,8 @@ test "tool envelope roundtrip list response" {
     };
 
     var env = tool_types.Envelope{
-        .server_id = tool_types.generateUuid(),
-        .message_id = tool_types.generateUuid(),
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .tool_list_response = .{ .tools = tools } },
@@ -412,7 +412,7 @@ test "tool envelope roundtrip list response" {
 test "tool envelope negative unknown tool error" {
     const allocator = std.testing.allocator;
     const json =
-        "{\"type\":\"tool_error\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"message_id\":\"00000000-0000-0000-0000-000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000-0000-0000-0000-000000000003\",\"code\":\"tool_not_found\",\"message\":\"unknown tool\"}}";
+        "{\"type\":\"tool_error\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"code\":\"tool_not_found\",\"message\":\"unknown tool\"}}";
 
     var env = try deserializeEnvelope(json, allocator);
     defer env.deinit(allocator);
@@ -424,7 +424,7 @@ test "tool envelope negative unknown tool error" {
 test "tool envelope negative malformed args" {
     const allocator = std.testing.allocator;
     const json =
-        "{\"type\":\"tool_execute\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"message_id\":\"00000000-0000-0000-0000-000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000-0000-0000-0000-000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{bad json\"}}";
+        "{\"type\":\"tool_execute\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"tool_name\":\"grep\",\"args_json\":\"{bad json\"}}";
 
     try std.testing.expectError(error.InvalidArgumentsJson, deserializeEnvelope(json, allocator));
 }
@@ -432,7 +432,7 @@ test "tool envelope negative malformed args" {
 test "tool envelope negative timeout error" {
     const allocator = std.testing.allocator;
     const json =
-        "{\"type\":\"tool_error\",\"server_id\":\"00000000-0000-0000-0000-000000000001\",\"message_id\":\"00000000-0000-0000-0000-000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000-0000-0000-0000-000000000003\",\"code\":\"tool_timeout\",\"message\":\"timed out\"}}";
+        "{\"type\":\"tool_error\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"code\":\"tool_timeout\",\"message\":\"timed out\"}}";
 
     var env = try deserializeEnvelope(json, allocator);
     defer env.deinit(allocator);

@@ -16,8 +16,8 @@ const OwnedSlice = owned_slice_mod.OwnedSlice;
 pub const ProtocolClient = struct {
     // Declarations must come before fields
     pub const PendingRequest = struct {
-        message_id: protocol_types.Uuid,
-        stream_id: protocol_types.Uuid = [_]u8{0} ** 16,
+        message_id: protocol_types.Ulid,
+        stream_id: protocol_types.Ulid = [_]u8{0} ** 16,
         sent_at: i64,
         timeout_ms: u64,
     };
@@ -28,8 +28,8 @@ pub const ProtocolClient = struct {
     };
 
     pub const StreamRequestRef = struct {
-        stream_id: protocol_types.Uuid,
-        message_id: protocol_types.Uuid,
+        stream_id: protocol_types.Ulid,
+        message_id: protocol_types.Ulid,
     };
 
     const Self = @This();
@@ -44,28 +44,28 @@ pub const ProtocolClient = struct {
     reconstructor: partial_reconstructor.PartialReconstructor,
 
     /// Pending requests awaiting ACK/NACK
-    pending_requests: std.AutoHashMap(protocol_types.Uuid, PendingRequest),
+    pending_requests: std.AutoHashMap(protocol_types.Ulid, PendingRequest),
 
     /// Per-stream outgoing sequence counters
-    stream_sequences: std.AutoHashMap(protocol_types.Uuid, u64),
+    stream_sequences: std.AutoHashMap(protocol_types.Ulid, u64),
 
     /// Per-stream reconstructors
-    reconstructors: std.AutoHashMap(protocol_types.Uuid, partial_reconstructor.PartialReconstructor),
+    reconstructors: std.AutoHashMap(protocol_types.Ulid, partial_reconstructor.PartialReconstructor),
 
     /// Per-stream final results
-    stream_results: std.AutoHashMap(protocol_types.Uuid, ai_types.AssistantMessage),
+    stream_results: std.AutoHashMap(protocol_types.Ulid, ai_types.AssistantMessage),
 
     /// Per-stream errors
-    stream_errors: std.AutoHashMap(protocol_types.Uuid, OwnedSlice(u8)),
+    stream_errors: std.AutoHashMap(protocol_types.Ulid, OwnedSlice(u8)),
 
     /// Per-stream completion flags
-    stream_complete_flags: std.AutoHashMap(protocol_types.Uuid, bool),
+    stream_complete_flags: std.AutoHashMap(protocol_types.Ulid, bool),
 
     /// Per-stream event streams (owned events)
-    stream_event_streams: std.AutoHashMap(protocol_types.Uuid, *event_stream.AssistantMessageEventStream),
+    stream_event_streams: std.AutoHashMap(protocol_types.Ulid, *event_stream.AssistantMessageEventStream),
 
     /// Current stream ID (compatibility for legacy single-stream callers)
-    current_stream_id: ?protocol_types.Uuid = null,
+    current_stream_id: ?protocol_types.Ulid = null,
 
     /// Event stream for consuming events
     event_stream: *event_stream.AssistantMessageEventStream,
@@ -96,13 +96,13 @@ pub const ProtocolClient = struct {
         return .{
             .allocator = allocator,
             .reconstructor = partial_reconstructor.PartialReconstructor.init(allocator),
-            .pending_requests = std.AutoHashMap(protocol_types.Uuid, PendingRequest).init(allocator),
-            .stream_sequences = std.AutoHashMap(protocol_types.Uuid, u64).init(allocator),
-            .reconstructors = std.AutoHashMap(protocol_types.Uuid, partial_reconstructor.PartialReconstructor).init(allocator),
-            .stream_results = std.AutoHashMap(protocol_types.Uuid, ai_types.AssistantMessage).init(allocator),
-            .stream_errors = std.AutoHashMap(protocol_types.Uuid, OwnedSlice(u8)).init(allocator),
-            .stream_complete_flags = std.AutoHashMap(protocol_types.Uuid, bool).init(allocator),
-            .stream_event_streams = std.AutoHashMap(protocol_types.Uuid, *event_stream.AssistantMessageEventStream).init(allocator),
+            .pending_requests = std.AutoHashMap(protocol_types.Ulid, PendingRequest).init(allocator),
+            .stream_sequences = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
+            .reconstructors = std.AutoHashMap(protocol_types.Ulid, partial_reconstructor.PartialReconstructor).init(allocator),
+            .stream_results = std.AutoHashMap(protocol_types.Ulid, ai_types.AssistantMessage).init(allocator),
+            .stream_errors = std.AutoHashMap(protocol_types.Ulid, OwnedSlice(u8)).init(allocator),
+            .stream_complete_flags = std.AutoHashMap(protocol_types.Ulid, bool).init(allocator),
+            .stream_event_streams = std.AutoHashMap(protocol_types.Ulid, *event_stream.AssistantMessageEventStream).init(allocator),
             .event_stream = es,
             .options = options,
         };
@@ -177,20 +177,20 @@ pub const ProtocolClient = struct {
         self.last_error = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, msg));
     }
 
-    fn nextSequenceForStream(self: *Self, stream_id: protocol_types.Uuid) !u64 {
+    fn nextSequenceForStream(self: *Self, stream_id: protocol_types.Ulid) !u64 {
         const next = if (self.stream_sequences.get(stream_id)) |cur| cur + 1 else 1;
         try self.stream_sequences.put(stream_id, next);
         self.sequence = next; // compatibility mirror
         return next;
     }
 
-    fn ensureReconstructor(self: *Self, stream_id: protocol_types.Uuid) !*partial_reconstructor.PartialReconstructor {
+    fn ensureReconstructor(self: *Self, stream_id: protocol_types.Ulid) !*partial_reconstructor.PartialReconstructor {
         if (self.reconstructors.getPtr(stream_id)) |r| return r;
         try self.reconstructors.put(stream_id, partial_reconstructor.PartialReconstructor.init(self.allocator));
         return self.reconstructors.getPtr(stream_id).?;
     }
 
-    fn ensureStreamEventStream(self: *Self, stream_id: protocol_types.Uuid) !*event_stream.AssistantMessageEventStream {
+    fn ensureStreamEventStream(self: *Self, stream_id: protocol_types.Ulid) !*event_stream.AssistantMessageEventStream {
         if (self.stream_event_streams.get(stream_id)) |es| return es;
         const es = oom.unreachableOnOom(self.allocator.create(event_stream.AssistantMessageEventStream));
         es.* = event_stream.AssistantMessageEventStream.init(self.allocator);
@@ -199,7 +199,7 @@ pub const ProtocolClient = struct {
         return es;
     }
 
-    fn setStreamError(self: *Self, stream_id: protocol_types.Uuid, msg: []const u8) !void {
+    fn setStreamError(self: *Self, stream_id: protocol_types.Ulid, msg: []const u8) !void {
         const already_complete = self.stream_complete_flags.get(stream_id) orelse false;
 
         if (self.stream_errors.getPtr(stream_id)) |existing| {
@@ -216,7 +216,7 @@ pub const ProtocolClient = struct {
         }
     }
 
-    fn setStreamResult(self: *Self, stream_id: protocol_types.Uuid, result: ai_types.AssistantMessage) !void {
+    fn setStreamResult(self: *Self, stream_id: protocol_types.Ulid, result: ai_types.AssistantMessage) !void {
         const already_complete = self.stream_complete_flags.get(stream_id) orelse false;
 
         if (self.stream_results.getPtr(stream_id)) |existing| {
@@ -244,7 +244,7 @@ pub const ProtocolClient = struct {
             return error.NoSender;
         }
 
-        const message_id = protocol_types.generateUuid();
+        const message_id = protocol_types.generateUlid();
         const stream_id = message_id;
         const seq = try self.nextSequenceForStream(stream_id);
 
@@ -292,7 +292,7 @@ pub const ProtocolClient = struct {
         model: ai_types.Model,
         context: ai_types.Context,
         options: ?ai_types.StreamOptions,
-    ) !protocol_types.Uuid {
+    ) !protocol_types.Ulid {
         const req = try self.startStream(model, context, options);
         return req.message_id;
     }
@@ -304,7 +304,7 @@ pub const ProtocolClient = struct {
     }
 
     /// Send abort_request for a specific stream
-    pub fn sendAbortRequestFor(self: *Self, stream_id: protocol_types.Uuid, reason: ?[]const u8) !void {
+    pub fn sendAbortRequestFor(self: *Self, stream_id: protocol_types.Ulid, reason: ?[]const u8) !void {
         if (self.sender == null) {
             return error.NoSender;
         }
@@ -324,7 +324,7 @@ pub const ProtocolClient = struct {
 
         var env = protocol_types.Envelope{
             .stream_id = stream_id,
-            .message_id = protocol_types.generateUuid(),
+            .message_id = protocol_types.generateUlid(),
             .sequence = seq,
             .timestamp = std.time.milliTimestamp(),
             .payload = payload,
@@ -435,7 +435,7 @@ pub const ProtocolClient = struct {
     }
 
     /// Get a per-stream event stream if it exists
-    pub fn getEventStreamFor(self: *Self, stream_id: protocol_types.Uuid) ?*event_stream.AssistantMessageEventStream {
+    pub fn getEventStreamFor(self: *Self, stream_id: protocol_types.Ulid) ?*event_stream.AssistantMessageEventStream {
         return self.stream_event_streams.get(stream_id);
     }
 
@@ -446,7 +446,7 @@ pub const ProtocolClient = struct {
     }
 
     /// Get result for a specific stream (blocking wait if not ready)
-    pub fn waitResultFor(self: *Self, stream_id: protocol_types.Uuid, timeout_ms: u64) !?ai_types.AssistantMessage {
+    pub fn waitResultFor(self: *Self, stream_id: protocol_types.Ulid, timeout_ms: u64) !?ai_types.AssistantMessage {
         const start_time = std.time.milliTimestamp();
         const deadline = start_time + @as(i64, @intCast(timeout_ms));
 
@@ -476,12 +476,12 @@ pub const ProtocolClient = struct {
     }
 
     /// Check if a specific stream is complete
-    pub fn isCompleteFor(self: *Self, stream_id: protocol_types.Uuid) bool {
+    pub fn isCompleteFor(self: *Self, stream_id: protocol_types.Ulid) bool {
         return self.stream_complete_flags.get(stream_id) orelse false;
     }
 
     /// Mark a specific stream as closed and complete with an explicit client-side error.
-    pub fn closeStream(self: *Self, stream_id: protocol_types.Uuid) !void {
+    pub fn closeStream(self: *Self, stream_id: protocol_types.Ulid) !void {
         if (self.stream_complete_flags.get(stream_id) orelse false) return;
 
         try self.setStreamError(stream_id, "Stream closed by client");
@@ -494,10 +494,10 @@ pub const ProtocolClient = struct {
     }
 
     /// Remove all tracked client state for a specific stream.
-    pub fn removeStreamState(self: *Self, stream_id: protocol_types.Uuid) void {
+    pub fn removeStreamState(self: *Self, stream_id: protocol_types.Ulid) void {
         // Remove any pending requests associated with this stream.
         while (true) {
-            var pending_to_remove: ?protocol_types.Uuid = null;
+            var pending_to_remove: ?protocol_types.Ulid = null;
             var pending_it = self.pending_requests.iterator();
             while (pending_it.next()) |entry| {
                 if (std.mem.eql(u8, &entry.value_ptr.stream_id, &stream_id)) {
@@ -589,7 +589,7 @@ pub const ProtocolClient = struct {
     }
 
     /// Get the current stream ID
-    pub fn getCurrentStreamId(self: *Self) ?protocol_types.Uuid {
+    pub fn getCurrentStreamId(self: *Self) ?protocol_types.Ulid {
         return self.current_stream_id;
     }
 
@@ -600,7 +600,7 @@ pub const ProtocolClient = struct {
     }
 
     /// Get error for a specific stream
-    pub fn getLastErrorFor(self: *Self, stream_id: protocol_types.Uuid) ?[]const u8 {
+    pub fn getLastErrorFor(self: *Self, stream_id: protocol_types.Ulid) ?[]const u8 {
         if (self.stream_errors.get(stream_id)) |err| {
             const msg = err.slice();
             if (msg.len > 0) return msg;
@@ -763,8 +763,8 @@ test "processEnvelope routes events to per-stream event stream" {
     var client = ProtocolClient.init(allocator, .{});
     defer client.deinit();
 
-    const sid1 = protocol_types.generateUuid();
-    const sid2 = protocol_types.generateUuid();
+    const sid1 = protocol_types.generateUlid();
+    const sid2 = protocol_types.generateUlid();
 
     const partial = ai_types.AssistantMessage{
         .content = &.{},
@@ -778,7 +778,7 @@ test "processEnvelope routes events to per-stream event stream" {
 
     var env1 = protocol_types.Envelope{
         .stream_id = sid1,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
@@ -787,7 +787,7 @@ test "processEnvelope routes events to per-stream event stream" {
 
     var env2 = protocol_types.Envelope{
         .stream_id = sid2,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
@@ -813,7 +813,7 @@ test "processEnvelope handles ack" {
     defer client.deinit();
 
     // Add a pending request
-    const message_id = protocol_types.generateUuid();
+    const message_id = protocol_types.generateUlid();
     try client.pending_requests.put(message_id, .{
         .message_id = message_id,
         .sent_at = std.time.milliTimestamp(),
@@ -821,10 +821,10 @@ test "processEnvelope handles ack" {
     });
 
     // Create an ack envelope
-    const stream_id = protocol_types.generateUuid();
+    const stream_id = protocol_types.generateUlid();
     const env = protocol_types.Envelope{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{
@@ -849,7 +849,7 @@ test "processEnvelope handles nack" {
     defer client.deinit();
 
     // Add a pending request
-    const message_id = protocol_types.generateUuid();
+    const message_id = protocol_types.generateUlid();
     try client.pending_requests.put(message_id, .{
         .message_id = message_id,
         .sent_at = std.time.milliTimestamp(),
@@ -861,8 +861,8 @@ test "processEnvelope handles nack" {
     // Note: nack_reason ownership is transferred to envelope, will be freed by env.deinit()
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
@@ -902,8 +902,8 @@ test "processEnvelope handles events" {
     };
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
@@ -937,8 +937,8 @@ test "processEnvelope accumulates to reconstructor" {
 
     // Send start event
     var env1 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
@@ -948,8 +948,8 @@ test "processEnvelope accumulates to reconstructor" {
 
     // Send text_start event
     var env2 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .text_start = .{ .content_index = 0, .partial = partial } } },
@@ -962,8 +962,8 @@ test "processEnvelope accumulates to reconstructor" {
     const delta_str = try allocator.dupe(u8, "Hello");
 
     var env3 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 3,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .text_delta = .{
@@ -1050,7 +1050,7 @@ test "sendAbortRequest sends valid envelope" {
     client.setSender(sender);
 
     // Set a stream ID first
-    client.current_stream_id = protocol_types.generateUuid();
+    client.current_stream_id = protocol_types.generateUlid();
 
     try client.sendAbortRequest("User cancelled");
 
@@ -1085,8 +1085,8 @@ test "processEnvelope handles done event and builds result" {
 
     // Send start event
     var env1 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
@@ -1096,8 +1096,8 @@ test "processEnvelope handles done event and builds result" {
 
     // Send text_start event
     var env2 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .text_start = .{ .content_index = 0, .partial = partial } } },
@@ -1110,8 +1110,8 @@ test "processEnvelope handles done event and builds result" {
     const delta_str = try allocator.dupe(u8, "Hello world");
 
     var env3 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 3,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .text_delta = .{
@@ -1135,8 +1135,8 @@ test "processEnvelope handles done event and builds result" {
     };
 
     var env4 = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 4,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .done = .{
@@ -1182,8 +1182,8 @@ test "processEnvelope handles result payload" {
     };
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .result = result_msg },
@@ -1212,8 +1212,8 @@ test "processEnvelope handles stream_error payload" {
     const error_msg = try allocator.dupe(u8, "Connection timeout");
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_error = .{
@@ -1241,7 +1241,7 @@ test "reset clears all state" {
     defer client.deinit();
 
     // Set up some state
-    client.current_stream_id = protocol_types.generateUuid();
+    client.current_stream_id = protocol_types.generateUlid();
     client.stream_complete = true;
     client.sequence = 10;
 
@@ -1278,7 +1278,7 @@ test "getCurrentStreamId returns correct value" {
     try std.testing.expect(client.getCurrentStreamId() == null);
 
     // After setting
-    const stream_id = protocol_types.generateUuid();
+    const stream_id = protocol_types.generateUlid();
     client.current_stream_id = stream_id;
 
     const result = client.getCurrentStreamId();
@@ -1319,7 +1319,7 @@ test "closeStream marks stream complete with client-side error" {
     var client = ProtocolClient.init(allocator, .{});
     defer client.deinit();
 
-    const sid = protocol_types.generateUuid();
+    const sid = protocol_types.generateUlid();
     try client.stream_complete_flags.put(sid, false);
     _ = try client.ensureStreamEventStream(sid);
 
@@ -1337,8 +1337,8 @@ test "removeStreamState clears per-stream maps and legacy current stream state" 
     var client = ProtocolClient.init(allocator, .{});
     defer client.deinit();
 
-    const sid = protocol_types.generateUuid();
-    const mid = protocol_types.generateUuid();
+    const sid = protocol_types.generateUlid();
+    const mid = protocol_types.generateUlid();
 
     try client.pending_requests.put(mid, .{
         .message_id = mid,
@@ -1397,9 +1397,9 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
     var client = ProtocolClient.init(allocator, .{});
     defer client.deinit();
 
-    const sid_result = protocol_types.generateUuid();
-    const sid_error = protocol_types.generateUuid();
-    const sid_done = protocol_types.generateUuid();
+    const sid_result = protocol_types.generateUlid();
+    const sid_error = protocol_types.generateUlid();
+    const sid_done = protocol_types.generateUlid();
 
     const result_text = try allocator.dupe(u8, "result stream text");
     const result_api = try allocator.dupe(u8, "test-api");
@@ -1410,7 +1410,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
 
     var env_result = protocol_types.Envelope{
         .stream_id = sid_result,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .result = .{
@@ -1429,7 +1429,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
     const err_msg = try allocator.dupe(u8, "stream two failed");
     var env_error = protocol_types.Envelope{
         .stream_id = sid_error,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_error = .{
@@ -1450,7 +1450,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
     };
     var env_done_start = protocol_types.Envelope{
         .stream_id = sid_done,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .start = .{ .partial = done_partial } } },
@@ -1468,7 +1468,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
     };
     var env_done = protocol_types.Envelope{
         .stream_id = sid_done,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .event = .{ .done = .{

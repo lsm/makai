@@ -18,7 +18,7 @@ pub fn serializeEnvelope(env: agent_types.Envelope, allocator: std.mem.Allocator
     defer allocator.free(session_id_str);
     try w.writeStringField("session_id", session_id_str);
 
-    const message_id_str = try agent_types.uuidToString(env.message_id, allocator);
+    const message_id_str = try agent_types.ulidToString(env.message_id, allocator);
     defer allocator.free(message_id_str);
     try w.writeStringField("message_id", message_id_str);
 
@@ -27,7 +27,7 @@ pub fn serializeEnvelope(env: agent_types.Envelope, allocator: std.mem.Allocator
     try w.writeIntField("version", env.version);
 
     if (env.in_reply_to) |reply_to| {
-        const reply_str = try agent_types.uuidToString(reply_to, allocator);
+        const reply_str = try agent_types.ulidToString(reply_to, allocator);
         defer allocator.free(reply_str);
         try w.writeStringField("in_reply_to", reply_str);
     }
@@ -136,12 +136,12 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
             if (p.getReason()) |reason| try w.writeStringField("reason", reason);
         },
         .ack => |p| {
-            const ack_id = try agent_types.uuidToString(p.acknowledged_id, allocator);
+            const ack_id = try agent_types.ulidToString(p.acknowledged_id, allocator);
             defer allocator.free(ack_id);
             try w.writeStringField("acknowledged_id", ack_id);
         },
         .nack => |p| {
-            const rejected_id = try agent_types.uuidToString(p.rejected_id, allocator);
+            const rejected_id = try agent_types.ulidToString(p.rejected_id, allocator);
             defer allocator.free(rejected_id);
             try w.writeStringField("rejected_id", rejected_id);
             try w.writeStringField("reason", p.reason.slice());
@@ -223,14 +223,14 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
 
     const root = parsed.value.object;
     const type_str = root.get("type").?.string;
-    const session_id = try parseSessionIdRequired(root.get("session_id").?.string);
-    const message_id = parseUuidOrError(root.get("message_id").?.string) orelse return error.InvalidUuid;
+    const session_id = parseSessionIdOrError(root.get("session_id").?.string) orelse return error.InvalidSessionId;
+    const message_id = try parseUlidRequired(root.get("message_id").?.string);
     const sequence = @as(u64, @intCast(root.get("sequence").?.integer));
     const timestamp = root.get("timestamp").?.integer;
     const version = @as(u8, @intCast(root.get("version").?.integer));
 
-    var in_reply_to: ?agent_types.Uuid = null;
-    if (root.get("in_reply_to")) |v| in_reply_to = try parseUuidRequired(v.string);
+    var in_reply_to: ?agent_types.Ulid = null;
+    if (root.get("in_reply_to")) |v| in_reply_to = try parseUlidRequired(v.string);
 
     const payload_obj = root.get("payload").?.object;
     const payload = try deserializePayload(type_str, payload_obj, allocator);
@@ -246,16 +246,16 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !agen
     };
 }
 
-fn parseUuidRequired(str: []const u8) !agent_types.Uuid {
-    return agent_types.parseUuid(str) orelse error.InvalidUuid;
+fn parseUlidRequired(str: []const u8) !agent_types.Ulid {
+    return agent_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
 fn parseSessionIdRequired(str: []const u8) !agent_types.SessionId {
     return agent_types.parseSessionId(str) orelse error.InvalidSessionId;
 }
 
-fn parseUuidOrError(str: []const u8) ?agent_types.Uuid {
-    return agent_types.parseUuid(str);
+fn parseSessionIdOrError(str: []const u8) ?agent_types.SessionId {
+    return agent_types.parseSessionId(str);
 }
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !agent_types.Payload {
@@ -358,10 +358,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .goodbye = g };
     }
     if (std.mem.eql(u8, type_str, "ack")) {
-        return .{ .ack = .{ .acknowledged_id = try parseUuidRequired(payload.get("acknowledged_id").?.string) } };
+        return .{ .ack = .{ .acknowledged_id = try parseUlidRequired(payload.get("acknowledged_id").?.string) } };
     }
     if (std.mem.eql(u8, type_str, "nack")) {
-        const rejected_id = try parseUuidRequired(payload.get("rejected_id").?.string);
+        const rejected_id = try parseUlidRequired(payload.get("rejected_id").?.string);
         const reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, payload.get("reason").?.string));
         // forward-compat: unknown error codes degrade to null rather than
         // failing deserialization. This is intentional asymmetry from the
@@ -601,17 +601,22 @@ fn parseReasoningLevel(str: []const u8) error{InvalidEnumValue}!model_catalog_ty
     return error.InvalidEnumValue;
 }
 
-test "deserializeEnvelope rejects invalid uuid" {
+test "deserializeEnvelope rejects invalid ulid" {
     const allocator = std.testing.allocator;
-    const bad =
-        "{\"type\":\"ping\",\"session_id\":\"not-a-session-id\",\"message_id\":\"not-a-uuid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{}}";
-    try std.testing.expectError(error.InvalidSessionId, deserializeEnvelope(bad, allocator));
+    const sid = "000000000000000000000";
+    const bad = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"ping\",\"session_id\":\"{s}\",\"message_id\":\"not-a-ulid\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
+        .{sid},
+    );
+    defer allocator.free(bad);
+    try std.testing.expectError(error.InvalidUlid, deserializeEnvelope(bad, allocator));
 }
 
 test "deserializeEnvelope rejects unknown payload type" {
     const allocator = std.testing.allocator;
-    const sid = "0123456789ABCDEabcdeF";
-    const mid = "00000000-0000-0000-0000-000000000002";
+    const sid = "000000000000000000000";
+    const mid = "00000000000000000000000002";
     const bad = try std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"not_real\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{}}}}",
@@ -626,7 +631,7 @@ test "agent envelope roundtrip" {
 
     var env = agent_types.Envelope{
         .session_id = agent_types.generateSessionId(),
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .agent_message = .{
@@ -652,7 +657,7 @@ test "agent envelope roundtrip for models_request" {
 
     var env = agent_types.Envelope{
         .session_id = agent_types.generateSessionId(),
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -713,7 +718,7 @@ test "agent envelope roundtrip for models_response preserves shape" {
 
     var env = agent_types.Envelope{
         .session_id = agent_types.generateSessionId(),
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_response = .{
@@ -753,10 +758,10 @@ test "agent envelope roundtrip for models_response preserves shape" {
 test "agent envelope roundtrip for ack and nack" {
     const allocator = std.testing.allocator;
 
-    const acked_id = agent_types.generateUuid();
+    const acked_id = agent_types.generateUlid();
     var ack_env = agent_types.Envelope{
         .session_id = agent_types.generateSessionId(),
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{ .acknowledged_id = acked_id } },
@@ -772,10 +777,10 @@ test "agent envelope roundtrip for ack and nack" {
     try std.testing.expect(parsed_ack.payload == .ack);
     try std.testing.expectEqualSlices(u8, &acked_id, &parsed_ack.payload.ack.acknowledged_id);
 
-    const rejected_id = agent_types.generateUuid();
+    const rejected_id = agent_types.generateUlid();
     var nack_env = agent_types.Envelope{
         .session_id = agent_types.generateSessionId(),
-        .message_id = agent_types.generateUuid(),
+        .message_id = agent_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{

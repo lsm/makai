@@ -526,25 +526,25 @@ pub const AuthLoginStartRequest = struct {
 };
 
 pub const AuthPromptResponse = struct {
-    flow_id: Uuid,
+    flow_id: ULID,
     prompt_id: OwnedSlice(u8),
     answer: OwnedSlice(u8),
 };
 
 pub const AuthCancelRequest = struct {
-    flow_id: Uuid,
+    flow_id: ULID,
 };
 
 pub const AuthEvent = union(enum) {
-    auth_url: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), url: OwnedSlice(u8), instructions: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed("") },
-    prompt: struct { flow_id: Uuid, prompt_id: OwnedSlice(u8), provider_id: OwnedSlice(u8), message: OwnedSlice(u8), allow_empty: bool = false },
-    progress: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), message: OwnedSlice(u8) },
-    success: struct { flow_id: Uuid, provider_id: OwnedSlice(u8) },
-    error: struct { flow_id: Uuid, provider_id: OwnedSlice(u8), code: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), message: OwnedSlice(u8) },
+    auth_url: struct { flow_id: ULID, provider_id: OwnedSlice(u8), url: OwnedSlice(u8), instructions: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed("") },
+    prompt: struct { flow_id: ULID, prompt_id: OwnedSlice(u8), provider_id: OwnedSlice(u8), message: OwnedSlice(u8), allow_empty: bool = false },
+    progress: struct { flow_id: ULID, provider_id: OwnedSlice(u8), message: OwnedSlice(u8) },
+    success: struct { flow_id: ULID, provider_id: OwnedSlice(u8) },
+    error: struct { flow_id: ULID, provider_id: OwnedSlice(u8), code: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""), message: OwnedSlice(u8) },
 };
 
 pub const AuthLoginResult = struct {
-    flow_id: Uuid,
+    flow_id: ULID,
     provider_id: OwnedSlice(u8),
     status: enum { success, cancelled, failed },
 };

@@ -71,7 +71,7 @@ fn handleToolClientEnvelope(
     const result_json = try std.fmt.allocPrint(allocator, "[{{\"type\":\"text\",\"text\":\"sum={d}\"}}]", .{sum});
     return .{
         .server_id = env.server_id,
-        .message_id = tool_types.generateUuid(),
+        .message_id = tool_types.generateUlid(),
         .sequence = env.sequence + 1,
         .in_reply_to = env.message_id,
         .timestamp = std.time.milliTimestamp(),
@@ -141,12 +141,12 @@ fn executeToolViaProtocol(
     };
 
     var req_env = tool_types.Envelope{
-        .server_id = tool_types.generateUuid(),
-        .message_id = tool_types.generateUuid(),
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .tool_execute = .{
-            .execution_id = tool_types.generateUuid(),
+            .execution_id = tool_types.generateUlid(),
             .tool_call_id = try allocator.dupe(u8, tool_call_id),
             .tool_name = try allocator.dupe(u8, tool_name),
             .args_json = try allocator.dupe(u8, args_json),

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { ulid } from "ulid";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -316,7 +316,7 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
       }
 
       const session: AuthSession = {
-        id: randomUUID(),
+        id: ulid(),
         provider: body.provider,
         status: "running",
         events: [],

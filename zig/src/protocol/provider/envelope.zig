@@ -26,12 +26,12 @@ pub fn serializeEnvelope(
     }
 
     // Write stream_id
-    const stream_id_str = try protocol_types.uuidToString(envelope.stream_id, allocator);
+    const stream_id_str = try protocol_types.ulidToString(envelope.stream_id, allocator);
     defer allocator.free(stream_id_str);
     try w.writeStringField("stream_id", stream_id_str);
 
     // Write message_id
-    const message_id_str = try protocol_types.uuidToString(envelope.message_id, allocator);
+    const message_id_str = try protocol_types.ulidToString(envelope.message_id, allocator);
     defer allocator.free(message_id_str);
     try w.writeStringField("message_id", message_id_str);
 
@@ -46,7 +46,7 @@ pub fn serializeEnvelope(
 
     // Write in_reply_to if present
     if (envelope.in_reply_to) |reply_to| {
-        const reply_to_str = try protocol_types.uuidToString(reply_to, allocator);
+        const reply_to_str = try protocol_types.ulidToString(reply_to, allocator);
         defer allocator.free(reply_to_str);
         try w.writeStringField("in_reply_to", reply_to_str);
     }
@@ -83,12 +83,12 @@ fn serializePayload(
             }
         },
         .sync_request => |sync_req| {
-            const target_str = try protocol_types.uuidToString(sync_req.target_stream_id, allocator);
+            const target_str = try protocol_types.ulidToString(sync_req.target_stream_id, allocator);
             defer allocator.free(target_str);
             try w.writeStringField("target_stream_id", target_str);
         },
         .sync => |sync_msg| {
-            const target_str = try protocol_types.uuidToString(sync_msg.target_stream_id, allocator);
+            const target_str = try protocol_types.ulidToString(sync_msg.target_stream_id, allocator);
             defer allocator.free(target_str);
             try w.writeStringField("target_stream_id", target_str);
             if (sync_msg.partial) |partial| {
@@ -140,7 +140,7 @@ fn serializePayload(
             }
         },
         .abort_request => |req| {
-            const target_str = try protocol_types.uuidToString(req.target_stream_id, allocator);
+            const target_str = try protocol_types.ulidToString(req.target_stream_id, allocator);
             defer allocator.free(target_str);
             try w.writeStringField("target_stream_id", target_str);
             if (req.getReason()) |reason| {
@@ -148,12 +148,12 @@ fn serializePayload(
             }
         },
         .ack => |ack| {
-            const acknowledged_id_str = try protocol_types.uuidToString(ack.acknowledged_id, allocator);
+            const acknowledged_id_str = try protocol_types.ulidToString(ack.acknowledged_id, allocator);
             defer allocator.free(acknowledged_id_str);
             try w.writeStringField("acknowledged_id", acknowledged_id_str);
         },
         .nack => |nack| {
-            const rejected_id_str = try protocol_types.uuidToString(nack.rejected_id, allocator);
+            const rejected_id_str = try protocol_types.ulidToString(nack.rejected_id, allocator);
             defer allocator.free(rejected_id_str);
             try w.writeStringField("rejected_id", rejected_id_str);
             try w.writeStringField("reason", nack.reason.slice());
@@ -601,11 +601,11 @@ pub fn deserializeEnvelope(
 
     // Parse stream_id
     const stream_id_str = obj.get("stream_id").?.string;
-    const stream_id = protocol_types.parseUuid(stream_id_str) orelse return error.InvalidUuid;
+    const stream_id = protocol_types.parseUlid(stream_id_str) orelse return error.InvalidUlid;
 
     // Parse message_id
     const message_id_str = obj.get("message_id").?.string;
-    const message_id = protocol_types.parseUuid(message_id_str) orelse return error.InvalidUuid;
+    const message_id = protocol_types.parseUlid(message_id_str) orelse return error.InvalidUlid;
 
     // Parse sequence
     const sequence: u64 = @intCast(obj.get("sequence").?.integer);
@@ -614,9 +614,9 @@ pub fn deserializeEnvelope(
     const timestamp: i64 = obj.get("timestamp").?.integer;
 
     // Parse in_reply_to if present
-    var in_reply_to: ?protocol_types.Uuid = null;
+    var in_reply_to: ?protocol_types.Ulid = null;
     if (obj.get("in_reply_to")) |reply_val| {
-        in_reply_to = protocol_types.parseUuid(reply_val.string) orelse return error.InvalidUuid;
+        in_reply_to = protocol_types.parseUlid(reply_val.string) orelse return error.InvalidUlid;
     }
 
     // Parse type
@@ -836,7 +836,7 @@ fn deserializeAbortRequest(
     allocator: std.mem.Allocator,
 ) !protocol_types.AbortRequest {
     const target_str = obj.get("target_stream_id").?.string;
-    const target_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
+    const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     const reason = if (obj.get("reason")) |r|
         protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, r.string))
@@ -1018,7 +1018,7 @@ fn deserializeModelDescriptor(
 /// Deserialize ack
 fn deserializeAck(obj: std.json.ObjectMap) !protocol_types.Ack {
     const acknowledged_id_str = obj.get("acknowledged_id").?.string;
-    const acknowledged_id = protocol_types.parseUuid(acknowledged_id_str) orelse return error.InvalidUuid;
+    const acknowledged_id = protocol_types.parseUlid(acknowledged_id_str) orelse return error.InvalidUlid;
 
     return .{
         .acknowledged_id = acknowledged_id,
@@ -1031,7 +1031,7 @@ fn deserializeNack(
     allocator: std.mem.Allocator,
 ) !protocol_types.Nack {
     const rejected_id_str = obj.get("rejected_id").?.string;
-    const rejected_id = protocol_types.parseUuid(rejected_id_str) orelse return error.InvalidUuid;
+    const rejected_id = protocol_types.parseUlid(rejected_id_str) orelse return error.InvalidUlid;
 
     const reason = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, obj.get("reason").?.string));
     errdefer {
@@ -1109,7 +1109,7 @@ fn deserializeGoodbye(
 /// Deserialize sync_request
 fn deserializeSyncRequest(obj: std.json.ObjectMap) !protocol_types.SyncRequest {
     const target_str = obj.get("target_stream_id").?.string;
-    const target_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
+    const target_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     return .{ .target_stream_id = target_id };
 }
@@ -1120,7 +1120,7 @@ fn deserializeSync(
     allocator: std.mem.Allocator,
 ) !protocol_types.Sync {
     const target_str = obj.get("target_stream_id").?.string;
-    const target_stream_id = protocol_types.parseUuid(target_str) orelse return error.InvalidUuid;
+    const target_stream_id = protocol_types.parseUlid(target_str) orelse return error.InvalidUlid;
 
     const partial = if (obj.get("partial")) |p|
         try transport.parseAssistantMessage(p.object, allocator)
@@ -1466,7 +1466,7 @@ fn parseServiceTier(str: []const u8) ?ai_types.ServiceTier {
 
 /// Create a new envelope with auto-generated IDs and timestamp
 pub fn createEnvelope(
-    stream_id: protocol_types.Uuid,
+    stream_id: protocol_types.Ulid,
     sequence: u64,
     payload: protocol_types.Payload,
     allocator: std.mem.Allocator,
@@ -1474,7 +1474,7 @@ pub fn createEnvelope(
     _ = allocator; // Not needed for basic envelope creation
     return .{
         .stream_id = stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = sequence,
         .timestamp = std.time.milliTimestamp(),
         .payload = payload,
@@ -1490,7 +1490,7 @@ pub fn createReply(
     _ = allocator;
     return .{
         .stream_id = original.stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
@@ -1506,7 +1506,7 @@ pub fn createAck(
     _ = allocator;
     return .{
         .stream_id = original.stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
@@ -1526,7 +1526,7 @@ pub fn createNack(
     const reason_copy = try allocator.dupe(u8, reason);
     return .{
         .stream_id = original.stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
@@ -1561,7 +1561,7 @@ pub fn createVersionMismatchNack(
 
     return .{
         .stream_id = original.stream_id,
-        .message_id = protocol_types.generateUuid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
         .timestamp = std.time.milliTimestamp(),
@@ -1576,7 +1576,7 @@ pub fn createVersionMismatchNack(
 
 // Custom error set
 pub const EnvelopeError = error{
-    InvalidUuid,
+    InvalidUlid,
     UnknownPayloadType,
     UnknownMessageRole,
     InvalidUserContent,
@@ -1591,8 +1591,8 @@ test "serializeEnvelope with ping payload" {
     const allocator = std.testing.allocator;
 
     const envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = 1708234567890,
         .payload = .ping,
@@ -1615,8 +1615,8 @@ test "serializeEnvelope with pong payload" {
     // Note: ping_id ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = 1708234567900,
         .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id) } },
@@ -1654,8 +1654,8 @@ test "serializeEnvelope with stream_request payload" {
     };
 
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = 1708234567890,
         .payload = .{ .stream_request = .{
@@ -1686,8 +1686,8 @@ test "deserializeEnvelope parses valid JSON" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
@@ -1704,37 +1704,37 @@ test "deserializeEnvelope parses valid JSON" {
     try std.testing.expect(envelope.payload == .ping);
 
     // Verify stream_id
-    const expected_stream_id: protocol_types.Uuid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    const expected_stream_id: protocol_types.Ulid = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10 };
     try std.testing.expectEqualSlices(u8, &expected_stream_id, &envelope.stream_id);
 }
 
-test "deserializeEnvelope rejects invalid in_reply_to uuid" {
+test "deserializeEnvelope rejects invalid in_reply_to ulid" {
     const allocator = std.testing.allocator;
 
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
-        \\  "in_reply_to": "not-a-uuid",
+        \\  "in_reply_to": "not-a-ulid",
         \\  "payload": {}
         \\}
     ;
 
-    try std.testing.expectError(error.InvalidUuid, deserializeEnvelope(json, allocator));
+    try std.testing.expectError(error.InvalidUlid, deserializeEnvelope(json, allocator));
 }
 
 test "serializeEnvelope and deserializeEnvelope roundtrip with ping" {
     const allocator = std.testing.allocator;
 
     const original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 42,
         .timestamp = std.time.milliTimestamp(),
-        .in_reply_to = protocol_types.generateUuid(),
+        .in_reply_to = protocol_types.generateUlid(),
         .payload = .ping,
     };
 
@@ -1756,11 +1756,11 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ping" {
 test "serializeEnvelope and deserializeEnvelope roundtrip with ack" {
     const allocator = std.testing.allocator;
 
-    const acknowledged_id = protocol_types.generateUuid();
+    const acknowledged_id = protocol_types.generateUlid();
 
     const original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .ack = .{
@@ -1781,13 +1781,13 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ack" {
 test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
     const allocator = std.testing.allocator;
 
-    const rejected_id = protocol_types.generateUuid();
+    const rejected_id = protocol_types.generateUlid();
     const reason = try allocator.dupe(u8, "Test error reason");
     // Note: reason ownership is transferred to original, will be freed by original.deinit
 
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .nack = .{
@@ -1814,7 +1814,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
 test "createEnvelope generates valid envelope" {
     const allocator = std.testing.allocator;
 
-    const stream_id = protocol_types.generateUuid();
+    const stream_id = protocol_types.generateUlid();
     var envelope = createEnvelope(stream_id, 1, .ping, allocator);
     defer envelope.deinit(allocator);
 
@@ -1829,8 +1829,8 @@ test "createReply sets in_reply_to correctly" {
     const allocator = std.testing.allocator;
 
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 5,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1852,8 +1852,8 @@ test "createAck creates valid ack" {
     const allocator = std.testing.allocator;
 
     const original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1875,8 +1875,8 @@ test "createNack creates valid nack" {
     const allocator = std.testing.allocator;
 
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_request = .{
@@ -1901,8 +1901,8 @@ test "createVersionMismatchNack includes supported versions" {
 
     const original = protocol_types.Envelope{
         .version = 2,
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .ping,
@@ -1925,12 +1925,12 @@ test "serializeEnvelope with abort_request payload" {
     // Note: reason ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 10,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .abort_request = .{
-            .target_stream_id = protocol_types.generateUuid(),
+            .target_stream_id = protocol_types.generateUlid(),
             .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
         } },
     };
@@ -1952,8 +1952,8 @@ test "serializeEnvelope with stream_error payload" {
     // Note: msg ownership is transferred to envelope, will be freed by envelope.deinit
 
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 20,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .stream_error = .{
@@ -1978,8 +1978,8 @@ test "deserializeEnvelope with version field defaults to 1" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "payload": {}
@@ -1999,8 +1999,8 @@ test "deserializeEnvelope with explicit version" {
     const json =
         \\{
         \\  "type": "ping",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 2,
@@ -2022,8 +2022,8 @@ test "deserializeEnvelope with stream_request frees all memory" {
     const json =
         \\{
         \\  "type": "stream_request",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
@@ -2079,8 +2079,8 @@ test "deserializeEnvelope with complete_request frees all memory" {
     const json =
         \\{
         \\  "type": "complete_request",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
@@ -2119,8 +2119,8 @@ test "deserializeEnvelope with complex context frees all memory" {
     const json =
         \\{
         \\  "type": "stream_request",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 1,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
@@ -2171,8 +2171,8 @@ test "serializeEnvelope with goodbye payload" {
 
     const reason = try allocator.dupe(u8, "Server shutting down");
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 100,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
@@ -2191,8 +2191,8 @@ test "serializeEnvelope with goodbye payload (no reason)" {
     const allocator = std.testing.allocator;
 
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 100,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .goodbye = .{} },
@@ -2210,10 +2210,10 @@ test "serializeEnvelope with goodbye payload (no reason)" {
 test "serializeEnvelope with sync_request payload" {
     const allocator = std.testing.allocator;
 
-    const target_id = protocol_types.generateUuid();
+    const target_id = protocol_types.generateUlid();
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 50,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .sync_request = .{ .target_stream_id = target_id } },
@@ -2243,12 +2243,12 @@ test "serializeEnvelope with sync payload" {
         .is_owned = false,
     };
     var envelope = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 60,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .sync = .{
-            .target_stream_id = protocol_types.generateUuid(),
+            .target_stream_id = protocol_types.generateUlid(),
             .partial = partial,
         } },
     };
@@ -2269,8 +2269,8 @@ test "deserializeEnvelope with pong payload" {
     const json =
         \\{
         \\  "type": "pong",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 2,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
@@ -2292,8 +2292,8 @@ test "deserializeEnvelope with goodbye payload" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
@@ -2315,8 +2315,8 @@ test "deserializeEnvelope with goodbye payload (no reason)" {
     const json =
         \\{
         \\  "type": "goodbye",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 100,
         \\  "timestamp": 1708234567900,
         \\  "payload": {}
@@ -2336,12 +2336,12 @@ test "deserializeEnvelope with sync_request payload" {
     const json =
         \\{
         \\  "type": "sync_request",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 50,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "abcdef01-2345-6789-abcd-ef0123456789"
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -2351,7 +2351,7 @@ test "deserializeEnvelope with sync_request payload" {
 
     try std.testing.expect(envelope.payload == .sync_request);
 
-    const expected_target: protocol_types.Uuid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
+    const expected_target: protocol_types.Ulid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
     try std.testing.expectEqualSlices(u8, &expected_target, &envelope.payload.sync_request.target_stream_id);
 }
 
@@ -2361,12 +2361,12 @@ test "deserializeEnvelope with sync payload" {
     const json =
         \\{
         \\  "type": "sync",
-        \\  "stream_id": "01234567-89ab-cdef-fedc-ba9876543210",
-        \\  "message_id": "12345678-9abc-def0-fedc-ba9876543210",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
         \\  "sequence": 60,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "abcdef01-2345-6789-abcd-ef0123456789",
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "partial": {
         \\      "stop_reason": "stop",
         \\      "model": "test-model",
@@ -2383,7 +2383,7 @@ test "deserializeEnvelope with sync payload" {
     defer envelope.deinit(allocator);
 
     try std.testing.expect(envelope.payload == .sync);
-    const expected_target: protocol_types.Uuid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
+    const expected_target: protocol_types.Ulid = .{ 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89 };
     try std.testing.expectEqualSlices(u8, &expected_target, &envelope.payload.sync.target_stream_id);
     try std.testing.expect(envelope.payload.sync.partial != null);
 }
@@ -2393,8 +2393,8 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
 
     const ping_id = try allocator.dupe(u8, "roundtrip-ping-id");
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 10,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id) } },
@@ -2417,8 +2417,8 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
 
     const reason = try allocator.dupe(u8, "Graceful shutdown");
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 200,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
@@ -2440,8 +2440,8 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_request" {
     const allocator = std.testing.allocator;
 
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_request = .{
@@ -2501,8 +2501,8 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_response" 
     };
 
     var original = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUuid(),
-        .message_id = protocol_types.generateUuid(),
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = std.time.milliTimestamp(),
         .payload = .{ .models_response = .{
