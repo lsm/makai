@@ -208,6 +208,23 @@ test("stream error paths throw MakaiStreamError", async () => {
   }
 });
 
+test("provider stream_error frames preserve MakaiStreamError code", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-stream-error-code-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([{ type: "stream_error", message: "login required", code: "auth_required" }]));
+  const harness = await setupHarness({ MAKAI_TEST_PROVIDER_EVENTS_PATH: eventsPath });
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    await assert.rejects(
+      async () => collect(provider.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "login required" && err.code === "auth_required",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("agent stream error paths throw MakaiStreamError", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-test-"));
   const eventsPath = path.join(tmpDir, "events.json");

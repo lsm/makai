@@ -247,7 +247,7 @@ function normalizeProviderFrame(
       toolBuffers,
     );
   }
-  if (frame.type === "stream_error") return { type: "error", message: stringValue(readPayloadOrFrame(frame).message, "stream error") };
+  if (frame.type === "stream_error") return parseError(readPayloadOrFrame(frame));
   if (frame.type === "message_start") return messageStartFrom(readPayloadOrFrame(frame));
   if (frame.type === "text_delta") return { type: "text_delta", delta: stringValue(readPayloadOrFrame(frame).delta) };
   if (frame.type === "thinking_delta" || frame.type === "reasoning_delta" || frame.type === "reasoning") {
