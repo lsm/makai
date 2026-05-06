@@ -151,7 +151,7 @@ test "Envelope roundtrip preserves ACK structure" {
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "acknowledged_id": "2NWQQG28T5CY4TQKFF04HMASW9"
+        \\    "acknowledged_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -179,7 +179,7 @@ test "Envelope roundtrip preserves NACK structure" {
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "rejected_id": "2NWQQG28T5CY4TQKFF04HMASW9",
+        \\    "rejected_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "Model not found",
         \\    "error_code": "model_not_found"
         \\  }
@@ -208,7 +208,7 @@ test "Envelope roundtrip preserves abort_request" {
         \\  "timestamp": 1708234567900,
         \\  "version": 1,
         \\  "payload": {
-        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9",
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "reason": "User cancelled"
         \\  }
         \\}
@@ -759,9 +759,9 @@ test "Envelope preserves in_reply_to field" {
         \\  "sequence": 2,
         \\  "timestamp": 1708234567890,
         \\  "version": 1,
-        \\  "in_reply_to": "2NWQQG28T5CY4TQKFF04HMASW9",
+        \\  "in_reply_to": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\  "payload": {
-        \\    "acknowledged_id": "2NWQQG28T5CY4TQKFF04HMASW9"
+        \\    "acknowledged_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;

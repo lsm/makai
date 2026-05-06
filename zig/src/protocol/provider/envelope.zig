@@ -2341,7 +2341,7 @@ test "deserializeEnvelope with sync_request payload" {
         \\  "sequence": 50,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9"
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9"
         \\  }
         \\}
     ;
@@ -2366,7 +2366,7 @@ test "deserializeEnvelope with sync payload" {
         \\  "sequence": 60,
         \\  "timestamp": 1708234567900,
         \\  "payload": {
-        \\    "target_stream_id": "2NWQQG28T5CY4TQKFF04HMASW9",
+        \\    "target_stream_id": "5BSQQG28T5CY4TQKFF04HMASW9",
         \\    "partial": {
         \\      "stop_reason": "stop",
         \\      "model": "test-model",
