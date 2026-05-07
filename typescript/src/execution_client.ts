@@ -284,7 +284,7 @@ class StdioAgentApi implements MakaiAgentApi {
     let terminal = false;
     let messageSent = false;
     let started = false;
-    let aggregateUsage: UsageSummary = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
+    let aggregateUsage: UsageSummary | undefined;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
       while (!terminal) {
@@ -299,6 +299,10 @@ class StdioAgentApi implements MakaiAgentApi {
         const events = normalizeAgentFrame(frame, toolBuffers);
         for (const rawEvent of events) {
           let event = rawEvent;
+          if (event.type === "error" && event.code === "auth_required") {
+            terminal = true;
+            throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+          }
           if (!started) {
             started = true;
             if (event.type !== "agent_start") {
@@ -306,16 +310,13 @@ class StdioAgentApi implements MakaiAgentApi {
             }
           }
           if (event.type === "message_end" && event.usage) {
-            aggregateUsage = addUsage(aggregateUsage, event.usage);
+            aggregateUsage = aggregateUsage ? addUsage(aggregateUsage, event.usage) : event.usage;
           }
           if (event.type === "agent_end") {
-            event = { ...event, usage: event.usage ?? aggregateUsage };
+            event = { ...event, usage: aggregateUsage ?? event.usage };
             terminal = true;
           } else if (event.type === "error") {
             terminal = true;
-            if (event.code === "auth_required") {
-              throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
-            }
           }
           yield event;
           if (terminal) break;

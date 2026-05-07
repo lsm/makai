@@ -118,7 +118,7 @@ test("agent stream aggregates usage across multiple turns", async () => {
     { type: "event", payload: { type: "turn_start" } },
     { type: "event", payload: { type: "message_end", usage: { input: 11, output: 13, cache_read: 17, cache_write: 19 } } },
     { type: "event", payload: { type: "turn_end", stop_reason: "end_turn" } },
-    { type: "agent_event", payload: { type: "agent_end", stop_reason: "max_turns" } },
+    { type: "agent_event", payload: { type: "agent_end", usage: { input: 11, output: 13 }, stop_reason: "max_turns" } },
   ]);
   const events = await collect(createMakaiAgentApi(transport as never).stream(REQUEST));
   const agentEnd = events.at(-1);
@@ -127,6 +127,56 @@ test("agent stream aggregates usage across multiple turns", async () => {
   assert.deepEqual(agentEnd?.usage, { input: 13, output: 16, cache_read: 22, cache_write: 26 });
   assert.equal(agentEnd?.stop_reason, "max_turns");
   assert.equal(events.filter((event) => event.type === "turn_end").length, 2);
+});
+
+test("agent stream preserves missing aggregate usage as unknown", async () => {
+  const transport = new ScriptedTransport([
+    { type: "agent_started", payload: {} },
+    { type: "agent_event", payload: { type: "agent_start", session_id: "abc" } },
+    { type: "event", payload: { type: "turn_start" } },
+    { type: "event", payload: { type: "message_end", stop_reason: "end_turn" } },
+    { type: "event", payload: { type: "turn_end", stop_reason: "end_turn" } },
+    { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+  ]);
+  const events = await collect(createMakaiAgentApi(transport as never).stream(REQUEST));
+  const agentEnd = events.at(-1);
+
+  assert.equal(agentEnd?.type, "agent_end");
+  assert.equal(agentEnd?.usage, undefined);
+});
+
+test("agent stream auth_required error retries before synthetic agent_start", async () => {
+  const attempts: StdioFrame[][] = [
+    [
+      { type: "agent_started", payload: {} },
+      { type: "event", payload: { type: "error", message: "login required", code: "auth_required", provider_id: "fixture" } },
+    ],
+    [
+      { type: "agent_started", payload: {} },
+      { type: "agent_event", payload: { type: "agent_start", session_id: "abc" } },
+      { type: "event", payload: { type: "message_end", usage: { input: 1, output: 2 } } },
+      { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+    ],
+  ];
+  const transport = new ScriptedTransport([]);
+  transport.nextFrameForSession = async (sessionId: string) => {
+    const agentStartCount = transport.sent.filter((frame) => frame.type === "agent_start").length;
+    const frame = attempts[agentStartCount - 1]?.shift();
+    if (!frame) throw new Error(`no scripted frame for ${sessionId}`);
+    return { session_id: sessionId, ...frame };
+  };
+  const auth = {
+    loginCalls: 0,
+    async listProviders() { return []; },
+    async login() { this.loginCalls += 1; return { status: "success" as const }; },
+  };
+
+  const events = await collect(createMakaiAgentApi(transport as never, { auth, authRetryPolicy: "auto_once" }).stream(REQUEST));
+
+  assert.equal(auth.loginCalls, 1);
+  assert.equal(events[0]?.type, "agent_start");
+  assert.equal(events.at(-1)?.type, "agent_end");
+  assert.equal(events.some((event) => event.type === "error"), false);
 });
 
 test("agent stream single failure emits one error and no agent_end", async () => {
