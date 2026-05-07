@@ -15,8 +15,8 @@ Highest-impact findings:
 1. **I/O interface migration is the main risk.** Makai uses `std.http.Client`, `std.fs.File`, `std.io.getStdIn/getStdOut`, `std.net`, file `reader`/`writer` APIs, and many blocking sleeps/threads. These are directly affected by Zig 0.16.0's `std.Io` migration.
 2. **Thread synchronization APIs used by Makai moved.** Release notes say `std.Thread.Futex`, `std.Thread.Mutex`, `std.Thread.Condition`, `std.Thread.ResetEvent`, and related primitives are replaced by `std.Io.*` equivalents. Makai's `EventStream` and OAuth refresh/auth protocol code rely on these.
 3. **HTTP provider implementations need nontrivial updates.** All provider HTTP clients instantiate `std.http.Client{ .allocator = ... }`; release notes show `std.http.Client` now takes an `io` field and uses a new request flow.
-4. **`std.mem.indexOf*` rename is a high-volume breaking change.** The Zig 0.16.0 release notes list “mem: introduce cut functions; rename 'index of' to 'find'”; Makai has 263 `std.mem.indexOf` calls across 37 files plus related `indexOfScalar`, `indexOfAny`, and `indexOfPos` calls.
-5. **`std.ArrayList` migration risk needs compile verification.** Makai has 240 `std.ArrayList` mentions in `zig/src/**` and hundreds of calls to `append`, `appendSlice`, `toOwnedSlice`, `clearRetainingCapacity`, etc. The 0.16.0 notes discuss unmanaged-container migration for priority queues, while ArrayList deprecation started in 0.15.x; whether Makai's exact aliases are removed in 0.16.0 must be verified by compiling.
+4. **`std.mem.indexOf*` rename is a high-volume breaking change.** The Zig 0.16.0 release notes list “mem: introduce cut functions; rename 'index of' to 'find'”; Makai has 223 direct `std.mem.indexOf(...)` calls across 29 production files, plus 27 related `indexOfScalar`, `indexOfAny`, and `indexOfPos` production call sites.
+5. **`std.ArrayList` migration risk needs compile verification.** Makai has 231 `std.ArrayList` mentions across 43 files in `zig/src/**`. A heuristic scan of locally declared `std.ArrayList` variables found 124 `append(...)` and 94 `appendSlice(...)` production call sites; exact workload still needs compiler-driven verification because some lists are stored in fields or passed through helper APIs. The 0.16.0 notes discuss unmanaged-container migration for priority queues, while ArrayList deprecation started in 0.15.x; whether Makai's exact aliases are removed in 0.16.0 must be verified by compiling.
 6. **Dependency status is mixed, not solved.** The currently pinned libxev commit in `zig/build.zig.zon` targets `0.15.2`. Current libxev appears to compile with Zig 0.16, but it explicitly does **not** implement `std.Io`; issue #219 tracks `std.Io` support and is open.
 7. **No evidence of some feared blockers.** Makai does not use `@cImport`, direct `@Type(...)` reification, `std.heap.ThreadSafeAllocator`, `SegmentedList`, `FixedBufferStream`, `std.os`, `@Vector`, packed structs/unions, or extern structs/unions in `zig/**/*.zig`.
 
@@ -51,9 +51,9 @@ Notable pattern counts:
 | `std.time.timestamp` | 25 occurrences | Release notes list `std.time.timestamp` → `std.Io.Timestamp.now`. |
 | `std.time.nanoTimestamp` | 5 occurrences | Not explicitly listed in release notes; verify with 0.16.0 stdlib. |
 | `std.crypto.random` | 11 occurrences | Release notes say entropy should come from `io.random` / `Io.randomSecure`. |
-| `std.mem.indexOf` | 263 occurrences / 37 files | Release notes list “index of” → `find` rename. |
-| `std.mem.indexOfScalar` and variants | 32 occurrences | Related rename family; verify exact 0.16.0 function names. |
-| `std.ArrayList` | 240 occurrences / 48 files in `zig/src/**` | Container migration risk; ArrayList-specific removal needs compile verification. |
+| `std.mem.indexOf(...)` | 223 occurrences / 29 files in `zig/src/**` | Release notes list “index of” → `find` rename. |
+| `std.mem.indexOfScalar` / `indexOfAny` / `indexOfPos` | 27 occurrences / 10 files in `zig/src/**` | Related rename family; verify exact 0.16.0 function names. |
+| `std.ArrayList` | 231 occurrences / 43 files in `zig/src/**` | Container migration risk; ArrayList-specific removal needs compile verification. |
 | `std.json` | 144 occurrences | Needs validation against 0.16.0 JSON API. |
 | `std.fmt.format` | 5 occurrences | Release notes say `fmt.format` → `std.Io.Writer.print`. |
 | `std.posix` | 27 occurrences | Mostly pipe/env helpers in tests/transports; verify against 0.16.0. |
@@ -251,10 +251,19 @@ Release note basis: the Zig 0.16.0 release notes include “mem: introduce cut f
 
 Makai patterns:
 
-- `std.mem.indexOf`: 263 occurrences across 37 files
-- `std.mem.indexOfScalar`: 23 occurrences
-- `std.mem.indexOfAny`: 3 occurrences
-- `std.mem.indexOfPos`: 6 occurrences
+Production (`zig/src/**`) counts:
+
+- `std.mem.indexOf(...)`: 223 occurrences across 29 files
+- `std.mem.indexOfScalar`: 18 occurrences across 8 files
+- `std.mem.indexOfAny`: 3 occurrences across 2 files
+- `std.mem.indexOfPos`: 6 occurrences across 4 files
+
+Whole Zig tree (`zig/**/*.zig`, including tests) counts for context:
+
+- `std.mem.indexOf(...)`: 231 occurrences across 30 files
+- `std.mem.indexOfScalar`: 23 occurrences across 9 files
+- `std.mem.indexOfAny`: 3 occurrences across 2 files
+- `std.mem.indexOfPos`: 6 occurrences across 4 files
 
 Representative files:
 
@@ -315,9 +324,11 @@ Release note basis: Zig 0.16.0 release notes mention migration to unmanaged cont
 
 Makai patterns:
 
-- `std.ArrayList`: 240 occurrences across 48 files in `zig/src/**`
-- `append`: 310 calls across 35 files
-- `appendSlice`: 154 calls across 25 files
+- `std.ArrayList`: 231 occurrences across 43 files in `zig/src/**`
+- Heuristic ArrayList-specific `append(...)`: 124 calls across 17 files in `zig/src/**`
+- Heuristic ArrayList-specific `appendSlice(...)`: 94 calls across 15 files in `zig/src/**`
+- Broad, non-ArrayList-specific `append(...)`: 310 calls across 35 files in `zig/src/**`; this intentionally overcounts and includes other APIs such as custom string builders, so it should not be used directly for ArrayList migration sizing.
+- Broad, non-ArrayList-specific `appendSlice(...)`: 154 calls across 25 files in `zig/src/**`; also overcounts.
 - `toOwnedSlice`: 36 calls across 19 files
 - `initCapacity`: 23 calls across 13 files
 - `clearRetainingCapacity`: 69 calls across 16 files
