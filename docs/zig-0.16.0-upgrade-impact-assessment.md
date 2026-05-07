@@ -15,15 +15,17 @@ Highest-impact findings:
 1. **I/O interface migration is the main risk.** Makai uses `std.http.Client`, `std.fs.File`, `std.io.getStdIn/getStdOut`, `std.net`, file `reader`/`writer` APIs, and many blocking sleeps/threads. These are directly affected by Zig 0.16.0's `std.Io` migration.
 2. **Thread synchronization APIs used by Makai moved.** Release notes say `std.Thread.Futex`, `std.Thread.Mutex`, `std.Thread.Condition`, `std.Thread.ResetEvent`, and related primitives are replaced by `std.Io.*` equivalents. Makai's `EventStream` and OAuth refresh/auth protocol code rely on these.
 3. **HTTP provider implementations need nontrivial updates.** All provider HTTP clients instantiate `std.http.Client{ .allocator = ... }`; release notes show `std.http.Client` now takes an `io` field and uses a new request flow.
-4. **`std.ArrayList` migration is broad.** Makai has ~240 `std.ArrayList` mentions and hundreds of calls to `append`, `appendSlice`, `toOwnedSlice`, `clearRetainingCapacity`, etc. Zig 0.16.0 continues the managed → unmanaged container migration.
-5. **Dependency status is better than expected, but pinned dependency must move.** The currently pinned libxev commit in `zig/build.zig.zon` targets `0.15.2`, while current libxev README says it builds with Zig 0.16 and has an “Integration with Zig 0.16+ std.Io” section. libxev issue #218 requesting 0.16 support was closed, but the issue itself has no detailed resolution notes.
-6. **No evidence of some feared blockers.** Makai does not use `@cImport`, direct `@Type(...)` reification, `std.heap.ThreadSafeAllocator`, `SegmentedList`, `FixedBufferStream`, `std.os`, `@Vector`, packed structs/unions, or extern structs/unions in `zig/**/*.zig`.
+4. **`std.mem.indexOf*` rename is a high-volume breaking change.** The Zig 0.16.0 release notes list “mem: introduce cut functions; rename 'index of' to 'find'”; Makai has 263 `std.mem.indexOf` calls across 37 files plus related `indexOfScalar`, `indexOfAny`, and `indexOfPos` calls.
+5. **`std.ArrayList` migration risk needs compile verification.** Makai has 240 `std.ArrayList` mentions in `zig/src/**` and hundreds of calls to `append`, `appendSlice`, `toOwnedSlice`, `clearRetainingCapacity`, etc. The 0.16.0 notes discuss unmanaged-container migration for priority queues, while ArrayList deprecation started in 0.15.x; whether Makai's exact aliases are removed in 0.16.0 must be verified by compiling.
+6. **Dependency status is mixed, not solved.** The currently pinned libxev commit in `zig/build.zig.zon` targets `0.15.2`. Current libxev appears to compile with Zig 0.16, but it explicitly does **not** implement `std.Io`; issue #219 tracks `std.Io` support and is open.
+7. **No evidence of some feared blockers.** Makai does not use `@cImport`, direct `@Type(...)` reification, `std.heap.ThreadSafeAllocator`, `SegmentedList`, `FixedBufferStream`, `std.os`, `@Vector`, packed structs/unions, or extern structs/unions in `zig/**/*.zig`.
 
 ## Sources used
 
 - Zig 0.16.0 release notes: <https://ziglang.org/download/0.16.0/release-notes.html>
 - libxev issue #218: <https://github.com/mitchellh/libxev/issues/218>
 - libxev repository README: <https://github.com/mitchellh/libxev>
+- libxev issue #219: <https://github.com/mitchellh/libxev/issues/219>
 - Local code scan in this worktree.
 
 ## Codebase scan methodology
@@ -45,11 +47,13 @@ Notable pattern counts:
 | `std.Thread.ResetEvent` | 2 occurrences | Breaking/migration item. |
 | `std.Thread.spawn` | 33 occurrences | Needs validation; release notes specifically call out sync primitive moves, not necessarily thread spawn removal. |
 | `std.Thread.sleep` | 48 occurrences | Release notes promote `Io.Clock`/timeouts; direct sleep may need API updates. |
-| `std.time.milliTimestamp` | 279 occurrences | Time APIs moved conceptually to `std.Io.Timestamp`; widespread timestamp helper recommended. |
-| `std.time.timestamp` | 25 occurrences | Same. |
-| `std.time.nanoTimestamp` | 5 occurrences | Same. |
+| `std.time.milliTimestamp` | 279 occurrences / 39 files | Not explicitly listed in release notes; needs compile-time verification. |
+| `std.time.timestamp` | 25 occurrences | Release notes list `std.time.timestamp` → `std.Io.Timestamp.now`. |
+| `std.time.nanoTimestamp` | 5 occurrences | Not explicitly listed in release notes; verify with 0.16.0 stdlib. |
 | `std.crypto.random` | 11 occurrences | Release notes say entropy should come from `io.random` / `Io.randomSecure`. |
-| `std.ArrayList` | 240 occurrences | Container migration likely broad. |
+| `std.mem.indexOf` | 263 occurrences / 37 files | Release notes list “index of” → `find` rename. |
+| `std.mem.indexOfScalar` and variants | 32 occurrences | Related rename family; verify exact 0.16.0 function names. |
+| `std.ArrayList` | 240 occurrences / 48 files in `zig/src/**` | Container migration risk; ArrayList-specific removal needs compile verification. |
 | `std.json` | 144 occurrences | Needs validation against 0.16.0 JSON API. |
 | `std.fmt.format` | 5 occurrences | Release notes say `fmt.format` → `std.Io.Writer.print`. |
 | `std.posix` | 27 occurrences | Mostly pipe/env helpers in tests/transports; verify against 0.16.0. |
@@ -238,12 +242,51 @@ Expected work:
 - Replace busy polling sleeps in CLI/protocol harnesses with `Io`-aware sleep/timeouts where possible.
 - Validate whether `std.Thread.spawn` itself remains usable unchanged in 0.16.0. Release notes emphasize moved synchronization primitives more than thread creation, so this may be lower-risk than mutex/futex/time.
 
-Risk level: **medium**, but high-volume.
+Risk level: **medium**, but high-volume. Treat `std.time.timestamp` as confirmed by release notes; treat `milliTimestamp` and `nanoTimestamp` as high-volume **unconfirmed** compatibility checks until Zig 0.16.0 compilation or stdlib source inspection proves removal/renaming.
 
-### 7. Entropy/randomness moved behind `std.Io`
+### 7. `std.mem.indexOf*` renamed to `std.mem.find*`
+
+Severity: **breaking**  
+Release note basis: the Zig 0.16.0 release notes include “mem: introduce cut functions; rename 'index of' to 'find'”.
+
+Makai patterns:
+
+- `std.mem.indexOf`: 263 occurrences across 37 files
+- `std.mem.indexOfScalar`: 23 occurrences
+- `std.mem.indexOfAny`: 3 occurrences
+- `std.mem.indexOfPos`: 6 occurrences
+
+Representative files:
+
+- `zig/src/tool_call_tracker.zig:372`
+- `zig/src/transport.zig:1389`, `:1390`, `:1480`, `:1481`, `:1482`
+- `zig/src/tools/makai.zig:817`, `:818`, `:1434`, `:1435`, `:1436`, `:1490`, `:1495`, `:1498-1501`, `:1522`
+- `zig/src/tools/auth_cli.zig:560`, `:679`, `:734`
+- `zig/src/providers/sse_parser.zig:102`
+- `zig/src/transports/websocket.zig:648`, `:653`, `:657`
+- `zig/src/protocol/model_ref.zig:48`, `:51`, `:57`, `:60`, `:63`, `:66`
+- `zig/src/utils/oauth/anthropic.zig:124`, `:157`
+- `zig/src/utils/oauth/google.zig:134`
+
+Expected work:
+
+- Replace `std.mem.indexOf` with the corresponding `std.mem.find` API.
+- Verify the exact replacements for scalar/pos/any variants against Zig 0.16.0 (`findScalar`, positional start arguments, and any/none equivalents may not be 1:1 by name).
+- Do this before deeper I/O migration because it is high-volume but mostly mechanical and will otherwise obscure more complex compile errors.
+
+Risk level: **medium-high** due to volume, but low conceptual complexity.
+
+### 8. Entropy/randomness moved behind `std.Io`
 
 Severity: **breaking/migration**  
-Release note basis: `std.crypto.random.bytes` and `posix.getrandom` are replaced by `io.random`; `Io.randomSecure` is available for fresh external entropy. `std.crypto.random` becomes `std.Random.IoSource`.
+Release note basis: `std.crypto.random.bytes` and `posix.getrandom` are replaced by `io.random`; `Io.randomSecure` is available for fresh external entropy. The release notes show the explicit `std.Random.IoSource` migration pattern:
+
+```zig
+const rng_impl: std.Random.IoSource = .{ .io = io };
+const rng = rng_impl.interface();
+```
+
+Use that two-step pattern when code needs a `std.Random` interface rather than direct `io.random`/`io.randomSecure` calls.
 
 Affected files:
 
@@ -265,14 +308,14 @@ Expected work:
 
 Risk level: **medium**, with security review required for OAuth and protocol IDs.
 
-### 8. Container migration: managed → unmanaged `std.ArrayList`
+### 9. Container migration: managed → unmanaged `std.ArrayList`
 
-Severity: **breaking/migration**  
-Release note basis: release notes mention migration to unmanaged containers and removal of old container patterns. The exact `ArrayList` details need validation against the 0.16.0 stdlib, but local code already uses the 0.15.2 style `std.ArrayList(T){}` with allocator-passing methods in many places.
+Severity: **unconfirmed breaking/migration risk**  
+Release note basis: Zig 0.16.0 release notes mention migration to unmanaged containers, but the visible release-note item specifically covers `PriorityQueue`/`PriorityDequeue`, not `ArrayList`. The `ArrayList` managed/unmanaged transition started in the 0.15.x timeframe. Therefore this should be treated as a compile-time verification item: Makai's exact `std.ArrayList(T){}` usage may still compile through compatibility aliases, or those aliases may be removed/changed in 0.16.0.
 
 Makai patterns:
 
-- `std.ArrayList`: 240 occurrences across 49 files
+- `std.ArrayList`: 240 occurrences across 48 files in `zig/src/**`
 - `append`: 310 calls across 35 files
 - `appendSlice`: 154 calls across 25 files
 - `toOwnedSlice`: 36 calls across 19 files
@@ -298,7 +341,7 @@ Expected work:
 
 Risk level: **medium-high** due to volume, but likely mechanical.
 
-### 9. Formatting and writer APIs
+### 10. Formatting and writer APIs
 
 Severity: **breaking/deprecated**  
 Release note basis: `fmt.format` → `std.Io.Writer.print`; `Formatter` → `Alt`; `FormatOptions` → `Options`; `bufPrintZ` → `bufPrintSentinel`; `Io.GenericWriter`, `Io.AnyWriter`, `Io.null_writer`, `Io.CountingReader`, `Io.GenericReader`, and `FixedBufferStream` removed.
@@ -320,10 +363,10 @@ Expected work:
 
 Risk level: **medium**. The custom JSON writer is small but central.
 
-### 10. `std.json` parsing/stringification
+### 11. `std.json` parsing/stringification
 
 Severity: **unknown/minor-to-medium**  
-Release note basis: the fetched release-note extraction did not include exact JSON API breakage, but JSON depends on the new I/O/writer model and may have moved stringify APIs.
+Release note basis: I did not find a direct 0.16.0 release-note entry that says `std.json.parseFromSlice` or `std.json.Stringify.valueAlloc` was renamed/removed. However, JSON-adjacent code is still exposed to two confirmed 0.16.0 changes: `fmt.format` → `std.Io.Writer.print`, and broader `Io.Reader`/`Io.Writer` migration seen in other stdlib serialization/compression APIs. Treat JSON parse APIs as unknown until compile-tested, and treat custom JSON serialization as higher risk because it depends on writer APIs.
 
 Makai patterns:
 
@@ -341,7 +384,24 @@ Expected work:
 
 Risk level: **medium** until exact 0.16 JSON API errors are known.
 
-### 11. Process APIs
+### 12. `heap.ArenaAllocator` thread-safety change
+
+Severity: **minor behavioral/performance change**  
+Release note basis: Zig 0.16.0 says `heap.ArenaAllocator` becomes thread-safe and lock-free.
+
+Makai patterns:
+
+- `zig/src/streaming_json.zig:45`: `arena: std.heap.ArenaAllocator`
+- `zig/src/streaming_json.zig:59`: `std.heap.ArenaAllocator.init(allocator)`
+
+Expected work:
+
+- No source change is expected solely from this release-note item.
+- Re-run streaming JSON tests and watch for changed performance or any tests that assumed arena allocation was not thread-safe.
+
+Risk level: **low**.
+
+### 13. Process APIs
 
 Severity: **minor-to-medium**  
 Release note basis: `std.process.Child.*` moved to `std.process.spawn` / `std.process.run`; `std.process.execv` → `std.process.replace`; `main` can receive `std.process.Init`.
@@ -360,7 +420,7 @@ Expected work:
 
 Risk level: **low-to-medium**.
 
-### 12. Build system and package manager
+### 14. Build system and package manager
 
 Severity: **minor-to-medium**  
 Release note basis: `@cImport` deprecated in favor of `b.addTranslateC`; local package overrides supported; packages fetched into a project-local directory; unit test timeouts and diagnostic flags added.
@@ -390,7 +450,7 @@ Expected work:
 
 Risk level: **medium**, mainly because package hash and libxev pin must be coordinated.
 
-### 13. `@import`, module system, and `@cImport`
+### 15. `@import`, module system, and `@cImport`
 
 Severity: **minor** for Makai  
 Release note basis: `@cImport` is deprecated and moved to build-system `addTranslateC`.
@@ -402,7 +462,7 @@ Makai impact:
 
 Risk level: **low**.
 
-### 14. `@Type`, error sets/unions, and comptime introspection
+### 16. `@Type`, error sets/unions, and comptime introspection
 
 Severity: **low-to-medium**  
 Release note basis: direct `@Type` reification is removed and replaced with `@EnumLiteral`, `@Int`, `@Tuple`, `@Pointer`, `@Fn`, `@Struct`, `@Union`, `@Enum`; error sets can no longer be reified; various comptime/type rules changed.
@@ -418,7 +478,7 @@ Makai impact:
   - `zig/src/event_stream.zig:82`
   - `zig/src/owned_slice.zig:52`
   - `zig/src/utils/oom.zig:11`, `:13`
-- `zig/src/utils/oom.zig:11` uses `@typeInfo(@TypeOf(value)).error_union.payload`; this may need enum-field spelling updates if `@typeInfo` tags changed in 0.16.0.
+- `zig/src/utils/oom.zig:11` uses `@typeInfo(@TypeOf(value)).error_union.payload`; line 13 stores `const info = @typeInfo(T);`. These may need enum-field spelling updates if `@typeInfo` tags changed in 0.16.0.
 
 Expected work:
 
@@ -427,7 +487,7 @@ Expected work:
 
 Risk level: **low-to-medium**.
 
-### 15. Packed types, vectors, C interop, ABI
+### 17. Packed types, vectors, C interop, ABI
 
 Severity: **low** for Makai  
 Release note basis: 0.16.0 changes packed union/struct behavior, forbids pointers in packed types, changes extern validity for inferred backing/tag types, forbids runtime vector indexes, and changes alignment/type coercion behavior.
@@ -451,14 +511,16 @@ Current Makai pin:
 Research findings:
 
 - libxev issue #218 requested Zig 0.16.0 support on 2026-04-14 after the Zig release. The issue is closed, with no detailed public discussion visible in the issue page extraction.
-- Current libxev README explicitly mentions “Integration with Zig 0.16+ std.Io” and says builds require Zig 0.16. This suggests upstream libxev now supports 0.16.x.
+- Current libxev README indicates libxev is Zig 0.16-aware/buildable, but it explicitly says libxev **does not implement** the `std.Io` interface and does not accept `std.Io` for operations; it calls I/O directly.
+- libxev issue #219, “Implement std.Io interface,” is open. That means upstream `std.Io` integration is not available today.
 
 Impact:
 
 - The currently pinned commit/hash probably should be replaced with a current 0.16-compatible libxev commit or release.
-- Because libxev now integrates with `std.Io`, Makai should decide whether to use libxev directly as an `std.Io` backend or continue using existing thread/blocking abstractions initially.
+- Makai should **not** plan on using libxev directly as a `std.Io` backend during the initial Zig 0.16 upgrade unless the project implements/maintains that adapter itself or waits for upstream issue #219.
+- If Makai wants full `std.Io` integration, libxev is a dependency risk rather than a ready-made solution.
 
-Risk level: **medium**. Not a hard blocker, but dependency pin/hash update is required.
+Risk level: **medium-high**. Compiling libxev with Zig 0.16 appears feasible, but `std.Io` integration remains an open upstream feature request.
 
 ### Other dependencies
 
@@ -471,6 +533,7 @@ No other dependencies are declared in `zig/build.zig.zon`.
 - Update `zig/build.zig.zon` version and dependency hash.
 - Compile against Zig 0.16.0 and collect first-pass errors.
 - Fix process/env/args call sites if signatures changed.
+- Replace `std.mem.indexOf*` calls with the new `std.mem.find*` family.
 - Replace `std.fmt.format` call sites.
 - Validate `@typeInfo` and `@hasDecl` call sites.
 
@@ -478,7 +541,7 @@ Estimated effort: **0.5-1 day**.
 
 ### Medium work items
 
-- Update `std.ArrayList` usage across providers/protocol/CLI.
+- Verify and update `std.ArrayList` usage across providers/protocol/CLI if 0.16.0 removes or changes the compatibility aliases.
 - Migrate custom JSON writer and JSON stringify/parse drift.
 - Add project wrappers for time, sleep, random, and file helpers.
 - Port OAuth storage filesystem operations.
@@ -518,7 +581,7 @@ Recommended sequence:
 
 3. **Core/std migration**
    - Port `EventStream` futex/mutex code.
-   - Port `ArrayList` and custom writer APIs.
+   - Port `std.mem.indexOf*`, `ArrayList`, and custom writer APIs.
    - Port time/random wrappers.
 
 4. **I/O stack migration**
@@ -537,7 +600,7 @@ Recommended sequence:
    - Run mock-based E2E protocol tests (`zig build test-e2e-protocol`).
    - Per standing instruction, skip external provider E2E unless separately requested/configured.
 
-Recommendation: **avoid attempting to redesign all of Makai around evented I/O in the first upgrade PR**. First get functional parity using the simplest supported `std.Io` backend, then follow up with targeted `std.Io`/libxev integration improvements.
+Recommendation: **avoid attempting to redesign all of Makai around evented I/O in the first upgrade PR**. First get functional parity using the simplest supported `std.Io` backend, then follow up with targeted I/O improvements. Do not assume libxev can serve as that backend until upstream issue #219 is resolved or Makai owns an adapter.
 
 ## Upgrade checklist
 
@@ -556,7 +619,8 @@ Recommendation: **avoid attempting to redesign all of Makai around evented I/O i
 - [ ] Port provider HTTP streaming loops.
 - [ ] Port OAuth HTTP flows and callback server.
 - [ ] Port WebSocket transport.
-- [ ] Fix `std.ArrayList` method/signature changes.
+- [ ] Replace `std.mem.indexOf*` with the 0.16.0 `std.mem.find*` family.
+- [ ] Verify and fix `std.ArrayList` method/signature changes.
 - [ ] Fix formatting/writer APIs in custom JSON writer.
 - [ ] Validate `std.json` parse/stringify APIs.
 - [ ] Run all grouped unit tests and mock E2E protocol tests.
@@ -566,5 +630,6 @@ Recommendation: **avoid attempting to redesign all of Makai around evented I/O i
 1. Which `std.Io` backend should Makai use by default in CLI and tests: `Io.Threaded`, `Io.Dispatch`, or another backend?
 2. Should provider APIs accept an explicit `std.Io` parameter, or should the registry/context own a default I/O instance?
 3. Should `CancelToken` and `EventStream` remain atomics/futex-based, or be redesigned around `std.Io.Queue`, `Io.Event`, or `Io.Group`?
-4. Should libxev become the primary event-loop backend for transports in 0.16, or remain only an optional dependency while initial migration uses Zig stdlib I/O?
+4. Should Makai wait for libxev issue #219, implement its own libxev-to-`std.Io` adapter, or keep libxev independent of `std.Io` for the initial upgrade?
 5. Do public Makai APIs need to stay source-compatible for downstream users, or can they change to pass `std.Io` explicitly?
+6. Does `std.time.milliTimestamp` still exist in Zig 0.16.0, or should Makai introduce a `Timestamp.now`-based millisecond wrapper?
