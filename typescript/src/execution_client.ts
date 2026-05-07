@@ -998,7 +998,15 @@ async function withAuthRetry<T>(
         throw loginError;
       }
       options.beforeRetry?.();
-      return await operation();
+      try {
+        return await operation();
+      } catch (retryError) {
+        if (isRetryableAuthError(retryError)) {
+          const retryProviderId = retryError.provider_id ?? providerId;
+          throw authRequiredError(retryProviderId, retryError.message);
+        }
+        throw retryError;
+      }
     }
     if (isRetryableAuthError(error)) {
       const providerId = error.provider_id ?? options.fallbackProviderId;

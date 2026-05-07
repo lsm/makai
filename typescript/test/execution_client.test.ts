@@ -8,6 +8,7 @@ import {
   createMakaiClient,
   createMakaiProviderApi,
   MakaiStdioClient,
+  MakaiAuthRequiredError,
   MakaiStreamError,
   type AgentStreamEvent,
   type ProviderStreamEvent,
@@ -552,6 +553,31 @@ test("client.provider.stream auto_once retries on auth_required nack and yields 
   }
 });
 
+test("client.provider.complete auto_once retries at most once when auth_required persists", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-complete-limit-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ALWAYS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.provider.complete(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "complete_request").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.provider.stream auto_once retries at most once when auth_required persists", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-stream-limit-test-"));
   const logPath = path.join(tmpDir, "request.log");
@@ -608,6 +634,31 @@ test("client.agent.run auto_once retries on auth_required nack and succeeds", as
     assert.equal(agentStarts.length, 2);
     const loginStarts = logged.filter((entry) => entry.type === "auth_login_start");
     assert.equal(loginStarts.length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run auto_once retries at most once when auth_required persists", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-limit-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ALWAYS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.agent.run(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_start").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
