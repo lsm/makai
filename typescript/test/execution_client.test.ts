@@ -94,21 +94,21 @@ test("client.provider.complete resolves with correct CompletionResponse shape", 
   }
 });
 
-test("client.provider.complete preserves non-canonical model_ref with fallback model fields", async () => {
+test("client.provider.complete keeps routing fields for non-canonical model_ref", async () => {
   const harness = await setupHarness();
   try {
     const provider = createMakaiProviderApi(harness.client);
-    await provider.complete({ ...request(), model_ref: "opaque-model-ref-with:colon" });
+    await provider.complete({ ...request(), model_ref: "anthropic/anthropic-messages@opaque-model-ref-with:colon" });
 
     const payload = readLoggedRequests(harness.logPath)[0]?.payload as Record<string, unknown>;
     assert.deepEqual(payload.model, {
       id: "opaque-model-ref-with:colon",
       name: "opaque-model-ref-with:colon",
-      api: "",
-      provider: "",
+      api: "anthropic-messages",
+      provider: "anthropic",
       base_url: "",
     });
-    assert.equal(payload.model_ref, "opaque-model-ref-with:colon");
+    assert.equal(payload.model_ref, "anthropic/anthropic-messages@opaque-model-ref-with:colon");
   } finally {
     await harness.cleanup();
   }

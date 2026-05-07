@@ -388,6 +388,24 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
       base_url: "",
     };
   } catch {
+    // Best-effort: extract provider/api even when model_id is non-canonical
+    // so the runtime has routing metadata for opaque server-issued handles.
+    const slashIndex = modelRef.indexOf("/");
+    const atIndex = modelRef.indexOf("@");
+    if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
+      const provider = modelRef.slice(0, slashIndex);
+      const api = modelRef.slice(slashIndex + 1, atIndex);
+      const id = modelRef.slice(atIndex + 1);
+      if (provider.length > 0 && api.length > 0) {
+        return {
+          id,
+          name: id,
+          api,
+          provider,
+          base_url: "",
+        };
+      }
+    }
     return opaqueModel(modelRef);
   }
 }
