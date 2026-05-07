@@ -58,6 +58,7 @@ export class MakaiStdioClient {
   private frameQueue: StdioFrame[] = [];
   private frameWaiters: PendingFrameWaiter[] = [];
   private streamFrameQueues = new Map<string, StreamQueueEntry[]>();
+  private sessionFrameQueues = new Map<string, StreamQueueEntry[]>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
   constructor(options: MakaiStdioClientOptions) {
@@ -133,8 +134,8 @@ export class MakaiStdioClient {
     const queued = this.dequeueStreamFrame(streamId);
     if (queued) return queued;
 
-    const deadline = Date.now() + timeoutMs;
     return this.withStreamReadLock(async () => {
+      const deadline = Date.now() + timeoutMs;
       while (true) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
@@ -155,10 +156,44 @@ export class MakaiStdioClient {
         }
         const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
         if (frameStreamId === streamId) return frame;
-        if (frameStreamId) {
-          this.enqueueStreamFrame(frameStreamId, frame);
+        this.enqueueRoutableFrame(frame);
+        // Frames without stream_id/session_id cannot be routed to a targeted waiter.
+      }
+    });
+  }
+
+  async nextFrameForSession(sessionId: string, timeoutMs = 1000): Promise<StdioFrame> {
+    if (sessionId.length === 0) {
+      throw new Error("sessionId is required");
+    }
+
+    const queued = this.dequeueSessionFrame(sessionId);
+    if (queued) return queued;
+
+    return this.withStreamReadLock(async () => {
+      const deadline = Date.now() + timeoutMs;
+      while (true) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
         }
-        // Frames without stream_id cannot be routed to a stream-specific waiter.
+
+        const queued = this.dequeueSessionFrame(sessionId);
+        if (queued) return queued;
+
+        let frame: StdioFrame;
+        try {
+          frame = await this.nextFrame(remainingMs);
+        } catch (error) {
+          if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
+            throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
+          }
+          throw error;
+        }
+        const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
+        if (frameSessionId === sessionId) return frame;
+        this.enqueueRoutableFrame(frame);
+        // Frames without stream_id/session_id cannot be routed to a targeted waiter.
       }
     });
   }
@@ -186,30 +221,55 @@ export class MakaiStdioClient {
   }
 
   private dequeueStreamFrame(streamId: string): StdioFrame | undefined {
-    this.pruneExpiredStreamFrames();
-    const queued = this.streamFrameQueues.get(streamId);
+    return this.dequeueRoutedFrame(this.streamFrameQueues, streamId);
+  }
+
+  private dequeueSessionFrame(sessionId: string): StdioFrame | undefined {
+    return this.dequeueRoutedFrame(this.sessionFrameQueues, sessionId);
+  }
+
+  private dequeueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string): StdioFrame | undefined {
+    this.pruneExpiredRoutedFrames();
+    const queued = queues.get(id);
     if (!queued || queued.length === 0) return undefined;
     const entry = queued.shift()!;
-    if (queued.length === 0) this.streamFrameQueues.delete(streamId);
+    if (queued.length === 0) queues.delete(id);
     return entry.frame;
   }
 
-  private enqueueStreamFrame(streamId: string, frame: StdioFrame): void {
-    this.pruneExpiredStreamFrames();
-    const queued = this.streamFrameQueues.get(streamId) ?? [];
-    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
-    this.streamFrameQueues.set(streamId, queued);
+  private enqueueRoutableFrame(frame: StdioFrame): void {
+    const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
+    if (frameStreamId) {
+      this.enqueueRoutedFrame(this.streamFrameQueues, frameStreamId, frame);
+      return;
+    }
+    const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
+    if (frameSessionId) {
+      this.enqueueRoutedFrame(this.sessionFrameQueues, frameSessionId, frame);
+    }
   }
 
-  private pruneExpiredStreamFrames(now = Date.now()): void {
-    for (const [streamId, queued] of this.streamFrameQueues) {
+  private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame): void {
+    this.pruneExpiredRoutedFrames();
+    const queued = queues.get(id) ?? [];
+    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
+    queues.set(id, queued);
+  }
+
+  private pruneExpiredRoutedFrames(now = Date.now()): void {
+    this.pruneExpiredQueue(this.streamFrameQueues, now);
+    this.pruneExpiredQueue(this.sessionFrameQueues, now);
+  }
+
+  private pruneExpiredQueue(queues: Map<string, StreamQueueEntry[]>, now: number): void {
+    for (const [id, queued] of queues) {
       const unexpired = queued.filter((entry) => entry.expiresAt > now);
       if (unexpired.length > 0) {
         if (unexpired.length !== queued.length) {
-          this.streamFrameQueues.set(streamId, unexpired);
+          queues.set(id, unexpired);
         }
       } else {
-        this.streamFrameQueues.delete(streamId);
+        queues.delete(id);
       }
     }
   }

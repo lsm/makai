@@ -5,9 +5,10 @@ export {
   type CreateMakaiStdioClientOptions,
   type MakaiStdioClientOptions,
   type StdioFrame,
-  // Deprecated aliases retained for backward compatibility with older imports.
-  type CreateMakaiClientOptions,
-  type MakaiClientOptions,
+  // Deprecated aliases retained under transport-specific names to avoid
+  // colliding with the unified high-level client factory options.
+  type CreateMakaiClientOptions as DeprecatedCreateMakaiStdioClientOptions,
+  type MakaiClientOptions as DeprecatedMakaiStdioClientOptions,
 } from "./stdio_client";
 
 export { resolveMakaiBinary, type BinaryResolverOptions } from "./binary_resolver";
@@ -33,6 +34,41 @@ export {
   createMakaiModelsApi,
   type ModelsApiOptions,
 } from "./models_client";
+
+export {
+  createMakaiAgentApi,
+  createMakaiClient,
+  createMakaiProviderApi,
+  type CreateMakaiClientOptions,
+  type MakaiClient,
+} from "./execution_client";
+
+export {
+  MakaiStreamError,
+  type AgentRunRequest,
+  type AgentRunResponse,
+  type AgentStreamEvent,
+  type AuthRetryPolicy,
+  type ChatMessage,
+  type CompletionResponse,
+  type ContentPart,
+  type ImageContentPart,
+  type MakaiAgentApi,
+  type MakaiClientOptions,
+  type MakaiProviderApi,
+  type MakaiStreamErrorKind,
+  type ProviderCompleteRequest,
+  type ProviderCompleteResponse,
+  type ProviderStreamEvent,
+  type RunOptions,
+  type StopReason,
+  type TextContentPart,
+  type ThinkingContentPart,
+  type ToolCallContentPart,
+  type ToolDefinition,
+  type ToolResultContentPart,
+  type UsageSummary,
+} from "./execution_types";
 export {
   MakaiProtocolError,
   // Note: `AuthStatus` and `ProviderId` are re-exported from `./auth_protocol`
