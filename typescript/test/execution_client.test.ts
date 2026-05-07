@@ -731,7 +731,7 @@ test("manual auth_retry_policy does not retry on auth_required", async () => {
   }
 });
 
-test("auto_once falls back to original auth_required error when login fails", async () => {
+test("auto_once normalizes login failure to auth_required with partial handlers", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-fail-test-"));
   const logPath = path.join(tmpDir, "request.log");
   const handle = await createMakaiClient({
@@ -740,12 +740,12 @@ test("auto_once falls back to original auth_required error when login fails", as
     env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRES_PROMPT: "1" },
     handshakeTimeoutMs: 5000,
     responseTimeoutMs: 5000,
-    auth: { auth_retry_policy: "auto_once" },
+    auth: { auth_retry_policy: "auto_once", handlers: { onEvent: () => undefined } },
   });
   try {
     await assert.rejects(
       () => handle.provider.complete(request()),
-      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic",
     );
     const logged = readLoggedRequests(logPath);
     const completeRequests = logged.filter((entry) => entry.type === "complete_request");

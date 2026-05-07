@@ -123,11 +123,8 @@ class StdioProviderApi implements MakaiProviderApi {
           if (providerId) {
             try {
               await this.auth.login(providerId, this.authHandlers);
-            } catch (loginError) {
-              if (this.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
-                throw authRequiredError(providerId, error.message);
-              }
-              throw loginError;
+            } catch {
+              throw authRequiredError(providerId, error.message);
             }
             retried = true;
             attempt = this.streamAttempt(request, effectivePolicy);
@@ -264,11 +261,8 @@ class StdioAgentApi implements MakaiAgentApi {
           if (providerId) {
             try {
               await this.auth.login(providerId, this.authHandlers);
-            } catch (loginError) {
-              if (this.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
-                throw authRequiredError(providerId, error.message);
-              }
-              throw loginError;
+            } catch {
+              throw authRequiredError(providerId, error.message);
             }
             retried = true;
             streamRequest = {
@@ -949,10 +943,6 @@ function authRequiredError(providerId: string, message: string): MakaiAuthRequir
   return new MakaiAuthRequiredError(providerId, message);
 }
 
-function isInteractiveAuthWithoutHandlers(error: unknown): boolean {
-  return error instanceof Error && /no onPrompt handler configured/.test(error.message);
-}
-
 function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunRequest): string | undefined {
   // model_ref is opaque per spec, but canonical refs carry provider info.
   // We derive a fallback provider_id for auth retry only when the runtime
@@ -991,11 +981,8 @@ async function withAuthRetry<T>(
       if (!providerId) throw error;
       try {
         await options.auth.login(providerId, options.authHandlers);
-      } catch (loginError) {
-        if (options.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
-          throw authRequiredError(providerId, error.message);
-        }
-        throw loginError;
+      } catch {
+        throw authRequiredError(providerId, error.message);
       }
       options.beforeRetry?.();
       try {
