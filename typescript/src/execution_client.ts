@@ -1,7 +1,5 @@
+import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
-// nanoid is ESM-only; ts-ignore lets us require it in a CJS build.
-// @ts-ignore
-import { customAlphabet } from "nanoid";
 import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
@@ -29,7 +27,14 @@ import {
 const ENVELOPE_VERSION = 1;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
 const NANO_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const nanoid = customAlphabet(NANO_ID_ALPHABET, 21);
+
+function generateNanoId(): string {
+  let id = "";
+  for (let i = 0; i < 21; i++) {
+    id += NANO_ID_ALPHABET[randomInt(NANO_ID_ALPHABET.length)];
+  }
+  return id;
+}
 
 type ExecutionOptions = {
   responseTimeoutMs?: number;
@@ -395,7 +400,7 @@ function executionContext(request: ProviderCompleteRequest | AgentRunRequest): R
 
 function agentSessionId(request: AgentRunRequest): string {
   const sessionId = request.options?.session_id;
-  if (sessionId === undefined) return nanoid();
+  if (sessionId === undefined) return generateNanoId();
   if (!isNanoId(sessionId)) {
     throw new TypeError("request.options.session_id must be a 21-character alphanumeric NanoID for agent transport");
   }
