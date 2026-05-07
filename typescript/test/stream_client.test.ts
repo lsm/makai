@@ -145,6 +145,35 @@ test("agent stream preserves missing aggregate usage as unknown", async () => {
   assert.equal(agentEnd?.usage, undefined);
 });
 
+test("agent stream preserves unknown cache usage while aggregating turns", async () => {
+  const transport = new ScriptedTransport([
+    { type: "agent_started", payload: {} },
+    { type: "agent_event", payload: { type: "agent_start", session_id: "abc" } },
+    { type: "event", payload: { type: "message_end", usage: { input: 2, output: 3 } } },
+    { type: "event", payload: { type: "message_end", usage: { input: 5, output: 7 } } },
+    { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+  ]);
+  const events = await collect(createMakaiAgentApi(transport as never).stream(REQUEST));
+  const agentEnd = events.at(-1);
+
+  assert.equal(agentEnd?.type, "agent_end");
+  assert.deepEqual(agentEnd?.usage, { input: 7, output: 10 });
+});
+
+test("agent stream parses event_type encoded lifecycle events", async () => {
+  const transport = new ScriptedTransport([
+    { type: "agent_started", payload: {} },
+    { type: "event", event_type: "turn_start" },
+    { type: "event", payload: { event: { event_type: "turn_end", stop_reason: "tool_use" } } },
+    { type: "event", event_type: "agent_end", payload: { stop_reason: "end_turn" } },
+  ]);
+  const events = await collect(createMakaiAgentApi(transport as never).stream(REQUEST));
+
+  assert.deepEqual(events.map((event) => event.type), ["agent_start", "turn_start", "turn_end", "agent_end"]);
+  assert.deepEqual(events[2], { type: "turn_end", stop_reason: "tool_use" });
+  assert.deepEqual(events.at(-1), { type: "agent_end", stop_reason: "end_turn" });
+});
+
 test("agent stream auth_required error retries before synthetic agent_start", async () => {
   const attempts: StdioFrame[][] = [
     [
