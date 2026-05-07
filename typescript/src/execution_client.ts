@@ -47,7 +47,7 @@ type ExecutionOptions = {
 export interface MakaiClient {
   auth: MakaiAuthApi;
   models: MakaiModelsApi;
-  agent: MakaiAgentApi;
+  agent: MakaiAgentModelsApi;
   provider: MakaiProviderApi;
   close(): Promise<void>;
 }
@@ -66,6 +66,19 @@ export function createMakaiAgentApi(
   options: ExecutionOptions = {},
 ): MakaiAgentApi {
   return new StdioAgentApi(transport, options);
+}
+
+export interface MakaiAgentModelsApi extends MakaiAgentApi {
+  models: MakaiModelsApi;
+}
+
+export function createMakaiAgentApiWithModels(
+  transport: MakaiStdioClient,
+  options: ExecutionOptions = {},
+): MakaiAgentModelsApi {
+  return Object.assign(new StdioAgentApi(transport, options), {
+    models: createMakaiModelsApi(transport, { responseTimeoutMs: options.responseTimeoutMs }),
+  });
 }
 
 class StdioProviderApi implements MakaiProviderApi {
@@ -1017,7 +1030,7 @@ export async function createMakaiClient(options: CreateMakaiClientOptions = {}):
   return {
     auth: authClient,
     models: createMakaiModelsApi(transport, { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs }),
-    agent: createMakaiAgentApi(transport, executionOptions),
+    agent: createMakaiAgentApiWithModels(transport, executionOptions),
     provider: createMakaiProviderApi(transport, executionOptions),
     close: () => transport.close(),
   };

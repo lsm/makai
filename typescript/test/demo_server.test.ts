@@ -72,7 +72,7 @@ test("demo: serves UI and metadata", async () => {
   }
 });
 
-test("demo: chat endpoint supports fixture provider", async () => {
+test("demo: chat endpoint uses provider-agnostic SDK stream path for fixture provider", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
   const logPath = path.join(tempHome, "request.log");
   const running = await startDemoServer({
@@ -101,6 +101,8 @@ test("demo: chat endpoint supports fixture provider", async () => {
     const streamRequest = requests.find((request) => request.type === "stream_request");
     assert.ok(streamRequest);
     assert.equal((streamRequest.payload as { model_ref?: string }).model_ref, "test-fixture/test-fixture@fixture-echo-v1");
+    assert.equal((streamRequest.payload as { context?: { messages?: unknown[] } }).context?.messages?.length, 1);
+    assert.equal((streamRequest.payload as { options?: { auth_retry_policy?: string } }).options?.auth_retry_policy, "manual");
   } finally {
     await running.close();
     await fs.rm(tempHome, { recursive: true, force: true });
