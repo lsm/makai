@@ -134,8 +134,8 @@ export class MakaiStdioClient {
     const queued = this.dequeueStreamFrame(streamId);
     if (queued) return queued;
 
-    const deadline = Date.now() + timeoutMs;
     return this.withStreamReadLock(async () => {
+      const deadline = Date.now() + timeoutMs;
       while (true) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {
@@ -170,8 +170,8 @@ export class MakaiStdioClient {
     const queued = this.dequeueSessionFrame(sessionId);
     if (queued) return queued;
 
-    const deadline = Date.now() + timeoutMs;
     return this.withStreamReadLock(async () => {
+      const deadline = Date.now() + timeoutMs;
       while (true) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) {

@@ -137,7 +137,12 @@ rl.on("line", (line) => {
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
-    if (agentError) {
+    if (process.env.MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON) {
+      emit(frame(env, "agent_result", { result_json: "not-json" }, 3));
+    } else if (process.env.MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON) {
+      emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
+      emit(frame(env, "agent_event", { event_json: "not-json" }, 4));
+    } else if (agentError) {
       emit(frame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
       emit(frame(env, "agent_result", { result_json: JSON.stringify(agentResult) }, 3));

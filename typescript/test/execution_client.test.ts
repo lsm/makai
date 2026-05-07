@@ -422,6 +422,32 @@ test("agent stream error paths throw MakaiStreamError", async () => {
   }
 });
 
+test("client.agent.run throws MakaiStreamError on malformed result_json", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "malformed JSON in result_json" && err.kind === "transport_error",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.stream throws MakaiStreamError on malformed event_json", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      async () => collect(agent.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "malformed JSON in event_json" && err.kind === "transport_error",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("createMakaiClient wires all namespaces correctly", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-client-wiring-test-"));
   const logPath = path.join(tmpDir, "request.log");

@@ -770,8 +770,12 @@ function readJsonStringPayload(frame: StdioFrame, key: string): Record<string, u
   const payload = readPayloadOrFrame(frame);
   const json = payload[key] ?? payload.event_json ?? payload.result_json;
   if (typeof json === "string") {
-    const parsed = JSON.parse(json) as unknown;
-    return isObject(parsed) ? parsed : {};
+    try {
+      const parsed = JSON.parse(json) as unknown;
+      return isObject(parsed) ? parsed : {};
+    } catch {
+      throw new MakaiStreamError(`malformed JSON in ${key}`, { kind: "transport_error" });
+    }
   }
   return payload;
 }
