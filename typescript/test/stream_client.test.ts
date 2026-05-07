@@ -144,7 +144,7 @@ test("agent stream single failure emits one error and no agent_end", async () =>
   assert.equal(events.some((event) => event.type === "agent_end"), false);
 });
 
-test("MakaiStreamError is thrown on async iterator failure", async () => {
+test("MakaiStreamError is thrown on provider async iterator failure", async () => {
   const transport = new ScriptedTransport([], new Error("transport failed"));
   const iterable = createMakaiProviderApi(transport as never).stream(REQUEST);
 
@@ -154,6 +154,19 @@ test("MakaiStreamError is thrown on async iterator failure", async () => {
       error instanceof MakaiStreamError &&
       error.kind === "transport_error" &&
       error.message === "transport failed",
+  );
+});
+
+test("MakaiStreamError is thrown on agent async iterator failure", async () => {
+  const transport = new ScriptedTransport([], new Error("agent transport failed"));
+  const iterable = createMakaiAgentApi(transport as never).stream(REQUEST);
+
+  await assert.rejects(
+    async () => collect(iterable),
+    (error: unknown) =>
+      error instanceof MakaiStreamError &&
+      error.kind === "transport_error" &&
+      error.message === "agent transport failed",
   );
 });
 
