@@ -52,7 +52,7 @@ Notable pattern counts:
 | `std.time.nanoTimestamp` | 5 occurrences | Not explicitly listed in release notes; verify with 0.16.0 stdlib. |
 | `std.crypto.random` | 11 occurrences | Release notes say entropy should come from `io.random` / `Io.randomSecure`. |
 | `std.mem.indexOf(...)` | 223 occurrences / 29 files in `zig/src/**` | Release notes list “index of” → `find` rename. |
-| `std.mem.indexOfScalar` / `indexOfAny` / `indexOfPos` | 27 occurrences / 10 files in `zig/src/**` | Related rename family; verify exact 0.16.0 function names. |
+| `std.mem.indexOfScalar` / `indexOfAny` / `indexOfPos` | 27 occurrences / 13 files in `zig/src/**` | Related rename family; verify exact 0.16.0 function names. |
 | `std.ArrayList` | 231 occurrences / 43 files in `zig/src/**` | Container migration risk; ArrayList-specific removal needs compile verification. |
 | `std.json` | 144 occurrences | Needs validation against 0.16.0 JSON API. |
 | `std.fmt.format` | 5 occurrences | Release notes say `fmt.format` → `std.Io.Writer.print`. |
@@ -152,7 +152,7 @@ Makai patterns:
 - `std.fs.openFileAbsolute` in `zig/test/e2e/test_helpers.zig:282`, `:366`, `:479`, `:599`
 - `std.fs.File` in CLI harness and stdio abstractions, especially `zig/src/tools/makai.zig`
 - `file.readToEndAlloc(...)` in `zig/src/utils/oauth/storage.zig:62` and test helper files
-- `file.writeAll(...)` appears 107 times, mostly CLI/protocol/test utilities.
+- `file.writeAll(...)` appears 16 times across 4 production files. A broader `.writeAll(...)` scan finds 107 production call sites across 10 files, but that includes non-filesystem writers/streams and should not be used as the filesystem migration size.
 
 Expected work:
 
@@ -327,10 +327,10 @@ Makai patterns:
 - `std.ArrayList`: 231 occurrences across 43 files in `zig/src/**`
 - Heuristic ArrayList-specific `append(...)`: 124 calls across 17 files in `zig/src/**`
 - Heuristic ArrayList-specific `appendSlice(...)`: 94 calls across 15 files in `zig/src/**`
-- Broad, non-ArrayList-specific `append(...)`: 310 calls across 35 files in `zig/src/**`; this intentionally overcounts and includes other APIs such as custom string builders, so it should not be used directly for ArrayList migration sizing.
-- Broad, non-ArrayList-specific `appendSlice(...)`: 154 calls across 25 files in `zig/src/**`; also overcounts.
-- `toOwnedSlice`: 36 calls across 19 files
-- `initCapacity`: 23 calls across 13 files
+- Broad, non-ArrayList-specific `append(...)`: 307 calls across 32 files in `zig/src/**`; this intentionally overcounts and includes other APIs such as custom string builders, so it should not be used directly for ArrayList migration sizing.
+- Broad, non-ArrayList-specific `appendSlice(...)`: 148 calls across 22 files in `zig/src/**`; also overcounts.
+- `.toOwnedSlice(...)`: 35 calls across 18 files in `zig/src/**`
+- `.initCapacity(...)`: 20 calls across 10 files in `zig/src/**`
 - `clearRetainingCapacity`: 69 calls across 16 files
 
 Representative high-volume files:
