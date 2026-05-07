@@ -154,6 +154,17 @@ export class MakaiStreamError extends Error {
   }
 }
 
+export class MakaiAuthRequiredError extends MakaiStreamError {
+  public readonly code = "auth_required";
+  public readonly provider_id: ProviderId;
+
+  constructor(providerId: ProviderId, message = `authentication required for provider ${providerId}`) {
+    super(message, { kind: "provider_error", code: "auth_required", provider_id: providerId });
+    this.name = "MakaiAuthRequiredError";
+    this.provider_id = providerId;
+  }
+}
+
 export interface MakaiClientOptions {
   auth?: {
     auth_retry_policy?: AuthRetryPolicy;

@@ -44,6 +44,7 @@ export {
 } from "./execution_client";
 
 export {
+  MakaiAuthRequiredError,
   MakaiStreamError,
   type AgentRunRequest,
   type AgentRunResponse,
@@ -69,6 +70,7 @@ export {
   type ToolResultContentPart,
   type UsageSummary,
 } from "./execution_types";
+
 export {
   MakaiProtocolError,
   // Note: `AuthStatus` and `ProviderId` are re-exported from `./auth_protocol`
