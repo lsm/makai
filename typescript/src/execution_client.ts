@@ -90,11 +90,12 @@ class StdioProviderApi implements MakaiProviderApi {
 
   private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<ProviderCompleteResponse> {
     const streamId = ulid();
+    const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     while (true) {
       const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
       if (frame.type === "ack") continue;
-      if (frame.type === "nack") throw nackToStreamError(frame);
+      if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "stream_error") throw streamErrorFrameToError(frame);
       if (frame.type === "result" || frame.type === "complete_response") {
         return parseCompletionResponse(frame.payload ?? frame);
@@ -140,6 +141,7 @@ class StdioProviderApi implements MakaiProviderApi {
 
   private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<ProviderStreamEvent> {
     const streamId = ulid();
+    const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -147,7 +149,7 @@ class StdioProviderApi implements MakaiProviderApi {
       while (!terminal) {
         const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
         if (frame.type === "ack") continue;
-        if (frame.type === "nack") throw nackToStreamError(frame);
+        if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         const event = normalizeProviderFrame(frame, toolBuffers);
         if (!event) continue;
         if (event.type === "error") {
@@ -199,6 +201,7 @@ class StdioAgentApi implements MakaiAgentApi {
 
   private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<AgentRunResponse> {
     const sessionId = agentSessionId(request);
+    const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -206,7 +209,7 @@ class StdioAgentApi implements MakaiAgentApi {
     while (true) {
       const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
       if (frame.type === "ack") continue;
-      if (frame.type === "nack") throw nackToStreamError(frame);
+      if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
       if (frame.type === "agent_started") {
         if (!messageSent) {
@@ -272,6 +275,7 @@ class StdioAgentApi implements MakaiAgentApi {
 
   private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<AgentStreamEvent> {
     const sessionId = agentSessionId(request);
+    const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     let terminal = false;
     let messageSent = false;
@@ -280,7 +284,7 @@ class StdioAgentApi implements MakaiAgentApi {
       while (!terminal) {
         const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
         if (frame.type === "ack") continue;
-        if (frame.type === "nack") throw nackToStreamError(frame);
+        if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         if (frame.type === "agent_started" && !messageSent) {
           this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy)));
           messageSent = true;
@@ -788,12 +792,17 @@ function parseUsage(raw: unknown): UsageSummary | undefined {
   return usage;
 }
 
-function nackToStreamError(frame: StdioFrame): MakaiStreamError {
+function nackToStreamError(frame: StdioFrame, fallbackProviderId?: string): MakaiStreamError {
   const payload = readPayloadOrFrame(frame);
+  const code = optionalString(payload.error_code);
+  let providerId = optionalString(payload.provider_id);
+  if (!providerId && code === "auth_required") {
+    providerId = fallbackProviderId;
+  }
   return new MakaiStreamError(stringValue(payload.reason, "request rejected"), {
     kind: "provider_error",
-    code: optionalString(payload.error_code),
-    provider_id: optionalString(payload.provider_id),
+    code,
+    provider_id: providerId,
   });
 }
 

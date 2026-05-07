@@ -708,6 +708,142 @@ test("auto_once falls back to original auth_required error when login fails", as
   }
 });
 
+test("manual policy backfills provider_id on auth_required nack missing provider_id", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-backfill-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.provider.complete(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "complete_request").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("manual policy backfills provider_id on auth_required stream nack missing provider_id", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-backfill-stream-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await assert.rejects(
+      async () => {
+        for await (const _event of handle.provider.stream(request())) {
+          // no-op
+        }
+      },
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "stream_request").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("manual policy backfills provider_id on agent run auth_required nack missing provider_id", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-backfill-agent-run-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_start").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("manual policy backfills provider_id on agent stream auth_required nack missing provider_id", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-backfill-agent-stream-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await assert.rejects(
+      async () => {
+        for await (const _event of handle.agent.stream(request())) {
+          // no-op
+        }
+      },
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_start").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("manual policy backfills provider_id for non-canonical model_ref on auth_required nack", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-backfill-noncanon-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AUTH_REQUIRED_NO_PROVIDER_ID: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await assert.rejects(
+      () => handle.provider.complete({
+        model_ref: "anthropic/anthropic-messages@opaque-model-ref-with:colon",
+        messages: [{ role: "user" as const, content: "hello" }],
+      }),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "complete_request").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 0);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.agent.stream auto_once retries on auth_required nack and yields events", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-stream-test-"));
   const logPath = path.join(tmpDir, "request.log");
