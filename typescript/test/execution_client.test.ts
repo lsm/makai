@@ -467,7 +467,7 @@ test("createMakaiClient wires all namespaces correctly", async () => {
     assert.equal(typeof handle.agent.run, "function");
     assert.equal(typeof handle.agent.stream, "function");
     assert.deepEqual(await handle.auth.listProviders(), []);
-    assert.deepEqual((await handle.models.list()).models, []);
+    assert.equal(Array.isArray((await handle.models.list()).models), true);
     await collect(handle.provider.stream(request()));
     const streamRequest = readLoggedRequests(logPath).find((entry) => entry.type === "stream_request");
     assert.equal(((streamRequest?.payload as Record<string, unknown>).options as Record<string, unknown>).auth_retry_policy, "auto_once");
@@ -1259,5 +1259,129 @@ test("agent_start payload includes resume_session_id", async () => {
     assert.equal(payload.resume_session_id, "testNanoIdSess1234567");
   } finally {
     await harness.cleanup();
+  }
+});
+
+test("acceptance: OAuth, model discovery, and provider execution share provider-agnostic client path", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-acceptance-provider-path-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const authStatePath = path.join(tmpDir, "auth-state.json");
+  const model = {
+    model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
+    model_id: "claude-sonnet-4-5",
+    display_name: "Claude Sonnet 4.5",
+    provider_id: "anthropic",
+    api: "anthropic-messages",
+    auth_status: "authenticated" as const,
+    lifecycle: "stable" as const,
+    capabilities: ["chat", "streaming", "tools", "reasoning"] as const,
+    source: "dynamic" as const,
+  };
+  const modelsPath = path.join(tmpDir, "models.json");
+  fs.writeFileSync(modelsPath, JSON.stringify({ models: [model], fetched_at_ms: 1, cache_max_age_ms: 300000 }));
+
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: {
+      ...process.env,
+      MAKAI_TEST_REQUEST_LOG: logPath,
+      MAKAI_TEST_AUTH_STATE_PATH: authStatePath,
+      MAKAI_TEST_AUTH_REQUIRES_PROMPT: "1",
+      MAKAI_TEST_MODELS_RESPONSE_PATH: modelsPath,
+    },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "manual" },
+  });
+  try {
+    await handle.auth.login("test-fixture", { onPrompt: () => "ok" });
+    const listed = await handle.models.list({ provider_id: "anthropic" });
+    assert.deepEqual(listed.models[0], model);
+
+    const selectedModelRef = listed.models[0]!.model_ref;
+    const result = await handle.provider.complete({
+      model_ref: selectedModelRef,
+      messages: [{ role: "user", content: "hello" }],
+    });
+    assert.deepEqual(result.message.content, [{ type: "text", text: "hello" }]);
+
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.some((entry) => entry.type === "auth_login_start"), true);
+    assert.equal(logged.some((entry) => entry.type === "models_request"), true);
+    const completePayload = logged.find((entry) => entry.type === "complete_request")?.payload as Record<string, unknown>;
+    assert.equal(completePayload.model_ref, selectedModelRef);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("acceptance: provider and agent model lists have identical output shape", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-acceptance-model-shape-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const model = {
+    model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
+    model_id: "claude-sonnet-4-5",
+    display_name: "Claude Sonnet 4.5",
+    provider_id: "anthropic",
+    api: "anthropic-messages",
+    auth_status: "authenticated" as const,
+    lifecycle: "stable" as const,
+    capabilities: ["chat", "streaming"] as const,
+    source: "dynamic" as const,
+  };
+  const modelsPath = path.join(tmpDir, "models.json");
+  fs.writeFileSync(modelsPath, JSON.stringify({ models: [model], fetched_at_ms: 7, cache_max_age_ms: 300000 }));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_MODELS_RESPONSE_PATH: modelsPath },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+  });
+  try {
+    assert.deepEqual(await handle.models.list(), await handle.agent.models.list());
+    assert.equal(readLoggedRequests(logPath).filter((entry) => entry.type === "models_request").length, 2);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("acceptance: provider and agent execution accept the same model_ref", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-acceptance-shared-model-ref-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: "ok",
+      usage: { input: 1, output: 1 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+    }],
+  }));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AGENT_RESULT_PATH: resultPath },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+  });
+  try {
+    const shared = request();
+    await handle.provider.complete(shared);
+    await handle.agent.run(shared);
+    const logged = readLoggedRequests(logPath);
+    const completePayload = logged.find((entry) => entry.type === "complete_request")?.payload as Record<string, unknown>;
+    const agentMessagePayload = logged.find((entry) => entry.type === "agent_message")?.payload as Record<string, unknown>;
+    assert.equal(completePayload.model_ref, shared.model_ref);
+    assert.equal(JSON.parse(agentMessagePayload.message_json as string).model_ref, shared.model_ref);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });

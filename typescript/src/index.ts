@@ -37,9 +37,11 @@ export {
 
 export {
   createMakaiAgentApi,
+  createMakaiAgentApiWithModels,
   createMakaiClient,
   createMakaiProviderApi,
   type CreateMakaiClientOptions,
+  type MakaiAgentModelsApi,
   type MakaiClient,
 } from "./execution_client";
 
