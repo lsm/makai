@@ -3,10 +3,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
-  createMakaiAuthClient,
-  type CreateMakaiAuthClientOptions,
+  createMakaiClient,
+  type CreateMakaiClientOptions,
   type MakaiAuthEvent,
   type ProviderAuthInfo,
+  type ProviderStreamEvent,
 } from "../src";
 
 type DemoOAuthProvider = {
@@ -42,6 +43,9 @@ type DemoServerOptions = {
   port?: number;
   homeDir?: string;
   binaryPath?: string;
+  command?: string;
+  args?: string[];
+  env?: NodeJS.ProcessEnv;
 };
 
 type RunningDemoServer = {
@@ -51,7 +55,6 @@ type RunningDemoServer = {
 };
 
 const PUBLIC_DIR = path.resolve(process.cwd(), "typescript/demo/public");
-const AUTH_FILE_RELATIVE = path.join(".makai", "auth.json");
 const SESSION_TTL_MS = 30 * 60 * 1000;
 
 const CHAT_PROVIDERS: ChatProviderConfig[] = [
@@ -78,15 +81,6 @@ const FALLBACK_AUTH_PROVIDERS: DemoOAuthProvider[] = [
   { id: "anthropic", name: "Anthropic" },
 ];
 
-type StoredProviderAuth = {
-  api_key?: string;
-  refresh?: string;
-  access?: string;
-  expires?: number;
-  provider_data?: string;
-};
-
-type StoredAuthFile = Record<string, StoredProviderAuth>;
 
 function json(res: ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload);
@@ -106,148 +100,20 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(raw);
 }
 
-async function readAuthFile(homeDir: string): Promise<StoredAuthFile> {
-  const authPath = path.join(homeDir, AUTH_FILE_RELATIVE);
-  try {
-    const raw = await fs.readFile(authPath, "utf8");
-    return JSON.parse(raw) as StoredAuthFile;
-  } catch {
-    return {};
+function modelRefFor(providerId: string, model: string): string {
+  switch (providerId) {
+    case "github-copilot":
+      return `${providerId}/openai-completions@${encodeURIComponent(model)}`;
+    case "anthropic":
+      return `${providerId}/anthropic-messages@${encodeURIComponent(model)}`;
+    default:
+      return `${providerId}/test-fixture@${encodeURIComponent(model)}`;
   }
 }
 
-function extractCopilotBaseUrl(token: string): string {
-  const prefix = "proxy-ep=";
-  const index = token.indexOf(prefix);
-  if (index < 0) {
-    return "https://api.individual.githubcopilot.com";
-  }
-  const start = index + prefix.length;
-  const end = token.indexOf(";", start);
-  const proxyHost = end >= 0 ? token.slice(start, end) : token.slice(start);
-  if (proxyHost.startsWith("proxy.")) {
-    return `https://api.${proxyHost.slice("proxy.".length)}`;
-  }
-  return `https://${proxyHost}`;
-}
-
-function extractMessageFromOpenAICompletion(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return "";
-  const choices = (payload as { choices?: unknown }).choices;
-  if (!Array.isArray(choices) || choices.length === 0) return "";
-  const first = choices[0] as { message?: { content?: unknown } };
-  const content = first?.message?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text: unknown }).text) : ""))
-      .join("");
-  }
-  return "";
-}
-
-function extractMessageFromAnthropic(payload: unknown): string {
-  if (!payload || typeof payload !== "object") return "";
-  const content = (payload as { content?: unknown }).content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .map((block) => {
-      if (!block || typeof block !== "object") return "";
-      if ((block as { type?: unknown }).type === "text") {
-        return String((block as { text?: unknown }).text ?? "");
-      }
-      return "";
-    })
-    .filter((text) => text.length > 0)
-    .join("\n");
-}
-
-async function chatWithTestFixture(model: string, message: string): Promise<string> {
-  return `[${model}] ${message.split("").reverse().join("")}`;
-}
-
-async function chatWithGitHubCopilot(auth: StoredProviderAuth, model: string, message: string): Promise<string> {
-  const token = auth.access ?? auth.api_key;
-  if (!token) {
-    throw new Error("missing github-copilot token");
-  }
-
-  const response = await fetch(`${extractCopilotBaseUrl(token)}/chat/completions`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      accept: "application/json",
-      "user-agent": "GitHubCopilotChat/0.35.0",
-      "editor-version": "vscode/1.107.0",
-      "editor-plugin-version": "copilot-chat/0.35.0",
-      "copilot-integration-id": "vscode-chat",
-      "x-initiator": "user",
-      "openai-intent": "conversation-edits",
-    },
-    body: JSON.stringify({
-      model,
-      stream: false,
-      messages: [{ role: "user", content: message }],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`copilot chat failed (${response.status}): ${err.slice(0, 240)}`);
-  }
-
-  const payload = (await response.json()) as unknown;
-  const text = extractMessageFromOpenAICompletion(payload);
-  if (!text) {
-    throw new Error("copilot response did not include message content");
-  }
-  return text;
-}
-
-async function chatWithAnthropic(auth: StoredProviderAuth, model: string, message: string): Promise<string> {
-  const token = auth.access ?? auth.api_key;
-  if (!token) {
-    throw new Error("missing anthropic token");
-  }
-
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "anthropic-version": "2023-06-01",
-  };
-  if (auth.api_key) {
-    headers["x-api-key"] = auth.api_key;
-    headers["anthropic-beta"] = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14";
-  } else {
-    headers.authorization = `Bearer ${token}`;
-    headers["anthropic-beta"] =
-      "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14";
-    headers["anthropic-dangerous-direct-browser-access"] = "true";
-    headers["user-agent"] = "claude-cli/2.1.2 (external, cli)";
-    headers["x-app"] = "cli";
-  }
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      max_tokens: 1024,
-      messages: [{ role: "user", content: message }],
-    }),
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error(`anthropic chat failed (${response.status}): ${err.slice(0, 240)}`);
-  }
-
-  const payload = (await response.json()) as unknown;
-  const text = extractMessageFromAnthropic(payload);
-  if (!text) {
-    throw new Error("anthropic response did not include text content");
-  }
-  return text;
+function appendProviderStreamText(reply: string, event: ProviderStreamEvent): string {
+  if (event.type !== "text_delta") return reply;
+  return reply + event.delta;
 }
 
 function contentTypeForFile(filePath: string): string {
@@ -272,22 +138,24 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
   const homeDir = options.homeDir ?? process.env.HOME ?? "";
   const binaryPath = options.binaryPath ?? process.env.MAKAI_BINARY_PATH;
 
-  function authClientOptions(extra?: Partial<CreateMakaiAuthClientOptions>): CreateMakaiAuthClientOptions {
+  function clientOptions(extra?: Partial<CreateMakaiClientOptions>): CreateMakaiClientOptions {
+    const env: NodeJS.ProcessEnv = { ...process.env, ...(options.env ?? {}), ...(homeDir ? { HOME: homeDir } : {}) };
     return {
-      ...(binaryPath ? { resolver: { binaryPath } } : {}),
-      ...(homeDir ? { env: { ...process.env, HOME: homeDir } } : { env: process.env }),
+      ...(options.command ? { command: options.command, args: options.args, env } : binaryPath ? { resolver: { binaryPath }, env } : { env }),
       ...extra,
     };
   }
 
-  async function resolveOAuthProviders(): Promise<DemoOAuthProvider[]> {
-    let client: { auth: { listProviders(): Promise<ProviderAuthInfo[]> }; close: () => Promise<void> } | undefined;
+  async function resolveOAuthProviders(): Promise<ProviderAuthInfo[]> {
+    let client: Awaited<ReturnType<typeof createMakaiClient>> | undefined;
     try {
-      client = await createMakaiAuthClient(authClientOptions());
-      const providers = await client.auth.listProviders();
-      return providers.map((provider) => ({ id: provider.id, name: provider.name }));
+      client = await createMakaiClient(clientOptions());
+      return await client.auth.listProviders();
     } catch {
-      return FALLBACK_AUTH_PROVIDERS;
+      return FALLBACK_AUTH_PROVIDERS.map((provider) => ({
+        ...provider,
+        auth_status: "unknown" as const,
+      }));
     } finally {
       if (client) {
         await client.close().catch(() => undefined);
@@ -299,10 +167,12 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
     cleanupSessions(authSessions);
 
     if (req.method === "GET" && pathname === "/api/meta") {
-      const [oauthProviders, authMap] = await Promise.all([resolveOAuthProviders(), readAuthFile(homeDir)]);
+      const authProviders = await resolveOAuthProviders();
+      const authStatusByProvider = new Map(authProviders.map((provider) => [provider.id, provider.auth_status]));
+      const oauthProviders = authProviders.map((provider) => ({ id: provider.id, name: provider.name }));
       const chatProviders = CHAT_PROVIDERS.map((provider) => ({
         ...provider,
-        authenticated: Boolean(authMap[provider.id]?.access || authMap[provider.id]?.api_key),
+        authenticated: authStatusByProvider.get(provider.id) === "authenticated",
       }));
       json(res, 200, { oauthProviders, chatProviders });
       return true;
@@ -327,9 +197,9 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
 
       const provider = body.provider;
       void (async () => {
-        let client: Awaited<ReturnType<typeof createMakaiAuthClient>> | undefined;
+        let client: Awaited<ReturnType<typeof createMakaiClient>> | undefined;
         try {
-          client = await createMakaiAuthClient(authClientOptions());
+          client = await createMakaiClient(clientOptions());
           await client.auth.login(provider, {
             onEvent: (event) => {
               session.events.push(event);
@@ -434,22 +304,19 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
         return true;
       }
 
+      let client: Awaited<ReturnType<typeof createMakaiClient>> | undefined;
       try {
-        let reply: string;
-        if (providerId === "test-fixture") {
-          reply = await chatWithTestFixture(model, message);
-        } else {
-          const authMap = await readAuthFile(homeDir);
-          const providerAuth = authMap[providerId];
-          if (!providerAuth) {
-            json(res, 400, { error: `${providerId} is not authenticated` });
-            return true;
+        client = await createMakaiClient(clientOptions());
+        let reply = "";
+        for await (const event of client.provider.stream({
+          model_ref: modelRefFor(providerId, model),
+          messages: [{ role: "user", content: message }],
+          options: { max_tokens: 1024, auth_retry_policy: "manual" },
+        })) {
+          if (event.type === "error") {
+            throw new Error(event.message);
           }
-          if (providerId === "github-copilot") {
-            reply = await chatWithGitHubCopilot(providerAuth, model, message);
-          } else {
-            reply = await chatWithAnthropic(providerAuth, model, message);
-          }
+          reply = appendProviderStreamText(reply, event);
         }
 
         json(res, 200, { reply, provider: providerId, model });
@@ -457,6 +324,10 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
         json(res, 500, {
           error: error instanceof Error ? error.message : String(error),
         });
+      } finally {
+        if (client) {
+          await client.close().catch(() => undefined);
+        }
       }
       return true;
     }

@@ -1,11 +1,26 @@
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
+import fsSync from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { startDemoServer } from "../demo/server";
 
 const binaryPath = process.env.MAKAI_BINARY_PATH;
+const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
+const executionFixture = path.join(sourceFixturesDir, "execution-server.js");
+
+function fixtureServerOptions(tempHome: string, requestLog?: string) {
+  return {
+    command: process.execPath,
+    args: [executionFixture],
+    env: {
+      MAKAI_TEST_AUTH_REQUIRES_PROMPT: "1",
+      ...(requestLog ? { MAKAI_TEST_REQUEST_LOG: requestLog } : {}),
+    },
+    homeDir: tempHome,
+  };
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,7 +46,10 @@ async function waitForAuthStatus(
 
 test("demo: serves UI and metadata", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
-  const running = await startDemoServer({ port: 0, homeDir: tempHome });
+  const running = await startDemoServer({
+    port: 0,
+    ...fixtureServerOptions(tempHome),
+  });
   try {
     const indexRes = await fetch(`${running.url}/`);
     assert.equal(indexRes.status, 200);
@@ -54,7 +72,11 @@ test("demo: serves UI and metadata", async () => {
 
 test("demo: chat endpoint supports fixture provider", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
-  const running = await startDemoServer({ port: 0, homeDir: tempHome });
+  const logPath = path.join(tempHome, "request.log");
+  const running = await startDemoServer({
+    port: 0,
+    ...fixtureServerOptions(tempHome, logPath),
+  });
   try {
     const response = await fetch(`${running.url}/api/chat`, {
       method: "POST",
@@ -68,20 +90,33 @@ test("demo: chat endpoint supports fixture provider", async () => {
     assert.equal(response.status, 200);
     const payload = (await response.json()) as { reply: string };
     assert.equal(payload.reply, "[fixture-echo-v1] dlrow olleh");
+
+    const requests = fsSync.readFileSync(logPath, "utf8")
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    const streamRequest = requests.find((request) => request.type === "stream_request");
+    assert.ok(streamRequest);
+    assert.equal((streamRequest.payload as { model_ref?: string }).model_ref, "test-fixture/test-fixture@fixture-echo-v1");
   } finally {
     await running.close();
     await fs.rm(tempHome, { recursive: true, force: true });
   }
 });
 
-test("demo: oauth fixture flow persists auth credentials", async (t) => {
-  if (!binaryPath) {
-    t.skip("MAKAI_BINARY_PATH is not set");
-    return;
-  }
-
+test("demo: oauth fixture flow persists auth credentials", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
-  const running = await startDemoServer({ port: 0, homeDir: tempHome, binaryPath });
+  const logPath = path.join(tempHome, "request.log");
+  const running = await startDemoServer(binaryPath ? {
+    port: 0,
+    homeDir: tempHome,
+    binaryPath,
+    env: { MAKAI_TEST_REQUEST_LOG: logPath },
+  } : {
+    port: 0,
+    ...fixtureServerOptions(tempHome, logPath),
+  });
   try {
     const createRes = await fetch(`${running.url}/api/auth/sessions`, {
       method: "POST",
@@ -103,10 +138,23 @@ test("demo: oauth fixture flow persists auth credentials", async (t) => {
     assert.equal(respondRes.status, 200);
 
     await waitForAuthStatus(running.url, created.sessionId, "success");
-    const authRaw = await fs.readFile(path.join(tempHome, ".makai", "auth.json"), "utf8");
-    const auth = JSON.parse(authRaw) as Record<string, { access?: string; refresh?: string }>;
-    assert.equal(typeof auth["test-fixture"]?.access, "string");
-    assert.equal(typeof auth["test-fixture"]?.refresh, "string");
+
+    if (binaryPath) {
+      const authRaw = await fs.readFile(path.join(tempHome, ".makai", "auth.json"), "utf8");
+      const auth = JSON.parse(authRaw) as Record<string, { access?: string; refresh?: string }>;
+      assert.equal(typeof auth["test-fixture"]?.access, "string");
+      assert.equal(typeof auth["test-fixture"]?.refresh, "string");
+    }
+
+    if (!binaryPath) {
+      const requests = fsSync.readFileSync(logPath, "utf8")
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      assert.equal(requests.some((request) => request.type === "auth_login_start"), true);
+      assert.equal(requests.some((request) => request.type === "auth_prompt_response"), true);
+    }
   } finally {
     await running.close();
     await fs.rm(tempHome, { recursive: true, force: true });

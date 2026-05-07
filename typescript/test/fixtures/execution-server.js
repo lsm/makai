@@ -53,13 +53,28 @@ const defaultProviderResult = {
   stop_reason: "end_turn",
 };
 
-const defaultProviderEvents = [
-  { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
-  { type: "text_delta", delta: "hel" },
-  { type: "reasoning", delta: "thinking" },
-  { type: "text_delta", delta: "lo" },
-  { type: "message_end", usage: { input: 3, output: 5 }, stop_reason: "end_turn" },
-];
+function defaultProviderEventsFor(env) {
+  const modelRef = env.payload?.model_ref || "";
+  if (modelRef === "test-fixture/test-fixture@fixture-echo-v1") {
+    const message = env.payload?.context?.messages?.[0]?.content || "";
+    return [
+      { type: "message_start", provider_id: "test-fixture", api: "test-fixture", model_id: "fixture-echo-v1" },
+      { type: "text_delta", delta: `[fixture-echo-v1] ${String(message).split("").reverse().join("")}` },
+      { type: "message_end", usage: { input: 1, output: 1 }, stop_reason: "end_turn" },
+    ];
+  }
+  return [
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "text_delta", delta: "hel" },
+    { type: "reasoning", delta: "thinking" },
+    { type: "text_delta", delta: "lo" },
+    { type: "message_end", usage: { input: 3, output: 5 }, stop_reason: "end_turn" },
+  ];
+}
+
+const configuredProviderEvents = process.env.MAKAI_TEST_PROVIDER_EVENTS_PATH
+  ? loadJson(process.env.MAKAI_TEST_PROVIDER_EVENTS_PATH, null)
+  : null;
 
 const defaultAgentEvents = [
   { type: "agent_start", session_id: "testNanoIdSess1234567" },
@@ -76,7 +91,6 @@ emit({ type: "ready", protocol_version: "1" });
 
 const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
 const providerResult = loadJson(process.env.MAKAI_TEST_PROVIDER_RESULT_PATH, defaultProviderResult);
-const providerEvents = loadJson(process.env.MAKAI_TEST_PROVIDER_EVENTS_PATH, defaultProviderEvents);
 const agentEvents = loadJson(process.env.MAKAI_TEST_AGENT_EVENTS_PATH, defaultAgentEvents);
 const agentResult = loadJson(process.env.MAKAI_TEST_AGENT_RESULT_PATH, null);
 const agentError = loadJson(process.env.MAKAI_TEST_AGENT_ERROR_PATH, null);
@@ -127,6 +141,7 @@ rl.on("line", (line) => {
       emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
+    const providerEvents = configuredProviderEvents ?? defaultProviderEventsFor(env);
     for (let i = 0; i < providerEvents.length; i += 1) {
       const event = providerEvents[i];
       emit(frame(env, event.type, event, i + 3));
@@ -153,16 +168,30 @@ rl.on("line", (line) => {
       }
     }
   } else if (env.type === "auth_providers_request") {
-    emit(frame(env, "auth_providers_response", { providers: [] }, 3));
+    const providers = process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT ? [
+      { id: "test-fixture", name: "Test Fixture (CI)", auth_status: "login_required" },
+      { id: "github-copilot", name: "GitHub Copilot", auth_status: "unknown" },
+      { id: "anthropic", name: "Anthropic", auth_status: "unknown" },
+    ] : [];
+    emit(frame(env, "auth_providers_response", { providers }, 3));
   } else if (env.type === "auth_login_start") {
     const providerId = env.payload?.provider_id || "";
     const flowId = env.stream_id || env.payload?.flow_id || "";
     if (process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT) {
       emit(frame(env, "auth_event", { prompt: { flow_id: flowId, prompt_id: "test-prompt", provider_id: providerId, message: "Enter code", allow_empty: false } }, 3));
-      emit(frame(env, "auth_login_result", { status: "cancelled", flow_id: flowId, provider_id: providerId }, 4));
     } else {
       emit(frame(env, "auth_event", { success: { flow_id: flowId, provider_id: providerId } }, 3));
       emit(frame(env, "auth_login_result", { status: "success", flow_id: flowId, provider_id: providerId }, 4));
+    }
+  } else if (env.type === "auth_prompt_response") {
+    const flowId = env.stream_id || env.payload?.flow_id || "";
+    const providerId = env.payload?.provider_id || "test-fixture";
+    if (env.payload?.answer === "ok" || env.payload?.answer === "letmein") {
+      emit(frame(env, "auth_event", { success: { flow_id: flowId, provider_id: providerId } }, 3));
+      emit(frame(env, "auth_login_result", { status: "success", flow_id: flowId, provider_id: providerId }, 4));
+    } else {
+      emit(frame(env, "auth_event", { error: { flow_id: flowId, provider_id: providerId, code: "invalid_code", message: "fixture rejected code" } }, 3));
+      emit(frame(env, "auth_login_result", { status: "failed", flow_id: flowId, provider_id: providerId }, 4));
     }
   } else if (env.type === "models_request") {
     emit(frame(env, "models_response", modelsResponse, 3));
