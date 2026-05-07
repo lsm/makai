@@ -856,6 +856,14 @@ function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunReques
     const parsed = parseModelRef(request.model_ref);
     return parsed.providerId;
   } catch {
+    // Best-effort: extract provider even when model_id is non-canonical
+    // so auto_once auth retry can still target the right provider.
+    const slashIndex = request.model_ref.indexOf("/");
+    const atIndex = request.model_ref.indexOf("@");
+    if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
+      const provider = request.model_ref.slice(0, slashIndex);
+      if (provider.length > 0) return provider;
+    }
     return undefined;
   }
 }
