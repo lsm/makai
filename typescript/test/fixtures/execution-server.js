@@ -89,6 +89,7 @@ const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, {
 const requestCounts = new Map();
 
 function shouldAuthReject(envType) {
+  if (process.env.MAKAI_TEST_AUTH_REQUIRED_ALWAYS) return true;
   if (!process.env.MAKAI_TEST_AUTH_REQUIRED_ONCE) return false;
   const count = requestCounts.get(envType) || 0;
   requestCounts.set(envType, count + 1);

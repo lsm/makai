@@ -553,6 +553,31 @@ test("client.provider.stream auto_once retries on auth_required nack and yields 
   }
 });
 
+test("client.provider.stream auto_once retries at most once when auth_required persists", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-stream-limit-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ALWAYS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await assert.rejects(
+      async () => collect(handle.provider.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "stream_request").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.agent.run auto_once retries on auth_required nack and succeeds", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-test-"));
   const logPath = path.join(tmpDir, "request.log");
@@ -663,6 +688,31 @@ test("client.agent.stream auto_once retries on auth_required nack and yields eve
     assert.equal(agentStarts.length, 2);
     const loginStarts = logged.filter((entry) => entry.type === "auth_login_start");
     assert.equal(loginStarts.length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream auto_once retries at most once when auth_required persists", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-stream-limit-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ALWAYS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await assert.rejects(
+      async () => collect(handle.agent.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "auth_required",
+    );
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_start").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

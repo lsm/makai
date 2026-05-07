@@ -109,13 +109,14 @@ class StdioProviderApi implements MakaiProviderApi {
     let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
+    let retried = false;
 
     while (true) {
       let result;
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+        if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
@@ -123,6 +124,7 @@ class StdioProviderApi implements MakaiProviderApi {
             } catch {
               throw error;
             }
+            retried = true;
             attempt = this.streamAttempt(request, effectivePolicy);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
@@ -222,13 +224,14 @@ class StdioAgentApi implements MakaiAgentApi {
     let attempt = this.streamAttempt(request, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
+    let retried = false;
 
     while (true) {
       let result;
       try {
         result = await iterator.next();
       } catch (error) {
-        if (!yielded && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+        if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
@@ -236,6 +239,7 @@ class StdioAgentApi implements MakaiAgentApi {
             } catch {
               throw error;
             }
+            retried = true;
             attempt = this.streamAttempt(request, effectivePolicy);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
