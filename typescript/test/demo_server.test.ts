@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { startDemoServer } from "../demo/server";
+import { createMakaiClient, MakaiAuthError } from "../src";
 
 const binaryPath = process.env.MAKAI_BINARY_PATH;
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
@@ -16,6 +17,7 @@ function fixtureServerOptions(tempHome: string, requestLog?: string) {
     args: [executionFixture],
     env: {
       MAKAI_TEST_AUTH_REQUIRES_PROMPT: "1",
+      MAKAI_TEST_AUTH_STATE_PATH: path.join(tempHome, "auth-state.json"),
       ...(requestLog ? { MAKAI_TEST_REQUEST_LOG: requestLog } : {}),
     },
     homeDir: tempHome,
@@ -29,7 +31,7 @@ function sleep(ms: number): Promise<void> {
 async function waitForAuthStatus(
   baseUrl: string,
   sessionId: string,
-  expected: "waiting_for_input" | "success",
+  expected: "waiting_for_input" | "success" | "error",
   timeoutMs = 12_000,
 ): Promise<{ status: string; pendingPrompt?: { message?: string } }> {
   const deadline = Date.now() + timeoutMs;
@@ -105,6 +107,75 @@ test("demo: chat endpoint supports fixture provider", async () => {
   }
 });
 
+test("demo: fixture chat works without configured Makai runtime", async () => {
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
+  const running = await startDemoServer({ port: 0, homeDir: tempHome, env: { MAKAI_BINARY_PATH: undefined } });
+  try {
+    const response = await fetch(`${running.url}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        provider: "test-fixture",
+        model: "fixture-echo-v1",
+        message: "binary free",
+      }),
+    });
+    assert.equal(response.status, 200);
+    const payload = (await response.json()) as { reply: string };
+    assert.equal(payload.reply, "[fixture-echo-v1] eerf yranib");
+  } finally {
+    await running.close();
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+});
+
+test("demo: auth-required chat response is client error", async () => {
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
+  const running = await startDemoServer({
+    port: 0,
+    command: process.execPath,
+    args: [executionFixture],
+    env: { MAKAI_TEST_AUTH_REQUIRED_ALWAYS: "1" },
+    homeDir: tempHome,
+  });
+  try {
+    const response = await fetch(`${running.url}/api/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        message: "hello world",
+      }),
+    });
+    assert.equal(response.status, 400);
+    const payload = (await response.json()) as { error: string };
+    assert.match(payload.error, /login required|auth/i);
+  } finally {
+    await running.close();
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+});
+
+test("demo: auth fixture flow reaches cancelled terminal state", async () => {
+  const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
+  const client = await createMakaiClient({
+    command: process.execPath,
+    args: [executionFixture],
+    env: { ...process.env, HOME: tempHome, MAKAI_TEST_AUTH_REQUIRES_PROMPT: "1" },
+    frameTimeoutMs: 5000,
+  });
+  try {
+    await assert.rejects(
+      () => client.auth.login("test-fixture"),
+      (error: unknown) => error instanceof MakaiAuthError && error.kind === "cancelled",
+    );
+  } finally {
+    await client.close();
+    await fs.rm(tempHome, { recursive: true, force: true });
+  }
+});
+
 test("demo: oauth fixture flow persists auth credentials", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
   const logPath = path.join(tempHome, "request.log");
@@ -147,6 +218,11 @@ test("demo: oauth fixture flow persists auth credentials", async () => {
     }
 
     if (!binaryPath) {
+      const metaRes = await fetch(`${running.url}/api/meta`);
+      assert.equal(metaRes.status, 200);
+      const meta = (await metaRes.json()) as { chatProviders: Array<{ id: string; authenticated: boolean }> };
+      assert.equal(meta.chatProviders.find((provider) => provider.id === "test-fixture")?.authenticated, true);
+
       const requests = fsSync.readFileSync(logPath, "utf8")
         .trim()
         .split(/\r?\n/)

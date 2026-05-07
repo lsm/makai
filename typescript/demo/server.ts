@@ -4,6 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
   createMakaiClient,
+  MakaiAuthRequiredError,
   type CreateMakaiClientOptions,
   type MakaiAuthEvent,
   type ProviderAuthInfo,
@@ -81,7 +82,6 @@ const FALLBACK_AUTH_PROVIDERS: DemoOAuthProvider[] = [
   { id: "anthropic", name: "Anthropic" },
 ];
 
-
 function json(res: ServerResponse, status: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.statusCode = status;
@@ -116,6 +116,19 @@ function appendProviderStreamText(reply: string, event: ProviderStreamEvent): st
   return reply + event.delta;
 }
 
+function hasConfiguredMakaiRuntime(options: DemoServerOptions, binaryPath: string | undefined): boolean {
+  return Boolean(options.command || binaryPath);
+}
+
+function fixtureReply(model: string, message: string): string {
+  return `[${model}] ${message.split("").reverse().join("")}`;
+}
+
+function chatErrorStatus(error: unknown): number {
+  if (error instanceof MakaiAuthRequiredError) return 400;
+  return 500;
+}
+
 function contentTypeForFile(filePath: string): string {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".js")) return "text/javascript; charset=utf-8";
@@ -141,7 +154,7 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
   function clientOptions(extra?: Partial<CreateMakaiClientOptions>): CreateMakaiClientOptions {
     const env: NodeJS.ProcessEnv = { ...process.env, ...(options.env ?? {}), ...(homeDir ? { HOME: homeDir } : {}) };
     return {
-      ...(options.command ? { command: options.command, args: options.args, env } : binaryPath ? { resolver: { binaryPath }, env } : { env }),
+      ...(options.command ? { command: options.command, args: options.args, env } : binaryPath ? { resolver: { binaryPath }, env } : { env, resolver: { binaryPath: "" } }),
       ...extra,
     };
   }
@@ -306,22 +319,26 @@ export function createDemoServer(options: DemoServerOptions = {}): Server {
 
       let client: Awaited<ReturnType<typeof createMakaiClient>> | undefined;
       try {
-        client = await createMakaiClient(clientOptions());
         let reply = "";
-        for await (const event of client.provider.stream({
-          model_ref: modelRefFor(providerId, model),
-          messages: [{ role: "user", content: message }],
-          options: { max_tokens: 1024, auth_retry_policy: "manual" },
-        })) {
-          if (event.type === "error") {
-            throw new Error(event.message);
+        if (providerId === "test-fixture" && !hasConfiguredMakaiRuntime(options, binaryPath)) {
+          reply = fixtureReply(model, message);
+        } else {
+          client = await createMakaiClient(clientOptions());
+          for await (const event of client.provider.stream({
+            model_ref: modelRefFor(providerId, model),
+            messages: [{ role: "user", content: message }],
+            options: { max_tokens: 1024, auth_retry_policy: "manual" },
+          })) {
+            if (event.type === "error") {
+              throw new Error(event.message);
+            }
+            reply = appendProviderStreamText(reply, event);
           }
-          reply = appendProviderStreamText(reply, event);
         }
 
         json(res, 200, { reply, provider: providerId, model });
       } catch (error: unknown) {
-        json(res, 500, {
+        json(res, chatErrorStatus(error), {
           error: error instanceof Error ? error.message : String(error),
         });
       } finally {

@@ -90,6 +90,7 @@ const defaultAgentEvents = [
 emit({ type: "ready", protocol_version: "1" });
 
 const requestLog = process.env.MAKAI_TEST_REQUEST_LOG || "";
+const authStatePath = process.env.MAKAI_TEST_AUTH_STATE_PATH || "";
 const providerResult = loadJson(process.env.MAKAI_TEST_PROVIDER_RESULT_PATH, defaultProviderResult);
 const agentEvents = loadJson(process.env.MAKAI_TEST_AGENT_EVENTS_PATH, defaultAgentEvents);
 const agentResult = loadJson(process.env.MAKAI_TEST_AGENT_RESULT_PATH, null);
@@ -101,6 +102,27 @@ const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, {
 });
 
 const requestCounts = new Map();
+const authenticatedProviders = new Set();
+const authFlows = new Map();
+
+function loadAuthState() {
+  if (!authStatePath || !fs.existsSync(authStatePath)) return;
+  try {
+    const state = JSON.parse(fs.readFileSync(authStatePath, "utf8"));
+    for (const providerId of state.authenticatedProviders || []) {
+      authenticatedProviders.add(providerId);
+    }
+  } catch {
+    // Ignore corrupt fixture state and behave as logged out.
+  }
+}
+
+function saveAuthState() {
+  if (!authStatePath) return;
+  fs.writeFileSync(authStatePath, JSON.stringify({ authenticatedProviders: [...authenticatedProviders] }));
+}
+
+loadAuthState();
 
 function shouldAuthReject(envType) {
   if (process.env.MAKAI_TEST_AUTH_REQUIRED_ALWAYS) return true;
@@ -169,7 +191,11 @@ rl.on("line", (line) => {
     }
   } else if (env.type === "auth_providers_request") {
     const providers = process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT ? [
-      { id: "test-fixture", name: "Test Fixture (CI)", auth_status: "login_required" },
+      {
+        id: "test-fixture",
+        name: "Test Fixture (CI)",
+        auth_status: authenticatedProviders.has("test-fixture") ? "authenticated" : "login_required",
+      },
       { id: "github-copilot", name: "GitHub Copilot", auth_status: "unknown" },
       { id: "anthropic", name: "Anthropic", auth_status: "unknown" },
     ] : [];
@@ -177,22 +203,31 @@ rl.on("line", (line) => {
   } else if (env.type === "auth_login_start") {
     const providerId = env.payload?.provider_id || "";
     const flowId = env.stream_id || env.payload?.flow_id || "";
+    authFlows.set(flowId, providerId);
     if (process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT) {
       emit(frame(env, "auth_event", { prompt: { flow_id: flowId, prompt_id: "test-prompt", provider_id: providerId, message: "Enter code", allow_empty: false } }, 3));
     } else {
+      authenticatedProviders.add(providerId);
+      saveAuthState();
       emit(frame(env, "auth_event", { success: { flow_id: flowId, provider_id: providerId } }, 3));
       emit(frame(env, "auth_login_result", { status: "success", flow_id: flowId, provider_id: providerId }, 4));
     }
   } else if (env.type === "auth_prompt_response") {
     const flowId = env.stream_id || env.payload?.flow_id || "";
-    const providerId = env.payload?.provider_id || "test-fixture";
+    const providerId = authFlows.get(flowId) || env.payload?.provider_id || "test-fixture";
     if (env.payload?.answer === "ok" || env.payload?.answer === "letmein") {
+      authenticatedProviders.add(providerId);
+      saveAuthState();
       emit(frame(env, "auth_event", { success: { flow_id: flowId, provider_id: providerId } }, 3));
       emit(frame(env, "auth_login_result", { status: "success", flow_id: flowId, provider_id: providerId }, 4));
     } else {
       emit(frame(env, "auth_event", { error: { flow_id: flowId, provider_id: providerId, code: "invalid_code", message: "fixture rejected code" } }, 3));
       emit(frame(env, "auth_login_result", { status: "failed", flow_id: flowId, provider_id: providerId }, 4));
     }
+  } else if (env.type === "auth_cancel") {
+    const flowId = env.stream_id || env.payload?.flow_id || "";
+    const providerId = authFlows.get(flowId) || env.payload?.provider_id || "test-fixture";
+    emit(frame(env, "auth_login_result", { status: "cancelled", flow_id: flowId, provider_id: providerId }, 3));
   } else if (env.type === "models_request") {
     emit(frame(env, "models_response", modelsResponse, 3));
   }
