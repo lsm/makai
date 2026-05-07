@@ -109,7 +109,12 @@ test("demo: chat endpoint supports fixture provider", async () => {
 
 test("demo: fixture chat works without configured Makai runtime", async () => {
   const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "makai-demo-home-"));
-  const running = await startDemoServer({ port: 0, homeDir: tempHome, env: { MAKAI_BINARY_PATH: undefined } });
+  const running = await startDemoServer({
+    port: 0,
+    homeDir: tempHome,
+    binaryPath: "",
+    env: { MAKAI_BINARY_PATH: undefined },
+  });
   try {
     const response = await fetch(`${running.url}/api/chat`, {
       method: "POST",
