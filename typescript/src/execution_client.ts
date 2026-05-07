@@ -154,7 +154,11 @@ class StdioProviderApi implements MakaiProviderApi {
         if (!event) continue;
         if (event.type === "error") {
           terminal = true;
-          throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+          if (event.code === "auth_required") {
+            throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+          }
+          yield event;
+          continue;
         }
         if (event.type === "message_end") terminal = true;
         yield event;
@@ -279,6 +283,8 @@ class StdioAgentApi implements MakaiAgentApi {
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     let terminal = false;
     let messageSent = false;
+    let started = false;
+    let aggregateUsage: UsageSummary = { input: 0, output: 0, cache_read: 0, cache_write: 0 };
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
       while (!terminal) {
@@ -291,13 +297,28 @@ class StdioAgentApi implements MakaiAgentApi {
           continue;
         }
         const events = normalizeAgentFrame(frame, toolBuffers);
-        for (const event of events) {
-          if (event.type === "error") {
-            terminal = true;
-            throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+        for (const rawEvent of events) {
+          let event = rawEvent;
+          if (!started) {
+            started = true;
+            if (event.type !== "agent_start") {
+              yield { type: "agent_start", session_id: sessionId };
+            }
           }
-          if (event.type === "agent_end") terminal = true;
+          if (event.type === "message_end" && event.usage) {
+            aggregateUsage = addUsage(aggregateUsage, event.usage);
+          }
+          if (event.type === "agent_end") {
+            event = { ...event, usage: event.usage ?? aggregateUsage };
+            terminal = true;
+          } else if (event.type === "error") {
+            terminal = true;
+            if (event.code === "auth_required") {
+              throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+            }
+          }
           yield event;
+          if (terminal) break;
         }
       }
     } catch (error) {
@@ -571,8 +592,8 @@ function normalizeProviderEvent(
   }
   if (type === "toolcall_end") return parseBufferedToolCall(payload, toolBuffers);
   if (type === "tool_call") return parseToolCall(payload);
-  if (type === "done") return messageEndFrom(payload);
-  if (type === "error") return parseError(payload);
+  if (type === "done" || type === "message_end") return messageEndFrom(payload);
+  if (type === "stream_error" || type === "error") return parseError(payload);
   return undefined;
 }
 
@@ -583,6 +604,12 @@ function normalizeAgentFrame(
   if (frame.type === "agent_result") return [agentEndFrom(readJsonStringPayload(frame, "result_json"))];
   if (frame.type === "agent_error") return [parseError(readPayloadOrFrame(frame))];
   if (frame.type === "agent_event") return normalizeAgentEvent(readJsonStringPayload(frame, "event_json"), toolBuffers);
+  if (frame.type === "event") {
+    const payload = readPayloadOrFrame(frame);
+    const inner = payload.event && isObject(payload.event) ? payload.event as Record<string, unknown> : payload;
+    const type = stringValue(inner.type ?? inner.event_type);
+    if (isAgentEventType(type)) return normalizeAgentEvent(inner, toolBuffers);
+  }
   const providerEvent = normalizeProviderFrame(frame, toolBuffers);
   return providerEvent ? [providerEvent] : [];
 }
@@ -604,6 +631,8 @@ function normalizeAgentEvent(
       return [{ type: "tool_execution_start", tool_call_id: stringValue(data.tool_call_id), tool_name: stringValue(data.tool_name) }];
     case "tool_execution_end":
       return [{ type: "tool_execution_end", tool_call_id: stringValue(data.tool_call_id), ...(typeof data.is_error === "boolean" ? { is_error: data.is_error } : {}) }];
+    case "tool_execution_update":
+      return [];
     case "agent_end":
       return [agentEndFrom(data)];
     case "message_start":
@@ -792,6 +821,15 @@ function parseUsage(raw: unknown): UsageSummary | undefined {
   return usage;
 }
 
+function addUsage(left: UsageSummary, right: UsageSummary): UsageSummary {
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cache_read: (left.cache_read ?? 0) + (right.cache_read ?? 0),
+    cache_write: (left.cache_write ?? 0) + (right.cache_write ?? 0),
+  };
+}
+
 function nackToStreamError(frame: StdioFrame, fallbackProviderId?: string): MakaiStreamError {
   const payload = readPayloadOrFrame(frame);
   const code = optionalString(payload.error_code);
@@ -831,6 +869,16 @@ function readJsonStringPayload(frame: StdioFrame, key: string): Record<string, u
     }
   }
   return payload;
+}
+
+function isAgentEventType(type: string): boolean {
+  return type === "agent_start" ||
+    type === "agent_end" ||
+    type === "turn_start" ||
+    type === "turn_end" ||
+    type === "tool_execution_start" ||
+    type === "tool_execution_end" ||
+    type === "tool_execution_update";
 }
 
 function stringValue(value: unknown, fallback = ""): string {

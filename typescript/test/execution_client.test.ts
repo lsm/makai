@@ -371,17 +371,16 @@ test("client.provider.stream buffers incremental tool calls into one tool_call e
   }
 });
 
-test("stream error paths throw MakaiStreamError", async () => {
+test("stream error paths emit one terminal error event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-exec-error-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
   fs.writeFileSync(eventsPath, JSON.stringify([{ type: "message_start" }, { type: "error", message: "boom", code: "provider_error" }]));
   const harness = await setupHarness({ MAKAI_TEST_PROVIDER_EVENTS_PATH: eventsPath });
   try {
     const provider = createMakaiProviderApi(harness.client);
-    await assert.rejects(
-      async () => collect(provider.stream(request())),
-      (err: unknown) => err instanceof MakaiStreamError && err.message === "boom" && err.code === "provider_error",
-    );
+    const events = await collect(provider.stream(request()));
+    assert.equal(events.filter((event) => event.type === "error").length, 1);
+    assert.deepEqual(events.at(-1), { type: "error", message: "boom", code: "provider_error" });
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -405,17 +404,17 @@ test("provider stream_error frames preserve MakaiStreamError code", async () => 
   }
 });
 
-test("agent stream error paths throw MakaiStreamError", async () => {
+test("agent stream error paths emit one terminal error event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
   fs.writeFileSync(eventsPath, JSON.stringify([{ type: "agent_start" }, { type: "error", message: "agent boom", code: "provider_error" }]));
   const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
   try {
     const agent = createMakaiAgentApi(harness.client);
-    await assert.rejects(
-      async () => collect(agent.stream(request())),
-      (err: unknown) => err instanceof MakaiStreamError && err.message === "agent boom" && err.code === "provider_error",
-    );
+    const events = await collect(agent.stream(request()));
+    assert.equal(events.filter((event) => event.type === "error").length, 1);
+    assert.equal(events.some((event) => event.type === "agent_end"), false);
+    assert.deepEqual(events.at(-1), { type: "error", message: "agent boom", code: "provider_error" });
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
