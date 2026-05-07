@@ -95,11 +95,26 @@ const providerResult = loadJson(process.env.MAKAI_TEST_PROVIDER_RESULT_PATH, def
 const agentEvents = loadJson(process.env.MAKAI_TEST_AGENT_EVENTS_PATH, defaultAgentEvents);
 const agentResult = loadJson(process.env.MAKAI_TEST_AGENT_RESULT_PATH, null);
 const agentError = loadJson(process.env.MAKAI_TEST_AGENT_ERROR_PATH, null);
-const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, {
-  models: [],
+const defaultModelsResponse = {
+  models: [{
+    model_ref: "anthropic/anthropic-messages@claude-sonnet-4-5",
+    model_id: "claude-sonnet-4-5",
+    display_name: "Claude Sonnet 4.5",
+    provider_id: "anthropic",
+    api: "anthropic-messages",
+    auth_status: "authenticated",
+    lifecycle: "stable",
+    capabilities: ["chat", "streaming", "tools", "reasoning"],
+    source: "dynamic",
+    base_url: "https://api.anthropic.com",
+    context_window: 200000,
+    max_output_tokens: 8192,
+    reasoning_default: "medium",
+  }],
   fetched_at_ms: 1,
   cache_max_age_ms: 300000,
-});
+};
+const modelsResponse = loadJson(process.env.MAKAI_TEST_MODELS_RESPONSE_PATH, defaultModelsResponse);
 
 const requestCounts = new Map();
 const authenticatedProviders = new Set();
