@@ -179,9 +179,21 @@ class StdioAgentApi implements MakaiAgentApi {
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
+    let retryRequest = request;
     return withAuthRetry(
-      () => this.runOnce(request, effectivePolicy),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request) },
+      () => this.runOnce(retryRequest, effectivePolicy),
+      {
+        auth: this.auth,
+        authHandlers: this.authHandlers,
+        authRetryPolicy: effectivePolicy,
+        fallbackProviderId: providerIdFromRequest(request),
+        beforeRetry: () => {
+          retryRequest = {
+            ...request,
+            options: { ...request.options, session_id: generateNanoId() },
+          };
+        },
+      },
     );
   }
 
@@ -221,7 +233,8 @@ class StdioAgentApi implements MakaiAgentApi {
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     const fallbackProviderId = providerIdFromRequest(request);
-    let attempt = this.streamAttempt(request, effectivePolicy);
+    let streamRequest = request;
+    let attempt = this.streamAttempt(streamRequest, effectivePolicy);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
     let retried = false;
@@ -240,7 +253,11 @@ class StdioAgentApi implements MakaiAgentApi {
               throw error;
             }
             retried = true;
-            attempt = this.streamAttempt(request, effectivePolicy);
+            streamRequest = {
+              ...request,
+              options: { ...request.options, session_id: generateNanoId() },
+            };
+            attempt = this.streamAttempt(streamRequest, effectivePolicy);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
           }
@@ -832,6 +849,7 @@ async function withAuthRetry<T>(
     authHandlers?: AuthFlowHandlers;
     authRetryPolicy?: RunOptions["auth_retry_policy"];
     fallbackProviderId?: string;
+    beforeRetry?: () => void;
   },
 ): Promise<T> {
   try {
@@ -845,6 +863,7 @@ async function withAuthRetry<T>(
       } catch {
         throw error;
       }
+      options.beforeRetry?.();
       return await operation();
     }
     throw error;

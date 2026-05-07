@@ -615,6 +615,45 @@ test("client.agent.run auto_once retries on auth_required nack and succeeds", as
   }
 });
 
+test("client.agent.run auto_once uses fresh session_id on retry", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-session-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: "ok",
+      usage: { input: 1, output: 1 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+    }],
+  }));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AGENT_RESULT_PATH: resultPath },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await handle.agent.run(request());
+    const logged = readLoggedRequests(logPath);
+    const agentStarts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(agentStarts.length, 2);
+    const firstSessionId = agentStarts[0]?.session_id;
+    const secondSessionId = agentStarts[1]?.session_id;
+    assert.equal(firstSessionId, "testNanoIdSess1234567");
+    assert.notEqual(secondSessionId, firstSessionId);
+    assert.match(secondSessionId as string, /^[0-9A-Za-z]{21}$/);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("manual auth_retry_policy does not retry on auth_required", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-manual-test-"));
   const logPath = path.join(tmpDir, "request.log");
@@ -688,6 +727,33 @@ test("client.agent.stream auto_once retries on auth_required nack and yields eve
     assert.equal(agentStarts.length, 2);
     const loginStarts = logged.filter((entry) => entry.type === "auth_login_start");
     assert.equal(loginStarts.length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream auto_once uses fresh session_id on retry", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-auth-retry-agent-stream-session-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await collect(handle.agent.stream(request()));
+    const logged = readLoggedRequests(logPath);
+    const agentStarts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(agentStarts.length, 2);
+    const firstSessionId = agentStarts[0]?.session_id;
+    const secondSessionId = agentStarts[1]?.session_id;
+    assert.equal(firstSessionId, "testNanoIdSess1234567");
+    assert.notEqual(secondSessionId, firstSessionId);
+    assert.match(secondSessionId as string, /^[0-9A-Za-z]{21}$/);
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
