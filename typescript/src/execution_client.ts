@@ -6,6 +6,7 @@ import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
 import {
+  MakaiAuthRequiredError,
   MakaiStreamError,
   type AgentRunRequest,
   type AgentRunResponse,
@@ -122,14 +123,21 @@ class StdioProviderApi implements MakaiProviderApi {
           if (providerId) {
             try {
               await this.auth.login(providerId, this.authHandlers);
-            } catch {
-              throw error;
+            } catch (loginError) {
+              if (this.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
+                throw authRequiredError(providerId, error.message);
+              }
+              throw loginError;
             }
             retried = true;
             attempt = this.streamAttempt(request, effectivePolicy);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
           }
+        }
+        if (isRetryableAuthError(error)) {
+          const providerId = error.provider_id ?? fallbackProviderId;
+          if (providerId) throw authRequiredError(providerId, error.message);
         }
         throw error;
       }
@@ -256,8 +264,11 @@ class StdioAgentApi implements MakaiAgentApi {
           if (providerId) {
             try {
               await this.auth.login(providerId, this.authHandlers);
-            } catch {
-              throw error;
+            } catch (loginError) {
+              if (this.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
+                throw authRequiredError(providerId, error.message);
+              }
+              throw loginError;
             }
             retried = true;
             streamRequest = {
@@ -268,6 +279,10 @@ class StdioAgentApi implements MakaiAgentApi {
             iterator = attempt[Symbol.asyncIterator]();
             continue;
           }
+        }
+        if (isRetryableAuthError(error)) {
+          const providerId = error.provider_id ?? fallbackProviderId;
+          if (providerId) throw authRequiredError(providerId, error.message);
         }
         throw error;
       }
@@ -930,6 +945,14 @@ function isRetryableAuthError(error: unknown): error is MakaiStreamError {
   return error instanceof MakaiStreamError && error.code === "auth_required";
 }
 
+function authRequiredError(providerId: string, message: string): MakaiAuthRequiredError {
+  return new MakaiAuthRequiredError(providerId, message);
+}
+
+function isInteractiveAuthWithoutHandlers(error: unknown): boolean {
+  return error instanceof Error && /no onPrompt handler configured/.test(error.message);
+}
+
 function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunRequest): string | undefined {
   // model_ref is opaque per spec, but canonical refs carry provider info.
   // We derive a fallback provider_id for auth retry only when the runtime
@@ -968,11 +991,18 @@ async function withAuthRetry<T>(
       if (!providerId) throw error;
       try {
         await options.auth.login(providerId, options.authHandlers);
-      } catch {
-        throw error;
+      } catch (loginError) {
+        if (options.authHandlers === undefined && isInteractiveAuthWithoutHandlers(loginError)) {
+          throw authRequiredError(providerId, error.message);
+        }
+        throw loginError;
       }
       options.beforeRetry?.();
       return await operation();
+    }
+    if (isRetryableAuthError(error)) {
+      const providerId = error.provider_id ?? options.fallbackProviderId;
+      if (providerId) throw authRequiredError(providerId, error.message);
     }
     throw error;
   }
