@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { ulid } from "ulid";
+// nanoid is ESM-only; ts-ignore lets us require it in a CJS build.
+// @ts-ignore
+import { customAlphabet } from "nanoid";
 import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
@@ -25,6 +28,8 @@ import {
 
 const ENVELOPE_VERSION = 1;
 const DEFAULT_RESPONSE_TIMEOUT_MS = 30_000;
+const NANO_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const nanoid = customAlphabet(NANO_ID_ALPHABET, 21);
 
 type ExecutionOptions = {
   responseTimeoutMs?: number;
@@ -79,7 +84,7 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<ProviderCompleteResponse> {
-    const streamId = randomUUID();
+    const streamId = ulid();
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     while (true) {
       const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
@@ -127,7 +132,7 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<ProviderStreamEvent> {
-    const streamId = randomUUID();
+    const streamId = ulid();
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
@@ -288,7 +293,7 @@ function buildAgentEnvelope(type: string, sessionId: string, sequence: number, p
   return {
     type,
     session_id: sessionId,
-    message_id: randomUUID(),
+    message_id: ulid(),
     sequence,
     timestamp: Date.now(),
     version: ENVELOPE_VERSION,
@@ -390,15 +395,15 @@ function executionContext(request: ProviderCompleteRequest | AgentRunRequest): R
 
 function agentSessionId(request: AgentRunRequest): string {
   const sessionId = request.options?.session_id;
-  if (sessionId === undefined) return randomUUID();
-  if (!isUuid(sessionId)) {
-    throw new TypeError("request.options.session_id must be a UUID for agent transport");
+  if (sessionId === undefined) return nanoid();
+  if (!isNanoId(sessionId)) {
+    throw new TypeError("request.options.session_id must be a 21-character alphanumeric NanoID for agent transport");
   }
   return sessionId;
 }
 
-function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+function isNanoId(value: string): boolean {
+  return /^[0-9A-Za-z]{21}$/.test(value);
 }
 
 function serializeChatMessage(message: ChatMessage): Record<string, unknown> {

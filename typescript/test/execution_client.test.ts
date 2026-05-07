@@ -48,7 +48,7 @@ function request() {
   return {
     model_ref: "anthropic/anthropic-messages@opaque-model-ref-with%3Acolon",
     messages: [{ role: "user" as const, content: "hello" }],
-    options: { temperature: 0.2, session_id: "11111111-1111-4111-8111-111111111111" },
+    options: { temperature: 0.2, session_id: "testNanoIdSess1234567" },
   };
 }
 
@@ -199,13 +199,13 @@ test("client.agent.run resolves with correct AgentRunResponse", async () => {
   }
 });
 
-test("client.agent.run rejects non-UUID session IDs before transport I/O", async () => {
+test("client.agent.run rejects non-NanoID session IDs before transport I/O", async () => {
   const harness = await setupHarness();
   try {
     const agent = createMakaiAgentApi(harness.client);
     await assert.rejects(
       () => agent.run({ ...request(), options: { ...request().options, session_id: "session-1" } }),
-      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a UUID for agent transport",
+      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a 21-character alphanumeric NanoID for agent transport",
     );
     assert.deepEqual(readLoggedRequests(harness.logPath), []);
   } finally {
@@ -213,13 +213,13 @@ test("client.agent.run rejects non-UUID session IDs before transport I/O", async
   }
 });
 
-test("client.agent.stream rejects non-UUID session IDs before transport I/O", async () => {
+test("client.agent.stream rejects non-NanoID session IDs before transport I/O", async () => {
   const harness = await setupHarness();
   try {
     const agent = createMakaiAgentApi(harness.client);
     await assert.rejects(
       async () => collect(agent.stream({ ...request(), options: { ...request().options, session_id: "session-1" } })),
-      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a UUID for agent transport",
+      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a 21-character alphanumeric NanoID for agent transport",
     );
     assert.deepEqual(readLoggedRequests(harness.logPath), []);
   } finally {
@@ -227,8 +227,22 @@ test("client.agent.stream rejects non-UUID session IDs before transport I/O", as
   }
 });
 
-test("client.agent.run accepts UUID v7 session IDs", async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-v7-session-test-"));
+test("client.agent.run rejects UUID session IDs", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run({ ...request(), options: { ...request().options, session_id: "01890f3e-7b62-7cc4-8f68-7a6f6a1b1234" } }),
+      (err: unknown) => err instanceof TypeError && err.message === "request.options.session_id must be a 21-character alphanumeric NanoID for agent transport",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run accepts valid NanoID session IDs", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-nanoid-session-test-"));
   const resultPath = path.join(tmpDir, "agent-result.json");
   fs.writeFileSync(resultPath, JSON.stringify({
     messages: [{
@@ -244,8 +258,9 @@ test("client.agent.run accepts UUID v7 session IDs", async () => {
   const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
   try {
     const agent = createMakaiAgentApi(harness.client);
-    await agent.run({ ...request(), options: { ...request().options, session_id: "01890f3e-7b62-7cc4-8f68-7a6f6a1b1234" } });
-    assert.equal(readLoggedRequests(harness.logPath)[0]?.session_id, "01890f3e-7b62-7cc4-8f68-7a6f6a1b1234");
+    const nanoId = "abcABC123xyzXYZ789mno";
+    await agent.run({ ...request(), options: { ...request().options, session_id: nanoId } });
+    assert.equal(readLoggedRequests(harness.logPath)[0]?.session_id, nanoId);
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -267,7 +282,7 @@ test("client.agent.stream yields agent lifecycle events in order", async () => {
       "turn_end",
       "agent_end",
     ]);
-    assert.deepEqual(events[0], { type: "agent_start", session_id: "11111111-1111-4111-8111-111111111111" } satisfies AgentStreamEvent);
+    assert.deepEqual(events[0], { type: "agent_start", session_id: "testNanoIdSess1234567" } satisfies AgentStreamEvent);
     assert.deepEqual(events.at(-1), { type: "agent_end", usage: { input: 7, output: 9 }, stop_reason: "end_turn" } satisfies AgentStreamEvent);
 
     const logged = readLoggedRequests(harness.logPath);
@@ -789,7 +804,7 @@ test("agent_start payload includes resume_session_id", async () => {
     const start = logged.find((entry) => entry.type === "agent_start");
     assert.ok(start);
     const payload = start?.payload as Record<string, unknown>;
-    assert.equal(payload.resume_session_id, "11111111-1111-4111-8111-111111111111");
+    assert.equal(payload.resume_session_id, "testNanoIdSess1234567");
   } finally {
     await harness.cleanup();
   }
