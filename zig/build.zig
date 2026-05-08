@@ -817,6 +817,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "pkce", .module = oauth_pkce_mod },
+                .{ .name = "compat", .module = compat_mod },
             },
         }),
     });
