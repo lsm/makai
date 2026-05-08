@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 /// PKCE challenge pair (verifier and challenge)
 pub const PKCEChallenge = struct {
@@ -14,9 +15,13 @@ pub const PKCEChallenge = struct {
 /// Generate PKCE challenge pair
 /// Returns base64url(random_32_bytes) as verifier and base64url(SHA256(verifier)) as challenge
 pub fn generate(allocator: std.mem.Allocator) !PKCEChallenge {
-    // 1. Generate 32 random bytes
+    return generateWithRandom(allocator, compat.random.fillSecureBytes);
+}
+
+fn generateWithRandom(allocator: std.mem.Allocator, fill_random: fn ([]u8) void) !PKCEChallenge {
+    // 1. Generate 32 secure random bytes
     var random_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    fill_random(&random_bytes);
 
     // 2. Base64url encode → verifier
     const verifier = try base64urlEncode(allocator, &random_bytes);
@@ -40,6 +45,12 @@ fn base64urlEncode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const encoded = try allocator.alloc(u8, encoded_len);
     _ = encoder.encode(encoded, data);
     return encoded;
+}
+
+fn fillTestPkceBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @intCast(i);
+    }
 }
 
 test "generate - returns valid PKCE challenge" {
@@ -71,6 +82,18 @@ test "generate - creates unique verifiers" {
     // Should be different
     try std.testing.expect(!std.mem.eql(u8, challenge1.verifier, challenge2.verifier));
     try std.testing.expect(!std.mem.eql(u8, challenge1.challenge, challenge2.challenge));
+}
+
+test "generateWithRandom - is deterministic for test seam" {
+    const challenge1 = try generateWithRandom(std.testing.allocator, fillTestPkceBytes);
+    defer challenge1.deinit(std.testing.allocator);
+
+    const challenge2 = try generateWithRandom(std.testing.allocator, fillTestPkceBytes);
+    defer challenge2.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(challenge1.verifier, challenge2.verifier);
+    try std.testing.expectEqualStrings(challenge1.challenge, challenge2.challenge);
+    try std.testing.expectEqualStrings("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", challenge1.verifier);
 }
 
 test "base64urlEncode - encodes correctly" {

@@ -7,6 +7,7 @@
 const std = @import("std");
 const transport = @import("transport");
 const ai_types = @import("ai_types");
+const compat = @import("compat");
 
 pub const WebSocketClient = struct {
     allocator: std.mem.Allocator,
@@ -447,7 +448,7 @@ pub fn encodeFrame(frame: Frame, allocator: std.mem.Allocator) ![]u8 {
     if (frame.masked) {
         // Generate random mask
         var mask: [4]u8 = undefined;
-        std.crypto.random.bytes(&mask);
+        compat.random.fillSecureBytes(&mask);
 
         // Write mask
         buffer[offset..][0..4].* = mask;
@@ -543,7 +544,7 @@ fn performHandshake(
 
     // Generate random 16-byte nonce and base64 encode
     var nonce: [16]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    compat.random.fillSecureBytes(&nonce);
 
     // Base64 encode the nonce
     const encoder = std.base64.standard.Encoder;
