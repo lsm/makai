@@ -34,12 +34,12 @@ var monotonic_mutex: std.Thread.Mutex = .{};
 /// stable monotonic origin and can be subtracted for elapsed-duration math.
 /// Zig 0.16 mapping: move to the chosen `std.Io.Threaded`/default-context
 /// monotonic clock internally while keeping raw `std.Io` out of this API.
-pub fn monotonicNanos() u64 {
+pub fn monotonicNanos() !u64 {
     monotonic_mutex.lock();
     defer monotonic_mutex.unlock();
 
     if (monotonic_timer == null) {
-        monotonic_timer = std.time.Timer.start() catch return 0;
+        monotonic_timer = try std.time.Timer.start();
     }
 
     return monotonic_timer.?.read();
@@ -62,7 +62,7 @@ test "compat time helpers return plausible timestamps" {
     try std.testing.expect(nowMillis() > 0);
     try std.testing.expect(nowSeconds() > 0);
     try std.testing.expect(nowNanos() > 0);
-    _ = monotonicNanos();
+    _ = try monotonicNanos();
 }
 
 test "compat sleep helpers accept zero duration" {

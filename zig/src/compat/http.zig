@@ -49,21 +49,23 @@ pub fn receiveResponse(request: *Request, redirect_buffer: []u8) !Response {
 }
 
 /// Reader wrapper for streaming response bodies without exposing raw `std.Io`.
-pub const ResponseReader = struct {
-    inner: *std.Io.Reader,
+pub const ResponseReader = opaque {};
 
-    pub fn read(self: ResponseReader, buffer: []u8) !usize {
-        return self.inner.readSliceShort(buffer);
-    }
+/// Read bytes from a response body reader.
+pub fn readResponse(reader: *ResponseReader, buffer: []u8) !usize {
+    const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
+    return inner.readSliceShort(buffer);
+}
 
-    pub fn readAll(self: ResponseReader, buffer: []u8) !void {
-        try self.inner.readSliceAll(buffer);
-    }
-};
+/// Read exactly `buffer.len` bytes from a response body reader.
+pub fn readAllResponse(reader: *ResponseReader, buffer: []u8) !void {
+    const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
+    try inner.readSliceAll(buffer);
+}
 
 /// Return a streaming reader for a response body.
-pub fn responseReader(response: *Response, transfer_buf: []u8) ResponseReader {
-    return .{ .inner = response.reader(transfer_buf) };
+pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
+    return @ptrCast(@alignCast(response.reader(transfer_buf)));
 }
 
 test "compat http client initializes and deinitializes" {
