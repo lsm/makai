@@ -30,7 +30,8 @@ pub fn nowNanos() i128 {
 /// Zig 0.16 mapping: move to the chosen `std.Io.Threaded`/default-context
 /// monotonic clock internally while keeping raw `std.Io` out of this API.
 pub fn monotonicNanos() u64 {
-    return @intCast(std.time.nanoTimestamp());
+    var timer = std.time.Timer.start() catch return 0;
+    return timer.read();
 }
 
 /// Sleep for a number of nanoseconds.

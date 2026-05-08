@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Address = std.net.Address;
+pub const AddressList = std.net.AddressList;
 pub const Server = std.net.Server;
 
 /// TCP stream wrapper used as the stable Makai networking boundary.
@@ -38,12 +39,20 @@ pub const Stream = struct {
 /// backend internally while keeping this wrapper signature context/allocator
 /// first and free of raw `std.Io`.
 ///
-/// `allocator` is intentionally reserved for the future resolver implementation,
-/// which may allocate address lists or context-backed resolver state. The Zig
-/// 0.15.2 pass-through uses `std.net.Address.resolveIp` and does not allocate.
+/// `allocator` owns temporary DNS resolver allocations during this call.
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
-    _ = allocator;
-    return std.net.Address.resolveIp(host, port);
+    var list = try std.net.getAddressList(allocator, host, port);
+    defer list.deinit();
+
+    if (list.addrs.len == 0) return error.UnknownHostName;
+    return list.addrs[0];
+}
+
+/// Resolve a host/port into an owned address list.
+///
+/// Callers own the returned list and must call `deinit`.
+pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !*AddressList {
+    return std.net.getAddressList(allocator, host, port);
 }
 
 /// Connect to a TCP peer.

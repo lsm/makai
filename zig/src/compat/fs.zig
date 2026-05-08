@@ -29,9 +29,15 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, dir: std.fs.Dir, path: []cons
     return dir.readFileAlloc(allocator, path, max_bytes);
 }
 
+pub const default_file_mode: std.fs.File.Mode = 0o600;
+
 /// Write a file relative to `dir`, replacing existing contents.
+///
+/// Files are created with restrictive permissions by default because later OAuth
+/// storage migration work may use this wrapper for credential material. Existing
+/// files keep their current mode when opened with truncation on POSIX systems.
 pub fn writeFile(dir: std.fs.Dir, path: []const u8, data: []const u8) !void {
-    var file = try dir.createFile(path, .{ .truncate = true });
+    var file = try dir.createFile(path, .{ .truncate = true, .mode = default_file_mode });
     defer file.close();
     try file.writeAll(data);
 }
@@ -50,6 +56,10 @@ pub fn atomicReplace(dir: std.fs.Dir, target_path: []const u8, tmp_path: []const
     try writeFile(dir, tmp_path, data);
     try dir.rename(tmp_path, target_path);
     cleanup_tmp = false;
+
+    var replaced = try dir.openFile(target_path, .{ .mode = .write_only });
+    defer replaced.close();
+    try replaced.chmod(default_file_mode);
 }
 
 /// Create a directory and any missing parents relative to `dir`.
