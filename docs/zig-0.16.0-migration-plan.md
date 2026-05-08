@@ -85,7 +85,7 @@ Depends on: work item 2.
 
 Priority: **high**
 
-Create random helpers that distinguish security-sensitive randomness from ordinary IDs. Use them for PKCE verifiers, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary-name generation in follow-up PRs. In Phase 0, implement wrappers using `std.crypto.random` and add deterministic test seams where possible.
+Create random helpers that distinguish security-sensitive randomness from ordinary IDs. Use them for both PKCE verifier modules (`zig/src/oauth/pkce.zig` and `zig/src/utils/oauth/pkce.zig`), OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary-name generation in follow-up PRs. In Phase 0, implement wrappers using `std.crypto.random`, add deterministic test seams where possible, and note that the two PKCE modules should either share the secure helper or be deduplicated in a follow-up to avoid divergent verifier entropy behavior.
 
 Suggested scope for one PR:
 - Add `secureBytes`, `randomBytes`, and test/deterministic source helpers if needed.
@@ -233,6 +233,7 @@ Convert remaining direct `std.time.timestamp`, `milliTimestamp`, `nanoTimestamp`
 Suggested scope for one PR:
 - Update wrapper implementation for Zig 0.16.
 - Migrate all remaining production call sites and tests.
+- Verify OAuth token-expiry arithmetic produces identical results on Zig 0.16.0 for representative seconds/milliseconds inputs, including boundary values used by refresh scheduling.
 - Run core, protocol, provider, utils, and agent unit groups as applicable.
 
 Depends on: work items 3 and 9; may depend on work item 11 if wrappers use migrated stream timing primitives.
@@ -241,11 +242,11 @@ Depends on: work items 3 and 9; may depend on work item 11 if wrappers use migra
 
 Priority: **high**
 
-Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol ID generation, and storage temporary names through these wrappers. Treat OAuth and security-sensitive call sites as requiring explicit secure entropy.
+Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate both PKCE verifier modules (`zig/src/oauth/pkce.zig:14` and `zig/src/utils/oauth/pkce.zig:19`), OAuth state, WebSocket masks/nonces, protocol ID generation, and storage temporary names through these wrappers. Treat OAuth and security-sensitive call sites as requiring explicit secure entropy, and either deduplicate the two PKCE paths or document why both remain separate while sharing the same secure helper.
 
 Suggested scope for one PR:
 - Update wrapper implementation for Zig 0.16.
-- Migrate all `std.crypto.random` call sites identified in the assessment.
+- Migrate all `std.crypto.random` call sites identified in the assessment, explicitly including `zig/src/oauth/pkce.zig` and `zig/src/utils/oauth/pkce.zig`.
 - After all intended random call sites in this work item are migrated, add or enable the failing `scripts/check-zig-patterns.sh` guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of `io.randomSecure`/secure wrappers.
 - Add or update tests to distinguish deterministic test mode from secure production mode.
 
@@ -277,8 +278,9 @@ Port OAuth credential storage to Zig 0.16 filesystem helpers as a standalone use
 Suggested scope for one PR:
 - Migrate `zig/src/utils/oauth/storage.zig` through filesystem helpers.
 - Run OAuth storage and utils tests.
-- Acceptance criteria: temp files are created in the target directory to preserve same-filesystem rename guarantees, final credential file mode is or remains `0o600` where supported, failed writes/renames do not truncate the existing credential file, and temporary files are cleaned up on failure where possible.
+- Acceptance criteria: temp files are created in the target directory to preserve same-filesystem rename guarantees, final credential file mode is or remains `0o600` where supported, failed writes/renames do not truncate the existing credential file, temporary files are cleaned up on failure where possible, and startup/load code cleans up stale orphaned `.tmp.*` files left by crashed writes where safe.
 - Preserve existing storage error messages and error types unless a compiler-enforced change is documented.
+- Address credential memory zeroing for `Credentials.deinit()` and `ProviderAuth.deinit()` if practical while touching storage; otherwise file a named security-debt follow-up and document that sensitive token/key slices are still freed without zeroing.
 - Include manual notes for credential storage rollback/backup behavior if relevant.
 
 Depends on: work items 5, 9, 13, 14, and 15.
@@ -307,6 +309,7 @@ Suggested scope for one PR:
 - Update shared HTTP abstraction for Zig 0.16.
 - Migrate one representative provider, preferably one with SSE streaming and nontrivial request/error handling.
 - Add HTTP/SSE cancellation tests for cancel during connect/setup, during response headers, between SSE events, and mid-event payload; use mocks where real network timing is not deterministic.
+- Preserve auth-header construction and forwarding semantics exactly, including API key, bearer token, OAuth, and provider-specific header names/values.
 - Run provider unit tests and mock/non-secret tests for that provider.
 - Preserve existing provider error messages and error types unless a compiler-enforced change is documented.
 
@@ -360,6 +363,8 @@ Port WebSocket connection setup, stream read/write, nonce/mask generation, and n
 Suggested scope for one PR:
 - Migrate `zig/src/transports/websocket.zig` through networking/random wrappers.
 - Run transport unit tests and WebSocket-specific regression tests.
+- Add or explicitly defer full `Sec-WebSocket-Accept` value verification; current behavior only checks header existence, so the PR must either fix it or document the known limitation.
+- Document that `wss://` TLS remains unsupported post-migration unless the PR explicitly adds TLS support.
 - Document any unsupported `std.Io` backend/networking caveats.
 
 Depends on: work items 7 and 14. It does not depend on filesystem/stdio/OAuth storage migration.
@@ -481,7 +486,8 @@ Depends on: work item 23.
 | libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
-| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. |
+| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. Both PKCE modules must migrate to secure entropy. |
+| Credential memory zeroing | Known security debt; address or explicitly defer | 16 | `Credentials.deinit()` and `ProviderAuth.deinit()` currently free sensitive slices without zeroing; work item 16 must either fix this while touching storage or file a named follow-up. |
 
 ## Open questions
 

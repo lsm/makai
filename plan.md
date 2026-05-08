@@ -20,7 +20,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 4. **Add random and secure-random wrappers on Zig 0.15.2**  
    Priority: **high**  
-   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of PKCE, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Phase 0 may add non-failing inventory/reporting for direct `std.crypto.random` usage, but must not make `check-zig-patterns.sh` fail until the bulk call-site migration in work item 14.
+   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of both PKCE modules (`zig/src/oauth/pkce.zig` and `zig/src/utils/oauth/pkce.zig`), OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Phase 0 may add non-failing inventory/reporting for direct `std.crypto.random` usage, but must not make `check-zig-patterns.sh` fail until the bulk call-site migration in work item 14.
 
 5. **Add filesystem and stdio helper layer on Zig 0.15.2**  
    Priority: **high**  
@@ -56,11 +56,11 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 13. **Migrate time, sleep, and timestamp call sites through wrappers**  
     Priority: **high**  
-    Convert remaining direct timestamp and sleep calls to the project wrapper API. Update wrapper implementations to use the chosen Zig 0.16 `std.Io` time primitives. Preserve wall-clock versus monotonic semantics explicitly.
+    Convert remaining direct timestamp and sleep calls to the project wrapper API. Update wrapper implementations to use the chosen Zig 0.16 `std.Io` time primitives. Preserve wall-clock versus monotonic semantics explicitly and verify OAuth token-expiry arithmetic remains identical on Zig 0.16 for representative and boundary inputs.
 
 14. **Migrate random and protocol/OAuth ID generation**  
     Priority: **high**  
-    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names. After these call sites migrate, enable the failing pattern guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of secure entropy.
+    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate both PKCE modules (`zig/src/oauth/pkce.zig:14` and `zig/src/utils/oauth/pkce.zig:19`), OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names; deduplicate PKCE helper logic or document why both paths remain separate while sharing secure entropy. After these call sites migrate, enable the failing pattern guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of secure entropy.
 
 15. **Migrate ArrayList, formatting, custom JSON writer, and std.json drift**  
     Priority: **high**  
@@ -68,7 +68,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 16. **Migrate OAuth credential storage filesystem operations**  
     Priority: **high**  
-    Port OAuth credential storage to Zig 0.16 filesystem helpers as its own user-data-focused PR. Preserve atomic replacement, directory creation, missing-file behavior, permissions expectations, rollback/backup safety, and existing storage error messages/error types unless a compiler-enforced change is documented. Keep stdio transport and CLI file I/O out of this PR.
+    Port OAuth credential storage to Zig 0.16 filesystem helpers as its own user-data-focused PR. Preserve atomic replacement, directory creation, missing-file behavior, permissions expectations, rollback/backup safety, startup cleanup of stale orphaned `.tmp.*` files where safe, and existing storage error messages/error types unless a compiler-enforced change is documented. Address credential memory zeroing for `Credentials.deinit()` and `ProviderAuth.deinit()` if practical while touching storage; otherwise file a named security-debt follow-up documenting that sensitive slices are still freed without zeroing.
 
 17. **Migrate stdio transport and CLI file I/O**  
     Priority: **high**  
@@ -76,7 +76,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 18. **Migrate shared HTTP abstraction and one proving provider**  
     Priority: **urgent**  
-    Port the shared HTTP abstraction to Zig 0.16's `std.Io`-aware request/response flow and migrate exactly one representative streaming provider as the proving provider. The proving provider should exercise request bodies, response head handling, incremental body reads, SSE parsing, provider error-body handling, and cancellation during connect/setup, headers, between SSE events, and mid-event payload. Preserve existing provider error messages/error types unless a compiler-enforced change is documented; do not migrate all provider families until this PR establishes the abstraction shape.
+    Port the shared HTTP abstraction to Zig 0.16's `std.Io`-aware request/response flow and migrate exactly one representative streaming provider as the proving provider. The proving provider should exercise request bodies, response head handling, incremental body reads, SSE parsing, provider error-body handling, and cancellation during connect/setup, headers, between SSE events, and mid-event payload. Preserve auth-header construction/forwarding semantics for API keys, bearer tokens, OAuth tokens, and provider-specific headers, and preserve existing provider error messages/error types unless a compiler-enforced change is documented.
 
 19. **Migrate remaining OpenAI/Azure provider HTTP implementations**  
     Priority: **high**  
@@ -92,7 +92,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 22. **Migrate WebSocket transport networking**  
     Priority: **normal**  
-    Port WebSocket connection setup, stream read/write, nonce/mask generation, and network error handling through the networking/random wrappers. Preserve frame parsing and existing transport interfaces. Validate with loopback or mock transport tests.
+    Port WebSocket connection setup, stream read/write, nonce/mask generation, and network error handling through the networking/random wrappers. Preserve frame parsing and existing transport interfaces. Add or explicitly defer full `Sec-WebSocket-Accept` value verification, since current behavior only checks header existence, and document that `wss://` TLS remains unsupported post-migration unless the PR adds TLS support.
 
 23. **Run full unit and mock E2E validation on Zig 0.16.0**  
     Priority: **urgent**  
@@ -145,7 +145,8 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 | libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
-| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. |
+| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. Both PKCE modules must migrate to secure entropy. |
+| Credential memory zeroing | Known security debt; address or explicitly defer | 16 | `Credentials.deinit()` and `ProviderAuth.deinit()` currently free sensitive slices without zeroing; work item 16 must either fix this while touching storage or file a named follow-up. |
 
 ## Open questions
 
