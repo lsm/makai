@@ -25,12 +25,24 @@ pub fn nowNanos() i128 {
     return std.time.nanoTimestamp();
 }
 
+var monotonic_timer: ?std.time.Timer = null;
+var monotonic_mutex: std.Thread.Mutex = .{};
+
 /// Monotonic nanoseconds suitable for durations and deadlines.
 ///
+/// Zig 0.15.2 mapping: use a process-wide `std.time.Timer` so readings share a
+/// stable monotonic origin and can be subtracted for elapsed-duration math.
 /// Zig 0.16 mapping: move to the chosen `std.Io.Threaded`/default-context
 /// monotonic clock internally while keeping raw `std.Io` out of this API.
 pub fn monotonicNanos() u64 {
-    return @intCast(std.time.nanoTimestamp());
+    monotonic_mutex.lock();
+    defer monotonic_mutex.unlock();
+
+    if (monotonic_timer == null) {
+        monotonic_timer = std.time.Timer.start() catch return 0;
+    }
+
+    return monotonic_timer.?.read();
 }
 
 /// Sleep for a number of nanoseconds.

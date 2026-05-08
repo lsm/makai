@@ -36,18 +36,18 @@ pub const HttpClient = struct {
 };
 
 /// Send a request body and complete the outbound request.
-pub fn sendRequest(request: *Request, body: []const u8) !void {
+pub fn sendRequest(request: *Request, body: []u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
     try request.sendBodyComplete(body);
 }
 
 /// Receive the response headers/body metadata for a request.
-pub fn receiveResponse(request: *Request, response: *Response) !void {
-    try request.receiveHead(response);
+pub fn receiveResponse(request: *Request, redirect_buffer: []u8) !Response {
+    return request.receiveHead(redirect_buffer);
 }
 
 /// Return a streaming reader for a response body.
-pub fn responseReader(response: *Response, transfer_buf: []u8) *std.http.Client.Response.Reader {
+pub fn responseReader(response: *Response, transfer_buf: []u8) *std.Io.Reader {
     return response.reader(transfer_buf);
 }
 
