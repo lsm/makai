@@ -5,6 +5,12 @@
 //! Current implementations are thin Zig 0.15.2-compatible pass-throughs; later
 //! migration PRs will remap internals to Zig 0.16 `std.Io.Threaded`/default
 //! context plumbing without changing these stable names unnecessarily.
+//!
+//! Names intentionally follow the task's stable helper list where it is more
+//! specific than the architecture note's examples (`monotonicNanos`, `sleepNs`,
+//! `getCwd`, `resolveAddress`, `tcpListen`). The examples in the architecture
+//! decision remain guidance; this skeleton records the concrete names that
+//! follow-up PRs will migrate without exposing raw `std.Io`.
 
 pub const time = @import("time.zig");
 pub const random = @import("random.zig");

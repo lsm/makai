@@ -12,9 +12,13 @@ pub fn secureBytes(buf: []u8) void {
 
 /// Fill `buf` with ordinary random bytes.
 ///
+/// Zig 0.15.2 note: this is currently equivalent to `secureBytes`; both use
+/// `std.crypto.random.bytes` until the Zig 0.16 I/O context exists.
+///
 /// Zig 0.16 mapping: route to the Makai default context's non-secure random
-/// source (`io.random`/test deterministic source where appropriate). Do not use
-/// this for credentials, PKCE, OAuth state, or other security-sensitive values.
+/// source (`io.random`/test deterministic source where appropriate), diverging
+/// from `secureBytes`. After that remap, do not use this for credentials, PKCE,
+/// OAuth state, or other security-sensitive values.
 pub fn randomBytes(buf: []u8) void {
     std.crypto.random.bytes(buf);
 }

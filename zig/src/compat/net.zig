@@ -37,6 +37,10 @@ pub const Stream = struct {
 /// Zig 0.16 mapping: route through the selected Makai default I/O/networking
 /// backend internally while keeping this wrapper signature context/allocator
 /// first and free of raw `std.Io`.
+///
+/// `allocator` is intentionally reserved for the future resolver implementation,
+/// which may allocate address lists or context-backed resolver state. The Zig
+/// 0.15.2 pass-through uses `std.net.Address.resolveIp` and does not allocate.
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
     _ = allocator;
     return std.net.Address.resolveIp(host, port);

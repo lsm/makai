@@ -15,19 +15,19 @@ pub const RequestOptions = struct {
 /// I/O context (`std.Io.Threaded`/dispatch as required internally) while keeping
 /// `std.Io` out of public signatures. Provider/OAuth rollout will add streaming
 /// response helpers on this boundary without changing provider behavior here.
-pub const CompatHttpClient = struct {
+pub const HttpClient = struct {
     client: std.http.Client,
 
-    pub fn init(allocator: std.mem.Allocator) CompatHttpClient {
+    pub fn init(allocator: std.mem.Allocator) HttpClient {
         return .{ .client = .{ .allocator = allocator } };
     }
 
-    pub fn deinit(self: *CompatHttpClient) void {
+    pub fn deinit(self: *HttpClient) void {
         self.client.deinit();
         self.* = undefined;
     }
 
-    pub fn openRequest(self: *CompatHttpClient, method: Method, uri: std.Uri, options: RequestOptions) !Request {
+    pub fn openRequest(self: *HttpClient, method: Method, uri: std.Uri, options: RequestOptions) !Request {
         return self.client.request(method, uri, .{
             .extra_headers = options.extra_headers,
             .keep_alive = options.keep_alive,
@@ -52,7 +52,7 @@ pub fn responseReader(response: *Response, transfer_buf: []u8) *std.http.Client.
 }
 
 test "compat http client initializes and deinitializes" {
-    var client = CompatHttpClient.init(std.testing.allocator);
+    var client = HttpClient.init(std.testing.allocator);
     client.deinit();
 }
 
