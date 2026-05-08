@@ -50,16 +50,14 @@ pub fn writeFile(dir: std.fs.Dir, path: []const u8, data: []const u8) !void {
 /// mode expectations. This skeleton is intentionally thin; crash-safety policy
 /// hardening belongs to the dedicated filesystem wrapper PR.
 pub fn atomicReplace(dir: std.fs.Dir, target_path: []const u8, tmp_path: []const u8, data: []const u8) !void {
+    if (std.mem.eql(u8, target_path, tmp_path)) return error.InvalidAtomicReplacePaths;
+
     var cleanup_tmp = true;
     defer if (cleanup_tmp) dir.deleteFile(tmp_path) catch {};
 
     try writeFile(dir, tmp_path, data);
     try dir.rename(tmp_path, target_path);
     cleanup_tmp = false;
-
-    var replaced = try dir.openFile(target_path, .{ .mode = .write_only });
-    defer replaced.close();
-    try replaced.chmod(default_file_mode);
 }
 
 /// Create a directory and any missing parents relative to `dir`.
