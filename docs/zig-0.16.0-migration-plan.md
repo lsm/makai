@@ -90,7 +90,7 @@ Create random helpers that distinguish security-sensitive randomness from ordina
 Suggested scope for one PR:
 - Add `secureBytes`, `randomBytes`, and test/deterministic source helpers if needed.
 - Add unit tests for length, non-empty generation, and deterministic test behavior.
-- Add a guardrail to `scripts/check-zig-patterns.sh` that fails production code using `std.crypto.random` directly after wrapper adoption and that forbids security-sensitive call sites from using non-secure helper names.
+- Add non-failing inventory/reporting support for random usage if useful, but do **not** make `scripts/check-zig-patterns.sh` fail on direct `std.crypto.random` in Phase 0 because most call sites intentionally migrate later.
 - Migrate one low-risk ID generation path only if straightforward.
 
 Depends on: work item 2.
@@ -173,7 +173,9 @@ Suggested scope for one PR:
 - Update CI Zig versions and any docs/scripts that hard-code 0.15.2.
 - Update `zig/build.zig.zon` to Zig 0.16.0 and remove the libxev dependency entry.
 - Record the dependency audit in the PR: no `b.dependency("libxev")`, `@import("xev")`, or `@import("libxev")` call sites exist.
-- Apply enough build/source fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16.0 at minimum; add temporary internal stubs only if they are explicitly documented and covered by follow-up work items.
+- Apply enough build/source fixes for all required PR CI jobs to pass on Zig 0.16.0, including the current unit-test matrix (`test-unit-core`, `test-unit-transport`, `test-unit-protocol`, `test-unit-providers`, `test-unit-utils`, `test-unit-agent-types`, `test-unit-agent-loop`, `test-unit-agent-mod`, `test-unit-agent-bridge`, `test-unit-agent-unit`, `test-unit-agent-chain`) and TS SDK E2E (`npm run test:sdk`) if it remains required by CI.
+- If CI is updated to include `test-unit-makai-cli`, include it in the Phase 1 baseline gate as well.
+- Add temporary internal stubs only if they are explicitly documented and covered by follow-up work items.
 - Document the exact baseline command set that passed and keep GitHub CI green for that baseline.
 
 Depends on: work items 1-8. If any Phase 0 coverage is incomplete, the Phase 1 PR must explicitly list the missing coverage, explain the accepted risk, and identify the follow-up task that closes it; it still must not leave `main` red.
@@ -244,7 +246,7 @@ Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.R
 Suggested scope for one PR:
 - Update wrapper implementation for Zig 0.16.
 - Migrate all `std.crypto.random` call sites identified in the assessment.
-- Extend the `scripts/check-zig-patterns.sh` guardrail from work item 4 so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of `io.randomSecure`/secure wrappers.
+- After all intended random call sites in this work item are migrated, add or enable the failing `scripts/check-zig-patterns.sh` guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of `io.randomSecure`/secure wrappers.
 - Add or update tests to distinguish deterministic test mode from secure production mode.
 
 Depends on: work items 4 and 9.
@@ -373,8 +375,9 @@ Priority: **urgent**
 Run and stabilize all grouped unit tests plus mock-based protocol E2E tests on Zig 0.16.0. Per standing instruction, do not add or require external provider E2E testing in this phase. Capture CI status, fix flakes, and update any CI timeouts only with evidence.
 
 Suggested scope for one PR:
-- Run `zig build test-unit-core`, `test-unit-transport`, `test-unit-protocol`, `test-unit-providers`, `test-unit-utils`, `test-unit-agent`, and current split agent groups if CI still uses them.
+- Run `zig build test-unit-core`, `test-unit-transport`, `test-unit-protocol`, `test-unit-providers`, `test-unit-utils`, `test-unit-makai-cli`, `test-unit-agent`, and all split agent groups (`test-unit-agent-types`, `test-unit-agent-loop`, `test-unit-agent-mod`, `test-unit-agent-bridge`, `test-unit-agent-unit`, `test-unit-agent-chain`).
 - Run `zig build test-e2e-protocol`.
+- Run required CI-level TS SDK validation (`npm run test:sdk`) if it remains part of required PR CI.
 - Validate CLI output formatting, exit codes, and auth-flow prompts remain unchanged after the full migration.
 - Fix only validation failures and test harness drift.
 
@@ -478,7 +481,7 @@ Depends on: work item 23.
 | libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
-| Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
+| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. |
 
 ## Open questions
 

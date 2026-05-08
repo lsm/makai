@@ -20,7 +20,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 4. **Add random and secure-random wrappers on Zig 0.15.2**  
    Priority: **high**  
-   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of PKCE, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Add a `scripts/check-zig-patterns.sh` guardrail that prevents direct production `std.crypto.random` use after wrapper adoption and forbids security-sensitive call sites from using non-secure helper names.
+   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of PKCE, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Phase 0 may add non-failing inventory/reporting for direct `std.crypto.random` usage, but must not make `check-zig-patterns.sh` fail until the bulk call-site migration in work item 14.
 
 5. **Add filesystem and stdio helper layer on Zig 0.15.2**  
    Priority: **high**  
@@ -40,7 +40,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 9. **Switch to a first green Zig 0.16 baseline PR and remove libxev**  
    Priority: **urgent**  
-   Update Zig/CI metadata and remove the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and docs; `zig/build.zig` does not call `b.dependency("libxev", ...)`, and source files do not import `xev`/`libxev`. Phase 1 must remove the unused declaration rather than update/pin it. Apply enough compile-restoring fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum.
+   Update Zig/CI metadata and remove the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and docs; `zig/build.zig` does not call `b.dependency("libxev", ...)`, and source files do not import `xev`/`libxev`. Phase 1 must remove the unused declaration rather than update/pin it. Apply enough compile-restoring fixes for all required PR CI jobs to pass, including the current unit-test matrix and TS SDK E2E; include `test-unit-makai-cli` too if CI adds it.
 
 10. **Migrate `std.mem.indexOf*` call sites to `std.mem.find*`**  
     Priority: **high**  
@@ -60,7 +60,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 14. **Migrate random and protocol/OAuth ID generation**  
     Priority: **high**  
-    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names. Extend the pattern guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of secure entropy.
+    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names. After these call sites migrate, enable the failing pattern guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of secure entropy.
 
 15. **Migrate ArrayList, formatting, custom JSON writer, and std.json drift**  
     Priority: **high**  
@@ -96,7 +96,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 23. **Run full unit and mock E2E validation on Zig 0.16.0**  
     Priority: **urgent**  
-    Run all grouped unit test steps plus mock-based protocol E2E on Zig 0.16.0. Stabilize failures and CI timing without adding external provider E2E requirements. Validate CLI output formatting, exit codes, and auth-flow prompts as part of the acceptance gate for compile/test parity.
+    Run all grouped unit test steps, including `test-unit-makai-cli`, plus mock-based protocol E2E on Zig 0.16.0. Run required CI-level TS SDK validation if still required by PR CI. Stabilize failures and CI timing without adding external provider E2E requirements, and validate CLI output formatting, exit codes, and auth-flow prompts as part of the acceptance gate for compile/test parity.
 
 24. **Update documentation, migration notes, and cleanup transitional code**  
     Priority: **normal**  
@@ -145,7 +145,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 | libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
-| Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
+| Secure randomness enforcement | Decided | 14 | Phase 0 may add non-failing inventory only; enable failing `check-zig-patterns.sh` guardrails after random call sites migrate in work item 14. |
 
 ## Open questions
 
