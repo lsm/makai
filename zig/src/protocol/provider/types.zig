@@ -30,10 +30,7 @@ pub const SessionId = [SESSION_ID_LENGTH]u8;
 pub fn generateSessionId() SessionId {
     var session_id: SessionId = undefined;
     for (&session_id) |*byte| {
-        var random_index: [2]u8 = undefined;
-        compat.random.fillRandomBytes(&random_index);
-        const raw_index = std.mem.readInt(u16, &random_index, .little);
-        const idx = raw_index % SESSION_ID_ALPHABET.len;
+        const idx = compat.random.secureIntRangeLessThan(usize, SESSION_ID_ALPHABET.len);
         byte.* = SESSION_ID_ALPHABET[idx];
     }
     return session_id;
@@ -101,7 +98,7 @@ pub fn generateUlid() Ulid {
     ulid[3] = @intCast((now_ms >> 16) & 0xff);
     ulid[4] = @intCast((now_ms >> 8) & 0xff);
     ulid[5] = @intCast(now_ms & 0xff);
-    compat.random.fillRandomBytes(ulid[6..16]);
+    compat.random.fillSecureBytes(ulid[6..16]);
 
     return ulid;
 }

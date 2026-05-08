@@ -59,6 +59,25 @@ pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
     return buf;
 }
 
+/// Return a secure random integer in `[0, upper_bound)` without modulo bias.
+///
+/// 0.15.2: delegates to `std.crypto.random.intRangeLessThan`, which uses
+/// rejection sampling. 0.16: use `io.randomSecure` through the Makai default
+/// context and preserve rejection-sampling semantics.
+pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
+    return std.crypto.random.intRangeLessThan(T, 0, upper_bound);
+}
+
+/// Return an ordinary random integer in `[0, upper_bound)` without modulo bias.
+///
+/// 0.15.2: this is currently equivalent to `secureIntRangeLessThan`; both use
+/// `std.crypto.random.intRangeLessThan` until the Zig 0.16 I/O context exists.
+/// 0.16: use `io.random` through the Makai default context and preserve
+/// rejection-sampling semantics.
+pub fn randomIntRangeLessThan(comptime T: type, upper_bound: T) T {
+    return std.crypto.random.intRangeLessThan(T, 0, upper_bound);
+}
+
 fn isAllZero(bytes: []const u8) bool {
     for (bytes) |byte| {
         if (byte != 0) return false;
@@ -93,6 +112,20 @@ test "compat random helpers have basic uniqueness" {
     defer std.testing.allocator.free(second);
 
     try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "compat random range helpers respect upper bound" {
+    for (0..128) |_| {
+        const secure_value = secureIntRangeLessThan(usize, 62);
+        const ordinary_value = randomIntRangeLessThan(usize, 62);
+        try std.testing.expect(secure_value < 62);
+        try std.testing.expect(ordinary_value < 62);
+    }
+}
+
+test "compat random range helpers accept a single value range" {
+    try std.testing.expectEqual(@as(usize, 0), secureIntRangeLessThan(usize, 1));
+    try std.testing.expectEqual(@as(usize, 0), randomIntRangeLessThan(usize, 1));
 }
 
 test "compat deterministic random source is reproducible" {
