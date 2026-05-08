@@ -55,6 +55,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const compat_mod = b.createModule(.{
+        .root_source_file = b.path("src/compat/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const streaming_json_mod = b.createModule(.{
         .root_source_file = b.path("src/streaming_json.zig"),
         .target = target,
@@ -726,6 +732,7 @@ pub fn build(b: *std.Build) void {
     const owned_slice_test = b.addTest(.{ .root_module = owned_slice_mod });
     const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
     const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
+    const compat_test = b.addTest(.{ .root_module = compat_mod });
 
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -1134,6 +1141,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
+    test_step.dependOn(&b.addRunArtifact(compat_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
@@ -1204,6 +1212,7 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(compat_test).step);
 
     const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
