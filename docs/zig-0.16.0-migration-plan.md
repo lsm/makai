@@ -17,13 +17,13 @@ Migrate Makai from Zig 0.15.2 to Zig 0.16.0 while preserving current provider, p
    The impact assessment identifies high-volume mechanical changes and high-risk I/O/concurrency changes. Splitting architecture, wrapper/test preparation, compiler switch, and subsystem migration keeps PRs reviewable and prevents unrelated concerns from being coupled.
 
 3. **Make Phase 1 a first green Zig 0.16 baseline PR.**  
-   This plan chooses a mergeable baseline PR with minimum compile-restoring fixes over an unmerged integration checkpoint with stacked red PRs. The Phase 1 PR should update toolchain/dependency metadata, verify libxev, and apply only the minimum source changes needed to produce an agreed green Zig 0.16 build/test subset; remaining issues become follow-up tasks.
+   This plan chooses a mergeable baseline PR with minimum compile-restoring fixes over an unmerged integration checkpoint with stacked red PRs. The Phase 1 PR should update toolchain metadata, audit the currently declared but apparently unused libxev dependency, and apply only the minimum source changes needed to produce an agreed green Zig 0.16 build/test subset; remaining issues become follow-up tasks.
 
 4. **Prefer project-level compatibility seams over ad hoc call-site rewrites.**  
    Introduce central wrappers for time, sleep, random, filesystem/stdio, HTTP client construction/request flows, and networking. The wrappers should reflect the prerequisite architecture decision and avoid duplicating 0.16-specific decisions across providers, OAuth flows, transports, and CLI code.
 
 5. **Use the simplest supported `std.Io` backend for initial parity.**  
-   Do not depend on libxev implementing `std.Io`; the research notes that upstream libxev issue #219 is still open. The initial migration should choose a standard Zig 0.16 backend with networking support, then defer evented/libxev integration to a later project.
+   Do not depend on libxev implementing `std.Io`; a fresh repo scan found no active Makai source/build usage beyond the `build.zig.zon` declaration. The initial migration should choose a standard Zig 0.16 backend with networking support, then handle libxev as dependency cleanup: remove it if the audit confirms it is unused, or update the pin only if a real user is identified.
 
 6. **Preserve public behavior before redesigning APIs.**  
    Public API churn should be limited to what the architecture decision and compiler require. The migration does not need to preserve Zig 0.15.2 source compatibility after Phase 1, but it must preserve documented Makai behavior where possible and provide migration notes for any public API signature changes. Where API changes are unavoidable, isolate them behind constructors/context objects and document them in the relevant implementation PR.
@@ -163,15 +163,16 @@ Purpose: move the branch to Zig 0.16.0 with a mergeable green baseline. After th
 
 Branch strategy: Phase 0 PRs may land directly on `main` while `main` still targets Zig 0.15.2. This plan uses the main-branch path, not a long-lived integration branch: Phase 1 must be a normal PR to `main` that switches `main` to Zig 0.16.0 and keeps CI green for the agreed baseline. After Phase 1 merges, follow-up migration PRs are short-lived branches targeting `main`; if the team chooses an integration branch instead, this plan must be revised before dispatch.
 
-#### Work item 9 — Switch to a first green Zig 0.16 baseline PR
+#### Work item 9 — Switch to a first green Zig 0.16 baseline PR and resolve unused libxev declaration
 
 Priority: **urgent**
 
-Update `zig/build.zig.zon` `.version` to `0.16.0`, select and pin a libxev commit/release that builds with Zig 0.16.0, refresh the dependency hash, and update CI setup-zig versions. Apply enough compile-restoring source fixes or temporary internal stubs for the agreed baseline test subset to pass; do not merge a red PR to `main` and do not use an unmerged red integration branch as the normal path. Capture the remaining compile/test inventory and assign it to follow-up tasks.
+Update `zig/build.zig.zon` `.version` to `0.16.0`, update CI setup-zig versions, and resolve the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and documentation; `zig/build.zig` does not call `b.dependency("libxev", ...)`, add an xev module, or expose an xev import, and source files do not import `xev`/`libxev`. Therefore the preferred Phase 1 action is to remove the unused libxev declaration; if a hidden or future consumer is identified during the audit, update the pin to a Zig 0.16-compatible upstream commit instead and document the consumer.
 
 Suggested scope for one PR:
-- Update `build.zig.zon`, CI Zig versions, and any docs/scripts that hard-code 0.15.2.
-- Verify libxev with Zig 0.16.0 and record the chosen pin rationale.
+- Update CI Zig versions and any docs/scripts that hard-code 0.15.2.
+- Update `zig/build.zig.zon` to Zig 0.16.0 and either remove unused libxev or update/pin it only with a documented active consumer.
+- If removing libxev, prove no `b.dependency("libxev")`, `@import("xev")`, or `@import("libxev")` call sites exist, and record that audit in the PR.
 - Apply enough build/source fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16.0 at minimum; add temporary internal stubs only if they are explicitly documented and covered by follow-up work items.
 - Document the exact baseline command set that passed and keep GitHub CI green for that baseline.
 
@@ -434,8 +435,8 @@ Depends on: work item 23.
 5. **Security-sensitive randomness review.**  
    Treat OAuth PKCE/state, WebSocket masks/nonces, and protocol IDs as explicit review points. Do not silently downgrade secure entropy to deterministic or weak randomness.
 
-6. **Keep libxev independent of initial `std.Io` decisions.**  
-   Verify libxev builds with Zig 0.16.0, but do not block the initial migration on libxev implementing `std.Io`.
+6. **Treat libxev as dependency cleanup, not an initial `std.Io` backend.**  
+   The current codebase appears not to use libxev beyond the package declaration. Prefer removing the unused dependency in Phase 1; if the audit finds a real consumer, update it to a Zig 0.16-compatible commit but keep it independent of the initial `std.Io` backend decision.
 
 7. **Provider migration by proving provider and provider families.**  
    First port the shared HTTP abstraction and one proving provider, then migrate remaining provider families in separate PRs. This prevents seven independent ad hoc request-flow migrations and avoids one oversized provider PR.
@@ -449,7 +450,7 @@ Depends on: work item 23.
 ## Rollback strategy
 
 - **Before Phase 1:** each Phase 0 PR is independently revertible because it should compile on Zig 0.15.2 and preserve behavior through thin wrappers/tests.
-- **At Phase 1:** if libxev or the compiler switch cannot produce the agreed first green baseline, revert the compiler/dependency PR and continue improving Phase 0 wrappers/tests on 0.15.2. Do not merge a red Zig 0.16 baseline without explicitly changing this plan.
+- **At Phase 1:** if the compiler switch or libxev dependency-audit decision cannot produce the agreed first green baseline, revert the compiler/dependency PR and continue improving Phase 0 wrappers/tests on 0.15.2. Do not merge a red Zig 0.16 baseline without explicitly changing this plan.
 - **After Phase 1:** rollback should revert to the last green Zig 0.16 migration PR rather than partially restoring Zig 0.15.2 APIs. Keep each post-switch PR narrow enough to revert independently.
 - **For core stream synchronization:** if core `EventStream` semantics regress, revert work item 11 independently without reverting auth/OAuth synchronization work that has not yet landed.
 - **For auth/OAuth synchronization:** if refresh coordination or auth locks regress, revert work item 12 independently from core stream synchronization.
@@ -462,6 +463,7 @@ Depends on: work item 23.
 - Preserving Zig 0.15.2 source compatibility after Phase 1; public API changes are allowed when documented in migration notes.
 - Implementing or maintaining a libxev-to-`std.Io` adapter.
 - Waiting for libxev issue #219 before starting the compiler migration.
+- Keeping libxev solely because it is declared today; Phase 1 should remove it if the dependency audit confirms it is unused.
 - Adding new providers, transports, OAuth providers, or agent features.
 - External provider E2E stabilization or new secret-dependent tests.
 - Broad performance optimization beyond preserving current behavior and avoiding obvious regressions.
@@ -473,12 +475,12 @@ Depends on: work item 23.
 |---|---|---:|---|
 | Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
 | Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
+| libxev dependency posture | Decided pending audit confirmation | 9 | Current scan shows no active source/build usage beyond `build.zig.zon`; prefer removal in Phase 1 unless an active consumer is found. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
 | Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
 
 ## Open questions
 
-1. Which libxev commit/release should be pinned for Zig 0.16.0, and what evidence is sufficient to accept it? Earliest blocked work item: **9**.
-2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
-3. Which provider should be selected as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.
+1. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
+2. Which provider should be selected as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.

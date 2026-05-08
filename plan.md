@@ -38,9 +38,9 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
    Priority: **high**  
    Expand named tests for EventStream completion-after-error, double-completion, timeout, multi-producer stress, and memory ordering; OAuth storage production `saveToFile`, `0o600` mode, same-directory temp rename, and cleanup; WebSocket masking-key XOR and continuation reassembly; SSE 1-byte incremental reads and error-body injection; provider cancellation across pre-request, connect/setup, headers, between events, and mid-event; and retry/time zero-timeout, large-timeout, overflow, and budget exhaustion. These tests must run on Zig 0.15.2 and become the measurable gate before Phase 1 dispatch. Avoid external provider E2E tests.
 
-9. **Switch to a first green Zig 0.16 baseline PR**  
+9. **Switch to a first green Zig 0.16 baseline PR and resolve unused libxev declaration**  
    Priority: **urgent**  
-   Update `zig/build.zig.zon`, select and hash a Zig 0.16-compatible libxev pin, update CI Zig versions, and apply enough compile-restoring source fixes or documented temporary internal stubs for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum. This plan chooses a main-branch first green baseline PR rather than an unmerged integration checkpoint; Phase 0 PRs may land on `main` while it still targets 0.15.2, and after this PR merges, follow-up migration work should use short-lived branches targeting Zig 0.16 `main`.
+   Update Zig/CI metadata and resolve the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and docs; `zig/build.zig` does not call `b.dependency("libxev", ...)`, and source files do not import `xev`/`libxev`. Prefer removing the unused declaration in Phase 1; only update/pin libxev to a Zig 0.16-compatible commit if the audit identifies an active consumer. Apply enough compile-restoring fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum.
 
 10. **Migrate `std.mem.indexOf*` call sites to `std.mem.find*`**  
     Priority: **high**  
@@ -130,6 +130,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 - Preserving Zig 0.15.2 source compatibility after Phase 1; public API changes are allowed when documented in migration notes.
 - Building or maintaining a libxev-to-`std.Io` adapter.
 - Waiting for upstream libxev `std.Io` support before the initial migration.
+- Keeping libxev solely because it is declared today; Phase 1 should remove it if the dependency audit confirms it is unused.
 - Adding new providers, transports, OAuth flows, or agent features.
 - External provider E2E stabilization or new secret-dependent tests.
 - Broad performance optimization unrelated to compile/test parity.
@@ -141,12 +142,12 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 |---|---|---:|---|
 | Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
 | Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
+| libxev dependency posture | Decided pending audit confirmation | 9 | Current scan shows no active source/build usage beyond `build.zig.zon`; prefer removal in Phase 1 unless an active consumer is found. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
 | Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
 
 ## Open questions
 
-1. Which libxev commit or release should be selected as the Zig 0.16-compatible pin, and what verification is required? Earliest blocked work item: **9**.
-2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
-3. Which provider should serve as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.
+1. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
+2. Which provider should serve as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.
