@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 /// PKCE pair containing verifier and challenge
 pub const PKCEPair = struct {
@@ -7,11 +8,15 @@ pub const PKCEPair = struct {
 };
 
 /// Generate a PKCE verifier and challenge pair.
-/// Uses crypto.random for secure random bytes.
+/// Uses compat secure random bytes for verifier material.
 pub fn generatePKCE() PKCEPair {
-    // 1. Generate 32 random bytes
+    return generatePKCEWithRandom(compat.random.fillSecureBytes);
+}
+
+fn generatePKCEWithRandom(fill_random: fn ([]u8) void) PKCEPair {
+    // 1. Generate 32 secure random bytes
     var random_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    fill_random(&random_bytes);
 
     // 2. Base64URL encode -> verifier (43 chars)
     var verifier: [43]u8 = undefined;
@@ -44,6 +49,12 @@ fn base64URLEncode(input: []const u8, output: []u8) usize {
     return encoded_len;
 }
 
+fn fillTestPkceBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @intCast(i);
+    }
+}
+
 test "generatePKCE produces valid pair" {
     const pair = generatePKCE();
 
@@ -74,6 +85,15 @@ test "generatePKCE creates unique verifiers" {
     // Should be different
     try std.testing.expect(!std.mem.eql(u8, &pair1.verifier, &pair2.verifier));
     try std.testing.expect(!std.mem.eql(u8, &pair1.challenge, &pair2.challenge));
+}
+
+test "generatePKCEWithRandom is deterministic for test seam" {
+    const pair1 = generatePKCEWithRandom(fillTestPkceBytes);
+    const pair2 = generatePKCEWithRandom(fillTestPkceBytes);
+
+    try std.testing.expectEqualSlices(u8, &pair1.verifier, &pair2.verifier);
+    try std.testing.expectEqualSlices(u8, &pair1.challenge, &pair2.challenge);
+    try std.testing.expectEqualStrings("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8", &pair1.verifier);
 }
 
 test "base64URLEncode produces correct output" {
