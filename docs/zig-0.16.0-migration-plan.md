@@ -481,7 +481,7 @@ Depends on: work item 23.
 
 | Decision | Status for dispatch | Earliest blocked work item | Notes |
 |---|---|---:|---|
-| Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
+| Default `std.Io` backend and ownership model | Decided | 1 | See [`docs/zig-0.16.0-io-architecture-decision.md`](./zig-0.16.0-io-architecture-decision.md). Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
 | Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
 | libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
