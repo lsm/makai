@@ -20,11 +20,11 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 4. **Add random and secure-random wrappers on Zig 0.15.2**  
    Priority: **high**  
-   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of PKCE, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Include deterministic test seams where practical.
+   Add helpers that distinguish security-sensitive entropy from ordinary random bytes. The wrappers should support later migration of PKCE, OAuth state, WebSocket nonce/masks, protocol IDs, and storage temporary names. Add a `scripts/check-zig-patterns.sh` guardrail that prevents direct production `std.crypto.random` use after wrapper adoption and forbids security-sensitive call sites from using non-secure helper names.
 
 5. **Add filesystem and stdio helper layer on Zig 0.15.2**  
    Priority: **high**  
-   Add wrappers around cwd/open/read/write/atomic rename, stdin/stdout, and file reader/writer operations. The initial implementation should use 0.15.2 `std.fs`/`std.io` while preserving existing behavior. Include tests for read/write, missing files, directory creation, and atomic replacement.
+   Add wrappers around cwd/open/read/write/atomic rename, stdin/stdout, and file reader/writer operations. The initial implementation should use 0.15.2 `std.fs`/`std.io` while preserving existing behavior. Atomic replacement acceptance criteria include same-directory temp files for same-filesystem rename, final `0o600` credential-file mode where supported, no truncation before successful rename, and temp-file cleanup on failure where possible.
 
 6. **Add HTTP client/request abstraction on Zig 0.15.2**  
    Priority: **high**  
@@ -36,11 +36,11 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 8. **Add focused regression tests before semantic migration**  
    Priority: **high**  
-   Expand tests for core EventStream/stream behavior, auth/OAuth refresh locking, OAuth storage atomic writes, WebSocket frame parsing/masking, SSE parsing, and protocol envelope JSON. These tests should run on Zig 0.15.2 and become the safety net for post-switch changes. Avoid external provider E2E tests.
+   Expand named tests for EventStream completion-after-error, double-completion, timeout, multi-producer stress, and memory ordering; OAuth storage production `saveToFile`, `0o600` mode, same-directory temp rename, and cleanup; WebSocket masking-key XOR and continuation reassembly; SSE 1-byte incremental reads and error-body injection; provider cancellation across pre-request, connect/setup, headers, between events, and mid-event; and retry/time zero-timeout, large-timeout, overflow, and budget exhaustion. These tests must run on Zig 0.15.2 and become the measurable gate before Phase 1 dispatch. Avoid external provider E2E tests.
 
 9. **Switch to a first green Zig 0.16 baseline PR**  
    Priority: **urgent**  
-   Update `zig/build.zig.zon`, select and hash a Zig 0.16-compatible libxev pin, update CI Zig versions, and apply only minimum compile-restoring source fixes needed for the baseline to compile and pass an agreed smoke/unit subset. This plan chooses a first green baseline PR rather than an unmerged integration checkpoint, so downstream migration PRs are based on mergeable Zig 0.16 code. Phase 0 PRs may land on `main` while it still targets 0.15.2; after this PR merges, follow-up migration work should use short-lived branches targeting Zig 0.16 `main` rather than a long-lived feature branch.
+   Update `zig/build.zig.zon`, select and hash a Zig 0.16-compatible libxev pin, update CI Zig versions, and apply enough compile-restoring source fixes or documented temporary internal stubs for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum. This plan chooses a main-branch first green baseline PR rather than an unmerged integration checkpoint; Phase 0 PRs may land on `main` while it still targets 0.15.2, and after this PR merges, follow-up migration work should use short-lived branches targeting Zig 0.16 `main`.
 
 10. **Migrate `std.mem.indexOf*` call sites to `std.mem.find*`**  
     Priority: **high**  
@@ -60,7 +60,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 14. **Migrate random and protocol/OAuth ID generation**  
     Priority: **high**  
-    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names. Treat secure entropy call sites as explicit security review points.
+    Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.Random.IoSource` as appropriate. Migrate PKCE, OAuth state, WebSocket masks/nonces, protocol IDs, and storage temporary names. Extend the pattern guardrail so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of secure entropy.
 
 15. **Migrate ArrayList, formatting, custom JSON writer, and std.json drift**  
     Priority: **high**  
@@ -76,7 +76,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 
 18. **Migrate shared HTTP abstraction and one proving provider**  
     Priority: **urgent**  
-    Port the shared HTTP abstraction to Zig 0.16's `std.Io`-aware request/response flow and migrate exactly one representative streaming provider as the proving provider. The proving provider should exercise request bodies, response head handling, incremental body reads, SSE parsing, cancellation, and provider error-body handling. Preserve existing provider error messages/error types unless a compiler-enforced change is documented; do not migrate all provider families until this PR establishes the abstraction shape.
+    Port the shared HTTP abstraction to Zig 0.16's `std.Io`-aware request/response flow and migrate exactly one representative streaming provider as the proving provider. The proving provider should exercise request bodies, response head handling, incremental body reads, SSE parsing, provider error-body handling, and cancellation during connect/setup, headers, between SSE events, and mid-event payload. Preserve existing provider error messages/error types unless a compiler-enforced change is documented; do not migrate all provider families until this PR establishes the abstraction shape.
 
 19. **Migrate remaining OpenAI/Azure provider HTTP implementations**  
     Priority: **high**  
@@ -135,8 +135,18 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 - Broad performance optimization unrelated to compile/test parity.
 - Changes to GitHub repository rules, admin bypass, or direct local-root modifications beyond instructed sync operations.
 
+## Decision log
+
+| Decision | Status for dispatch | Earliest blocked work item | Notes |
+|---|---|---:|---|
+| Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
+| Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
+| Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
+| Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
+| Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
+
 ## Open questions
 
-1. Which libxev commit or release should be selected as the Zig 0.16-compatible pin, and what verification is required?
-2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`?
-3. Which provider should serve as the proving provider for the shared HTTP abstraction PR?
+1. Which libxev commit or release should be selected as the Zig 0.16-compatible pin, and what verification is required? Earliest blocked work item: **9**.
+2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
+3. Which provider should serve as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.

@@ -90,6 +90,7 @@ Create random helpers that distinguish security-sensitive randomness from ordina
 Suggested scope for one PR:
 - Add `secureBytes`, `randomBytes`, and test/deterministic source helpers if needed.
 - Add unit tests for length, non-empty generation, and deterministic test behavior.
+- Add a guardrail to `scripts/check-zig-patterns.sh` that fails production code using `std.crypto.random` directly after wrapper adoption and that forbids security-sensitive call sites from using non-secure helper names.
 - Migrate one low-risk ID generation path only if straightforward.
 
 Depends on: work item 2.
@@ -103,6 +104,7 @@ Add wrappers around cwd/open/read/write/atomic rename, stdin/stdout access, and 
 Suggested scope for one PR:
 - Implement wrappers with 0.15.2 `std.fs`/`std.io` APIs.
 - Add tests for read/write, missing file behavior, directory creation, and atomic replace semantics.
+- Acceptance criteria for atomic replacement helpers: temp file is created in the target directory for same-filesystem rename, final credential file mode is or remains `0o600`, partially written temp files are cleaned up on failure where possible, and existing files are not truncated before rename succeeds.
 - Do not migrate OAuth storage, stdio transport, and CLI file I/O together; leave those for separate post-switch PRs.
 
 Depends on: work item 2.
@@ -137,11 +139,20 @@ Depends on: work item 2.
 
 Priority: **high**
 
-Strengthen tests before changing core behavior. Add or expand tests for `EventStream.wait`, `pollBatch`, completion and error paths, OAuth refresh lock coordination, OAuth storage atomic writes, WebSocket frame parsing/masking, provider SSE parsing, and protocol envelope JSON round trips. These tests should run under Zig 0.15.2 and become the safety net for post-switch changes.
+Strengthen tests before changing core behavior. These tests should run under Zig 0.15.2 and become the safety net for post-switch changes. The PR must enumerate each scenario by name in test descriptions so later migration PRs can cite the exact coverage.
+
+Required scenarios and acceptance gate:
+- EventStream/core stream: `completion_after_error_is_stable`, `double_completion_is_idempotent_or_errors_predictably`, `wait_timeout_returns_without_event`, `multi_producer_stress_preserves_events`, and `completion_memory_ordering_visibility`.
+- OAuth storage: call the production `saveToFile` path directly, assert credential file mode `0o600` where the platform supports it, test same-directory temp/rename behavior as a crash-safety surrogate, and verify temp-file cleanup after injected write/rename failure.
+- WebSocket: verify masking-key XOR output byte-for-byte and continuation-frame reassembly across fragmented frames.
+- SSE parser/provider input: stress 1-byte incremental reads and inject provider error bodies through the parser/error path.
+- Provider cancellation: add cancellation-boundary tests for providers without coverage, at least Anthropic, Ollama, Azure, and Vertex, and cover cancellation before request, during connect/setup where mockable, during headers, between SSE events, and mid-event.
+- Retry/time: cover zero-timeout, very-large-timeout, integer-overflow, and retry budget exhaustion edge cases.
 
 Suggested scope for one PR:
 - Add focused unit tests only; avoid production behavior changes except test-only helpers.
 - Keep tests in the existing grouped test structure.
+- Measurable gate: all newly named scenarios must be present and passing in their grouped unit steps on Zig 0.15.2 before Phase 1 dispatch.
 - Do not add external provider E2E coverage.
 
 Depends on: work item 1; can run in parallel with wrapper tasks.
@@ -150,21 +161,21 @@ Depends on: work item 1; can run in parallel with wrapper tasks.
 
 Purpose: move the branch to Zig 0.16.0 with a mergeable green baseline. After this PR lands, no further work should assume Zig 0.15.2 compatibility.
 
-Branch strategy: Phase 0 PRs may land directly on `main` while `main` still targets Zig 0.15.2. Phase 1 should be a normal PR to `main` that switches `main` to Zig 0.16.0 with the agreed green baseline. After Phase 1 merges, follow-up migration PRs are short-lived branches targeting `main`; avoid a long-lived feature branch unless Phase 1 is explicitly re-planned as a red integration checkpoint.
+Branch strategy: Phase 0 PRs may land directly on `main` while `main` still targets Zig 0.15.2. This plan uses the main-branch path, not a long-lived integration branch: Phase 1 must be a normal PR to `main` that switches `main` to Zig 0.16.0 and keeps CI green for the agreed baseline. After Phase 1 merges, follow-up migration PRs are short-lived branches targeting `main`; if the team chooses an integration branch instead, this plan must be revised before dispatch.
 
 #### Work item 9 — Switch to a first green Zig 0.16 baseline PR
 
 Priority: **urgent**
 
-Update `zig/build.zig.zon` `.version` to `0.16.0`, select and pin a libxev commit/release that builds with Zig 0.16.0, refresh the dependency hash, and update CI setup-zig versions. Apply only minimum compile-restoring source fixes needed for the agreed baseline test subset to pass; do not use an unmerged red integration branch as the normal path. Capture the remaining compile/test inventory and assign it to follow-up tasks.
+Update `zig/build.zig.zon` `.version` to `0.16.0`, select and pin a libxev commit/release that builds with Zig 0.16.0, refresh the dependency hash, and update CI setup-zig versions. Apply enough compile-restoring source fixes or temporary internal stubs for the agreed baseline test subset to pass; do not merge a red PR to `main` and do not use an unmerged red integration branch as the normal path. Capture the remaining compile/test inventory and assign it to follow-up tasks.
 
 Suggested scope for one PR:
 - Update `build.zig.zon`, CI Zig versions, and any docs/scripts that hard-code 0.15.2.
 - Verify libxev with Zig 0.16.0 and record the chosen pin rationale.
-- Apply minimal fixes needed for a green baseline, such as build metadata/API adjustments that unblock the build graph.
-- Document the exact baseline command set that passed.
+- Apply enough build/source fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16.0 at minimum; add temporary internal stubs only if they are explicitly documented and covered by follow-up work items.
+- Document the exact baseline command set that passed and keep GitHub CI green for that baseline.
 
-Depends on: work items 1-8, or an explicit decision to accept reduced pre-switch coverage.
+Depends on: work items 1-8. If any Phase 0 coverage is incomplete, the Phase 1 PR must explicitly list the missing coverage, explain the accepted risk, and identify the follow-up task that closes it; it still must not leave `main` red.
 
 ### Phase 2 — Core/std migration on Zig 0.16.0
 
@@ -232,6 +243,7 @@ Update random wrappers to use Zig 0.16 `io.random`, `io.randomSecure`, or `std.R
 Suggested scope for one PR:
 - Update wrapper implementation for Zig 0.16.
 - Migrate all `std.crypto.random` call sites identified in the assessment.
+- Extend the `scripts/check-zig-patterns.sh` guardrail from work item 4 so production code cannot reintroduce direct `std.crypto.random` usage and security-sensitive paths cannot use `io.random`/non-secure wrappers instead of `io.randomSecure`/secure wrappers.
 - Add or update tests to distinguish deterministic test mode from secure production mode.
 
 Depends on: work items 4 and 9.
@@ -262,6 +274,7 @@ Port OAuth credential storage to Zig 0.16 filesystem helpers as a standalone use
 Suggested scope for one PR:
 - Migrate `zig/src/utils/oauth/storage.zig` through filesystem helpers.
 - Run OAuth storage and utils tests.
+- Acceptance criteria: temp files are created in the target directory to preserve same-filesystem rename guarantees, final credential file mode is or remains `0o600` where supported, failed writes/renames do not truncate the existing credential file, and temporary files are cleaned up on failure where possible.
 - Preserve existing storage error messages and error types unless a compiler-enforced change is documented.
 - Include manual notes for credential storage rollback/backup behavior if relevant.
 
@@ -290,6 +303,7 @@ Port the shared HTTP abstraction to Zig 0.16's `std.Io`-aware HTTP request/respo
 Suggested scope for one PR:
 - Update shared HTTP abstraction for Zig 0.16.
 - Migrate one representative provider, preferably one with SSE streaming and nontrivial request/error handling.
+- Add HTTP/SSE cancellation tests for cancel during connect/setup, during response headers, between SSE events, and mid-event payload; use mocks where real network timing is not deterministic.
 - Run provider unit tests and mock/non-secret tests for that provider.
 - Preserve existing provider error messages and error types unless a compiler-enforced change is documented.
 
@@ -386,7 +400,7 @@ Depends on: work item 23.
 - Work item 1 is the prerequisite for work items 2-8.
 - Work item 2 is the base for wrapper work items 3-7.
 - Work item 8 can run in parallel with wrapper tasks after work item 1.
-- Work item 9 depends on completion of work items 1-8 unless the team explicitly accepts reduced pre-switch coverage.
+- Work item 9 depends on completion of work items 1-8. If any Phase 0 coverage is incomplete, the Phase 1 PR must explicitly list the missing coverage, explain the accepted risk, identify the follow-up task that closes it, and still keep `main` green.
 - Work item 10 depends on work item 9.
 - Work item 11 depends on work items 8 and 9.
 - Work item 12 depends on work items 8, 9, and 11.
@@ -453,8 +467,18 @@ Depends on: work item 23.
 - Broad performance optimization beyond preserving current behavior and avoiding obvious regressions.
 - Changes to GitHub repository rules, admin bypass, or direct changes to the local root repo outside required sync operations.
 
+## Decision log
+
+| Decision | Status for dispatch | Earliest blocked work item | Notes |
+|---|---|---:|---|
+| Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
+| Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
+| Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
+| Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
+| Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
+
 ## Open questions
 
-1. Which libxev commit/release should be pinned for Zig 0.16.0, and what evidence is sufficient to accept it?
-2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`?
-3. Which provider should be selected as the proving provider for the shared HTTP abstraction PR?
+1. Which libxev commit/release should be pinned for Zig 0.16.0, and what evidence is sufficient to accept it? Earliest blocked work item: **9**.
+2. Does Zig 0.16.0 preserve `std.time.milliTimestamp`/`nanoTimestamp`, or should all usage move immediately to wrapper implementations backed by `std.Io.Timestamp`/`Io.Clock`? Earliest blocked work item: **13**.
+3. Which provider should be selected as the proving provider for the shared HTTP abstraction PR? Earliest blocked work item: **18**.
