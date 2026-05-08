@@ -17,7 +17,7 @@ Highest-impact findings:
 3. **HTTP provider implementations need nontrivial updates.** All provider HTTP clients instantiate `std.http.Client{ .allocator = ... }`; release notes show `std.http.Client` now takes an `io` field and uses a new request flow.
 4. **`std.mem.indexOf*` rename is a high-volume breaking change.** The Zig 0.16.0 release notes list “mem: introduce cut functions; rename 'index of' to 'find'”; Makai has 223 direct `std.mem.indexOf(...)` calls across 29 production files, plus 27 related `indexOfScalar`, `indexOfAny`, and `indexOfPos` production call sites.
 5. **`std.ArrayList` migration risk needs compile verification.** Makai has 231 `std.ArrayList` mentions across 43 files in `zig/src/**`. A heuristic scan of locally declared `std.ArrayList` variables found 124 `append(...)` and 94 `appendSlice(...)` production call sites; exact workload still needs compiler-driven verification because some lists are stored in fields or passed through helper APIs. The 0.16.0 notes discuss unmanaged-container migration for priority queues, while ArrayList deprecation started in 0.15.x; whether Makai's exact aliases are removed in 0.16.0 must be verified by compiling.
-6. **Dependency status is mixed, not solved.** The currently pinned libxev commit in `zig/build.zig.zon` targets `0.15.2`. Current libxev appears to compile with Zig 0.16, but it explicitly does **not** implement `std.Io`; issue #219 tracks `std.Io` support and is open.
+6. **Dependency status is mixed and requires verification.** The currently pinned libxev commit in `zig/build.zig.zon` targets `0.15.2`. Current libxev documentation is Zig 0.16-aware, but this research did not run a libxev build against Zig 0.16, so compatibility must be verified. libxev also explicitly does **not** implement `std.Io`; issue #219 tracks `std.Io` support and is open.
 7. **No evidence of some feared blockers.** Makai does not use `@cImport`, direct `@Type(...)` reification, `std.heap.ThreadSafeAllocator`, `SegmentedList`, `FixedBufferStream`, `std.os`, `@Vector`, packed structs/unions, or extern structs/unions in `zig/**/*.zig`.
 
 ## Sources used
@@ -152,7 +152,9 @@ Makai patterns:
 - `std.fs.openFileAbsolute` in `zig/test/e2e/test_helpers.zig:282`, `:366`, `:479`, `:599`
 - `std.fs.File` in CLI harness and stdio abstractions, especially `zig/src/tools/makai.zig`
 - `file.readToEndAlloc(...)` in `zig/src/utils/oauth/storage.zig:62` and test helper files
-- `file.writeAll(...)` appears 16 times across 4 production files. A broader `.writeAll(...)` scan finds 107 production call sites across 10 files, but that includes non-filesystem writers/streams and should not be used as the filesystem migration size.
+- Heuristic `std.fs.File` receiver `.writeAll(...)` calls appear 91 times across 6 production files. This includes `file.writeAll(...)`, `stdout_file.writeAll(...)`, `stdin_write.writeAll(...)`, and `self.file.writeAll(...)` patterns where the receiver is declared as or wraps `std.fs.File`.
+- A narrower literal `file.writeAll(...)` scan finds only 16 calls across 4 production files and undercounts filesystem migration scope.
+- A broader `.writeAll(...)` scan finds 107 production call sites across 10 files, but that includes non-filesystem writers/streams and should not be used directly as the filesystem migration size.
 
 Expected work:
 
@@ -455,7 +457,7 @@ Makai impact:
 Expected work:
 
 - Update `.version` to `0.16.0`.
-- Update libxev URL/hash to a 0.16-compatible commit or release.
+- Update libxev URL/hash to a candidate commit or release, then verify compatibility with Zig 0.16.0.
 - Run `zig fetch`/`zig build` with 0.16.0 to refresh dependency hash.
 - Consider adding unit test timeouts once build compiles.
 
@@ -522,16 +524,17 @@ Current Makai pin:
 Research findings:
 
 - libxev issue #218 requested Zig 0.16.0 support on 2026-04-14 after the Zig release. The issue is closed, with no detailed public discussion visible in the issue page extraction.
-- Current libxev README indicates libxev is Zig 0.16-aware/buildable, but it explicitly says libxev **does not implement** the `std.Io` interface and does not accept `std.Io` for operations; it calls I/O directly.
+- Current libxev documentation is Zig 0.16-aware, but this research did **not** run or cite a successful libxev build with Zig 0.16. Treat Zig 0.16 compatibility as unverified until the migration branch updates the pin/hash and compiles libxev with the target toolchain.
+- The libxev documentation explicitly says libxev **does not implement** the `std.Io` interface and does not accept `std.Io` for operations; it calls I/O directly.
 - libxev issue #219, “Implement std.Io interface,” is open. That means upstream `std.Io` integration is not available today.
 
 Impact:
 
-- The currently pinned commit/hash probably should be replaced with a current 0.16-compatible libxev commit or release.
+- The currently pinned commit/hash probably should be replaced with a candidate libxev commit or release, then verified by an actual Zig 0.16 build before treating dependency compatibility as established.
 - Makai should **not** plan on using libxev directly as a `std.Io` backend during the initial Zig 0.16 upgrade unless the project implements/maintains that adapter itself or waits for upstream issue #219.
 - If Makai wants full `std.Io` integration, libxev is a dependency risk rather than a ready-made solution.
 
-Risk level: **medium-high**. Compiling libxev with Zig 0.16 appears feasible, but `std.Io` integration remains an open upstream feature request.
+Risk level: **medium-high**. Zig 0.16 compatibility for the selected libxev pin is unverified in this research and must be proven in the migration branch; `std.Io` integration remains an open upstream feature request.
 
 ### Other dependencies
 
@@ -587,7 +590,7 @@ Recommended sequence:
 
 2. **Dependency and compiler switch branch**
    - Update `zig/build.zig.zon` to `0.16.0`.
-   - Move libxev pin/hash to a 0.16-compatible upstream commit.
+   - Move libxev pin/hash to a candidate upstream commit and verify it builds with Zig 0.16.0.
    - Run `zig build test-unit-core` first to isolate core and concurrency errors.
 
 3. **Core/std migration**
@@ -617,7 +620,7 @@ Recommendation: **avoid attempting to redesign all of Makai around evented I/O i
 
 - [ ] Install/use Zig 0.16.0 in a migration branch.
 - [ ] Update `zig/build.zig.zon` `.version` to `0.16.0`.
-- [ ] Update libxev pin/hash to a 0.16-compatible commit or release.
+- [ ] Update libxev pin/hash to a candidate 0.16-compatible commit or release and verify it with an actual Zig 0.16.0 build.
 - [ ] Choose default `std.Io` implementation for CLI/tests/providers.
 - [ ] Add or port project wrappers for:
   - [ ] HTTP client/request/response
