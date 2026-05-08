@@ -36,9 +36,11 @@ pub const HttpClient = struct {
 };
 
 /// Send a request body and complete the outbound request.
-pub fn sendRequest(request: *Request, body: []u8) !void {
+pub fn sendRequest(request: *Request, body: []const u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
-    try request.sendBodyComplete(body);
+    var body_writer = try request.sendBody(&.{});
+    try body_writer.writer.writeAll(body);
+    try body_writer.end();
 }
 
 /// Receive the response headers/body metadata for a request.
@@ -46,9 +48,22 @@ pub fn receiveResponse(request: *Request, redirect_buffer: []u8) !Response {
     return request.receiveHead(redirect_buffer);
 }
 
+/// Reader wrapper for streaming response bodies without exposing raw `std.Io`.
+pub const ResponseReader = struct {
+    inner: *std.Io.Reader,
+
+    pub fn read(self: ResponseReader, buffer: []u8) !usize {
+        return self.inner.readSliceShort(buffer);
+    }
+
+    pub fn readAll(self: ResponseReader, buffer: []u8) !void {
+        try self.inner.readSliceAll(buffer);
+    }
+};
+
 /// Return a streaming reader for a response body.
-pub fn responseReader(response: *Response, transfer_buf: []u8) *std.Io.Reader {
-    return response.reader(transfer_buf);
+pub fn responseReader(response: *Response, transfer_buf: []u8) ResponseReader {
+    return .{ .inner = response.reader(transfer_buf) };
 }
 
 test "compat http client initializes and deinitializes" {

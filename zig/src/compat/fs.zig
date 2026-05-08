@@ -31,6 +31,12 @@ pub fn readFileAlloc(allocator: std.mem.Allocator, dir: std.fs.Dir, path: []cons
 
 pub const default_file_mode: std.fs.File.Mode = 0o600;
 
+fn chmodFile(dir: std.fs.Dir, path: []const u8, mode: std.fs.File.Mode) !void {
+    var file = try dir.openFile(path, .{ .mode = .write_only });
+    defer file.close();
+    try file.chmod(mode);
+}
+
 /// Write a file relative to `dir`, replacing existing contents.
 ///
 /// Files are created with restrictive permissions by default because later OAuth
@@ -52,10 +58,16 @@ pub fn writeFile(dir: std.fs.Dir, path: []const u8, data: []const u8) !void {
 pub fn atomicReplace(dir: std.fs.Dir, target_path: []const u8, tmp_path: []const u8, data: []const u8) !void {
     if (std.mem.eql(u8, target_path, tmp_path)) return error.InvalidAtomicReplacePaths;
 
+    const target_mode = if (dir.statFile(target_path)) |stat| stat.mode else |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+
     var cleanup_tmp = true;
     defer if (cleanup_tmp) dir.deleteFile(tmp_path) catch {};
 
     try writeFile(dir, tmp_path, data);
+    if (target_mode) |mode| try chmodFile(dir, tmp_path, mode);
     try dir.rename(tmp_path, target_path);
     cleanup_tmp = false;
 }
@@ -80,6 +92,19 @@ test "compat filesystem wrappers read write and atomically replace" {
     try std.testing.expectEqualStrings("two", replaced);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("compat.txt.tmp", .{}));
+}
+
+test "compat atomic replace preserves existing target mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeFile(tmp.dir, "mode.txt", "one");
+    try chmodFile(tmp.dir, "mode.txt", 0o640);
+
+    try atomicReplace(tmp.dir, "mode.txt", "mode.txt.tmp", "two");
+
+    const stat = try tmp.dir.statFile("mode.txt");
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o640), stat.mode & 0o777);
 }
 
 test "compat filesystem wrappers create directories and open files" {
