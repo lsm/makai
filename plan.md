@@ -38,9 +38,9 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
    Priority: **high**  
    Expand named tests for EventStream completion-after-error, double-completion, timeout, multi-producer stress, and memory ordering; OAuth storage production `saveToFile`, `0o600` mode, same-directory temp rename, and cleanup; WebSocket masking-key XOR and continuation reassembly; SSE 1-byte incremental reads and error-body injection; provider cancellation across pre-request, connect/setup, headers, between events, and mid-event; and retry/time zero-timeout, large-timeout, overflow, and budget exhaustion. These tests must run on Zig 0.15.2 and become the measurable gate before Phase 1 dispatch. Avoid external provider E2E tests.
 
-9. **Switch to a first green Zig 0.16 baseline PR and resolve unused libxev declaration**  
+9. **Switch to a first green Zig 0.16 baseline PR and remove libxev**  
    Priority: **urgent**  
-   Update Zig/CI metadata and resolve the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and docs; `zig/build.zig` does not call `b.dependency("libxev", ...)`, and source files do not import `xev`/`libxev`. Prefer removing the unused declaration in Phase 1; only update/pin libxev to a Zig 0.16-compatible commit if the audit identifies an active consumer. Apply enough compile-restoring fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum.
+   Update Zig/CI metadata and remove the currently declared libxev dependency. A repo scan found `libxev` only in `zig/build.zig.zon` and docs; `zig/build.zig` does not call `b.dependency("libxev", ...)`, and source files do not import `xev`/`libxev`. Phase 1 must remove the unused declaration rather than update/pin it. Apply enough compile-restoring fixes for `zig build test-unit-core` and `zig build test-unit-utils` to pass on Zig 0.16 at minimum.
 
 10. **Migrate `std.mem.indexOf*` call sites to `std.mem.find*`**  
     Priority: **high**  
@@ -130,7 +130,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 - Preserving Zig 0.15.2 source compatibility after Phase 1; public API changes are allowed when documented in migration notes.
 - Building or maintaining a libxev-to-`std.Io` adapter.
 - Waiting for upstream libxev `std.Io` support before the initial migration.
-- Keeping libxev solely because it is declared today; Phase 1 should remove it if the dependency audit confirms it is unused.
+- Keeping libxev solely because it is declared today; Phase 1 removes it because the dependency audit found no active source/build usage.
 - Adding new providers, transports, OAuth flows, or agent features.
 - External provider E2E stabilization or new secret-dependent tests.
 - Broad performance optimization unrelated to compile/test parity.
@@ -142,7 +142,7 @@ Deliver a concrete, reviewable implementation plan for migrating Makai from Zig 
 |---|---|---:|---|
 | Default `std.Io` backend and ownership model | Binding default set; final backend selection recorded in work item 1 | 1 | Phase 0 wrappers MUST NOT expose `std.Io` in public APIs; public constructors use Makai context/default-I/O patterns, internal helpers may accept explicit handles. |
 | Branch strategy | Decided | 9 | Use main-branch path with a first green Zig 0.16 PR; no long-lived integration branch unless this plan is revised. |
-| libxev dependency posture | Decided pending audit confirmation | 9 | Current scan shows no active source/build usage beyond `build.zig.zon`; prefer removal in Phase 1 unless an active consumer is found. |
+| libxev dependency posture | Decided | 9 | Remove libxev in Phase 1; current scan shows no active source/build usage beyond `build.zig.zon`. |
 | Zig 0.15.2 source compatibility after Phase 1 | Decided | 9 | Not required after compiler switch; public API changes must be documented in migration notes. |
 | Provider HTTP rollout shape | Decided | 18 | Shared abstraction + one proving provider, then OpenAI/Azure, then Anthropic/Google/Ollama. |
 | Secure randomness enforcement | Decided | 4 | Add/extend `check-zig-patterns.sh` guardrails so secure paths cannot use non-secure entropy directly. |
