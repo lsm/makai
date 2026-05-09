@@ -22,35 +22,44 @@ pub fn stdout() File {
 
 /// Return a Zig 0.15.2 stdin reader using caller-owned buffer storage.
 ///
+/// The reader is initialized in streaming mode so repeated helper construction
+/// continues from the file descriptor's current position instead of resetting to
+/// offset 0 when stdin is redirected from a seekable file.
+///
 /// Zig 0.16 mapping: adapt this helper to the selected Makai input context while
 /// preserving buffer ownership: callers provide the storage and stdin itself is
 /// borrowed, not closed here.
 pub fn getStdinReader(buffer: []u8) FileReader {
-    return stdin().reader(buffer);
+    return stdin().readerStreaming(buffer);
 }
 
 /// Return a Zig 0.15.2 stdout writer using caller-owned buffer storage.
 ///
-/// Callers that write through it are responsible for flushing according to
-/// `std.fs.File.Writer` semantics.
+/// The writer is initialized in streaming mode so repeated helper construction
+/// appends through the file descriptor's current position instead of resetting to
+/// offset 0 when stdout is redirected to a seekable file. Callers that write
+/// through it are responsible for flushing according to `std.fs.File.Writer`
+/// semantics.
 pub fn getStdoutWriter(buffer: []u8) FileWriter {
-    return stdout().writer(buffer);
+    return stdout().writerStreaming(buffer);
 }
 
-/// Return a reader for an explicit file handle using a caller-owned buffer.
+/// Return a streaming reader for an explicit file handle using a caller-owned
+/// buffer.
 ///
 /// Used by future stdio transport and CLI migrations to centralize file reader
 /// construction while keeping `std.Io` out of public signatures.
 pub fn fileReader(file: File, buffer: []u8) FileReader {
-    return file.reader(buffer);
+    return file.readerStreaming(buffer);
 }
 
-/// Return a writer for an explicit file handle using a caller-owned buffer.
+/// Return a streaming writer for an explicit file handle using a caller-owned
+/// buffer.
 ///
 /// Used by future stdio transport and CLI migrations to centralize file writer
 /// construction while keeping `std.Io` out of public signatures.
 pub fn fileWriter(file: File, buffer: []u8) FileWriter {
-    return file.writer(buffer);
+    return file.writerStreaming(buffer);
 }
 
 test "compat stdio helpers construct file handles readers and writers" {

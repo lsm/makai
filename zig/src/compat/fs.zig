@@ -84,11 +84,11 @@ fn basename(path: []const u8) []const u8 {
     return std.fs.path.basename(path);
 }
 
-fn tempPath(allocator: std.mem.Allocator, target_path: []const u8) ![]u8 {
+fn tempName(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "{s}.tmp.{d}.{x}",
-        .{ target_path, compat_time.nowMillis(), compat_random.randomIntRangeLessThan(u64, std.math.maxInt(u64)) },
+        ".makai-tmp-{d}-{x}",
+        .{ compat_time.nowMillis(), compat_random.randomIntRangeLessThan(u64, std.math.maxInt(u64)) },
     );
 }
 
@@ -112,19 +112,17 @@ fn writeFileFailAfter(dir: Dir, path: []const u8, data: []const u8, mode: std.fs
 }
 
 fn atomicReplaceWithInjectedFailure(allocator: std.mem.Allocator, path: []const u8, data: []const u8, fail_after: ?usize) !void {
-    const tmp_path = try tempPath(allocator, path);
-    defer allocator.free(tmp_path);
-
-    if (std.mem.eql(u8, path, tmp_path)) return error.InvalidAtomicReplacePaths;
-
     const target_dir_path = dirnameOrDot(path);
     const target_name = basename(path);
-    const tmp_name = basename(tmp_path);
+    const tmp_name = try tempName(allocator);
+    defer allocator.free(tmp_name);
 
-    var dir = try getCwd().openDir(target_dir_path, .{ .iterate = true });
+    if (std.mem.eql(u8, target_name, tmp_name)) return error.InvalidAtomicReplacePaths;
+
+    var dir = try getCwd().openDir(target_dir_path, .{});
     defer dir.close();
 
-    const final_mode = if (dir.statFile(target_name)) |stat| stat.mode & 0o777 else |err| switch (err) {
+    const final_mode = if (dir.statFile(target_name)) |stat| stat.mode else |err| switch (err) {
         error.FileNotFound => default_file_mode,
         else => return err,
     };
@@ -258,6 +256,33 @@ test "compat atomic replace preserves existing target mode" {
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o644), stat.mode & 0o777);
 }
 
+test "compat atomic replace preserves special mode bits" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try makeTmpPath(allocator, tmp, "special-mode.txt");
+    defer allocator.free(path);
+
+    try writeFile(path, "old");
+    var file = try openFile(path, .{ .mode = .write_only });
+    defer file.close();
+    try file.chmod(0o1755);
+
+    try atomicReplace(allocator, path, "new contents");
+
+    const stat = try getCwd().statFile(path);
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o1755), stat.mode & 0o7777);
+}
+
+test "compat atomic replace temp basename stays bounded" {
+    const allocator = std.testing.allocator;
+    const name = try tempName(allocator);
+    defer allocator.free(name);
+
+    try std.testing.expect(name.len <= std.fs.max_name_bytes);
+}
+
 test "compat atomic replace cleans temp after partial write failure" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -279,10 +304,8 @@ test "compat atomic replace cleans temp after partial write failure" {
     var target_dir = try getCwd().openDir(dirnameOrDot(path), .{ .iterate = true });
     defer target_dir.close();
     var iter = target_dir.iterate();
-    const prefix = try std.fmt.allocPrint(allocator, "{s}.tmp.", .{basename(path)});
-    defer allocator.free(prefix);
     while (try iter.next()) |entry| {
-        try std.testing.expect(!std.mem.startsWith(u8, entry.name, prefix));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".makai-tmp-"));
     }
 }
 
