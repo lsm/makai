@@ -3,6 +3,7 @@ const std = @import("std");
 pub const Address = std.net.Address;
 pub const AddressList = std.net.AddressList;
 pub const ListenOptions = Address.ListenOptions;
+pub const Server = std.net.Server;
 
 /// TCP stream wrapper used as the stable Makai networking boundary.
 ///
@@ -34,39 +35,31 @@ pub const Stream = struct {
     }
 };
 
-/// Accepted TCP connection returned by `Server.accept`.
+/// Accepted TCP connection returned by `accept`.
 pub const Connection = struct {
     stream: Stream,
     address: Address,
 };
 
-/// TCP listener wrapper used by OAuth callback and transport networking paths.
+/// Return the bound listener address.
 ///
-/// Zig 0.15.2: owns a `std.net.Server`. 0.16: use Makai's selected networking
-/// backend internally while preserving this listen/accept shape.
-pub const Server = struct {
-    inner: std.net.Server,
+/// Zig 0.15.2: reads `std.net.Server.listen_address`.
+/// 0.16: route through Makai's selected networking backend internally.
+pub fn listenAddress(server: *const Server) Address {
+    return server.listen_address;
+}
 
-    pub fn init(inner: std.net.Server) Server {
-        return .{ .inner = inner };
-    }
-
-    pub fn listenAddress(self: *const Server) Address {
-        return self.inner.listen_address;
-    }
-
-    pub fn accept(self: *Server) !Connection {
-        const connection = try self.inner.accept();
-        return .{
-            .stream = Stream.init(connection.stream),
-            .address = connection.address,
-        };
-    }
-
-    pub fn deinit(self: *Server) void {
-        self.inner.deinit();
-    }
-};
+/// Accept a TCP connection and wrap its stream at the Makai compatibility seam.
+///
+/// Zig 0.15.2: wraps `std.net.Server.accept`.
+/// 0.16: preserve this helper shape over Makai's selected networking backend.
+pub fn accept(server: *Server) !Connection {
+    const connection = try server.accept();
+    return .{
+        .stream = Stream.init(connection.stream),
+        .address = connection.address,
+    };
+}
 
 /// Resolve a host/port into an address.
 ///
@@ -104,7 +97,7 @@ pub fn tcpConnect(address: Address) !Stream {
 /// Zig 0.15.2: wraps `std.net.Address.listen`.
 /// 0.16: use std.Io.net.tcpListen internally.
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
-    return Server.init(try address.listen(options));
+    return address.listen(options);
 }
 
 const LoopbackServerContext = struct {
@@ -113,7 +106,7 @@ const LoopbackServerContext = struct {
 };
 
 fn loopbackServerThread(context: *LoopbackServerContext) void {
-    var connection = context.server.accept() catch |err| {
+    var connection = accept(context.server) catch |err| {
         context.result = err;
         return;
     };
@@ -159,7 +152,7 @@ test "compat networking can listen on loopback" {
     var server = try tcpListen(address, .{ .reuse_address = true });
     defer server.deinit();
 
-    try std.testing.expect(server.listenAddress().getPort() != 0);
+    try std.testing.expect(listenAddress(&server).getPort() != 0);
 }
 
 test "compat networking loopback connect read write round trip" {
@@ -167,13 +160,13 @@ test "compat networking loopback connect read write round trip" {
     var server = try tcpListen(address, .{ .reuse_address = true });
     defer server.deinit();
 
-    var client = try tcpConnect(server.listenAddress());
-    errdefer client.close();
+    var client = try tcpConnect(listenAddress(&server));
+    defer client.close();
 
     var context = LoopbackServerContext{ .server = &server };
     const thread = try std.Thread.spawn(.{}, loopbackServerThread, .{&context});
-    defer thread.join();
-    defer client.close();
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
 
     try client.writeAll("ping");
 
@@ -186,5 +179,7 @@ test "compat networking loopback connect read write round trip" {
     }
     try std.testing.expectEqualStrings("pong", &response);
 
+    thread.join();
+    thread_joined = true;
     try context.result;
 }
