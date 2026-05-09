@@ -68,13 +68,20 @@ pub const Server = struct {
     }
 };
 
-/// Resolve an IPv4/IPv6 string host and port into an address.
+/// Resolve a host/port into an address.
 ///
-/// Zig 0.15.2: wraps `std.net.Address.resolveIp`.
+/// Zig 0.15.2: wraps `std.net.getAddressList` and returns the first resolved
+/// address, preserving DNS hostname support in addition to literal IP inputs.
 /// 0.16: keep this public signature and route through the selected Makai
 /// networking context internally.
-pub fn resolveAddress(host: []const u8, port: u16) !Address {
-    return std.net.Address.resolveIp(host, port);
+///
+/// `allocator` owns temporary DNS resolver allocations during this call.
+pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
+    var list = try std.net.getAddressList(allocator, host, port);
+    defer list.deinit();
+
+    if (list.addrs.len == 0) return error.UnknownHostName;
+    return list.addrs[0];
 }
 
 /// Resolve a host/port into an owned address list for DNS-style consumers.
@@ -135,13 +142,21 @@ fn loopbackServerThread(context: *LoopbackServerContext) void {
     };
     defer connection.stream.close();
 
-    var buffer: [32]u8 = undefined;
-    const bytes_read = connection.stream.read(&buffer) catch |err| {
-        context.result = err;
-        return;
-    };
+    var buffer: [4]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < buffer.len) {
+        const bytes_read = connection.stream.read(buffer[total_read..]) catch |err| {
+            context.result = err;
+            return;
+        };
+        if (bytes_read == 0) {
+            context.result = error.EndOfStream;
+            return;
+        }
+        total_read += bytes_read;
+    }
 
-    if (!std.mem.eql(u8, buffer[0..bytes_read], "ping")) {
+    if (!std.mem.eql(u8, &buffer, "ping")) {
         context.result = error.UnexpectedRequest;
         return;
     }
@@ -153,12 +168,17 @@ fn loopbackServerThread(context: *LoopbackServerContext) void {
 }
 
 test "compat networking resolves loopback address" {
-    const address = try resolveAddress("127.0.0.1", 0);
+    const address = try resolveAddress(std.testing.allocator, "127.0.0.1", 0);
+    try std.testing.expectEqual(@as(u16, 0), address.getPort());
+}
+
+test "compat networking resolves localhost hostname" {
+    const address = try resolveAddress(std.testing.allocator, "localhost", 0);
     try std.testing.expectEqual(@as(u16, 0), address.getPort());
 }
 
 test "compat networking can listen on loopback" {
-    const address = try resolveAddress("127.0.0.1", 0);
+    const address = try resolveAddress(std.testing.allocator, "127.0.0.1", 0);
     var server = try tcpListen(address, .{ .reuse_address = true });
     defer server.deinit();
 
@@ -166,12 +186,13 @@ test "compat networking can listen on loopback" {
 }
 
 test "compat networking loopback connect read write round trip" {
-    const address = try resolveAddress("127.0.0.1", 0);
+    const address = try resolveAddress(std.testing.allocator, "127.0.0.1", 0);
     var server = try tcpListen(address, .{ .reuse_address = true });
     defer server.deinit();
 
     var context = LoopbackServerContext{ .server = &server };
     const thread = try std.Thread.spawn(.{}, loopbackServerThread, .{&context});
+    defer thread.join();
 
     var client = try tcpConnect(server.listenAddress());
     defer client.close();
@@ -179,9 +200,13 @@ test "compat networking loopback connect read write round trip" {
     try client.writeAll("ping");
 
     var response: [4]u8 = undefined;
-    const bytes_read = try client.read(&response);
-    try std.testing.expectEqualStrings("pong", response[0..bytes_read]);
+    var total_read: usize = 0;
+    while (total_read < response.len) {
+        const bytes_read = try client.read(response[total_read..]);
+        if (bytes_read == 0) return error.EndOfStream;
+        total_read += bytes_read;
+    }
+    try std.testing.expectEqualStrings("pong", &response);
 
-    thread.join();
     try context.result;
 }
