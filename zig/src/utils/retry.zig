@@ -666,7 +666,7 @@ test "retry_time_zero_timeout_completes_without_sleep" {
     try std.testing.expect(!cancelled.load(.acquire));
 }
 
-test "retry_time_very_large_timeout_is_clamped_by_cancel_token" {
+test "retry_time_very_large_timeout_returns_immediately_when_cancelled" {
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expect(!sleepMs(std.math.maxInt(u64), &cancelled));
 }

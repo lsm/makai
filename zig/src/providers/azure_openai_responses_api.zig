@@ -222,6 +222,7 @@ const ThreadCtx = struct {
     api_key: []u8,
     base_url: []u8,
     body: []u8,
+    cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
 };
 
@@ -231,6 +232,14 @@ fn runThread(ctx: *ThreadCtx) void {
         ctx.allocator.free(ctx.base_url);
         ctx.allocator.free(ctx.body);
         ctx.allocator.destroy(ctx);
+    }
+
+    if (ctx.cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            ctx.stream.markThreadDone();
+            ctx.stream.completeWithError("request cancelled");
+            return;
+        }
     }
 
     var client = std.http.Client{ .allocator = ctx.allocator };
@@ -403,7 +412,7 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .base_url = base_url, .body = body, .ping_interval_ms = o.ping_interval_ms };
+    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .base_url = base_url, .body = body, .cancel_token = o.cancel_token, .ping_interval_ms = o.ping_interval_ms };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();
@@ -505,24 +514,32 @@ fn regressionContext() ai_types.Context {
     return .{ .messages = messages };
 }
 
-fn expectCancelledOrSetupErrorStream(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
-    defer allocator.destroy(stream);
-    while (stream.wait()) |_| {}
-    _ = stream.waitForThread(5_000);
-    try std.testing.expect(stream.isDone());
+fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (!stream.isDone()) {
+        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
     try std.testing.expect(stream.getError() != null);
-    const err = stream.getError().?;
-    try std.testing.expect(std.mem.eql(u8, err, "request cancelled") or std.mem.eql(u8, err, "azure request failed"));
-    stream.deinit();
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
 
 
 test "provider_cancellation_azure_cancel_before_request" {
     var cancelled = std.atomic.Value(bool).init(true);
     const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
-    const options = ai_types.SimpleStreamOptions{ .api_key = "test-key", .cancel_token = cancel_token };
-
-    try std.testing.expect(options.cancel_token.?.isCancelled());
-    _ = regressionModel("azure-openai-responses", "azure", "https://example.openai.azure.com");
-    _ = regressionContext();
+    const stream = try streamSimpleAzureOpenAIResponses(
+        regressionModel("azure-openai-responses", "azure", "https://example.openai.azure.com"),
+        regressionContext(),
+        .{ .api_key = "test-key", .cancel_token = cancel_token },
+        std.testing.allocator,
+    );
+    try expectCancelledStream(stream, std.testing.allocator);
 }
