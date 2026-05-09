@@ -501,3 +501,180 @@ test "EventStream wait wakes and returns pushed event" {
     const got = stream.wait();
     try std.testing.expectEqual(@as(?u32, 42), got);
 }
+
+
+const CompletionAfterErrorCtx = struct {
+    stream: *EventStream(u32, u32),
+    ready: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) void {
+        while (!self.ready.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+        self.stream.complete(99);
+    }
+};
+
+test "completion_after_error_is_stable" {
+    const TestStream = EventStream(u32, u32);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    stream.completeWithError("first failure");
+
+    var ready = std.atomic.Value(bool).init(false);
+    var ctx = CompletionAfterErrorCtx{ .stream = &stream, .ready = &ready };
+    const thread = try std.Thread.spawn(.{}, CompletionAfterErrorCtx.run, .{&ctx});
+    ready.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(stream.isDone());
+    try std.testing.expectEqualStrings("first failure", stream.getError().?);
+    try std.testing.expectEqual(@as(?u32, 99), stream.getResult());
+    try std.testing.expect(stream.wait() == null);
+}
+
+test "double_completion_is_idempotent_or_errors_predictably" {
+    const TestStream = EventStream(u32, u32);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    stream.complete(1);
+    stream.complete(2);
+
+    try std.testing.expect(stream.isDone());
+    try std.testing.expectEqual(@as(?u32, 2), stream.getResult());
+    try std.testing.expect(stream.getError() == null);
+    try std.testing.expect(stream.wait() == null);
+}
+
+const WaitTimeoutCtx = struct {
+    stream: *EventStream(u32, u32),
+    result: std.atomic.Value(u32) = std.atomic.Value(u32).init(999),
+
+    fn run(self: *@This()) void {
+        const got = self.stream.wait();
+        self.result.store(if (got) |v| v else 0, .release);
+    }
+};
+
+test "wait_timeout_returns_without_event" {
+    const TestStream = EventStream(u32, u32);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    var ctx = WaitTimeoutCtx{ .stream = &stream };
+    const thread = try std.Thread.spawn(.{}, WaitTimeoutCtx.run, .{&ctx});
+
+    try std.testing.expect(!stream.waitForThread(1));
+    stream.complete(7);
+    thread.join();
+
+    try std.testing.expectEqual(@as(u32, 0), ctx.result.load(.acquire));
+}
+
+const StressEvent = struct {
+    producer: u16,
+    seq: u16,
+};
+
+const MultiProducerStressCtx = struct {
+    stream: *EventStream(StressEvent, usize),
+    producer: u16,
+    start: *std.atomic.Value(bool),
+
+    const per_producer = 64;
+
+    fn run(self: *@This()) void {
+        while (!self.start.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+
+        var seq: u16 = 0;
+        while (seq < per_producer) : (seq += 1) {
+            while (true) {
+                self.stream.push(.{ .producer = self.producer, .seq = seq }) catch |err| switch (err) {
+                    error.QueueFull => {
+                        std.Thread.yield() catch {};
+                        continue;
+                    },
+                };
+                break;
+            }
+        }
+    }
+};
+
+test "multi_producer_stress_preserves_events" {
+    const producer_count = 4;
+    const per_producer = MultiProducerStressCtx.per_producer;
+    const expected_total = producer_count * per_producer;
+
+    const StressStream = EventStream(StressEvent, usize);
+    var stream = StressStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    var start = std.atomic.Value(bool).init(false);
+    var contexts: [producer_count]MultiProducerStressCtx = undefined;
+    var threads: [producer_count]std.Thread = undefined;
+
+    for (&contexts, 0..) |*ctx, i| {
+        ctx.* = .{ .stream = &stream, .producer = @intCast(i), .start = &start };
+        threads[i] = try std.Thread.spawn(.{}, MultiProducerStressCtx.run, .{ctx});
+    }
+    start.store(true, .release);
+
+    var seen = [_][per_producer]bool{[_]bool{false} ** per_producer} ** producer_count;
+    var received: usize = 0;
+    while (received < expected_total) {
+        if (stream.wait()) |event| {
+            try std.testing.expect(event.producer < producer_count);
+            try std.testing.expect(event.seq < per_producer);
+            try std.testing.expect(!seen[event.producer][event.seq]);
+            seen[event.producer][event.seq] = true;
+            received += 1;
+        }
+    }
+
+    for (&threads) |*thread| thread.join();
+
+    for (seen) |producer_seen| {
+        for (producer_seen) |was_seen| {
+            try std.testing.expect(was_seen);
+        }
+    }
+}
+
+const MemoryOrderingCtx = struct {
+    stream: *EventStream(u64, u64),
+    side_channel: *std.atomic.Value(u64),
+    start: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) void {
+        while (!self.start.load(.acquire)) {
+            std.Thread.yield() catch {};
+        }
+        self.side_channel.store(0xC0FFEE, .release);
+        self.stream.complete(0xC0FFEE);
+    }
+};
+
+test "completion_memory_ordering_visibility" {
+    const TestStream = EventStream(u64, u64);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    var side_channel = std.atomic.Value(u64).init(0);
+    var start = std.atomic.Value(bool).init(false);
+    var ctx = MemoryOrderingCtx{ .stream = &stream, .side_channel = &side_channel, .start = &start };
+    const thread = try std.Thread.spawn(.{}, MemoryOrderingCtx.run, .{&ctx});
+    defer thread.join();
+
+    start.store(true, .release);
+    while (!stream.isDone()) {
+        std.Thread.yield() catch {};
+    }
+
+    try std.testing.expectEqual(@as(u64, 0xC0FFEE), side_channel.load(.acquire));
+    try std.testing.expectEqual(@as(?u64, 0xC0FFEE), stream.getResult());
+}
