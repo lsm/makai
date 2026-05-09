@@ -1605,8 +1605,14 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
         stream.deinit();
         allocator.destroy(stream);
     }
-    while (stream.wait()) |_| {}
-    try std.testing.expect(stream.isDone());
+
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (!stream.isDone()) {
+        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }

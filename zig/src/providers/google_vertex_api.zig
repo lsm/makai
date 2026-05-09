@@ -8,6 +8,9 @@ const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 /// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
     /// Google Cloud project ID (from GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT env var)
@@ -28,6 +31,7 @@ pub const VertexError = error{
     MissingLocation,
     MissingApiKey,
     InvalidConfiguration,
+    OutOfMemory,
 };
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -312,6 +316,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         }
                         try w.endObject();
                     },
+                    .image => {},
                 };
             },
             .tool_result => |tr| {
@@ -695,6 +700,7 @@ const ThreadCtx = struct {
     location: []u8,
     thinking_enabled: bool,
     retry_config: ?ai_types.RetryConfig = null,
+    cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
 };
 
@@ -708,6 +714,20 @@ fn runThread(ctx: *ThreadCtx) void {
     const location = ctx.location;
     const thinking_enabled = ctx.thinking_enabled;
     const retry_opts = ctx.retry_config;
+    const cancel_token = ctx.cancel_token;
+
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(project);
+            allocator.free(location);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -1374,6 +1394,7 @@ pub fn streamGoogleVertex(
         .location = location,
         .thinking_enabled = o.thinking_enabled,
         .retry_config = o.retry,
+        .cancel_token = o.cancel_token,
         .ping_interval_ms = o.ping_interval_ms,
     };
 
@@ -1645,19 +1666,32 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
         stream.deinit();
         allocator.destroy(stream);
     }
-    while (stream.wait()) |_| {}
-    try std.testing.expect(stream.isDone());
+
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (!stream.isDone()) {
+        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
 
 
 test "provider_cancellation_vertex_cancel_before_request" {
+    try std.testing.expectEqual(@as(c_int, 0), setenv("GOOGLE_CLOUD_PROJECT", "test-project", 1));
+    defer _ = unsetenv("GOOGLE_CLOUD_PROJECT");
+    try std.testing.expectEqual(@as(c_int, 0), setenv("GOOGLE_CLOUD_LOCATION", "us-central1", 1));
+    defer _ = unsetenv("GOOGLE_CLOUD_LOCATION");
+
     var cancelled = std.atomic.Value(bool).init(true);
     const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
-    const options = ai_types.SimpleStreamOptions{ .api_key = "test-key", .cancel_token = cancel_token };
-
-    try std.testing.expect(options.cancel_token.?.isCancelled());
-    _ = regressionModel("google-vertex", "google", "https://example.googleapis.com");
-    _ = regressionContext();
+    const stream = try streamSimpleGoogleVertex(
+        regressionModel("google-vertex", "google", "https://example.googleapis.com"),
+        regressionContext(),
+        .{ .api_key = "test-key", .cancel_token = cancel_token },
+        std.testing.allocator,
+    );
+    try expectCancelledStream(stream, std.testing.allocator);
 }

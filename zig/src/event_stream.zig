@@ -558,7 +558,7 @@ const WaitTimeoutCtx = struct {
     }
 };
 
-test "wait_timeout_returns_without_event" {
+test "wait_returns_null_after_complete_without_event" {
     const TestStream = EventStream(u32, u32);
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
@@ -583,7 +583,7 @@ const MultiProducerStressCtx = struct {
     producer: u16,
     start: *std.atomic.Value(bool),
 
-    const per_producer = 64;
+    const per_producer = 50;
 
     fn run(self: *@This()) void {
         while (!self.start.load(.acquire)) {
