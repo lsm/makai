@@ -167,11 +167,12 @@ test "compat networking loopback connect read write round trip" {
     var server = try tcpListen(address, .{ .reuse_address = true });
     defer server.deinit();
 
+    var client = try tcpConnect(server.listenAddress());
+    errdefer client.close();
+
     var context = LoopbackServerContext{ .server = &server };
     const thread = try std.Thread.spawn(.{}, loopbackServerThread, .{&context});
     defer thread.join();
-
-    var client = try tcpConnect(server.listenAddress());
     defer client.close();
 
     try client.writeAll("ping");
