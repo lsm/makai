@@ -658,3 +658,35 @@ test "RetryConfig nextDelay with jitter_factor 0 returns exact value" {
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
 }
+
+
+test "retry_time_zero_timeout_completes_without_sleep" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    try std.testing.expect(sleepMs(0, &cancelled));
+    try std.testing.expect(!cancelled.load(.acquire));
+}
+
+test "retry_time_very_large_timeout_is_clamped_by_cancel_token" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expect(!sleepMs(std.math.maxInt(u64), &cancelled));
+}
+
+test "retry_time_integer_overflow_edges_do_not_wrap_to_retryable_delay" {
+    const config = RetryConfig{ .base_delay_ms = std.math.maxInt(u64), .max_delay_ms = std.math.maxInt(u64), .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), config.nextDelay(0, null));
+
+    const wrapped = calculateDelay(63, std.math.maxInt(u32), std.math.maxInt(u32));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u32)), wrapped);
+
+    try std.testing.expectEqual(@as(?u64, null), extractRetryDelayFromHeader("18446744073709551616"));
+}
+
+test "retry_budget_exhaustion_edge_cases" {
+    const exhausted = RetryConfig{ .max_retries = 0, .base_delay_ms = 100, .max_delay_ms = 0, .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, 100), exhausted.nextDelay(0, null));
+    try std.testing.expect(exhausted.isRetryableStatus(.too_many_requests));
+
+    const capped = RetryConfig{ .max_retries = 1, .base_delay_ms = 100, .max_delay_ms = 150, .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, 100), capped.nextDelay(0, null));
+    try std.testing.expectEqual(@as(?u64, null), capped.nextDelay(1, null));
+}

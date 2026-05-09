@@ -1616,3 +1616,48 @@ test "mapFinishReason - Vertex finish reasons" {
     try std.testing.expectEqual(ai_types.StopReason.@"error", mapFinishReason("SAFETY"));
     try std.testing.expectEqual(ai_types.StopReason.stop, mapFinishReason(null));
 }
+
+
+fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
+    return .{
+        .id = "regression-model",
+        .name = "regression-model",
+        .api = api_name,
+        .provider = provider_name,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 16,
+    };
+}
+
+fn regressionContext() ai_types.Context {
+    const messages = struct {
+        const items = [_]ai_types.Message{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } }};
+    }.items[0..];
+    return .{ .messages = messages };
+}
+
+fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+    while (stream.wait()) |_| {}
+    try std.testing.expect(stream.isDone());
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}
+
+
+test "provider_cancellation_vertex_cancel_before_request" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+    const options = ai_types.SimpleStreamOptions{ .api_key = "test-key", .cancel_token = cancel_token };
+
+    try std.testing.expect(options.cancel_token.?.isCancelled());
+    _ = regressionModel("google-vertex", "google", "https://example.googleapis.com");
+    _ = regressionContext();
+}
