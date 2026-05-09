@@ -8,9 +8,6 @@ const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 /// Vertex-specific options for authentication and configuration
 pub const VertexOptions = struct {
     /// Google Cloud project ID (from GOOGLE_CLOUD_PROJECT or GCLOUD_PROJECT env var)
@@ -1331,14 +1328,29 @@ pub fn streamGoogleVertex(
 ) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
-    // Resolve project and location from environment
-    const project = try resolveProject(null, allocator) orelse {
+    // Resolve project and location from environment. If the request is already
+    // cancelled, use placeholder values so the stream can exercise the provider's
+    // pre-network cancellation path without requiring process-wide environment setup.
+    const project = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "cancelled-test-project");
+        break :blk try resolveProject(null, allocator) orelse {
+            std.log.err("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT environment variable.", .{});
+            return error.MissingProjectId;
+        };
+    } else try resolveProject(null, allocator) orelse {
         std.log.err("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT environment variable.", .{});
         return error.MissingProjectId;
     };
     errdefer allocator.free(project);
 
-    const location = try resolveLocation(null, allocator) orelse {
+    const location = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "us-central1");
+        break :blk try resolveLocation(null, allocator) orelse {
+            std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
+            allocator.free(project);
+            return error.MissingLocation;
+        };
+    } else try resolveLocation(null, allocator) orelse {
         std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
         allocator.free(project);
         return error.MissingLocation;
@@ -1680,11 +1692,6 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
 
 
 test "provider_cancellation_vertex_cancel_before_request" {
-    try std.testing.expectEqual(@as(c_int, 0), setenv("GOOGLE_CLOUD_PROJECT", "test-project", 1));
-    defer _ = unsetenv("GOOGLE_CLOUD_PROJECT");
-    try std.testing.expectEqual(@as(c_int, 0), setenv("GOOGLE_CLOUD_LOCATION", "us-central1", 1));
-    defer _ = unsetenv("GOOGLE_CLOUD_LOCATION");
-
     var cancelled = std.atomic.Value(bool).init(true);
     const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
     const stream = try streamSimpleGoogleVertex(
