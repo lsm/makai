@@ -15,6 +15,9 @@ const default_header_buffer_size = 16 * 1024;
 pub const CompatHttpRequestOptions = struct {
     keep_alive: bool = true,
     header_buffer_size: usize = default_header_buffer_size,
+    /// Defaults to `identity` so SSE streams are not buffered behind gzip. Future
+    /// non-SSE consumers can opt into another value without bypassing this seam.
+    accept_encoding: []const u8 = "identity",
 };
 
 /// Type-erased streaming response body reader.
@@ -126,12 +129,12 @@ pub const CompatHttpClient = struct {
         errdefer self.allocator.free(header_buffer);
 
         // SSE streams must not be gzip-compressed: compression can buffer event
-        // delivery and break incremental parsing. This mirrors provider call
-        // sites that currently override accept-encoding to `identity`.
+        // delivery and break incremental parsing. Default to `identity`, while
+        // allowing non-SSE consumers to opt into another accept-encoding value.
         var request_handle = try self.client.request(method, uri, .{
             .extra_headers = headers,
             .keep_alive = options.keep_alive,
-            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+            .headers = .{ .accept_encoding = .{ .override = options.accept_encoding } },
         });
         errdefer request_handle.deinit();
 
@@ -187,6 +190,7 @@ pub fn responseReader(response: *Response, transfer_buffer: []u8) CompatHttpBody
 pub const CompatHttpMockResponse = struct {
     status_code: CompatHttpStatus,
     header_list: []const CompatHttpHeader,
+    raw_header_bytes: []const u8 = "",
     body: []const u8,
     offset: usize = 0,
     max_chunk_size: usize = std.math.maxInt(usize),
@@ -195,8 +199,26 @@ pub const CompatHttpMockResponse = struct {
         return .{ .status_code = status_code, .header_list = header_list, .body = body };
     }
 
+    pub fn initWithHeaderBytes(
+        status_code: CompatHttpStatus,
+        header_list: []const CompatHttpHeader,
+        raw_header_bytes: []const u8,
+        body: []const u8,
+    ) CompatHttpMockResponse {
+        return .{
+            .status_code = status_code,
+            .header_list = header_list,
+            .raw_header_bytes = raw_header_bytes,
+            .body = body,
+        };
+    }
+
     pub fn status(self: *const CompatHttpMockResponse) CompatHttpStatus {
         return self.status_code;
+    }
+
+    pub fn headerBytes(self: *const CompatHttpMockResponse) []const u8 {
+        return self.raw_header_bytes;
     }
 
     pub fn headers(self: *const CompatHttpMockResponse) []const CompatHttpHeader {
@@ -228,6 +250,10 @@ test "compat http request options default to streaming safe behavior" {
     const options = CompatHttpRequestOptions{};
     try std.testing.expect(options.keep_alive);
     try std.testing.expectEqual(@as(usize, default_header_buffer_size), options.header_buffer_size);
+    try std.testing.expectEqualStrings("identity", options.accept_encoding);
+
+    const gzip_options = CompatHttpRequestOptions{ .accept_encoding = "gzip" };
+    try std.testing.expectEqualStrings("gzip", gzip_options.accept_encoding);
 }
 
 test "compat http mock response exposes status headers and incremental reader" {
@@ -239,6 +265,10 @@ test "compat http mock response exposes status headers and incremental reader" {
 
     try std.testing.expectEqual(CompatHttpStatus.ok, response.status());
     try std.testing.expectEqualStrings("content-type", response.headers()[0].name);
+    try std.testing.expectEqualStrings("", response.headerBytes());
+
+    const raw_response = CompatHttpMockResponse.initWithHeaderBytes(.ok, &headers, "HTTP/1.1 200 OK\r\n", "");
+    try std.testing.expectEqualStrings("HTTP/1.1 200 OK\r\n", raw_response.headerBytes());
 
     var reader = response.reader();
     var buffer: [4]u8 = undefined;
