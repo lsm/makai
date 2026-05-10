@@ -57,8 +57,8 @@ pub fn atomicReplace(dir: std.fs.Dir, target_path: []const u8, tmp_path: []const
 
     var file = try dir.createFile(tmp_path, .{ .truncate = false, .exclusive = true, .mode = default_file_mode });
     cleanup_tmp = true;
-    defer file.close();
     try file.writeAll(data);
+    file.close();
 
     try dir.rename(tmp_path, target_path);
     cleanup_tmp = false;

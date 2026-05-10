@@ -59,14 +59,15 @@ pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: 
 pub fn tcpConnectAny(list: *const AddressList) !Stream {
     if (list.addrs.len == 0) return error.UnknownHostName;
 
+    var last_err: ?anyerror = null;
     for (list.addrs) |address| {
-        return tcpConnect(address) catch |err| switch (err) {
-            error.ConnectionRefused => continue,
-            else => return err,
+        return tcpConnect(address) catch |err| {
+            last_err = err;
+            continue;
         };
     }
 
-    return error.ConnectionRefused;
+    return last_err orelse error.ConnectionRefused;
 }
 
 /// Connect to a TCP host, trying resolved addresses in resolver order.
