@@ -43,6 +43,13 @@ fn runtimeEnviron() std.process.Environ {
 }
 
 pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    if (!@import("builtin").is_test) {
+        if (std.mem.eql(u8, name, "HOME")) {
+            if (std.Io.Threaded.global_single_threaded.environString("HOME")) |value| {
+                return allocator.dupe(u8, value);
+            }
+        }
+    }
     return std.process.Environ.getAlloc(runtimeEnviron(), allocator, name);
 }
 
