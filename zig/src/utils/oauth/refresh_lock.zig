@@ -461,6 +461,19 @@ pub const RefreshLock = struct {
         }
         return count;
     }
+
+    fn refCountForTesting(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var iter = self.entries.iterator();
+        while (iter.next()) |hashmap_entry| {
+            if (keyMatches(hashmap_entry.key_ptr.*, provider_id, user_id)) {
+                return hashmap_entry.value_ptr.*.ref_count;
+            }
+        }
+        return 0;
+    }
 };
 
 // ===========================================================================
@@ -620,8 +633,9 @@ test "concurrent requests for same provider trigger only one refresh" {
         t.* = try std.Thread.spawn(.{}, concurrentWorker, .{&ctx});
     }
 
-    // Hold the lock a moment so waiters actually block.
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    while (lock.refCountForTesting("test-provider", null) < num_waiters + 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
     lock.complete("test-provider", null, first_gen, null);
 
     for (&threads) |t| {
@@ -659,8 +673,9 @@ test "all waiting requests succeed after a single shared refresh completes" {
         t.* = try std.Thread.spawn(.{}, concurrentWorker, .{&ctx});
     }
 
-    // Complete with success.
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    while (lock.refCountForTesting("prov-ok", null) < num_waiters + 1) {
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
     lock.complete("prov-ok", null, first_gen, null);
 
     for (&threads) |t| {
