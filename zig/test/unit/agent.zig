@@ -6,6 +6,7 @@
 //! - Agent loop behavior with a mock ProtocolClient implementation
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const agent_types = @import("agent_types");
@@ -135,7 +136,7 @@ fn makeOwnedAssistantMessage(
         .model = "mock-model",
         .usage = .{},
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .is_owned = false,
     };
 }
@@ -170,7 +171,7 @@ fn mockProtocolStream(
             .usage = .{},
             .stop_reason = .@"error",
             .error_message = ai_types.OwnedSlice(u8).initBorrowed("mock provider error"),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .is_owned = false,
         };
 
@@ -211,7 +212,7 @@ test "agentLoop: basic single turn with text response" {
     const prompt_text = try allocator.dupe(u8, "Hello");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{
@@ -244,7 +245,7 @@ test "agentLoop: collects events in correct order" {
     const prompt_text = try allocator.dupe(u8, "Hi");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{
@@ -286,7 +287,7 @@ test "agentLoop: emits lifecycle events in strict sequence" {
     const prompt_text = try allocator.dupe(u8, "Hi");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{
@@ -339,7 +340,7 @@ test "agentLoop: handles provider error" {
     const prompt_text = try allocator.dupe(u8, "Fail please");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{
@@ -371,7 +372,7 @@ test "ProtocolOptions: passed through to protocol client" {
     const prompt_text = try allocator.dupe(u8, "options test");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{
@@ -408,7 +409,7 @@ test "agentLoop: cancellation token stops before protocol stream call" {
     const prompt_text = try allocator.dupe(u8, "cancel");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     var cancelled = std.atomic.Value(bool).init(true);
@@ -446,7 +447,7 @@ test "agentLoop: max_iterations caps repeated tool_use loop" {
     const prompt_text = try allocator.dupe(u8, "loop");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const config = AgentLoopConfig{

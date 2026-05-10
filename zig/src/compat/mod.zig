@@ -12,12 +12,18 @@
 //! decision remain guidance; this skeleton records the concrete names that
 //! follow-up PRs will migrate without exposing raw `std.Io`.
 
+const std = @import("std");
+
 pub const time = @import("time.zig");
 pub const random = @import("random.zig");
 pub const fs = @import("fs.zig");
 pub const stdio = @import("stdio.zig");
 pub const http = @import("http.zig");
 pub const net = @import("net.zig");
+
+pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    return std.process.Environ.getAlloc(std.testing.environ, allocator, name);
+}
 
 test {
     _ = time;

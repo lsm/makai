@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 pub const pkce = @import("pkce.zig");
 
@@ -19,12 +20,12 @@ pub const OAuthCredentials = struct {
     }
 
     pub fn isExpired(self: *const OAuthCredentials) bool {
-        const now = std.time.milliTimestamp();
+        const now = compat.time.nowMillis();
         return now >= self.expires;
     }
 
     pub fn expiresInSeconds(self: *const OAuthCredentials) i64 {
-        const now = std.time.milliTimestamp();
+        const now = compat.time.nowMillis();
         const remaining = self.expires - now;
         return @max(0, remaining / 1000);
     }

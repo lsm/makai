@@ -1,4 +1,12 @@
 const std = @import("std");
+const compat = @import("compat");
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 pub const Credentials = struct {
     refresh: []const u8,
@@ -45,11 +53,13 @@ pub const AuthStorage = struct {
 
     /// Load auth storage from ~/.makai/auth.json
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+        const home = std.process.Environ.getAlloc(std.testing.environ, allocator, "HOME") catch return error.NoHomeDir;
+        defer allocator.free(home);
         const path = try std.fs.path.join(allocator, &.{ home, ".makai", "auth.json" });
         defer allocator.free(path);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch {
+        const cwd = compat.fs.getCwd();
+        var file = compat.fs.openFile(cwd, path, .{}) catch {
             // File doesn't exist, return empty storage
             return .{
                 .providers = std.StringHashMap(ProviderAuth).init(allocator),
@@ -57,9 +67,9 @@ pub const AuthStorage = struct {
                 .save_fn = null,
             };
         };
-        defer file.close();
+        file.close(defaultIo());
 
-        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        const content = try compat.fs.readFileAlloc(allocator, cwd, path, 1024 * 1024);
         defer allocator.free(content);
 
         // Parse JSON
@@ -115,27 +125,25 @@ pub const AuthStorage = struct {
     /// Concurrent readers will either see the old file or the new file —
     /// never a partial write.
     pub fn saveToFile(self: *const AuthStorage) !void {
-        const home = std.posix.getenv("HOME") orelse return error.NoHomeDir;
+        const home = std.process.Environ.getAlloc(std.testing.environ, self.allocator, "HOME") catch return error.NoHomeDir;
+        defer self.allocator.free(home);
         const dir_path = try std.fs.path.join(self.allocator, &.{ home, ".makai" });
         defer self.allocator.free(dir_path);
 
         // Ensure directory exists
-        std.fs.cwd().makePath(dir_path) catch {};
+        const cwd = compat.fs.getCwd();
+        compat.fs.createDir(cwd, dir_path) catch {};
 
         const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", "auth.json" });
         defer self.allocator.free(file_path);
 
         // Write to temporary file with a unique suffix (timestamp + random)
         // to avoid collisions when two processes write concurrently.
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}.{x}", .{ file_path, std.time.milliTimestamp(), std.crypto.random.int(u64) });
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}.{x}", .{ file_path, compat.time.nowMillis(), compat.random.int(u64) });
         defer self.allocator.free(tmp_path);
 
-        // Create with restrictive permissions BEFORE writing any data.
-        const file = try std.fs.cwd().createFile(tmp_path, .{ .mode = 0o600 });
-        defer file.close();
-
         // Build JSON
-        var json_buf = std.ArrayList(u8){};
+        var json_buf = std.ArrayList(u8).empty;
         defer json_buf.deinit(self.allocator);
 
         const appendJsonString = struct {
@@ -188,14 +196,10 @@ pub const AuthStorage = struct {
 
         try json_buf.appendSlice(self.allocator, "\n}\n");
 
-        // Write full content then fsync before rename for durability.
-        // If sync fails, do not commit the temp file over the last known-good
-        // auth file: callers must see the persistence failure.
-        try file.writeAll(json_buf.items);
-        try file.sync();
-
-        // Atomic rename — readers see old or new file, never partial.
-        try std.fs.cwd().rename(tmp_path, file_path);
+        // Atomic replace writes with restrictive permissions at the filesystem
+        // compatibility seam. Crash-safety hardening remains in the dedicated
+        // filesystem wrapper PR.
+        try compat.fs.atomicReplace(cwd, file_path, tmp_path, json_buf.items);
     }
 
     pub fn hasRefreshableCredentials(self: *const AuthStorage, provider_id: []const u8) bool {
@@ -210,7 +214,7 @@ pub const AuthStorage = struct {
         const auth = self.providers.get(provider_id) orelse return false;
         return switch (auth) {
             .api_key => false,
-            .oauth => |credentials| std.time.milliTimestamp() >= credentials.expires,
+            .oauth => |credentials| compat.time.nowMillis() >= credentials.expires,
         };
     }
 
@@ -263,7 +267,7 @@ pub const AuthStorage = struct {
             .api_key => |key| return try self.allocator.dupe(u8, key),
             .oauth => |credentials| {
                 const provider = oauth_provider orelse return error.UnknownProvider;
-                if (std.time.milliTimestamp() >= credentials.expires) {
+                if (compat.time.nowMillis() >= credentials.expires) {
                     try self.refreshCredentials(provider_id, provider);
                     const refreshed_auth = self.providers.get(provider_id) orelse return error.AuthRequired;
                     return switch (refreshed_auth) {
@@ -324,7 +328,7 @@ test "ProviderAuth - deinit oauth" {
         .oauth = .{
             .refresh = refresh,
             .access = access,
-            .expires = std.time.milliTimestamp() + 3600000,
+            .expires = compat.time.nowMillis() + 3600000,
         },
     };
     auth.deinit(std.testing.allocator);
@@ -360,7 +364,7 @@ test "saveToFile writes atomically via temp file + rename" {
     });
 
     // Build the JSON directly and write via temp+rename
-    var json_buf = std.ArrayList(u8){};
+    var json_buf = std.ArrayList(u8).empty;
     defer json_buf.deinit(std.testing.allocator);
 
     try json_buf.appendSlice(std.testing.allocator, "{\"test-provider\":{\"api_key\":\"sk-test-key-12345\"}}");
@@ -395,7 +399,7 @@ fn putOwnedAuth(storage: *AuthStorage, provider_id: []const u8, auth: ProviderAu
 }
 
 fn setHomeForTest(allocator: std.mem.Allocator, home: []const u8) !?[]u8 {
-    const previous = if (std.posix.getenv("HOME")) |value| try allocator.dupe(u8, value) else null;
+    const previous = std.process.Environ.getAlloc(std.testing.environ, allocator, "HOME") catch null;
     try std.posix.setenv("HOME", home, true);
     return previous;
 }

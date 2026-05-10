@@ -8,7 +8,7 @@ Makai is a Zig implementation of a unified multi-provider AI streaming abstracti
 
 ## Build Commands
 
-All build commands run from the `zig/` directory. Requires Zig 0.15.2.
+All build commands run from the `zig/` directory. Requires Zig 0.16.0.
 
 ```bash
 cd zig
@@ -46,8 +46,7 @@ There is no single-test command. Tests are inline in each `.zig` file using Zig'
 
 ## Dependencies
 
-Managed via `zig/build.zig.zon` with automatic fetching and hash verification:
-- **libxev**: Cross-platform event loop (epoll/kqueue/IOCP) for async I/O
+No external Zig package dependencies are currently declared in `zig/build.zig.zon`.
 
 ## Architecture
 

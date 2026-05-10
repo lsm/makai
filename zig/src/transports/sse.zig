@@ -2,12 +2,23 @@ const std = @import("std");
 const transport = @import("transport");
 const sse_parser = @import("sse_parser");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+fn fileFromPipeHandle(handle: std.Io.File.Handle) std.Io.File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+}
+
 /// SSE Sender — writes events in Server-Sent Events wire format.
 /// Each write becomes: "data: <json>\n\n"
 pub const SseSender = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
-    pub fn init(file: std.fs.File) SseSender {
+    pub fn init(file: std.Io.File) SseSender {
         return .{ .file = file };
     }
 
@@ -20,9 +31,9 @@ pub const SseSender = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *SseSender = @ptrCast(@alignCast(ctx));
-        try self.file.writeAll("data: ");
-        try self.file.writeAll(data);
-        try self.file.writeAll("\n\n");
+        try self.file.writeStreamingAll(defaultIo(), "data: ");
+        try self.file.writeStreamingAll(defaultIo(), data);
+        try self.file.writeStreamingAll(defaultIo(), "\n\n");
     }
 };
 
@@ -30,18 +41,18 @@ pub const SseSender = struct {
 /// and yields one data payload per read() call.
 pub const SseReceiver = struct {
     parser: sse_parser.SSEParser,
-    file: std.fs.File,
+    file: std.Io.File,
     read_buf: [4096]u8 = undefined,
     /// Pending events from last parser.feed() — stored as duped data strings
     pending: std.ArrayList([]u8),
     pending_index: usize = 0,
     allocator: std.mem.Allocator,
 
-    pub fn init(file: std.fs.File, allocator: std.mem.Allocator) SseReceiver {
+    pub fn init(file: std.Io.File, allocator: std.mem.Allocator) SseReceiver {
         return .{
             .parser = sse_parser.SSEParser.init(allocator),
             .file = file,
-            .pending = std.ArrayList([]u8){},
+            .pending = std.ArrayList([]u8).empty,
             .allocator = allocator,
         };
     }
@@ -86,7 +97,7 @@ pub const SseReceiver = struct {
             self.pending_index = 0;
 
             // Read more bytes from the source
-            const bytes_read = self.file.read(&self.read_buf) catch return null;
+            const bytes_read = self.file.readStreaming(defaultIo(), &.{&self.read_buf}) catch return null;
             if (bytes_read == 0) return null; // EOF
 
             // Feed to parser — parser returns slice of SSEEvent
@@ -110,9 +121,9 @@ pub const SseReceiver = struct {
 
 /// Async SSE Sender — writes events in Server-Sent Events wire format.
 pub const AsyncSseSender = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
-    pub fn init(file: std.fs.File) AsyncSseSender {
+    pub fn init(file: std.Io.File) AsyncSseSender {
         return .{ .file = file };
     }
 
@@ -125,16 +136,16 @@ pub const AsyncSseSender = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *AsyncSseSender = @ptrCast(@alignCast(ctx));
-        try self.file.writeAll("data: ");
-        try self.file.writeAll(data);
-        try self.file.writeAll("\n\n");
+        try self.file.writeStreamingAll(defaultIo(), "data: ");
+        try self.file.writeStreamingAll(defaultIo(), data);
+        try self.file.writeStreamingAll(defaultIo(), "\n\n");
     }
 };
 
 /// Async SSE Receiver — produces ByteStream with parsed SSE data payloads.
 /// Caller must call deinit() to join the thread and free resources.
 pub const AsyncSseReceiver = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     thread: ?std.Thread = null,
     stream: ?*transport.ByteStream = null,
     cancel_token: ?*std.atomic.Value(bool) = null,
@@ -142,7 +153,7 @@ pub const AsyncSseReceiver = struct {
 
     const Self = @This();
 
-    pub fn init(file: std.fs.File) Self {
+    pub fn init(file: std.Io.File) Self {
         return .{ .file = file };
     }
 
@@ -199,7 +210,7 @@ pub const AsyncSseReceiver = struct {
 
     const ProducerContext = struct {
         stream: *transport.ByteStream,
-        file: std.fs.File,
+        file: std.Io.File,
         allocator: std.mem.Allocator,
         parser: sse_parser.SSEParser,
         read_buf: [4096]u8 = undefined,
@@ -262,7 +273,7 @@ pub const AsyncSseReceiver = struct {
             }
 
             // Read more bytes from the source
-            const bytes_read = ctx.file.read(&ctx.read_buf) catch {
+            const bytes_read = ctx.file.readStreaming(defaultIo(), &.{&ctx.read_buf}) catch {
                 ctx.stream.completeWithError("Read error");
                 return;
             };
@@ -303,7 +314,7 @@ pub const AsyncSseReceiver = struct {
         var parser = sse_parser.SSEParser.init(allocator);
         defer parser.deinit();
         var read_buf: [4096]u8 = undefined;
-        var pending = std.ArrayList([]u8).init(allocator);
+        var pending = std.ArrayList([]u8).empty;
         defer {
             for (pending.items) |item| {
                 allocator.free(item);
@@ -325,7 +336,7 @@ pub const AsyncSseReceiver = struct {
             pending_index = 0;
 
             // Read more bytes from the source
-            const bytes_read = self.file.read(&read_buf) catch return null;
+            const bytes_read = self.file.readStreaming(defaultIo(), &.{&read_buf}) catch return null;
             if (bytes_read == 0) return null; // EOF
 
             // Feed to parser
@@ -344,21 +355,21 @@ pub const AsyncSseReceiver = struct {
 
 test "SseSender writes SSE format" {
     // Create a pipe
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     var sse_sender = SseSender.init(write_file);
     var s = sse_sender.sender();
 
     try s.write("{\"type\":\"ping\"}");
     try s.write("{\"type\":\"start\",\"model\":\"test\"}");
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Read raw bytes and verify SSE format
     var buf: [1024]u8 = undefined;
-    const n = try read_file.readAll(&buf);
+    const n = try read_file.readStreaming(defaultIo(), &.{&buf});
     const output = buf[0..n];
 
     const expected = "data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"start\",\"model\":\"test\"}\n\n";
@@ -369,14 +380,14 @@ test "SseReceiver parses SSE format" {
     const allocator = std.testing.allocator;
 
     // Create a pipe
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Write SSE-formatted data
-    try write_file.writeAll("data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"start\",\"model\":\"test\"}\n\n");
-    write_file.close();
+    try write_file.writeStreamingAll(defaultIo(), "data: {\"type\":\"ping\"}\n\ndata: {\"type\":\"start\",\"model\":\"test\"}\n\n");
+    write_file.close(defaultIo());
 
     var sse_recv = SseReceiver.init(read_file, allocator);
     defer sse_recv.deinit();
@@ -400,10 +411,10 @@ test "SseSender and SseReceiver round-trip with transport" {
     const allocator = std.testing.allocator;
 
     // Create a pipe
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Serialize a real event through SseSender
     var sse_sender = SseSender.init(write_file);
@@ -439,7 +450,7 @@ test "SseSender and SseReceiver round-trip with transport" {
     defer allocator.free(result_json);
     try s.write(result_json);
 
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Read back through SseReceiver + deserialize
     var sse_recv = SseReceiver.init(read_file, allocator);

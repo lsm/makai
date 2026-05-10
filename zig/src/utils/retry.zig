@@ -198,7 +198,7 @@ pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
         // Find the colon and value
         const after_key = error_text[start_idx..];
         if (std.mem.indexOf(u8, after_key, ":")) |colon_idx| {
-            const after_colon = std.mem.trimLeft(u8, after_key[colon_idx + 1 ..], " \t");
+            const after_colon = std.mem.trimStart(u8, after_key[colon_idx + 1 ..], " \t");
             if (parseRetryInFormat(after_colon)) |ms| {
                 return normalizeDelay(ms);
             }

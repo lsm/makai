@@ -1,14 +1,25 @@
 const std = @import("std");
 const transport = @import("transport");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+fn fileFromPipeHandle(handle: std.Io.File.Handle) std.Io.File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+}
+
 pub const StdioSender = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
     pub fn init() StdioSender {
-        return .{ .file = std.io.getStdOut() };
+        return .{ .file = std.Io.File.stdout() };
     }
 
-    pub fn initWithFile(file: std.fs.File) StdioSender {
+    pub fn initWithFile(file: std.Io.File) StdioSender {
         return .{ .file = file };
     }
 
@@ -21,23 +32,23 @@ pub const StdioSender = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *StdioSender = @ptrCast(@alignCast(ctx));
-        try self.file.writeAll(data);
-        try self.file.writeAll("\n");
+        try self.file.writeStreamingAll(defaultIo(), data);
+        try self.file.writeStreamingAll(defaultIo(), "\n");
     }
 };
 
 pub const StdioReceiver = struct {
-    file: std.fs.File,
+    file: std.Io.File,
     read_buf: [4096]u8 = undefined,
     /// Unprocessed data carried over from previous read
-    leftover: std.ArrayList(u8) = std.ArrayList(u8){},
+    leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) StdioReceiver {
-        return .{ .file = std.io.getStdIn(), .allocator = allocator };
+        return .{ .file = std.Io.File.stdin(), .allocator = allocator };
     }
 
-    pub fn initWithFile(file: std.fs.File, allocator: std.mem.Allocator) StdioReceiver {
+    pub fn initWithFile(file: std.Io.File, allocator: std.mem.Allocator) StdioReceiver {
         return .{ .file = file, .allocator = allocator };
     }
 
@@ -67,7 +78,7 @@ pub const StdioReceiver = struct {
             }
 
             // Read more data
-            const bytes_read = self.file.read(&self.read_buf) catch return null;
+            const bytes_read = self.file.readStreaming(defaultIo(), &.{&self.read_buf}) catch return null;
             if (bytes_read == 0) {
                 // EOF - return remaining data as last line if any
                 if (self.leftover.items.len > 0) {
@@ -139,13 +150,13 @@ pub const AsyncStreamHandle = struct {
 };
 
 pub const AsyncStdioSender = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
     pub fn init() AsyncStdioSender {
-        return .{ .file = std.io.getStdOut() };
+        return .{ .file = std.Io.File.stdout() };
     }
 
-    pub fn initWithFile(file: std.fs.File) AsyncStdioSender {
+    pub fn initWithFile(file: std.Io.File) AsyncStdioSender {
         return .{ .file = file };
     }
 
@@ -158,21 +169,21 @@ pub const AsyncStdioSender = struct {
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
         const self: *AsyncStdioSender = @ptrCast(@alignCast(ctx));
-        try self.file.writeAll(data);
-        try self.file.writeAll("\n");
+        try self.file.writeStreamingAll(defaultIo(), data);
+        try self.file.writeStreamingAll(defaultIo(), "\n");
     }
 };
 
 pub const AsyncStdioReceiver = struct {
-    file: std.fs.File,
+    file: std.Io.File,
 
     const Self = @This();
 
     pub fn init() Self {
-        return .{ .file = std.io.getStdIn() };
+        return .{ .file = std.Io.File.stdin() };
     }
 
-    pub fn initWithFile(file: std.fs.File) Self {
+    pub fn initWithFile(file: std.Io.File) Self {
         return .{ .file = file };
     }
 
@@ -186,7 +197,7 @@ pub const AsyncStdioReceiver = struct {
 
     const ProducerContext = struct {
         stream: *transport.ByteStream,
-        file: std.fs.File,
+        file: std.Io.File,
         allocator: std.mem.Allocator,
         leftover: std.ArrayList(u8),
         read_buf: [4096]u8 = undefined,
@@ -210,7 +221,7 @@ pub const AsyncStdioReceiver = struct {
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
-            .leftover = std.ArrayList(u8){},
+            .leftover = std.ArrayList(u8).empty,
             .cancel_token = cancel_token,
             .owns_cancel_token = true, // Thread owns it in legacy mode
         };
@@ -240,7 +251,7 @@ pub const AsyncStdioReceiver = struct {
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
-            .leftover = std.ArrayList(u8){},
+            .leftover = std.ArrayList(u8).empty,
             .cancel_token = cancel_token,
             .owns_cancel_token = false, // Handle owns it
         };
@@ -296,7 +307,7 @@ pub const AsyncStdioReceiver = struct {
             }
 
             // Read more data
-            const bytes_read = ctx.file.read(&ctx.read_buf) catch {
+            const bytes_read = ctx.file.readStreaming(defaultIo(), &.{&ctx.read_buf}) catch {
                 ctx.stream.completeWithError("Read error");
                 return;
             };
@@ -330,7 +341,7 @@ pub const AsyncStdioReceiver = struct {
     // Keep backward-compatible blocking read
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        var leftover = std.ArrayList(u8){};
+        var leftover = std.ArrayList(u8).empty;
         defer leftover.deinit(allocator);
         var read_buf: [4096]u8 = undefined;
 
@@ -342,7 +353,7 @@ pub const AsyncStdioReceiver = struct {
             }
 
             // Read more data
-            const bytes_read = self.file.read(&read_buf) catch return null;
+            const bytes_read = self.file.readStreaming(defaultIo(), &.{&read_buf}) catch return null;
             if (bytes_read == 0) {
                 // EOF - return remaining data if any
                 if (leftover.items.len > 0) {
@@ -362,10 +373,10 @@ test "StdioSender and StdioReceiver round-trip via pipe" {
     const allocator = std.testing.allocator;
 
     // Create a pipe for testing
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Set up sender and receiver
     var stdio_sender = StdioSender.initWithFile(write_file);
@@ -380,7 +391,7 @@ test "StdioSender and StdioReceiver round-trip via pipe" {
     try s.write("{\"type\":\"start\",\"model\":\"test\"}");
 
     // Close write end so receiver gets EOF after reading
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Read it back
     const line1 = try r.read(allocator);
@@ -402,10 +413,10 @@ test "AsyncStdioReceiver with handle lifecycle management" {
     const allocator = std.testing.allocator;
 
     // Create a pipe for testing
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Set up async receiver with handle
     var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
@@ -413,11 +424,11 @@ test "AsyncStdioReceiver with handle lifecycle management" {
 
     // Write test data from another thread (simulate producer)
     const WriterContext = struct {
-        file: std.fs.File,
+        file: std.Io.File,
         fn writeData(ctx: *@This()) void {
-            std.Thread.sleep(std.time.ns_per_ms * 10); // Small delay
-            _ = ctx.file.write("line1\nline2\n") catch {};
-            ctx.file.close();
+            defaultIo().sleep(.fromNanoseconds(std.time.ns_per_ms * 10), .boot) catch {}; // Small delay
+            ctx.file.writeStreamingAll(defaultIo(), "line1\nline2\n") catch {};
+            ctx.file.close(defaultIo());
         }
     };
     var writer_ctx = WriterContext{ .file = write_file };
@@ -457,9 +468,9 @@ test "AsyncStreamHandle cancellation" {
     const allocator = std.testing.allocator;
 
     // Create a pipe - we won't write to it, so the reader will block
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
 
     var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
     var handle = try async_receiver.receiveStreamWithHandle(allocator);
@@ -472,7 +483,7 @@ test "AsyncStreamHandle cancellation" {
     try std.testing.expect(handle.isCancelled());
 
     // Close the write end to unblock the read (in case cancellation isn't instant)
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Clean up - should exit quickly due to cancellation
     const exited = handle.deinit(5000);
@@ -484,10 +495,10 @@ test "AsyncStdioReceiver legacy interface still works" {
     const allocator = std.testing.allocator;
 
     // Create a pipe for testing
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Set up async receiver using the legacy interface
     var async_receiver = AsyncStdioReceiver.initWithFile(read_file);
@@ -497,8 +508,8 @@ test "AsyncStdioReceiver legacy interface still works" {
     const stream = try receiver.receiveStream(allocator);
 
     // Write test data and close
-    _ = try write_file.write("test_data\n");
-    write_file.close();
+    try write_file.writeStreamingAll(defaultIo(), "test_data\n");
+    write_file.close(defaultIo());
 
     // Read from stream
     if (stream.wait()) |chunk| {

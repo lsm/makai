@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 /// Local HTTP callback server for OAuth
 pub const CallbackServer = struct {
@@ -25,9 +26,9 @@ pub const CallbackServer = struct {
 
     /// Wait for OAuth callback with timeout
     pub fn waitForCode(self: *CallbackServer, timeout_ms: u64) !?[]const u8 {
-        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        const deadline = compat.time.nowMillis() + @as(i64, @intCast(timeout_ms));
 
-        while (std.time.milliTimestamp() < deadline) {
+        while (compat.time.nowMillis() < deadline) {
             // Accept connection with timeout
             var connection = self.listener.accept() catch |err| {
                 if (err == error.WouldBlock) {

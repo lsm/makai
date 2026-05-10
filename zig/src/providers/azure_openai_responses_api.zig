@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
@@ -6,7 +7,7 @@ const sse_parser = @import("sse_parser");
 const json_writer = @import("json_writer");
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -43,7 +44,7 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
 }
 
 fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator) ![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     var w = json_writer.JsonWriter.init(&buf, allocator);
@@ -147,7 +148,7 @@ fn buildBody(model: ai_types.Model, context: ai_types.Context, options: ai_types
             },
             .tool_result => |tr| {
                 // Output as function_call_output
-                var result_text = std.ArrayList(u8){};
+                var result_text = std.ArrayList(u8).empty;
                 defer result_text.deinit(allocator);
                 for (tr.content) |c| {
                     switch (c) {
@@ -242,7 +243,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = ctx.allocator };
+    var client = std.http.Client{ .allocator = ctx.allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     const url = std.fmt.allocPrint(ctx.allocator, "{s}/openai/v1/responses", .{ctx.base_url}) catch {
@@ -258,7 +259,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(ctx.allocator);
     headers.append(ctx.allocator, .{ .name = "api-key", .value = ctx.api_key }) catch {
         ctx.stream.markThreadDone();
@@ -303,7 +304,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(ctx.allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
@@ -315,7 +316,7 @@ fn runThread(ctx: *ThreadCtx) void {
     while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
-            const now = std.time.milliTimestamp();
+            const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
                 ctx.stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
@@ -374,7 +375,7 @@ fn runThread(ctx: *ThreadCtx) void {
         },
         .usage = usage,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .is_owned = true, // Strings were duped above
     };
 
@@ -444,7 +445,7 @@ pub fn registerAzureOpenAIResponsesApiProvider(registry: *api_registry.ApiRegist
 }
 
 test "parseEvent appends output_text delta" {
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(std.testing.allocator);
 
     var usage = ai_types.Usage{};
@@ -460,7 +461,7 @@ test "parseEvent appends output_text delta" {
 }
 
 test "parseEvent extracts incomplete stop reason and usage from response.completed" {
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(std.testing.allocator);
 
     var usage = ai_types.Usage{};
@@ -478,7 +479,7 @@ test "parseEvent extracts incomplete stop reason and usage from response.complet
 }
 
 test "parseEvent ignores done sentinel" {
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(std.testing.allocator);
 
     var usage = ai_types.Usage{ .input = 1, .output = 2, .total_tokens = 3 };
@@ -520,10 +521,10 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
         allocator.destroy(stream);
     }
 
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = compat.time.nowMillis() + 5_000;
     while (!stream.isDone()) {
-        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-        std.Thread.sleep(std.time.ns_per_ms);
+        if (compat.time.nowMillis() >= deadline) return error.TestUnexpectedResult;
+        compat.time.sleepNs(std.time.ns_per_ms);
     }
 
     try std.testing.expect(stream.waitForThread(5_000));

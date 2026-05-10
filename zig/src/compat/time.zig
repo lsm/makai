@@ -2,11 +2,18 @@ const std = @import("std");
 
 /// Wall-clock milliseconds since the Unix epoch.
 ///
-/// 0.15.2: wraps `std.time.milliTimestamp()`.
+/// 0.15.2: wraps `compat.time.nowMillis()`.
 /// 0.16: use `std.Io.Timestamp.now` through the Makai default context while
 /// keeping raw `std.Io` out of this public signature.
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 pub fn nowMillis() i64 {
-    return std.time.milliTimestamp();
+    return std.Io.Timestamp.now(defaultIo(), .real).toMilliseconds();
 }
 
 /// Wall-clock seconds since the Unix epoch.
@@ -15,7 +22,7 @@ pub fn nowMillis() i64 {
 /// 0.16: use `std.Io.Timestamp.now` through the Makai default context while
 /// preserving wall-clock semantics.
 pub fn nowSeconds() i64 {
-    return std.time.timestamp();
+    return std.Io.Timestamp.now(defaultIo(), .real).toSeconds();
 }
 
 /// Wall-clock nanoseconds since the Unix epoch.
@@ -24,11 +31,11 @@ pub fn nowSeconds() i64 {
 /// 0.16: use `std.Io.Timestamp.now` through the Makai default context and keep
 /// this separate from monotonic-duration measurements.
 pub fn nowNanos() i64 {
-    return @intCast(std.time.nanoTimestamp());
+    return @intCast(std.Io.Timestamp.now(defaultIo(), .real).toNanoseconds());
 }
 
-var monotonic_timer: ?std.time.Timer = null;
-var monotonic_mutex: std.Thread.Mutex = .{};
+var monotonic_origin: ?std.Io.Timestamp = null;
+var monotonic_mutex: std.Io.Mutex = .init;
 
 /// Monotonic nanoseconds suitable for durations and deadlines.
 ///
@@ -37,14 +44,15 @@ var monotonic_mutex: std.Thread.Mutex = .{};
 /// 0.16: use `std.Io.Clock`/the chosen default-context monotonic clock
 /// internally while keeping raw `std.Io` out of this API.
 pub fn monotonicNanos() !u64 {
-    monotonic_mutex.lock();
-    defer monotonic_mutex.unlock();
+    monotonic_mutex.lockUncancelable(defaultIo());
+    defer monotonic_mutex.unlock(defaultIo());
 
-    if (monotonic_timer == null) {
-        monotonic_timer = try std.time.Timer.start();
+    const now = std.Io.Timestamp.now(defaultIo(), .boot);
+    if (monotonic_origin == null) {
+        monotonic_origin = now;
     }
 
-    return monotonic_timer.?.read();
+    return @intCast(monotonic_origin.?.durationTo(now).nanoseconds);
 }
 
 /// Sleep for a number of nanoseconds.
@@ -53,7 +61,8 @@ pub fn monotonicNanos() !u64 {
 /// 0.16: route through the Makai default I/O context timeout/sleep primitive
 /// while keeping this public helper stable.
 pub fn sleepNs(ns: u64) void {
-    std.Thread.sleep(ns);
+    const capped_ns = @min(ns, @as(u64, std.math.maxInt(i64)));
+    defaultIo().sleep(.fromNanoseconds(@intCast(capped_ns)), .boot) catch {};
 }
 
 /// Sleep for a number of milliseconds.

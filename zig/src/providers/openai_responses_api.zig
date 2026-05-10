@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
@@ -77,7 +78,7 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
 }
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    return compat.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
 
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -114,7 +115,7 @@ fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
 }
 
 fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator) ![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
@@ -321,7 +322,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             },
             .tool_result => |tr| {
                 // Output as function_call_output
-                var result_text = std.ArrayList(u8){};
+                var result_text = std.ArrayList(u8).empty;
                 defer result_text.deinit(allocator);
                 for (tr.content) |c| {
                     switch (c) {
@@ -643,7 +644,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/responses") catch {
@@ -676,7 +677,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
         allocator.free(auth);
@@ -907,9 +908,9 @@ fn runThread(ctx: *ThreadCtx) void {
     var read_buf: [8192]u8 = undefined;
     const reader = response.reader(&transfer_buf);
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
@@ -960,7 +961,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .model = model.id,
                 .usage = .{},
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
             },
         },
     }) catch {};
@@ -968,7 +969,7 @@ fn runThread(ctx: *ThreadCtx) void {
     while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
-            const now = std.time.milliTimestamp();
+            const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
                 stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
@@ -1033,7 +1034,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1054,7 +1055,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1156,7 +1157,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1179,7 +1180,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1206,7 +1207,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1227,7 +1228,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1247,7 +1248,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1271,7 +1272,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                             .model = model.id,
                                             .usage = usage,
                                             .stop_reason = stop_reason,
-                                            .timestamp = std.time.milliTimestamp(),
+                                            .timestamp = compat.time.nowMillis(),
                                         },
                                     },
                                 }) catch {};
@@ -1336,7 +1337,7 @@ fn runThread(ctx: *ThreadCtx) void {
             .model = model.id,
             .usage = usage,
             .stop_reason = stop_reason,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
         };
         allocator.free(auth);
         allocator.free(url);
@@ -1414,7 +1415,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 
     // Free ctx allocations before completing

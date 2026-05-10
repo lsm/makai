@@ -1,5 +1,12 @@
 const std = @import("std");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 pub const Method = std.http.Method;
 pub const Headers = std.http.Client.Request.Headers;
 pub const Request = std.http.Client.Request;
@@ -19,7 +26,7 @@ pub const HttpClient = struct {
     client: std.http.Client,
 
     pub fn init(allocator: std.mem.Allocator) HttpClient {
-        return .{ .client = .{ .allocator = allocator } };
+        return .{ .client = .{ .allocator = allocator, .io = defaultIo() } };
     }
 
     pub fn deinit(self: *HttpClient) void {

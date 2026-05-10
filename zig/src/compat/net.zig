@@ -1,9 +1,26 @@
 const std = @import("std");
 
-pub const Address = std.net.Address;
-pub const AddressList = std.net.AddressList;
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+pub const Address = std.Io.net.IpAddress;
 pub const ListenOptions = Address.ListenOptions;
-pub const Server = std.net.Server;
+pub const Server = std.Io.net.Server;
+
+pub const AddressList = struct {
+    addrs: []Address,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *AddressList) void {
+        const allocator = self.allocator;
+        allocator.free(self.addrs);
+        allocator.destroy(self);
+    }
+};
 
 /// TCP stream wrapper used as the stable Makai networking boundary.
 ///
@@ -12,28 +29,41 @@ pub const Server = std.net.Server;
 /// (`std.Io.net.tcpConnect` internally) without exposing raw `std.Io` in this
 /// public wrapper API.
 pub const Stream = struct {
-    inner: std.net.Stream,
+    inner: std.Io.net.Stream,
 
-    pub fn init(inner: std.net.Stream) Stream {
+    pub fn init(inner: std.Io.net.Stream) Stream {
         return .{ .inner = inner };
     }
 
     pub fn read(self: *Stream, buffer: []u8) !usize {
-        return self.inner.read(buffer);
+        var reader = self.inner.reader(defaultIo(), &.{});
+        return reader.interface.readSliceShort(buffer);
     }
 
     pub fn write(self: *Stream, data: []const u8) !usize {
-        return self.inner.write(data);
+        return defaultIo().vtable.netWrite(defaultIo().userdata, self.inner.socket.handle, &.{}, &.{data}, 1);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
-        try self.inner.writeAll(data);
+        var written: usize = 0;
+        while (written < data.len) {
+            written += try self.write(data[written..]);
+        }
     }
 
     pub fn close(self: *Stream) void {
-        self.inner.close();
+        self.inner.close(defaultIo());
     }
 };
+
+fn readAll(stream: *Stream, buffer: []u8) !void {
+    var total_read: usize = 0;
+    while (total_read < buffer.len) {
+        const bytes_read = try stream.read(buffer[total_read..]);
+        if (bytes_read == 0) return error.EndOfStream;
+        total_read += bytes_read;
+    }
+}
 
 /// Accepted TCP connection returned by `accept`.
 pub const Connection = struct {
@@ -46,7 +76,7 @@ pub const Connection = struct {
 /// Zig 0.15.2: reads `std.net.Server.listen_address`.
 /// 0.16: route through Makai's selected networking backend internally.
 pub fn listenAddress(server: *const Server) Address {
-    return server.listen_address;
+    return server.socket.address;
 }
 
 /// Accept a TCP connection and wrap its stream at the Makai compatibility seam.
@@ -54,10 +84,10 @@ pub fn listenAddress(server: *const Server) Address {
 /// Zig 0.15.2: wraps `std.net.Server.accept`.
 /// 0.16: preserve this helper shape over Makai's selected networking backend.
 pub fn accept(server: *Server) !Connection {
-    const connection = try server.accept();
+    const stream = try server.accept(defaultIo());
     return .{
-        .stream = Stream.init(connection.stream),
-        .address = connection.address,
+        .stream = Stream.init(stream),
+        .address = stream.socket.address,
     };
 }
 
@@ -70,7 +100,7 @@ pub fn accept(server: *Server) !Connection {
 ///
 /// `allocator` owns temporary DNS resolver allocations during this call.
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
-    var list = try std.net.getAddressList(allocator, host, port);
+    var list = try resolveAddressList(allocator, host, port);
     defer list.deinit();
 
     if (list.addrs.len == 0) return error.UnknownHostName;
@@ -81,7 +111,20 @@ pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16)
 ///
 /// Callers own the returned list and must call `deinit`.
 pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: u16) !*AddressList {
-    return std.net.getAddressList(allocator, host, port);
+    const list = try allocator.create(AddressList);
+    errdefer allocator.destroy(list);
+
+    const address = Address.resolve(defaultIo(), host, port) catch blk: {
+        if (std.ascii.eqlIgnoreCase(host, "localhost")) {
+            break :blk Address{ .ip4 = .loopback(port) };
+        }
+        return error.UnknownHostName;
+    };
+    list.* = .{
+        .addrs = try allocator.dupe(Address, &.{address}),
+        .allocator = allocator,
+    };
+    return list;
 }
 
 /// Connect to the first reachable TCP peer from a resolved address list.
@@ -112,7 +155,7 @@ pub fn tcpConnectHost(allocator: std.mem.Allocator, host: []const u8, port: u16)
 /// Zig 0.15.2: wraps `std.net.tcpConnectToAddress`.
 /// 0.16: use std.Io.net.tcpConnect internally.
 pub fn tcpConnect(address: Address) !Stream {
-    return Stream.init(try std.net.tcpConnectToAddress(address));
+    return Stream.init(try address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }));
 }
 
 /// Listen for TCP connections on `address`.
@@ -120,7 +163,7 @@ pub fn tcpConnect(address: Address) !Stream {
 /// Zig 0.15.2: wraps `std.net.Address.listen`.
 /// 0.16: use std.Io.net.tcpListen internally.
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
-    return address.listen(options);
+    return address.listen(defaultIo(), options);
 }
 
 const LoopbackServerContext = struct {
@@ -136,18 +179,10 @@ fn loopbackServerThread(context: *LoopbackServerContext) void {
     defer connection.stream.close();
 
     var buffer: [4]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < buffer.len) {
-        const bytes_read = connection.stream.read(buffer[total_read..]) catch |err| {
-            context.result = err;
-            return;
-        };
-        if (bytes_read == 0) {
-            context.result = error.EndOfStream;
-            return;
-        }
-        total_read += bytes_read;
-    }
+    readAll(&connection.stream, &buffer) catch |err| {
+        context.result = err;
+        return;
+    };
 
     if (!std.mem.eql(u8, &buffer, "ping")) {
         context.result = error.UnexpectedRequest;
@@ -173,7 +208,7 @@ test "compat networking resolves localhost hostname" {
 test "compat networking can listen on loopback" {
     const address = try resolveAddress(std.testing.allocator, "127.0.0.1", 0);
     var server = try tcpListen(address, .{ .reuse_address = true });
-    defer server.deinit();
+    defer server.deinit(defaultIo());
 
     try std.testing.expect(listenAddress(&server).getPort() != 0);
 }
@@ -181,7 +216,7 @@ test "compat networking can listen on loopback" {
 test "compat networking loopback connect read write round trip" {
     const address = try resolveAddress(std.testing.allocator, "127.0.0.1", 0);
     var server = try tcpListen(address, .{ .reuse_address = true });
-    defer server.deinit();
+    defer server.deinit(defaultIo());
 
     var client = try tcpConnect(listenAddress(&server));
     defer client.close();

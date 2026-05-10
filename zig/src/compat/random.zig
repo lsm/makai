@@ -1,5 +1,12 @@
 const std = @import("std");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Deterministic byte source for tests that need stable random-dependent output.
 pub const DeterministicSource = struct {
     prng: std.Random.DefaultPrng,
@@ -26,7 +33,9 @@ pub const DeterministicSource = struct {
 /// raw `std.Io` out of this public signature. OAuth PKCE/state, credential
 /// material, and protocol-sensitive nonces should prefer this helper.
 pub fn fillSecureBytes(buf: []u8) void {
-    std.crypto.random.bytes(buf);
+    defaultIo().randomSecure(buf) catch |err| {
+        std.debug.panic("secure random unavailable: {}", .{err});
+    };
 }
 
 /// Fill `buf` with ordinary random bytes.
@@ -38,7 +47,7 @@ pub fn fillSecureBytes(buf: []u8) void {
 /// separate from `fillSecureBytes`. Do not use this for credentials, PKCE,
 /// OAuth state, or other security-sensitive values.
 pub fn fillRandomBytes(buf: []u8) void {
-    std.crypto.random.bytes(buf);
+    defaultIo().random(buf);
 }
 
 /// Allocate and fill security-sensitive random bytes.
@@ -65,7 +74,8 @@ pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
 /// rejection sampling. 0.16: use `io.randomSecure` through the Makai default
 /// context and preserve rejection-sampling semantics.
 pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
-    return std.crypto.random.intRangeLessThan(T, 0, upper_bound);
+    var source: std.Random.IoSource = .{ .io = defaultIo() };
+    return source.interface().intRangeLessThan(T, 0, upper_bound);
 }
 
 /// Return an ordinary random integer in `[0, upper_bound)` without modulo bias.
@@ -75,7 +85,14 @@ pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
 /// 0.16: use `io.random` through the Makai default context and preserve
 /// rejection-sampling semantics.
 pub fn randomIntRangeLessThan(comptime T: type, upper_bound: T) T {
-    return std.crypto.random.intRangeLessThan(T, 0, upper_bound);
+    var source: std.Random.IoSource = .{ .io = defaultIo() };
+    return source.interface().intRangeLessThan(T, 0, upper_bound);
+}
+
+/// Return an ordinary random integer of type `T`.
+pub fn int(comptime T: type) T {
+    var source: std.Random.IoSource = .{ .io = defaultIo() };
+    return source.interface().int(T);
 }
 
 fn isAllZero(bytes: []const u8) bool {

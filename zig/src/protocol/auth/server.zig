@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const auth_providers = @import("auth/providers");
 const auth_types = @import("auth_types");
 const anthropic_oauth = @import("oauth/anthropic");
@@ -145,7 +146,7 @@ pub const AuthProtocolServer = struct {
                     .message_id = auth_types.generateUlid(),
                     .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
                     .in_reply_to = env.message_id,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .pong = .{
                         .ping_id = OwnedSlice(u8).initOwned(ping_id),
                     } },
@@ -197,7 +198,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_providers_response = providers },
         };
         try self.outbox.append(self.allocator, response);
@@ -340,7 +341,7 @@ pub const AuthProtocolServer = struct {
                 .stream_id = request.flow_id,
                 .message_id = auth_types.generateUlid(),
                 .sequence = self.nextOutgoingSequenceLocked(request.flow_id),
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .{ .auth_login_result = .{
                     .flow_id = request.flow_id,
                     .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -391,7 +392,7 @@ pub const AuthProtocolServer = struct {
         var storage = oauth_storage.AuthStorage.loadFromFile(self.allocator) catch null;
         defer if (storage) |*auth_storage| auth_storage.deinit();
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.time.nowMillis();
 
         for (auth_providers.AUTH_PROVIDER_DEFINITIONS, 0..) |definition, index| {
             var status: auth_types.AuthStatus = .login_required;
@@ -439,7 +440,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .ack = .{
                 .acknowledged_id = in_reply_to,
             } },
@@ -467,7 +468,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .nack = .{
                 .rejected_id = in_reply_to,
                 .reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason)),
@@ -559,7 +560,7 @@ pub const AuthProtocolServer = struct {
         return .{
             .refresh = try self.allocator.dupe(u8, "fixture-refresh-token"),
             .access = try self.allocator.dupe(u8, "fixture-access-token"),
-            .expires = std.time.milliTimestamp() + (60 * 60 * 1000),
+            .expires = compat.time.nowMillis() + (60 * 60 * 1000),
             .provider_data = try self.allocator.dupe(u8, "{\"provider\":\"test-fixture\"}"),
         };
     }
@@ -672,7 +673,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .prompt = .{
                 .flow_id = flow.flow_id,
                 .prompt_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, prompt_id)),
@@ -696,7 +697,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .progress = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -726,7 +727,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = event },
         });
     }
@@ -750,7 +751,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .success = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -761,7 +762,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -780,7 +781,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .@"error" = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -793,7 +794,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -812,7 +813,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),

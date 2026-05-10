@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 pub const protocol_types = @import("protocol_types");
 const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
@@ -9,7 +10,7 @@ pub fn serializeEnvelope(
     envelope: protocol_types.Envelope,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -555,8 +556,7 @@ fn writeJsonValue(
         .integer => |i| try w.writeInt(i),
         .float => |f| {
             // Float formatting
-            const writer = w.buffer.writer(allocator);
-            try std.fmt.format(writer, "{d}", .{f});
+            try w.buffer.print(allocator, "{d}", .{f});
             w.needs_comma = true;
         },
         .number_string => |s| {
@@ -1351,7 +1351,7 @@ fn deserializeTool(
     const schema_json = if (obj.get("parameters_schema_json")) |schema| switch (schema) {
         .string => |s| try allocator.dupe(u8, s),
         else => blk: {
-            var buffer = std.ArrayList(u8){};
+            var buffer = std.ArrayList(u8).empty;
             errdefer buffer.deinit(allocator);
             var w = json_writer.JsonWriter.init(&buffer, allocator);
             try writeJsonValue(&w, schema, allocator);
@@ -1476,7 +1476,7 @@ pub fn createEnvelope(
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = payload,
     };
 }
@@ -1493,7 +1493,7 @@ pub fn createReply(
         .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = payload,
     };
 }
@@ -1509,7 +1509,7 @@ pub fn createAck(
         .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{
             .acknowledged_id = original.message_id,
         } },
@@ -1529,7 +1529,7 @@ pub fn createNack(
         .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = original.message_id,
             .reason = protocol_types.OwnedSlice(u8).initOwned(reason_copy),
@@ -1564,7 +1564,7 @@ pub fn createVersionMismatchNack(
         .message_id = protocol_types.generateUlid(),
         .sequence = original.sequence + 1,
         .in_reply_to = original.message_id,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = original.message_id,
             .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
@@ -1733,7 +1733,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ping" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 42,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .in_reply_to = protocol_types.generateUlid(),
         .payload = .ping,
     };
@@ -1762,7 +1762,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with ack" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{
             .acknowledged_id = acknowledged_id,
         } },
@@ -1789,7 +1789,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with nack" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = rejected_id,
             .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
@@ -1832,7 +1832,7 @@ test "createReply sets in_reply_to correctly" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 5,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = undefined,
             .context = undefined,
@@ -1855,7 +1855,7 @@ test "createAck creates valid ack" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = undefined,
             .context = undefined,
@@ -1878,7 +1878,7 @@ test "createNack creates valid nack" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = undefined,
             .context = undefined,
@@ -1904,7 +1904,7 @@ test "createVersionMismatchNack includes supported versions" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
 
@@ -1928,7 +1928,7 @@ test "serializeEnvelope with abort_request payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 10,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = protocol_types.generateUlid(),
             .reason = protocol_types.OwnedSlice(u8).initOwned(reason),
@@ -1955,7 +1955,7 @@ test "serializeEnvelope with stream_error payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 20,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_error = .{
             .code = .provider_error,
             .message = protocol_types.OwnedSlice(u8).initOwned(msg),
@@ -2174,7 +2174,7 @@ test "serializeEnvelope with goodbye payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 100,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
     };
 
@@ -2194,7 +2194,7 @@ test "serializeEnvelope with goodbye payload (no reason)" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 100,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .goodbye = .{} },
     };
 
@@ -2215,7 +2215,7 @@ test "serializeEnvelope with sync_request payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 50,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .sync_request = .{ .target_stream_id = target_id } },
     };
 
@@ -2246,7 +2246,7 @@ test "serializeEnvelope with sync payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 60,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .sync = .{
             .target_stream_id = protocol_types.generateUlid(),
             .partial = partial,
@@ -2396,7 +2396,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with pong" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 10,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initOwned(ping_id) } },
     };
 
@@ -2420,7 +2420,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with goodbye" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 200,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .goodbye = .{ .reason = protocol_types.OwnedSlice(u8).initOwned(reason) } },
     };
 
@@ -2443,7 +2443,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_request" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
             .api = protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
@@ -2504,7 +2504,7 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_response" 
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_response = .{
             .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(models),
             .fetched_at_ms = 1_760_000_000_198,

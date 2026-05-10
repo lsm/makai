@@ -3,6 +3,13 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry_mod = @import("api_registry");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 pub fn stream(
     registry: *api_registry_mod.ApiRegistry,
     model: ai_types.Model,
@@ -39,7 +46,7 @@ pub fn complete(
     }
 
     while (!s.isDone()) {
-        std.Thread.Futex.wait(&s.futex, s.futex.load(.acquire));
+        defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
     }
 
     const result = s.getResult() orelse return error.NoResult;
@@ -60,7 +67,7 @@ pub fn completeSimple(
     }
 
     while (!s.isDone()) {
-        std.Thread.Futex.wait(&s.futex, s.futex.load(.acquire));
+        defaultIo().futexWaitUncancelable(u32, &s.futex.raw, s.futex.load(.acquire));
     }
 
     const result = s.getResult() orelse return error.NoResult;

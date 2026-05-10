@@ -10,6 +10,7 @@
 //! Phase 5.
 
 const std = @import("std");
+const compat = @import("compat");
 const auth_server_mod = @import("auth_server");
 const auth_runtime_mod = @import("auth_runtime");
 const auth_envelope_mod = @import("auth_envelope");
@@ -90,7 +91,7 @@ pub fn runProvidersCommand(
             .stream_id = stream_id,
             .message_id = auth_types.generateUlid(),
             .sequence = 1,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_providers_request = .{} },
         };
         const json = try auth_envelope_mod.serializeEnvelope(env, allocator);
@@ -246,7 +247,7 @@ fn sendLoginStart(
         .stream_id = flow_id,
         .message_id = auth_types.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_login_start = .{
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } },
@@ -273,7 +274,7 @@ fn sendPromptResponse(
         .stream_id = flow_id,
         .message_id = auth_types.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_prompt_response = .{
             .flow_id = flow_id,
             .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
@@ -459,7 +460,7 @@ fn emitProviders(
         // [{ "id", "name" }] }`. Auth status from the runtime is intentionally
         // omitted from the wrapper output to avoid altering the output schema
         // existing scripts depend on.
-        var buf = std.ArrayList(u8){};
+        var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{\"type\":\"providers\",\"providers\":[");
         for (response.providers.slice(), 0..) |provider, i| {
@@ -535,7 +536,7 @@ pub const FileIo = struct {
     stdout: std.fs.File,
     stderr: std.fs.File,
     allocator: std.mem.Allocator,
-    leftover: std.ArrayList(u8) = std.ArrayList(u8){},
+    leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     read_buf: [4096]u8 = undefined,
 
     pub fn init(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File, stderr: std.fs.File) FileIo {
@@ -610,8 +611,8 @@ const file_io_vtable = AuthCliIo.VTable{
 const TestIo = struct {
     inputs: std.ArrayList([]const u8),
     input_index: usize = 0,
-    out: std.ArrayList(u8) = std.ArrayList(u8){},
-    err: std.ArrayList(u8) = std.ArrayList(u8){},
+    out: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    err: std.ArrayList(u8) = std.ArrayList(u8).empty,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) TestIo {

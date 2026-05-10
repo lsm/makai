@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const pkce_mod = @import("oauth/pkce");
 
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -68,7 +69,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     defer allocator.free(token_response.access_token);
 
     // 6. Return credentials with 5-minute buffer
-    const expires = std.time.milliTimestamp() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
+    const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
         .refresh = try allocator.dupe(u8, token_response.refresh_token),
@@ -92,7 +93,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
-    const expires = std.time.milliTimestamp() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
+    const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
         .refresh = try allocator.dupe(u8, token_response.refresh_token),
@@ -245,7 +246,7 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
         getObjectI64Field(obj, "expiresIn") orelse 3600;
     if (expires_in <= 0) {
         if (getObjectI64Field(obj, "expires_at")) |expires_at| {
-            const now_seconds = std.time.timestamp();
+            const now_seconds = compat.time.nowSeconds();
             if (expires_at > now_seconds) expires_in = expires_at - now_seconds else expires_in = 3600;
         } else {
             expires_in = 3600;
@@ -277,18 +278,22 @@ fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, alloc
 
 /// Exchange tokens with Anthropic API
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
-    client.initDefaultProxies(allocator) catch |err| blk: {
-        std.debug.print("Warning: Failed to initialize HTTP proxy: {}\n", .{err});
-        break :blk;
-    };
+    var environ_map = std.process.Environ.createMap(std.testing.environ, allocator) catch null;
+    defer if (environ_map) |*map| map.deinit();
+    if (environ_map) |*map| {
+        client.initDefaultProxies(allocator, map) catch |err| blk: {
+            std.debug.print("Warning: Failed to initialize HTTP proxy: {}\n", .{err});
+            break :blk;
+        };
+    }
 
     const uri = try std.Uri.parse(token_url);
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
@@ -309,14 +314,14 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
         defer allocator.free(error_body);
         std.debug.print("Token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
         return error.OAuthFailed;
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
     defer allocator.free(response_body);
 
     return try parseTokenResponse(response_body, allocator);
@@ -366,7 +371,7 @@ test "getApiKey - returns access token" {
     const credentials = Credentials{
         .refresh = "refresh_token",
         .access = "access_token",
-        .expires = std.time.milliTimestamp() + 3600000,
+        .expires = compat.time.nowMillis() + 3600000,
     };
 
     const api_key = try getApiKey(credentials, std.testing.allocator);

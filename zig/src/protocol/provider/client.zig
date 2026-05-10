@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const protocol_types = @import("protocol_types");
 const envelope = @import("protocol_envelope");
 const partial_reconstructor = @import("partial_reconstructor.zig");
@@ -261,7 +262,7 @@ pub const ProtocolClient = struct {
             .stream_id = stream_id,
             .message_id = message_id,
             .sequence = seq,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = payload,
         };
         defer env.deinit(self.allocator);
@@ -276,7 +277,7 @@ pub const ProtocolClient = struct {
         try self.pending_requests.put(message_id, .{
             .message_id = message_id,
             .stream_id = stream_id,
-            .sent_at = std.time.milliTimestamp(),
+            .sent_at = compat.time.nowMillis(),
             .timeout_ms = self.options.request_timeout_ms,
         });
         try self.stream_complete_flags.put(stream_id, false);
@@ -326,7 +327,7 @@ pub const ProtocolClient = struct {
             .stream_id = stream_id,
             .message_id = protocol_types.generateUlid(),
             .sequence = seq,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = payload,
         };
         defer env.deinit(self.allocator);
@@ -447,14 +448,14 @@ pub const ProtocolClient = struct {
 
     /// Get result for a specific stream (blocking wait if not ready)
     pub fn waitResultFor(self: *Self, stream_id: protocol_types.Ulid, timeout_ms: u64) !?ai_types.AssistantMessage {
-        const start_time = std.time.milliTimestamp();
+        const start_time = compat.time.nowMillis();
         const deadline = start_time + @as(i64, @intCast(timeout_ms));
 
         while (!(self.stream_complete_flags.get(stream_id) orelse false)) {
-            if (std.time.milliTimestamp() >= deadline) {
+            if (compat.time.nowMillis() >= deadline) {
                 return error.TimeoutExceeded;
             }
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            compat.time.sleepNs(1 * std.time.ns_per_ms);
         }
 
         if (self.stream_errors.get(stream_id)) |_| {
@@ -699,7 +700,7 @@ test "sendStreamRequest creates valid envelope" {
 test "startStream uses per-stream sequence numbers" {
     const allocator = std.testing.allocator;
 
-    var writes = std.ArrayList([]u8){};
+    var writes = std.ArrayList([]u8).empty;
     defer {
         for (writes.items) |line| allocator.free(line);
         writes.deinit(allocator);
@@ -780,7 +781,7 @@ test "processEnvelope routes events to per-stream event stream" {
         .stream_id = sid1,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
     };
     defer env1.deinit(allocator);
@@ -789,7 +790,7 @@ test "processEnvelope routes events to per-stream event stream" {
         .stream_id = sid2,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
     };
     defer env2.deinit(allocator);
@@ -816,7 +817,7 @@ test "processEnvelope handles ack" {
     const message_id = protocol_types.generateUlid();
     try client.pending_requests.put(message_id, .{
         .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
+        .sent_at = compat.time.nowMillis(),
         .timeout_ms = 30_000,
     });
 
@@ -826,7 +827,7 @@ test "processEnvelope handles ack" {
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{
             .acknowledged_id = message_id,
         } },
@@ -852,7 +853,7 @@ test "processEnvelope handles nack" {
     const message_id = protocol_types.generateUlid();
     try client.pending_requests.put(message_id, .{
         .message_id = message_id,
-        .sent_at = std.time.milliTimestamp(),
+        .sent_at = compat.time.nowMillis(),
         .timeout_ms = 30_000,
     });
 
@@ -864,7 +865,7 @@ test "processEnvelope handles nack" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = message_id,
             .reason = OwnedSlice(u8).initOwned(nack_reason),
@@ -905,7 +906,7 @@ test "processEnvelope handles events" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
     };
 
@@ -940,7 +941,7 @@ test "processEnvelope accumulates to reconstructor" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
     };
     try client.processEnvelope(env1);
@@ -951,7 +952,7 @@ test "processEnvelope accumulates to reconstructor" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .text_start = .{ .content_index = 0, .partial = partial } } },
     };
     try client.processEnvelope(env2);
@@ -965,7 +966,7 @@ test "processEnvelope accumulates to reconstructor" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 3,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .text_delta = .{
             .content_index = 0,
             .delta = delta_str,
@@ -1088,7 +1089,7 @@ test "processEnvelope handles done event and builds result" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = partial } } },
     };
     try client.processEnvelope(env1);
@@ -1099,7 +1100,7 @@ test "processEnvelope handles done event and builds result" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .text_start = .{ .content_index = 0, .partial = partial } } },
     };
     try client.processEnvelope(env2);
@@ -1113,7 +1114,7 @@ test "processEnvelope handles done event and builds result" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 3,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .text_delta = .{
             .content_index = 0,
             .delta = delta_str,
@@ -1138,7 +1139,7 @@ test "processEnvelope handles done event and builds result" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 4,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .done = .{
             .reason = .stop,
             .message = done_msg,
@@ -1185,7 +1186,7 @@ test "processEnvelope handles result payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .result = result_msg },
     };
 
@@ -1215,7 +1216,7 @@ test "processEnvelope handles stream_error payload" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_error = .{
             .code = .provider_error,
             .message = OwnedSlice(u8).initOwned(error_msg),
@@ -1343,7 +1344,7 @@ test "removeStreamState clears per-stream maps and legacy current stream state" 
     try client.pending_requests.put(mid, .{
         .message_id = mid,
         .stream_id = sid,
-        .sent_at = std.time.milliTimestamp(),
+        .sent_at = compat.time.nowMillis(),
         .timeout_ms = 30_000,
     });
     try client.stream_sequences.put(sid, 7);
@@ -1412,7 +1413,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
         .stream_id = sid_result,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .result = .{
             .content = result_content,
             .api = result_api,
@@ -1431,7 +1432,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
         .stream_id = sid_error,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_error = .{
             .code = .provider_error,
             .message = OwnedSlice(u8).initOwned(err_msg),
@@ -1452,7 +1453,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
         .stream_id = sid_done,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .start = .{ .partial = done_partial } } },
     };
     defer env_done_start.deinit(allocator);
@@ -1470,7 +1471,7 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
         .stream_id = sid_done,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .event = .{ .done = .{
             .reason = .stop,
             .message = done_msg,

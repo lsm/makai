@@ -9,7 +9,7 @@ pub const StreamingJsonAccumulator = struct {
     /// Initialize a new StreamingJsonAccumulator with the given allocator.
     pub fn init(allocator: std.mem.Allocator) StreamingJsonAccumulator {
         return .{
-            .buffer = .{},
+            .buffer = .empty,
             .allocator = allocator,
         };
     }

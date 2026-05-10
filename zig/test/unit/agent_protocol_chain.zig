@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const event_stream = @import("event_stream");
@@ -35,7 +36,7 @@ fn mockProviderStream(
         .model = "mock-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 
     try s.push(.{ .done = .{ .reason = .stop, .message = final } });
@@ -111,7 +112,7 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
     const prompt_text = try allocator.dupe(u8, "hello");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const loop_stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, .{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -515,7 +516,7 @@ fn makeFixtureStream(
         .model = "fixture-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     });
     s.markThreadDone();
     return s;
@@ -574,7 +575,7 @@ fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
         .stream_id = ProviderProtocolTypes.generateUlid(),
         .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
     return provider_protocol_envelope.serializeEnvelope(env, allocator);
@@ -585,7 +586,7 @@ fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
         .session_id = AgentProtocolTypes.generateSessionId(),
         .message_id = AgentProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
@@ -596,7 +597,7 @@ fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: A
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_providers_request = .{} },
     };
     return auth_protocol_envelope.serializeEnvelope(env, allocator);
@@ -612,7 +613,7 @@ fn makeAuthLoginStartEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_login_start = .{
             .provider_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } },
@@ -632,7 +633,7 @@ fn makeAuthPromptResponseEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_prompt_response = .{
             .flow_id = flow_id,
             .prompt_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
@@ -652,7 +653,7 @@ fn makeAuthCancelEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_cancel = .{
             .flow_id = flow_id,
         } },
@@ -668,7 +669,7 @@ fn makeProviderStreamRequestEnvelopeJson(
         .stream_id = ProviderProtocolTypes.generateUlid(),
         .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{
             .stream_request = .{
                 .model = fixtureModel(api),
@@ -1157,7 +1158,7 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
 
 test "writeOwnedLinesAndClear clears owned lines on write failure" {
     const allocator = std.testing.allocator;
-    const pipe = try std.posix.pipe();
+    const pipe = try std.Io.Threaded.pipe2(.{});
     const read_file = std.fs.File{ .handle = pipe[0] };
     const write_file = std.fs.File{ .handle = pipe[1] };
     defer read_file.close();
@@ -1182,8 +1183,8 @@ test "writeOwnedLinesAndClear clears owned lines on write failure" {
 test "stdio mode preserves ready handshake compatibility" {
     const allocator = std.testing.allocator;
 
-    const stdin_pipe = try std.posix.pipe();
-    const stdout_pipe = try std.posix.pipe();
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+    const stdout_pipe = try std.Io.Threaded.pipe2(.{});
 
     var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
     var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
@@ -1251,8 +1252,8 @@ test "stdio mode preserves ready handshake compatibility" {
 test "stdio mode emits unknown_envelope error and continues processing" {
     const allocator = std.testing.allocator;
 
-    const stdin_pipe = try std.posix.pipe();
-    const stdout_pipe = try std.posix.pipe();
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+    const stdout_pipe = try std.Io.Threaded.pipe2(.{});
 
     var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
     var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
@@ -1359,9 +1360,9 @@ const AuthCliHarness = struct {
     err: ?anyerror = null,
 
     fn init(allocator: std.mem.Allocator, args: []const []const u8) !AuthCliHarness {
-        const stdin_pipe = try std.posix.pipe();
-        const stdout_pipe = try std.posix.pipe();
-        const stderr_pipe = try std.posix.pipe();
+        const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+        const stdout_pipe = try std.Io.Threaded.pipe2(.{});
+        const stderr_pipe = try std.Io.Threaded.pipe2(.{});
 
         return .{
             .allocator = allocator,
@@ -1397,7 +1398,7 @@ const AuthCliHarness = struct {
     }
 
     fn readAll(file: std.fs.File, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+        var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
         var chunk: [4096]u8 = undefined;
         while (true) {

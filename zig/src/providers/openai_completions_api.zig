@@ -11,6 +11,7 @@ const sanitize = @import("sanitize");
 const retry = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
+const compat_mod = @import("compat");
 
 /// Merged compatibility options from model-level config and detected capabilities
 const MergedCompat = struct {
@@ -61,7 +62,7 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
 }
 
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
 
 fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -313,7 +314,7 @@ fn writeMessagesArray(
                         }
                         try writer.endArray();
                     } else {
-                        var text_buf = std.ArrayList(u8){};
+                        var text_buf = std.ArrayList(u8).empty;
                         defer text_buf.deinit(allocator);
                         for (parts) |p| {
                             switch (p) {
@@ -365,7 +366,7 @@ fn writeMessagesArray(
             if (has_text) {
                 if (is_github_copilot) {
                     // GitHub Copilot requires content as a flat string
-                    var text_buf = std.ArrayList(u8){};
+                    var text_buf = std.ArrayList(u8).empty;
                     defer text_buf.deinit(allocator);
                     for (a.content) |c| switch (c) {
                         .text => |t| {
@@ -449,7 +450,7 @@ fn writeMessagesArray(
                 };
 
                 // Collect all thinking text
-                var thinking_buf = std.ArrayList(u8){};
+                var thinking_buf = std.ArrayList(u8).empty;
                 defer thinking_buf.deinit(allocator);
                 for (a.content) |c| switch (c) {
                     .thinking => |t| {
@@ -517,7 +518,7 @@ fn writeMessagesArray(
         // Handle tool_result messages - group consecutive ones, extract images
         if (msg == .tool_result) {
             // Collect image blocks from all consecutive tool results
-            var image_blocks = std.ArrayList(ai_types.UserContentPart){};
+            var image_blocks = std.ArrayList(ai_types.UserContentPart).empty;
             defer image_blocks.deinit(allocator);
 
             // Process consecutive tool_result messages
@@ -533,7 +534,7 @@ fn writeMessagesArray(
                 }
 
                 // Extract text content
-                var text_buf = std.ArrayList(u8){};
+                var text_buf = std.ArrayList(u8).empty;
                 defer text_buf.deinit(allocator);
                 var has_images = false;
                 for (tr.content) |c| switch (c) {
@@ -627,7 +628,7 @@ fn buildRequestBody(
     options: ai_types.StreamOptions,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     const merged = mergeCompat(model);
@@ -979,9 +980,9 @@ fn parseChunk(
                                                 if (detail_data) |dat| {
                                                     if (dat == .string and dat.string.len > 0) {
                                                         // Serialize the detail object back to JSON
-                                                        var detail_buf = std.ArrayList(u8){};
+                                                        var detail_buf = std.ArrayList(u8).empty;
                                                         defer detail_buf.deinit(allocator);
-                                                        detail_buf.writer(allocator).print("{{\"type\":\"reasoning.encrypted\",\"id\":\"{s}\",\"data\":\"{s}\"}}", .{ id.string, dat.string }) catch return;
+                                                        detail_buf.print(allocator, "{{\"type\":\"reasoning.encrypted\",\"id\":\"{s}\",\"data\":\"{s}\"}}", .{ id.string, dat.string }) catch return;
                                                         const detail_json = try allocator.dupe(u8, detail_buf.items);
                                                         const tool_call_id = try allocator.dupe(u8, id.string);
 
@@ -1068,7 +1069,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // GitHub Copilot uses /chat/completions, others use /v1/chat/completions
@@ -1103,7 +1104,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
         ctx.deinit();
@@ -1338,7 +1339,7 @@ fn runThread(ctx: *ThreadCtx) void {
     if (response.head.status != .ok) {
         // Read error body for debugging
         var error_buf: [4096]u8 = undefined;
-        const error_body = response.reader(&error_buf).*.allocRemaining(allocator, std.io.Limit.limited(8192)) catch null;
+        const error_body = response.reader(&error_buf).*.allocRemaining(allocator, std.Io.Limit.limited(8192)) catch null;
         defer if (error_body) |eb| allocator.free(eb);
 
         std.debug.print("OpenAI API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), model.name });
@@ -1355,9 +1356,9 @@ fn runThread(ctx: *ThreadCtx) void {
     var parser = sse_parser.SSEParser.init(allocator);
     defer parser.deinit();
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
@@ -1368,14 +1369,14 @@ fn runThread(ctx: *ThreadCtx) void {
     // Tool call tracking
     var tool_call_tracker_instance = tool_call_tracker.ToolCallTracker.init(allocator);
     defer tool_call_tracker_instance.deinit();
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer {
         for (tool_call_events.items) |*tce| {
             @constCast(tce).deinit(allocator);
         }
         tool_call_events.deinit(allocator);
     }
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -1403,7 +1404,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .model = model.id,
                 .usage = .{},
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat_mod.time.nowMillis(),
             },
         },
     }) catch {};
@@ -1411,7 +1412,7 @@ fn runThread(ctx: *ThreadCtx) void {
     while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
-            const now = std.time.milliTimestamp();
+            const now = compat_mod.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
                 stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
@@ -1480,7 +1481,7 @@ fn runThread(ctx: *ThreadCtx) void {
                             .model = model.id,
                             .usage = usage,
                             .stop_reason = stop_reason,
-                            .timestamp = std.time.milliTimestamp(),
+                            .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
                 }) catch {};
@@ -1500,7 +1501,7 @@ fn runThread(ctx: *ThreadCtx) void {
                             .model = model.id,
                             .usage = usage,
                             .stop_reason = stop_reason,
-                            .timestamp = std.time.milliTimestamp(),
+                            .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
                 }) catch {};
@@ -1540,7 +1541,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .model = model.id,
                                 .usage = usage,
                                 .stop_reason = stop_reason,
-                                .timestamp = std.time.milliTimestamp(),
+                                .timestamp = compat_mod.time.nowMillis(),
                             },
                         },
                     }) catch {};
@@ -1566,7 +1567,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .model = model.id,
                                     .usage = usage,
                                     .stop_reason = stop_reason,
-                                    .timestamp = std.time.milliTimestamp(),
+                                    .timestamp = compat_mod.time.nowMillis(),
                                 },
                             },
                         }) catch {};
@@ -1581,7 +1582,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // Complete all tool calls and emit toolcall_end events
     // We need to complete tool calls in content_index order
-    var api_indices = std.ArrayList(usize){};
+    var api_indices = std.ArrayList(usize).empty;
     defer api_indices.deinit(allocator);
     api_indices.ensureTotalCapacity(allocator, tool_call_tracker_instance.count()) catch {};
 
@@ -1623,7 +1624,7 @@ fn runThread(ctx: *ThreadCtx) void {
             .model = model.id,
             .usage = usage,
             .stop_reason = stop_reason,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat_mod.time.nowMillis(),
         };
         ctx.deinit();
         stream.markThreadDone();
@@ -1720,7 +1721,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         .model = model.id,
                         .usage = usage,
                         .stop_reason = stop_reason,
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat_mod.time.nowMillis(),
                     },
                 },
             }) catch {};
@@ -1736,7 +1737,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat_mod.time.nowMillis(),
     };
 
     ctx.deinit();
@@ -1891,7 +1892,7 @@ test "buildRequestBody includes stream_options and tools without memory leak" {
         .model = "gpt-4o-mini",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat_mod.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{
@@ -1942,7 +1943,7 @@ test "buildRequestBody with assistant message containing tool_calls" {
         .model = "gpt-4o-mini",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat_mod.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{
@@ -1962,18 +1963,18 @@ test "buildRequestBody with assistant message containing tool_calls" {
 test "parseChunk does not leak memory with reasoning content" {
     const allocator = std.testing.allocator;
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer tool_call_events.deinit(allocator);
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -2008,18 +2009,18 @@ test "parseChunk does not leak memory with reasoning content" {
 test "parseChunk handles multiple chunks without leaking" {
     const allocator = std.testing.allocator;
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer tool_call_events.deinit(allocator);
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -2058,23 +2059,23 @@ test "parseChunk handles multiple chunks without leaking" {
 test "parseChunk handles tool_calls without leaking" {
     const allocator = std.testing.allocator;
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer {
         for (tool_call_events.items) |*tce| {
             @constCast(tce).deinit(allocator);
         }
         tool_call_events.deinit(allocator);
     }
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -2165,23 +2166,23 @@ test "parseChunk handles tool_calls without leaking" {
 test "parseChunk handles multiple tool_calls" {
     const allocator = std.testing.allocator;
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer {
         for (tool_call_events.items) |*tce| {
             @constCast(tce).deinit(allocator);
         }
         tool_call_events.deinit(allocator);
     }
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -2332,8 +2333,8 @@ test "buildRequestBody adds cache_control for OpenRouter Anthropic models" {
         .max_tokens = 100,
     };
 
-    const user_msg1 = ai_types.Message{ .user = .{ .content = .{ .text = "First message" }, .timestamp = std.time.timestamp() } };
-    const user_msg2 = ai_types.Message{ .user = .{ .content = .{ .text = "Second message" }, .timestamp = std.time.timestamp() } };
+    const user_msg1 = ai_types.Message{ .user = .{ .content = .{ .text = "First message" }, .timestamp = compat_mod.time.nowSeconds() } };
+    const user_msg2 = ai_types.Message{ .user = .{ .content = .{ .text = "Second message" }, .timestamp = compat_mod.time.nowSeconds() } };
 
     const ctx = ai_types.Context{
         .messages = &[_]ai_types.Message{ user_msg1, user_msg2 },
@@ -2368,7 +2369,7 @@ test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" 
         .max_tokens = 100,
     };
 
-    const user_msg = ai_types.Message{ .user = .{ .content = .{ .text = "Hello" }, .timestamp = std.time.timestamp() } };
+    const user_msg = ai_types.Message{ .user = .{ .content = .{ .text = "Hello" }, .timestamp = compat_mod.time.nowSeconds() } };
 
     const ctx = ai_types.Context{
         .messages = &[_]ai_types.Message{user_msg},
@@ -2600,23 +2601,23 @@ test "buildRequestBody omits store field for non-OpenAI providers" {
 test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" {
     const allocator = std.testing.allocator;
 
-    var text = std.ArrayList(u8){};
+    var text = std.ArrayList(u8).empty;
     defer text.deinit(allocator);
-    var thinking = std.ArrayList(u8){};
+    var thinking = std.ArrayList(u8).empty;
     defer thinking.deinit(allocator);
     var usage = ai_types.Usage{};
     var stop_reason: ai_types.StopReason = .stop;
     var current_block: BlockType = .none;
     var reasoning_signature: ?[]const u8 = null;
     defer if (reasoning_signature) |sig| allocator.free(sig);
-    var tool_call_events = std.ArrayList(ToolCallEvent){};
+    var tool_call_events = std.ArrayList(ToolCallEvent).empty;
     defer {
         for (tool_call_events.items) |*tce| {
             @constCast(tce).deinit(allocator);
         }
         tool_call_events.deinit(allocator);
     }
-    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent){};
+    var reasoning_detail_events = std.ArrayList(ReasoningDetailEvent).empty;
     defer {
         for (reasoning_detail_events.items) |*rde| {
             @constCast(rde).deinit(allocator);
@@ -2719,7 +2720,7 @@ test "buildRequestBody includes reasoning_details for tool calls with thought_si
             .model = "o1",
             .usage = .{},
             .stop_reason = .tool_use,
-            .timestamp = std.time.timestamp(),
+            .timestamp = compat_mod.time.nowSeconds(),
         },
     };
 

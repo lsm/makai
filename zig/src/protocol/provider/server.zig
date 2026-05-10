@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const protocol_types = @import("protocol_types");
 const envelope = @import("protocol_envelope");
 const partial_serializer = @import("partial_serializer.zig");
@@ -51,7 +52,7 @@ fn createSequenceNack(
             .stream_id = stream_id,
             .message_id = message_id,
             .sequence = 0,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .ping,
         },
         reason,
@@ -272,7 +273,7 @@ pub const ProtocolServer = struct {
             .registry = registry,
             .sequence_counters = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
             .expected_sequences = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
-            .outbox = std.ArrayList(protocol_types.Envelope){},
+            .outbox = std.ArrayList(protocol_types.Envelope).empty,
             .options = options,
             .refresh_lock = refresh_lock_mod.RefreshLock.init(allocator),
         };
@@ -489,7 +490,7 @@ fn nackTemplate(stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid
         .stream_id = stream_id,
         .message_id = in_reply_to,
         .sequence = 0,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
 }
@@ -744,7 +745,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .model = request.model,
         .event_stream = stream,
         .partial_state = partial_serializer.PartialState.init(server.allocator),
-        .started_at = std.time.milliTimestamp(),
+        .started_at = compat.time.nowMillis(),
     };
 
     // Store in active_streams
@@ -763,7 +764,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
         .in_reply_to = in_reply_to,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{
             .acknowledged_id = in_reply_to,
         } },
@@ -800,7 +801,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             .message_id = protocol_types.generateUlid(),
             .sequence = seq,
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .ack = .{
                 .acknowledged_id = in_reply_to,
             } },
@@ -813,7 +814,7 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             .message_id = protocol_types.generateUlid(),
             .sequence = 0,
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .ack = .{
                 .acknowledged_id = in_reply_to,
             } },
@@ -864,7 +865,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             .message_id = protocol_types.generateUlid(),
             .sequence = 1,
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .result = cloned_result },
         };
     } else if (stream.getError()) |err_msg| {
@@ -874,7 +875,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
                 .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .ping,
             },
             err_msg,
@@ -888,7 +889,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
                 .stream_id = stream_id,
                 .message_id = in_reply_to,
                 .sequence = 0,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .ping,
             },
             "Stream did not complete in time",
@@ -957,7 +958,7 @@ fn handleModelsRequest(
         .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{
             .acknowledged_id = in_reply_to,
         } },
@@ -968,7 +969,7 @@ fn handleModelsRequest(
         .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_response = response },
     });
 
@@ -1030,7 +1031,7 @@ fn buildStaticFallbackResponse(
 
     return .{
         .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(models),
-        .fetched_at_ms = std.time.milliTimestamp(),
+        .fetched_at_ms = compat.time.nowMillis(),
         .cache_max_age_ms = STATIC_FALLBACK_CACHE_MAX_AGE_MS,
     };
 }
@@ -1083,7 +1084,7 @@ fn filterAndNormalizeModels(
     var response = input;
     errdefer response.deinit(server.allocator);
 
-    var filtered = std.ArrayList(protocol_types.ModelDescriptor){};
+    var filtered = std.ArrayList(protocol_types.ModelDescriptor).empty;
     defer filtered.deinit(server.allocator);
     errdefer {
         for (filtered.items) |*model| model.deinit(server.allocator);
@@ -1129,7 +1130,7 @@ fn filterAndNormalizeModels(
 
     return .{
         .models = protocol_types.OwnedSlice(protocol_types.ModelDescriptor).initOwned(filtered_models),
-        .fetched_at_ms = std.time.milliTimestamp(),
+        .fetched_at_ms = compat.time.nowMillis(),
         .cache_max_age_ms = cache_max_age_ms,
     };
 }
@@ -1178,7 +1179,7 @@ fn makeModelsNack(
         .message_id = protocol_types.generateUlid(),
         .sequence = server.nextSequence(stream_id),
         .in_reply_to = in_reply_to,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = in_reply_to,
             .reason = protocol_types.OwnedSlice(u8).initOwned(try server.allocator.dupe(u8, reason)),
@@ -1209,7 +1210,7 @@ fn mockStream(
         .model = "test-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
     s.complete(result);
     s.markThreadDone();
@@ -1236,7 +1237,7 @@ fn mockStreamSimple(
         .model = "test-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
     s.complete(result);
     s.markThreadDone();
@@ -1281,7 +1282,7 @@ fn authTestRefresh(credentials: oauth_storage.Credentials, allocator: std.mem.Al
     const state = auth_test_state.?;
     if (state.fail_refresh) return error.RefreshFailed;
     state.refresh_count += 1;
-    state.expires = std.time.milliTimestamp() + 60_000;
+    state.expires = compat.time.nowMillis() + 60_000;
     return .{
         .refresh = try allocator.dupe(u8, credentials.refresh),
         .access = try std.fmt.allocPrint(allocator, "access-{d}", .{state.refresh_count}),
@@ -1334,7 +1335,7 @@ fn authTestStream(
     if (state.auth_fail_all_calls or (state.auth_fail_first_call and state.stream_calls == 1)) {
         s.completeWithError("401 unauthorized");
     } else {
-        s.complete(.{ .content = &.{}, .api = "test-api", .provider = "test-provider", .model = "test-model", .usage = .{}, .stop_reason = .stop, .timestamp = std.time.milliTimestamp() });
+        s.complete(.{ .content = &.{}, .api = "test-api", .provider = "test-provider", .model = "test-model", .usage = .{}, .stop_reason = .stop, .timestamp = compat.time.nowMillis() });
     }
     s.markThreadDone();
     return s;
@@ -1403,7 +1404,7 @@ test "handleModelsRequest emits ack then models_response from static fallback" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer request.deinit(std.testing.allocator);
@@ -1442,7 +1443,7 @@ test "handleModelsRequest returns not_implemented nack when unsupported" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer request.deinit(std.testing.allocator);
@@ -1467,7 +1468,7 @@ test "handleModelsRequest applies provider api and exact model filters" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = protocol_types.OwnedSlice(u8).initBorrowed("openai"),
         } },
@@ -1489,7 +1490,7 @@ test "handleModelsRequest applies provider api and exact model filters" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .api = protocol_types.OwnedSlice(u8).initBorrowed("openai-responses"),
         } },
@@ -1510,7 +1511,7 @@ test "handleModelsRequest applies provider api and exact model filters" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .api = protocol_types.OwnedSlice(u8).initBorrowed("ollama"),
             .model_id = protocol_types.OwnedSlice(u8).initBorrowed("qwen2.5:7b"),
@@ -1538,7 +1539,7 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = protocol_types.OwnedSlice(u8).initBorrowed("openai"),
             .model_id = protocol_types.OwnedSlice(u8).initBorrowed("gpt-4o"),
@@ -1558,7 +1559,7 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = protocol_types.OwnedSlice(u8).initBorrowed("anthropic"),
             .model_id = protocol_types.OwnedSlice(u8).initBorrowed("does-not-exist"),
@@ -1590,7 +1591,7 @@ test "handleModelsRequest prefers dynamic fetch and falls back to static catalog
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer dynamic_request.deinit(std.testing.allocator);
@@ -1612,7 +1613,7 @@ test "handleModelsRequest prefers dynamic fetch and falls back to static catalog
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer fallback_request.deinit(std.testing.allocator);
@@ -1628,7 +1629,7 @@ test "handleModelsRequest prefers dynamic fetch and falls back to static catalog
 }
 
 test "expired stored credentials refresh before upstream call" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1 };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() - 1 };
     auth_test_state = &state;
     defer auth_test_state = null;
 
@@ -1650,7 +1651,7 @@ test "expired stored credentials refresh before upstream call" {
 }
 
 test "upstream auth failure refreshes and retries once" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .auth_fail_first_call = true };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000, .auth_fail_first_call = true };
     auth_test_state = &state;
     defer auth_test_state = null;
 
@@ -1692,24 +1693,24 @@ fn expectAuthRefreshFailedNack(state: *AuthTestState) !void {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_refresh_failed, response.payload.nack.error_code.?);
 }
 
 test "pre-call refresh failure returns auth_refresh_failed nack" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1, .fail_refresh = true };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() - 1, .fail_refresh = true };
     try expectAuthRefreshFailedNack(&state);
 }
 
 test "retry refresh failure returns auth_refresh_failed nack" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .fail_refresh = true, .auth_fail_first_call = true };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000, .fail_refresh = true, .auth_fail_first_call = true };
     try expectAuthRefreshFailedNack(&state);
 }
 
 test "stored api_key used when provider has OAuth hook but storage has non-OAuth entry" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .use_api_key_storage = true };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000, .use_api_key_storage = true };
     auth_test_state = &state;
     defer auth_test_state = null;
 
@@ -1732,7 +1733,7 @@ test "stored api_key used when provider has OAuth hook but storage has non-OAuth
 }
 
 test "retry auth failure returns auth_required nack" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() + 60_000, .auth_fail_all_calls = true };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() + 60_000, .auth_fail_all_calls = true };
     auth_test_state = &state;
     defer auth_test_state = null;
 
@@ -1742,7 +1743,7 @@ test "retry auth failure returns auth_required nack" {
 
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .load_auth_storage_fn = authTestLoadStorage, .load_auth_storage_ctx = &state });
     defer server.deinit();
-    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = std.time.milliTimestamp(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
+    const env = protocol_types.Envelope{ .stream_id = protocol_types.generateUlid(), .message_id = protocol_types.generateUlid(), .sequence = 1, .timestamp = compat.time.nowMillis(), .payload = .{ .stream_request = .{ .model = testModel(), .context = testContext() } } };
     var response = (try server.handleEnvelope(env)).?;
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(protocol_types.ErrorCode.auth_required, response.payload.nack.error_code.?);
@@ -1777,7 +1778,7 @@ test "handleEnvelope returns pong for ping" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
 
@@ -1817,7 +1818,7 @@ test "handleEnvelope returns nack for stream_request without provider" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -1848,7 +1849,7 @@ test "handleEnvelope returns version_mismatch nack for unsupported version" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
 
@@ -1896,7 +1897,7 @@ test "handleStreamRequest creates stream and returns ack" {
         .stream_id = client_stream_id,
         .message_id = msg_id,
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -1953,7 +1954,7 @@ test "handleStreamRequest rejects duplicate stream id" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -1970,7 +1971,7 @@ test "handleStreamRequest rejects duplicate stream id" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2018,7 +2019,7 @@ test "handleAbortRequest cancels stream" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2037,7 +2038,7 @@ test "handleAbortRequest cancels stream" {
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
             .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
@@ -2066,7 +2067,7 @@ test "handleAbortRequest returns ack for unknown stream (idempotent)" {
         .stream_id = unknown_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = unknown_stream_id,
             .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
@@ -2111,7 +2112,7 @@ test "cleanupCompletedStreams removes done streams" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2164,7 +2165,7 @@ test "max streams limit enforced" {
         .stream_id = client_stream_id_1,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2184,7 +2185,7 @@ test "max streams limit enforced" {
         .stream_id = client_stream_id_2,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Each new stream starts at sequence 1
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2204,7 +2205,7 @@ test "max streams limit enforced" {
         .stream_id = client_stream_id_3,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Each new stream starts at sequence 1
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2274,7 +2275,7 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 0,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2296,7 +2297,7 @@ test "handleEnvelope rejects stream_request with invalid sequence" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2341,7 +2342,7 @@ test "handleEnvelope rejects complete_request with invalid sequence" {
         .stream_id = client_stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 5,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .complete_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2390,7 +2391,7 @@ test "handleAbortRequest rejects duplicate sequence" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2408,7 +2409,7 @@ test "handleAbortRequest rejects duplicate sequence" {
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 1, // Duplicate - should be 2
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
             .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
@@ -2457,7 +2458,7 @@ test "handleAbortRequest rejects sequence gap" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2475,7 +2476,7 @@ test "handleAbortRequest rejects sequence gap" {
         .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 10, // Gap - expected 2
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .abort_request = .{
             .target_stream_id = stream_id,
             .reason = protocol_types.OwnedSlice(u8).initBorrowed(""),
@@ -2549,7 +2550,7 @@ fn capturingStream(
         .model = "test-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
     s.complete(result);
     s.markThreadDone();
@@ -2602,7 +2603,7 @@ test "credential resolution: explicit api_key bypasses storage lookup" {
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2664,7 +2665,7 @@ test "credential resolution: missing api_key loads credentials from storage by p
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2717,7 +2718,7 @@ test "credential resolution: missing api_key and missing storage entry returns a
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2768,7 +2769,7 @@ test "credential resolution: complete_request without credentials returns auth_r
         .stream_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .complete_request = .{
             .model = model,
             .context = .{ .messages = &.{} },
@@ -2816,7 +2817,7 @@ test "refresh lock prevents duplicate concurrent refresh calls" {
 }
 
 test "refreshWithLock wraps refreshCredentials under the lock" {
-    var state = AuthTestState{ .expires = std.time.milliTimestamp() - 1 };
+    var state = AuthTestState{ .expires = compat.time.nowMillis() - 1 };
     auth_test_state = &state;
     defer auth_test_state = null;
 
@@ -2833,7 +2834,7 @@ test "refreshWithLock wraps refreshCredentials under the lock" {
         .oauth = .{
             .refresh = refresh,
             .access = access,
-            .expires = std.time.milliTimestamp() - 1,
+            .expires = compat.time.nowMillis() - 1,
         },
     });
 
@@ -2886,7 +2887,7 @@ test "refresh lock timeout returns timed_out for stale locks" {
     const gen1 = try expectRefreshLockAcquired(try lock.acquire("slow-provider", null));
 
     // Wait for timeout
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    compat.time.sleepNs(5 * std.time.ns_per_ms);
 
     // Second caller should get timed_out
     const r2 = try lock.acquire("slow-provider", null);

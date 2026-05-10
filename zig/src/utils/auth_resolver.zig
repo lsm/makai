@@ -20,6 +20,7 @@
 //! by M-007's refresh path, since it shares the same OAuth provider plumbing.
 
 const std = @import("std");
+const compat = @import("compat");
 const storage_mod = @import("oauth/storage");
 
 pub const AuthStorage = storage_mod.AuthStorage;
@@ -145,7 +146,7 @@ test "resolveApiKey - loads oauth access token from storage by provider_id" {
     try storage.providers.put(provider_id, .{ .oauth = .{
         .refresh = refresh,
         .access = access,
-        .expires = std.time.milliTimestamp() + 3_600_000,
+        .expires = compat.time.nowMillis() + 3_600_000,
     } });
 
     var resolved = try resolveApiKey(testing.allocator, &storage, "anthropic", null);
