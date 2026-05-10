@@ -233,11 +233,8 @@ test "InProcessProviderProtocolBridge smoke test" {
                 .is_owned = false,
             } } }) catch {};
 
-            const content = try a.alloc(ai_types.AssistantContent, 1);
-            content[0] = .{ .text = .{ .text = try a.dupe(u8, "ok") } };
-
             s.complete(.{
-                .content = content,
+                .content = &.{},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
