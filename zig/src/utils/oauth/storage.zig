@@ -53,7 +53,7 @@ pub const AuthStorage = struct {
 
     /// Load auth storage from ~/.makai/auth.json
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
-        const home = std.process.Environ.getAlloc(std.testing.environ, allocator, "HOME") catch return error.NoHomeDir;
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
         defer allocator.free(home);
         const path = try std.fs.path.join(allocator, &.{ home, ".makai", "auth.json" });
         defer allocator.free(path);
@@ -125,7 +125,7 @@ pub const AuthStorage = struct {
     /// Concurrent readers will either see the old file or the new file —
     /// never a partial write.
     pub fn saveToFile(self: *const AuthStorage) !void {
-        const home = std.process.Environ.getAlloc(std.testing.environ, self.allocator, "HOME") catch return error.NoHomeDir;
+        const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return error.NoHomeDir;
         defer self.allocator.free(home);
         const dir_path = try std.fs.path.join(self.allocator, &.{ home, ".makai" });
         defer self.allocator.free(dir_path);

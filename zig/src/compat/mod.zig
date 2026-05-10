@@ -21,8 +21,33 @@ pub const stdio = @import("stdio.zig");
 pub const http = @import("http.zig");
 pub const net = @import("net.zig");
 
+fn runtimeEnviron() std.process.Environ {
+    const builtin = @import("builtin");
+    if (builtin.is_test) {
+        return std.testing.environ;
+    }
+
+    const Block = std.process.Environ.Block;
+    if (@hasField(Block, "use_global")) {
+        return .{ .block = .global };
+    }
+
+    if (!builtin.link_libc) {
+        return .empty;
+    }
+
+    const c_environ = std.c.environ;
+    var env_count: usize = 0;
+    while (c_environ[env_count] != null) : (env_count += 1) {}
+    return .{ .block = .{ .slice = @ptrCast(c_environ[0..env_count :null]) } };
+}
+
 pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
-    return std.process.Environ.getAlloc(std.testing.environ, allocator, name);
+    return std.process.Environ.getAlloc(runtimeEnviron(), allocator, name);
+}
+
+pub fn createEnvMap(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    return std.process.Environ.createMap(runtimeEnviron(), allocator);
 }
 
 test {

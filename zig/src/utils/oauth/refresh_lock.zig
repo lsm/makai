@@ -12,6 +12,7 @@
 //! fresh lock generation; stale owner completions are ignored.
 
 const std = @import("std");
+const compat = @import("compat");
 
 fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
@@ -25,7 +26,7 @@ pub const RefreshLock = struct {
 
     const Entry = struct {
         key_owned: []const u8,
-        acquired_at_ms: i64,
+        acquired_at_ms: u64,
         cond: std.Io.Condition,
         /// null  = refresh succeeded
         /// error = refresh failed with this error
@@ -197,12 +198,12 @@ pub const RefreshLock = struct {
         }
     }
 
-    fn nowMillis() i64 {
-        return std.Io.Timestamp.now(defaultIo(), .real).toMilliseconds();
+    fn monotonicMillis() u64 {
+        return (compat.time.monotonicNanos() catch 0) / std.time.ns_per_ms;
     }
 
-    fn elapsedMs(entry: *const Entry, now_ms: i64) u64 {
-        return @intCast(@max(now_ms - entry.acquired_at_ms, 0));
+    fn elapsedMs(entry: *const Entry, now_ms: u64) u64 {
+        return now_ms -| entry.acquired_at_ms;
     }
 
     // ------------------------------------------------------------------
@@ -256,7 +257,7 @@ pub const RefreshLock = struct {
                 }
             } else {
                 // Check timeout.
-                const now = nowMillis();
+                const now = monotonicMillis();
                 if (elapsedMs(entry, now) > self.timeout_ms) {
                     // Timed out — mark completed so all current waiters see
                     // the failure immediately, and release the owner's ref so
@@ -273,7 +274,7 @@ pub const RefreshLock = struct {
                 // refresh timeout even if no later caller observes expiry.
                 entry.ref_count += 1;
                 while (!self.shutdown and !entry.completed) {
-                    const instant = nowMillis();
+                    const instant = monotonicMillis();
                     const elapsed_ms = elapsedMs(entry, instant);
                     if (elapsed_ms >= self.timeout_ms) {
                         _ = self.timeoutEntry(entry);
@@ -321,7 +322,7 @@ pub const RefreshLock = struct {
             self.mutex.unlock(defaultIo());
             return err;
         };
-        const acquired_at_ms = nowMillis();
+        const acquired_at_ms = monotonicMillis();
 
         const generation = self.next_generation;
         self.next_generation +%= 1;
@@ -407,7 +408,7 @@ pub const RefreshLock = struct {
     /// and all waiters are woken.  The holder's `complete()` call will be a
     /// no-op (entry already removed or marked completed).
     pub fn expireTimedOut(self: *RefreshLock) void {
-        const now = nowMillis();
+        const now = monotonicMillis();
 
         self.mutex.lockUncancelable(defaultIo());
         // Collect entries to expire so we don't invalidate the iterator.

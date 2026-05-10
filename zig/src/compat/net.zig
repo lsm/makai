@@ -1,4 +1,5 @@
 const std = @import("std");
+const HostName = std.Io.net.HostName;
 
 fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
@@ -114,14 +115,34 @@ pub fn resolveAddressList(allocator: std.mem.Allocator, host: []const u8, port: 
     const list = try allocator.create(AddressList);
     errdefer allocator.destroy(list);
 
-    const address = Address.resolve(defaultIo(), host, port) catch blk: {
-        if (std.ascii.eqlIgnoreCase(host, "localhost")) {
-            break :blk Address{ .ip4 = .loopback(port) };
+    if (Address.parse(host, port)) |address| {
+        list.* = .{
+            .addrs = try allocator.dupe(Address, &.{address}),
+            .allocator = allocator,
+        };
+        return list;
+    } else |_| {}
+
+    const host_name = try HostName.init(host);
+    var result_buffer: [32]HostName.LookupResult = undefined;
+    var result_queue = std.Io.Queue(HostName.LookupResult).init(&result_buffer);
+    try HostName.lookup(host_name, defaultIo(), &result_queue, .{ .port = port });
+
+    var addresses: std.ArrayList(Address) = .empty;
+    defer addresses.deinit(allocator);
+    while (result_queue.getOne(defaultIo())) |result| {
+        switch (result) {
+            .address => |address| try addresses.append(allocator, address),
+            .canonical_name => {},
         }
-        return error.UnknownHostName;
-    };
+    } else |err| switch (err) {
+        error.Closed => {},
+        else => |e| return e,
+    }
+
+    if (addresses.items.len == 0) return error.UnknownHostName;
     list.* = .{
-        .addrs = try allocator.dupe(Address, &.{address}),
+        .addrs = try addresses.toOwnedSlice(allocator),
         .allocator = allocator,
     };
     return list;

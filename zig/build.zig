@@ -91,6 +91,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const api_registry_mod = b.createModule(.{

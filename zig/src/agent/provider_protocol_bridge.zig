@@ -222,11 +222,8 @@ test "InProcessProviderProtocolBridge smoke test" {
             const s = try a.create(event_stream.AssistantMessageEventStream);
             s.* = event_stream.AssistantMessageEventStream.init(a);
 
-            const content = try a.alloc(ai_types.AssistantContent, 1);
-            content[0] = .{ .text = .{ .text = try a.dupe(u8, "ok") } };
-
             s.push(.{ .start = .{ .partial = .{
-                .content = content,
+                .content = &.{.{ .text = .{ .text = "ok" } }},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
@@ -235,6 +232,9 @@ test "InProcessProviderProtocolBridge smoke test" {
                 .timestamp = compat.time.nowMillis(),
                 .is_owned = false,
             } } }) catch {};
+
+            const content = try a.alloc(ai_types.AssistantContent, 1);
+            content[0] = .{ .text = .{ .text = try a.dupe(u8, "ok") } };
 
             s.complete(.{
                 .content = content,

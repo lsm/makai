@@ -282,7 +282,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     defer client.deinit();
 
     // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
-    var environ_map = std.process.Environ.createMap(std.testing.environ, allocator) catch null;
+    var environ_map = compat.createEnvMap(allocator) catch null;
     defer if (environ_map) |*map| map.deinit();
     if (environ_map) |*map| {
         client.initDefaultProxies(allocator, map) catch |err| blk: {

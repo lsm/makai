@@ -74,8 +74,18 @@ pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
 /// rejection sampling. 0.16: use `io.randomSecure` through the Makai default
 /// context and preserve rejection-sampling semantics.
 pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
-    var source: std.Random.IoSource = .{ .io = defaultIo() };
-    return source.interface().intRangeLessThan(T, 0, upper_bound);
+    std.debug.assert(upper_bound > 0);
+
+    const U = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const bound: U = @intCast(upper_bound);
+    const limit: U = std.math.maxInt(U) - (std.math.maxInt(U) % bound);
+
+    while (true) {
+        var bytes: [@sizeOf(U)]u8 = undefined;
+        fillSecureBytes(&bytes);
+        const value = std.mem.readInt(U, &bytes, .little);
+        if (value < limit) return @intCast(value % bound);
+    }
 }
 
 /// Return an ordinary random integer in `[0, upper_bound)` without modulo bias.
