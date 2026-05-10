@@ -322,3 +322,49 @@ test "SSEParser - field without space after colon" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("no space", events[0].data);
 }
+
+
+test "sse_parser_one_byte_incremental_reads_preserve_events" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.init(allocator);
+    defer parser.deinit();
+
+    const input = "event: message\ndata: {\"delta\":\"a\"}\n\ndata: [DONE]\n\n";
+    var completed: usize = 0;
+    var first_seen = false;
+    var done_seen = false;
+
+    for (input) |byte| {
+        const events = try parser.feed((&byte)[0..1]);
+        for (events) |event| {
+            completed += 1;
+            if (completed == 1) {
+                first_seen = true;
+                try std.testing.expectEqualStrings("message", event.event_type.?);
+                try std.testing.expectEqualStrings("{\"delta\":\"a\"}", event.data);
+            } else if (completed == 2) {
+                done_seen = true;
+                try std.testing.expect(event.event_type == null);
+                try std.testing.expectEqualStrings("[DONE]", event.data);
+            }
+        }
+    }
+
+    try std.testing.expect(first_seen);
+    try std.testing.expect(done_seen);
+    try std.testing.expectEqual(@as(usize, 2), completed);
+}
+
+test "sse_parser_provider_error_body_path_surfaces_error_event" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.init(allocator);
+    defer parser.deinit();
+
+    const body = "event: error\ndata: {\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n";
+    const events = try parser.feed(body);
+
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("error", events[0].event_type.?);
+    try std.testing.expect(std.mem.indexOf(u8, events[0].data, "invalid_request_error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, events[0].data, "bad input") != null);
+}

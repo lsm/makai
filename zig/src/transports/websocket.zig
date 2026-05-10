@@ -1078,3 +1078,76 @@ test "AsyncSender and AsyncReceiver interfaces" {
     _ = receiver.receive_stream_fn;
     _ = receiver.context;
 }
+
+
+test "websocket_masking_key_xor_output_byte_for_byte" {
+    const payload = "Mask me";
+    const mask = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+    const encoded = [_]u8{
+        0x81, 0x80 | @as(u8, @intCast(payload.len)),
+        mask[0], mask[1], mask[2], mask[3],
+        payload[0] ^ mask[0],
+        payload[1] ^ mask[1],
+        payload[2] ^ mask[2],
+        payload[3] ^ mask[3],
+        payload[4] ^ mask[0],
+        payload[5] ^ mask[1],
+        payload[6] ^ mask[2],
+    };
+
+    const decoded = decodeFrame(&encoded).?;
+    try std.testing.expectEqual(Opcode.text, decoded.frame.opcode);
+    try std.testing.expect(decoded.frame.masked);
+    try std.testing.expectEqual(encoded.len, decoded.consumed);
+
+    for (decoded.frame.payload, 0..) |masked_byte, i| {
+        try std.testing.expectEqual(payload[i] ^ mask[i % 4], masked_byte);
+        try std.testing.expectEqual(payload[i], masked_byte ^ mask[i % 4]);
+    }
+}
+
+test "websocket_continuation_frame_reassembly_across_fragmented_frames" {
+    const allocator = std.testing.allocator;
+
+    const fragments = [_]Frame{
+        .{ .opcode = .text, .payload = "frag", .fin = false, .masked = false },
+        .{ .opcode = .continuation, .payload = "ment", .fin = false, .masked = false },
+        .{ .opcode = .continuation, .payload = "ed", .fin = true, .masked = false },
+    };
+
+    var wire = std.ArrayList(u8){};
+    defer wire.deinit(allocator);
+
+    for (fragments) |fragment| {
+        const encoded = try encodeFrame(fragment, allocator);
+        defer allocator.free(encoded);
+        try wire.appendSlice(allocator, encoded);
+    }
+
+    var reassembled = std.ArrayList(u8){};
+    defer reassembled.deinit(allocator);
+
+    var offset: usize = 0;
+    var saw_start = false;
+    while (offset < wire.items.len) {
+        const decoded = decodeFrame(wire.items[offset..]).?;
+        offset += decoded.consumed;
+
+        switch (decoded.frame.opcode) {
+            .text => {
+                try std.testing.expect(!saw_start);
+                saw_start = true;
+                try reassembled.appendSlice(allocator, decoded.frame.payload);
+                try std.testing.expect(!decoded.frame.fin);
+            },
+            .continuation => {
+                try std.testing.expect(saw_start);
+                try reassembled.appendSlice(allocator, decoded.frame.payload);
+            },
+            else => return error.UnexpectedOpcode,
+        }
+    }
+
+    try std.testing.expectEqual(wire.items.len, offset);
+    try std.testing.expectEqualStrings("fragmented", reassembled.items);
+}
