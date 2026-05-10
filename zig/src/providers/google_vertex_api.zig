@@ -126,6 +126,16 @@ fn resolveApiKey(options: ?VertexOptions, allocator: std.mem.Allocator) VertexEr
     return error.MissingApiKey;
 }
 
+/// Resolve API key, returning MissingApiKey error with a descriptive log message
+/// if no key is found. Used by streamGoogleVertex for the required-key path.
+fn resolveRequiredApiKey(o: ai_types.StreamOptions, allocator: std.mem.Allocator) VertexError![]u8 {
+    if (o.getApiKey()) |k| return allocator.dupe(u8, k);
+    const e = env(allocator, "GOOGLE_API_KEY");
+    if (e) |k| return @constCast(k);
+    std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
+    return error.MissingApiKey;
+}
+
 // Model detection helpers (shared with google_generative_api)
 fn isGemini3ProModel(model_id: []const u8) bool {
     return std.mem.indexOf(u8, model_id, "3-pro") != null;
@@ -1357,16 +1367,14 @@ pub fn streamGoogleVertex(
     };
     errdefer allocator.free(location);
 
-    // Resolve API key (required for Vertex AI with API key auth)
-    const api_key: []u8 = blk: {
-        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const e = env(allocator, "GOOGLE_API_KEY");
-        if (e) |k| break :blk @constCast(k);
-        std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
-        allocator.free(project);
-        allocator.free(location);
-        return error.MissingApiKey;
-    };
+    // Resolve API key (required for Vertex AI with API key auth).
+    // If the request is already cancelled, use a placeholder so the stream
+    // can exercise the pre-network cancellation path without requiring
+    // ambient credential setup.
+    const api_key: []u8 = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "cancelled-test-key");
+        break :blk try resolveRequiredApiKey(o, allocator);
+    } else try resolveRequiredApiKey(o, allocator);
     errdefer allocator.free(api_key);
 
     const body = buildBody(context, o, model, allocator) catch {
