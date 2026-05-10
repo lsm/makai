@@ -6,6 +6,7 @@
 //!   - tool protocol runtime (remote tool execution callback path)
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -74,7 +75,7 @@ fn handleToolClientEnvelope(
         .message_id = tool_types.generateUlid(),
         .sequence = env.sequence + 1,
         .in_reply_to = env.message_id,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_result = .{
             .execution_id = req.execution_id,
             .tool_call_id = try allocator.dupe(u8, req.tool_call_id),
@@ -144,7 +145,7 @@ fn executeToolViaProtocol(
         .server_id = tool_types.generateUlid(),
         .message_id = tool_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_execute = .{
             .execution_id = tool_types.generateUlid(),
             .tool_call_id = try allocator.dupe(u8, tool_call_id),
@@ -223,7 +224,7 @@ test "distributed fullstack github: agent loop via provider+tool protocols witho
     );
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const tools = [_]agent_types.AgentTool{

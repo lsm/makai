@@ -4,6 +4,7 @@
 //! provider streams to clients via the protocol layer in test environments.
 
 const std = @import("std");
+const compat = @import("compat");
 const protocol_server = @import("protocol_server");
 const envelope = @import("envelope");
 const in_process = @import("transports/in_process");
@@ -39,7 +40,7 @@ pub const ProtocolPump = struct {
                     .stream_id = stream_id,
                     .message_id = protocol_types.generateUlid(),
                     .sequence = seq,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .event = event },
                 };
                 // NOTE: Do NOT call env.deinit() - event payloads have borrowed strings
@@ -65,7 +66,7 @@ pub const ProtocolPump = struct {
                         .stream_id = stream_id,
                         .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat.time.nowMillis(),
                         .payload = .{ .result = result },
                     };
                     // NOTE: Do NOT call env.deinit() - result payloads have borrowed strings
@@ -85,7 +86,7 @@ pub const ProtocolPump = struct {
                         .stream_id = stream_id,
                         .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat.time.nowMillis(),
                         .payload = .{ .stream_error = .{
                             .code = .provider_error,
                             .message = protocol_types.OwnedSlice(u8).initOwned(err_copy),
@@ -135,5 +136,5 @@ pub const ProtocolPump = struct {
 
 /// Helper to get env var or return null
 pub fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }

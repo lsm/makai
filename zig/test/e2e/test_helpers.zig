@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const retry = @import("retry");
 
@@ -7,12 +8,12 @@ pub const DEFAULT_E2E_TIMEOUT_MS: u64 = 60_000;
 
 /// Create a deadline timestamp from now + timeout_ms
 pub fn createDeadline(timeout_ms: u64) i64 {
-    return std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    return compat.time.nowMillis() + @as(i64, @intCast(timeout_ms));
 }
 
 /// Check if deadline has passed
 pub fn isDeadlineExceeded(deadline: i64) bool {
-    return std.time.milliTimestamp() > deadline;
+    return compat.time.nowMillis() > deadline;
 }
 
 /// Wait for stream completion with timeout
@@ -23,7 +24,7 @@ pub fn waitForStreamCompletion(stream: anytype, timeout_ms: u64) !void {
         if (isDeadlineExceeded(deadline)) {
             return error.TimeoutExceeded;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 }
 
@@ -64,7 +65,7 @@ pub fn runWithRetries(
                 std.debug.print("\n  Retry {}/{} after {}ms (error: {})\n", .{
                     attempt + 1, config.max_retries, capped_delay, err
                 });
-                std.Thread.sleep(capped_delay * std.time.ns_per_ms);
+                compat.time.sleepNs(capped_delay * std.time.ns_per_ms);
                 continue;
             }
             return err;
@@ -136,10 +137,10 @@ pub fn skipAzureTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     // Check for AZURE_OPENAI_API_KEY
     if (!shouldSkipProvider(allocator, "azure")) {
         // Has API key, check for AZURE_RESOURCE_NAME or AZURE_OPENAI_ENDPOINT
-        if (std.process.getEnvVarOwned(allocator, "AZURE_OPENAI_ENDPOINT")) |_| {
+        if (compat.getEnvVarOwned(allocator, "AZURE_OPENAI_ENDPOINT")) |_| {
             return; // Has both credentials, don't skip
         } else |_| {}
-        if (std.process.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
+        if (compat.getEnvVarOwned(allocator, "AZURE_RESOURCE_NAME")) |_| {
             return; // Has both credentials, don't skip
         } else |_| {}
     }
@@ -159,7 +160,7 @@ pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!voi
     // Check for GOOGLE_APPLICATION_CREDENTIALS
     if (!shouldSkipProvider(allocator, "google_vertex")) {
         // Has credentials, check for GOOGLE_VERTEX_PROJECT_ID
-        if (std.process.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
+        if (compat.getEnvVarOwned(allocator, "GOOGLE_VERTEX_PROJECT_ID")) |_| {
             return; // Has both credentials, don't skip
         } else |_| {}
     }
@@ -169,7 +170,7 @@ pub fn skipGoogleVertexTest(allocator: std.mem.Allocator) error{SkipZigTest}!voi
 
 /// Print a skip message for Bedrock tests
 pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
-    if (std.process.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {
+    if (compat.getEnvVarOwned(allocator, "AWS_ACCESS_KEY_ID")) |_| {
         return; // Has credentials, don't skip
     } else |_| {}
     std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: E2E test for 'bedrock' - no credentials available (set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION)\n", .{});
@@ -179,7 +180,7 @@ pub fn skipBedrockTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
 /// Print a skip message for Ollama tests
 pub fn skipOllamaTest(allocator: std.mem.Allocator) error{SkipZigTest}!void {
     // Check for OLLAMA_API_KEY environment variable
-    if (std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |key| {
+    if (compat.getEnvVarOwned(allocator, "OLLAMA_API_KEY")) |key| {
         allocator.free(key);
         return; // Has API key, don't skip
     } else |_| {}
@@ -202,10 +203,10 @@ pub const OllamaCredentials = struct {
 /// Returns null if OLLAMA_API_KEY is not set
 pub fn getOllamaCredentials(allocator: std.mem.Allocator) !?OllamaCredentials {
     // Check for OLLAMA_API_KEY
-    const api_key = std.process.getEnvVarOwned(allocator, "OLLAMA_API_KEY") catch return null;
+    const api_key = compat.getEnvVarOwned(allocator, "OLLAMA_API_KEY") catch return null;
 
     // Get base URL (defaults to Ollama cloud if API key is set)
-    const base_url = if (std.process.getEnvVarOwned(allocator, "OLLAMA_BASE_URL")) |url|
+    const base_url = if (compat.getEnvVarOwned(allocator, "OLLAMA_BASE_URL")) |url|
         url
     else |_|
         try allocator.dupe(u8, "https://api.ollama.ai");
@@ -240,7 +241,7 @@ pub const AnthropicCredential = struct {
 /// 3. ~/.makai/auth.json (fallback)
 pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredential {
     // 1. Try ANTHROPIC_AUTH_TOKEN first (OAuth token)
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // OAuth token format: "refresh_token:access_token" or just "access_token"
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
             const access_token = try allocator.dupe(u8, token[colon_pos + 1 ..]);
@@ -259,7 +260,7 @@ pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredentia
     } else |_| {}
 
     // 2. Try ANTHROPIC_API_KEY
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| {
         return AnthropicCredential{
             .token = key,
             .is_oauth = false,
@@ -273,16 +274,20 @@ pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredentia
 /// Read Anthropic credential from ~/.makai/auth.json
 /// Checks for oauth_token first, then api_key
 fn getAnthropicCredentialFromAuthFile(allocator: std.mem.Allocator) !?AnthropicCredential {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home_dir = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home_dir);
 
     const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
     defer allocator.free(auth_path);
 
-    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.testing.io, auth_path, .{}) catch return null;
+    defer file.close(std.testing.io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size > 1024 * 1024) return null;
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(std.testing.io, &read_buffer);
+    const content = try reader.interface.readAlloc(allocator, @intCast(stat.size));
     defer allocator.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
@@ -347,7 +352,7 @@ pub fn getApiKey(allocator: std.mem.Allocator, provider_name: []const u8) !?[]co
     }
 
     // Try environment variable first
-    if (std.process.getEnvVarOwned(allocator, env_var_name.items)) |key| {
+    if (compat.getEnvVarOwned(allocator, env_var_name.items)) |key| {
         return key;
     } else |_| {
         // Fall back to auth.json
@@ -357,16 +362,20 @@ pub fn getApiKey(allocator: std.mem.Allocator, provider_name: []const u8) !?[]co
 
 /// Read API key from ~/.makai/auth.json
 fn getApiKeyFromAuthFile(allocator: std.mem.Allocator, provider_name: []const u8) !?[]const u8 {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home_dir = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home_dir);
 
     const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
     defer allocator.free(auth_path);
 
-    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.testing.io, auth_path, .{}) catch return null;
+    defer file.close(std.testing.io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size > 1024 * 1024) return null;
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(std.testing.io, &read_buffer);
+    const content = try reader.interface.readAlloc(allocator, @intCast(stat.size));
     defer allocator.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
@@ -417,8 +426,8 @@ pub const GitHubCopilotCredentials = struct {
 /// Get GitHub Copilot credentials from environment variable or ~/.makai/auth.json
 pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilotCredentials {
     // Try separate environment variables first (GH_COPILOT_REFRESH and GH_COPILOT_ACCESS)
-    const refresh_result = std.process.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH");
-    const access_result = std.process.getEnvVarOwned(allocator, "GH_COPILOT_ACCESS");
+    const refresh_result = compat.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH");
+    const access_result = compat.getEnvVarOwned(allocator, "GH_COPILOT_ACCESS");
     
     if (refresh_result) |refresh_token| {
         if (access_result) |access_token| {
@@ -441,7 +450,7 @@ pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilot
     }
     
     // Try combined format (COPILOT_TOKEN for backward compatibility)
-    if (std.process.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
+    if (compat.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
         // Check for combined format: "github_token:copilot_token"
         // Split on the first colon - copilot_token may contain colons (semicolons in the token)
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
@@ -470,16 +479,20 @@ pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilot
 
 /// Read GitHub Copilot credentials from ~/.makai/auth.json
 fn getGitHubCopilotCredentialsFromAuthFile(allocator: std.mem.Allocator) !?GitHubCopilotCredentials {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home_dir = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home_dir);
 
     const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
     defer allocator.free(auth_path);
 
-    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.testing.io, auth_path, .{}) catch return null;
+    defer file.close(std.testing.io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size > 1024 * 1024) return null;
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(std.testing.io, &read_buffer);
+    const content = try reader.interface.readAlloc(allocator, @intCast(stat.size));
     defer allocator.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
@@ -526,13 +539,13 @@ fn getGitHubCopilotCredentialsFromAuthFile(allocator: std.mem.Allocator) !?GitHu
 /// Check if GitHub Copilot provider should be skipped (no credentials)
 pub fn shouldSkipGitHubCopilot(allocator: std.mem.Allocator) bool {
     // Check for separate env vars first
-    if (std.process.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH")) |token| {
+    if (compat.getEnvVarOwned(allocator, "GH_COPILOT_REFRESH")) |token| {
         allocator.free(token);
         return false;
     } else |_| {}
     
     // Check combined format
-    if (std.process.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
+    if (compat.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
         allocator.free(token);
         return false;
     } else |_| {}
@@ -563,7 +576,7 @@ pub const AnthropicOAuthCredentials = struct {
 /// Get Anthropic OAuth credentials from environment variable or ~/.makai/auth.json
 pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
     // 1. Try ANTHROPIC_AUTH_TOKEN (combined format: "refresh_token:access_token" or single token)
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // Split on the first colon
         if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
             const refresh_token = token[0..colon_pos];
@@ -590,16 +603,20 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
 
 /// Read Anthropic OAuth credentials from ~/.makai/auth.json
 fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?AnthropicOAuthCredentials {
-    const home_dir = std.process.getEnvVarOwned(allocator, "HOME") catch return null;
+    const home_dir = compat.getEnvVarOwned(allocator, "HOME") catch return null;
     defer allocator.free(home_dir);
 
     const auth_path = try std.fs.path.join(allocator, &[_][]const u8{ home_dir, ".makai", "auth.json" });
     defer allocator.free(auth_path);
 
-    const file = std.fs.openFileAbsolute(auth_path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(std.testing.io, auth_path, .{}) catch return null;
+    defer file.close(std.testing.io);
 
-    const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+    const stat = try file.stat(std.testing.io);
+    if (stat.size > 1024 * 1024) return null;
+    var read_buffer: [4096]u8 = undefined;
+    var reader = file.reader(std.testing.io, &read_buffer);
+    const content = try reader.interface.readAlloc(allocator, @intCast(stat.size));
     defer allocator.free(content);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
@@ -649,7 +666,7 @@ fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?Anth
 /// Check if Anthropic OAuth provider should be skipped (no credentials)
 pub fn shouldSkipAnthropicOAuth(allocator: std.mem.Allocator) bool {
     // Check for ANTHROPIC_AUTH_TOKEN
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         allocator.free(token);
         return false;
     } else |_| {}
@@ -867,7 +884,7 @@ pub fn basicTextGeneration(
             if (isDeadlineExceeded(deadline)) {
                 return error.TimeoutExceeded;
             }
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            compat.time.sleepNs(10 * std.time.ns_per_ms);
         }
     }
 

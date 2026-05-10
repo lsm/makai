@@ -3,6 +3,7 @@
 //! Tests provider protocol stack: ProtocolClient -> SerializedPipe -> ProtocolServer -> GitHub Copilot
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -75,7 +76,7 @@ test "ProviderProtocol: GitHub Copilot streaming through ProtocolServer and Prot
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Reply with exactly: hello world" },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -137,7 +138,7 @@ test "ProviderProtocol: GitHub Copilot streaming through ProtocolServer and Prot
             break;
         }
 
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Check for errors before asserting success
@@ -204,7 +205,7 @@ test "ProviderProtocol: GitHub Copilot abort through protocol layer" {
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Write a long story about a space adventure." },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -242,7 +243,7 @@ test "ProviderProtocol: GitHub Copilot abort through protocol layer" {
             event_count += 1;
         }
 
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Check for errors before proceeding

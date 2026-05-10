@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -7,7 +8,7 @@ const stream_mod = @import("stream");
 const testing = std.testing;
 
 fn envOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 test "azure e2e: openai responses (cheap model)" {
@@ -43,7 +44,7 @@ test "azure e2e: openai responses (cheap model)" {
         .max_tokens = 64,
     };
 
-    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: azure ok" }, .timestamp = std.time.timestamp() } };
+    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: azure ok" }, .timestamp = compat.time.nowSeconds() } };
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed(key), .max_tokens = 48, .temperature = 0.0 }, testing.allocator);
@@ -54,7 +55,7 @@ test "azure e2e: openai responses (cheap model)" {
 
     while (!stream.isDone()) {
         _ = stream.poll();
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     if (stream.getError()) |err| {

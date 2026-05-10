@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
@@ -9,7 +10,7 @@ const test_helpers = @import("test_helpers");
 const testing = std.testing;
 
 fn envOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 fn waitResultOrFail(stream: *event_stream.AssistantMessageEventStream) !ai_types.AssistantMessage {
@@ -19,11 +20,11 @@ fn waitResultOrFail(stream: *event_stream.AssistantMessageEventStream) !ai_types
             return error.TimeoutExceeded;
         }
         _ = stream.poll();
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Small delay to allow detached provider thread to fully exit and free resources
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: openai e2e stream error: {s}\n", .{err});
@@ -60,7 +61,7 @@ test "openai e2e: chat completions (cheap model)" {
         .max_tokens = 48,
     };
 
-    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: openai ok" }, .timestamp = std.time.timestamp() } };
+    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: openai ok" }, .timestamp = compat.time.nowSeconds() } };
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed(key), .max_tokens = 48, .temperature = 0.0 }, testing.allocator);
@@ -106,7 +107,7 @@ test "openai e2e: responses api (cheap model)" {
         .max_tokens = 48,
     };
 
-    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: responses ok" }, .timestamp = std.time.timestamp() } };
+    const user = ai_types.Message{ .user = .{ .content = .{ .text = "Reply with: responses ok" }, .timestamp = compat.time.nowSeconds() } };
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
 
     const stream = try stream_mod.stream(&registry, model, ctx, .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed(key), .max_tokens = 48, .temperature = 0.0 }, testing.allocator);

@@ -210,6 +210,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "retry", .module = retry_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
@@ -867,6 +868,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -882,6 +884,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -898,6 +901,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -913,6 +917,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -928,6 +933,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -944,6 +950,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -964,6 +971,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -1022,6 +1030,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -1382,6 +1391,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
