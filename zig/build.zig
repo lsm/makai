@@ -160,6 +160,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/utils/retry.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const oom_mod = b.createModule(.{
@@ -449,6 +452,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
