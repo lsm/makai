@@ -81,9 +81,15 @@ fn streamViaProtocol(
     return out_stream;
 }
 
-fn pushEventBlocking(stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
+fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
+    const cloned = try ai_types.cloneAssistantMessageEvent(allocator, ev);
+    errdefer {
+        var cleanup = cloned;
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
+    }
+
     while (true) {
-        stream.push(ev) catch |err| switch (err) {
+        stream.push(cloned) catch |err| switch (err) {
             error.QueueFull => {
                 std.Thread.sleep(1 * std.time.ns_per_ms);
                 continue;
@@ -94,9 +100,9 @@ fn pushEventBlocking(stream: *event_stream.AssistantMessageEventStream, ev: ai_t
     }
 }
 
-fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.AssistantMessageEventStream) !void {
+fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
     while (client.getEventStream().poll()) |ev| {
-        try pushEventBlocking(out_stream, ev);
+        try pushEventBlocking(allocator, out_stream, ev);
     }
 }
 
@@ -151,7 +157,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
             return;
         };
 
-        drainClientEvents(&client, ctx.out_stream) catch |err| {
+        drainClientEvents(&client, ctx.out_stream, ctx.allocator) catch |err| {
             ctx.out_stream.completeWithError(@errorName(err));
             return;
         };
@@ -166,7 +172,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
 
     // Final drain after completion.
     _ = runtime.pumpOnce(&client) catch {};
-    drainClientEvents(&client, ctx.out_stream) catch |err| {
+    drainClientEvents(&client, ctx.out_stream, ctx.allocator) catch |err| {
         ctx.out_stream.completeWithError(@errorName(err));
         return;
     };
