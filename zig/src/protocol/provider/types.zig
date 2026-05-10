@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const owned_slice_mod = @import("owned_slice");
 const model_catalog_types = @import("model_catalog_types");
+const compat = @import("compat");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -90,7 +91,7 @@ fn ulidDecode(c: u8) ?u5 {
 pub fn generateUlid() Ulid {
     var ulid: Ulid = undefined;
 
-    const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+    const now_ms: u64 = @intCast(@max(compat.time.nowMillis(), 0));
     ulid[0] = @intCast((now_ms >> 40) & 0xff);
     ulid[1] = @intCast((now_ms >> 32) & 0xff);
     ulid[2] = @intCast((now_ms >> 24) & 0xff);
@@ -445,7 +446,7 @@ test "generateSessionId produces 21-character alphanumeric NanoID" {
 
 test "generateUlid produces valid ULID" {
     const ulid = generateUlid();
-    const now_ms: u64 = @intCast(@max(std.time.milliTimestamp(), 0));
+    const now_ms: u64 = @intCast(@max(compat.time.nowMillis(), 0));
     const ulid_ms = (@as(u64, ulid[0]) << 40) |
         (@as(u64, ulid[1]) << 32) |
         (@as(u64, ulid[2]) << 24) |
@@ -542,7 +543,7 @@ test "Envelope with ping payload" {
         .stream_id = ulid,
         .message_id = generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
 

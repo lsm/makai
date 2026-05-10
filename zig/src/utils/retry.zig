@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 /// Retry configuration
 pub const RetryConfig = struct {
@@ -21,7 +22,7 @@ pub const RetryConfig = struct {
 
         // Apply jitter if factor > 0
         if (self.jitter_factor > 0) {
-            const seed = @as(u64, @intCast(std.time.nanoTimestamp()));
+            const seed = @as(u64, @intCast(compat.time.nowNanos()));
             var prng = std.Random.DefaultPrng.init(seed);
             const rand = prng.random().float(f32);
             // jitter_mult ranges from (1 - jitter_factor) to (1 + jitter_factor)
@@ -76,7 +77,7 @@ pub fn extractRetryDelayFromHeader(header_value: ?[]const u8) ?u64 {
     // Try parsing as HTTP date (RFC 1123)
     // Format: "Wed, 21 Oct 2015 07:28:00 GMT"
     if (parseHttpDate(trimmed)) |timestamp_ms| {
-        const now_ms = @as(u64, @intCast(std.time.timestamp())) * 1000;
+        const now_ms = @as(u64, @intCast(compat.time.nowSeconds())) * 1000;
         if (timestamp_ms > now_ms) {
             return timestamp_ms - now_ms;
         }
@@ -379,7 +380,7 @@ pub fn isRetryableError(error_text: []const u8) bool {
 /// Returns false if cancelled, true if completed normally.
 pub fn sleepMs(ms: u64, cancel_token: ?*const std.atomic.Value(bool)) bool {
     const check_interval_ms: u64 = 100;
-    const ns_per_ms: u64 = 1_000_000;
+    const ns_per_ms: u64 = std.time.ns_per_ms;
     var remaining: u64 = ms;
 
     while (remaining > 0) {
@@ -391,7 +392,7 @@ pub fn sleepMs(ms: u64, cancel_token: ?*const std.atomic.Value(bool)) bool {
         }
 
         const sleep_time = @min(remaining, check_interval_ms);
-        std.Thread.sleep(sleep_time * ns_per_ms);
+        compat.time.sleepNs(sleep_time * ns_per_ms);
         remaining -= sleep_time;
     }
 
@@ -592,24 +593,24 @@ test "indexOfCaseInsensitive finds substrings correctly" {
 }
 
 test "sleepMs completes normally without cancel token" {
-    const ns_per_ms: i128 = 1_000_000;
-    const start = std.time.nanoTimestamp();
+    const ns_per_ms: u64 = std.time.ns_per_ms;
+    const start = try compat.time.monotonicNanos();
     const completed = sleepMs(50, null);
-    const elapsed = std.time.nanoTimestamp() - start;
+    const elapsed = try compat.time.monotonicNanos() - start;
 
     try std.testing.expect(completed);
     try std.testing.expect(elapsed >= 50 * ns_per_ms);
 }
 
 test "sleepMs respects cancel token" {
-    const ns_per_ms: u64 = 1_000_000;
+    const ns_per_ms: u64 = std.time.ns_per_ms;
     var cancelled = std.atomic.Value(bool).init(false);
 
     // Start a timer to cancel after 10ms
     const ThreadCtx = struct {
         cancel_token: *std.atomic.Value(bool),
         fn run(self: *@This()) void {
-            std.Thread.sleep(10 * ns_per_ms);
+            compat.time.sleepNs(10 * ns_per_ms);
             self.cancel_token.store(true, .release);
         }
     };
