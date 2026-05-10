@@ -25,6 +25,13 @@ const SerializedPipe = in_process.SerializedPipe;
 /// Idle pump sleep when the auth protocol runtime has no immediate work.
 const IDLE_SLEEP_NS = std.time.ns_per_ms;
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Hard upper bound on iterations spent waiting for terminal envelopes.
 /// 60_000 iterations × 1ms ≈ 60s per command. Real OAuth flows finish in well
 /// under a minute; the bound exists so a stuck flow still yields control.
@@ -135,7 +142,7 @@ pub fn runProvidersCommand(
                 else => {},
             }
         }
-        if (!did_work) std.Thread.sleep(IDLE_SLEEP_NS);
+        if (!did_work) compat.time.sleepNs(IDLE_SLEEP_NS);
     }
 
     return AuthCliError.AuthProtocolTimeout;
@@ -221,7 +228,7 @@ pub fn runLoginCommand(
                 else => {},
             }
         }
-        if (!did_work) std.Thread.sleep(IDLE_SLEEP_NS);
+        if (!did_work) compat.time.sleepNs(IDLE_SLEEP_NS);
     }
 
     if (!saw_terminal) return AuthCliError.AuthProtocolTimeout;
@@ -532,14 +539,14 @@ fn appendJsonStringField(
 // =============================================================================
 
 pub const FileIo = struct {
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
     allocator: std.mem.Allocator,
     leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     read_buf: [4096]u8 = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File, stderr: std.fs.File) FileIo {
+    pub fn init(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io.File, stderr: std.Io.File) FileIo {
         return .{
             .stdin = stdin,
             .stdout = stdout,
@@ -569,7 +576,7 @@ pub const FileIo = struct {
                 return dup;
             }
 
-            const bytes_read = self.stdin.read(&self.read_buf) catch |err| return err;
+            const bytes_read = self.stdin.readStreaming(defaultIo(), &.{&self.read_buf}) catch |err| return err;
             if (bytes_read == 0) {
                 if (self.leftover.items.len == 0) return error.EndOfStream;
                 const raw = self.leftover.items;
@@ -589,12 +596,12 @@ pub const FileIo = struct {
 
     fn writeOutFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FileIo = @ptrCast(@alignCast(ctx));
-        try self.stdout.writeAll(bytes);
+        try self.stdout.writeStreamingAll(defaultIo(), bytes);
     }
 
     fn writeErrFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FileIo = @ptrCast(@alignCast(ctx));
-        try self.stderr.writeAll(bytes);
+        try self.stderr.writeStreamingAll(defaultIo(), bytes);
     }
 };
 
@@ -617,7 +624,7 @@ const TestIo = struct {
 
     fn init(allocator: std.mem.Allocator) TestIo {
         return .{
-            .inputs = std.ArrayList([]const u8){},
+            .inputs = .empty,
             .allocator = allocator,
         };
     }

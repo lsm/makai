@@ -668,6 +668,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -1153,6 +1154,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -1181,6 +1183,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 

@@ -240,11 +240,11 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
         if (poll_result.error_msg) |err_msg| {
             if (std.mem.eql(u8, err_msg, "authorization_pending")) {
-                std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+                compat.time.sleepNs(interval_ms * std.time.ns_per_ms);
                 continue;
             } else if (std.mem.eql(u8, err_msg, "slow_down")) {
                 interval_ms += 5000;
-                std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+                compat.time.sleepNs(interval_ms * std.time.ns_per_ms);
                 continue;
             } else {
                 return error.OAuthFailed;
