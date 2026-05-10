@@ -57,10 +57,10 @@ pub fn readResponse(reader: *ResponseReader, buffer: []u8) !usize {
     return inner.readSliceShort(buffer);
 }
 
-/// Read exactly `buffer.len` bytes from a response body reader.
-pub fn readAllResponse(reader: *ResponseReader, buffer: []u8) !void {
+/// Read up to `buffer.len` bytes from a response body reader.
+pub fn readAllResponse(reader: *ResponseReader, buffer: []u8) !usize {
     const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
-    try inner.readSliceAll(buffer);
+    return inner.readSliceShort(buffer);
 }
 
 /// Return a streaming reader for a response body.
