@@ -6,6 +6,7 @@
 //! without requiring external provider credentials.
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const event_stream = @import("event_stream");
@@ -42,7 +43,7 @@ fn makeToolUseMessage(allocator: std.mem.Allocator) !ai_types.AssistantMessage {
         .model = "mock-model",
         .usage = .{},
         .stop_reason = .tool_use,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .is_owned = false,
     };
 }
@@ -60,7 +61,7 @@ fn makeFinalMessage(allocator: std.mem.Allocator) !ai_types.AssistantMessage {
         .model = "mock-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .is_owned = false,
     };
 }
@@ -151,7 +152,7 @@ fn remoteSumToolExecute(
                 .message_id = tool_types.generateUlid(),
                 .sequence = env.sequence + 1,
                 .in_reply_to = env.message_id,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .{ .tool_result = .{
                     .execution_id = req.execution_id,
                     .tool_call_id = try test_allocator.dupe(u8, req.tool_call_id),
@@ -194,7 +195,7 @@ fn remoteSumToolExecute(
         .server_id = tool_types.generateUlid(),
         .message_id = tool_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_execute = .{
             .execution_id = tool_types.generateUlid(),
             .tool_call_id = try allocator.dupe(u8, tool_call_id),
@@ -235,7 +236,7 @@ fn filterContextForProtocol(
     allocator: std.mem.Allocator,
 ) anyerror![]const ai_types.Message {
     _ = ctx;
-    var filtered = std.ArrayList(ai_types.Message){};
+    var filtered = std.ArrayList(ai_types.Message).empty;
     defer filtered.deinit(allocator);
 
     for (messages) |message| {
@@ -277,7 +278,7 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
     const prompt_text = try allocator.dupe(u8, "What is 2 + 3?");
     const prompt = ai_types.Message{ .user = .{
         .content = .{ .text = prompt_text },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const tools = [_]agent_types.AgentTool{

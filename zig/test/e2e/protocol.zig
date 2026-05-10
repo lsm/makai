@@ -8,6 +8,17 @@ const stdio = @import("stdio");
 
 const testing = std.testing;
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+fn fileFromPipeHandle(handle: std.Io.File.Handle) std.Io.File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+}
+
 // =============================================================================
 // Mock Transport for Testing
 // =============================================================================
@@ -276,10 +287,10 @@ test "Envelope roundtrip preserves goodbye" {
 
 test "Stdio transport frames messages correctly" {
     // Create a pipe for testing
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Create sender with write end
     var stdio_sender = stdio.AsyncStdioSender.initWithFile(write_file);
@@ -290,7 +301,7 @@ test "Stdio transport frames messages correctly" {
     const msg2 = "{\"type\":\"start\",\"model\":\"test\"}";
     try sender.write(msg1);
     try sender.write(msg2);
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Create receiver with read end
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
@@ -321,15 +332,15 @@ test "Stdio transport frames messages correctly" {
 }
 
 test "Stdio transport handles multi-line message splitting" {
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Write multiple messages at once (with newlines)
     const combined = "{\"type\":\"ping\"}\n{\"type\":\"pong\"}\n{\"type\":\"ack\"}\n";
-    _ = try write_file.write(combined);
-    write_file.close();
+    try write_file.writeStreamingAll(defaultIo(), combined);
+    write_file.close(defaultIo());
 
     // Create receiver
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
@@ -360,10 +371,10 @@ test "Stdio transport sends and receives messages" {
     const allocator = testing.allocator;
 
     // Create a pipe for testing
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = fileFromPipeHandle(pipe[0]);
+    const write_file = fileFromPipeHandle(pipe[1]);
+    defer read_file.close(defaultIo());
 
     // Create a simple message
     const msg = "test-message-123";
@@ -373,7 +384,7 @@ test "Stdio transport sends and receives messages" {
     var sender = stdio_sender.sender();
     try sender.write(msg);
     try sender.write("\n"); // Add newline terminator
-    write_file.close();
+    write_file.close(defaultIo());
 
     // Receive through stdio transport
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(read_file);
