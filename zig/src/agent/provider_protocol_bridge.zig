@@ -102,6 +102,8 @@ fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.Assista
 
 fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
     while (client.getEventStream().poll()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
         try pushEventBlocking(allocator, out_stream, ev);
     }
 }
