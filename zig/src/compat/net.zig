@@ -61,10 +61,11 @@ pub fn tcpConnectAny(list: *const AddressList) !Stream {
 
     var last_err: ?anyerror = null;
     for (list.addrs) |address| {
-        return tcpConnect(address) catch |err| {
+        if (tcpConnect(address)) |stream| {
+            return stream;
+        } else |err| {
             last_err = err;
-            continue;
-        };
+        }
     }
 
     return last_err orelse error.ConnectionRefused;

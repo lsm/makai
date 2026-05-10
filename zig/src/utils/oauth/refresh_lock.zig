@@ -481,6 +481,15 @@ pub const RefreshLock = struct {
 // ===========================================================================
 
 const testing = std.testing;
+const waiter_spin_limit = 10_000;
+
+fn waitForRefCount(lock: *RefreshLock, provider: []const u8, expected: usize) !void {
+    var attempts: usize = 0;
+    while (lock.refCountForTesting(provider, null) < expected) : (attempts += 1) {
+        if (attempts >= waiter_spin_limit) return error.WaiterRefCountTimeout;
+        std.Thread.sleep(1 * std.time.ns_per_ms);
+    }
+}
 
 fn expectAcquired(result: RefreshLock.AcquireResult) !u64 {
     return switch (result) {
@@ -633,9 +642,7 @@ test "concurrent requests for same provider trigger only one refresh" {
         t.* = try std.Thread.spawn(.{}, concurrentWorker, .{&ctx});
     }
 
-    while (lock.refCountForTesting("test-provider", null) < num_waiters + 1) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
+    try waitForRefCount(&lock, "test-provider", num_waiters + 1);
     lock.complete("test-provider", null, first_gen, null);
 
     for (&threads) |t| {
@@ -673,9 +680,7 @@ test "all waiting requests succeed after a single shared refresh completes" {
         t.* = try std.Thread.spawn(.{}, concurrentWorker, .{&ctx});
     }
 
-    while (lock.refCountForTesting("prov-ok", null) < num_waiters + 1) {
-        std.Thread.sleep(1 * std.time.ns_per_ms);
-    }
+    try waitForRefCount(&lock, "prov-ok", num_waiters + 1);
     lock.complete("prov-ok", null, first_gen, null);
 
     for (&threads) |t| {

@@ -52,13 +52,20 @@ pub fn writeFile(dir: std.fs.Dir, path: []const u8, data: []const u8) !void {
 pub fn atomicReplace(dir: std.fs.Dir, target_path: []const u8, tmp_path: []const u8, data: []const u8) !void {
     if (std.mem.eql(u8, target_path, tmp_path)) return error.InvalidAtomicReplacePaths;
 
+    dir.deleteFile(tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
     var cleanup_tmp = false;
     defer if (cleanup_tmp) dir.deleteFile(tmp_path) catch {};
 
-    var file = try dir.createFile(tmp_path, .{ .truncate = false, .exclusive = true, .mode = default_file_mode });
-    cleanup_tmp = true;
-    try file.writeAll(data);
-    file.close();
+    {
+        var file = try dir.createFile(tmp_path, .{ .truncate = false, .exclusive = true, .mode = default_file_mode });
+        cleanup_tmp = true;
+        defer file.close();
+        try file.writeAll(data);
+    }
 
     try dir.rename(tmp_path, target_path);
     cleanup_tmp = false;
@@ -103,22 +110,20 @@ test "compat atomic replace re-hardens existing target mode" {
     try std.testing.expectEqual(@as(std.fs.File.Mode, default_file_mode), stat.mode & 0o777);
 }
 
-test "compat atomic replace requires a fresh temporary path" {
+test "compat atomic replace recovers from a stale temporary path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeFile(tmp.dir, "target.txt", "target");
     try writeFile(tmp.dir, "target.txt.tmp", "stale");
 
-    try std.testing.expectError(error.PathAlreadyExists, atomicReplace(tmp.dir, "target.txt", "target.txt.tmp", "new"));
+    try atomicReplace(tmp.dir, "target.txt", "target.txt.tmp", "new");
 
     const target = try readFileAlloc(std.testing.allocator, tmp.dir, "target.txt", 1024);
     defer std.testing.allocator.free(target);
-    try std.testing.expectEqualStrings("target", target);
+    try std.testing.expectEqualStrings("new", target);
 
-    const tmp_contents = try readFileAlloc(std.testing.allocator, tmp.dir, "target.txt.tmp", 1024);
-    defer std.testing.allocator.free(tmp_contents);
-    try std.testing.expectEqualStrings("stale", tmp_contents);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("target.txt.tmp", .{}));
 }
 
 test "compat filesystem wrappers create directories and open files" {
