@@ -36,12 +36,12 @@ var monotonic_mutex: std.Thread.Mutex = .{};
 /// monotonic origin and can be subtracted for elapsed-duration math.
 /// 0.16: use `std.Io.Clock`/the chosen default-context monotonic clock
 /// internally while keeping raw `std.Io` out of this API.
-pub fn monotonicNanos() !u64 {
+pub fn monotonicNanos() u64 {
     monotonic_mutex.lock();
     defer monotonic_mutex.unlock();
 
     if (monotonic_timer == null) {
-        monotonic_timer = try std.time.Timer.start();
+        monotonic_timer = std.time.Timer.start() catch return 0;
     }
 
     return monotonic_timer.?.read();
@@ -65,7 +65,7 @@ test "compat time helpers return expected public types" {
     const millis: i64 = nowMillis();
     const seconds: i64 = nowSeconds();
     const nanos: i64 = nowNanos();
-    const monotonic: u64 = try monotonicNanos();
+    const monotonic: u64 = monotonicNanos();
 
     _ = millis;
     _ = seconds;
@@ -86,17 +86,17 @@ test "compat time helpers return plausible wall-clock timestamps" {
 }
 
 test "compat monotonic nanoseconds are nondecreasing" {
-    const before = try monotonicNanos();
+    const before = monotonicNanos();
     sleepNs(1);
-    const after = try monotonicNanos();
+    const after = monotonicNanos();
 
     try std.testing.expect(after >= before);
 }
 
 test "compat sleep helpers bound short sleeps" {
-    const start_ns = try monotonicNanos();
+    const start_ns = monotonicNanos();
     sleepNs(1 * std.time.ns_per_ms);
-    const elapsed_ns = try monotonicNanos() - start_ns;
+    const elapsed_ns = monotonicNanos() - start_ns;
 
     // Only assert the lower bound: `sleepNs` must wait at least the requested
     // duration. Avoid an absolute upper bound here because scheduler pauses on

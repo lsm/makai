@@ -59,6 +59,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/compat/mod.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+        },
     });
 
     const streaming_json_mod = b.createModule(.{
@@ -114,6 +117,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/utils/oauth/pkce.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const oauth_anthropic_mod = b.createModule(.{
@@ -203,6 +209,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/oauth/pkce.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const openai_completions_api_mod = b.createModule(.{
@@ -390,6 +399,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -799,6 +809,7 @@ pub fn build(b: *std.Build) void {
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
 
     const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
+    const oauth_utils_pkce_test = b.addTest(.{ .root_module = oauth_utils_pkce_mod });
 
     const refresh_lock_test = b.addTest(.{ .root_module = refresh_lock_mod });
 
@@ -809,6 +820,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "pkce", .module = oauth_pkce_mod },
+                .{ .name = "compat", .module = compat_mod },
             },
         }),
     });
@@ -1184,6 +1196,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
@@ -1265,6 +1278,7 @@ pub fn build(b: *std.Build) void {
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);

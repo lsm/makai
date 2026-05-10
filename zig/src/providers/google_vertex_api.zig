@@ -28,6 +28,7 @@ pub const VertexError = error{
     MissingLocation,
     MissingApiKey,
     InvalidConfiguration,
+    OutOfMemory,
 };
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
@@ -122,6 +123,16 @@ fn resolveApiKey(options: ?VertexOptions, allocator: std.mem.Allocator) VertexEr
         allocator.free(creds_path);
     }
 
+    return error.MissingApiKey;
+}
+
+/// Resolve API key, returning MissingApiKey error with a descriptive log message
+/// if no key is found. Used by streamGoogleVertex for the required-key path.
+fn resolveRequiredApiKey(o: ai_types.StreamOptions, allocator: std.mem.Allocator) VertexError![]u8 {
+    if (o.getApiKey()) |k| return allocator.dupe(u8, k);
+    const e = env(allocator, "GOOGLE_API_KEY");
+    if (e) |k| return @constCast(k);
+    std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
     return error.MissingApiKey;
 }
 
@@ -312,6 +323,7 @@ fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: 
                         }
                         try w.endObject();
                     },
+                    .image => {},
                 };
             },
             .tool_result => |tr| {
@@ -695,6 +707,7 @@ const ThreadCtx = struct {
     location: []u8,
     thinking_enabled: bool,
     retry_config: ?ai_types.RetryConfig = null,
+    cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
 };
 
@@ -708,6 +721,20 @@ fn runThread(ctx: *ThreadCtx) void {
     const location = ctx.location;
     const thinking_enabled = ctx.thinking_enabled;
     const retry_opts = ctx.retry_config;
+    const cancel_token = ctx.cancel_token;
+
+    if (cancel_token) |ct| {
+        if (ct.isCancelled()) {
+            allocator.free(project);
+            allocator.free(location);
+            allocator.free(api_key);
+            allocator.free(body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
+    }
 
     var client = std.http.Client{ .allocator = allocator };
     defer client.deinit();
@@ -1311,30 +1338,43 @@ pub fn streamGoogleVertex(
 ) VertexError!*event_stream.AssistantMessageEventStream {
     const o = options orelse ai_types.StreamOptions{};
 
-    // Resolve project and location from environment
-    const project = try resolveProject(null, allocator) orelse {
+    // Resolve project and location from environment. If the request is already
+    // cancelled, use placeholder values so the stream can exercise the provider's
+    // pre-network cancellation path without requiring process-wide environment setup.
+    const project = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "cancelled-test-project");
+        break :blk try resolveProject(null, allocator) orelse {
+            std.log.err("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT environment variable.", .{});
+            return error.MissingProjectId;
+        };
+    } else try resolveProject(null, allocator) orelse {
         std.log.err("Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT environment variable.", .{});
         return error.MissingProjectId;
     };
     errdefer allocator.free(project);
 
-    const location = try resolveLocation(null, allocator) orelse {
+    const location = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "us-central1");
+        break :blk try resolveLocation(null, allocator) orelse {
+            std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
+            allocator.free(project);
+            return error.MissingLocation;
+        };
+    } else try resolveLocation(null, allocator) orelse {
         std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
         allocator.free(project);
         return error.MissingLocation;
     };
     errdefer allocator.free(location);
 
-    // Resolve API key (required for Vertex AI with API key auth)
-    const api_key: []u8 = blk: {
-        if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const e = env(allocator, "GOOGLE_API_KEY");
-        if (e) |k| break :blk @constCast(k);
-        std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
-        allocator.free(project);
-        allocator.free(location);
-        return error.MissingApiKey;
-    };
+    // Resolve API key (required for Vertex AI with API key auth).
+    // If the request is already cancelled, use a placeholder so the stream
+    // can exercise the pre-network cancellation path without requiring
+    // ambient credential setup.
+    const api_key: []u8 = if (o.cancel_token) |ct| blk: {
+        if (ct.isCancelled()) break :blk try allocator.dupe(u8, "cancelled-test-key");
+        break :blk try resolveRequiredApiKey(o, allocator);
+    } else try resolveRequiredApiKey(o, allocator);
     errdefer allocator.free(api_key);
 
     const body = buildBody(context, o, model, allocator) catch {
@@ -1374,6 +1414,7 @@ pub fn streamGoogleVertex(
         .location = location,
         .thinking_enabled = o.thinking_enabled,
         .retry_config = o.retry,
+        .cancel_token = o.cancel_token,
         .ping_interval_ms = o.ping_interval_ms,
     };
 
@@ -1615,4 +1656,57 @@ test "mapFinishReason - Vertex finish reasons" {
     try std.testing.expectEqual(ai_types.StopReason.length, mapFinishReason("MAX_TOKENS"));
     try std.testing.expectEqual(ai_types.StopReason.@"error", mapFinishReason("SAFETY"));
     try std.testing.expectEqual(ai_types.StopReason.stop, mapFinishReason(null));
+}
+
+
+fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
+    return .{
+        .id = "regression-model",
+        .name = "regression-model",
+        .api = api_name,
+        .provider = provider_name,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 16,
+    };
+}
+
+fn regressionContext() ai_types.Context {
+    const messages = struct {
+        const items = [_]ai_types.Message{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } }};
+    }.items[0..];
+    return .{ .messages = messages };
+}
+
+fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (!stream.isDone()) {
+        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}
+
+
+test "provider_cancellation_vertex_cancel_before_request" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+    const stream = try streamSimpleGoogleVertex(
+        regressionModel("google-vertex", "google", "https://example.googleapis.com"),
+        regressionContext(),
+        .{ .api_key = "test-key", .cancel_token = cancel_token },
+        std.testing.allocator,
+    );
+    try expectCancelledStream(stream, std.testing.allocator);
 }
