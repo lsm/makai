@@ -2198,3 +2198,56 @@ test "parseAnthropicEventType extracts tool_use id and name" {
     allocator.free(result.content_block_start.tool_id);
     allocator.free(result.content_block_start.tool_name);
 }
+
+
+fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
+    return .{
+        .id = "regression-model",
+        .name = "regression-model",
+        .api = api_name,
+        .provider = provider_name,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 16,
+    };
+}
+
+fn regressionContext() ai_types.Context {
+    const messages = struct {
+        const items = [_]ai_types.Message{.{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } }};
+    }.items[0..];
+    return .{ .messages = messages };
+}
+
+fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allocator: std.mem.Allocator) !void {
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (!stream.isDone()) {
+        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(stream.waitForThread(5_000));
+    try std.testing.expect(stream.getError() != null);
+    try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
+}
+
+
+test "provider_cancellation_anthropic_cancel_before_request" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+    const stream = try streamSimpleAnthropicMessages(
+        regressionModel("anthropic-messages", "anthropic", "https://example.invalid"),
+        regressionContext(),
+        .{ .api_key = "test-key", .cancel_token = cancel_token },
+        std.testing.allocator,
+    );
+    try expectCancelledStream(stream, std.testing.allocator);
+}

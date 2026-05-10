@@ -384,3 +384,114 @@ test "saveToFile writes atomically via temp file + rename" {
     try std.testing.expect(std.mem.indexOf(u8, content, "sk-test-key-12345") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "test-provider") != null);
 }
+
+
+const builtin = @import("builtin");
+
+fn putOwnedAuth(storage: *AuthStorage, provider_id: []const u8, auth: ProviderAuth) !void {
+    const key = try storage.allocator.dupe(u8, provider_id);
+    errdefer storage.allocator.free(key);
+    try storage.providers.put(key, auth);
+}
+
+fn setHomeForTest(allocator: std.mem.Allocator, home: []const u8) !?[]u8 {
+    const previous = if (std.posix.getenv("HOME")) |value| try allocator.dupe(u8, value) else null;
+    try std.posix.setenv("HOME", home, true);
+    return previous;
+}
+
+fn restoreHomeForTest(allocator: std.mem.Allocator, previous: ?[]u8) void {
+    if (previous) |value| {
+        std.posix.setenv("HOME", value, true) catch {};
+        allocator.free(value);
+    } else {
+        std.posix.unsetenv("HOME") catch {};
+    }
+}
+
+fn countAuthTempFiles(home: []const u8) !usize {
+    const dir_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
+    defer std.testing.allocator.free(dir_path);
+
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "auth.json.tmp.")) count += 1;
+    }
+    return count;
+}
+
+test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = tmp.sub_path[0..];
+    const previous_home = try setHomeForTest(std.testing.allocator, home);
+    defer restoreHomeForTest(std.testing.allocator, previous_home);
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    const api_key = try std.testing.allocator.dupe(u8, "secret-key");
+    try putOwnedAuth(&storage, "direct-provider", .{ .api_key = api_key });
+
+    try storage.saveToFile();
+
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", "auth.json" });
+    defer std.testing.allocator.free(file_path);
+
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "direct-provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "secret-key") != null);
+
+    if (builtin.os.tag != .windows) {
+        const stat = try file.stat();
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.mode & 0o777)));
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), try countAuthTempFiles(home));
+}
+
+test "oauth_storage_saveToFile_rename_failure_leaves_target_unchanged_and_temp_visible_for_cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = tmp.sub_path[0..];
+    const previous_home = try setHomeForTest(std.testing.allocator, home);
+    defer restoreHomeForTest(std.testing.allocator, previous_home);
+
+    const makai_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
+    defer std.testing.allocator.free(makai_path);
+    try std.fs.cwd().makePath(makai_path);
+
+    const blocker_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", "auth.json" });
+    defer std.testing.allocator.free(blocker_path);
+    try std.fs.cwd().makePath(blocker_path);
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    const api_key = try std.testing.allocator.dupe(u8, "secret-key");
+    try putOwnedAuth(&storage, "rename-failure-provider", .{ .api_key = api_key });
+
+    try std.testing.expectError(error.IsDir, storage.saveToFile());
+
+    const stat = try std.fs.cwd().statFile(blocker_path);
+    try std.testing.expectEqual(std.fs.File.Kind.directory, stat.kind);
+
+    const temp_count = try countAuthTempFiles(home);
+    try std.testing.expect(temp_count >= 1);
+}

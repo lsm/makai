@@ -594,9 +594,9 @@ test "indexOfCaseInsensitive finds substrings correctly" {
 
 test "sleepMs completes normally without cancel token" {
     const ns_per_ms: u64 = std.time.ns_per_ms;
-    const start = try compat.time.monotonicNanos();
+    const start = compat.time.monotonicNanos();
     const completed = sleepMs(50, null);
-    const elapsed = try compat.time.monotonicNanos() - start;
+    const elapsed = compat.time.monotonicNanos() - start;
 
     try std.testing.expect(completed);
     try std.testing.expect(elapsed >= 50 * ns_per_ms);
@@ -657,4 +657,36 @@ test "RetryConfig nextDelay with jitter_factor 0 returns exact value" {
     var config = RetryConfig{ .jitter_factor = 0.0 };
     try std.testing.expectEqual(@as(?u64, 1000), config.nextDelay(0, null));
     try std.testing.expectEqual(@as(?u64, 2000), config.nextDelay(1, null));
+}
+
+
+test "retry_time_zero_timeout_completes_without_sleep" {
+    var cancelled = std.atomic.Value(bool).init(false);
+    try std.testing.expect(sleepMs(0, &cancelled));
+    try std.testing.expect(!cancelled.load(.acquire));
+}
+
+test "retry_time_very_large_timeout_returns_immediately_when_cancelled" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expect(!sleepMs(std.math.maxInt(u64), &cancelled));
+}
+
+test "retry_time_integer_overflow_edges_do_not_wrap_to_retryable_delay" {
+    const config = RetryConfig{ .base_delay_ms = std.math.maxInt(u64), .max_delay_ms = std.math.maxInt(u64), .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), config.nextDelay(0, null));
+
+    const wrapped = calculateDelay(63, std.math.maxInt(u32), std.math.maxInt(u32));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u32)), wrapped);
+
+    try std.testing.expectEqual(@as(?u64, null), extractRetryDelayFromHeader("18446744073709551616"));
+}
+
+test "retry_budget_exhaustion_edge_cases" {
+    const exhausted = RetryConfig{ .max_retries = 0, .base_delay_ms = 100, .max_delay_ms = 0, .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, 100), exhausted.nextDelay(0, null));
+    try std.testing.expect(exhausted.isRetryableStatus(.too_many_requests));
+
+    const capped = RetryConfig{ .max_retries = 1, .base_delay_ms = 100, .max_delay_ms = 150, .jitter_factor = 0.0 };
+    try std.testing.expectEqual(@as(?u64, 100), capped.nextDelay(0, null));
+    try std.testing.expectEqual(@as(?u64, null), capped.nextDelay(1, null));
 }
