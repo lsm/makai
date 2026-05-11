@@ -26,14 +26,20 @@ pub const SESSION_ID_LENGTH: usize = 21;
 pub const SESSION_ID_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 pub const SessionId = [SESSION_ID_LENGTH]u8;
 
-/// Generate a random NanoID-style session ID with an alphanumeric alphabet.
-pub fn generateSessionId() SessionId {
+fn generateSessionIdWithRandomInt(random_int_range_less_than: fn (comptime type, usize) usize) SessionId {
     var session_id: SessionId = undefined;
     for (&session_id) |*byte| {
-        const idx = compat.random.secureIntRangeLessThan(usize, SESSION_ID_ALPHABET.len);
+        const idx = random_int_range_less_than(usize, SESSION_ID_ALPHABET.len);
         byte.* = SESSION_ID_ALPHABET[idx];
     }
     return session_id;
+}
+
+/// Generate a random NanoID-style session ID with an alphanumeric alphabet.
+/// Session IDs are protocol correlation values, so use secure entropy to make
+/// accidental or malicious guessing impractical across distributed runtimes.
+pub fn generateSessionId() SessionId {
+    return generateSessionIdWithRandomInt(compat.random.secureIntRangeLessThan);
 }
 
 /// Convert session ID to string representation (21 alphanumeric chars).
@@ -87,8 +93,7 @@ fn ulidDecode(c: u8) ?u5 {
     };
 }
 
-/// Generate a ULID with the current millisecond timestamp and 80 random bits.
-pub fn generateUlid() Ulid {
+fn generateUlidWithRandom(fill_random: fn ([]u8) void) Ulid {
     var ulid: Ulid = undefined;
 
     const now_ms: u64 = @intCast(@max(compat.time.nowMillis(), 0));
@@ -98,9 +103,16 @@ pub fn generateUlid() Ulid {
     ulid[3] = @intCast((now_ms >> 16) & 0xff);
     ulid[4] = @intCast((now_ms >> 8) & 0xff);
     ulid[5] = @intCast(now_ms & 0xff);
-    compat.random.fillSecureBytes(ulid[6..16]);
+    fill_random(ulid[6..16]);
 
     return ulid;
+}
+
+/// Generate a ULID with the current millisecond timestamp and 80 random bits.
+/// Protocol stream/message IDs use secure entropy because they are externally
+/// visible correlation identifiers in distributed transports.
+pub fn generateUlid() Ulid {
+    return generateUlidWithRandom(compat.random.fillSecureBytes);
 }
 
 /// Convert ULID to Crockford Base32 string representation (26 chars).
@@ -424,6 +436,17 @@ test "ModelsRequest deinit frees owned filter strings" {
     req.deinit(allocator);
 }
 
+fn deterministicSessionIndex(comptime T: type, upper_bound: T) T {
+    _ = upper_bound;
+    return 0;
+}
+
+fn fillDeterministicUlidBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @intCast(i);
+    }
+}
+
 test "generateSessionId produces 21-character alphanumeric NanoID" {
     const session_id = generateSessionId();
     const str = try sessionIdToString(session_id, std.testing.allocator);
@@ -444,6 +467,14 @@ test "generateSessionId produces 21-character alphanumeric NanoID" {
     try std.testing.expectEqualSlices(u8, &session_id, &parsed.?);
 }
 
+test "generateSessionIdWithRandomInt is deterministic for test seam" {
+    const session_id = generateSessionIdWithRandomInt(deterministicSessionIndex);
+    const str = try sessionIdToString(session_id, std.testing.allocator);
+    defer std.testing.allocator.free(str);
+
+    try std.testing.expectEqualStrings("000000000000000000000", str);
+}
+
 test "generateUlid produces valid ULID" {
     const ulid = generateUlid();
     const now_ms: u64 = @intCast(@max(compat.time.nowMillis(), 0));
@@ -460,6 +491,12 @@ test "generateUlid produces valid ULID" {
     // Generate multiple ULIDs and ensure they're different
     const ulid2 = generateUlid();
     try std.testing.expect(!std.mem.eql(u8, &ulid, &ulid2));
+}
+
+test "generateUlidWithRandom is deterministic for test seam" {
+    const ulid = generateUlidWithRandom(fillDeterministicUlidBytes);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 }, ulid[6..16]);
 }
 
 test "ulidToString and parseUlid roundtrip" {

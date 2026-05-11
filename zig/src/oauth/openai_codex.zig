@@ -1,6 +1,7 @@
 const std = @import("std");
 const oauth = @import("mod.zig");
 const pkce = @import("pkce.zig");
+const compat = @import("compat");
 
 /// Client ID for OpenAI Codex OAuth
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -60,7 +61,7 @@ pub const OpenAICodexOAuth = struct {
     /// Generate a random state string for CSRF protection
     fn generateState() [32]u8 {
         var state: [32]u8 = undefined;
-        std.crypto.random.bytes(&state);
+        compat.random.fillSecureBytes(&state);
         // Encode as hex for URL safety
         var hex_state: [32]u8 = undefined;
         for (state[0..16], 0..) |byte, i| {
