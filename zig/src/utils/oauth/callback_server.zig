@@ -32,7 +32,7 @@ pub const CallbackServer = struct {
             // Accept connection with timeout
             var connection = self.listener.accept() catch |err| {
                 if (err == error.WouldBlock) {
-                    std.Thread.sleep(100 * std.time.ns_per_ms);
+                    compat.time.sleepMs(100);
                     continue;
                 }
                 return err;
