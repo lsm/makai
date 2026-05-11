@@ -1,8 +1,16 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream_mod = @import("event_stream");
 const types = @import("agent_types");
 const agent_loop = @import("agent_loop");
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 // Re-export types
 pub const AgentEvent = types.AgentEvent;
@@ -85,8 +93,8 @@ pub const Agent = struct {
 
     // Async support
     _thread: ?std.Thread,
-    _done_event: std.Thread.ResetEvent,
-    _mutex: std.Thread.Mutex,
+    _done_event: std.Io.Event,
+    _mutex: std.Io.Mutex,
 
     // === Lifecycle ===
 
@@ -101,11 +109,11 @@ pub const Agent = struct {
             ._state = initial_state.?,
             ._allocator = allocator,
             ._protocol = options.protocol,
-            ._listeners = .{},
+            ._listeners = std.ArrayList(*const fn (event: AgentEvent) void).empty,
             ._cancel_token = null,
             ._is_running = false,
-            ._steering_queue = .{},
-            ._follow_up_queue = .{},
+            ._steering_queue = std.ArrayList(ai_types.Message).empty,
+            ._follow_up_queue = std.ArrayList(ai_types.Message).empty,
             ._steering_mode = options.steering_mode,
             ._follow_up_mode = options.follow_up_mode,
             ._skip_initial_steering_poll = false,
@@ -119,8 +127,8 @@ pub const Agent = struct {
             ._thinking_budgets = options.thinking_budgets,
             ._max_retry_delay_ms = options.max_retry_delay_ms,
             ._thread = null,
-            ._done_event = std.Thread.ResetEvent{},
-            ._mutex = .{},
+            ._done_event = .is_set,
+            ._mutex = .init,
         };
     }
 
@@ -265,8 +273,8 @@ pub const Agent = struct {
     /// Delivered after current tool execution, skips remaining tools.
     /// Thread-safe: can be called while agent is running.
     pub fn steer(self: *Agent, message: ai_types.Message) !void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         try self._steering_queue.append(self._allocator, message);
     }
 
@@ -274,15 +282,15 @@ pub const Agent = struct {
     /// Delivered only when agent has no more tool calls or steering messages.
     /// Thread-safe: can be called while agent is running.
     pub fn followUp(self: *Agent, message: ai_types.Message) !void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         try self._follow_up_queue.append(self._allocator, message);
     }
 
     /// Clear the steering queue.
     pub fn clearSteeringQueue(self: *Agent) void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         for (self._steering_queue.items) |*msg| {
             msg.deinit(self._allocator);
         }
@@ -291,8 +299,8 @@ pub const Agent = struct {
 
     /// Clear the follow-up queue.
     pub fn clearFollowUpQueue(self: *Agent) void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         for (self._follow_up_queue.items) |*msg| {
             msg.deinit(self._allocator);
         }
@@ -301,8 +309,8 @@ pub const Agent = struct {
 
     /// Clear all message queues.
     pub fn clearAllQueues(self: *Agent) void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         for (self._steering_queue.items) |*msg| {
             msg.deinit(self._allocator);
         }
@@ -334,7 +342,7 @@ pub const Agent = struct {
                 const msg = ai_types.Message{
                     .user = .{
                         .content = .{ .text = text },
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat.time.nowMillis(),
                     },
                 };
                 break :blk @as([]const ai_types.Message, &.{msg});
@@ -364,7 +372,7 @@ pub const Agent = struct {
         }
 
         // Build content parts
-        var content_parts: std.ArrayList(ai_types.UserContentPart) = .{};
+        var content_parts: std.ArrayList(ai_types.UserContentPart) = .empty;
         defer content_parts.deinit(self._allocator);
 
         // Add text part
@@ -384,7 +392,7 @@ pub const Agent = struct {
         const msg = ai_types.Message{
             .user = .{
                 .content = .{ .parts = content_parts.items },
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
             },
         };
 
@@ -443,8 +451,8 @@ pub const Agent = struct {
 
     /// Check if the agent is currently idle (not streaming).
     pub fn isIdle(self: *Agent) bool {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
         return !self._state.is_streaming;
     }
 
@@ -452,20 +460,20 @@ pub const Agent = struct {
     /// Blocks until the current operation completes.
     /// Returns immediately if not streaming.
     pub fn waitForIdle(self: *Agent) void {
-        self._mutex.lock();
+        self._mutex.lockUncancelable(defaultIo());
         const should_wait = self._state.is_streaming or self._thread != null;
-        self._mutex.unlock();
+        self._mutex.unlock(defaultIo());
 
         if (!should_wait) {
             return;
         }
 
         // Wait for the done event (blocks until set)
-        self._done_event.wait();
+        self._done_event.waitUncancelable(defaultIo());
 
         // Join the thread if it exists
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
 
         if (self._thread) |t| {
             t.join();
@@ -477,8 +485,8 @@ pub const Agent = struct {
     /// Use waitForIdle() to block until completion.
     /// Returns error if already streaming.
     pub fn promptAsync(self: *Agent, message_or_messages: anytype) !void {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
 
         if (self._state.is_streaming) {
             return error.AgentAlreadyStreaming;
@@ -610,12 +618,12 @@ pub const Agent = struct {
     fn runLoopThread(self: *Agent, messages: []ai_types.Message, skip_steering: bool) void {
         defer {
             // Signal completion
-            self._done_event.set();
+            self._done_event.set(defaultIo());
 
             // Update state under lock
-            self._mutex.lock();
+            self._mutex.lockUncancelable(defaultIo());
             self._state.is_streaming = false;
-            self._mutex.unlock();
+            self._mutex.unlock(defaultIo());
         }
 
         // Run the loop (errors are handled internally)
@@ -767,8 +775,8 @@ pub const Agent = struct {
     }
 
     fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
 
         if (self._steering_mode == .one_at_a_time) {
             if (self._steering_queue.items.len > 0) {
@@ -792,8 +800,8 @@ pub const Agent = struct {
     }
 
     fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
-        self._mutex.lock();
-        defer self._mutex.unlock();
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
 
         if (self._follow_up_mode == .one_at_a_time) {
             if (self._follow_up_queue.items.len > 0) {

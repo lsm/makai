@@ -15,6 +15,7 @@
 //! - Full-stack e2e tests that need to exercise serialization
 
 const std = @import("std");
+const compat = @import("compat");
 const transport_mod = @import("transport");
 const event_stream = @import("event_stream");
 const ai_types = @import("ai_types");
@@ -482,7 +483,7 @@ pub const EventBridge = struct {
                 }
 
                 // Wait a bit before polling again (simple backoff)
-                std.Thread.sleep(1_000_000); // 1ms
+                compat.time.sleepNs(1_000_000); // 1ms
             }
         }
 

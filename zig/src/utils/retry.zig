@@ -198,7 +198,7 @@ pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
         // Find the colon and value
         const after_key = error_text[start_idx..];
         if (std.mem.indexOf(u8, after_key, ":")) |colon_idx| {
-            const after_colon = std.mem.trimLeft(u8, after_key[colon_idx + 1 ..], " \t");
+            const after_colon = std.mem.trimStart(u8, after_key[colon_idx + 1 ..], " \t");
             if (parseRetryInFormat(after_colon)) |ms| {
                 return normalizeDelay(ms);
             }
@@ -594,9 +594,9 @@ test "indexOfCaseInsensitive finds substrings correctly" {
 
 test "sleepMs completes normally without cancel token" {
     const ns_per_ms: u64 = std.time.ns_per_ms;
-    const start = compat.time.monotonicNanos();
+    const start = try compat.time.monotonicNanos();
     const completed = sleepMs(50, null);
-    const elapsed = compat.time.monotonicNanos() - start;
+    const elapsed = try compat.time.monotonicNanos() - start;
 
     try std.testing.expect(completed);
     try std.testing.expect(elapsed >= 50 * ns_per_ms);

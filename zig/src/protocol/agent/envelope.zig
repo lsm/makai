@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const agent_types = @import("agent_types");
 const json_writer = @import("json_writer");
 const model_catalog_types = @import("model_catalog_types");
@@ -7,7 +8,7 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 pub const protocol_types = agent_types;
 
 pub fn serializeEnvelope(env: agent_types.Envelope, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -633,7 +634,7 @@ test "agent envelope roundtrip" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_message = .{
             .session_id = agent_types.generateSessionId(),
             .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
@@ -659,7 +660,7 @@ test "agent envelope roundtrip for models_request" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic")),
             .api = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "anthropic-messages")),
@@ -720,7 +721,7 @@ test "agent envelope roundtrip for models_response preserves shape" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_response = .{
             .models = OwnedSlice(agent_types.ModelDescriptor).initOwned(descriptors),
             .fetched_at_ms = 1_700_000_000_000,
@@ -763,7 +764,7 @@ test "agent envelope roundtrip for ack and nack" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .ack = .{ .acknowledged_id = acked_id } },
     };
     defer ack_env.deinit(allocator);
@@ -782,7 +783,7 @@ test "agent envelope roundtrip for ack and nack" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .nack = .{
             .rejected_id = rejected_id,
             .reason = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "models catalog is not implemented for this runtime")),

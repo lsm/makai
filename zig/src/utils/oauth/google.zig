@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const pkce_mod = @import("oauth/pkce");
 const callback_server = @import("oauth/callback_server");
 
@@ -90,7 +91,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator, port: u16, clie
         .{ project_id, email },
     );
 
-    const expires = std.time.milliTimestamp() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
+    const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
         .refresh = try allocator.dupe(u8, token_response.refresh_token),
@@ -112,7 +113,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
-    const expires = std.time.milliTimestamp() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
+    const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
         .refresh = try allocator.dupe(u8, token_response.refresh_token),
@@ -197,7 +198,7 @@ test "getApiKey - returns access token" {
     const credentials = Credentials{
         .refresh = "refresh_token",
         .access = "access_token",
-        .expires = std.time.milliTimestamp() + 3600000,
+        .expires = compat.time.nowMillis() + 3600000,
         .provider_data = "{\"projectId\":\"test\",\"email\":\"test@example.com\"}",
     };
 

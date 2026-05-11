@@ -143,7 +143,7 @@ pub fn serializeEvent(
     options: SerializationOptions,
     allocator: std.mem.Allocator,
 ) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 

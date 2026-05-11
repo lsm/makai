@@ -2,13 +2,13 @@ const std = @import("std");
 const oauth = @import("oauth/github_copilot");
 
 // Global state for callbacks (needed for stdin reading)
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa = std.heap.DebugAllocator(.{}){};
 var allocator: std.mem.Allocator = undefined;
 var input_buffer: [1024]u8 = undefined;
 var reader_buf: [4096]u8 = undefined;
 
 fn onAuth(info: oauth.AuthInfo) void {
-    const stdout_file = std.fs.File.stdout();
+    const stdout_file = std.Io.File.stdout();
     stdout_file.writeAll("\n") catch return;
     stdout_file.writeAll(info.url) catch return;
     stdout_file.writeAll("\n") catch return;
@@ -20,8 +20,8 @@ fn onAuth(info: oauth.AuthInfo) void {
 }
 
 fn onPrompt(prompt: oauth.Prompt) []const u8 {
-    const stdout_file = std.fs.File.stdout();
-    const stdin_file = std.fs.File.stdin();
+    const stdout_file = std.Io.File.stdout();
+    const stdin_file = std.Io.File.stdin();
 
     stdout_file.writeAll(prompt.message) catch return "";
     stdout_file.writeAll(" ") catch return "";
@@ -55,7 +55,7 @@ pub fn main() !void {
         }
     }
 
-    const stdout_file = std.fs.File.stdout();
+    const stdout_file = std.Io.File.stdout();
 
     try stdout_file.writeAll("GitHub Copilot Login\n");
     try stdout_file.writeAll("====================\n\n");

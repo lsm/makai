@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
 const types = @import("agent_types");
@@ -96,7 +97,7 @@ fn createToolResultMessage(
         .content = result.content.slice(),
         .details_json = details_json,
         .is_error = is_error,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 }
 
@@ -157,7 +158,7 @@ fn skipToolCall(
         .content = content,
         .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
         .is_error = true,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 }
 
@@ -188,7 +189,7 @@ fn executeToolCalls(
     event_stream: *AgentEventStream,
 ) !ToolExecutionResult {
     // Extract tool calls from assistant message
-    var tool_calls: std.ArrayList(ai_types.ToolCall) = .{};
+    var tool_calls: std.ArrayList(ai_types.ToolCall) = .empty;
     defer tool_calls.deinit(allocator);
 
     for (assistant_message.content) |block| {
@@ -197,7 +198,7 @@ fn executeToolCalls(
         }
     }
 
-    var results: std.ArrayList(ai_types.ToolResultMessage) = .{};
+    var results: std.ArrayList(ai_types.ToolResultMessage) = .empty;
     var has_steering = false;
     var steering_messages: ?[]const ai_types.Message = null;
 
@@ -524,7 +525,7 @@ fn runLoop(
     event_stream: *AgentEventStream,
 ) !void {
     var state = LoopState{
-        .messages = .{},
+        .messages = std.ArrayList(ai_types.Message).empty,
         .iterations = 0,
         .final_message = null,
     };
@@ -611,7 +612,7 @@ fn runLoop(
                     .usage = .{},
                     .stop_reason = .@"error",
                     .error_message = ai_types.OwnedSlice(u8).initBorrowed(@errorName(err)),
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .is_owned = false,
                 };
                 try setFinalMessage(&state, allocator, error_msg);
@@ -736,7 +737,7 @@ fn runLoop(
             .model = config.model.id,
             .usage = .{},
             .stop_reason = .stop,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .is_owned = false,
         };
     };

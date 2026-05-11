@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -7,7 +8,7 @@ const stream_mod = @import("stream");
 const testing = std.testing;
 
 fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 test "ollama e2e: basic text generation (new api)" {
@@ -19,7 +20,7 @@ test "ollama e2e: basic text generation (new api)" {
 
     // Skip if no API key and local server isn't running
     if (api_key == null) {
-        var client = std.http.Client{ .allocator = testing.allocator };
+        var client = std.http.Client{ .allocator = testing.allocator, .io = std.testing.io };
         defer client.deinit();
 
         const uri = std.Uri.parse("http://127.0.0.1:11434/api/tags") catch {
@@ -33,8 +34,8 @@ test "ollama e2e: basic text generation (new api)" {
         };
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = 0 };
-        req.sendBodyComplete(&.{}) catch {
+        req.transfer_encoding = .none;
+        req.sendBodiless() catch {
             std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: ollama local server not responding\n", .{});
             return error.SkipZigTest;
         };
@@ -77,7 +78,7 @@ test "ollama e2e: basic text generation (new api)" {
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Reply with exactly: tiny ollama ok" },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -94,11 +95,11 @@ test "ollama e2e: basic text generation (new api)" {
 
     while (!stream.isDone()) {
         _ = stream.poll();
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Allow detached provider thread to complete deferred cleanup
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: ollama e2e stream error: {s}\n", .{err});

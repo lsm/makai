@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const auth_types = @import("auth_types");
 const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -6,7 +7,7 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 pub const protocol_types = auth_types;
 
 pub fn serializeEnvelope(env: auth_types.Envelope, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var writer = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -400,7 +401,7 @@ test "auth envelope roundtrip with auth_event prompt" {
         .stream_id = flow_id,
         .message_id = auth_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_event = .{ .prompt = .{
             .flow_id = flow_id,
             .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "prompt-1")),

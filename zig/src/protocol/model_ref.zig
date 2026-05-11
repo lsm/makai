@@ -116,7 +116,7 @@ fn encodeModelId(allocator: std.mem.Allocator, model_id: []const u8) (std.mem.Al
     if (model_id.len == 0) return error.MissingModelId;
     if (!std.unicode.utf8ValidateSlice(model_id)) return error.InvalidUtf8ModelId;
 
-    var encoded = std.ArrayList(u8){};
+    var encoded = std.ArrayList(u8).empty;
     defer encoded.deinit(allocator);
 
     for (model_id) |byte| {
@@ -134,7 +134,7 @@ fn decodeModelId(allocator: std.mem.Allocator, encoded_model_id: []const u8) (st
     // Keep decodeModelId defensive even though parseModelRef currently checks this first.
     if (encoded_model_id.len == 0) return error.MissingModelId;
 
-    var decoded = std.ArrayList(u8){};
+    var decoded = std.ArrayList(u8).empty;
     defer decoded.deinit(allocator);
 
     var idx: usize = 0;

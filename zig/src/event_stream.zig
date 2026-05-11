@@ -16,7 +16,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         result: ?R = null,
         completed: std.atomic.Value(bool),
         err_msg: ?[]const u8 = null,
-        mutex: std.Thread.Mutex = .{},
+        mutex: std.Io.Mutex = .init,
         futex: std.atomic.Value(u32),
         thread_done: std.atomic.Value(bool),
         allocator: std.mem.Allocator,
@@ -42,6 +42,33 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .thread_done = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
             };
+        }
+
+        fn defaultIo() std.Io {
+            return if (@import("builtin").is_test)
+                std.testing.io
+            else
+                std.Io.Threaded.global_single_threaded.io();
+        }
+
+        fn wake(self: *Self, max_waiters: u32) void {
+            defaultIo().futexWake(u32, &self.futex.raw, max_waiters);
+        }
+
+        fn waitUncancelable(self: *Self, expected: u32) void {
+            defaultIo().futexWaitUncancelable(u32, &self.futex.raw, expected);
+        }
+
+        fn waitTimeoutMs(self: *Self, expected: u32, timeout_ms: u64) void {
+            const capped_ms = @min(timeout_ms, @as(u64, std.math.maxInt(i64)));
+            defaultIo().futexWaitTimeout(u32, &self.futex.raw, expected, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(capped_ms)),
+                .clock = .boot,
+            } }) catch {};
+        }
+
+        fn monotonicNanos() i128 {
+            return std.Io.Timestamp.now(defaultIo(), .boot).toNanoseconds();
         }
 
         pub fn deinit(self: *Self) void {
@@ -135,26 +162,26 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 self.published[current_head].store(true, .release);
 
                 _ = self.futex.fetchAdd(1, .release);
-                std.Thread.Futex.wake(&self.futex, 1);
+                self.wake(1);
 
                 return;
             }
         }
 
         pub fn complete(self: *Self, result: R) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             self.result = result;
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.futex, std.math.maxInt(u32));
+            self.wake(std.math.maxInt(u32));
         }
 
         pub fn completeWithError(self: *Self, msg: []const u8) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             // Always dupe the message so the stream owns its memory
             // This allows callers to free their copy immediately after this call
@@ -163,23 +190,23 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             self.completed.store(true, .release);
 
             _ = self.futex.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.futex, std.math.maxInt(u32));
+            self.wake(std.math.maxInt(u32));
         }
 
         pub fn markThreadDone(self: *Self) void {
             self.thread_done.store(true, .release);
             _ = self.futex.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.futex, std.math.maxInt(u32));
+            self.wake(std.math.maxInt(u32));
         }
 
         pub fn waitForThread(self: *Self, timeout_ms: u64) bool {
-            const start_time = std.time.nanoTimestamp();
+            const start_time = monotonicNanos();
             const timeout_ns = @as(i128, timeout_ms) * 1_000_000;
 
             var futex_value = self.futex.load(.acquire);
 
             while (!self.thread_done.load(.acquire)) {
-                const elapsed = std.time.nanoTimestamp() - start_time;
+                const elapsed = monotonicNanos() - start_time;
                 if (elapsed >= timeout_ns) {
                     return false;
                 }
@@ -188,7 +215,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 const remaining_ms = @as(u64, @intCast(@divFloor(remaining_ns, 1_000_000)));
                 const remaining_max_ms = @min(remaining_ms, std.math.maxInt(u32));
 
-                std.Thread.Futex.timedWait(&self.futex, futex_value, remaining_max_ms) catch {};
+                self.waitTimeoutMs(futex_value, remaining_max_ms);
 
                 futex_value = self.futex.load(.acquire);
             }
@@ -197,8 +224,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn poll(self: *Self) ?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             const current_tail = self.tail.load(.acquire);
             const current_head = self.head.load(.acquire);
@@ -223,8 +250,8 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn pollBatch(self: *Self, buffer: []T) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             var count: usize = 0;
             var current_tail = self.tail.load(.acquire);
@@ -255,7 +282,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             var futex_value = self.futex.load(.acquire);
 
             while (true) {
-                self.mutex.lock();
+                self.mutex.lockUncancelable(defaultIo());
 
                 const current_tail = self.tail.load(.acquire);
                 const current_head = self.head.load(.acquire);
@@ -271,18 +298,18 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     // Clear published flag for slot reuse and advance tail
                     self.published[current_tail].store(false, .release);
                     self.tail.store((current_tail + 1) & RING_BUFFER_MASK, .release);
-                    self.mutex.unlock();
+                    self.mutex.unlock(defaultIo());
                     return event;
                 }
 
                 if (self.completed.load(.acquire)) {
-                    self.mutex.unlock();
+                    self.mutex.unlock(defaultIo());
                     return null;
                 }
 
-                self.mutex.unlock();
+                self.mutex.unlock(defaultIo());
 
-                std.Thread.Futex.wait(&self.futex, futex_value);
+                self.waitUncancelable(futex_value);
                 futex_value = self.futex.load(.acquire);
             }
         }
@@ -292,15 +319,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         }
 
         pub fn getResult(self: *Self) ?R {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             return self.result;
         }
 
         pub fn getError(self: *Self) ?[]const u8 {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
 
             return self.err_msg;
         }
@@ -485,7 +512,7 @@ const WaitPushCtx = struct {
 };
 
 fn pushEventAfterDelay(ctx: *WaitPushCtx) void {
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .boot) catch {};
     ctx.stream.push(42) catch {};
 }
 

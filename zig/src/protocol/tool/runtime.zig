@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const tool_envelope = @import("tool_envelope");
 const in_process = @import("transports/in_process");
 
@@ -118,12 +119,12 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
                 .message_id = protocol_types.generateUlid(),
                 .sequence = env.sequence + 1,
                 .in_reply_to = env.message_id,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .{ .tool_status_response = .{
                     .execution_id = env.payload.tool_status.execution_id,
                     .tool_name = try test_allocator.dupe(u8, "grep"),
                     .status = .running,
-                    .started_at = std.time.milliTimestamp(),
+                    .started_at = compat.time.nowMillis(),
                     .completed_at = null,
                 } },
             };
@@ -138,7 +139,7 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
                 .server_id = protocol_types.generateUlid(),
                 .message_id = protocol_types.generateUlid(),
                 .sequence = 99,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .{ .tool_stream = .{
                     .execution_id = protocol_types.generateUlid(),
                     .tool_call_id = try test_allocator.dupe(u8, "call_1"),
@@ -179,7 +180,7 @@ test "ToolProtocolRuntime pumps request, response, and outbox" {
         .server_id = protocol_types.generateUlid(),
         .message_id = protocol_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_status = .{
             .execution_id = protocol_types.generateUlid(),
         } },

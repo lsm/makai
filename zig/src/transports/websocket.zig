@@ -9,16 +9,39 @@ const transport = @import("transport");
 const ai_types = @import("ai_types");
 const compat = @import("compat");
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+fn streamFromSocketHandle(handle: std.Io.net.Socket.Handle) std.Io.net.Stream {
+    return .{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } };
+}
+
+fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
+    var reader = stream.reader(defaultIo(), &.{});
+    return reader.interface.readSliceShort(buffer);
+}
+
+fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        written += try defaultIo().vtable.netWrite(defaultIo().userdata, stream.socket.handle, &.{}, &.{data[written..]}, 1);
+    }
+}
+
 pub const WebSocketClient = struct {
     allocator: std.mem.Allocator,
     state: ConnectionState,
 
     // Connection state
-    tcp_stream: ?std.net.Stream = null,
+    tcp_stream: ?std.Io.net.Stream = null,
 
     // For async operation
-    send_buffer: std.ArrayList(u8) = std.ArrayList(u8){},
-    recv_buffer: std.ArrayList(u8) = std.ArrayList(u8){},
+    send_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    recv_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
 
     // Callbacks
     on_message: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
@@ -46,8 +69,8 @@ pub const WebSocketClient = struct {
         return .{
             .allocator = allocator,
             .state = .disconnected,
-            .send_buffer = std.ArrayList(u8){},
-            .recv_buffer = std.ArrayList(u8){},
+            .send_buffer = std.ArrayList(u8).empty,
+            .recv_buffer = std.ArrayList(u8).empty,
         };
     }
 
@@ -91,12 +114,12 @@ pub const WebSocketClient = struct {
         }
 
         // Resolve and connect
-        const address = std.net.Address.resolveIp(parsed.host, parsed.port) catch {
+        const address = std.Io.net.IpAddress.resolve(defaultIo(), parsed.host, parsed.port) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
 
-        self.tcp_stream = std.net.tcpConnectToAddress(address) catch {
+        self.tcp_stream = address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
@@ -104,7 +127,7 @@ pub const WebSocketClient = struct {
         // Perform WebSocket handshake
         performHandshake(self, parsed.host, parsed.port, parsed.path, headers) catch |err| {
             if (self.tcp_stream) |stream| {
-                stream.close();
+                stream.close(defaultIo());
                 self.tcp_stream = null;
             }
             self.state = .disconnected;
@@ -133,7 +156,7 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
-        try stream.writeAll(encoded);
+        try streamWriteAll(stream, encoded);
     }
 
     /// Receive a message (blocking)
@@ -185,7 +208,7 @@ pub const WebSocketClient = struct {
 
             // Need more data - read from stream
             var read_buf: [4096]u8 = undefined;
-            const bytes_read = stream.read(&read_buf) catch |err| {
+            const bytes_read = streamRead(stream, &read_buf) catch |err| {
                 if (err == error.EndOfStream) {
                     self.state = .closed;
                     return null;
@@ -215,10 +238,10 @@ pub const WebSocketClient = struct {
                 };
                 if (encodeFrame(close_frame, self.allocator)) |encoded| {
                     defer self.allocator.free(encoded);
-                    stream.writeAll(encoded) catch {}; // Ignore errors on close
+                    streamWriteAll(stream, encoded) catch {}; // Ignore errors on close
                 } else |_| {}
             }
-            stream.close();
+            stream.close(defaultIo());
             self.tcp_stream = null;
         }
         self.send_buffer.clearRetainingCapacity();
@@ -260,7 +283,7 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
-        try stream.writeAll(encoded);
+        try streamWriteAll(stream, encoded);
     }
 
     fn resetPingState(self: *Self) void {
@@ -551,34 +574,32 @@ fn performHandshake(
     const key = encoder.encode(&client.handshake_key, &nonce);
 
     // Build handshake request
-    var request = std.ArrayList(u8){};
+    var request = std.ArrayList(u8).empty;
     defer request.deinit(client.allocator);
 
-    const writer = request.writer(client.allocator);
-
-    try writer.print("GET {s} HTTP/1.1\r\n", .{path});
-    try writer.print("Host: {s}\r\n", .{host});
-    try writer.print("Upgrade: websocket\r\n", .{});
-    try writer.print("Connection: Upgrade\r\n", .{});
-    try writer.print("Sec-WebSocket-Key: {s}\r\n", .{key});
-    try writer.print("Sec-WebSocket-Protocol: makai.v1\r\n", .{});
-    try writer.print("Sec-WebSocket-Version: 13\r\n", .{});
+    try request.print(client.allocator, "GET {s} HTTP/1.1\r\n", .{path});
+    try request.print(client.allocator, "Host: {s}\r\n", .{host});
+    try request.print(client.allocator, "Upgrade: websocket\r\n", .{});
+    try request.print(client.allocator, "Connection: Upgrade\r\n", .{});
+    try request.print(client.allocator, "Sec-WebSocket-Key: {s}\r\n", .{key});
+    try request.print(client.allocator, "Sec-WebSocket-Protocol: makai.v1\r\n", .{});
+    try request.print(client.allocator, "Sec-WebSocket-Version: 13\r\n", .{});
 
     // Add custom headers
     if (headers) |h| {
         for (h) |header| {
-            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+            try request.print(client.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         }
     }
 
-    try writer.print("\r\n", .{});
+    try request.print(client.allocator, "\r\n", .{});
 
     // Send request
-    try stream.writeAll(request.items);
+    try streamWriteAll(stream, request.items);
 
     // Read response
     var response_buf: [4096]u8 = undefined;
-    const response_len = try stream.read(&response_buf);
+    const response_len = try streamRead(stream, &response_buf);
     const response = response_buf[0..response_len];
 
     // Verify response
@@ -757,7 +778,7 @@ test "decodeFrame supports partial buffering and consumed ordering" {
     defer allocator.free(e2);
 
     // Simulate partial read: first frame + partial second frame
-    var partial = std.ArrayList(u8){};
+    var partial = std.ArrayList(u8).empty;
     defer partial.deinit(allocator);
     try partial.appendSlice(allocator, e1);
     try partial.appendSlice(allocator, e2[0..2]);
@@ -808,7 +829,7 @@ test "decodeFrame preserves interleaved logical stream ordering" {
     const ec = try encodeFrame(c, allocator);
     defer allocator.free(ec);
 
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
     try buf.appendSlice(allocator, ea);
     try buf.appendSlice(allocator, eb);
@@ -936,12 +957,12 @@ test "WebSocketClient pong clears timeout wait state" {
 test "WebSocketClient receive close frame enters closing state" {
     const allocator = std.testing.allocator;
 
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[1]);
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    defer streamFromSocketHandle(pipe[1]).close(defaultIo());
 
     var client = WebSocketClient.init(allocator);
     defer client.deinit();
-    client.tcp_stream = std.net.Stream{ .handle = pipe[0] };
+    client.tcp_stream = streamFromSocketHandle(pipe[0]);
     client.state = .connected;
 
     const close_frame = Frame{ .opcode = .close, .payload = "bye", .fin = true, .masked = false };
@@ -957,12 +978,12 @@ test "WebSocketClient receive close frame enters closing state" {
 test "WebSocketClient close from closing state finalizes cleanup" {
     const allocator = std.testing.allocator;
 
-    const pipe = try std.posix.pipe();
-    defer std.posix.close(pipe[1]);
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    defer streamFromSocketHandle(pipe[1]).close(defaultIo());
 
     var client = WebSocketClient.init(allocator);
     defer client.deinit();
-    client.tcp_stream = std.net.Stream{ .handle = pipe[0] };
+    client.tcp_stream = streamFromSocketHandle(pipe[0]);
     client.state = .closing;
     client.ping_timeout_ms = 50;
     client.markPingSent(1_000);
@@ -1019,7 +1040,7 @@ test "performHandshake validates response" {
     const allocator = std.testing.allocator;
 
     // Create a pipe to simulate connection
-    const pipe = try std.posix.pipe();
+    const pipe = try std.Io.Threaded.pipe2(.{});
     const read_fd = pipe[0];
     const write_fd = pipe[1];
 
@@ -1027,7 +1048,7 @@ test "performHandshake validates response" {
     var client = WebSocketClient.init(allocator);
     defer client.deinit();
 
-    client.tcp_stream = std.net.Stream{ .handle = write_fd };
+    client.tcp_stream = streamFromSocketHandle(write_fd);
     client.state = .connecting;
 
     // Write valid handshake response (not used in this simplified test)
@@ -1042,8 +1063,8 @@ test "performHandshake validates response" {
 
     // We can't easily test performHandshake with a pipe because it needs bidirectional communication
     // So just close the pipes and verify no crash
-    std.posix.close(pipe[0]);
-    std.posix.close(pipe[1]);
+    streamFromSocketHandle(pipe[0]).close(defaultIo());
+    streamFromSocketHandle(pipe[1]).close(defaultIo());
     client.tcp_stream = null;
 }
 
@@ -1115,7 +1136,7 @@ test "websocket_continuation_frame_reassembly_across_fragmented_frames" {
         .{ .opcode = .continuation, .payload = "ed", .fin = true, .masked = false },
     };
 
-    var wire = std.ArrayList(u8){};
+    var wire = std.ArrayList(u8).empty;
     defer wire.deinit(allocator);
 
     for (fragments) |fragment| {
@@ -1124,7 +1145,7 @@ test "websocket_continuation_frame_reassembly_across_fragmented_frames" {
         try wire.appendSlice(allocator, encoded);
     }
 
-    var reassembled = std.ArrayList(u8){};
+    var reassembled = std.ArrayList(u8).empty;
     defer reassembled.deinit(allocator);
 
     var offset: usize = 0;

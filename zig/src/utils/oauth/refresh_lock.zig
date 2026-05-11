@@ -12,14 +12,22 @@
 //! fresh lock generation; stale owner completions are ignored.
 
 const std = @import("std");
+const compat = @import("compat");
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 pub const RefreshLock = struct {
     pub const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
     const Entry = struct {
         key_owned: []const u8,
-        acquired_at: std.time.Instant,
-        cond: std.Thread.Condition,
+        acquired_at_ms: u64,
+        cond: std.Io.Condition,
         /// null  = refresh succeeded
         /// error = refresh failed with this error
         result: ?anyerror,
@@ -41,7 +49,7 @@ pub const RefreshLock = struct {
     };
 
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
     entries: std.StringHashMap(*Entry),
     timeout_ms: u64,
     next_generation: u64,
@@ -72,7 +80,7 @@ pub const RefreshLock = struct {
     pub fn initWithTimeout(allocator: std.mem.Allocator, timeout_ms: u64) RefreshLock {
         return .{
             .allocator = allocator,
-            .mutex = .{},
+            .mutex = .init,
             .entries = std.StringHashMap(*Entry).init(allocator),
             .timeout_ms = timeout_ms,
             .next_generation = 1,
@@ -85,7 +93,7 @@ pub const RefreshLock = struct {
         // state. Setting shutdown first ensures waiters wake into the
         // shutdown path instead of interpreting the result as a normal
         // refresh completion.
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
         self.shutdown = true;
 
         var iter = self.entries.iterator();
@@ -98,7 +106,7 @@ pub const RefreshLock = struct {
             entry.completed = true;
             entry.result = error.AuthRefreshFailed;
             entry.timed_out = false;
-            entry.cond.broadcast();
+            entry.cond.broadcast(defaultIo());
         }
 
         // Wait for any woken waiters to release their refs before freeing.
@@ -108,12 +116,12 @@ pub const RefreshLock = struct {
             var first_iter = self.entries.iterator();
             const entry = first_iter.next().?.value_ptr.*;
             while (entry.ref_count > 0) {
-                entry.cond.wait(&self.mutex);
+                entry.cond.waitUncancelable(defaultIo(), &self.mutex);
             }
             self.freeEntry(entry);
         }
 
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
         self.entries.deinit();
     }
 
@@ -151,14 +159,14 @@ pub const RefreshLock = struct {
             self.freeEntry(entry);
             return false;
         }
-        entry.cond.broadcast();
+        entry.cond.broadcast(defaultIo());
         return true;
     }
 
     fn releaseWaiterRef(self: *RefreshLock, entry: *Entry) void {
         entry.ref_count -= 1;
         if (self.shutdown) {
-            entry.cond.broadcast();
+            entry.cond.broadcast(defaultIo());
         } else if (entry.ref_count == 0) {
             self.freeEntry(entry);
         }
@@ -190,12 +198,12 @@ pub const RefreshLock = struct {
         }
     }
 
-    fn nowInstant() !std.time.Instant {
-        return std.time.Instant.now();
+    fn monotonicMillis() u64 {
+        return (compat.time.monotonicNanos() catch 0) / std.time.ns_per_ms;
     }
 
-    fn elapsedMs(entry: *const Entry, now: std.time.Instant) u64 {
-        return @intCast(now.since(entry.acquired_at) / std.time.ns_per_ms);
+    fn elapsedMs(entry: *const Entry, now_ms: u64) u64 {
+        return now_ms -| entry.acquired_at_ms;
     }
 
     // ------------------------------------------------------------------
@@ -210,12 +218,12 @@ pub const RefreshLock = struct {
     pub fn acquire(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8) !AcquireResult {
         const key = try buildLockKey(self.allocator, provider_id, user_id);
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
 
         // Fast exit if the lock has been shut down.
         if (self.shutdown) {
             self.allocator.free(key);
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return error.AuthRefreshFailed;
         }
 
@@ -233,7 +241,7 @@ pub const RefreshLock = struct {
                         // Current waiters still hold refs; don't start a
                         // second overlapping refresh for the same scope.
                         self.allocator.free(key);
-                        self.mutex.unlock();
+                        self.mutex.unlock(defaultIo());
                         return .timed_out;
                     }
                     // Fall through below and create a fresh entry for
@@ -241,7 +249,7 @@ pub const RefreshLock = struct {
                 } else {
                     const result = entry.result;
                     self.allocator.free(key);
-                    self.mutex.unlock();
+                    self.mutex.unlock(defaultIo());
                     return if (result) |err|
                         .{ .completed_err = err }
                     else
@@ -249,11 +257,7 @@ pub const RefreshLock = struct {
                 }
             } else {
                 // Check timeout.
-                const now = nowInstant() catch |err| {
-                    self.allocator.free(key);
-                    self.mutex.unlock();
-                    return err;
-                };
+                const now = monotonicMillis();
                 if (elapsedMs(entry, now) > self.timeout_ms) {
                     // Timed out — mark completed so all current waiters see
                     // the failure immediately, and release the owner's ref so
@@ -261,43 +265,30 @@ pub const RefreshLock = struct {
                     // of being poisoned by a stuck owner forever.
                     _ = self.timeoutEntry(entry);
                     self.allocator.free(key);
-                    self.mutex.unlock();
+                    self.mutex.unlock(defaultIo());
                     return .timed_out;
                 }
 
-                // Wait for the in-flight refresh. Use timed waits so a
-                // waiter can enforce the refresh timeout even if no later
-                // caller arrives to observe expiry.
+                // Wait for the in-flight refresh. Zig 0.16's Condition does
+                // not expose a timed wait, so wake periodically to enforce the
+                // refresh timeout even if no later caller observes expiry.
                 entry.ref_count += 1;
                 while (!self.shutdown and !entry.completed) {
-                    const instant = nowInstant() catch |err| {
-                        self.releaseWaiterRef(entry);
-                        self.allocator.free(key);
-                        self.mutex.unlock();
-                        return err;
-                    };
+                    const instant = monotonicMillis();
                     const elapsed_ms = elapsedMs(entry, instant);
                     if (elapsed_ms >= self.timeout_ms) {
                         _ = self.timeoutEntry(entry);
                         self.releaseWaiterRef(entry);
                         self.allocator.free(key);
-                        self.mutex.unlock();
+                        self.mutex.unlock(defaultIo());
                         return .timed_out;
                     }
+
                     const remaining_ms = self.timeout_ms - elapsed_ms;
-                    const timeout_ns = remaining_ms * std.time.ns_per_ms;
-                    entry.cond.timedWait(&self.mutex, timeout_ns) catch |err| switch (err) {
-                        error.Timeout => {
-                            if (!entry.completed) {
-                                _ = self.timeoutEntry(entry);
-                                self.releaseWaiterRef(entry);
-                                self.allocator.free(key);
-                                self.mutex.unlock();
-                                return .timed_out;
-                            }
-                            break;
-                        },
-                    };
+                    const sleep_ms: u64 = @min(remaining_ms, 10);
+                    self.mutex.unlock(defaultIo());
+                    defaultIo().sleep(.fromNanoseconds(sleep_ms * std.time.ns_per_ms), .boot) catch {};
+                    self.mutex.lockUncancelable(defaultIo());
                 }
 
                 // If the lock was shut down while we were waiting, release
@@ -307,7 +298,7 @@ pub const RefreshLock = struct {
                 if (self.shutdown) {
                     self.releaseWaiterRef(entry);
                     self.allocator.free(key);
-                    self.mutex.unlock();
+                    self.mutex.unlock(defaultIo());
                     return error.AuthRefreshFailed;
                 }
 
@@ -316,7 +307,7 @@ pub const RefreshLock = struct {
                 const timed_out = entry.timed_out;
                 self.releaseWaiterRef(entry);
                 self.allocator.free(key);
-                self.mutex.unlock();
+                self.mutex.unlock(defaultIo());
                 if (timed_out) return .timed_out;
                 return if (result) |err|
                     .{ .completed_err = err }
@@ -328,15 +319,10 @@ pub const RefreshLock = struct {
         // No entry — create one.  Caller owns the refresh.
         const entry = self.allocator.create(Entry) catch |err| {
             self.allocator.free(key);
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return err;
         };
-        const acquired_at = nowInstant() catch |err| {
-            self.allocator.free(key);
-            self.allocator.destroy(entry);
-            self.mutex.unlock();
-            return err;
-        };
+        const acquired_at_ms = monotonicMillis();
 
         const generation = self.next_generation;
         self.next_generation +%= 1;
@@ -344,8 +330,8 @@ pub const RefreshLock = struct {
 
         entry.* = .{
             .key_owned = key,
-            .acquired_at = acquired_at,
-            .cond = .{},
+            .acquired_at_ms = acquired_at_ms,
+            .cond = .init,
             .result = null,
             .completed = false,
             .timed_out = false,
@@ -358,10 +344,10 @@ pub const RefreshLock = struct {
             // Free key via entry.key_owned then destroy the entry.
             self.allocator.free(entry.key_owned);
             self.allocator.destroy(entry);
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return err;
         };
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
         return .{ .acquired = generation };
     }
 
@@ -371,7 +357,7 @@ pub const RefreshLock = struct {
     /// This method does not allocate — it finds the entry by linear scan
     /// so that OOM cannot prevent completion.
     pub fn complete(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8, generation: u64, err: ?anyerror) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
 
         // Find matching entry by linear scan.  This avoids allocating a
         // temporary lookup key (which can fail under memory pressure and
@@ -387,19 +373,19 @@ pub const RefreshLock = struct {
         }
 
         const entry = match orelse {
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return;
         };
 
         if (entry.generation != generation or entry.timed_out) {
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return;
         }
 
         entry.result = err;
         entry.completed = true;
         entry.timed_out = false;
-        entry.cond.broadcast();
+        entry.cond.broadcast(defaultIo());
         if (!entry.owner_released) {
             entry.owner_released = true;
             entry.ref_count -= 1;
@@ -408,7 +394,7 @@ pub const RefreshLock = struct {
         if (entry.ref_count == 0) {
             self.freeEntry(entry);
         }
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
     }
 
     // ------------------------------------------------------------------
@@ -422,12 +408,12 @@ pub const RefreshLock = struct {
     /// and all waiters are woken.  The holder's `complete()` call will be a
     /// no-op (entry already removed or marked completed).
     pub fn expireTimedOut(self: *RefreshLock) void {
-        const now = nowInstant() catch return;
+        const now = monotonicMillis();
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
         // Collect entries to expire so we don't invalidate the iterator.
         var to_expire = std.ArrayList(*Entry).initCapacity(self.allocator, self.entries.count()) catch {
-            self.mutex.unlock();
+            self.mutex.unlock(defaultIo());
             return;
         };
         defer to_expire.deinit(self.allocator);
@@ -441,19 +427,19 @@ pub const RefreshLock = struct {
         }
         for (to_expire.items) |entry| {
             if (self.timeoutEntry(entry)) {
-                entry.cond.broadcast();
+                entry.cond.broadcast(defaultIo());
             }
             // timeoutEntry releases the owner's ref. Waiters clean up
             // when ref_count hits 0, or timeoutEntry frees immediately
             // if no waiters remain.
         }
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
     }
 
     /// Number of in-flight (not completed) refresh locks.  For diagnostics.
     pub fn activeCount(self: *RefreshLock) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
         var count: usize = 0;
         var iter = self.entries.iterator();
         while (iter.next()) |hashmap_entry| {
@@ -463,8 +449,8 @@ pub const RefreshLock = struct {
     }
 
     fn refCountForTesting(self: *RefreshLock, provider_id: []const u8, user_id: ?[]const u8) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
         var iter = self.entries.iterator();
         while (iter.next()) |hashmap_entry| {
@@ -487,7 +473,7 @@ fn waitForRefCount(lock: *RefreshLock, provider: []const u8, expected: usize) !v
     var attempts: usize = 0;
     while (lock.refCountForTesting(provider, null) < expected) : (attempts += 1) {
         if (attempts >= waiter_spin_limit) return error.WaiterRefCountTimeout;
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        defaultIo().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
     }
 }
 
@@ -603,7 +589,7 @@ fn concurrentWorker(ctx: *ConcurrencyCtx) void {
         .acquired => |generation| {
             _ = ctx.refresh_count.fetchAdd(1, .monotonic);
             // Simulate a short refresh delay
-            std.Thread.sleep(5 * std.time.ns_per_ms);
+            defaultIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .boot) catch {};
             ctx.lock.complete(ctx.provider, null, generation, null);
         },
         .completed_ok => {
@@ -703,7 +689,7 @@ test "lock held beyond timeout returns timed_out" {
     const first_gen = try expectAcquired(try lock.acquire("slow-provider", null));
 
     // Wait for the timeout to elapse.
-    std.Thread.sleep(80 * std.time.ns_per_ms);
+    defaultIo().sleep(.fromNanoseconds(80 * std.time.ns_per_ms), .boot) catch {};
 
     // A second acquire should observe the timeout.
     const second = try lock.acquire("slow-provider", null);
@@ -719,7 +705,7 @@ test "expireTimedOut marks stale entries as completed" {
 
     _ = try expectAcquired(try lock.acquire("expired-provider", null));
 
-    std.Thread.sleep(80 * std.time.ns_per_ms);
+    defaultIo().sleep(.fromNanoseconds(80 * std.time.ns_per_ms), .boot) catch {};
     lock.expireTimedOut();
 
     // No waiters were holding refs, so expireTimedOut removes the stale
@@ -815,7 +801,7 @@ test "shutdown with waiter does not dereference freed entries" {
     };
     const waiter = try std.Thread.spawn(.{}, shutdownWaiter, .{&ctx});
 
-    std.Thread.sleep(5 * std.time.ns_per_ms);
+    defaultIo().sleep(.fromNanoseconds(5 * std.time.ns_per_ms), .boot) catch {};
     var deinit_ctx = DeinitCtx{ .lock = &lock };
     const deinit_thread = try std.Thread.spawn(.{}, deinitWorker, .{&deinit_ctx});
 

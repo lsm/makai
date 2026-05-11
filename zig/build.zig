@@ -85,12 +85,18 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/utils/oauth/storage.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const refresh_lock_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
     });
 
     const api_registry_mod = b.createModule(.{
@@ -110,6 +116,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -129,6 +136,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -138,6 +146,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -190,6 +199,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -200,6 +210,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "retry", .module = retry_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
         },
@@ -231,6 +242,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -251,6 +263,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -269,6 +282,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -282,6 +296,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -296,9 +311,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -313,8 +330,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "retry", .module = retry_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -328,9 +347,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "sanitize", .module = sanitize_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "retry", .module = retry_mod },
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -412,6 +433,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "oom", .module = oom_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -451,6 +473,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "content_partial", .module = content_partial_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -475,6 +498,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -509,6 +533,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_resolver", .module = auth_resolver_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "oauth/refresh_lock", .module = refresh_lock_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -527,6 +552,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
             .{ .name = "oom", .module = oom_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -535,6 +561,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "protocol_server", .module = protocol_server_mod },
             .{ .name = "protocol_client", .module = protocol_client_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
@@ -565,6 +592,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "model_catalog_types", .module = protocol_model_catalog_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -575,6 +603,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "agent_types", .module = protocol_agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -587,6 +616,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -623,6 +653,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_types", .module = protocol_auth_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -637,6 +668,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -672,6 +704,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tool_types", .module = protocol_tool_types_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -682,6 +715,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -694,6 +728,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -702,6 +737,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
@@ -714,6 +750,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
@@ -739,6 +776,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol_client", .module = protocol_client_mod },
             .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -831,6 +869,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -846,6 +885,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -862,6 +902,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -877,6 +918,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -892,6 +934,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -908,6 +951,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -928,6 +972,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -965,6 +1010,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "event_stream", .module = event_stream_mod },
@@ -985,6 +1031,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },
@@ -1062,6 +1109,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "event_stream", .module = event_stream_mod },
                 .{ .name = "agent_types", .module = agent_types_mod },
@@ -1076,6 +1124,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "event_stream", .module = event_stream_mod },
@@ -1105,6 +1154,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_envelope", .module = protocol_auth_envelope_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -1133,6 +1183,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -1343,6 +1394,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
                 .{ .name = "ai_types", .module = ai_types_mod },
                 .{ .name = "api_registry", .module = api_registry_mod },
                 .{ .name = "register_builtins", .module = register_builtins_mod },

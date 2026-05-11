@@ -60,29 +60,25 @@ pub const JsonWriter = struct {
 
     pub fn writeInt(self: *JsonWriter, value: anytype) !void {
         try self.writeCommaIfNeeded();
-        const writer = self.buffer.writer(self.allocator);
-        try std.fmt.format(writer, "{d}", .{value});
+        try self.buffer.print(self.allocator, "{d}", .{value});
         self.needs_comma = true;
     }
 
     pub fn writeFloat(self: *JsonWriter, value: f32) !void {
         try self.writeCommaIfNeeded();
-        const writer = self.buffer.writer(self.allocator);
-        try std.fmt.format(writer, "{d}", .{value});
+        try self.buffer.print(self.allocator, "{d}", .{value});
         self.needs_comma = true;
     }
 
     pub fn writeBool(self: *JsonWriter, value: bool) !void {
         try self.writeCommaIfNeeded();
-        const writer = self.buffer.writer(self.allocator);
-        try writer.writeAll(if (value) "true" else "false");
+        try self.buffer.appendSlice(self.allocator, if (value) "true" else "false");
         self.needs_comma = true;
     }
 
     pub fn writeNull(self: *JsonWriter) !void {
         try self.writeCommaIfNeeded();
-        const writer = self.buffer.writer(self.allocator);
-        try writer.writeAll("null");
+        try self.buffer.appendSlice(self.allocator, "null");
         self.needs_comma = true;
     }
 
@@ -124,14 +120,12 @@ pub const JsonWriter = struct {
                 '\t' => try self.buffer.appendSlice(self.allocator, "\\t"),
                 0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
                     // Other control characters
-                    const writer = self.buffer.writer(self.allocator);
-                    try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+                    try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
                 },
                 0x80...0xFF => {
                     // Non-ASCII bytes - escape as \uXXXX to ensure valid JSON
                     // This handles potentially invalid UTF-8 sequences
-                    const writer = self.buffer.writer(self.allocator);
-                    try std.fmt.format(writer, "\\u{x:0>4}", .{c});
+                    try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
                 },
                 else => try self.buffer.append(self.allocator, c),
             }
@@ -154,7 +148,7 @@ pub fn getResult(writer: *JsonWriter) []const u8 {
 
 test "build anthropic request" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);
@@ -180,7 +174,7 @@ test "build anthropic request" {
 
 test "string escaping" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);
@@ -197,7 +191,7 @@ test "string escaping" {
 
 test "nested objects and arrays" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);
@@ -225,7 +219,7 @@ test "nested objects and arrays" {
 
 test "null and boolean values" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);
@@ -244,7 +238,7 @@ test "null and boolean values" {
 
 test "float values" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);
@@ -263,7 +257,7 @@ test "float values" {
 
 test "writeRawJson embeds pre-serialized JSON" {
     const allocator = std.testing.allocator;
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     defer buffer.deinit(allocator);
 
     var writer = JsonWriter.init(&buffer, allocator);

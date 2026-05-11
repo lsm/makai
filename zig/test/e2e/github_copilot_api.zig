@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -36,7 +37,7 @@ test "github_copilot e2e: basic text generation" {
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Reply with exactly: hello world" },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -53,11 +54,11 @@ test "github_copilot e2e: basic text generation" {
 
     while (!stream.isDone()) {
         _ = stream.poll();
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Allow detached provider thread to complete deferred cleanup
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: github_copilot e2e stream error: {s}\n", .{err});
@@ -101,7 +102,7 @@ test "github_copilot e2e: streaming events sequence" {
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Count to 3." },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -131,12 +132,12 @@ test "github_copilot e2e: streaming events sequence" {
             }
         } else {
             if (stream.isDone()) break;
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            compat.time.sleepNs(10 * std.time.ns_per_ms);
         }
     }
 
     // Allow detached provider thread to complete deferred cleanup
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    compat.time.sleepNs(50 * std.time.ns_per_ms);
 
     if (stream.getError()) |err| {
         std.debug.print("\nTest FAILED: github_copilot e2e stream error: {s}\n", .{err});

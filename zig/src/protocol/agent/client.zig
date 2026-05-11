@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const agent_types = @import("agent_types");
 const envelope = @import("agent_envelope");
 const transport = @import("transport");
@@ -23,7 +24,7 @@ pub const AgentProtocolClient = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .event_queue = std.ArrayList(OwnedSlice(u8)){},
+            .event_queue = std.ArrayList(OwnedSlice(u8)).empty,
             .next_sequence_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .session_complete_flags = std.AutoHashMap(agent_types.SessionId, bool).init(allocator),
             .session_last_errors = std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)).init(allocator),
@@ -80,7 +81,7 @@ pub const AgentProtocolClient = struct {
             .session_id = sid,
             .message_id = msg_id,
             .sequence = seq,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = payload,
         });
 
@@ -102,7 +103,7 @@ pub const AgentProtocolClient = struct {
             .session_id = session_id,
             .message_id = msg_id,
             .sequence = seq,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = payload,
         });
         return msg_id;
@@ -120,7 +121,7 @@ pub const AgentProtocolClient = struct {
             .session_id = session_id,
             .message_id = msg_id,
             .sequence = seq,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = payload,
         });
         return msg_id;
@@ -265,7 +266,7 @@ test "AgentProtocolClient processes events and results" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_started = .{ .session_id = sid } },
     });
 
@@ -273,7 +274,7 @@ test "AgentProtocolClient processes events and results" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_event = try allocator.dupe(u8, "{\"type\":\"turn_start\"}") },
     };
     defer event_env.deinit(allocator);
@@ -283,7 +284,7 @@ test "AgentProtocolClient processes events and results" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 3,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
     };
     defer result_env.deinit(allocator);
@@ -325,7 +326,7 @@ test "AgentProtocolClient removeSessionState clears per-session and legacy curre
 test "AgentProtocolClient maintains per-session sequence continuity across stop and restart" {
     const allocator = std.testing.allocator;
 
-    var writes = std.ArrayList([]u8){};
+    var writes = std.ArrayList([]u8).empty;
     defer {
         for (writes.items) |line| allocator.free(line);
         writes.deinit(allocator);
@@ -364,7 +365,7 @@ test "AgentProtocolClient maintains per-session sequence continuity across stop 
         .session_id = sid1,
         .message_id = agent_types.generateUlid(),
         .sequence = 10,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_stopped = .{ .session_id = sid1 } },
     };
     defer stopped_env.deinit(allocator);

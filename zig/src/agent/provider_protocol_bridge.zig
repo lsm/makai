@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const event_stream = @import("event_stream");
@@ -89,12 +90,9 @@ fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.Assista
     }
 
     while (true) {
-        stream.push(cloned) catch |err| switch (err) {
-            error.QueueFull => {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
-                continue;
-            },
-            else => return err,
+        stream.push(cloned) catch {
+            compat.time.sleepNs(1 * std.time.ns_per_ms);
+            continue;
         };
         return;
     }
@@ -150,7 +148,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         return;
     };
 
-    const start_ms = std.time.milliTimestamp();
+    const start_ms = compat.time.nowMillis();
     const timeout_ms: i64 = 120_000;
 
     while (!client.isComplete()) {
@@ -164,12 +162,12 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
             return;
         };
 
-        if (std.time.milliTimestamp() - start_ms > timeout_ms) {
+        if (compat.time.nowMillis() - start_ms > timeout_ms) {
             ctx.out_stream.completeWithError("Provider protocol stream timed out");
             return;
         }
 
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        compat.time.sleepNs(1 * std.time.ns_per_ms);
     }
 
     // Final drain after completion.
@@ -224,28 +222,25 @@ test "InProcessProviderProtocolBridge smoke test" {
             const s = try a.create(event_stream.AssistantMessageEventStream);
             s.* = event_stream.AssistantMessageEventStream.init(a);
 
-            const content = try a.alloc(ai_types.AssistantContent, 1);
-            content[0] = .{ .text = .{ .text = try a.dupe(u8, "ok") } };
-
             s.push(.{ .start = .{ .partial = .{
-                .content = content,
+                .content = &.{.{ .text = .{ .text = "ok" } }},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
                 .usage = .{},
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .is_owned = false,
             } } }) catch {};
 
             s.complete(.{
-                .content = content,
+                .content = &.{},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
                 .usage = .{},
                 .stop_reason = .stop,
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .is_owned = false,
             });
             s.markThreadDone();
@@ -287,7 +282,7 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     const user = ai_types.Message{ .user = .{
         .content = .{ .text = "hi" },
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };

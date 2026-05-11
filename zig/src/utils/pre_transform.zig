@@ -7,6 +7,7 @@
 //! - Claude Code tool name normalization for OAuth tokens
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const StringBuilder = @import("string_builder").StringBuilder;
 
@@ -181,16 +182,16 @@ pub fn preTransform(
     messages: []const ai_types.Message,
     config: TransformConfig,
 ) !TransformResult {
-    var result_messages = std.ArrayList(ai_types.Message){};
+    var result_messages = std.ArrayList(ai_types.Message).empty;
     errdefer result_messages.deinit(allocator);
 
-    var owned_content = std.ArrayList([]const ai_types.AssistantContent){};
+    var owned_content = std.ArrayList([]const ai_types.AssistantContent).empty;
     errdefer owned_content.deinit(allocator);
 
-    var owned_tool_ids = std.ArrayList([]const u8){};
+    var owned_tool_ids = std.ArrayList([]const u8).empty;
     errdefer owned_tool_ids.deinit(allocator);
 
-    var owned_synthetic = std.ArrayList(TransformResult.SyntheticToolResult){};
+    var owned_synthetic = std.ArrayList(TransformResult.SyntheticToolResult).empty;
     errdefer owned_synthetic.deinit(allocator);
 
     // First pass: build tool call ID map (original → normalized) and collect existing result IDs
@@ -201,7 +202,7 @@ pub fn preTransform(
     }
 
     // Collect all tool call IDs from assistant messages
-    var all_tool_call_ids = std.ArrayList(struct { id: []const u8, name: []const u8 }){};
+    var all_tool_call_ids = std.ArrayList(struct { id: []const u8, name: []const u8 }).empty;
     defer all_tool_call_ids.deinit(allocator);
 
     var existing_result_ids = std.StringHashMap(void).init(allocator);
@@ -237,7 +238,7 @@ pub fn preTransform(
     }
 
     // Second pass: transform messages
-    var pending_tool_calls = std.ArrayList(struct { id: []const u8, name: []const u8 }){};
+    var pending_tool_calls = std.ArrayList(struct { id: []const u8, name: []const u8 }).empty;
     defer pending_tool_calls.deinit(allocator);
     var pending_result_ids = std.StringHashMap(void).init(allocator);
     defer pending_result_ids.deinit();
@@ -267,7 +268,7 @@ pub fn preTransform(
                 const same_model = isSameModel(a, config);
 
                 // Transform content blocks
-                var new_content = std.ArrayList(ai_types.AssistantContent){};
+                var new_content = std.ArrayList(ai_types.AssistantContent).empty;
                 errdefer new_content.deinit(allocator);
 
                 for (a.content) |block| {
@@ -440,7 +441,7 @@ fn createSyntheticResult(
             .tool_name = name_dup,
             .content = content,
             .is_error = true,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
         },
     };
 }

@@ -1,10 +1,18 @@
 const std = @import("std");
+const compat = @import("compat");
 const auth_providers = @import("auth/providers");
 const auth_types = @import("auth_types");
 const anthropic_oauth = @import("oauth/anthropic");
 const github_oauth = @import("oauth/github_copilot");
 const oauth_storage = @import("oauth/storage");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 const FlowState = struct {
     flow_id: auth_types.Ulid,
@@ -16,8 +24,8 @@ const FlowState = struct {
     waiting_prompt_id: ?[]u8 = null,
     pending_answer: ?[]u8 = null,
     thread: ?std.Thread = null,
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
 
     fn init(allocator: std.mem.Allocator, flow_id: auth_types.Ulid, provider_id: []const u8) !FlowState {
         return .{
@@ -46,7 +54,7 @@ pub const AuthProtocolServer = struct {
     outgoing_sequences: std.AutoHashMap(auth_types.Ulid, u64),
     flows: std.AutoHashMap(auth_types.Ulid, *FlowState),
     outbox: std.ArrayList(auth_types.Envelope),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     options: Options,
 
     const Self = @This();
@@ -63,24 +71,24 @@ pub const AuthProtocolServer = struct {
             .expected_sequences = std.AutoHashMap(auth_types.Ulid, u64).init(allocator),
             .outgoing_sequences = std.AutoHashMap(auth_types.Ulid, u64).init(allocator),
             .flows = std.AutoHashMap(auth_types.Ulid, *FlowState).init(allocator),
-            .outbox = std.ArrayList(auth_types.Envelope){},
+            .outbox = .empty,
             .options = options,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
 
         var flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
             const flow = entry.value_ptr.*;
-            flow.mutex.lock();
+            flow.mutex.lockUncancelable(defaultIo());
             flow.cancelled = true;
-            flow.cond.broadcast();
-            flow.mutex.unlock();
+            flow.cond.broadcast(defaultIo());
+            flow.mutex.unlock(defaultIo());
         }
 
-        var join_list = std.ArrayList(*FlowState){};
+        var join_list = std.ArrayList(*FlowState).empty;
         defer join_list.deinit(self.allocator);
 
         flow_iter = self.flows.iterator();
@@ -88,7 +96,7 @@ pub const AuthProtocolServer = struct {
             join_list.append(self.allocator, entry.value_ptr.*) catch {};
         }
 
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
 
         for (join_list.items) |flow| {
             if (flow.thread) |thread| {
@@ -97,7 +105,7 @@ pub const AuthProtocolServer = struct {
             }
         }
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(defaultIo());
 
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
@@ -115,13 +123,13 @@ pub const AuthProtocolServer = struct {
         }
         self.outbox.deinit(self.allocator);
 
-        self.mutex.unlock();
+        self.mutex.unlock(defaultIo());
         self.* = undefined;
     }
 
     pub fn handleEnvelope(self: *Self, env: auth_types.Envelope) !?auth_types.Envelope {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
         self.cleanupCompletedFlowsLocked();
 
         if (env.version != auth_types.PROTOCOL_VERSION) {
@@ -145,7 +153,7 @@ pub const AuthProtocolServer = struct {
                     .message_id = auth_types.generateUlid(),
                     .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
                     .in_reply_to = env.message_id,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .pong = .{
                         .ping_id = OwnedSlice(u8).initOwned(ping_id),
                     } },
@@ -158,8 +166,8 @@ pub const AuthProtocolServer = struct {
     }
 
     pub fn popOutbound(self: *Self) ?auth_types.Envelope {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
         self.cleanupCompletedFlowsLocked();
 
         if (self.outbox.items.len == 0) return null;
@@ -167,17 +175,17 @@ pub const AuthProtocolServer = struct {
     }
 
     pub fn activeFlowCount(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
         self.cleanupCompletedFlowsLocked();
 
         var count: usize = 0;
         var iter = self.flows.iterator();
         while (iter.next()) |entry| {
             const flow = entry.value_ptr.*;
-            flow.mutex.lock();
+            flow.mutex.lockUncancelable(defaultIo());
             const active = !flow.terminal_emitted;
-            flow.mutex.unlock();
+            flow.mutex.unlock(defaultIo());
             if (active) count += 1;
         }
 
@@ -197,7 +205,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(env.stream_id),
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_providers_response = providers },
         };
         try self.outbox.append(self.allocator, response);
@@ -258,10 +266,10 @@ pub const AuthProtocolServer = struct {
             return self.makeAckLocked(env.stream_id, env.message_id);
         };
 
-        flow.mutex.lock();
+        flow.mutex.lockUncancelable(defaultIo());
         const terminal = flow.terminal_emitted;
         const cancelled = flow.cancelled;
-        flow.mutex.unlock();
+        flow.mutex.unlock(defaultIo());
         if (terminal or cancelled) {
             return self.makeAckLocked(env.stream_id, env.message_id);
         }
@@ -272,15 +280,15 @@ pub const AuthProtocolServer = struct {
 
         const ack = self.makeAckLocked(env.stream_id, env.message_id);
 
-        flow.mutex.lock();
-        defer flow.mutex.unlock();
+        flow.mutex.lockUncancelable(defaultIo());
+        defer flow.mutex.unlock(defaultIo());
 
         if (flow.waiting_prompt_id) |pending_prompt_id| {
             if (std.mem.eql(u8, pending_prompt_id, response.prompt_id.slice()) and flow.pending_answer == null and !flow.cancelled and !flow.terminal_emitted) {
                 flow.pending_answer = self.allocator.dupe(u8, response.answer.slice()) catch null;
                 self.allocator.free(pending_prompt_id);
                 flow.waiting_prompt_id = null;
-                flow.cond.broadcast();
+                flow.cond.broadcast(defaultIo());
             }
         }
 
@@ -301,10 +309,10 @@ pub const AuthProtocolServer = struct {
             return self.makeAckLocked(env.stream_id, env.message_id);
         };
 
-        flow.mutex.lock();
+        flow.mutex.lockUncancelable(defaultIo());
         const terminal = flow.terminal_emitted;
         const cancelled = flow.cancelled;
-        flow.mutex.unlock();
+        flow.mutex.unlock(defaultIo());
         if (terminal or cancelled) {
             return self.makeAckLocked(env.stream_id, env.message_id);
         }
@@ -315,7 +323,7 @@ pub const AuthProtocolServer = struct {
 
         const ack = self.makeAckLocked(env.stream_id, env.message_id);
 
-        flow.mutex.lock();
+        flow.mutex.lockUncancelable(defaultIo());
         flow.cancelled = true;
 
         var should_emit_cancel_result = false;
@@ -332,15 +340,15 @@ pub const AuthProtocolServer = struct {
             self.allocator.free(answer);
             flow.pending_answer = null;
         }
-        flow.cond.broadcast();
-        flow.mutex.unlock();
+        flow.cond.broadcast(defaultIo());
+        flow.mutex.unlock(defaultIo());
 
         if (should_emit_cancel_result) {
             try self.outbox.append(self.allocator, auth_types.Envelope{
                 .stream_id = request.flow_id,
                 .message_id = auth_types.generateUlid(),
                 .sequence = self.nextOutgoingSequenceLocked(request.flow_id),
-                .timestamp = std.time.milliTimestamp(),
+                .timestamp = compat.time.nowMillis(),
                 .payload = .{ .auth_login_result = .{
                     .flow_id = request.flow_id,
                     .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -353,15 +361,15 @@ pub const AuthProtocolServer = struct {
     }
 
     fn cleanupCompletedFlowsLocked(self: *Self) void {
-        var completed = std.ArrayList(auth_types.Ulid){};
+        var completed = std.ArrayList(auth_types.Ulid).empty;
         defer completed.deinit(self.allocator);
 
         var iter = self.flows.iterator();
         while (iter.next()) |entry| {
             const flow = entry.value_ptr.*;
-            flow.mutex.lock();
+            flow.mutex.lockUncancelable(defaultIo());
             const should_remove = flow.worker_done and flow.terminal_emitted;
-            flow.mutex.unlock();
+            flow.mutex.unlock(defaultIo());
             if (!should_remove) continue;
             completed.append(self.allocator, entry.key_ptr.*) catch return;
         }
@@ -391,7 +399,7 @@ pub const AuthProtocolServer = struct {
         var storage = oauth_storage.AuthStorage.loadFromFile(self.allocator) catch null;
         defer if (storage) |*auth_storage| auth_storage.deinit();
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = compat.time.nowMillis();
 
         for (auth_providers.AUTH_PROVIDER_DEFINITIONS, 0..) |definition, index| {
             var status: auth_types.AuthStatus = .login_required;
@@ -439,7 +447,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .ack = .{
                 .acknowledged_id = in_reply_to,
             } },
@@ -467,7 +475,7 @@ pub const AuthProtocolServer = struct {
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(scope_id),
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .nack = .{
                 .rejected_id = in_reply_to,
                 .reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason)),
@@ -480,10 +488,10 @@ pub const AuthProtocolServer = struct {
         defer {
             // INVARIANT: this defer must never lock server.mutex.
             // cleanupCompletedFlowsLocked() joins worker threads while holding it.
-            flow.mutex.lock();
+            flow.mutex.lockUncancelable(defaultIo());
             flow.worker_done = true;
-            flow.cond.broadcast();
-            flow.mutex.unlock();
+            flow.cond.broadcast(defaultIo());
+            flow.mutex.unlock(defaultIo());
         }
 
         server.runLoginFlow(flow) catch {};
@@ -503,9 +511,9 @@ pub const AuthProtocolServer = struct {
         var credentials_consumed = false;
         defer if (!credentials_consumed) credentials.deinit(self.allocator);
 
-        flow.mutex.lock();
+        flow.mutex.lockUncancelable(defaultIo());
         const cancelled = flow.cancelled;
-        flow.mutex.unlock();
+        flow.mutex.unlock(defaultIo());
         if (cancelled) {
             try self.emitCancelledIfNeeded(flow);
             return;
@@ -559,7 +567,7 @@ pub const AuthProtocolServer = struct {
         return .{
             .refresh = try self.allocator.dupe(u8, "fixture-refresh-token"),
             .access = try self.allocator.dupe(u8, "fixture-access-token"),
-            .expires = std.time.milliTimestamp() + (60 * 60 * 1000),
+            .expires = compat.time.nowMillis() + (60 * 60 * 1000),
             .provider_data = try self.allocator.dupe(u8, "{\"provider\":\"test-fixture\"}"),
         };
     }
@@ -617,8 +625,8 @@ pub const AuthProtocolServer = struct {
         while (true) {
             try self.queuePrompt(flow, message, allow_empty);
 
-            flow.mutex.lock();
-            defer flow.mutex.unlock();
+            flow.mutex.lockUncancelable(defaultIo());
+            defer flow.mutex.unlock(defaultIo());
 
             while (true) {
                 if (flow.cancelled or flow.terminal_emitted) {
@@ -643,17 +651,17 @@ pub const AuthProtocolServer = struct {
                     break;
                 }
 
-                flow.cond.wait(&flow.mutex);
+                flow.cond.waitUncancelable(defaultIo(), &flow.mutex);
             }
         }
     }
 
     fn queuePrompt(self: *Self, flow: *FlowState, message: []const u8, allow_empty: bool) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
-        flow.mutex.lock();
-        defer flow.mutex.unlock();
+        flow.mutex.lockUncancelable(defaultIo());
+        defer flow.mutex.unlock(defaultIo());
 
         if (flow.cancelled or flow.terminal_emitted) {
             return error.AuthFlowCancelled;
@@ -672,7 +680,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .prompt = .{
                 .flow_id = flow.flow_id,
                 .prompt_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, prompt_id)),
@@ -685,18 +693,18 @@ pub const AuthProtocolServer = struct {
     }
 
     fn emitProgress(self: *Self, flow: *FlowState, message: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
-        flow.mutex.lock();
-        defer flow.mutex.unlock();
+        flow.mutex.lockUncancelable(defaultIo());
+        defer flow.mutex.unlock(defaultIo());
         if (flow.cancelled or flow.terminal_emitted) return;
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .progress = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -706,11 +714,11 @@ pub const AuthProtocolServer = struct {
     }
 
     fn emitAuthUrl(self: *Self, flow: *FlowState, url: []const u8, instructions: ?[]const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
-        flow.mutex.lock();
-        defer flow.mutex.unlock();
+        flow.mutex.lockUncancelable(defaultIo());
+        defer flow.mutex.unlock(defaultIo());
         if (flow.cancelled or flow.terminal_emitted) return;
 
         var event = auth_types.AuthEvent{ .auth_url = .{
@@ -726,14 +734,14 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = event },
         });
     }
 
     fn tryBeginTerminal(flow: *FlowState) bool {
-        flow.mutex.lock();
-        defer flow.mutex.unlock();
+        flow.mutex.lockUncancelable(defaultIo());
+        defer flow.mutex.unlock(defaultIo());
 
         if (flow.terminal_emitted) return false;
         flow.terminal_emitted = true;
@@ -743,14 +751,14 @@ pub const AuthProtocolServer = struct {
     fn emitSuccessIfNeeded(self: *Self, flow: *FlowState) !void {
         if (!tryBeginTerminal(flow)) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .success = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -761,7 +769,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -773,14 +781,14 @@ pub const AuthProtocolServer = struct {
     fn emitFailureIfNeeded(self: *Self, flow: *FlowState, code: []const u8, message: []const u8) !void {
         if (!tryBeginTerminal(flow)) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_event = .{ .@"error" = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -793,7 +801,7 @@ pub const AuthProtocolServer = struct {
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),
@@ -805,14 +813,14 @@ pub const AuthProtocolServer = struct {
     fn emitCancelledIfNeeded(self: *Self, flow: *FlowState) !void {
         if (!tryBeginTerminal(flow)) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(defaultIo());
+        defer self.mutex.unlock(defaultIo());
 
         try self.outbox.append(self.allocator, auth_types.Envelope{
             .stream_id = flow.flow_id,
             .message_id = auth_types.generateUlid(),
             .sequence = self.nextOutgoingSequenceLocked(flow.flow_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_login_result = .{
                 .flow_id = flow.flow_id,
                 .provider_id = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, flow.provider_id)),

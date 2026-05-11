@@ -22,10 +22,10 @@ pub const SSEParser = struct {
 
     pub fn init(allocator: std.mem.Allocator) SSEParser {
         return .{
-            .line_buffer = std.ArrayList(u8){},
+            .line_buffer = std.ArrayList(u8).empty,
             .current_event_type = null,
-            .current_data = std.ArrayList(u8){},
-            .pending_events = std.ArrayList(SSEEvent){},
+            .current_data = std.ArrayList(u8).empty,
+            .pending_events = std.ArrayList(SSEEvent).empty,
             .allocator = allocator,
         };
     }

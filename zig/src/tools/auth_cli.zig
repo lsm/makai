@@ -10,6 +10,7 @@
 //! Phase 5.
 
 const std = @import("std");
+const compat = @import("compat");
 const auth_server_mod = @import("auth_server");
 const auth_runtime_mod = @import("auth_runtime");
 const auth_envelope_mod = @import("auth_envelope");
@@ -23,6 +24,13 @@ const SerializedPipe = in_process.SerializedPipe;
 
 /// Idle pump sleep when the auth protocol runtime has no immediate work.
 const IDLE_SLEEP_NS = std.time.ns_per_ms;
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 /// Hard upper bound on iterations spent waiting for terminal envelopes.
 /// 60_000 iterations × 1ms ≈ 60s per command. Real OAuth flows finish in well
@@ -90,7 +98,7 @@ pub fn runProvidersCommand(
             .stream_id = stream_id,
             .message_id = auth_types.generateUlid(),
             .sequence = 1,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .auth_providers_request = .{} },
         };
         const json = try auth_envelope_mod.serializeEnvelope(env, allocator);
@@ -134,7 +142,7 @@ pub fn runProvidersCommand(
                 else => {},
             }
         }
-        if (!did_work) std.Thread.sleep(IDLE_SLEEP_NS);
+        if (!did_work) compat.time.sleepNs(IDLE_SLEEP_NS);
     }
 
     return AuthCliError.AuthProtocolTimeout;
@@ -220,7 +228,7 @@ pub fn runLoginCommand(
                 else => {},
             }
         }
-        if (!did_work) std.Thread.sleep(IDLE_SLEEP_NS);
+        if (!did_work) compat.time.sleepNs(IDLE_SLEEP_NS);
     }
 
     if (!saw_terminal) return AuthCliError.AuthProtocolTimeout;
@@ -246,7 +254,7 @@ fn sendLoginStart(
         .stream_id = flow_id,
         .message_id = auth_types.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_login_start = .{
             .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } },
@@ -273,7 +281,7 @@ fn sendPromptResponse(
         .stream_id = flow_id,
         .message_id = auth_types.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_prompt_response = .{
             .flow_id = flow_id,
             .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
@@ -459,7 +467,7 @@ fn emitProviders(
         // [{ "id", "name" }] }`. Auth status from the runtime is intentionally
         // omitted from the wrapper output to avoid altering the output schema
         // existing scripts depend on.
-        var buf = std.ArrayList(u8){};
+        var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
         try buf.appendSlice(allocator, "{\"type\":\"providers\",\"providers\":[");
         for (response.providers.slice(), 0..) |provider, i| {
@@ -531,14 +539,14 @@ fn appendJsonStringField(
 // =============================================================================
 
 pub const FileIo = struct {
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
     allocator: std.mem.Allocator,
-    leftover: std.ArrayList(u8) = std.ArrayList(u8){},
+    leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     read_buf: [4096]u8 = undefined,
 
-    pub fn init(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File, stderr: std.fs.File) FileIo {
+    pub fn init(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io.File, stderr: std.Io.File) FileIo {
         return .{
             .stdin = stdin,
             .stdout = stdout,
@@ -568,7 +576,7 @@ pub const FileIo = struct {
                 return dup;
             }
 
-            const bytes_read = self.stdin.read(&self.read_buf) catch |err| return err;
+            const bytes_read = self.stdin.readStreaming(defaultIo(), &.{&self.read_buf}) catch |err| return err;
             if (bytes_read == 0) {
                 if (self.leftover.items.len == 0) return error.EndOfStream;
                 const raw = self.leftover.items;
@@ -588,12 +596,12 @@ pub const FileIo = struct {
 
     fn writeOutFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FileIo = @ptrCast(@alignCast(ctx));
-        try self.stdout.writeAll(bytes);
+        try self.stdout.writeStreamingAll(defaultIo(), bytes);
     }
 
     fn writeErrFn(ctx: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *FileIo = @ptrCast(@alignCast(ctx));
-        try self.stderr.writeAll(bytes);
+        try self.stderr.writeStreamingAll(defaultIo(), bytes);
     }
 };
 
@@ -610,13 +618,13 @@ const file_io_vtable = AuthCliIo.VTable{
 const TestIo = struct {
     inputs: std.ArrayList([]const u8),
     input_index: usize = 0,
-    out: std.ArrayList(u8) = std.ArrayList(u8){},
-    err: std.ArrayList(u8) = std.ArrayList(u8){},
+    out: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    err: std.ArrayList(u8) = std.ArrayList(u8).empty,
     allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator) TestIo {
         return .{
-            .inputs = std.ArrayList([]const u8){},
+            .inputs = .empty,
             .allocator = allocator,
         };
     }

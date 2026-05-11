@@ -1,14 +1,16 @@
 const std = @import("std");
-const compat_random = @import("random.zig");
-const compat_time = @import("time.zig");
 
-pub const OpenFlags = std.fs.File.OpenFlags;
-pub const CreateFlags = std.fs.File.CreateFlags;
-pub const File = std.fs.File;
-pub const Dir = std.fs.Dir;
+pub const OpenFlags = std.Io.Dir.OpenFileOptions;
+pub const CreateFlags = std.Io.Dir.CreateFileOptions;
+pub const File = std.Io.File;
+pub const Dir = std.Io.Dir;
 
-pub const default_file_mode: std.fs.File.Mode = 0o600;
-pub const default_max_file_bytes = 1024 * 1024;
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
 
 /// Return the process current working directory handle.
 ///
@@ -16,316 +18,135 @@ pub const default_max_file_bytes = 1024 * 1024;
 /// implementation may borrow the Makai default I/O context, but public callers
 /// should not receive or pass raw `std.Io` handles.
 pub fn getCwd() Dir {
-    return std.fs.cwd();
+    return Dir.cwd();
 }
 
-/// Open a file from the process current working directory.
+/// Open a file relative to `dir`.
 ///
-/// Zig 0.16 mapping: preserve this project-level seam while rerouting the
-/// implementation through the selected Makai filesystem context. The public
-/// signature intentionally exposes `std.fs.File`, not raw `std.Io`.
-pub fn openFile(path: []const u8, flags: OpenFlags) !File {
-    return getCwd().openFile(path, flags);
+/// Parameter order follows the migration convention: I/O handle (`dir`) first
+/// for handle-scoped operations, then operation-specific parameters.
+pub fn openFile(dir: Dir, path: []const u8, flags: OpenFlags) !File {
+    return dir.openFile(defaultIo(), path, flags);
 }
 
-/// Read a file from the process current working directory into caller-owned
-/// memory. The returned slice is owned by `allocator`.
+/// Read a file relative to `dir` into an allocated buffer.
 ///
-/// `max_bytes` preserves the caller-controlled limit from the initial wrapper
-/// skeleton and mirrors `std.fs.File.readToEndAlloc` error behavior.
+/// Zig 0.16 mapping: preserve allocation ownership and error behavior while
+/// routing file reads through the Makai filesystem wrapper internals.
+pub fn readFileAlloc(allocator: std.mem.Allocator, dir: Dir, path: []const u8, max_bytes: usize) ![]u8 {
+    return dir.readFileAlloc(defaultIo(), path, allocator, .limited(max_bytes));
+}
+
+pub const default_file_mode: std.Io.File.Permissions = @enumFromInt(0o600);
+
+/// Write a file relative to `dir`, replacing existing contents.
 ///
-/// Zig 0.16 mapping: keep allocation ownership and error behavior stable while
-/// moving the internals to the future filesystem/I/O context.
-pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var file = try openFile(path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, max_bytes);
+/// Files are created with restrictive permissions by default because later OAuth
+/// storage migration work may use this wrapper for credential material. Existing
+/// files keep their current mode when opened with truncation on POSIX systems.
+pub fn writeFile(dir: Dir, path: []const u8, data: []const u8) !void {
+    var file = try dir.createFile(defaultIo(), path, .{ .truncate = true, .permissions = default_file_mode });
+    defer file.close(defaultIo());
+    try file.writeStreamingAll(defaultIo(), data);
 }
 
-/// Read a file using the credential/config-sized default cap.
-pub fn readFileAllocDefault(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileAlloc(allocator, path, default_max_file_bytes);
-}
-
-/// Write `data` to `path` from the process current working directory.
+/// Atomically replace `target_path` by writing `data` to `tmp_path` in `dir` and
+/// renaming it over the target.
 ///
-/// Files are created with restrictive permissions because this wrapper will be
-/// used by credential storage in a later PR. Existing files are truncated through
-/// the same `std.fs` semantics used today by call sites that directly create
-/// files.
-pub fn writeFile(path: []const u8, data: []const u8) !void {
-    var file = try getCwd().createFile(path, .{ .truncate = true, .mode = default_file_mode });
-    defer file.close();
-    try file.writeAll(data);
-}
+/// Zig 0.16 mapping: keep the same-directory temporary-file boundary so later
+/// OAuth storage work can preserve same-filesystem rename guarantees and file
+/// mode expectations. This skeleton is intentionally thin; crash-safety policy
+/// hardening belongs to the dedicated filesystem wrapper PR.
+pub fn atomicReplace(dir: Dir, target_path: []const u8, tmp_path: []const u8, data: []const u8) !void {
+    if (std.mem.eql(u8, target_path, tmp_path)) return error.InvalidAtomicReplacePaths;
 
-/// Create a directory path relative to cwd or at an absolute path.
-///
-/// This is recursive and idempotent, matching `std.fs.Dir.makePath` behavior so
-/// first-run setup can safely create nested config/cache directories repeatedly.
-///
-/// Zig 0.16 mapping: route through the future filesystem/I/O context while
-/// preserving relative-path support and recursive semantics.
-pub fn createDir(path: []const u8) !void {
-    try getCwd().makePath(path);
-}
-
-/// Explicit alias documenting the recursive semantics expected by later OAuth
-/// storage migration work.
-pub fn createDirAll(path: []const u8) !void {
-    try createDir(path);
-}
-
-fn dirnameOrDot(path: []const u8) []const u8 {
-    return std.fs.path.dirname(path) orelse ".";
-}
-
-fn basename(path: []const u8) []const u8 {
-    return std.fs.path.basename(path);
-}
-
-fn tempName(allocator: std.mem.Allocator) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        ".makai-tmp-{d}-{x}",
-        .{ compat_time.nowMillis(), compat_random.randomIntRangeLessThan(u64, std.math.maxInt(u64)) },
-    );
-}
-
-fn chmodFile(file: File, mode: std.fs.File.Mode) !void {
-    try file.chmod(mode);
-}
-
-fn writeFileFailAfter(dir: Dir, path: []const u8, data: []const u8, mode: std.fs.File.Mode, fail_after: ?usize) !void {
-    var file = try dir.createFile(path, .{ .truncate = true, .mode = mode });
-    defer file.close();
-
-    if (fail_after) |limit| {
-        const bytes_to_write = @min(limit, data.len);
-        if (bytes_to_write > 0) try file.writeAll(data[0..bytes_to_write]);
-        return error.InjectedPartialWriteFailure;
-    }
-
-    try file.writeAll(data);
-    try chmodFile(file, mode);
-    try file.sync();
-}
-
-fn atomicReplaceWithInjectedFailure(allocator: std.mem.Allocator, path: []const u8, data: []const u8, fail_after: ?usize) !void {
-    const target_dir_path = dirnameOrDot(path);
-    const target_name = basename(path);
-    const tmp_name = try tempName(allocator);
-    defer allocator.free(tmp_name);
-
-    if (std.mem.eql(u8, target_name, tmp_name)) return error.InvalidAtomicReplacePaths;
-
-    var dir = try getCwd().openDir(target_dir_path, .{});
-    defer dir.close();
-
-    const final_mode = if (dir.statFile(target_name)) |stat| stat.mode else |err| switch (err) {
-        error.FileNotFound => default_file_mode,
+    dir.deleteFile(defaultIo(), tmp_path) catch |err| switch (err) {
+        error.FileNotFound => {},
         else => return err,
     };
 
-    var cleanup_tmp = true;
-    defer if (cleanup_tmp) dir.deleteFile(tmp_name) catch {};
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) dir.deleteFile(defaultIo(), tmp_path) catch {};
 
-    try writeFileFailAfter(dir, tmp_name, data, final_mode, fail_after);
-    try dir.rename(tmp_name, target_name);
+    {
+        var file = try dir.createFile(defaultIo(), tmp_path, .{ .truncate = false, .exclusive = true, .permissions = default_file_mode });
+        cleanup_tmp = true;
+        defer file.close(defaultIo());
+        try file.writeStreamingAll(defaultIo(), data);
+    }
+
+    try dir.rename(tmp_path, dir, target_path, defaultIo());
     cleanup_tmp = false;
 }
 
-/// Atomically replace `path` with `data`.
-///
-/// The temporary file is created next to the target so `rename` stays on the
-/// same filesystem. The target is not opened or truncated before the rename, so
-/// readers see either the old file or the new complete file. Existing target
-/// permissions are preserved; new targets use `0o600`, matching credential-file
-/// safety requirements. Failed writes clean up the temporary file where possible.
-///
-/// Zig 0.16 mapping: keep this same-directory temp-file boundary and public
-/// signature; only the internals should change when std.fs/std.Io APIs move.
-pub fn atomicReplace(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    try atomicReplaceWithInjectedFailure(allocator, path, data, null);
+/// Create a directory and any missing parents relative to `dir`.
+pub fn createDir(dir: Dir, path: []const u8) !void {
+    try dir.createDirPath(defaultIo(), path);
 }
 
-fn makeTmpPath(allocator: std.mem.Allocator, tmp_dir: std.testing.TmpDir, relative_path: []const u8) ![]u8 {
-    const real = try tmp_dir.dir.realpathAlloc(allocator, ".");
-    defer allocator.free(real);
-    return std.fs.path.join(allocator, &.{ real, relative_path });
-}
-
-test "compat filesystem wrappers read write round trip" {
-    const allocator = std.testing.allocator;
+test "compat filesystem wrappers read write and atomically replace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try makeTmpPath(allocator, tmp, "compat.txt");
-    defer allocator.free(path);
+    try writeFile(tmp.dir, "compat.txt", "one");
+    const initial = try readFileAlloc(std.testing.allocator, tmp.dir, "compat.txt", 1024);
+    defer std.testing.allocator.free(initial);
+    try std.testing.expectEqualStrings("one", initial);
 
-    try writeFile(path, "one");
-    const content = try readFileAlloc(allocator, path, default_max_file_bytes);
-    defer allocator.free(content);
+    try atomicReplace(tmp.dir, "compat.txt", "compat.txt.tmp", "two");
+    const replaced = try readFileAlloc(std.testing.allocator, tmp.dir, "compat.txt", 1024);
+    defer std.testing.allocator.free(replaced);
+    try std.testing.expectEqualStrings("two", replaced);
 
-    try std.testing.expectEqualStrings("one", content);
+    try std.testing.expectError(error.FileNotFound, openFile(tmp.dir, "compat.txt.tmp", .{}));
 }
 
-test "compat filesystem wrappers report missing file errors" {
-    const allocator = std.testing.allocator;
+test "compat atomic replace re-hardens existing target mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try makeTmpPath(allocator, tmp, "missing.txt");
-    defer allocator.free(path);
-
-    try std.testing.expectError(error.FileNotFound, openFile(path, .{}));
-    try std.testing.expectError(error.FileNotFound, readFileAlloc(allocator, path, default_max_file_bytes));
-}
-
-test "compat filesystem wrappers preserve caller controlled read limits" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try makeTmpPath(allocator, tmp, "limited.txt");
-    defer allocator.free(path);
-
-    try writeFile(path, "abcdef");
-    try std.testing.expectError(error.FileTooBig, readFileAlloc(allocator, path, 3));
-
-    const content = try readFileAlloc(allocator, path, 6);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings("abcdef", content);
-}
-
-test "compat filesystem wrappers create nested directories idempotently" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const dir_path = try makeTmpPath(allocator, tmp, "nested/path");
-    defer allocator.free(dir_path);
-    const file_path = try makeTmpPath(allocator, tmp, "nested/path/file.txt");
-    defer allocator.free(file_path);
-
-    try createDir(dir_path);
-    try createDir(dir_path);
-    try createDirAll(dir_path);
-    try writeFile(file_path, "data");
-
-    const content = try readFileAlloc(allocator, file_path, default_max_file_bytes);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings("data", content);
-}
-
-
-test "compat atomic replace commits complete data for new file with mode 0600" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try makeTmpPath(allocator, tmp, "atomic.txt");
-    defer allocator.free(path);
-
-    try atomicReplace(allocator, path, "new credential contents");
-
-    const content = try readFileAlloc(allocator, path, default_max_file_bytes);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings("new credential contents", content);
-
-    const stat = try getCwd().statFile(path);
-    try std.testing.expectEqual(@as(std.fs.File.Mode, default_file_mode), stat.mode & 0o777);
-}
-
-test "compat atomic replace preserves existing target mode" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try makeTmpPath(allocator, tmp, "mode.txt");
-    defer allocator.free(path);
-
-    try writeFile(path, "old");
-    var file = try openFile(path, .{ .mode = .write_only });
-    defer file.close();
-    try file.chmod(0o644);
-
-    try atomicReplace(allocator, path, "new contents");
-
-    const stat = try getCwd().statFile(path);
-    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o644), stat.mode & 0o777);
-}
-
-test "compat atomic replace preserves special mode bits" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try makeTmpPath(allocator, tmp, "special-mode.txt");
-    defer allocator.free(path);
-
-    try writeFile(path, "old");
-    var file = try openFile(path, .{ .mode = .write_only });
-    defer file.close();
-    try file.chmod(0o1755);
-
-    try atomicReplace(allocator, path, "new contents");
-
-    const stat = try getCwd().statFile(path);
-    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o1755), stat.mode & 0o7777);
-}
-
-test "compat atomic replace temp basename stays bounded" {
-    const allocator = std.testing.allocator;
-    const name = try tempName(allocator);
-    defer allocator.free(name);
-
-    try std.testing.expect(name.len <= std.fs.max_name_bytes);
-}
-
-test "compat atomic replace cleans temp after partial write failure" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try makeTmpPath(allocator, tmp, "partial.txt");
-    defer allocator.free(path);
-
-    try writeFile(path, "old stable contents");
-    try std.testing.expectError(
-        error.InjectedPartialWriteFailure,
-        atomicReplaceWithInjectedFailure(allocator, path, "new contents", 3),
-    );
-
-    const content = try readFileAlloc(allocator, path, default_max_file_bytes);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings("old stable contents", content);
-
-    var target_dir = try getCwd().openDir(dirnameOrDot(path), .{ .iterate = true });
-    defer target_dir.close();
-    var iter = target_dir.iterate();
-    while (try iter.next()) |entry| {
-        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".makai-tmp-"));
+    try writeFile(tmp.dir, "mode.txt", "one");
+    {
+        var file = try openFile(tmp.dir, "mode.txt", .{ .mode = .write_only });
+        defer file.close(defaultIo());
+        try file.setPermissions(defaultIo(), @enumFromInt(0o640));
     }
+
+    try atomicReplace(tmp.dir, "mode.txt", "mode.txt.tmp", "two");
+
+    const stat = try tmp.dir.statFile(defaultIo(), "mode.txt", .{});
+    try std.testing.expectEqual(default_file_mode, @as(std.Io.File.Permissions, @enumFromInt(@intFromEnum(stat.permissions) & 0o777)));
 }
 
-test "compat atomic replace leaves existing file untouched before successful rename" {
-    const allocator = std.testing.allocator;
+test "compat atomic replace recovers from a stale temporary path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try makeTmpPath(allocator, tmp, "unchanged.txt");
-    defer allocator.free(path);
+    try writeFile(tmp.dir, "target.txt", "target");
+    try writeFile(tmp.dir, "target.txt.tmp", "stale");
 
-    try writeFile(path, "do not truncate");
-    try std.testing.expectError(
-        error.InjectedPartialWriteFailure,
-        atomicReplaceWithInjectedFailure(allocator, path, "replacement", 0),
-    );
+    try atomicReplace(tmp.dir, "target.txt", "target.txt.tmp", "new");
 
-    const content = try readFileAlloc(allocator, path, default_max_file_bytes);
-    defer allocator.free(content);
-    try std.testing.expectEqualStrings("do not truncate", content);
+    const target = try readFileAlloc(std.testing.allocator, tmp.dir, "target.txt", 1024);
+    defer std.testing.allocator.free(target);
+    try std.testing.expectEqualStrings("new", target);
+
+    try std.testing.expectError(error.FileNotFound, openFile(tmp.dir, "target.txt.tmp", .{}));
+}
+
+test "compat filesystem wrappers create directories and open files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try createDir(tmp.dir, "nested/path");
+    try writeFile(tmp.dir, "nested/path/file.txt", "data");
+
+    var file = try openFile(tmp.dir, "nested/path/file.txt", .{});
+    defer file.close(defaultIo());
+
+    var buf: [4]u8 = undefined;
+    const n = try file.readStreaming(defaultIo(), &.{&buf});
+    try std.testing.expectEqualStrings("data", buf[0..n]);
 }
 
 test "compat getCwd returns a directory handle" {

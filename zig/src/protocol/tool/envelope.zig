@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const tool_types = @import("tool_types");
 const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -6,7 +7,7 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 pub const protocol_types = tool_types;
 
 pub fn serializeEnvelope(env: tool_types.Envelope, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -349,7 +350,7 @@ test "tool envelope roundtrip execute request" {
         .server_id = tool_types.generateUlid(),
         .message_id = tool_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_execute = .{
             .execution_id = tool_types.generateUlid(),
             .tool_call_id = try allocator.dupe(u8, "call_123"),
@@ -393,7 +394,7 @@ test "tool envelope roundtrip list response" {
         .server_id = tool_types.generateUlid(),
         .message_id = tool_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .tool_list_response = .{ .tools = tools } },
     };
     defer env.deinit(allocator);

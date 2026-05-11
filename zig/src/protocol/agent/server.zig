@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const agent_types = @import("agent_types");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
@@ -64,7 +65,7 @@ pub const AgentProtocolServer = struct {
             .sessions = std.AutoHashMap(agent_types.SessionId, SessionState).init(allocator),
             .expected_sequences = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .outgoing_sequences = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
-            .outbox = std.ArrayList(agent_types.Envelope){},
+            .outbox = std.ArrayList(agent_types.Envelope).empty,
             .options = options,
         };
     }
@@ -95,13 +96,13 @@ pub const AgentProtocolServer = struct {
             .agent_stop => |req| return try self.handleStop(req, env),
             .agent_status => |req| return try self.handleStatus(req, env),
             .models_request => |req| return try self.handleModelsRequest(req, env),
-            .tool_list => |_| {
+            .tool_list => {
                 return .{
                     .session_id = env.session_id,
                     .message_id = agent_types.generateUlid(),
                     .sequence = env.sequence,
                     .in_reply_to = env.message_id,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .tool_list_response = .{ .tools = &.{} } },
                 };
             },
@@ -112,7 +113,7 @@ pub const AgentProtocolServer = struct {
                     .message_id = agent_types.generateUlid(),
                     .sequence = env.sequence,
                     .in_reply_to = env.message_id,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .pong = .{ .ping_id = OwnedSlice(u8).initOwned(ping_id) } },
                 };
             },
@@ -133,7 +134,7 @@ pub const AgentProtocolServer = struct {
             return try self.makeError(env.session_id, env.message_id, .agent_busy, "session already exists");
         }
 
-        const now = std.time.milliTimestamp();
+        const now = compat.time.nowMillis();
         try self.sessions.put(session_id, .{
             .session_id = session_id,
             .status = .ready,
@@ -168,7 +169,7 @@ pub const AgentProtocolServer = struct {
 
         session.status = .processing;
         session.message_count += 1;
-        session.updated_at = std.time.milliTimestamp();
+        session.updated_at = compat.time.nowMillis();
 
         return null;
     }
@@ -187,7 +188,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = env.sequence,
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_stopped = .{
                 .session_id = req.session_id,
                 .reason = OwnedSlice(u8).initOwned(reason),
@@ -205,7 +206,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = env.sequence,
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .session_info = .{
                 .session_id = session.session_id,
                 .status = session.status,
@@ -280,7 +281,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = ack_seq,
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .ack = .{ .acknowledged_id = env.message_id } },
         };
 
@@ -290,7 +291,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = response_seq,
             .in_reply_to = env.message_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .models_response = response },
         });
 
@@ -310,7 +311,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .nack = .{
                 .rejected_id = in_reply_to,
                 .reason = OwnedSlice(u8).initOwned(reason),
@@ -325,7 +326,7 @@ pub const AgentProtocolServer = struct {
             .message_id = agent_types.generateUlid(),
             .sequence = 0,
             .in_reply_to = in_reply_to,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_error = .{
                 .code = code,
                 .message = try self.allocator.dupe(u8, msg),
@@ -346,7 +347,7 @@ pub const AgentProtocolServer = struct {
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_event = try self.allocator.dupe(u8, event_json) },
         });
     }
@@ -357,7 +358,7 @@ pub const AgentProtocolServer = struct {
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
             .sequence = self.nextOutgoingSequence(session_id),
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_result = try self.allocator.dupe(u8, result_json) },
         });
     }
@@ -377,7 +378,7 @@ test "AgentProtocolServer rejects invalid start sequence" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
     };
     defer start.deinit(allocator);
@@ -399,7 +400,7 @@ test "AgentProtocolServer rejects unknown session message" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_message = .{
             .session_id = sid,
             .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
@@ -508,7 +509,7 @@ test "handleModelsRequest emits ack then models_response with same shape as prov
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{
             .provider_id = OwnedSlice(u8).initBorrowed("anthropic"),
         } },
@@ -562,7 +563,7 @@ test "handleModelsRequest returns not_implemented nack when unsupported" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer request.deinit(allocator);
@@ -589,7 +590,7 @@ test "handleModelsRequest returns not_implemented nack when delegate is missing"
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer request.deinit(allocator);
@@ -624,7 +625,7 @@ test "handleModelsRequest maps delegate NotImplemented error to not_implemented 
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .models_request = .{} },
     };
     defer request.deinit(allocator);
@@ -648,7 +649,7 @@ test "AgentProtocolServer start message status stop" {
         .session_id = agent_types.generateSessionId(),
         .message_id = agent_types.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
     };
     defer start.deinit(allocator);
@@ -663,7 +664,7 @@ test "AgentProtocolServer start message status stop" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 2,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_message = .{
             .session_id = sid,
             .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
@@ -676,7 +677,7 @@ test "AgentProtocolServer start message status stop" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 3,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_status = .{ .session_id = sid } },
     };
     defer status.deinit(allocator);
@@ -690,7 +691,7 @@ test "AgentProtocolServer start message status stop" {
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
         .sequence = 4,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_stop = .{ .session_id = sid } },
     };
     defer stop.deinit(allocator);

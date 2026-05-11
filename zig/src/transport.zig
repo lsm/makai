@@ -490,7 +490,7 @@ pub fn spawnReceiverWithControl(
 // --- Serialization ---
 
 pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -606,7 +606,7 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
 }
 
 pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
@@ -637,7 +637,7 @@ pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.All
 }
 
 pub fn serializeError(msg: []const u8, allocator: std.mem.Allocator) ![]u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 

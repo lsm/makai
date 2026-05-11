@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
@@ -76,7 +77,7 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
 }
 
 fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const u8, model_id: []const u8, api_key: []const u8) ![]const u8 {
@@ -191,7 +192,7 @@ fn getGoogleBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBud
 }
 
 fn buildBody(context: ai_types.Context, options: ai_types.StreamOptions, model: ai_types.Model, allocator: std.mem.Allocator) ![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
@@ -527,7 +528,7 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
     if (parsed.value != .object) return null;
     const obj = parsed.value.object;
 
-    var parts_list = std.ArrayList(ParsedPart){};
+    var parts_list = std.ArrayList(ParsedPart).empty;
     defer parts_list.deinit(allocator);
 
     var usage = ai_types.Usage{};
@@ -599,7 +600,7 @@ fn parseGoogleEventExtended(data: []const u8, allocator: std.mem.Allocator) ?Goo
 
                                                 // Stringify args to JSON
                                                 const args_json = if (fc.object.get("args")) |args| blk: {
-                                                    var buf = std.ArrayList(u8){};
+                                                    var buf = std.ArrayList(u8).empty;
                                                     stringifyJsonValue(args, &buf, allocator) catch break :blk "";
                                                     break :blk buf.toOwnedSlice(allocator) catch "";
                                                 } else "";
@@ -693,7 +694,7 @@ fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
         .model = model.id,
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 }
 
@@ -754,7 +755,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     const url = buildStreamGenerateContentUrl(allocator, base_url, model.id, api_key) catch {
@@ -980,15 +981,15 @@ fn runThread(ctx: *ThreadCtx) void {
     const reader = response.reader(&transfer_buf);
 
     // Content block accumulators
-    var content_blocks = std.ArrayList(ai_types.AssistantContent){};
+    var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
     defer content_blocks.deinit(allocator);
-    var current_text = std.ArrayList(u8){};
+    var current_text = std.ArrayList(u8).empty;
     defer current_text.deinit(allocator);
-    var current_thinking = std.ArrayList(u8){};
+    var current_thinking = std.ArrayList(u8).empty;
     defer current_thinking.deinit(allocator);
-    var current_thinking_signature = std.ArrayList(u8){};
+    var current_thinking_signature = std.ArrayList(u8).empty;
     defer current_thinking_signature.deinit(allocator);
-    var current_text_signature = std.ArrayList(u8){};
+    var current_text_signature = std.ArrayList(u8).empty;
     defer current_text_signature.deinit(allocator);
 
     var usage = ai_types.Usage{};
@@ -1007,7 +1008,7 @@ fn runThread(ctx: *ThreadCtx) void {
     while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
-            const now = std.time.milliTimestamp();
+            const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
                 stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
@@ -1235,7 +1236,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                 allocator.dupe(u8, id) catch continue
                             else blk: {
                                 tool_call_counter += 1;
-                                const timestamp = std.time.milliTimestamp();
+                                const timestamp = compat.time.nowMillis();
                                 break :blk std.fmt.allocPrint(
                                     allocator,
                                     "{s}_{}_{}",
@@ -1376,7 +1377,7 @@ fn runThread(ctx: *ThreadCtx) void {
         .model = model.id,
         .usage = usage,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 
     stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};

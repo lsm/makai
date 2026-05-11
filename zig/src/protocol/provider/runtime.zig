@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const protocol_server = @import("protocol_server");
 const protocol_client = @import("protocol_client");
 const envelope = @import("protocol_envelope");
@@ -36,7 +37,7 @@ pub const ProviderProtocolRuntime = struct {
                     .stream_id = stream_id,
                     .message_id = protocol_types.generateUlid(),
                     .sequence = seq,
-                    .timestamp = std.time.milliTimestamp(),
+                    .timestamp = compat.time.nowMillis(),
                     .payload = .{ .event = event },
                 };
 
@@ -58,7 +59,7 @@ pub const ProviderProtocolRuntime = struct {
                         .stream_id = stream_id,
                         .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat.time.nowMillis(),
                         .payload = .{ .result = result },
                     };
 
@@ -75,7 +76,7 @@ pub const ProviderProtocolRuntime = struct {
                         .stream_id = stream_id,
                         .message_id = protocol_types.generateUlid(),
                         .sequence = seq,
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = compat.time.nowMillis(),
                         .payload = .{ .stream_error = .{
                             .code = protocol_server.streamErrorCode(err_msg),
                             .message = protocol_types.OwnedSlice(u8).initOwned(err_copy),

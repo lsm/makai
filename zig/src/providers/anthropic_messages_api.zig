@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
@@ -48,8 +49,8 @@ fn anthropicIsAuthFailure(err_msg: []const u8) bool {
 fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
     // Support both OAuth tokens (sk-ant-oat) and API keys (sk-ant-api)
     // Check ANTHROPIC_AUTH_TOKEN first (OAuth), then ANTHROPIC_API_KEY
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
-    if (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |key| return key else |_| {}
+    if (compat.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY")) |key| return key else |_| {}
     return null;
 }
 
@@ -267,7 +268,7 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
 }
 
 fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: ai_types.StreamOptions, allocator: std.mem.Allocator, is_oauth: bool) ![]u8 {
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
     // Pre-transform messages: cross-model thinking conversion, tool ID normalization,
@@ -1078,7 +1079,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/messages") catch {
@@ -1106,7 +1107,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |h| allocator.free(h);
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
 
     // OAuth tokens use Authorization: Bearer, API keys use x-api-key
@@ -1417,13 +1418,13 @@ fn runThread(ctx: *ThreadCtx) void {
     defer tc_tracker.deinit();
 
     // Accumulate content for final message
-    var content_blocks = std.ArrayList(ai_types.AssistantContent){};
+    var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
     defer content_blocks.deinit(allocator);
-    var current_text = std.ArrayList(u8){};
+    var current_text = std.ArrayList(u8).empty;
     defer current_text.deinit(allocator);
-    var current_thinking = std.ArrayList(u8){};
+    var current_thinking = std.ArrayList(u8).empty;
     defer current_thinking.deinit(allocator);
-    var current_thinking_signature = std.ArrayList(u8){};
+    var current_thinking_signature = std.ArrayList(u8).empty;
     defer current_thinking_signature.deinit(allocator);
 
     // Deferred frees for delta strings pushed to the stream.
@@ -1434,7 +1435,7 @@ fn runThread(ctx: *ThreadCtx) void {
     // By collecting delta pointers here and freeing them all at thread exit we:
     //   a) eliminate the leak the GPA would otherwise report, and
     //   b) guarantee the frees only happen after all SSE processing is complete.
-    var pending_delta_frees = std.ArrayList([]const u8){};
+    var pending_delta_frees = std.ArrayList([]const u8).empty;
     defer {
         for (pending_delta_frees.items) |s| allocator.free(s);
         pending_delta_frees.deinit(allocator);
@@ -1442,7 +1443,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // Accumulate raw response bytes for error diagnosis (up to 8 KB).
     // Used to detect non-SSE JSON error bodies returned with HTTP 200.
-    var raw_body = std.ArrayList(u8){};
+    var raw_body = std.ArrayList(u8).empty;
     defer raw_body.deinit(allocator);
 
     var usage = ai_types.Usage{};
@@ -1459,7 +1460,7 @@ fn runThread(ctx: *ThreadCtx) void {
     while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
-            const now = std.time.milliTimestamp();
+            const now = compat.time.nowMillis();
             if (now - last_ping_time >= ping_interval) {
                 stream.push(.{ .keepalive = {} }) catch {};
                 last_ping_time = now;
@@ -1800,7 +1801,7 @@ fn runThread(ctx: *ThreadCtx) void {
         },
         .usage = usage,
         .stop_reason = stop_reason,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .is_owned = true, // Strings were duped above
     };
 
@@ -1823,7 +1824,7 @@ fn createPartialMessage(model: ai_types.Model) ai_types.AssistantMessage {
         .model = model.id,
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     };
 }
 
@@ -2228,10 +2229,10 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
         allocator.destroy(stream);
     }
 
-    const deadline = std.time.milliTimestamp() + 5_000;
+    const deadline = compat.time.nowMillis() + 5_000;
     while (!stream.isDone()) {
-        if (std.time.milliTimestamp() >= deadline) return error.TestUnexpectedResult;
-        std.Thread.sleep(std.time.ns_per_ms);
+        if (compat.time.nowMillis() >= deadline) return error.TestUnexpectedResult;
+        compat.time.sleepNs(std.time.ns_per_ms);
     }
 
     try std.testing.expect(stream.waitForThread(5_000));

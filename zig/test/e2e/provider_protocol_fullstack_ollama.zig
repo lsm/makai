@@ -3,6 +3,7 @@
 //! Tests provider protocol stack: ProtocolClient -> SerializedPipe -> ProtocolServer -> Ollama
 
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -24,7 +25,7 @@ const protocol_types = envelope.protocol_types;
 
 /// Helper to get env var or return null
 fn getEnvOwned(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch null;
+    return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
 // =============================================================================
@@ -40,7 +41,7 @@ test "ProviderProtocol: Ollama streaming through ProtocolServer and ProtocolClie
 
     if (api_key == null) {
         // Check for local server
-        var http_client = std.http.Client{ .allocator = allocator };
+        var http_client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
         defer http_client.deinit();
 
         const uri = std.Uri.parse("http://127.0.0.1:11434/api/tags") catch {
@@ -54,8 +55,8 @@ test "ProviderProtocol: Ollama streaming through ProtocolServer and ProtocolClie
         };
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = 0 };
-        req.sendBodyComplete(&.{}) catch {
+        req.transfer_encoding = .none;
+        req.sendBodiless() catch {
             std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: Protocol Ollama test - ollama local server not responding\n", .{});
             return error.SkipZigTest;
         };
@@ -115,7 +116,7 @@ test "ProviderProtocol: Ollama streaming through ProtocolServer and ProtocolClie
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Reply with exactly: hello world" },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -181,7 +182,7 @@ test "ProviderProtocol: Ollama streaming through ProtocolServer and ProtocolClie
             break;
         }
 
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Verify event sequence
@@ -203,7 +204,7 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
 
     if (api_key == null) {
         // Check for local server
-        var http_client = std.http.Client{ .allocator = allocator };
+        var http_client = std.http.Client{ .allocator = allocator, .io = std.testing.io };
         defer http_client.deinit();
 
         const uri = std.Uri.parse("http://127.0.0.1:11434/api/tags") catch {
@@ -217,8 +218,8 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
         };
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = 0 };
-        req.sendBodyComplete(&.{}) catch {
+        req.transfer_encoding = .none;
+        req.sendBodiless() catch {
             std.debug.print("\n\x1b[90mSKIPPED\x1b[0m: Protocol Ollama abort test - ollama local server not responding\n", .{});
             return error.SkipZigTest;
         };
@@ -278,7 +279,7 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
 
     const user_msg = ai_types.Message{ .user = .{
         .content = .{ .text = "Write a long story about a space adventure." },
-        .timestamp = std.time.timestamp(),
+        .timestamp = compat.time.nowSeconds(),
     } };
 
     const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user_msg} };
@@ -318,7 +319,7 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
             event_count += 1;
         }
 
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.time.sleepNs(10 * std.time.ns_per_ms);
     }
 
     // Check for errors before proceeding

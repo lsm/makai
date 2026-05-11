@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
@@ -31,6 +32,14 @@ const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
 const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
 const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
@@ -261,20 +270,20 @@ fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]const u
 }
 
 fn writeOwnedLinesAndClear(
-    file: std.fs.File,
+    file: std.Io.File,
     allocator: std.mem.Allocator,
     lines: *std.ArrayList([]const u8),
 ) !void {
     defer clearOwnedLines(allocator, lines);
 
     for (lines.items) |line| {
-        try file.writeAll(line);
-        try file.writeAll("\n");
+        try file.writeStreamingAll(defaultIo(), line);
+        try file.writeStreamingAll(defaultIo(), "\n");
     }
 }
 
 fn emitRuntimeError(
-    file: std.fs.File,
+    file: std.Io.File,
     allocator: std.mem.Allocator,
     code: RuntimeErrorCode,
     message: []const u8,
@@ -286,22 +295,22 @@ fn emitRuntimeError(
         .message = message,
     }, .{});
     defer allocator.free(payload);
-    try file.writeAll(payload);
-    try file.writeAll("\n");
+    try file.writeStreamingAll(defaultIo(), payload);
+    try file.writeStreamingAll(defaultIo(), "\n");
 }
 
-fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs.File) !void {
+fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io.File) !void {
     var stdio_loop = try StdioProtocolLoop.initWithBuiltins(allocator);
     defer stdio_loop.deinit();
 
-    try stdout.writeAll(READY_FRAME);
+    try stdout.writeStreamingAll(defaultIo(), READY_FRAME);
 
     var async_receiver = stdio.AsyncStdioReceiver.initWithFile(stdin);
     var stdin_handle = try async_receiver.receiveStreamWithHandle(allocator);
     defer _ = stdin_handle.deinit(STDIO_THREAD_JOIN_TIMEOUT_MS);
 
     const stdin_stream = stdin_handle.getStream();
-    var outbound_lines = std.ArrayList([]const u8){};
+    var outbound_lines = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound_lines);
         outbound_lines.deinit(allocator);
@@ -350,7 +359,7 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
         }
 
         if (!did_work) {
-            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+            compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
         }
     }
 
@@ -382,8 +391,8 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.fs.File, stdout: std.fs
     }
 }
 
-fn printUsage(file: std.fs.File) !void {
-    try file.writeAll(
+fn printUsage(file: std.Io.File) !void {
+    try file.writeStreamingAll(defaultIo(), 
         \\Usage:
         \\  makai --version
         \\  makai --stdio
@@ -409,9 +418,9 @@ const PRODUCTION_AUTH_SERVER_OPTIONS = auth_protocol_server.AuthProtocolServer.O
 fn handleAuth(
     args: []const []const u8,
     allocator: std.mem.Allocator,
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
 ) !void {
     return handleAuthWithOptions(args, allocator, stdin, stdout, stderr, PRODUCTION_AUTH_SERVER_OPTIONS);
 }
@@ -423,9 +432,9 @@ fn handleAuth(
 fn handleAuthWithOptions(
     args: []const []const u8,
     allocator: std.mem.Allocator,
-    stdin: std.fs.File,
-    stdout: std.fs.File,
-    stderr: std.fs.File,
+    stdin: std.Io.File,
+    stdout: std.Io.File,
+    stderr: std.Io.File,
     server_options: auth_protocol_server.AuthProtocolServer.Options,
 ) !void {
     if (args.len == 0) {
@@ -515,7 +524,7 @@ fn makeFixtureStream(
         .model = "fixture-model",
         .usage = .{},
         .stop_reason = .stop,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
     });
     s.markThreadDone();
     return s;
@@ -574,7 +583,7 @@ fn makeProviderPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
         .stream_id = ProviderProtocolTypes.generateUlid(),
         .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
     return provider_protocol_envelope.serializeEnvelope(env, allocator);
@@ -585,7 +594,7 @@ fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
         .session_id = AgentProtocolTypes.generateSessionId(),
         .message_id = AgentProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
@@ -596,7 +605,7 @@ fn makeAuthProvidersRequestEnvelopeJson(allocator: std.mem.Allocator, flow_id: A
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_providers_request = .{} },
     };
     return auth_protocol_envelope.serializeEnvelope(env, allocator);
@@ -612,7 +621,7 @@ fn makeAuthLoginStartEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_login_start = .{
             .provider_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, provider_id)),
         } },
@@ -632,7 +641,7 @@ fn makeAuthPromptResponseEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_prompt_response = .{
             .flow_id = flow_id,
             .prompt_id = AuthProtocolTypes.OwnedSlice(u8).initOwned(try allocator.dupe(u8, prompt_id)),
@@ -652,7 +661,7 @@ fn makeAuthCancelEnvelopeJson(
         .stream_id = flow_id,
         .message_id = AuthProtocolTypes.generateUlid(),
         .sequence = sequence,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{ .auth_cancel = .{
             .flow_id = flow_id,
         } },
@@ -668,7 +677,7 @@ fn makeProviderStreamRequestEnvelopeJson(
         .stream_id = ProviderProtocolTypes.generateUlid(),
         .message_id = ProviderProtocolTypes.generateUlid(),
         .sequence = 1,
-        .timestamp = std.time.milliTimestamp(),
+        .timestamp = compat.time.nowMillis(),
         .payload = .{
             .stream_request = .{
                 .model = fixtureModel(api),
@@ -701,7 +710,7 @@ test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -744,7 +753,7 @@ test "stdio protocol loop decodes and dispatches auth providers request and emit
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -759,7 +768,7 @@ test "stdio protocol loop decodes and dispatches auth providers request and emit
     for (0..TEST_AUTH_POLL_ITERS_SHORT) |_| {
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
         if (outbound.items.len >= 2) break;
-        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
     try std.testing.expectEqual(@as(usize, 2), outbound.items.len);
@@ -783,7 +792,7 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -809,7 +818,7 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
         if (outbound.items.len == 0) {
-            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+            compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
             continue;
         }
 
@@ -871,7 +880,7 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
         clearOwnedLines(allocator, &outbound);
 
         if (result_index != null) break;
-        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
     try std.testing.expect(!saw_secret_leak);
@@ -895,7 +904,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -916,7 +925,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
         try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
 
         if (outbound.items.len == 0) {
-            std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+            compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
             continue;
         }
 
@@ -954,7 +963,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
         clearOwnedLines(allocator, &outbound);
 
         if (saw_cancelled_result) break;
-        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
     try std.testing.expect(cancel_sent);
@@ -984,7 +993,7 @@ test "stdio auth login flow cancellation emits cancelled result and ignores late
             }
         }
         clearOwnedLines(allocator, &outbound);
-        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
     try std.testing.expectEqual(@as(usize, 0), late_terminal_messages);
@@ -999,7 +1008,7 @@ test "stdio auth login failure emits auth_event.error before auth_login_result" 
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -1040,7 +1049,7 @@ test "stdio auth login failure emits auth_event.error before auth_login_result" 
         }
         clearOwnedLines(allocator, &outbound);
         if (result_index != null) break;
-        std.Thread.sleep(STDIO_IDLE_SLEEP_NS);
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
     try std.testing.expect(error_index != null);
@@ -1065,7 +1074,7 @@ test "stdio protocol loop rejects ambiguous dispatch envelope with both ids" {
 
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine(ambiguous)));
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -1085,7 +1094,7 @@ test "stdio protocol loop rejects malformed json dispatch line" {
 
     try std.testing.expect(!(try stdio_loop.dispatchInboundLine("{not-json")));
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -1113,7 +1122,7 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
     var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
     defer stdio_loop.deinit();
 
-    var outbound = std.ArrayList([]const u8){};
+    var outbound = std.ArrayList([]const u8).empty;
     defer {
         clearOwnedLines(allocator, &outbound);
         outbound.deinit(allocator);
@@ -1157,15 +1166,15 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
 
 test "writeOwnedLinesAndClear clears owned lines on write failure" {
     const allocator = std.testing.allocator;
-    const pipe = try std.posix.pipe();
-    const read_file = std.fs.File{ .handle = pipe[0] };
-    const write_file = std.fs.File{ .handle = pipe[1] };
-    defer read_file.close();
+    const pipe = try std.Io.Threaded.pipe2(.{});
+    const read_file = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = pipe[0] };
+    const write_file = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = pipe[1] };
+    defer read_file.close(defaultIo());
 
     // Force write error path.
-    write_file.close();
+    write_file.close(defaultIo());
 
-    var lines = std.ArrayList([]const u8){};
+    var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(allocator);
     try lines.append(allocator, try allocator.dupe(u8, "line-1"));
     try lines.append(allocator, try allocator.dupe(u8, "line-2"));
@@ -1182,32 +1191,32 @@ test "writeOwnedLinesAndClear clears owned lines on write failure" {
 test "stdio mode preserves ready handshake compatibility" {
     const allocator = std.testing.allocator;
 
-    const stdin_pipe = try std.posix.pipe();
-    const stdout_pipe = try std.posix.pipe();
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+    const stdout_pipe = try std.Io.Threaded.pipe2(.{});
 
-    var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
-    var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
-    var stdout_read = std.fs.File{ .handle = stdout_pipe[0] };
-    var stdout_write = std.fs.File{ .handle = stdout_pipe[1] };
+    var stdin_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[0] };
+    var stdin_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[1] };
+    var stdout_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[0] };
+    var stdout_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[1] };
     errdefer {
-        stdin_read.close();
-        stdin_write.close();
-        stdout_read.close();
-        stdout_write.close();
+        stdin_read.close(defaultIo());
+        stdin_write.close(defaultIo());
+        stdout_read.close(defaultIo());
+        stdout_write.close(defaultIo());
     }
 
     const Runner = struct {
         allocator: std.mem.Allocator,
-        stdin_file: std.fs.File,
-        stdout_file: std.fs.File,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
             runStdioMode(self.allocator, self.stdin_file, self.stdout_file) catch |err| {
                 self.err = err;
             };
-            self.stdin_file.close();
-            self.stdout_file.close();
+            self.stdin_file.close(defaultIo());
+            self.stdout_file.close(defaultIo());
         }
     };
 
@@ -1220,11 +1229,11 @@ test "stdio mode preserves ready handshake compatibility" {
     defer thread.join();
 
     var stdin_write_closed = false;
-    defer if (!stdin_write_closed) stdin_write.close();
+    defer if (!stdin_write_closed) stdin_write.close(defaultIo());
 
     var out_receiver = stdio.StdioReceiver.initWithFile(stdout_read, allocator);
     defer out_receiver.deinit();
-    defer stdout_read.close();
+    defer stdout_read.close(defaultIo());
 
     var receiver = out_receiver.receiver();
 
@@ -1234,8 +1243,8 @@ test "stdio mode preserves ready handshake compatibility" {
 
     const ping = try makeProviderPingEnvelopeJson(allocator);
     defer allocator.free(ping);
-    try stdin_write.writeAll(ping);
-    try stdin_write.writeAll("\n");
+    try stdin_write.writeStreamingAll(defaultIo(), ping);
+    try stdin_write.writeStreamingAll(defaultIo(), "\n");
 
     const response_line = (try receiver.read(allocator)).?;
     defer allocator.free(response_line);
@@ -1243,7 +1252,7 @@ test "stdio mode preserves ready handshake compatibility" {
     defer pong.deinit(allocator);
     try std.testing.expect(pong.payload == .pong);
 
-    stdin_write.close();
+    stdin_write.close(defaultIo());
     stdin_write_closed = true;
     try std.testing.expect(runner.err == null);
 }
@@ -1251,32 +1260,32 @@ test "stdio mode preserves ready handshake compatibility" {
 test "stdio mode emits unknown_envelope error and continues processing" {
     const allocator = std.testing.allocator;
 
-    const stdin_pipe = try std.posix.pipe();
-    const stdout_pipe = try std.posix.pipe();
+    const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+    const stdout_pipe = try std.Io.Threaded.pipe2(.{});
 
-    var stdin_read = std.fs.File{ .handle = stdin_pipe[0] };
-    var stdin_write = std.fs.File{ .handle = stdin_pipe[1] };
-    var stdout_read = std.fs.File{ .handle = stdout_pipe[0] };
-    var stdout_write = std.fs.File{ .handle = stdout_pipe[1] };
+    var stdin_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[0] };
+    var stdin_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[1] };
+    var stdout_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[0] };
+    var stdout_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[1] };
     errdefer {
-        stdin_read.close();
-        stdin_write.close();
-        stdout_read.close();
-        stdout_write.close();
+        stdin_read.close(defaultIo());
+        stdin_write.close(defaultIo());
+        stdout_read.close(defaultIo());
+        stdout_write.close(defaultIo());
     }
 
     const Runner = struct {
         allocator: std.mem.Allocator,
-        stdin_file: std.fs.File,
-        stdout_file: std.fs.File,
+        stdin_file: std.Io.File,
+        stdout_file: std.Io.File,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
             runStdioMode(self.allocator, self.stdin_file, self.stdout_file) catch |err| {
                 self.err = err;
             };
-            self.stdin_file.close();
-            self.stdout_file.close();
+            self.stdin_file.close(defaultIo());
+            self.stdout_file.close(defaultIo());
         }
     };
 
@@ -1289,11 +1298,11 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     defer thread.join();
 
     var stdin_write_closed = false;
-    defer if (!stdin_write_closed) stdin_write.close();
+    defer if (!stdin_write_closed) stdin_write.close(defaultIo());
 
     var out_receiver = stdio.StdioReceiver.initWithFile(stdout_read, allocator);
     defer out_receiver.deinit();
-    defer stdout_read.close();
+    defer stdout_read.close(defaultIo());
 
     var receiver = out_receiver.receiver();
 
@@ -1301,12 +1310,12 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     defer allocator.free(ready_line);
     try std.testing.expectEqualStrings("{\"type\":\"ready\",\"protocol_version\":\"1\"}", ready_line);
 
-    try stdin_write.writeAll("{\"type\":\"unknown\",\"payload\":{}}\n");
+    try stdin_write.writeStreamingAll(defaultIo(), "{\"type\":\"unknown\",\"payload\":{}}\n");
 
     const ping = try makeProviderPingEnvelopeJson(allocator);
     defer allocator.free(ping);
-    try stdin_write.writeAll(ping);
-    try stdin_write.writeAll("\n");
+    try stdin_write.writeStreamingAll(defaultIo(), ping);
+    try stdin_write.writeStreamingAll(defaultIo(), "\n");
 
     const error_line = (try receiver.read(allocator)).?;
     defer allocator.free(error_line);
@@ -1324,7 +1333,7 @@ test "stdio mode emits unknown_envelope error and continues processing" {
     defer pong.deinit(allocator);
     try std.testing.expect(pong.payload == .pong);
 
-    stdin_write.close();
+    stdin_write.close(defaultIo());
     stdin_write_closed = true;
     try std.testing.expect(runner.err == null);
 }
@@ -1349,29 +1358,29 @@ const AuthCliHarness = struct {
     allocator: std.mem.Allocator,
     args: []const []const u8,
 
-    stdin_read: std.fs.File,
-    stdin_write: std.fs.File,
-    stdout_read: std.fs.File,
-    stdout_write: std.fs.File,
-    stderr_read: std.fs.File,
-    stderr_write: std.fs.File,
+    stdin_read: std.Io.File,
+    stdin_write: std.Io.File,
+    stdout_read: std.Io.File,
+    stdout_write: std.Io.File,
+    stderr_read: std.Io.File,
+    stderr_write: std.Io.File,
 
     err: ?anyerror = null,
 
     fn init(allocator: std.mem.Allocator, args: []const []const u8) !AuthCliHarness {
-        const stdin_pipe = try std.posix.pipe();
-        const stdout_pipe = try std.posix.pipe();
-        const stderr_pipe = try std.posix.pipe();
+        const stdin_pipe = try std.Io.Threaded.pipe2(.{});
+        const stdout_pipe = try std.Io.Threaded.pipe2(.{});
+        const stderr_pipe = try std.Io.Threaded.pipe2(.{});
 
         return .{
             .allocator = allocator,
             .args = args,
-            .stdin_read = std.fs.File{ .handle = stdin_pipe[0] },
-            .stdin_write = std.fs.File{ .handle = stdin_pipe[1] },
-            .stdout_read = std.fs.File{ .handle = stdout_pipe[0] },
-            .stdout_write = std.fs.File{ .handle = stdout_pipe[1] },
-            .stderr_read = std.fs.File{ .handle = stderr_pipe[0] },
-            .stderr_write = std.fs.File{ .handle = stderr_pipe[1] },
+            .stdin_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[0] },
+            .stdin_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdin_pipe[1] },
+            .stdout_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[0] },
+            .stdout_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stdout_pipe[1] },
+            .stderr_read = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stderr_pipe[0] },
+            .stderr_write = std.Io.File{ .flags = .{ .nonblocking = false }, .handle = stderr_pipe[1] },
         };
     }
 
@@ -1379,9 +1388,9 @@ const AuthCliHarness = struct {
         defer {
             // The wrapper does not own these fds; closing them here lets the
             // reader side observe EOF after the command finishes.
-            self.stdout_write.close();
-            self.stderr_write.close();
-            self.stdin_read.close();
+            self.stdout_write.close(defaultIo());
+            self.stderr_write.close(defaultIo());
+            self.stdin_read.close(defaultIo());
         }
 
         handleAuthWithOptions(
@@ -1396,15 +1405,12 @@ const AuthCliHarness = struct {
         };
     }
 
-    fn readAll(file: std.fs.File, allocator: std.mem.Allocator) ![]u8 {
-        var buf = std.ArrayList(u8){};
+    fn readAll(file: std.Io.File, allocator: std.mem.Allocator) ![]u8 {
+        var buf = std.ArrayList(u8).empty;
         defer buf.deinit(allocator);
         var chunk: [4096]u8 = undefined;
         while (true) {
-            const n = file.read(&chunk) catch |err| switch (err) {
-                error.WouldBlock => continue,
-                else => return err,
-            };
+            const n = file.readStreaming(defaultIo(), &.{&chunk}) catch break;
             if (n == 0) break;
             try buf.appendSlice(allocator, chunk[0..n]);
         }
@@ -1419,7 +1425,7 @@ test "handleAuth providers end-to-end through CLI wrapper emits provider ids" {
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
     // No stdin needed; close immediately so the worker doesn't block on read.
-    harness.stdin_write.close();
+    harness.stdin_write.close(defaultIo());
 
     const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
     defer allocator.free(stdout_bytes);
@@ -1427,8 +1433,8 @@ test "handleAuth providers end-to-end through CLI wrapper emits provider ids" {
     defer allocator.free(stderr_bytes);
 
     thread.join();
-    harness.stdout_read.close();
-    harness.stderr_read.close();
+    harness.stdout_read.close(defaultIo());
+    harness.stderr_read.close(defaultIo());
 
     try std.testing.expect(harness.err == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "anthropic\n") != null);
@@ -1443,7 +1449,7 @@ test "handleAuth providers --json end-to-end emits backward-compatible shape" {
     var harness = try AuthCliHarness.init(allocator, &.{ "providers", "--json" });
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
-    harness.stdin_write.close();
+    harness.stdin_write.close(defaultIo());
 
     const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
     defer allocator.free(stdout_bytes);
@@ -1451,8 +1457,8 @@ test "handleAuth providers --json end-to-end emits backward-compatible shape" {
     defer allocator.free(stderr_bytes);
 
     thread.join();
-    harness.stdout_read.close();
-    harness.stderr_read.close();
+    harness.stdout_read.close(defaultIo());
+    harness.stderr_read.close(defaultIo());
 
     try std.testing.expect(harness.err == null);
 
@@ -1474,8 +1480,8 @@ test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
     // Reject first attempt to force the prompt loop to iterate, then accept.
-    try harness.stdin_write.writeAll("not-the-answer\nok\n");
-    harness.stdin_write.close();
+    try harness.stdin_write.writeStreamingAll(defaultIo(), "not-the-answer\nok\n");
+    harness.stdin_write.close(defaultIo());
 
     const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
     defer allocator.free(stdout_bytes);
@@ -1483,8 +1489,8 @@ test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
     defer allocator.free(stderr_bytes);
 
     thread.join();
-    harness.stdout_read.close();
-    harness.stderr_read.close();
+    harness.stdout_read.close(defaultIo());
+    harness.stderr_read.close(defaultIo());
 
     try std.testing.expect(harness.err == null);
     try std.testing.expect(std.mem.indexOf(
@@ -1507,7 +1513,7 @@ test "handleAuth login surfaces typed error for unknown provider via CLI wrapper
     var harness = try AuthCliHarness.init(allocator, &.{ "login", "--provider", "no-such-provider" });
     const thread = try std.Thread.spawn(.{}, AuthCliHarness.run, .{&harness});
 
-    harness.stdin_write.close();
+    harness.stdin_write.close(defaultIo());
 
     const stdout_bytes = try AuthCliHarness.readAll(harness.stdout_read, allocator);
     defer allocator.free(stdout_bytes);
@@ -1515,24 +1521,24 @@ test "handleAuth login surfaces typed error for unknown provider via CLI wrapper
     defer allocator.free(stderr_bytes);
 
     thread.join();
-    harness.stdout_read.close();
-    harness.stderr_read.close();
+    harness.stdout_read.close(defaultIo());
+    harness.stderr_read.close(defaultIo());
 
     try std.testing.expectEqual(auth_cli.AuthCliError.AuthLoginFailed, harness.err.?);
     try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "auth login failed") != null);
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const stdout = std.fs.File.stdout();
-    const stderr = std.fs.File.stderr();
-    const stdin = std.fs.File.stdin();
+    const stdout = std.Io.File.stdout();
+    const stderr = std.Io.File.stderr();
+    const stdin = std.Io.File.stdin();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.args.toSlice(allocator);
+    defer allocator.free(args);
 
     if (args.len <= 1) {
         try printUsage(stdout);
@@ -1540,7 +1546,7 @@ pub fn main() !void {
     }
 
     if (std.mem.eql(u8, args[1], "--version")) {
-        try stdout.writeAll(VERSION ++ "\n");
+        try stdout.writeStreamingAll(defaultIo(), VERSION ++ "\n");
         return;
     }
 
@@ -1561,7 +1567,7 @@ pub fn main() !void {
 
     var msg_buf: [512]u8 = undefined;
     const msg = try std.fmt.bufPrint(&msg_buf, "unknown argument: {s}\n\n", .{args[1]});
-    try stderr.writeAll(msg);
+    try stderr.writeStreamingAll(defaultIo(), msg);
     try printUsage(stderr);
     return error.InvalidArgument;
 }

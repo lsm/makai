@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 
 // GitHub OAuth configuration
@@ -104,7 +105,7 @@ pub fn enableModel(
     model_id: []const u8,
     base_url: []const u8,
 ) !bool {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // Build URL
@@ -120,7 +121,7 @@ pub fn enableModel(
     var body_buffer = "{\"state\": \"enabled\"}".*;
     const body = body_buffer[0..];
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "authorization", .value = auth_header });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
@@ -195,9 +196,9 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
     // 4. Poll for token
     var interval_ms: u64 = device_response.interval * 1000;
-    const deadline = std.time.milliTimestamp() + (@as(i64, device_response.expires_in) * 1000);
+    const deadline = compat.time.nowMillis() + (@as(i64, device_response.expires_in) * 1000);
 
-    while (std.time.milliTimestamp() < deadline) {
+    while (compat.time.nowMillis() < deadline) {
         const poll_result = try pollForToken(github_domain, device_response.device_code, allocator);
         defer if (poll_result.access_token) |t| allocator.free(t);
         defer if (poll_result.error_msg) |msg| allocator.free(msg);
@@ -230,7 +231,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
             return .{
                 .refresh = try allocator.dupe(u8, github_token),
                 .access = copilot_token,
-                .expires = std.time.milliTimestamp() + (3600 * 1000), // 1 hour
+                .expires = compat.time.nowMillis() + (3600 * 1000), // 1 hour
                 .provider_data = provider_data,
                 .enabled_models = enabled_models,
                 .base_url = if (base_url) |bu| try allocator.dupe(u8, bu) else null,
@@ -239,11 +240,11 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
         if (poll_result.error_msg) |err_msg| {
             if (std.mem.eql(u8, err_msg, "authorization_pending")) {
-                std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+                compat.time.sleepNs(interval_ms * std.time.ns_per_ms);
                 continue;
             } else if (std.mem.eql(u8, err_msg, "slow_down")) {
                 interval_ms += 5000;
-                std.Thread.sleep(interval_ms * std.time.ns_per_ms);
+                compat.time.sleepNs(interval_ms * std.time.ns_per_ms);
                 continue;
             } else {
                 return error.OAuthFailed;
@@ -286,7 +287,7 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     return .{
         .refresh = try allocator.dupe(u8, credentials.refresh),
         .access = copilot_token,
-        .expires = std.time.milliTimestamp() + (3600 * 1000),
+        .expires = compat.time.nowMillis() + (3600 * 1000),
         .provider_data = if (credentials.provider_data) |data| try allocator.dupe(u8, data) else null,
         .enabled_models = enabled_models,
         .base_url = result_base_url,
@@ -372,7 +373,7 @@ const DeviceCodeResponse = struct {
 
 /// Start GitHub device code flow
 fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCodeResponse {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -388,7 +389,7 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     const body = try std.fmt.allocPrint(allocator, "client_id={s}&scope=user:email", .{client_id});
     defer allocator.free(body);
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
@@ -406,7 +407,7 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
         defer allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(allocator, "Device flow error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         defer allocator.free(err_msg);
@@ -414,7 +415,7 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
     defer allocator.free(response_body);
 
     // Parse JSON response
@@ -448,7 +449,7 @@ const PollResult = struct {
 
 /// Poll for GitHub access token
 fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.Allocator) !PollResult {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -468,7 +469,7 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     );
     defer allocator.free(body);
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
@@ -491,7 +492,7 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
     defer allocator.free(response_body);
 
     // Parse JSON response (can be success or error)
@@ -526,7 +527,7 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
 
 /// Get Copilot token from GitHub token
 fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -542,7 +543,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{github_token});
     defer allocator.free(auth_header);
 
-    var headers: std.ArrayList(std.http.Header) = .{};
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(allocator);
     try headers.append(allocator, .{ .name = "authorization", .value = auth_header });
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
@@ -567,7 +568,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
         defer allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(allocator, "Copilot token error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         defer allocator.free(err_msg);
@@ -575,7 +576,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.io.Limit.limited(8192));
+    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
     defer allocator.free(response_body);
 
     // Parse JSON response (expected format: {"token": "..."})
@@ -627,7 +628,7 @@ test "getApiKey - returns access token" {
     const credentials = Credentials{
         .refresh = "github_token",
         .access = "copilot_token",
-        .expires = std.time.milliTimestamp() + 3600000,
+        .expires = compat.time.nowMillis() + 3600000,
     };
 
     const api_key = try getApiKey(credentials, std.testing.allocator);

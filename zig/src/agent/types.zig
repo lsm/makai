@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const owned_slice_mod = @import("owned_slice");
@@ -312,7 +313,7 @@ pub const AgentContext = struct {
 
     pub fn init(allocator: std.mem.Allocator) AgentContext {
         return .{
-            .messages = .{},
+            .messages = std.ArrayList(ai_types.Message).empty,
             .allocator = allocator,
         };
     }
@@ -359,7 +360,7 @@ pub const AgentState = struct {
 
     pub fn init(allocator: std.mem.Allocator) AgentState {
         return .{
-            .messages = .{},
+            .messages = std.ArrayList(ai_types.Message).empty,
             .pending_tool_calls = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
@@ -539,7 +540,7 @@ test "AgentContext appendMessage" {
     const msg = ai_types.Message{
         .user = .{
             .content = .{ .text = text },
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = compat.time.nowMillis(),
         },
     };
     try context.appendMessage(msg);
