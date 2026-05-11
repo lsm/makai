@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 /// AWS SigV4 signing utilities for Bedrock API authentication
 /// Reference: https://docs.aws.amazon.com/IAM/latest/UserGuide/create-signed-request.html
@@ -23,7 +24,7 @@ pub fn signRequest(
     session_token: ?[]const u8,
     allocator: std.mem.Allocator,
 ) !SignedRequest {
-    const timestamp = std.time.timestamp();
+    const timestamp = compat.time.nowSeconds();
     const amz_date = try formatAmzDate(timestamp, allocator);
     errdefer allocator.free(amz_date);
 

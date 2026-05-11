@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const oauth = @import("mod.zig");
 
 /// Decoded client ID for GitHub Copilot (Iv1.b507a08c87ecfe98)
@@ -271,13 +272,10 @@ pub const GitHubCopilotOAuth = struct {
             return CopilotError.OutOfMemory;
         };
 
-        // Set expiry to 5 minutes before actual expiry (similar to TypeScript)
-        const expires_at = std.time.timestamp() + 3600 - 300; // 55 minutes from now
-
         return oauth.OAuthCredentials{
             .access = token,
             .refresh = refresh_token,
-            .expires = expires_at * 1000, // Convert to milliseconds
+            .expires = accessTokenExpiresMillis(compat.time.nowSeconds()),
         };
     }
 
@@ -340,7 +338,7 @@ pub const GitHubCopilotOAuth = struct {
         const expires_at_val = obj.get("expires_at") orelse return CopilotError.InvalidResponse;
 
         if (token_val != .string) return CopilotError.InvalidResponse;
-        const expires_at: i64 = if (expires_at_val == .integer) expires_at_val.integer else std.time.timestamp() + 3600;
+        const expires_at: i64 = if (expires_at_val == .integer) expires_at_val.integer else compat.time.nowSeconds() + 3600;
 
         const token = self.allocator.dupe(u8, token_val.string) catch return CopilotError.OutOfMemory;
         errdefer self.allocator.free(token);
@@ -370,12 +368,13 @@ pub const GitHubCopilotOAuth = struct {
         // Notify user
         onAuth(device_info.verification_uri, device_info.user_code);
 
-        // Poll for access token
+        // Poll for access token. These are wall-clock seconds because the OAuth
+        // device-code expiry is specified relative to the current Unix time.
         var interval_ms: u64 = @as(u64, device_info.interval) * 1000;
-        const deadline = std.time.timestamp() + device_info.expires_in;
+        const deadline = compat.time.nowSeconds() + device_info.expires_in;
 
-        while (std.time.timestamp() < deadline) {
-            std.time.sleep(interval_ms * std.time.ns_per_ms);
+        while (compat.time.nowSeconds() < deadline) {
+            compat.time.sleepMs(interval_ms);
 
             const result = self.pollForAccessToken(device_info.device_code) catch |err| {
                 switch (err) {
@@ -405,7 +404,7 @@ pub const GitHubCopilotOAuth = struct {
         return oauth.OAuthCredentials{
             .access = self.allocator.dupe(u8, copilot_token.token) catch return CopilotError.OutOfMemory,
             .refresh = self.allocator.dupe(u8, refresh_token) catch return CopilotError.OutOfMemory,
-            .expires = copilot_token.expires_at * 1000 - 5 * 60 * 1000, // 5 min buffer
+            .expires = copilotTokenRefreshExpiresMillis(copilot_token.expires_at),
         };
     }
 
@@ -451,6 +450,16 @@ pub const GitHubCopilotOAuth = struct {
         return response.head.status == .ok or response.head.status == .created or response.head.status == .no_content;
     }
 };
+
+fn accessTokenExpiresMillis(now_seconds: i64) i64 {
+    // Set expiry to 5 minutes before actual expiry (similar to TypeScript):
+    // 3600s lifetime - 300s refresh buffer = 55 minutes from now.
+    return (now_seconds + 3600 - 300) * std.time.ms_per_s;
+}
+
+fn copilotTokenRefreshExpiresMillis(expires_at_seconds: i64) i64 {
+    return expires_at_seconds * std.time.ms_per_s - 5 * std.time.s_per_min * std.time.ms_per_s;
+}
 
 /// Extract base URL from Copilot token's proxy-ep field
 /// Token format: "tid=...;exp=...;proxy-ep=proxy.individual.githubcopilot.com;..."
@@ -521,6 +530,32 @@ pub fn normalizeDomain(input: []const u8) ?[]const u8 {
 }
 
 // Tests
+test "OAuth token expiry arithmetic preserves second-to-millisecond behavior" {
+    const cases = [_]struct { now_seconds: i64, expected_expires_ms: i64 }{
+        .{ .now_seconds = 0, .expected_expires_ms = 3_300_000 },
+        .{ .now_seconds = 1, .expected_expires_ms = 3_301_000 },
+        .{ .now_seconds = 1_609_459_200, .expected_expires_ms = 1_609_462_500_000 },
+        .{ .now_seconds = 4_102_444_800, .expected_expires_ms = 4_102_448_100_000 },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected_expires_ms, accessTokenExpiresMillis(case.now_seconds));
+    }
+}
+
+test "Copilot token refresh expiry keeps five minute buffer" {
+    const cases = [_]struct { expires_at_seconds: i64, expected_refresh_ms: i64 }{
+        .{ .expires_at_seconds = 300, .expected_refresh_ms = 0 },
+        .{ .expires_at_seconds = 301, .expected_refresh_ms = 1_000 },
+        .{ .expires_at_seconds = 1_609_459_200, .expected_refresh_ms = 1_609_458_900_000 },
+        .{ .expires_at_seconds = 4_102_444_800, .expected_refresh_ms = 4_102_444_500_000 },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected_refresh_ms, copilotTokenRefreshExpiresMillis(case.expires_at_seconds));
+    }
+}
+
 test "extractBaseUrlFromToken extracts proxy endpoint" {
     const token = "tid=abc123;exp=1234567890;proxy-ep=proxy.individual.githubcopilot.com;other=stuff";
     const result = extractBaseUrlFromToken(token);
