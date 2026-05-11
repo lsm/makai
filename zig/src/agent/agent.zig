@@ -417,8 +417,9 @@ pub const Agent = struct {
                 const steering = try self.dequeueSteeringMessages();
                 defer if (steering) |s| self._allocator.free(s);
 
+                var run_messages: ?[]const ai_types.Message = if (steering) |s| s else null;
                 try self.runLoopInternal(
-                    if (steering) |s| s else null,
+                    &run_messages,
                     .{ .skip_initial_steering_poll = true },
                 );
                 return;
@@ -429,8 +430,9 @@ pub const Agent = struct {
                 const follow_up = try self.dequeueFollowUpMessages();
                 defer if (follow_up) |f| self._allocator.free(f);
 
+                var run_messages: ?[]const ai_types.Message = if (follow_up) |f| f else null;
                 try self.runLoopInternal(
-                    if (follow_up) |f| f else null,
+                    &run_messages,
                     .{},
                 );
                 return;
@@ -439,7 +441,8 @@ pub const Agent = struct {
             return error.CannotContinueFromAssistant;
         }
 
-        try self.runLoopInternal(null, .{});
+        var run_messages: ?[]const ai_types.Message = null;
+        try self.runLoopInternal(&run_messages, .{});
     }
 
     /// Abort the current operation.
@@ -638,19 +641,17 @@ pub const Agent = struct {
             return;
         }
 
-        // runLoopInternal takes ownership of non-empty prompt messages once it
-        // reaches agentLoop; the model precheck above keeps the known early
-        // validation path from leaking the cloned async payloads.
-        const run_messages = if (messages.len > 0) blk: {
-            messages_owned = false;
-            break :blk messages;
-        } else null;
+        var run_messages: ?[]const ai_types.Message = if (messages.len > 0) messages else null;
 
-        // Run the loop (errors are handled internally)
+        // Run the loop. runLoopInternal only clears run_messages after the
+        // prompt slice has been consumed successfully. If an error occurs before
+        // that transfer, messages_owned remains true and the thread cleanup
+        // frees the cloned payloads here.
         self.runLoopInternal(
-            run_messages,
+            &run_messages,
             .{ .skip_initial_steering_poll = skip_steering },
         ) catch {};
+        messages_owned = run_messages != null;
     }
 
     /// Reset all state (clear messages, queues, error).
@@ -671,12 +672,13 @@ pub const Agent = struct {
     };
 
     fn runLoop(self: *Agent, messages: []const ai_types.Message) !void {
-        try self.runLoopInternal(messages, .{});
+        var run_messages: ?[]const ai_types.Message = messages;
+        try self.runLoopInternal(&run_messages, .{});
     }
 
     fn runLoopInternal(
         self: *Agent,
-        messages: ?[]const ai_types.Message,
+        messages: *?[]const ai_types.Message,
         options: RunLoopOptions,
     ) !void {
         const model = self._state.model orelse return error.NoModelConfigured;
@@ -730,10 +732,15 @@ pub const Agent = struct {
         };
 
         // Run loop
-        const stream = if (messages) |msgs|
+        const stream = if (messages.*) |msgs|
             try agent_loop.agentLoop(self._allocator, msgs, &context, config)
         else
             try agent_loop.agentLoopContinue(self._allocator, &context, config);
+
+        // agentLoop has successfully copied the prompt payloads into its result
+        // stream. The caller no longer owns the per-message payloads and should
+        // only release the outer slice container.
+        messages.* = null;
 
         defer {
             stream.deinit();
