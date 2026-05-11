@@ -51,6 +51,11 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 std.Io.Threaded.global_single_threaded.io();
         }
 
+        /// Zig 0.16 routes futex operations through the active `std.Io` context.
+        /// The EventStream still uses a monotonically increasing futex word so
+        /// wake/wait semantics match the previous `std.Thread.Futex` design:
+        /// waiters sleep only while the observed word remains unchanged, and
+        /// every push/completion/thread-done transition increments before wake.
         fn wake(self: *Self, max_waiters: u32) void {
             defaultIo().futexWake(u32, &self.futex.raw, max_waiters);
         }
@@ -59,6 +64,10 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             defaultIo().futexWaitUncancelable(u32, &self.futex.raw, expected);
         }
 
+        /// Timed waits now use `std.Io.Timeout` on the boot clock. Timeout and
+        /// spurious-wake errors are intentionally collapsed here because callers
+        /// re-check `thread_done` and their monotonic deadline after every wait,
+        /// preserving the public bool-returning timeout behavior.
         fn waitTimeoutMs(self: *Self, expected: u32, timeout_ms: u64) void {
             const capped_ms = @min(timeout_ms, @as(u64, std.math.maxInt(i64)));
             defaultIo().futexWaitTimeout(u32, &self.futex.raw, expected, .{ .duration = .{
