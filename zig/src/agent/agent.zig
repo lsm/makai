@@ -632,10 +632,8 @@ pub const Agent = struct {
             .{ .skip_initial_steering_poll = skip_steering },
         ) catch {};
 
-        // Free the owned messages
-        for (messages) |*m| {
-            m.deinit(self._allocator);
-        }
+        // runLoopInternal moves messages into its AgentContext, which owns and
+        // frees their contents. Free only the thread-owned slice container here.
         self._allocator.free(messages);
     }
 
@@ -997,6 +995,71 @@ test "Agent isIdle and waitForIdle" {
 
     // Still idle after waitForIdle
     try std.testing.expect(agent.isIdle());
+}
+
+fn delayedErrorStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_mod.AssistantMessageEventStream {
+    _ = ctx;
+    _ = model;
+    _ = context;
+    _ = options;
+
+    defaultIo().sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .boot) catch {};
+
+    const stream = try allocator.create(event_stream_mod.AssistantMessageEventStream);
+    stream.* = event_stream_mod.AssistantMessageEventStream.init(allocator);
+    const message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("test done"),
+        .timestamp = 0,
+    };
+    stream.push(.{ .done = .{ .reason = .@"error", .message = message } }) catch {};
+    stream.complete(message);
+    return stream;
+}
+
+fn createDelayedErrorProtocol() types.ProtocolClient {
+    return .{
+        .stream_fn = delayedErrorStreamFn,
+        .ctx = null,
+    };
+}
+
+const test_model = ai_types.Model{
+    .id = "test-model",
+    .name = "Test Model",
+    .api = "test-api",
+    .provider = "test-provider",
+    .base_url = "https://example.invalid",
+    .reasoning = false,
+    .input = &.{"text"},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 8192,
+    .max_tokens = 1024,
+};
+
+test "Agent async completion signals waitForIdle" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    try agent.promptAsync(@as([]const ai_types.Message, &.{}));
+    try std.testing.expect(!agent.isIdle());
+
+    agent.waitForIdle();
+
+    try std.testing.expect(agent.isIdle());
+    try std.testing.expect(agent._thread == null);
 }
 
 test "Agent cloneMessage" {
