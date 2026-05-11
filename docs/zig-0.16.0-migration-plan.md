@@ -209,6 +209,8 @@ Suggested scope for one PR:
 - Preserve existing error messages and error types for stream completion/error paths unless a compiler-enforced change is documented.
 - Document semantic differences in timeout or wake behavior.
 
+Phase 2 item 11 implementation note: EventStream synchronization now uses `std.Io.Mutex` and `std.Io` futex wait/wake operations. The public semantics intentionally remain unchanged: push, completion, and thread-done paths increment the futex word before waking waiters; waiters re-check queue/completion state after every wake. Timed `waitForThread` waits use `std.Io.Timeout` on the boot clock and still collapse timeout/spurious-wake errors into the existing bool-returning deadline loop, so callers observe the same timeout behavior.
+
 Depends on: work items 8 and 9.
 
 #### Work item 12 — Migrate agent/auth/OAuth synchronization
