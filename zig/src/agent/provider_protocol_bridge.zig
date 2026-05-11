@@ -306,6 +306,8 @@ test "InProcessProviderProtocolBridge smoke test" {
     const result = stream.getResult().?;
     var owned_result = result;
     owned_result.deinit(allocator);
+    // We already freed the result contents above. Null the reference so
+    // stream.deinit() doesn't attempt a double-free.
     stream.result = null;
 
     try std.testing.expect(saw_start);
