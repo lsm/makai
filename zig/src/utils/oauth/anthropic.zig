@@ -116,30 +116,30 @@ const ParsedAuth = struct {
 /// Parse code and state from manual input (format: "code#state" or just "code")
 fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
     // Try to find #code= in URL
-    if (std.mem.indexOf(u8, input, "#code=")) |idx| {
+    if (std.mem.find(u8, input, "#code=")) |idx| {
         const code_start = idx + 6;
         var code_end = input.len;
         var state: []const u8 = "";
 
         // Look for & or # after code
-        if (std.mem.indexOfAny(u8, input[code_start..], "#&")) |end| {
+        if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
             code_end = code_start + end;
         }
 
         const code = try allocator.dupe(u8, input[code_start..code_end]);
 
         // Look for state parameter
-        if (std.mem.indexOf(u8, input, "&state=")) |state_idx| {
+        if (std.mem.find(u8, input, "&state=")) |state_idx| {
             const state_start = state_idx + 7;
             var state_end = input.len;
-            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+            if (std.mem.find(u8, input[state_start..], "&")) |end| {
                 state_end = state_start + end;
             }
             state = try allocator.dupe(u8, input[state_start..state_end]);
-        } else if (std.mem.indexOf(u8, input, "#state=")) |state_idx| {
+        } else if (std.mem.find(u8, input, "#state=")) |state_idx| {
             const state_start = state_idx + 7;
             var state_end = input.len;
-            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+            if (std.mem.find(u8, input[state_start..], "&")) |end| {
                 state_end = state_start + end;
             }
             state = try allocator.dupe(u8, input[state_start..state_end]);
@@ -149,23 +149,23 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
     }
 
     // Try to find ?code= in URL
-    if (std.mem.indexOf(u8, input, "?code=")) |idx| {
+    if (std.mem.find(u8, input, "?code=")) |idx| {
         const code_start = idx + 6;
         var code_end = input.len;
         var state: []const u8 = "";
 
         // Look for & or # after code
-        if (std.mem.indexOfAny(u8, input[code_start..], "#&")) |end| {
+        if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
             code_end = code_start + end;
         }
 
         const code = try allocator.dupe(u8, input[code_start..code_end]);
 
         // Look for state parameter
-        if (std.mem.indexOf(u8, input, "&state=")) |state_idx| {
+        if (std.mem.find(u8, input, "&state=")) |state_idx| {
             const state_start = state_idx + 7;
             var state_end = input.len;
-            if (std.mem.indexOf(u8, input[state_start..], "&")) |end| {
+            if (std.mem.find(u8, input[state_start..], "&")) |end| {
                 state_end = state_start + end;
             }
             state = try allocator.dupe(u8, input[state_start..state_end]);
@@ -175,7 +175,7 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
     }
 
     // Assume raw "code#state" format
-    if (std.mem.indexOf(u8, input, "#")) |hash_idx| {
+    if (std.mem.find(u8, input, "#")) |hash_idx| {
         const code = try allocator.dupe(u8, input[0..hash_idx]);
         const state = try allocator.dupe(u8, input[hash_idx + 1 ..]);
         return .{ .code = code, .state = state };
@@ -397,7 +397,7 @@ test "buildAuthUrl includes code=true" {
     const url = try buildAuthUrl(std.testing.allocator, "challenge-value", "state-value");
     defer std.testing.allocator.free(url);
 
-    try std.testing.expect(std.mem.indexOf(u8, url, "code=true") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code=true") != null);
 }
 
 test "parseTokenResponse handles camelCase token fields" {

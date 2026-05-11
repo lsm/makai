@@ -188,12 +188,12 @@ pub const RefreshLock = struct {
     fn keyMatches(key: []const u8, provider_id: []const u8, user_id: ?[]const u8) bool {
         if (user_id) |uid| {
             // Multi-tenant key: "provider_id\x00user_id"
-            const null_pos = std.mem.indexOfScalar(u8, key, 0) orelse return false;
+            const null_pos = std.mem.findScalar(u8, key, 0) orelse return false;
             return std.mem.eql(u8, key[0..null_pos], provider_id) and
                 std.mem.eql(u8, key[null_pos + 1 ..], uid);
         } else {
             // Single-tenant: key must be exactly provider_id with no null byte.
-            if (std.mem.indexOfScalar(u8, key, 0) != null) return false;
+            if (std.mem.findScalar(u8, key, 0) != null) return false;
             return std.mem.eql(u8, key, provider_id);
         }
     }

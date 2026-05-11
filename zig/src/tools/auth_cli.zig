@@ -565,7 +565,7 @@ pub const FileIo = struct {
 
     fn readLine(self: *FileIo, allocator: std.mem.Allocator) ![]u8 {
         while (true) {
-            if (std.mem.indexOfScalar(u8, self.leftover.items, '\n')) |nl_pos| {
+            if (std.mem.findScalar(u8, self.leftover.items, '\n')) |nl_pos| {
                 const raw = self.leftover.items[0..nl_pos];
                 const trimmed = std.mem.trim(u8, raw, " \t\r");
                 const dup = try allocator.dupe(u8, trimmed);
@@ -684,9 +684,9 @@ test "runProvidersCommand plain mode emits provider ids one per line" {
     try runProvidersCommand(allocator, test_io.io(), test_server_options, .{ .json_mode = false });
 
     // Expect at least the built-in provider ids on their own lines.
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "anthropic\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "github-copilot\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "test-fixture\n") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "anthropic\n") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "github-copilot\n") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "test-fixture\n") != null);
     try std.testing.expectEqual(@as(usize, 0), test_io.err.items.len);
 }
 
@@ -734,22 +734,22 @@ test "runLoginCommand routes through protocol runtime and completes test-fixture
         .json_mode = false,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "https://example.invalid/makai-test-fixture-login") != null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "Enter code 'ok' to complete fixture login.") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "https://example.invalid/makai-test-fixture-login") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "Enter code 'ok' to complete fixture login.") != null);
     // Two prompts must have been issued (one for the rejected code, one for "ok").
     var prompt_count: usize = 0;
     var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, test_io.out.items, idx, "Enter fixture code:")) |found| {
+    while (std.mem.findPos(u8, test_io.out.items, idx, "Enter fixture code:")) |found| {
         prompt_count += 1;
         idx = found + 1;
     }
     try std.testing.expect(prompt_count >= 2);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "Login successful.") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "Login successful.") != null);
     // Tokens must never appear in the wrapper-visible output.
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "fixture-refresh-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.out.items, "fixture-access-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.err.items, "fixture-refresh-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.err.items, "fixture-access-token") == null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.find(u8, test_io.out.items, "fixture-access-token") == null);
+    try std.testing.expect(std.mem.find(u8, test_io.err.items, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.find(u8, test_io.err.items, "fixture-access-token") == null);
 }
 
 test "runLoginCommand json mode emits per-event envelopes followed by terminal success" {
@@ -772,8 +772,8 @@ test "runLoginCommand json mode emits per-event envelopes followed by terminal s
     var line_iter = std.mem.splitScalar(u8, test_io.out.items, '\n');
     while (line_iter.next()) |line| {
         if (line.len == 0) continue;
-        if (std.mem.indexOf(u8, line, "fixture-refresh-token") != null) saw_token_leak = true;
-        if (std.mem.indexOf(u8, line, "fixture-access-token") != null) saw_token_leak = true;
+        if (std.mem.find(u8, line, "fixture-refresh-token") != null) saw_token_leak = true;
+        if (std.mem.find(u8, line, "fixture-access-token") != null) saw_token_leak = true;
 
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch continue;
         defer parsed.deinit();
@@ -810,5 +810,5 @@ test "runLoginCommand surfaces typed error for unknown provider" {
     });
 
     try std.testing.expectError(AuthCliError.AuthLoginFailed, result);
-    try std.testing.expect(std.mem.indexOf(u8, test_io.err.items, "auth login failed") != null);
+    try std.testing.expect(std.mem.find(u8, test_io.err.items, "auth login failed") != null);
 }

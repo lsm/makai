@@ -162,7 +162,7 @@ test "GoogleGeminiCliOAuth startAuth returns valid AuthInfo" {
 
     try std.testing.expect(auth_info.auth_url.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, auth_info.auth_url, "https://accounts.google.com"));
-    try std.testing.expect(std.mem.indexOf(u8, auth_info.auth_url, "code_challenge") != null);
+    try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "code_challenge") != null);
 }
 
 test "GoogleGeminiCliOAuth login returns NotImplemented" {

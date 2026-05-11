@@ -609,15 +609,15 @@ fn performHandshake(
     }
 
     // Verify Upgrade: websocket
-    if (std.mem.indexOf(u8, response, "Upgrade: websocket") == null and
-        std.mem.indexOf(u8, response, "Upgrade: Websocket") == null)
+    if (std.mem.find(u8, response, "Upgrade: websocket") == null and
+        std.mem.find(u8, response, "Upgrade: Websocket") == null)
     {
         return error.HandshakeFailed;
     }
 
     // Verify Connection: Upgrade
-    if (std.mem.indexOf(u8, response, "Connection: Upgrade") == null and
-        std.mem.indexOf(u8, response, "Connection: upgrade") == null)
+    if (std.mem.find(u8, response, "Connection: Upgrade") == null and
+        std.mem.find(u8, response, "Connection: upgrade") == null)
     {
         return error.HandshakeFailed;
     }
@@ -625,8 +625,8 @@ fn performHandshake(
     // Verify Sec-WebSocket-Accept header
     // The accept key is base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
     // For simplicity, just verify the header exists
-    if (std.mem.indexOf(u8, response, "Sec-WebSocket-Accept:") == null and
-        std.mem.indexOf(u8, response, "Sec-WebSocket-Protocol:") == null)
+    if (std.mem.find(u8, response, "Sec-WebSocket-Accept:") == null and
+        std.mem.find(u8, response, "Sec-WebSocket-Protocol:") == null)
     {
         return error.HandshakeFailed;
     }
@@ -667,16 +667,16 @@ fn parseUrl(url: []const u8) !ParsedUrl {
     var host_end = url.len;
 
     // Look for port
-    if (std.mem.indexOfScalarPos(u8, url, offset, ':')) |colon_pos| {
+    if (std.mem.findScalarPos(u8, url, offset, ':')) |colon_pos| {
         host_end = colon_pos;
         offset = colon_pos + 1;
 
         // Parse port
-        const port_end = std.mem.indexOfScalarPos(u8, url, offset, '/') orelse url.len;
+        const port_end = std.mem.findScalarPos(u8, url, offset, '/') orelse url.len;
         const port_str = url[offset..port_end];
         result.port = try std.fmt.parseInt(u16, port_str, 10);
         offset = port_end;
-    } else if (std.mem.indexOfScalarPos(u8, url, offset, '/')) |slash_pos| {
+    } else if (std.mem.findScalarPos(u8, url, offset, '/')) |slash_pos| {
         host_end = slash_pos;
         offset = slash_pos;
     } else {

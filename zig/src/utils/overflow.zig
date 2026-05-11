@@ -41,7 +41,7 @@ pub fn isContextOverflow(message: ai_types.AssistantMessage, context_window: ?u6
 
 /// Check if error message matches known overflow patterns
 fn matchesOverflowPattern(err_msg: []const u8) bool {
-    // Use std.mem.indexOfPosScalar for case-insensitive matching
+    // Use std.mem.findPosScalar for case-insensitive matching
     // We use std.ascii.lower to do case-insensitive comparisons
 
     // Anthropic: "prompt is too long"

@@ -130,9 +130,9 @@ pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]cons
 
 /// Parse code from URL
 fn parseCodeFromUrl(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, url, "code=")) |idx| {
+    if (std.mem.find(u8, url, "code=")) |idx| {
         const code_start = idx + 5;
-        const code_end = std.mem.indexOfAny(u8, url[code_start..], "&# ") orelse url.len - code_start;
+        const code_end = std.mem.findAny(u8, url[code_start..], "&# ") orelse url.len - code_start;
         return try allocator.dupe(u8, url[code_start .. code_start + code_end]);
     }
     return error.NoCodeInUrl;

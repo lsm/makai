@@ -96,18 +96,18 @@ fn parseHttpDate(date_str: []const u8) ?u64 {
     var idx: usize = 5;
 
     // Parse day
-    const day_end = std.mem.indexOfPos(u8, date_str, idx, " ") orelse return null;
+    const day_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const day = std.fmt.parseInt(u32, date_str[idx..day_end], 10) catch return null;
     idx = day_end + 1;
 
     // Parse month
-    const month_end = std.mem.indexOfPos(u8, date_str, idx, " ") orelse return null;
+    const month_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const month_str = date_str[idx..month_end];
     const month = monthFromString(month_str) orelse return null;
     idx = month_end + 1;
 
     // Parse year
-    const year_end = std.mem.indexOfPos(u8, date_str, idx, " ") orelse return null;
+    const year_end = std.mem.findPos(u8, date_str, idx, " ") orelse return null;
     const year = std.fmt.parseInt(u32, date_str[idx..year_end], 10) catch return null;
     idx = year_end + 1;
 
@@ -197,7 +197,7 @@ pub fn extractRetryDelayFromBody(error_text: []const u8) ?u64 {
     if (indexOfCaseInsensitive(error_text, "\"retrydelay\"")) |start_idx| {
         // Find the colon and value
         const after_key = error_text[start_idx..];
-        if (std.mem.indexOf(u8, after_key, ":")) |colon_idx| {
+        if (std.mem.find(u8, after_key, ":")) |colon_idx| {
             const after_colon = std.mem.trimStart(u8, after_key[colon_idx + 1 ..], " \t");
             if (parseRetryInFormat(after_colon)) |ms| {
                 return normalizeDelay(ms);

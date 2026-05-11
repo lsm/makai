@@ -63,13 +63,13 @@ test "generate - returns valid PKCE challenge" {
     try std.testing.expect(challenge.challenge.len == 43);
 
     // Should not contain standard base64 characters
-    try std.testing.expect(std.mem.indexOf(u8, challenge.verifier, "+") == null);
-    try std.testing.expect(std.mem.indexOf(u8, challenge.verifier, "/") == null);
-    try std.testing.expect(std.mem.indexOf(u8, challenge.verifier, "=") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.verifier, "+") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.verifier, "/") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.verifier, "=") == null);
 
-    try std.testing.expect(std.mem.indexOf(u8, challenge.challenge, "+") == null);
-    try std.testing.expect(std.mem.indexOf(u8, challenge.challenge, "/") == null);
-    try std.testing.expect(std.mem.indexOf(u8, challenge.challenge, "=") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.challenge, "+") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.challenge, "/") == null);
+    try std.testing.expect(std.mem.find(u8, challenge.challenge, "=") == null);
 }
 
 test "generate - creates unique verifiers" {
@@ -103,5 +103,5 @@ test "base64urlEncode - encodes correctly" {
 
     // Should be base64url without padding
     try std.testing.expectEqualStrings("aGVsbG8gd29ybGQ", encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "=") == null);
+    try std.testing.expect(std.mem.find(u8, encoded, "=") == null);
 }

@@ -45,25 +45,25 @@ pub fn parseModelRef(
     allocator: std.mem.Allocator,
     model_ref: []const u8,
 ) (std.mem.Allocator.Error || ModelRefError)!ParsedModelRef {
-    const slash_index = std.mem.indexOfScalar(u8, model_ref, '/') orelse return error.MissingSeparators;
+    const slash_index = std.mem.findScalar(u8, model_ref, '/') orelse return error.MissingSeparators;
     if (slash_index == 0) return error.MissingProviderId;
 
-    const first_at_index = std.mem.indexOfScalar(u8, model_ref, '@');
+    const first_at_index = std.mem.findScalar(u8, model_ref, '@');
     if (first_at_index) |idx| {
         if (idx < slash_index) return error.AmbiguousSeparators;
     }
 
     const api_and_model = model_ref[slash_index + 1 ..];
-    const at_offset = std.mem.indexOfScalar(u8, api_and_model, '@') orelse return error.MissingSeparators;
+    const at_offset = std.mem.findScalar(u8, api_and_model, '@') orelse return error.MissingSeparators;
     const at_index = slash_index + 1 + at_offset;
 
-    if (std.mem.indexOfScalar(u8, model_ref[slash_index + 1 .. at_index], '/')) |_| {
+    if (std.mem.findScalar(u8, model_ref[slash_index + 1 .. at_index], '/')) |_| {
         return error.AmbiguousSeparators;
     }
-    if (std.mem.indexOfScalar(u8, model_ref[at_index + 1 ..], '@')) |_| {
+    if (std.mem.findScalar(u8, model_ref[at_index + 1 ..], '@')) |_| {
         return error.AmbiguousSeparators;
     }
-    if (std.mem.indexOfScalar(u8, model_ref[at_index + 1 ..], '/')) |_| {
+    if (std.mem.findScalar(u8, model_ref[at_index + 1 ..], '/')) |_| {
         return error.AmbiguousSeparators;
     }
 

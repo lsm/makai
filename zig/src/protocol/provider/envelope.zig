@@ -1602,10 +1602,10 @@ test "serializeEnvelope with ping payload" {
     defer allocator.free(json);
 
     // Check that the JSON contains expected fields
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"ping\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"timestamp\":1708234567890") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"payload\":{}") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"ping\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"sequence\":1") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"timestamp\":1708234567890") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"payload\":{}") != null);
 }
 
 test "serializeEnvelope with pong payload" {
@@ -1625,9 +1625,9 @@ test "serializeEnvelope with pong payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"pong\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"sequence\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"ping_id\":\"test-ping-123\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"pong\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"sequence\":2") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"ping_id\":\"test-ping-123\"") != null);
 
     envelope.deinit(allocator);
 }
@@ -1669,13 +1669,13 @@ test "serializeEnvelope with stream_request payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"stream_request\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"stream_request\"") != null);
     // Check for nested model object format per PROTOCOL.md
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"model\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"gpt-4\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"GPT-4\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"system_prompt\":\"You are helpful.\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"include_partial\":true") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"model\":{") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"id\":\"gpt-4\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"GPT-4\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"system_prompt\":\"You are helpful.\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"include_partial\":true") != null);
 
     envelope.deinit(allocator);
 }
@@ -1938,9 +1938,9 @@ test "serializeEnvelope with abort_request payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"abort_request\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"User cancelled\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"target_stream_id\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"abort_request\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"reason\":\"User cancelled\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"target_stream_id\"") != null);
 
     envelope.deinit(allocator);
 }
@@ -1965,9 +1965,9 @@ test "serializeEnvelope with stream_error payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"stream_error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"code\":\"provider_error\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"message\":\"Connection timeout\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"stream_error\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"code\":\"provider_error\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"message\":\"Connection timeout\"") != null);
 
     envelope.deinit(allocator);
 }
@@ -2181,8 +2181,8 @@ test "serializeEnvelope with goodbye payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"goodbye\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"Server shutting down\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"goodbye\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"reason\":\"Server shutting down\"") != null);
 
     envelope.deinit(allocator);
 }
@@ -2201,8 +2201,8 @@ test "serializeEnvelope with goodbye payload (no reason)" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"goodbye\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\"") == null); // reason should not be present
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"goodbye\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"reason\"") == null); // reason should not be present
 
     envelope.deinit(allocator);
 }
@@ -2222,8 +2222,8 @@ test "serializeEnvelope with sync_request payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"sync_request\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"target_stream_id\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"sync_request\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"target_stream_id\"") != null);
 
     envelope.deinit(allocator);
 }
@@ -2256,9 +2256,9 @@ test "serializeEnvelope with sync payload" {
     const json = try serializeEnvelope(envelope, allocator);
     defer allocator.free(json);
 
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"sync\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"target_stream_id\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"partial\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"sync\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"target_stream_id\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"partial\"") != null);
 
     envelope.deinit(allocator);
 }

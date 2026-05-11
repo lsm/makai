@@ -165,8 +165,8 @@ test "GoogleAntigravityOAuth startAuth returns valid AuthInfo with correct port"
     try std.testing.expect(auth_info.auth_url.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, auth_info.auth_url, "https://accounts.google.com"));
     // Verify it uses port 51121
-    try std.testing.expect(std.mem.indexOf(u8, auth_info.auth_url, "51121") != null);
-    try std.testing.expect(std.mem.indexOf(u8, auth_info.auth_url, "code_challenge") != null);
+    try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "51121") != null);
+    try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "code_challenge") != null);
 }
 
 test "GoogleAntigravityOAuth login returns NotImplemented" {

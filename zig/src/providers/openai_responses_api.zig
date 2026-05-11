@@ -182,7 +182,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) {
+    if (std.mem.find(u8, model.base_url, "openai.com") != null) {
         try w.writeBoolField("store", false);
     }
 
@@ -207,7 +207,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // Cache retention for OpenAI API
     if (options.cache_retention) |retention| {
-        if (retention == .long and std.mem.indexOf(u8, model.base_url, "openai.com") != null) {
+        if (retention == .long and std.mem.find(u8, model.base_url, "openai.com") != null) {
             try w.writeStringField("prompt_cache_retention", "24h");
         }
     }
@@ -842,7 +842,7 @@ fn runThread(ctx: *ThreadCtx) void {
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
             // Check Retry-After header (only if headers contain valid \r\n separator)
-            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+            if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -1785,7 +1785,7 @@ test "buildRequestBody includes service_tier when set" {
     const body = try buildRequestBody(model, context, options, allocator);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"service_tier\":\"flex\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"flex\"") != null);
 }
 
 test "buildRequestBody omits service_tier when null" {
@@ -1810,7 +1810,7 @@ test "buildRequestBody omits service_tier when null" {
     const body = try buildRequestBody(model, context, options, allocator);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "service_tier") == null);
+    try std.testing.expect(std.mem.find(u8, body, "service_tier") == null);
 }
 
 test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" {
@@ -1838,8 +1838,8 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
     const body = try buildRequestBody(model, context, options, allocator);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "# Juice: 0 !important") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"developer\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "# Juice: 0 !important") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") != null);
 }
 
 test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {
@@ -1867,7 +1867,7 @@ test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {
     const body = try buildRequestBody(model, context, options, allocator);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "Juice") == null);
+    try std.testing.expect(std.mem.find(u8, body, "Juice") == null);
 }
 
 test "buildRequestBody omits juice workaround for non-GPT-5 models" {
@@ -1895,7 +1895,7 @@ test "buildRequestBody omits juice workaround for non-GPT-5 models" {
     const body = try buildRequestBody(model, context, options, allocator);
     defer allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "Juice") == null);
+    try std.testing.expect(std.mem.find(u8, body, "Juice") == null);
 }
 
 test "ServiceTier enum values are correct" {

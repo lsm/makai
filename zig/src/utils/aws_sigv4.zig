@@ -310,9 +310,9 @@ test "buildCanonicalHeaders" {
     const canonical = try buildCanonicalHeaders(headers, allocator);
     defer allocator.free(canonical);
 
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "content-type:application/json\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "host:example.com\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "x-amz-date:20210101T000000Z\n") != null);
+    try std.testing.expect(std.mem.find(u8, canonical, "content-type:application/json\n") != null);
+    try std.testing.expect(std.mem.find(u8, canonical, "host:example.com\n") != null);
+    try std.testing.expect(std.mem.find(u8, canonical, "x-amz-date:20210101T000000Z\n") != null);
 }
 
 test "getSignedHeaders" {
@@ -354,8 +354,8 @@ test "buildCanonicalRequest" {
     );
     defer allocator.free(canonical);
 
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "GET\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, canonical, "/\n") != null);
+    try std.testing.expect(std.mem.find(u8, canonical, "GET\n") != null);
+    try std.testing.expect(std.mem.find(u8, canonical, "/\n") != null);
 }
 
 test "signRequest complete flow" {

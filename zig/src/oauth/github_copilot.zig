@@ -458,12 +458,12 @@ pub const GitHubCopilotOAuth = struct {
 pub fn extractBaseUrlFromToken(token: []const u8) ?[]const u8 {
     // Find "proxy-ep=" in token
     const prefix = "proxy-ep=";
-    const start_idx = std.mem.indexOf(u8, token, prefix) orelse return null;
+    const start_idx = std.mem.find(u8, token, prefix) orelse return null;
     const value_start = start_idx + prefix.len;
 
     // Find end of value (next semicolon or end of string)
     const remaining = token[value_start..];
-    const end_idx = std.mem.indexOf(u8, remaining, ";") orelse remaining.len;
+    const end_idx = std.mem.find(u8, remaining, ";") orelse remaining.len;
 
     const proxy_host = remaining[0..end_idx];
     if (proxy_host.len == 0) return null;
@@ -502,18 +502,18 @@ pub fn normalizeDomain(input: []const u8) ?[]const u8 {
     if (trimmed.len == 0) return null;
 
     // Check if it looks like a URL
-    if (std.mem.indexOf(u8, trimmed, "://")) |idx| {
+    if (std.mem.find(u8, trimmed, "://")) |idx| {
         // Skip the scheme
         const after_scheme = trimmed[idx + 3 ..];
         // Find end of host (before first / or end)
-        if (std.mem.indexOf(u8, after_scheme, "/")) |slash_idx| {
+        if (std.mem.find(u8, after_scheme, "/")) |slash_idx| {
             return after_scheme[0..slash_idx];
         }
         return after_scheme;
     }
 
     // Assume it's already a hostname - find first /
-    if (std.mem.indexOf(u8, trimmed, "/")) |slash_idx| {
+    if (std.mem.find(u8, trimmed, "/")) |slash_idx| {
         return trimmed[0..slash_idx];
     }
 

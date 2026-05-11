@@ -61,67 +61,67 @@ pub const ProviderCapabilities = struct {
 /// Check if URL is GitHub Copilot
 pub fn isGitHubCopilot(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.githubcopilot.com") != null;
+    return std.mem.find(u8, url, "api.githubcopilot.com") != null;
 }
 
 /// Check if URL is Mistral
 pub fn isMistral(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.mistral.ai") != null;
+    return std.mem.find(u8, url, "api.mistral.ai") != null;
 }
 
 /// Check if URL is Groq
 pub fn isGroq(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.groq.com") != null;
+    return std.mem.find(u8, url, "api.groq.com") != null;
 }
 
 /// Check if URL is Cerebras
 pub fn isCerebras(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.cerebras.ai") != null;
+    return std.mem.find(u8, url, "api.cerebras.ai") != null;
 }
 
 /// Check if URL is Z.ai
 pub fn isZai(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.zukijourney.com") != null or std.mem.indexOf(u8, url, "zai") != null;
+    return std.mem.find(u8, url, "api.zukijourney.com") != null or std.mem.find(u8, url, "zai") != null;
 }
 
 /// Check if URL is OpenRouter
 pub fn isOpenRouter(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "openrouter.ai") != null;
+    return std.mem.find(u8, url, "openrouter.ai") != null;
 }
 
 /// Check if URL is Chutes
 pub fn isChutes(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "chutes.ai") != null;
+    return std.mem.find(u8, url, "chutes.ai") != null;
 }
 
 /// Check if URL is Qwen
 pub fn isQwen(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "dashscope") != null or std.mem.indexOf(u8, url, "qwen") != null;
+    return std.mem.find(u8, url, "dashscope") != null or std.mem.find(u8, url, "qwen") != null;
 }
 
 /// Check if URL is DeepSeek
 pub fn isDeepSeek(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.deepseek.com") != null;
+    return std.mem.find(u8, url, "api.deepseek.com") != null;
 }
 
 /// Check if URL is OpenAI native
 pub fn isOpenAINative(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.openai.com") != null;
+    return std.mem.find(u8, url, "api.openai.com") != null;
 }
 
 /// Check if URL is Anthropic
 pub fn isAnthropic(base_url: ?[]const u8) bool {
     const url = base_url orelse return false;
-    return std.mem.indexOf(u8, url, "api.anthropic.com") != null;
+    return std.mem.find(u8, url, "api.anthropic.com") != null;
 }
 
 /// Detect provider type from base URL
@@ -136,11 +136,11 @@ pub fn detectProviderType(base_url: ?[]const u8) ProviderType {
     if (isCerebras(url)) return .openai_compatible;
     if (isZai(url)) return .openai_compatible;
     if (isOpenRouter(url)) return .openai_compatible;
-    if (std.mem.indexOf(u8, url, "generativelanguage.googleapis.com") != null) return .google;
-    if (std.mem.indexOf(u8, url, "aiplatform.googleapis.com") != null) return .google;
-    if (std.mem.indexOf(u8, url, "bedrock-runtime.") != null or std.mem.indexOf(u8, url, "bedrock.") != null) return .bedrock;
-    if (std.mem.indexOf(u8, url, ".openai.azure.com") != null or std.mem.indexOf(u8, url, "cognitiveservices.azure.com") != null) return .azure;
-    if (std.mem.indexOf(u8, url, "localhost:11434") != null or std.mem.indexOf(u8, url, "127.0.0.1:11434") != null or std.mem.indexOf(u8, url, "ollama") != null) return .ollama;
+    if (std.mem.find(u8, url, "generativelanguage.googleapis.com") != null) return .google;
+    if (std.mem.find(u8, url, "aiplatform.googleapis.com") != null) return .google;
+    if (std.mem.find(u8, url, "bedrock-runtime.") != null or std.mem.find(u8, url, "bedrock.") != null) return .bedrock;
+    if (std.mem.find(u8, url, ".openai.azure.com") != null or std.mem.find(u8, url, "cognitiveservices.azure.com") != null) return .azure;
+    if (std.mem.find(u8, url, "localhost:11434") != null or std.mem.find(u8, url, "127.0.0.1:11434") != null or std.mem.find(u8, url, "ollama") != null) return .ollama;
 
     // Default to OpenAI-compatible for unknown URLs
     if (url.len > 0) return .openai_compatible;

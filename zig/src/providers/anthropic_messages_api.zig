@@ -37,8 +37,8 @@ fn anthropicGetApiKey(credentials: oauth_storage.Credentials, allocator: std.mem
 }
 
 fn anthropicIsAuthFailure(err_msg: []const u8) bool {
-    return std.mem.indexOf(u8, err_msg, "401") != null or
-        std.mem.indexOf(u8, err_msg, "403") != null or
+    return std.mem.find(u8, err_msg, "401") != null or
+        std.mem.find(u8, err_msg, "403") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "unauthorized") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "forbidden") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "authentication_error") != null or
@@ -55,7 +55,7 @@ fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
 }
 
 fn isOAuthToken(key: []const u8) bool {
-    return std.mem.indexOf(u8, key, "sk-ant-oat") != null;
+    return std.mem.find(u8, key, "sk-ant-oat") != null;
 }
 
 fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
@@ -107,7 +107,7 @@ fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetenti
     if (retention == .none) return null;
 
     // Only add ttl for "long" retention on api.anthropic.com
-    const has_ttl = retention == .long and std.mem.indexOf(u8, base_url, "api.anthropic.com") != null;
+    const has_ttl = retention == .long and std.mem.find(u8, base_url, "api.anthropic.com") != null;
 
     return .{
         .retention = retention,
@@ -117,8 +117,8 @@ fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetenti
 
 /// Check if a model supports adaptive thinking (Opus 4.6+)
 fn supportsAdaptiveThinking(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "opus-4-6") != null or
-        std.mem.indexOf(u8, model_id, "opus-4.6") != null;
+    return std.mem.find(u8, model_id, "opus-4-6") != null or
+        std.mem.find(u8, model_id, "opus-4.6") != null;
 }
 
 /// Map ThinkingLevel to Anthropic effort levels for adaptive thinking
@@ -1336,7 +1336,7 @@ fn runThread(ctx: *ThreadCtx) void {
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
             // Check Retry-After header (only if headers contain valid \r\n separator)
-            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+            if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -1985,9 +1985,9 @@ test "buildRequestBody includes cache_control in system prompt" {
     defer allocator.free(body);
 
     // Verify system prompt is an array with cache_control
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"ttl\"") == null); // short retention, no ttl
+    try std.testing.expect(std.mem.find(u8, body, "\"system\":[") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"ttl\"") == null); // short retention, no ttl
 }
 
 test "buildRequestBody includes ttl for long retention on anthropic url" {
@@ -2024,7 +2024,7 @@ test "buildRequestBody includes ttl for long retention on anthropic url" {
     defer allocator.free(body);
 
     // Verify ttl is included for long retention
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}") != null);
 }
 
 test "buildRequestBody serializes tool_result as tool_result content block" {
@@ -2127,7 +2127,7 @@ test "buildRequestBody serializes tool_result with is_error=true" {
     defer allocator.free(body);
 
     // Verify is_error is true
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\":true") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"is_error\":true") != null);
 }
 
 test "buildRequestBody adds cache_control to last user message" {

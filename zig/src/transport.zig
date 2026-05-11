@@ -1386,8 +1386,8 @@ test "serialize and deserialize toolcall_start event with id and name" {
     defer allocator.free(json);
 
     // Verify the serialized JSON contains id and name
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"id\":\"toolu_abc\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"calculator\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"id\":\"toolu_abc\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"name\":\"calculator\"") != null);
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);
@@ -1477,9 +1477,9 @@ test "serialize and deserialize error event" {
     defer allocator.free(json);
 
     // Verify JSON contains the new fields
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_message\":\"API rate limit exceeded\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"input\":100") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"output\":50") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"error_message\":\"API rate limit exceeded\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"input\":100") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"output\":50") != null);
 
     const msg = try deserialize(json, allocator);
     try std.testing.expect(msg == .event);

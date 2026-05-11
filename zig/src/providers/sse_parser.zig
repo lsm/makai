@@ -99,7 +99,7 @@ pub const SSEParser = struct {
         if (line[0] == ':') return;
 
         // Find the colon separator
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, line, ':')) |colon_pos| {
             const field = line[0..colon_pos];
             var value = line[colon_pos + 1 ..];
 
@@ -365,6 +365,6 @@ test "sse_parser_provider_error_body_path_surfaces_error_event" {
 
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("error", events[0].event_type.?);
-    try std.testing.expect(std.mem.indexOf(u8, events[0].data, "invalid_request_error") != null);
-    try std.testing.expect(std.mem.indexOf(u8, events[0].data, "bad input") != null);
+    try std.testing.expect(std.mem.find(u8, events[0].data, "invalid_request_error") != null);
+    try std.testing.expect(std.mem.find(u8, events[0].data, "bad input") != null);
 }

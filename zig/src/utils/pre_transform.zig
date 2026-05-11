@@ -44,7 +44,7 @@ fn isSameModel(msg: ai_types.AssistantMessage, config: TransformConfig) bool {
 pub fn normalizeToolId(allocator: std.mem.Allocator, id: []const u8, max_len: usize) ![]const u8 {
     // Strip pipe-separated suffix
     var effective_id = id;
-    if (std.mem.indexOf(u8, id, "|")) |pipe_pos| {
+    if (std.mem.find(u8, id, "|")) |pipe_pos| {
         effective_id = id[0..pipe_pos];
     }
 
@@ -218,7 +218,7 @@ pub fn preTransform(
 
                         // Build normalized ID if needed
                         if (config.max_tool_id_len > 0 or config.mistral_tool_ids or
-                            std.mem.indexOf(u8, c.tool_call.id, "|") != null)
+                            std.mem.find(u8, c.tool_call.id, "|") != null)
                         {
                             const normalized = if (config.mistral_tool_ids)
                                 try mistralToolId(allocator, c.tool_call.id)
