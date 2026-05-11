@@ -74,12 +74,12 @@ pub const Prompt = struct {
 pub fn getBaseUrlFromToken(token: []const u8, allocator: std.mem.Allocator) ?[]const u8 {
     // Find "proxy-ep=" in token
     const prefix = "proxy-ep=";
-    const start_idx = std.mem.indexOf(u8, token, prefix) orelse return null;
+    const start_idx = std.mem.find(u8, token, prefix) orelse return null;
     const value_start = start_idx + prefix.len;
 
     // Find end of value (semicolon or end of string)
     const remaining = token[value_start..];
-    const end_idx = std.mem.indexOf(u8, remaining, ";") orelse remaining.len;
+    const end_idx = std.mem.find(u8, remaining, ";") orelse remaining.len;
     const proxy_host = remaining[0..end_idx];
 
     // Convert "proxy.xxx" to "api.xxx"
@@ -259,10 +259,10 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
     // Parse enterprise URL from provider_data
     const github_domain = if (credentials.provider_data) |data| blk: {
-        if (std.mem.indexOf(u8, data, "enterpriseUrl")) |_| {
-            if (std.mem.indexOf(u8, data, "https://")) |idx| {
+        if (std.mem.find(u8, data, "enterpriseUrl")) |_| {
+            if (std.mem.find(u8, data, "https://")) |idx| {
                 const start = idx + 8;
-                const end = std.mem.indexOfScalar(u8, data[start..], '"') orelse data.len - start;
+                const end = std.mem.findScalar(u8, data[start..], '"') orelse data.len - start;
                 break :blk data[start .. start + end];
             }
         }
@@ -591,8 +591,8 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
         // Some endpoints may return the raw token string directly instead of JSON.
         // Accept token-like payloads as a fallback.
         const trimmed = std.mem.trim(u8, response_body, " \r\n\t\"");
-        if (std.mem.indexOf(u8, trimmed, "tid=") != null or
-            std.mem.indexOf(u8, trimmed, "proxy-ep=") != null)
+        if (std.mem.find(u8, trimmed, "tid=") != null or
+            std.mem.find(u8, trimmed, "proxy-ep=") != null)
         {
             return try allocator.dupe(u8, trimmed);
         }

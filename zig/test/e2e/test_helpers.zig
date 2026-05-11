@@ -243,7 +243,7 @@ pub fn getAnthropicCredential(allocator: std.mem.Allocator) !?AnthropicCredentia
     // 1. Try ANTHROPIC_AUTH_TOKEN first (OAuth token)
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // OAuth token format: "refresh_token:access_token" or just "access_token"
-        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, token, ':')) |colon_pos| {
             const access_token = try allocator.dupe(u8, token[colon_pos + 1 ..]);
             allocator.free(token);
             return AnthropicCredential{
@@ -453,7 +453,7 @@ pub fn getGitHubCopilotCredentials(allocator: std.mem.Allocator) !?GitHubCopilot
     if (compat.getEnvVarOwned(allocator, "COPILOT_TOKEN")) |token| {
         // Check for combined format: "github_token:copilot_token"
         // Split on the first colon - copilot_token may contain colons (semicolons in the token)
-        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, token, ':')) |colon_pos| {
             const github_token = token[0..colon_pos];
             const copilot_token = token[colon_pos + 1 ..];
             const result = GitHubCopilotCredentials{
@@ -510,7 +510,7 @@ fn getGitHubCopilotCredentialsFromAuthFile(allocator: std.mem.Allocator) !?GitHu
     if (provider_val == .string) {
         const combined = provider_val.string;
         // Split on the first colon - copilot_token may contain colons
-        if (std.mem.indexOfScalar(u8, combined, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, combined, ':')) |colon_pos| {
             const github_token = combined[0..colon_pos];
             const copilot_token = combined[colon_pos + 1 ..];
             return GitHubCopilotCredentials{
@@ -578,7 +578,7 @@ pub fn getAnthropicOAuthCredentials(allocator: std.mem.Allocator) !?AnthropicOAu
     // 1. Try ANTHROPIC_AUTH_TOKEN (combined format: "refresh_token:access_token" or single token)
     if (compat.getEnvVarOwned(allocator, "ANTHROPIC_AUTH_TOKEN")) |token| {
         // Split on the first colon
-        if (std.mem.indexOfScalar(u8, token, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, token, ':')) |colon_pos| {
             const refresh_token = token[0..colon_pos];
             const access_token = token[colon_pos + 1 ..];
             const result = AnthropicOAuthCredentials{
@@ -633,7 +633,7 @@ fn getAnthropicOAuthCredentialsFromAuthFile(allocator: std.mem.Allocator) !?Anth
     // Support combined format: if the value is a string, parse as "refresh_token:access_token"
     if (provider_val == .string) {
         const combined = provider_val.string;
-        if (std.mem.indexOfScalar(u8, combined, ':')) |colon_pos| {
+        if (std.mem.findScalar(u8, combined, ':')) |colon_pos| {
             const refresh_token = combined[0..colon_pos];
             const access_token = combined[colon_pos + 1 ..];
             return AnthropicOAuthCredentials{

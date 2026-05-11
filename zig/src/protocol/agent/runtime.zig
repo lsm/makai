@@ -118,7 +118,7 @@ test "AgentProtocolRuntime supports multi-session routing" {
 
     const a = ev1.slice();
     const b = ev2.slice();
-    const ok = (std.mem.indexOf(u8, a, "session") != null) and (std.mem.indexOf(u8, b, "session") != null);
+    const ok = (std.mem.find(u8, a, "session") != null) and (std.mem.find(u8, b, "session") != null);
     try std.testing.expect(ok);
 
     try std.testing.expectEqual(@as(usize, 2), server.sessionCount());

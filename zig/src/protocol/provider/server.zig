@@ -166,8 +166,8 @@ const AUTH_EXPIRED_MESSAGE = "auth_expired";
 fn defaultAuthFailureDetector(err_msg: []const u8) bool {
     return std.mem.eql(u8, err_msg, AUTH_REQUIRED_MESSAGE) or
         std.mem.eql(u8, err_msg, AUTH_EXPIRED_MESSAGE) or
-        std.mem.indexOf(u8, err_msg, "401") != null or
-        std.mem.indexOf(u8, err_msg, "403") != null or
+        std.mem.find(u8, err_msg, "401") != null or
+        std.mem.find(u8, err_msg, "403") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "unauthorized") != null or
         std.ascii.indexOfIgnoreCase(err_msg, "forbidden") != null;
 }
@@ -1553,7 +1553,7 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
     defer ambiguous_nack.deinit(std.testing.allocator);
     try std.testing.expect(ambiguous_nack.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, ambiguous_nack.payload.nack.error_code.?);
-    try std.testing.expect(std.mem.indexOf(u8, ambiguous_nack.payload.nack.reason.slice(), "multiple APIs") != null);
+    try std.testing.expect(std.mem.find(u8, ambiguous_nack.payload.nack.reason.slice(), "multiple APIs") != null);
 
     var missing = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -1573,7 +1573,7 @@ test "handleModelsRequest returns invalid_request for ambiguous or missing model
     defer missing_nack.deinit(std.testing.allocator);
     try std.testing.expect(missing_nack.payload == .nack);
     try std.testing.expectEqual(protocol_types.ErrorCode.invalid_request, missing_nack.payload.nack.error_code.?);
-    try std.testing.expect(std.mem.indexOf(u8, missing_nack.payload.nack.reason.slice(), "model not found") != null);
+    try std.testing.expect(std.mem.find(u8, missing_nack.payload.nack.reason.slice(), "model not found") != null);
 }
 
 test "handleModelsRequest prefers dynamic fetch and falls back to static catalog when unavailable" {

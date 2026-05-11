@@ -48,12 +48,12 @@ pub const CallbackServer = struct {
 
             // Parse query string from GET request
             if (std.mem.startsWith(u8, request, "GET ")) {
-                const query_start = std.mem.indexOf(u8, request, "?") orelse {
+                const query_start = std.mem.find(u8, request, "?") orelse {
                     try self.sendResponse(connection.stream, false, "No query parameters");
                     continue;
                 };
 
-                const query_end = std.mem.indexOf(u8, request[query_start..], " ") orelse request.len - query_start;
+                const query_end = std.mem.find(u8, request[query_start..], " ") orelse request.len - query_start;
                 const query = request[query_start + 1 .. query_start + query_end];
 
                 // Parse code and state

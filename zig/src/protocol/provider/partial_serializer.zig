@@ -479,12 +479,12 @@ test "serializeEvent without partial omits partial field" {
     defer std.testing.allocator.free(json);
 
     // Should not contain "partial" field
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"partial\"") == null);
+    try std.testing.expect(std.mem.find(u8, json, "\"partial\"") == null);
 
     // Should contain basic fields
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"type\":\"text_delta\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"content_index\":0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"delta\":\"Hello\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"type\":\"text_delta\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"content_index\":0") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"delta\":\"Hello\"") != null);
 }
 
 test "serializeEvent with lightweight partial includes block partial" {
@@ -525,13 +525,13 @@ test "serializeEvent with lightweight partial includes block partial" {
     defer std.testing.allocator.free(json);
 
     // Should contain partial field
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"partial\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"partial\"") != null);
 
     // Should contain accumulated length
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"accumulated_len\":11") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"accumulated_len\":11") != null);
 
     // Should contain text block partial
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"text\":") != null);
 }
 
 test "serializeEvent produces valid JSON" {
@@ -568,7 +568,7 @@ test "serializeEvent produces valid JSON" {
         try std.testing.expect(json[json.len - 1] == '}');
 
         // Should contain type field
-        try std.testing.expect(std.mem.indexOf(u8, json, "\"type\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\"") != null);
     }
 }
 
@@ -609,8 +609,8 @@ test "serializeEvent for thinking_delta includes partial" {
     defer std.testing.allocator.free(json);
 
     // Should contain thinking partial
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"thinking\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"accumulated_len\":11") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"thinking\":") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"accumulated_len\":11") != null);
 }
 
 test "serializeEvent for toolcall_delta includes partial" {
@@ -643,8 +643,8 @@ test "serializeEvent for toolcall_delta includes partial" {
     defer std.testing.allocator.free(json);
 
     // Should contain tool_call partial
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call\":") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"json_len\":7") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"tool_call\":") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"json_len\":7") != null);
 }
 
 test "processEvent handles multiple blocks" {

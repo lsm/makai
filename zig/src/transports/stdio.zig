@@ -68,7 +68,7 @@ pub const StdioReceiver = struct {
 
         while (true) {
             // Check leftover buffer for a complete line
-            if (std.mem.indexOfScalar(u8, self.leftover.items, '\n')) |nl_pos| {
+            if (std.mem.findScalar(u8, self.leftover.items, '\n')) |nl_pos| {
                 const line = try allocator.dupe(u8, self.leftover.items[0..nl_pos]);
                 // Remove consumed bytes including the newline
                 const remaining = self.leftover.items[nl_pos + 1 ..];
@@ -286,7 +286,7 @@ pub const AsyncStdioReceiver = struct {
 
         while (!ctx.cancel_token.load(.acquire)) {
             // Check for complete line in leftover
-            if (std.mem.indexOfScalar(u8, ctx.leftover.items, '\n')) |nl_pos| {
+            if (std.mem.findScalar(u8, ctx.leftover.items, '\n')) |nl_pos| {
                 const line = ctx.leftover.items[0..nl_pos];
                 const chunk = transport.ByteChunk{
                     .data = ctx.allocator.dupe(u8, line) catch {
@@ -347,7 +347,7 @@ pub const AsyncStdioReceiver = struct {
 
         while (true) {
             // Check for complete line
-            if (std.mem.indexOfScalar(u8, leftover.items, '\n')) |nl_pos| {
+            if (std.mem.findScalar(u8, leftover.items, '\n')) |nl_pos| {
                 const line = try allocator.dupe(u8, leftover.items[0..nl_pos]);
                 return line;
             }

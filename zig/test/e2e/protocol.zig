@@ -118,9 +118,9 @@ test "Envelope serialization roundtrip with ping" {
     defer allocator.free(serialized);
 
     // Verify structure
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"ping\"") != null);
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"sequence\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"timestamp\":1708234567890") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"type\":\"ping\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"sequence\":1") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"timestamp\":1708234567890") != null);
 }
 
 test "Envelope serialization roundtrip with pong" {
@@ -146,8 +146,8 @@ test "Envelope serialization roundtrip with pong" {
     const serialized = try envelope.serializeEnvelope(parsed, allocator);
     defer allocator.free(serialized);
 
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"pong\"") != null);
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"ping_id\":\"test-ping-123\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"type\":\"pong\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"ping_id\":\"test-ping-123\"") != null);
 }
 
 test "Envelope roundtrip preserves ACK structure" {
@@ -174,8 +174,8 @@ test "Envelope roundtrip preserves ACK structure" {
     defer allocator.free(serialized);
 
     try testing.expect(parsed.payload == .ack);
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"type\":\"ack\"") != null);
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"acknowledged_id\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"type\":\"ack\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"acknowledged_id\"") != null);
 }
 
 test "Envelope roundtrip preserves NACK structure" {
@@ -786,5 +786,5 @@ test "Envelope preserves in_reply_to field" {
     const serialized = try envelope.serializeEnvelope(parsed, allocator);
     defer allocator.free(serialized);
 
-    try testing.expect(std.mem.indexOf(u8, serialized, "\"in_reply_to\"") != null);
+    try testing.expect(std.mem.find(u8, serialized, "\"in_reply_to\"") != null);
 }

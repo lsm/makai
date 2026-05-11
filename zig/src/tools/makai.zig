@@ -823,8 +823,8 @@ test "stdio auth login flow supports prompt loop terminal ordering and no secret
         }
 
         for (outbound.items) |line| {
-            if (std.mem.indexOf(u8, line, "fixture-refresh-token") != null or
-                std.mem.indexOf(u8, line, "fixture-access-token") != null)
+            if (std.mem.find(u8, line, "fixture-refresh-token") != null or
+                std.mem.find(u8, line, "fixture-access-token") != null)
             {
                 saw_secret_leak = true;
             }
@@ -1437,9 +1437,9 @@ test "handleAuth providers end-to-end through CLI wrapper emits provider ids" {
     harness.stderr_read.close(defaultIo());
 
     try std.testing.expect(harness.err == null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "anthropic\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "github-copilot\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "test-fixture\n") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "anthropic\n") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "github-copilot\n") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "test-fixture\n") != null);
     try std.testing.expectEqual(@as(usize, 0), stderr_bytes.len);
 }
 
@@ -1493,18 +1493,18 @@ test "handleAuth login end-to-end drives prompt loop through CLI wrapper" {
     harness.stderr_read.close(defaultIo());
 
     try std.testing.expect(harness.err == null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         stdout_bytes,
         "https://example.invalid/makai-test-fixture-login",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "Login successful.") != null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "Login successful.") != null);
 
     // Tokens must never appear in CLI-visible streams.
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "fixture-refresh-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_bytes, "fixture-access-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "fixture-refresh-token") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "fixture-access-token") == null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.find(u8, stdout_bytes, "fixture-access-token") == null);
+    try std.testing.expect(std.mem.find(u8, stderr_bytes, "fixture-refresh-token") == null);
+    try std.testing.expect(std.mem.find(u8, stderr_bytes, "fixture-access-token") == null);
 }
 
 test "handleAuth login surfaces typed error for unknown provider via CLI wrapper" {
@@ -1525,7 +1525,7 @@ test "handleAuth login surfaces typed error for unknown provider via CLI wrapper
     harness.stderr_read.close(defaultIo());
 
     try std.testing.expectEqual(auth_cli.AuthCliError.AuthLoginFailed, harness.err.?);
-    try std.testing.expect(std.mem.indexOf(u8, stderr_bytes, "auth login failed") != null);
+    try std.testing.expect(std.mem.find(u8, stderr_bytes, "auth login failed") != null);
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {

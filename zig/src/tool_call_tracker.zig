@@ -369,7 +369,7 @@ test "ToolCallTracker - setThoughtSignatureById sets signature on matching tool 
     }
 
     try std.testing.expect(tc.thought_signature != null);
-    try std.testing.expect(std.mem.indexOf(u8, tc.thought_signature.?, "reasoning.encrypted") != null);
+    try std.testing.expect(std.mem.find(u8, tc.thought_signature.?, "reasoning.encrypted") != null);
 }
 
 test "ToolCallTracker - setThoughtSignatureById does nothing for non-existent ID" {

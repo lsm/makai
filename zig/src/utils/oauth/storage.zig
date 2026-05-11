@@ -385,8 +385,8 @@ test "saveToFile writes atomically via temp file + rename" {
     const content = try result_file.readToEndAlloc(std.testing.allocator, 1024);
     defer std.testing.allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "sk-test-key-12345") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "test-provider") != null);
+    try std.testing.expect(std.mem.find(u8, content, "sk-test-key-12345") != null);
+    try std.testing.expect(std.mem.find(u8, content, "test-provider") != null);
 }
 
 
@@ -455,8 +455,8 @@ test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" 
     const content = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "direct-provider") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "secret-key") != null);
+    try std.testing.expect(std.mem.find(u8, content, "direct-provider") != null);
+    try std.testing.expect(std.mem.find(u8, content, "secret-key") != null);
 
     if (builtin.os.tag != .windows) {
         const stat = try file.stat();

@@ -33,7 +33,7 @@ const MergedCompat = struct {
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.indexOf(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
@@ -113,7 +113,7 @@ fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: 
 /// Check if we're using OpenRouter with an Anthropic model
 fn isOpenRouterAnthropic(model: ai_types.Model) bool {
     if (model.base_url.len == 0) return false;
-    if (std.mem.indexOf(u8, model.base_url, "openrouter") == null) return false;
+    if (std.mem.find(u8, model.base_url, "openrouter") == null) return false;
     if (!std.mem.startsWith(u8, model.id, "anthropic/")) return false;
     return true;
 }
@@ -639,7 +639,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.indexOf(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,
@@ -1292,7 +1292,7 @@ fn runThread(ctx: *ThreadCtx) void {
             var delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
             // Check Retry-After header (only if headers contain valid \r\n separator)
-            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+            if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -1904,11 +1904,11 @@ test "buildRequestBody includes stream_options and tools without memory leak" {
     defer allocator.free(body);
 
     // Verify the body contains expected fields
-    try std.testing.expect(std.mem.indexOf(u8, body, "stream_options") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "include_usage") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "tools") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "tool_calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "test_tool") != null);
+    try std.testing.expect(std.mem.find(u8, body, "stream_options") != null);
+    try std.testing.expect(std.mem.find(u8, body, "include_usage") != null);
+    try std.testing.expect(std.mem.find(u8, body, "tools") != null);
+    try std.testing.expect(std.mem.find(u8, body, "tool_calls") != null);
+    try std.testing.expect(std.mem.find(u8, body, "test_tool") != null);
 }
 
 test "buildRequestBody with assistant message containing tool_calls" {
@@ -1954,10 +1954,10 @@ test "buildRequestBody with assistant message containing tool_calls" {
     defer allocator.free(body);
 
     // Verify the body contains tool_calls
-    try std.testing.expect(std.mem.indexOf(u8, body, "tool_calls") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "call_456") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "bash") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "ls -la") != null);
+    try std.testing.expect(std.mem.find(u8, body, "tool_calls") != null);
+    try std.testing.expect(std.mem.find(u8, body, "call_456") != null);
+    try std.testing.expect(std.mem.find(u8, body, "bash") != null);
+    try std.testing.expect(std.mem.find(u8, body, "ls -la") != null);
 }
 
 test "parseChunk does not leak memory with reasoning content" {
@@ -2344,13 +2344,13 @@ test "buildRequestBody adds cache_control for OpenRouter Anthropic models" {
     defer allocator.free(body);
 
     // Verify cache_control is added to the last user message
-    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "ephemeral") != null);
+    try std.testing.expect(std.mem.find(u8, body, "cache_control") != null);
+    try std.testing.expect(std.mem.find(u8, body, "ephemeral") != null);
 
     // The body should contain array content format for the last user message
     // Verify structure contains the expected format
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"type\":\"text\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"content\":[") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"type\":\"text\"") != null);
 }
 
 test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" {
@@ -2379,7 +2379,7 @@ test "buildRequestBody does not add cache_control for non-OpenRouter Anthropic" 
     defer allocator.free(body);
 
     // Verify cache_control is NOT added for non-OpenRouter
-    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+    try std.testing.expect(std.mem.find(u8, body, "cache_control") == null);
 }
 
 test "mergeCompat uses model-level compat options over detected capabilities" {
@@ -2464,10 +2464,10 @@ test "buildRequestBody uses max_tokens field from compat options" {
     defer allocator.free(body);
 
     // Should use max_tokens, not max_completion_tokens
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":50") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "max_completion_tokens") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"max_tokens\":50") != null);
+    try std.testing.expect(std.mem.find(u8, body, "max_completion_tokens") == null);
     // Should not include store field
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"store\"") == null);
 }
 
 test "buildRequestBody adds strict mode when supported" {
@@ -2504,7 +2504,7 @@ test "buildRequestBody adds strict mode when supported" {
     defer allocator.free(body);
 
     // Should include strict: true in tool definition
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"strict\":true") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\":true") != null);
 }
 
 test "buildRequestBody omits strict mode when not supported" {
@@ -2541,7 +2541,7 @@ test "buildRequestBody omits strict mode when not supported" {
     defer allocator.free(body);
 
     // Should NOT include strict field
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"strict\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\"") == null);
 }
 
 test "buildRequestBody adds store: false for OpenAI native" {
@@ -2568,7 +2568,7 @@ test "buildRequestBody adds store: false for OpenAI native" {
     defer allocator.free(body);
 
     // Should include store: false
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\":false") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"store\":false") != null);
 }
 
 test "buildRequestBody omits store field for non-OpenAI providers" {
@@ -2595,7 +2595,7 @@ test "buildRequestBody omits store field for non-OpenAI providers" {
     defer allocator.free(body);
 
     // Should NOT include store field for Mistral
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"store\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"store\"") == null);
 }
 
 test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" {
@@ -2670,9 +2670,9 @@ test "parseChunk extracts reasoning_details for encrypted reasoning round-trip" 
     // Should have extracted the reasoning_detail event
     try std.testing.expectEqual(@as(usize, 1), reasoning_detail_events.items.len);
     try std.testing.expectEqualStrings("call_abc123", reasoning_detail_events.items[0].tool_call_id);
-    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "reasoning.encrypted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "call_abc123") != null);
-    try std.testing.expect(std.mem.indexOf(u8, reasoning_detail_events.items[0].detail_json, "encrypted_data_here") != null);
+    try std.testing.expect(std.mem.find(u8, reasoning_detail_events.items[0].detail_json, "reasoning.encrypted") != null);
+    try std.testing.expect(std.mem.find(u8, reasoning_detail_events.items[0].detail_json, "call_abc123") != null);
+    try std.testing.expect(std.mem.find(u8, reasoning_detail_events.items[0].detail_json, "encrypted_data_here") != null);
 }
 
 test "buildRequestBody includes reasoning_details for tool calls with thought_signature" {
@@ -2732,9 +2732,9 @@ test "buildRequestBody includes reasoning_details for tool calls with thought_si
     defer allocator.free(body);
 
     // Should include reasoning_details array
-    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_details") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "reasoning.encrypted") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "call_abc123") != null);
+    try std.testing.expect(std.mem.find(u8, body, "reasoning_details") != null);
+    try std.testing.expect(std.mem.find(u8, body, "reasoning.encrypted") != null);
+    try std.testing.expect(std.mem.find(u8, body, "call_abc123") != null);
 }
 
 test "streamSimpleOpenAICompletions exits early when pre-cancelled" {

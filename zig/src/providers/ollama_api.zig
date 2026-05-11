@@ -772,7 +772,7 @@ fn runThread(ctx: *ThreadCtx) void {
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
             // Check Retry-After header (only if headers contain valid \r\n separator)
-            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+            if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {
@@ -1340,12 +1340,12 @@ test "buildBody includes model stream options and messages" {
     const body = try buildBody(model, ctx, .{ .temperature = 0.2, .max_tokens = 12 }, std.testing.allocator);
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"llama3.2:1b\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"num_predict\":12") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":\"hello\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"llama3.2:1b\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"num_predict\":12") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"temperature\":0.2") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"content\":\"hello\"") != null);
 }
 
 test "buildBody includes images array for user message with image parts" {
@@ -1378,9 +1378,9 @@ test "buildBody includes images array for user message with image parts" {
     defer std.testing.allocator.free(body);
 
     // Verify the images array is present with the base64 data
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"images\":[\"iVBORw0KGgoAAAANSUhEUgAAAAE\"]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"images\":[\"iVBORw0KGgoAAAANSUhEUgAAAAE\"]") != null);
     // Verify text content is also present
-    try std.testing.expect(std.mem.indexOf(u8, body, "What is in this image?") != null);
+    try std.testing.expect(std.mem.find(u8, body, "What is in this image?") != null);
 }
 
 test "buildBody includes images array for tool_result with image" {
@@ -1420,10 +1420,10 @@ test "buildBody includes images array for tool_result with image" {
 
     // Verify the tool message has the images array
     // Note: Ollama doesn't use tool_call_id for tool results, just role: "tool"
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"images\":[\"screenshotaBCD123\"]") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"tool\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"images\":[\"screenshotaBCD123\"]") != null);
     // Verify text content is present
-    try std.testing.expect(std.mem.indexOf(u8, body, "Here is the screenshot") != null);
+    try std.testing.expect(std.mem.find(u8, body, "Here is the screenshot") != null);
 }
 
 test "parseLineExtended - text content" {
@@ -1554,9 +1554,9 @@ test "parseLineExtended - tool call with nested arguments" {
     const tc = result.tool_calls[0];
     try std.testing.expectEqualStrings("execute", tc.name);
     // Verify nested structure is preserved
-    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"options\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"verbose\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "\"command\":\"echo hello\"") != null);
+    try std.testing.expect(std.mem.find(u8, tc.arguments_json, "\"options\"") != null);
+    try std.testing.expect(std.mem.find(u8, tc.arguments_json, "\"verbose\":true") != null);
+    try std.testing.expect(std.mem.find(u8, tc.arguments_json, "\"command\":\"echo hello\"") != null);
 }
 
 test "parseLineExtended - tool call with array arguments" {
@@ -1575,7 +1575,7 @@ test "parseLineExtended - tool call with array arguments" {
 
     const tc = result.tool_calls[0];
     try std.testing.expectEqualStrings("multi_cmd", tc.name);
-    try std.testing.expect(std.mem.indexOf(u8, tc.arguments_json, "[\"ls\",\"pwd\",\"whoami\"]") != null);
+    try std.testing.expect(std.mem.find(u8, tc.arguments_json, "[\"ls\",\"pwd\",\"whoami\"]") != null);
 }
 
 

@@ -397,7 +397,7 @@ pub const SerializedPipe = struct {
             if (read_pos >= self.buffer.items.len) return null;
 
             const remaining = self.buffer.items[read_pos..];
-            if (std.mem.indexOfScalar(u8, remaining, '\n')) |nl_pos| {
+            if (std.mem.findScalar(u8, remaining, '\n')) |nl_pos| {
                 const line_end = read_pos + nl_pos;
                 const line = self.buffer.items[read_pos..line_end];
                 const result = try allocator.dupe(u8, line);

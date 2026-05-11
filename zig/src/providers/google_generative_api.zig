@@ -106,19 +106,19 @@ fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const
 
 // Model detection helpers
 fn isGemini3ProModel(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "3-pro") != null;
+    return std.mem.find(u8, model_id, "3-pro") != null;
 }
 
 fn isGemini3FlashModel(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "3-flash") != null;
+    return std.mem.find(u8, model_id, "3-flash") != null;
 }
 
 fn isGemini25ProModel(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "2.5-pro") != null;
+    return std.mem.find(u8, model_id, "2.5-pro") != null;
 }
 
 fn isGemini25FlashModel(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "2.5-flash") != null;
+    return std.mem.find(u8, model_id, "2.5-flash") != null;
 }
 
 /// Check if a thought signature is valid base64
@@ -916,7 +916,7 @@ fn runThread(ctx: *ThreadCtx) void {
             var delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
 
             // Check Retry-After header (only if headers contain valid \r\n separator)
-            if (std.mem.indexOf(u8, response.head.bytes, "\r\n") != null) {
+            if (std.mem.find(u8, response.head.bytes, "\r\n") != null) {
                 var retry_after_iter = response.head.iterateHeaders();
                 while (retry_after_iter.next()) |header| {
                     if (std.ascii.eqlIgnoreCase(header.name, "retry-after")) {

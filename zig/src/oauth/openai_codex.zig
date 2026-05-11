@@ -80,9 +80,9 @@ pub const OpenAICodexOAuth = struct {
         // We need to decode the payload and extract the "sub" claim
 
         // Find the first dot (end of header)
-        const first_dot = std.mem.indexOf(u8, access_token, ".") orelse return null;
+        const first_dot = std.mem.find(u8, access_token, ".") orelse return null;
         // Find the second dot (end of payload)
-        const second_dot = std.mem.indexOfPos(u8, access_token, first_dot + 1, ".") orelse return null;
+        const second_dot = std.mem.findPos(u8, access_token, first_dot + 1, ".") orelse return null;
 
         // Extract payload
         const payload_b64 = access_token[first_dot + 1 .. second_dot];
@@ -167,8 +167,8 @@ test "OpenAICodexOAuth startAuth returns valid AuthInfo" {
     try std.testing.expect(auth_info.auth_url.len > 0);
     try std.testing.expect(std.mem.startsWith(u8, auth_info.auth_url, "https://auth.openai.com"));
     // Verify it uses port 1455
-    try std.testing.expect(std.mem.indexOf(u8, auth_info.auth_url, "1455") != null);
-    try std.testing.expect(std.mem.indexOf(u8, auth_info.auth_url, "code_challenge") != null);
+    try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "1455") != null);
+    try std.testing.expect(std.mem.find(u8, auth_info.auth_url, "code_challenge") != null);
 }
 
 test "OpenAICodexOAuth login returns NotImplemented" {
