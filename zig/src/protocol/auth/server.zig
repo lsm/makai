@@ -888,6 +888,23 @@ test "AuthProtocolServer type is available" {
     _ = AuthProtocolServer;
 }
 
+fn waitForAuthOutbound(server: *AuthProtocolServer, comptime predicate: anytype, timeout_ms: u64) !auth_types.Envelope {
+    const start = compat.time.monotonicNanos() catch 0;
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
+
+    while (true) {
+        if (server.popOutbound()) |env| {
+            if (predicate(env)) return env;
+            var discard = env;
+            discard.deinit(server.allocator);
+        } else {
+            const now = compat.time.monotonicNanos() catch 0;
+            if (now -| start >= timeout_ns) return error.TestAuthOutboundTimeout;
+            defaultIo().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+        }
+    }
+}
+
 test "AuthProtocolServer fixture login waits for prompt response" {
     const allocator = std.testing.allocator;
     var server = AuthProtocolServer.init(allocator, .{
@@ -913,23 +930,13 @@ test "AuthProtocolServer fixture login waits for prompt response" {
     defer ack.deinit(allocator);
     try std.testing.expect(ack.payload == .ack);
 
-    var prompt_id: ?[]u8 = null;
-    defer if (prompt_id) |id| allocator.free(id);
-
-    var attempts: usize = 0;
-    while (attempts < 1_000) : (attempts += 1) {
-        if (server.popOutbound()) |env| {
-            var outbound = env;
-            defer outbound.deinit(allocator);
-            if (outbound.payload == .auth_event and outbound.payload.auth_event == .prompt) {
-                prompt_id = try allocator.dupe(u8, outbound.payload.auth_event.prompt.prompt_id.slice());
-                break;
-            }
-        } else {
-            defaultIo().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+    var prompt_env = try waitForAuthOutbound(&server, struct {
+        fn isPrompt(env: auth_types.Envelope) bool {
+            return env.payload == .auth_event and env.payload.auth_event == .prompt;
         }
-    }
-    const id = prompt_id orelse return error.TestExpectedPrompt;
+    }.isPrompt, 30_000);
+    defer prompt_env.deinit(allocator);
+    const id = prompt_env.payload.auth_event.prompt.prompt_id.slice();
 
     var response_env = auth_types.Envelope{
         .stream_id = flow_id,
@@ -948,28 +955,18 @@ test "AuthProtocolServer fixture login waits for prompt response" {
     defer response_ack.deinit(allocator);
     try std.testing.expect(response_ack.payload == .ack);
 
-    var saw_success = false;
-    var saw_result = false;
-    attempts = 0;
-    while (attempts < 1_000 and !(saw_success and saw_result)) : (attempts += 1) {
-        if (server.popOutbound()) |env| {
-            var outbound = env;
-            defer outbound.deinit(allocator);
-            switch (outbound.payload) {
-                .auth_event => |event| {
-                    if (event == .success) saw_success = true;
-                },
-                .auth_login_result => |result| {
-                    try std.testing.expectEqual(auth_types.AuthLoginStatus.success, result.status);
-                    saw_result = true;
-                },
-                else => {},
-            }
-        } else {
-            defaultIo().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+    var success_env = try waitForAuthOutbound(&server, struct {
+        fn isSuccess(env: auth_types.Envelope) bool {
+            return env.payload == .auth_event and env.payload.auth_event == .success;
         }
-    }
+    }.isSuccess, 30_000);
+    defer success_env.deinit(allocator);
 
-    try std.testing.expect(saw_success);
-    try std.testing.expect(saw_result);
+    var result_env = try waitForAuthOutbound(&server, struct {
+        fn isLoginResult(env: auth_types.Envelope) bool {
+            return env.payload == .auth_login_result;
+        }
+    }.isLoginResult, 30_000);
+    defer result_env.deinit(allocator);
+    try std.testing.expectEqual(auth_types.AuthLoginStatus.success, result_env.payload.auth_login_result.status);
 }

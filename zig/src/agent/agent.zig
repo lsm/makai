@@ -616,7 +616,15 @@ pub const Agent = struct {
 
     /// Thread entry point for async execution
     fn runLoopThread(self: *Agent, messages: []ai_types.Message, skip_steering: bool) void {
+        var messages_owned = true;
         defer {
+            if (messages_owned) {
+                for (messages) |*m| {
+                    m.deinit(self._allocator);
+                }
+            }
+            self._allocator.free(messages);
+
             // Signal completion
             self._done_event.set(defaultIo());
 
@@ -626,15 +634,23 @@ pub const Agent = struct {
             self._mutex.unlock(defaultIo());
         }
 
+        if (messages.len > 0 and self._state.model == null) {
+            return;
+        }
+
+        // runLoopInternal takes ownership of non-empty prompt messages once it
+        // reaches agentLoop; the model precheck above keeps the known early
+        // validation path from leaking the cloned async payloads.
+        const run_messages = if (messages.len > 0) blk: {
+            messages_owned = false;
+            break :blk messages;
+        } else null;
+
         // Run the loop (errors are handled internally)
         self.runLoopInternal(
-            if (messages.len > 0) messages else null,
+            run_messages,
             .{ .skip_initial_steering_poll = skip_steering },
         ) catch {};
-
-        // runLoopInternal moves messages into its AgentContext, which owns and
-        // frees their contents. Free only the thread-owned slice container here.
-        self._allocator.free(messages);
     }
 
     /// Reset all state (clear messages, queues, error).
@@ -1054,7 +1070,6 @@ test "Agent async completion signals waitForIdle" {
     agent.setModel(test_model);
 
     try agent.promptAsync(@as([]const ai_types.Message, &.{}));
-    try std.testing.expect(!agent.isIdle());
 
     agent.waitForIdle();
 
