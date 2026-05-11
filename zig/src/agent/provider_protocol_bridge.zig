@@ -303,6 +303,10 @@ test "InProcessProviderProtocolBridge smoke test" {
         if (ev == .start) saw_start = true;
     }
 
+    const result = stream.getResult().?;
+    var owned_result = result;
+    owned_result.deinit(allocator);
+    stream.result = null;
+
     try std.testing.expect(saw_start);
-    try std.testing.expect(stream.getResult() != null);
 }

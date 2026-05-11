@@ -1102,6 +1102,7 @@ pub fn build(b: *std.Build) void {
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
 
     const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
+    agent_provider_protocol_bridge_test.use_llvm = true;
 
     const agent_test = b.addTest(.{
         .root_module = b.createModule(.{
