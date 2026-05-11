@@ -1024,6 +1024,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
+    // The distributed fullstack test uses in-process threading + condition variables
+    // and currently matches the bridge test backend issue; LLVM handles it fine.
+    e2e_distributed_fullstack_test.use_llvm = true;
 
     const e2e_distributed_fullstack_github_test = b.addTest(.{
         .root_module = b.createModule(.{
