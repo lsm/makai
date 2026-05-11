@@ -302,6 +302,12 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
         // `auth_required`. The mock provider does not validate the key.
         .api_key = "test-key",
     });
+    // agentLoop transfers prompt ownership into the AgentContext. The prompt is
+    // deep-copied into AgentLoopResult as well, so clear context after the loop
+    // to avoid keeping a duplicate owned prompt alive until the test allocator's
+    // leak check runs.
+    for (context.messages.items) |*message| message.deinit(allocator);
+    context.messages.clearRetainingCapacity();
     defer {
         stream.deinit();
         allocator.destroy(stream);
