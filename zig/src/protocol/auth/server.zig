@@ -887,3 +887,86 @@ fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Cred
 test "AuthProtocolServer type is available" {
     _ = AuthProtocolServer;
 }
+
+fn waitForAuthOutbound(server: *AuthProtocolServer, comptime predicate: anytype, timeout_ms: u64) !auth_types.Envelope {
+    const start = compat.time.monotonicNanos() catch 0;
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
+
+    while (true) {
+        if (server.popOutbound()) |env| {
+            if (predicate(env)) return env;
+            var discard = env;
+            discard.deinit(server.allocator);
+        } else {
+            const now = compat.time.monotonicNanos() catch 0;
+            if (now -| start >= timeout_ns) return error.TestAuthOutboundTimeout;
+            defaultIo().sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+        }
+    }
+}
+
+test "AuthProtocolServer fixture login waits for prompt response" {
+    const allocator = std.testing.allocator;
+    var server = AuthProtocolServer.init(allocator, .{
+        .persist_credentials = false,
+        .enable_real_oauth = false,
+    });
+    defer server.deinit();
+
+    const flow_id = auth_types.generateUlid();
+    const start_id = auth_types.generateUlid();
+    var start_env = auth_types.Envelope{
+        .stream_id = flow_id,
+        .message_id = start_id,
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .auth_login_start = .{
+            .provider_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "test-fixture")),
+        } },
+    };
+    defer start_env.deinit(allocator);
+
+    var ack = (try server.handleEnvelope(start_env)).?;
+    defer ack.deinit(allocator);
+    try std.testing.expect(ack.payload == .ack);
+
+    var prompt_env = try waitForAuthOutbound(&server, struct {
+        fn isPrompt(env: auth_types.Envelope) bool {
+            return env.payload == .auth_event and env.payload.auth_event == .prompt;
+        }
+    }.isPrompt, 30_000);
+    defer prompt_env.deinit(allocator);
+    const id = prompt_env.payload.auth_event.prompt.prompt_id.slice();
+
+    var response_env = auth_types.Envelope{
+        .stream_id = flow_id,
+        .message_id = auth_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .auth_prompt_response = .{
+            .flow_id = flow_id,
+            .prompt_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, id)),
+            .answer = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "ok")),
+        } },
+    };
+    defer response_env.deinit(allocator);
+
+    var response_ack = (try server.handleEnvelope(response_env)).?;
+    defer response_ack.deinit(allocator);
+    try std.testing.expect(response_ack.payload == .ack);
+
+    var success_env = try waitForAuthOutbound(&server, struct {
+        fn isSuccess(env: auth_types.Envelope) bool {
+            return env.payload == .auth_event and env.payload.auth_event == .success;
+        }
+    }.isSuccess, 30_000);
+    defer success_env.deinit(allocator);
+
+    var result_env = try waitForAuthOutbound(&server, struct {
+        fn isLoginResult(env: auth_types.Envelope) bool {
+            return env.payload == .auth_login_result;
+        }
+    }.isLoginResult, 30_000);
+    defer result_env.deinit(allocator);
+    try std.testing.expectEqual(auth_types.AuthLoginStatus.success, result_env.payload.auth_login_result.status);
+}

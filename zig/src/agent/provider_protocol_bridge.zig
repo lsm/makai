@@ -298,9 +298,17 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     var saw_start = false;
     while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
         if (ev == .start) saw_start = true;
     }
 
+    const result = stream.getResult().?;
+    var owned_result = result;
+    owned_result.deinit(allocator);
+    // We already freed the result contents above. Null the reference so
+    // stream.deinit() doesn't attempt a double-free.
+    stream.result = null;
+
     try std.testing.expect(saw_start);
-    try std.testing.expect(stream.getResult() != null);
 }

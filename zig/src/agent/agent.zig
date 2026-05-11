@@ -417,8 +417,9 @@ pub const Agent = struct {
                 const steering = try self.dequeueSteeringMessages();
                 defer if (steering) |s| self._allocator.free(s);
 
+                var run_messages: ?[]const ai_types.Message = if (steering) |s| s else null;
                 try self.runLoopInternal(
-                    if (steering) |s| s else null,
+                    &run_messages,
                     .{ .skip_initial_steering_poll = true },
                 );
                 return;
@@ -429,8 +430,9 @@ pub const Agent = struct {
                 const follow_up = try self.dequeueFollowUpMessages();
                 defer if (follow_up) |f| self._allocator.free(f);
 
+                var run_messages: ?[]const ai_types.Message = if (follow_up) |f| f else null;
                 try self.runLoopInternal(
-                    if (follow_up) |f| f else null,
+                    &run_messages,
                     .{},
                 );
                 return;
@@ -439,7 +441,8 @@ pub const Agent = struct {
             return error.CannotContinueFromAssistant;
         }
 
-        try self.runLoopInternal(null, .{});
+        var run_messages: ?[]const ai_types.Message = null;
+        try self.runLoopInternal(&run_messages, .{});
     }
 
     /// Abort the current operation.
@@ -616,7 +619,15 @@ pub const Agent = struct {
 
     /// Thread entry point for async execution
     fn runLoopThread(self: *Agent, messages: []ai_types.Message, skip_steering: bool) void {
+        var messages_owned = true;
         defer {
+            if (messages_owned) {
+                for (messages) |*m| {
+                    m.deinit(self._allocator);
+                }
+            }
+            self._allocator.free(messages);
+
             // Signal completion
             self._done_event.set(defaultIo());
 
@@ -626,17 +637,21 @@ pub const Agent = struct {
             self._mutex.unlock(defaultIo());
         }
 
-        // Run the loop (errors are handled internally)
+        if (messages.len > 0 and self._state.model == null) {
+            return;
+        }
+
+        var run_messages: ?[]const ai_types.Message = if (messages.len > 0) messages else null;
+
+        // Run the loop. runLoopInternal only clears run_messages after the
+        // prompt slice has been consumed successfully. If an error occurs before
+        // that transfer, messages_owned remains true and the thread cleanup
+        // frees the cloned payloads here.
         self.runLoopInternal(
-            if (messages.len > 0) messages else null,
+            &run_messages,
             .{ .skip_initial_steering_poll = skip_steering },
         ) catch {};
-
-        // Free the owned messages
-        for (messages) |*m| {
-            m.deinit(self._allocator);
-        }
-        self._allocator.free(messages);
+        messages_owned = run_messages != null;
     }
 
     /// Reset all state (clear messages, queues, error).
@@ -657,12 +672,13 @@ pub const Agent = struct {
     };
 
     fn runLoop(self: *Agent, messages: []const ai_types.Message) !void {
-        try self.runLoopInternal(messages, .{});
+        var run_messages: ?[]const ai_types.Message = messages;
+        try self.runLoopInternal(&run_messages, .{});
     }
 
     fn runLoopInternal(
         self: *Agent,
-        messages: ?[]const ai_types.Message,
+        messages: *?[]const ai_types.Message,
         options: RunLoopOptions,
     ) !void {
         const model = self._state.model orelse return error.NoModelConfigured;
@@ -716,10 +732,15 @@ pub const Agent = struct {
         };
 
         // Run loop
-        const stream = if (messages) |msgs|
+        const stream = if (messages.*) |msgs|
             try agent_loop.agentLoop(self._allocator, msgs, &context, config)
         else
             try agent_loop.agentLoopContinue(self._allocator, &context, config);
+
+        // agentLoop has successfully copied the prompt payloads into its result
+        // stream. The caller no longer owns the per-message payloads and should
+        // only release the outer slice container.
+        messages.* = null;
 
         defer {
             stream.deinit();
@@ -997,6 +1018,70 @@ test "Agent isIdle and waitForIdle" {
 
     // Still idle after waitForIdle
     try std.testing.expect(agent.isIdle());
+}
+
+fn delayedErrorStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_mod.AssistantMessageEventStream {
+    _ = ctx;
+    _ = model;
+    _ = context;
+    _ = options;
+
+    defaultIo().sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .boot) catch {};
+
+    const stream = try allocator.create(event_stream_mod.AssistantMessageEventStream);
+    stream.* = event_stream_mod.AssistantMessageEventStream.init(allocator);
+    const message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("test done"),
+        .timestamp = 0,
+    };
+    stream.push(.{ .done = .{ .reason = .@"error", .message = message } }) catch {};
+    stream.complete(message);
+    return stream;
+}
+
+fn createDelayedErrorProtocol() types.ProtocolClient {
+    return .{
+        .stream_fn = delayedErrorStreamFn,
+        .ctx = null,
+    };
+}
+
+const test_model = ai_types.Model{
+    .id = "test-model",
+    .name = "Test Model",
+    .api = "test-api",
+    .provider = "test-provider",
+    .base_url = "https://example.invalid",
+    .reasoning = false,
+    .input = &.{"text"},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 8192,
+    .max_tokens = 1024,
+};
+
+test "Agent async completion signals waitForIdle" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    try agent.promptAsync(@as([]const ai_types.Message, &.{}));
+
+    agent.waitForIdle();
+
+    try std.testing.expect(agent.isIdle());
+    try std.testing.expect(agent._thread == null);
 }
 
 test "Agent cloneMessage" {
