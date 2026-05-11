@@ -298,6 +298,8 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     var saw_start = false;
     while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
         if (ev == .start) saw_start = true;
     }
 
