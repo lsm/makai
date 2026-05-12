@@ -44,16 +44,30 @@ type ExecutionOptions = {
   authHandlers?: AuthFlowHandlers;
 };
 
+/** Root Makai SDK client returned by {@link createMakaiClient}. */
 export interface MakaiClient {
   auth: MakaiAuthApi;
   models: MakaiModelsApi;
   agent: MakaiAgentModelsApi;
   provider: MakaiProviderApi;
+  /**
+   * Closes the underlying shared stdio transport.
+   *
+   * @returns A promise that resolves after the transport closes.
+   */
   close(): Promise<void>;
 }
 
+/** Options for {@link createMakaiClient}. */
 export type CreateMakaiClientOptions = CreateMakaiStdioClientOptions & MakaiClientOptions;
 
+/**
+ * Creates a direct provider API facade over an existing stdio transport.
+ *
+ * @param transport Connected stdio transport.
+ * @param options Execution timeout and auth retry options.
+ * @returns A {@link MakaiProviderApi} bound to the transport.
+ */
 export function createMakaiProviderApi(
   transport: MakaiStdioClient,
   options: ExecutionOptions = {},
@@ -61,6 +75,13 @@ export function createMakaiProviderApi(
   return new StdioProviderApi(transport, options);
 }
 
+/**
+ * Creates an agent execution API facade over an existing stdio transport.
+ *
+ * @param transport Connected stdio transport.
+ * @param options Execution timeout and auth retry options.
+ * @returns A {@link MakaiAgentApi} bound to the transport.
+ */
 export function createMakaiAgentApi(
   transport: MakaiStdioClient,
   options: ExecutionOptions = {},
@@ -68,10 +89,18 @@ export function createMakaiAgentApi(
   return new StdioAgentApi(transport, options);
 }
 
+/** Agent API augmented with the model-discovery API for convenience. */
 export interface MakaiAgentModelsApi extends MakaiAgentApi {
   models: MakaiModelsApi;
 }
 
+/**
+ * Creates an agent API facade with a nested {@link MakaiModelsApi}.
+ *
+ * @param transport Connected stdio transport.
+ * @param options Execution timeout and auth retry options.
+ * @returns A {@link MakaiAgentModelsApi} bound to the transport.
+ */
 export function createMakaiAgentApiWithModels(
   transport: MakaiStdioClient,
   options: ExecutionOptions = {},
@@ -1016,6 +1045,29 @@ async function withAuthRetry<T>(
   }
 }
 
+/**
+ * Creates and connects the root Makai SDK client backed by `makai --stdio`.
+ *
+ * The returned client exposes provider execution, agent execution, model
+ * discovery, and authentication APIs over one shared transport. Always call
+ * {@link MakaiClient.close} when finished.
+ *
+ * @param options Binary resolver, stdio transport, auth, and timeout options.
+ * @returns A connected {@link MakaiClient}.
+ * @throws If binary resolution, process startup, or protocol handshake fails.
+ *
+ * @example
+ * ```ts
+ * const client = await createMakaiClient();
+ * const { models } = await client.models.list();
+ * const result = await client.provider.complete({
+ *   model_ref: models[0]!.model_ref,
+ *   messages: [{ role: "user", content: "Hello!" }],
+ * });
+ * console.log(result.message.content);
+ * await client.close();
+ * ```
+ */
 export async function createMakaiClient(options: CreateMakaiClientOptions = {}): Promise<MakaiClient> {
   const { auth: authOptions, responseTimeoutMs, frameTimeoutMs, ...transportOptions } = options;
   const transport = await createMakaiStdioClient(transportOptions);

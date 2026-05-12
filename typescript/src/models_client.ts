@@ -81,6 +81,7 @@ const KNOWN_REASONING_LEVELS: ReadonlySet<string> = new Set([
   "xhigh",
 ]);
 
+/** Options for {@link createMakaiModelsApi}. */
 export interface ModelsApiOptions {
   /** How long `list` / `resolve` waits for a terminal response frame. */
   responseTimeoutMs?: number;
@@ -92,6 +93,16 @@ export interface ModelsApiOptions {
  *
  * The transport is shared, so do not interleave concurrent calls without
  * external synchronization — V1 frame correlation is sequential per stream.
+ *
+ * @param client Connected stdio client used to exchange model-discovery frames.
+ * @param options Response timeout configuration.
+ * @returns A models API facade bound to the supplied transport.
+ *
+ * @example
+ * ```ts
+ * const models = createMakaiModelsApi(transport);
+ * const { models: available } = await models.list();
+ * ```
  */
 export function createMakaiModelsApi(
   client: MakaiStdioClient,

@@ -2,11 +2,13 @@ import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
 import { BinaryResolverOptions, resolveMakaiBinary } from "./binary_resolver";
 
+/** A single JSON-line protocol frame exchanged with `makai --stdio`. */
 export type StdioFrame = {
   type: string;
   [key: string]: unknown;
 };
 
+/** Options for constructing a {@link MakaiStdioClient}. */
 export type MakaiStdioClientOptions = {
   command: string;
   args?: string[];
@@ -20,7 +22,12 @@ export type MakaiStdioClientOptions = {
 /** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
 export type MakaiClientOptions = MakaiStdioClientOptions;
 
+/** Error raised for stdio protocol negotiation failures. */
 export class StdioProtocolError extends Error {
+  /**
+   * @param message Human-readable protocol failure.
+   * @param code Optional protocol error code.
+   */
   constructor(
     message: string,
     public readonly code?: string,
@@ -49,6 +56,7 @@ type StreamQueueEntry = {
 
 const STREAM_FRAME_QUEUE_TTL_MS = 30_000;
 
+/** Low-level stdio transport client used by higher-level Makai APIs. */
 export class MakaiStdioClient {
   private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">> &
     Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">;
@@ -61,6 +69,9 @@ export class MakaiStdioClient {
   private sessionFrameQueues = new Map<string, StreamQueueEntry[]>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
+  /**
+   * @param options Command, process, handshake, and queue options.
+   */
   constructor(options: MakaiStdioClientOptions) {
     this.options = {
       ...options,
@@ -71,6 +82,11 @@ export class MakaiStdioClient {
     };
   }
 
+  /**
+   * Spawns the stdio process and waits for the protocol handshake.
+   *
+   * @throws If the client is already connected, the process errors, or handshake fails.
+   */
   async connect(): Promise<void> {
     if (this.child) {
       throw new Error("client is already connected");
@@ -107,6 +123,12 @@ export class MakaiStdioClient {
     });
   }
 
+  /**
+   * Sends one JSON frame to the child process.
+   *
+   * @param frame Frame to serialize and write.
+   * @throws If the client is not connected.
+   */
   send(frame: StdioFrame): void {
     if (!this.child) {
       throw new Error("client is not connected");
@@ -114,6 +136,13 @@ export class MakaiStdioClient {
     this.child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
 
+  /**
+   * Waits for the next unrouted frame from the transport.
+   *
+   * @param timeoutMs Maximum wait time in milliseconds.
+   * @returns The next frame.
+   * @throws If no frame arrives before the timeout.
+   */
   nextFrame(timeoutMs = 1000): Promise<StdioFrame> {
     if (this.frameQueue.length > 0) {
       return Promise.resolve(this.frameQueue.shift()!);
@@ -126,6 +155,14 @@ export class MakaiStdioClient {
     });
   }
 
+  /**
+   * Waits for the next frame matching a stream ID.
+   *
+   * @param streamId Stream identifier to route by.
+   * @param timeoutMs Maximum wait time in milliseconds.
+   * @returns The next matching frame.
+   * @throws If `streamId` is empty or no matching frame arrives before timeout.
+   */
   async nextFrameForStream(streamId: string, timeoutMs = 1000): Promise<StdioFrame> {
     if (streamId.length === 0) {
       throw new Error("streamId is required");
@@ -162,6 +199,14 @@ export class MakaiStdioClient {
     });
   }
 
+  /**
+   * Waits for the next frame matching an agent session ID.
+   *
+   * @param sessionId Session identifier to route by.
+   * @param timeoutMs Maximum wait time in milliseconds.
+   * @returns The next matching frame.
+   * @throws If `sessionId` is empty or no matching frame arrives before timeout.
+   */
   async nextFrameForSession(sessionId: string, timeoutMs = 1000): Promise<StdioFrame> {
     if (sessionId.length === 0) {
       throw new Error("sessionId is required");
@@ -198,6 +243,11 @@ export class MakaiStdioClient {
     });
   }
 
+  /**
+   * Closes the child process and releases local handles.
+   *
+   * @returns A promise that resolves after graceful shutdown or forced termination.
+   */
   async close(): Promise<void> {
     if (!this.child) return;
 
@@ -368,6 +418,7 @@ function isNextFrameTimeout(error: unknown, timeoutMs: number): boolean {
   return error instanceof Error && error.message === `timed out waiting for frame after ${timeoutMs}ms`;
 }
 
+/** Options for {@link createMakaiStdioClient}; `command` is optional and can be resolved automatically. */
 export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {
   command?: string;
   resolver?: BinaryResolverOptions;
@@ -376,6 +427,13 @@ export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "comma
 /** @deprecated Use CreateMakaiStdioClientOptions. Kept for backward compatibility. */
 export type CreateMakaiClientOptions = CreateMakaiStdioClientOptions;
 
+/**
+ * Creates an unconnected {@link MakaiStdioClient}, resolving the binary if needed.
+ *
+ * @param options Transport and binary resolver options.
+ * @returns A stdio client; call {@link MakaiStdioClient.connect} before use.
+ * @throws If binary resolution fails.
+ */
 export async function createMakaiStdioClient(
   options: CreateMakaiStdioClientOptions = {},
 ): Promise<MakaiStdioClient> {
