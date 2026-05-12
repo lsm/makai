@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("compat");
+const http = compat.http;
 const oauth = @import("mod.zig");
 
 /// Decoded client ID for GitHub Copilot (Iv1.b507a08c87ecfe98)
@@ -97,7 +98,7 @@ pub const GitHubCopilotOAuth = struct {
 
     /// Start device flow - returns user_code and verification_uri
     pub fn startDeviceFlow(self: *Self) CopilotError!DeviceFlowInfo {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         var url_buf: [256]u8 = undefined;
@@ -114,32 +115,23 @@ pub const GitHubCopilotOAuth = struct {
         headers.appendAssumeCapacity(.{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
         headers.appendAssumeCapacity(.{ .name = "user-agent", .value = "GitHubCopilot/1.0.0" });
 
-        var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
+        var req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = body.len };
-        req.sendBodyComplete(body) catch return CopilotError.HttpError;
+        http.sendRequest(&req, body) catch return CopilotError.HttpError;
 
         var head_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&head_buf) catch return CopilotError.HttpError;
+        var response = http.receiveResponse(&req, &head_buf) catch return CopilotError.HttpError;
 
         if (response.head.status != .ok) return CopilotError.DeviceFlowFailed;
 
-        // Read response body
-        var body_list = std.ArrayList(u8).init(self.allocator);
-        defer body_list.deinit(self.allocator);
-
+        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
-        var read_buf: [4096]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+        const reader = http.responseReader(&response, &transfer_buf);
+        const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
+        defer self.allocator.free(response_body);
 
-        while (true) {
-            const n = reader.*.readSliceShort(&read_buf) catch break;
-            if (n.len == 0) break;
-            body_list.appendSlice(self.allocator, n) catch return CopilotError.OutOfMemory;
-        }
-
-        return self.parseDeviceCodeResponse(body_list.items);
+        return self.parseDeviceCodeResponse(response_body);
     }
 
     fn parseDeviceCodeResponse(self: *Self, body: []const u8) CopilotError!DeviceFlowInfo {
@@ -182,7 +174,7 @@ pub const GitHubCopilotOAuth = struct {
     /// Poll for access token after user enters code
     /// Returns null if still pending, credentials if successful
     pub fn pollForAccessToken(self: *Self, device_code: []const u8) CopilotError!?oauth.OAuthCredentials {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         var url_buf: [256]u8 = undefined;
@@ -203,32 +195,23 @@ pub const GitHubCopilotOAuth = struct {
         headers.appendAssumeCapacity(.{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
         headers.appendAssumeCapacity(.{ .name = "user-agent", .value = "GitHubCopilot/1.0.0" });
 
-        var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
+        var req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
         defer req.deinit();
 
-        req.transfer_encoding = .{ .content_length = body.len };
-        req.sendBodyComplete(body) catch return CopilotError.HttpError;
+        http.sendRequest(&req, body) catch return CopilotError.HttpError;
 
         var head_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&head_buf) catch return CopilotError.HttpError;
+        var response = http.receiveResponse(&req, &head_buf) catch return CopilotError.HttpError;
 
         if (response.head.status != .ok) return CopilotError.HttpError;
 
-        // Read response body
-        var body_list = std.ArrayList(u8).init(self.allocator);
-        defer body_list.deinit(self.allocator);
-
+        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
-        var read_buf: [4096]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+        const reader = http.responseReader(&response, &transfer_buf);
+        const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
+        defer self.allocator.free(response_body);
 
-        while (true) {
-            const n = reader.*.readSliceShort(&read_buf) catch break;
-            if (n.len == 0) break;
-            body_list.appendSlice(self.allocator, n) catch return CopilotError.OutOfMemory;
-        }
-
-        return self.parseAccessTokenResponse(body_list.items);
+        return self.parseAccessTokenResponse(response_body);
     }
 
     fn parseAccessTokenResponse(self: *Self, body: []const u8) CopilotError!?oauth.OAuthCredentials {
@@ -281,7 +264,7 @@ pub const GitHubCopilotOAuth = struct {
 
     /// Exchange GitHub access token for Copilot API token
     pub fn exchangeForCopilotToken(self: *Self, access_token: []const u8) CopilotError!CopilotToken {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         var url_buf: [256]u8 = undefined;
@@ -300,31 +283,23 @@ pub const GitHubCopilotOAuth = struct {
             headers.appendAssumeCapacity(h);
         }
 
-        var req = client.request(.GET, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
+        var req = client.openRequest(.GET, uri, .{ .extra_headers = headers.items }) catch return CopilotError.HttpError;
         defer req.deinit();
 
-        req.sendBodyComplete("") catch return CopilotError.HttpError;
+        http.sendBodilessRequest(&req) catch return CopilotError.HttpError;
 
         var head_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&head_buf) catch return CopilotError.HttpError;
+        var response = http.receiveResponse(&req, &head_buf) catch return CopilotError.HttpError;
 
         if (response.head.status != .ok) return CopilotError.TokenExchangeFailed;
 
-        // Read response body
-        var body_list = std.ArrayList(u8).init(self.allocator);
-        defer body_list.deinit(self.allocator);
-
+        // Read response body with a fixed upper bound for OAuth JSON payloads.
         var transfer_buf: [4096]u8 = undefined;
-        var read_buf: [4096]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
+        const reader = http.responseReader(&response, &transfer_buf);
+        const response_body = http.allocRemainingResponse(self.allocator, reader, 8192) catch return CopilotError.HttpError;
+        defer self.allocator.free(response_body);
 
-        while (true) {
-            const n = reader.*.readSliceShort(&read_buf) catch break;
-            if (n.len == 0) break;
-            body_list.appendSlice(self.allocator, n) catch return CopilotError.OutOfMemory;
-        }
-
-        return self.parseCopilotTokenResponse(body_list.items);
+        return self.parseCopilotTokenResponse(response_body);
     }
 
     fn parseCopilotTokenResponse(self: *Self, body: []const u8) CopilotError!CopilotToken {
@@ -410,7 +385,7 @@ pub const GitHubCopilotOAuth = struct {
 
     /// Enable a model for use (POST to /models/{id}/policy)
     pub fn enableModel(self: *Self, token: []const u8, model_id: []const u8) !bool {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = http.HttpClient.init(self.allocator);
         defer client.deinit();
 
         // Determine base URL
@@ -437,15 +412,14 @@ pub const GitHubCopilotOAuth = struct {
             headers.appendAssumeCapacity(h);
         }
 
-        var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch return false;
+        var req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch return false;
         defer req.deinit();
 
         const body = "{\"state\":\"enabled\"}";
-        req.transfer_encoding = .{ .content_length = body.len };
-        req.sendBodyComplete(body) catch return false;
+        http.sendRequest(&req, body) catch return false;
 
         var head_buf: [4096]u8 = undefined;
-        const response = req.receiveHead(&head_buf) catch return false;
+        const response = http.receiveResponse(&req, &head_buf) catch return false;
 
         return response.head.status == .ok or response.head.status == .created or response.head.status == .no_content;
     }
