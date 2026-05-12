@@ -385,6 +385,26 @@ fn pushChunkOrFail(stream: *transport.ByteStream, chunk: transport.ByteChunk, al
     return true;
 }
 
+fn hasHeaderName(response: []const u8, name: []const u8) bool {
+    var line_start: usize = 0;
+    while (line_start < response.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, response, line_start, '\n') orelse response.len;
+        var line = response[line_start..line_end];
+        if (std.mem.endsWith(u8, line, "\r")) {
+            line = line[0 .. line.len - 1];
+        }
+
+        if (line.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const header_name = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(header_name, name)) return true;
+        }
+
+        line_start = if (line_end < response.len) line_end + 1 else response.len;
+    }
+    return false;
+}
+
 // --- Internal types ---
 
 fn canInitiateConnect(state: WebSocketClient.ConnectionState) bool {
@@ -618,7 +638,7 @@ fn performHandshake(
     // "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")). Full value verification is
     // intentionally deferred; this migration preserves existing behavior by
     // only requiring the accept header to be present.
-    if (std.mem.find(u8, response, "Sec-WebSocket-Accept:") == null) {
+    if (!hasHeaderName(response, "Sec-WebSocket-Accept")) {
         return error.HandshakeFailed;
     }
 }
@@ -741,6 +761,19 @@ test "encodeFrame and decodeFrame roundtrip" {
     try std.testing.expectEqual(Opcode.ping, result3.frame.opcode);
     try std.testing.expect(!result3.frame.masked);
     try std.testing.expectEqualStrings("ping", result3.frame.payload);
+}
+
+test "hasHeaderName matches HTTP header names case-insensitively" {
+    const response =
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+        "upgrade: websocket\r\n" ++
+        "connection: Upgrade\r\n" ++
+        "sec-websocket-accept: value\r\n" ++
+        "\r\n";
+
+    try std.testing.expect(hasHeaderName(response, "Sec-WebSocket-Accept"));
+    try std.testing.expect(hasHeaderName(response, "Upgrade"));
+    try std.testing.expect(!hasHeaderName(response, "Sec-WebSocket-Protocol"));
 }
 
 test "decodeFrame rejects incomplete extended length and masked payloads" {
