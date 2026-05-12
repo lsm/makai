@@ -7,6 +7,8 @@
  * per spec §9 (additive-only V1 evolution rule).
  */
 
+import type { TimeoutDiagnostics } from "./timeout_diagnostics";
+
 /** Stable identifier for a provider configured in the Makai runtime. */
 export type ProviderId = string;
 
@@ -128,6 +130,8 @@ export interface MakaiModelsApi {
  * or a synthetic code when the client itself rejects a malformed reply.
  */
 export class MakaiProtocolError extends Error {
+  public readonly diagnostics?: TimeoutDiagnostics;
+
   /**
    * @param message Human-readable protocol failure.
    * @param code Optional protocol error code.
@@ -135,8 +139,10 @@ export class MakaiProtocolError extends Error {
   constructor(
     message: string,
     public readonly code?: string,
+    options: { diagnostics?: TimeoutDiagnostics } = {},
   ) {
     super(message);
     this.name = "MakaiProtocolError";
+    this.diagnostics = options.diagnostics;
   }
 }

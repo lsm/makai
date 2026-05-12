@@ -172,6 +172,7 @@ rl.on("line", (line) => {
       emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
+    if (process.env.MAKAI_TEST_SUPPRESS_COMPLETE_RESPONSE) return;
     emit(frame(env, "result", providerResult, 3));
   } else if (env.type === "stream_request") {
     if (shouldAuthReject("stream_request")) {
@@ -190,6 +191,7 @@ rl.on("line", (line) => {
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
+    if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE) return;
     if (process.env.MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON) {
       emit(frame(env, "agent_result", { result_json: "not-json" }, 3));
     } else if (process.env.MAKAI_TEST_AGENT_MALFORMED_EVENT_JSON) {

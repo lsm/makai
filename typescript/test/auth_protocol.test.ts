@@ -261,6 +261,33 @@ test("client.auth.login rejects with cancelled error on cancelled login result",
   }
 });
 
+test("client.auth.listProviders timeout includes actionable diagnostics", async () => {
+  const client = await createMakaiAuthClient(
+    fixtureClientOptions("auth-protocol-providers-server.js", {
+      frameTimeoutMs: 20,
+      env: { ...process.env, MAKAI_TEST_RESPONSE_DELAY_MS: "100" },
+    }),
+  );
+  try {
+    await assert.rejects(
+      () => client.auth.listProviders(),
+      (error: unknown) =>
+        error instanceof MakaiAuthError &&
+        error.kind === "transport_error" &&
+        error.message.includes("Timed out waiting for auth_providers_response after 20ms") &&
+        error.message.includes("stream_id=") &&
+        error.message.includes("message_id=") &&
+        error.message.includes("Verify the makai binary") &&
+        error.diagnostics?.operation === "auth_providers_response" &&
+        error.diagnostics.timeout_ms === 20 &&
+        typeof error.diagnostics.stream_id === "string" &&
+        typeof error.diagnostics.message_id === "string",
+    );
+  } finally {
+    await client.close();
+  }
+});
+
 test("client.auth.login rejects with provider_error and propagates code/message on failure", async () => {
   const client = await createMakaiAuthClient(
     fixtureClientOptions("auth-protocol-login-failed-server.js"),

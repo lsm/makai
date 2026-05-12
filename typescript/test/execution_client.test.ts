@@ -147,6 +147,33 @@ test("client.provider.complete maps system prompts and tool messages into provid
   }
 });
 
+test("provider.complete timeout includes actionable diagnostics", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_SUPPRESS_COMPLETE_RESPONSE: "1" });
+  try {
+    const provider = createMakaiProviderApi(harness.client, { responseTimeoutMs: 20 });
+    await assert.rejects(
+      () => provider.complete(request()),
+      (err: unknown) =>
+        err instanceof MakaiStreamError &&
+        err.kind === "transport_error" &&
+        err.message.includes("Timed out waiting for provider complete_response after 20ms for provider 'anthropic'") &&
+        err.message.includes("model_ref='anthropic/anthropic-messages@opaque-model-ref-with%3Acolon'") &&
+        err.message.includes("stream_id=") &&
+        err.message.includes("message_id=") &&
+        err.message.includes("Check network connectivity") &&
+        err.diagnostics?.operation === "provider complete_response" &&
+        err.diagnostics.timeout_ms === 20 &&
+        err.diagnostics.provider_id === "anthropic" &&
+        err.diagnostics.api === "anthropic-messages" &&
+        err.diagnostics.model_id === "opaque-model-ref-with:colon" &&
+        typeof err.diagnostics.stream_id === "string" &&
+        err.diagnostics.message_id === err.diagnostics.stream_id,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("client.provider.stream yields ProviderStreamEvent sequence including message_end", async () => {
   const harness = await setupHarness();
   try {
@@ -197,6 +224,30 @@ test("client.agent.run resolves with correct AgentRunResponse", async () => {
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("agent.run timeout includes actionable diagnostics", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 20 });
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) =>
+        err instanceof MakaiStreamError &&
+        err.kind === "transport_error" &&
+        err.message.includes("Timed out waiting for agent result after 20ms for provider 'anthropic'") &&
+        err.message.includes("session_id=testNanoIdSess1234567") &&
+        err.message.includes("Verify the makai binary") &&
+        err.diagnostics?.operation === "agent result" &&
+        err.diagnostics.timeout_ms === 20 &&
+        err.diagnostics.provider_id === "anthropic" &&
+        err.diagnostics.api === "anthropic-messages" &&
+        err.diagnostics.model_id === "opaque-model-ref-with:colon" &&
+        err.diagnostics.session_id === "testNanoIdSess1234567",
+    );
+  } finally {
+    await harness.cleanup();
   }
 });
 
