@@ -216,10 +216,10 @@ pub const AsyncStdioReceiver = struct {
 
         const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
 
-        // Store thread handle in the stream's result field (hack for backward compat)
-        // Actually, we cannot do this cleanly without changing the ByteStream type.
-        // For backward compatibility with receiveStreamFn signature, we detach but
-        // the caller should use receiveStreamWithHandle() for proper lifecycle management.
+        // TODO(zig-0.16-migration): deprecate this legacy receiveStream() path
+        // once transport migration callers use receiveStreamWithHandle(). It
+        // detaches the producer for backward compatibility, while the handle
+        // API below keeps lifecycle ownership explicit.
         thread.detach();
 
         return stream;

@@ -1,5 +1,9 @@
 const std = @import("std");
 
+// TODO(zig-0.16-migration): replace this alias with an opaque Makai-owned
+// handle wrapper in a later phase. This PR keeps the transport/CLI migration
+// small, but callers should already route all operations through this module so
+// the public surface does not depend on `std.Io` operations directly.
 pub const File = std.Io.File;
 pub const Pipe = [2]File;
 
