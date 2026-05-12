@@ -755,7 +755,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = compat.http.HttpClient.init(allocator);
     defer client.deinit();
 
     const url = buildStreamGenerateContentUrl(allocator, base_url, model.id, api_key) catch {
@@ -786,10 +786,10 @@ fn runThread(ctx: *ThreadCtx) void {
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_opts) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
 
-    var response: std.http.Client.Response = undefined;
+    var response: compat.http.Response = undefined;
     var head_buf: [4096]u8 = undefined;
     var retry_attempt: u8 = 0;
-    var req: std.http.Client.Request = undefined;
+    var req: compat.http.Request = undefined;
     var req_initialized = false;
     defer if (req_initialized) req.deinit();
 
@@ -813,7 +813,7 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
-        req = client.request(.POST, uri, .{ .extra_headers = &headers }) catch {
+        req = client.openRequest(.POST, uri, .{ .extra_headers = &headers }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -840,8 +840,7 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         req_initialized = true;
 
-        req.transfer_encoding = .{ .content_length = body.len };
-        req.sendBodyComplete(body) catch {
+        compat.http.sendRequest(&req, body) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -867,7 +866,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
-        response = req.receiveHead(&head_buf) catch {
+        response = compat.http.receiveResponse(&req, &head_buf) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -978,7 +977,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
+    const reader = compat.http.responseReader(&response, &transfer_buf);
 
     // Content block accumulators
     var content_blocks = std.ArrayList(ai_types.AssistantContent).empty;
@@ -1028,7 +1027,7 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        const n = reader.*.readSliceShort(&read_buf) catch {
+        const n = compat.http.readResponse(reader, &read_buf) catch {
             allocator.free(base_url);
             allocator.free(api_key);
             allocator.free(body);
