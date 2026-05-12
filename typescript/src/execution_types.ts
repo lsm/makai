@@ -1,5 +1,6 @@
 import type { ApiId, ProviderId } from "./models_types";
 import type { AuthFlowHandlers } from "./auth_protocol";
+import type { TimeoutDiagnostics } from "./timeout_diagnostics";
 
 export type AuthRetryPolicy = "manual" | "auto_once";
 
@@ -144,13 +145,15 @@ export class MakaiStreamError extends Error {
   public readonly kind: MakaiStreamErrorKind;
   public readonly code?: string;
   public readonly provider_id?: string;
+  public readonly diagnostics?: TimeoutDiagnostics;
 
-  constructor(message: string, options: { kind?: MakaiStreamErrorKind; code?: string; provider_id?: string } = {}) {
+  constructor(message: string, options: { kind?: MakaiStreamErrorKind; code?: string; provider_id?: string; diagnostics?: TimeoutDiagnostics } = {}) {
     super(message);
     this.name = "MakaiStreamError";
     this.kind = options.kind ?? "unknown";
     this.code = options.code;
     this.provider_id = options.provider_id;
+    this.diagnostics = options.diagnostics;
   }
 }
 

@@ -35,6 +35,12 @@ import {
   ResolveModelResponse,
 } from "./models_types";
 import { MakaiStdioClient, StdioFrame } from "./stdio_client";
+import {
+  createTimeoutDiagnostics,
+  formatTimeoutMessage,
+  isTimeoutLikeError,
+  type TimeoutDiagnosticContext,
+} from "./timeout_diagnostics";
 
 const ENVELOPE_VERSION = 1;
 const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omits
@@ -154,12 +160,16 @@ class StdioModelsApi implements MakaiModelsApi {
     return { model };
   }
 
-  private async nextFrameForStream(streamId: string, timeoutMs: number): Promise<StdioFrame> {
+  private async nextFrameForStream(streamId: string, timeoutMs: number, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
     try {
       return await this.client.nextFrameForStream(streamId, timeoutMs);
     } catch (error) {
       throw new MakaiProtocolError(
-        error instanceof Error ? error.message : String(error),
+        isTimeoutLikeError(error)
+          ? formatTimeoutMessage(context)
+          : error instanceof Error ? error.message : String(error),
+        undefined,
+        { diagnostics: isTimeoutLikeError(error) ? createTimeoutDiagnostics(context) : undefined },
       );
     }
   }
@@ -177,15 +187,26 @@ class StdioModelsApi implements MakaiModelsApi {
     };
     this.client.send(envelope);
 
+    const timeoutContext: TimeoutDiagnosticContext = {
+      operation: "models_response",
+      timeout_ms: this.responseTimeoutMs,
+      stream_id: streamId,
+      message_id: streamId,
+      provider_id: request.provider_id,
+      api: request.api,
+      model_id: request.model_id,
+    };
     const deadline = Date.now() + this.responseTimeoutMs;
     while (true) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw new MakaiProtocolError(
-          `models_request timed out after ${this.responseTimeoutMs}ms`,
+          formatTimeoutMessage(timeoutContext),
+          undefined,
+          { diagnostics: createTimeoutDiagnostics(timeoutContext) },
         );
       }
-      const frame = await this.nextFrameForStream(streamId, remaining);
+      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext);
 
       switch (frame.type) {
         case "ack":

@@ -7,6 +7,8 @@
  * per spec §9 (additive-only V1 evolution rule).
  */
 
+import type { TimeoutDiagnostics } from "./timeout_diagnostics";
+
 export type ProviderId = string;
 
 export type ApiId =
@@ -101,11 +103,15 @@ export interface MakaiModelsApi {
  * or a synthetic code when the client itself rejects a malformed reply.
  */
 export class MakaiProtocolError extends Error {
+  public readonly diagnostics?: TimeoutDiagnostics;
+
   constructor(
     message: string,
     public readonly code?: string,
+    options: { diagnostics?: TimeoutDiagnostics } = {},
   ) {
     super(message);
     this.name = "MakaiProtocolError";
+    this.diagnostics = options.diagnostics;
   }
 }

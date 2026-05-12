@@ -6,6 +6,12 @@ import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
 import {
+  createTimeoutDiagnostics,
+  formatTimeoutMessage,
+  isTimeoutLikeError,
+  type TimeoutDiagnosticContext,
+} from "./timeout_diagnostics";
+import {
   MakaiAuthRequiredError,
   MakaiStreamError,
   type AgentRunRequest,
@@ -106,8 +112,9 @@ class StdioProviderApi implements MakaiProviderApi {
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
+    const timeoutContext = executionTimeoutContext("provider complete_response", this.responseTimeoutMs, streamId, request);
     while (true) {
-      const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
+      const frame = await nextFrame(this.transport, streamId, timeoutContext);
       if (frame.type === "ack") continue;
       if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "stream_error") throw streamErrorFrameToError(frame);
@@ -161,11 +168,12 @@ class StdioProviderApi implements MakaiProviderApi {
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
+    const timeoutContext = executionTimeoutContext("provider stream event", this.responseTimeoutMs, streamId, request);
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
       while (!terminal) {
-        const frame = await nextFrame(this.transport, streamId, this.responseTimeoutMs);
+        const frame = await nextFrame(this.transport, streamId, timeoutContext);
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         const event = normalizeProviderFrame(frame, toolBuffers);
@@ -225,11 +233,12 @@ class StdioAgentApi implements MakaiAgentApi {
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
+    const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
     while (true) {
-      const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
+      const frame = await nextAgentFrame(this.transport, sessionId, timeoutContext);
       if (frame.type === "ack") continue;
       if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
@@ -303,6 +312,7 @@ class StdioAgentApi implements MakaiAgentApi {
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
+    const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
     let terminal = false;
     let messageSent = false;
     let started = false;
@@ -310,7 +320,7 @@ class StdioAgentApi implements MakaiAgentApi {
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     try {
       while (!terminal) {
-        const frame = await nextAgentFrame(this.transport, sessionId, this.responseTimeoutMs);
+        const frame = await nextAgentFrame(this.transport, sessionId, timeoutContext);
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         if (frame.type === "agent_started" && !messageSent) {
@@ -551,19 +561,74 @@ function serializeOptionsWithDefaults(
   return out;
 }
 
-async function nextFrame(transport: MakaiStdioClient, streamId: string, timeoutMs: number): Promise<StdioFrame> {
+async function nextFrame(transport: MakaiStdioClient, streamId: string, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
   try {
-    return await transport.nextFrameForStream(streamId, timeoutMs);
+    return await transport.nextFrameForStream(streamId, context.timeout_ms);
   } catch (error) {
-    throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
+    throw timeoutAwareStreamError(error, context);
   }
 }
 
-async function nextAgentFrame(transport: MakaiStdioClient, sessionId: string, timeoutMs: number): Promise<StdioFrame> {
+async function nextAgentFrame(transport: MakaiStdioClient, sessionId: string, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
   try {
-    return await transport.nextFrameForSession(sessionId, timeoutMs);
+    return await transport.nextFrameForSession(sessionId, context.timeout_ms);
   } catch (error) {
-    throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
+    throw timeoutAwareStreamError(error, context);
+  }
+}
+
+function timeoutAwareStreamError(error: unknown, context: TimeoutDiagnosticContext): MakaiStreamError {
+  if (isTimeoutLikeError(error)) {
+    return new MakaiStreamError(formatTimeoutMessage(context), {
+      kind: "transport_error",
+      diagnostics: createTimeoutDiagnostics(context),
+    });
+  }
+  return new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
+}
+
+function executionTimeoutContext(
+  operation: string,
+  timeoutMs: number,
+  streamId: string,
+  request: ProviderCompleteRequest | AgentRunRequest,
+): TimeoutDiagnosticContext {
+  const parsed = safeParseModelRef(request.model_ref);
+  return {
+    operation,
+    timeout_ms: timeoutMs,
+    stream_id: streamId,
+    message_id: streamId,
+    provider_id: parsed?.providerId,
+    api: parsed?.api,
+    model_ref: request.model_ref,
+    model_id: parsed?.modelId,
+  };
+}
+
+function agentTimeoutContext(
+  operation: string,
+  timeoutMs: number,
+  sessionId: string,
+  request: AgentRunRequest,
+): TimeoutDiagnosticContext {
+  const parsed = safeParseModelRef(request.model_ref);
+  return {
+    operation,
+    timeout_ms: timeoutMs,
+    session_id: sessionId,
+    provider_id: parsed?.providerId,
+    api: parsed?.api,
+    model_ref: request.model_ref,
+    model_id: parsed?.modelId,
+  };
+}
+
+function safeParseModelRef(modelRef: string): ReturnType<typeof parseModelRef> | undefined {
+  try {
+    return parseModelRef(modelRef);
+  } catch {
+    return undefined;
   }
 }
 
