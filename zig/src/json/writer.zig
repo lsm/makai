@@ -189,6 +189,25 @@ test "string escaping" {
     try std.testing.expectEqualStrings(expected, result);
 }
 
+test "control characters escape as unicode sequences" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    var writer = JsonWriter.init(&buffer, allocator);
+
+    const value = [_]u8{ 'A', 0x01, 'B' };
+
+    try writer.beginObject();
+    try writer.writeStringField("control", &value);
+    try writer.endObject();
+
+    const result = getResult(&writer);
+    const expected = "{\"control\":\"A\\u0001B\"}";
+
+    try std.testing.expectEqualStrings(expected, result);
+}
+
 test "nested objects and arrays" {
     const allocator = std.testing.allocator;
     var buffer = std.ArrayList(u8).empty;
