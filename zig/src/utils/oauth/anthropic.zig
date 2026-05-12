@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("compat");
+const http = compat.http;
 const pkce_mod = @import("oauth/pkce");
 
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -278,7 +279,7 @@ fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, alloc
 
 /// Exchange tokens with Anthropic API
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
     // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
@@ -298,30 +299,32 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
 
-    var request = try client.request(.POST, uri, .{
+    var request = try client.openRequest(.POST, uri, .{
         .extra_headers = headers.items,
+        .accept_encoding = "identity",
     });
     defer request.deinit();
 
     // Avoid compressed response bodies for stable token JSON parsing.
     request.headers.accept_encoding = .omit;
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    try request.sendBodyComplete(@constCast(body));
+    try http.sendRequest(&request, body);
 
     var header_buffer: [4096]u8 = undefined;
-    var response = try request.receiveHead(&header_buffer);
+    var response = try http.receiveResponse(&request, &header_buffer);
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+        const reader = http.responseReader(&response, &buffer);
+        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
         defer allocator.free(error_body);
         std.debug.print("Token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
         return error.OAuthFailed;
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+    const reader = http.responseReader(&response, &response_buffer);
+    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
     return try parseTokenResponse(response_body, allocator);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("compat");
+const http = compat.http;
 const ai_types = @import("ai_types");
 
 // GitHub OAuth configuration
@@ -105,7 +106,7 @@ pub fn enableModel(
     model_id: []const u8,
     base_url: []const u8,
 ) !bool {
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
     // Build URL
@@ -128,16 +129,15 @@ pub fn enableModel(
     try headers.append(allocator, .{ .name = "openai-intent", .value = "chat-policy" });
     try headers.append(allocator, .{ .name = "x-interaction-type", .value = "chat-policy" });
 
-    var request = try client.request(.POST, uri, .{
+    var request = try client.openRequest(.POST, uri, .{
         .extra_headers = headers.items,
     });
     defer request.deinit();
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    try request.sendBodyComplete(body);
+    try http.sendRequest(&request, body);
 
     var header_buffer: [4096]u8 = undefined;
-    const response = try request.receiveHead(&header_buffer);
+    const response = try http.receiveResponse(&request, &header_buffer);
 
     // Return true if status is 200, false otherwise
     return response.head.status == .ok;
@@ -373,7 +373,7 @@ const DeviceCodeResponse = struct {
 
 /// Start GitHub device code flow
 fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCodeResponse {
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -394,20 +394,20 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
 
-    var request = try client.request(.POST, uri, .{
+    var request = try client.openRequest(.POST, uri, .{
         .extra_headers = headers.items,
     });
     defer request.deinit();
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    try request.sendBodyComplete(@constCast(body));
+    try http.sendRequest(&request, body);
 
     var header_buffer: [4096]u8 = undefined;
-    var response = try request.receiveHead(&header_buffer);
+    var response = try http.receiveResponse(&request, &header_buffer);
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+        const reader = http.responseReader(&response, &buffer);
+        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
         defer allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(allocator, "Device flow error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         defer allocator.free(err_msg);
@@ -415,7 +415,8 @@ fn startDeviceFlow(domain: []const u8, allocator: std.mem.Allocator) !DeviceCode
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+    const reader = http.responseReader(&response, &response_buffer);
+    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
     // Parse JSON response
@@ -449,7 +450,7 @@ const PollResult = struct {
 
 /// Poll for GitHub access token
 fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.Allocator) !PollResult {
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -474,16 +475,15 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     try headers.append(allocator, .{ .name = "accept", .value = "application/json" });
     try headers.append(allocator, .{ .name = "content-type", .value = "application/x-www-form-urlencoded" });
 
-    var request = try client.request(.POST, uri, .{
+    var request = try client.openRequest(.POST, uri, .{
         .extra_headers = headers.items,
     });
     defer request.deinit();
 
-    request.transfer_encoding = .{ .content_length = body.len };
-    try request.sendBodyComplete(@constCast(body));
+    try http.sendRequest(&request, body);
 
     var header_buffer: [4096]u8 = undefined;
-    var response = try request.receiveHead(&header_buffer);
+    var response = try http.receiveResponse(&request, &header_buffer);
 
     if (response.head.status != .ok) {
         return .{
@@ -492,7 +492,8 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+    const reader = http.responseReader(&response, &response_buffer);
+    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
     // Parse JSON response (can be success or error)
@@ -527,7 +528,7 @@ fn pollForToken(domain: []const u8, device_code: []const u8, allocator: std.mem.
 
 /// Get Copilot token from GitHub token
 fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.mem.Allocator) ![]const u8 {
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
     // Build URL (support enterprise domains)
@@ -553,7 +554,7 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     try headers.append(allocator, .{ .name = "user-agent", .value = COPILOT_HEADERS.user_agent });
     try headers.append(allocator, .{ .name = "copilot-integration-id", .value = COPILOT_HEADERS.copilot_integration_id });
 
-    var request = try client.request(.GET, uri, .{
+    var request = try client.openRequest(.GET, uri, .{
         .extra_headers = headers.items,
     });
     defer request.deinit();
@@ -561,14 +562,15 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     // Avoid compressed response bodies for simpler token JSON parsing
     request.headers.accept_encoding = .omit;
 
-    try request.sendBodiless();
+    try http.sendBodilessRequest(&request);
 
     var header_buffer: [4096]u8 = undefined;
-    var response = try request.receiveHead(&header_buffer);
+    var response = try http.receiveResponse(&request, &header_buffer);
 
     if (response.head.status != .ok) {
         var buffer: [4096]u8 = undefined;
-        const error_body = try response.reader(&buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+        const reader = http.responseReader(&response, &buffer);
+        const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
         defer allocator.free(error_body);
         const err_msg = try std.fmt.allocPrint(allocator, "Copilot token error {d}: {s}", .{ @intFromEnum(response.head.status), error_body });
         defer allocator.free(err_msg);
@@ -576,7 +578,8 @@ fn getCopilotToken(domain: []const u8, github_token: []const u8, allocator: std.
     }
 
     var response_buffer: [8192]u8 = undefined;
-    const response_body = try response.reader(&response_buffer).*.allocRemaining(allocator, std.Io.Limit.limited(8192));
+    const reader = http.responseReader(&response, &response_buffer);
+    const response_body = try http.allocRemainingResponse(allocator, reader, 8192);
     defer allocator.free(response_body);
 
     // Parse JSON response (expected format: {"token": "..."})

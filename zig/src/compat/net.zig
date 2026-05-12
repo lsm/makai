@@ -80,6 +80,11 @@ pub fn listenAddress(server: *const Server) Address {
     return server.socket.address;
 }
 
+/// Stop a TCP listener through the compatibility networking boundary.
+pub fn closeServer(server: *Server) void {
+    server.deinit(defaultIo());
+}
+
 /// Accept a TCP connection and wrap its stream at the Makai compatibility seam.
 ///
 /// Zig 0.15.2: wraps `std.net.Server.accept`.

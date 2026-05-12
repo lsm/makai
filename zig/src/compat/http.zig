@@ -42,12 +42,21 @@ pub const HttpClient = struct {
             .headers = .{ .accept_encoding = if (options.accept_encoding) |value| .{ .override = value } else .default },
         });
     }
+
+    pub fn initDefaultProxies(self: *HttpClient, allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map) !void {
+        try self.client.initDefaultProxies(allocator, environ_map);
+    }
 };
 
 /// Send a request body and complete the outbound request.
 pub fn sendRequest(request: *Request, body: []const u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
     try request.sendBodyComplete(@constCast(body));
+}
+
+/// Send a request without an outbound body.
+pub fn sendBodilessRequest(request: *Request) !void {
+    try request.sendBodiless();
 }
 
 /// Receive the response headers/body metadata for a request.

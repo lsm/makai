@@ -1,19 +1,20 @@
 const std = @import("std");
 const compat = @import("compat");
+const net = compat.net;
 
 /// Local HTTP callback server for OAuth
 pub const CallbackServer = struct {
     allocator: std.mem.Allocator,
     port: u16,
-    listener: std.net.Server,
+    listener: net.Server,
     code: ?[]const u8 = null,
     state: ?[]const u8 = null,
     error_msg: ?[]const u8 = null,
 
     /// Start callback server on 127.0.0.1
     pub fn start(allocator: std.mem.Allocator, port: u16) !CallbackServer {
-        const address = try std.net.Address.parseIp4("127.0.0.1", port);
-        const listener = try address.listen(.{
+        const address = try net.resolveAddress(allocator, "127.0.0.1", port);
+        const listener = try net.tcpListen(address, .{
             .reuse_address = true,
         });
 
@@ -30,7 +31,7 @@ pub const CallbackServer = struct {
 
         while (compat.time.nowMillis() < deadline) {
             // Accept connection with timeout
-            var connection = self.listener.accept() catch |err| {
+            var connection = net.accept(&self.listener) catch |err| {
                 if (err == error.WouldBlock) {
                     compat.time.sleepMs(100);
                     continue;
@@ -49,7 +50,7 @@ pub const CallbackServer = struct {
             // Parse query string from GET request
             if (std.mem.startsWith(u8, request, "GET ")) {
                 const query_start = std.mem.find(u8, request, "?") orelse {
-                    try self.sendResponse(connection.stream, false, "No query parameters");
+                    try self.sendResponse(&connection.stream, false, "No query parameters");
                     continue;
                 };
 
@@ -74,18 +75,18 @@ pub const CallbackServer = struct {
 
                 if (error_param) |err_msg| {
                     self.error_msg = err_msg;
-                    try self.sendResponse(connection.stream, false, err_msg);
+                    try self.sendResponse(&connection.stream, false, err_msg);
                     return error.OAuthError;
                 }
 
                 if (code) |c| {
                     self.code = c;
                     self.state = state;
-                    try self.sendResponse(connection.stream, true, null);
+                    try self.sendResponse(&connection.stream, true, null);
                     return c;
                 }
 
-                try self.sendResponse(connection.stream, false, "No code parameter");
+                try self.sendResponse(&connection.stream, false, "No code parameter");
             }
         }
 
@@ -93,8 +94,7 @@ pub const CallbackServer = struct {
     }
 
     /// Send HTML response to browser
-    fn sendResponse(self: *CallbackServer, stream: std.net.Stream, success: bool, error_msg: ?[]const u8) !void {
-        _ = self;
+    fn sendResponse(self: *CallbackServer, stream: *net.Stream, success: bool, error_msg: ?[]const u8) !void {
         const html = if (success)
             \\HTTP/1.1 200 OK
             \\Content-Type: text/html; charset=utf-8
@@ -107,7 +107,7 @@ pub const CallbackServer = struct {
             \\</body></html>
         else blk: {
             const msg = error_msg orelse "Unknown error";
-            break :blk try std.fmt.allocPrint(std.testing.allocator,
+            break :blk try std.fmt.allocPrint(self.allocator,
                 \\HTTP/1.1 400 Bad Request
                 \\Content-Type: text/html; charset=utf-8
                 \\Connection: close
@@ -120,13 +120,13 @@ pub const CallbackServer = struct {
             , .{msg});
         };
 
-        defer if (!success) std.testing.allocator.free(html);
-        _ = try stream.write(html);
+        defer if (!success) self.allocator.free(html);
+        try stream.writeAll(html);
     }
 
     /// Stop callback server and free resources
     pub fn stop(self: *CallbackServer) void {
-        self.listener.deinit();
+        net.closeServer(&self.listener);
         if (self.code) |code| {
             self.allocator.free(code);
         }
