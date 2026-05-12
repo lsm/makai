@@ -37,36 +37,41 @@ rl.on("line", (line) => {
 
   if (envelope.type === "auth_providers_request") {
     appendLog(requestLog, JSON.stringify(envelope));
-    send({
-      type: "ack",
-      stream_id: envelope.stream_id,
-      message_id: ulid(),
-      sequence: nextSeq(envelope.stream_id),
-      in_reply_to: envelope.message_id,
-      timestamp: Date.now(),
-      version: 1,
-      payload: { acknowledged_id: envelope.message_id },
-    });
-    send({
-      type: "auth_providers_response",
-      stream_id: envelope.stream_id,
-      message_id: ulid(),
-      sequence: nextSeq(envelope.stream_id),
-      in_reply_to: envelope.message_id,
-      timestamp: Date.now(),
-      version: 1,
-      payload: {
-        providers: [
-          { id: "anthropic", name: "Anthropic", auth_status: "login_required" },
-          { id: "github-copilot", name: "GitHub Copilot", auth_status: "authenticated" },
-          {
-            id: "test-fixture",
-            name: "Test Fixture (CI)",
-            auth_status: "failed",
-            last_error: "previous attempt rejected",
-          },
-        ],
-      },
-    });
+    const respond = () => {
+      send({
+        type: "ack",
+        stream_id: envelope.stream_id,
+        message_id: ulid(),
+        sequence: nextSeq(envelope.stream_id),
+        in_reply_to: envelope.message_id,
+        timestamp: Date.now(),
+        version: 1,
+        payload: { acknowledged_id: envelope.message_id },
+      });
+      send({
+        type: "auth_providers_response",
+        stream_id: envelope.stream_id,
+        message_id: ulid(),
+        sequence: nextSeq(envelope.stream_id),
+        in_reply_to: envelope.message_id,
+        timestamp: Date.now(),
+        version: 1,
+        payload: {
+          providers: [
+            { id: "anthropic", name: "Anthropic", auth_status: "login_required" },
+            { id: "github-copilot", name: "GitHub Copilot", auth_status: "authenticated" },
+            {
+              id: "test-fixture",
+              name: "Test Fixture (CI)",
+              auth_status: "failed",
+              last_error: "previous attempt rejected",
+            },
+          ],
+        },
+      });
+    };
+    const responseDelayMs = Number(process.env.MAKAI_TEST_RESPONSE_DELAY_MS || "0");
+    if (responseDelayMs > 0) setTimeout(respond, responseDelayMs);
+    else respond();
   }
 });

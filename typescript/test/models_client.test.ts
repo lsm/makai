@@ -414,6 +414,33 @@ test("models.resolve throws invalid_request 'model not found' when no match", as
   }
 });
 
+test("models.list timeout includes actionable diagnostics", async () => {
+  const harness = await setupHarness({
+    response: makeResponse([makeDescriptor()]),
+    responseDelayMs: 100,
+  });
+  try {
+    const api = createMakaiModelsApi(harness.client, { responseTimeoutMs: 20 });
+    await assert.rejects(
+      () => api.list({ provider_id: "anthropic", api: "anthropic-messages" }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.message.includes("Timed out waiting for models_response after 20ms for provider 'anthropic'") &&
+        err.message.includes("stream_id=") &&
+        err.message.includes("message_id=") &&
+        err.message.includes("Check network connectivity") &&
+        err.diagnostics?.operation === "models_response" &&
+        err.diagnostics.timeout_ms === 20 &&
+        err.diagnostics.provider_id === "anthropic" &&
+        err.diagnostics.api === "anthropic-messages" &&
+        typeof err.diagnostics.stream_id === "string" &&
+        err.diagnostics.message_id === err.diagnostics.stream_id,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("models.list propagates nack error_code as MakaiProtocolError", async () => {
   const harness = await setupHarness({
     nack: { reason: "model not found", error_code: "invalid_request" },

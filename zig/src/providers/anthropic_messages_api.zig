@@ -1173,12 +1173,12 @@ fn runThread(ctx: *ThreadCtx) void {
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_options) |ro| ro.max_retry_delay_ms orelse 60000 else 60000;
 
-    var response: std.http.Client.Response = undefined;
+    var response: compat.http.Response = undefined;
     var head_buf: [4096]u8 = undefined;
     var retry_attempt: u8 = 0;
     var last_error: ?[]u8 = null;
     defer if (last_error) |e| allocator.free(e);
-    var req: std.http.Client.Request = undefined;
+    var req: compat.http.Request = undefined;
     var req_initialized = false;
     defer if (req_initialized) req.deinit();
 

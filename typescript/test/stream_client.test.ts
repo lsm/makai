@@ -27,14 +27,14 @@ class ScriptedTransport {
     this.sent.push(frame);
   }
 
-  async nextFrameForStream(streamId: string): Promise<StdioFrame> {
+  async nextFrameForStream(streamId: string, _timeoutMs?: number): Promise<StdioFrame> {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) throw new Error(`no scripted frame for ${streamId}`);
     return { stream_id: streamId, ...frame };
   }
 
-  async nextFrameForSession(sessionId: string): Promise<StdioFrame> {
+  async nextFrameForSession(sessionId: string, _timeoutMs?: number): Promise<StdioFrame> {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) throw new Error(`no scripted frame for ${sessionId}`);
@@ -221,6 +221,50 @@ test("agent stream single failure emits one error and no agent_end", async () =>
   assert.equal(events.filter((event) => event.type === "error").length, 1);
   assert.deepEqual(events.at(-1), { type: "error", message: "boom", code: "provider_error" });
   assert.equal(events.some((event) => event.type === "agent_end"), false);
+});
+
+test("provider stream timeout includes actionable diagnostics", async () => {
+  const transport = new ScriptedTransport([], new Error("timed out waiting for frame for stream s1 after 25ms"));
+  const iterable = createMakaiProviderApi(transport as never, { responseTimeoutMs: 25 }).stream(REQUEST);
+
+  await assert.rejects(
+    async () => collect(iterable),
+    (error: unknown) =>
+      error instanceof MakaiStreamError &&
+      error.kind === "transport_error" &&
+      error.message.includes("Timed out waiting for provider stream event after 25ms for provider 'fixture'") &&
+      error.message.includes("model_ref='fixture/anthropic-messages@model'") &&
+      error.message.includes("stream_id=") &&
+      error.message.includes("Suggestions:") &&
+      error.diagnostics?.operation === "provider stream event" &&
+      error.diagnostics.timeout_ms === 25 &&
+      error.diagnostics.provider_id === "fixture" &&
+      error.diagnostics.api === "anthropic-messages" &&
+      error.diagnostics.model_id === "model" &&
+      typeof error.diagnostics.stream_id === "string" &&
+      error.diagnostics.message_id === error.diagnostics.stream_id,
+  );
+});
+
+test("agent stream timeout includes actionable diagnostics", async () => {
+  const transport = new ScriptedTransport([], new Error("timed out waiting for frame for session abc after 30ms"));
+  const iterable = createMakaiAgentApi(transport as never, { responseTimeoutMs: 30 }).stream({
+    ...REQUEST,
+    options: { session_id: "abcdefghijklmnopqrstu" },
+  });
+
+  await assert.rejects(
+    async () => collect(iterable),
+    (error: unknown) =>
+      error instanceof MakaiStreamError &&
+      error.kind === "transport_error" &&
+      error.message.includes("Timed out waiting for agent stream event after 30ms for provider 'fixture'") &&
+      error.message.includes("session_id=abcdefghijklmnopqrstu") &&
+      error.diagnostics?.operation === "agent stream event" &&
+      error.diagnostics.timeout_ms === 30 &&
+      error.diagnostics.provider_id === "fixture" &&
+      error.diagnostics.session_id === "abcdefghijklmnopqrstu",
+  );
 });
 
 test("MakaiStreamError is thrown on provider async iterator failure", async () => {

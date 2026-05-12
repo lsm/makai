@@ -6,6 +6,13 @@ import {
   createMakaiStdioClient,
   type CreateMakaiStdioClientOptions,
 } from "./stdio_client";
+import {
+  createTimeoutDiagnostics,
+  formatTimeoutMessage,
+  isTimeoutLikeError,
+  type TimeoutDiagnosticContext,
+  type TimeoutDiagnostics,
+} from "./timeout_diagnostics";
 
 // ---------------------------------------------------------------------------
 // Spec-aligned types (docs/v1-sdk-agent-provider-spec.md §3, §3.6, §4).
@@ -93,6 +100,7 @@ export type MakaiAuthErrorKind =
 export class MakaiAuthError extends Error {
   public readonly kind: MakaiAuthErrorKind;
   public readonly code?: string;
+  public readonly diagnostics?: TimeoutDiagnostics;
 
   /**
    * @param message Human-readable auth failure.
@@ -100,12 +108,13 @@ export class MakaiAuthError extends Error {
    */
   constructor(
     message: string,
-    options: { kind?: MakaiAuthErrorKind; code?: string } = {},
+    options: { kind?: MakaiAuthErrorKind; code?: string; diagnostics?: TimeoutDiagnostics } = {},
   ) {
     super(message);
     this.name = "MakaiAuthError";
     this.kind = options.kind ?? "unknown";
     this.code = options.code;
+    this.diagnostics = options.diagnostics;
   }
 }
 
@@ -316,7 +325,10 @@ export class MakaiAuthClient implements MakaiAuthApi {
     this.sendOrThrow(envelope);
 
     while (true) {
-      const frame = await this.nextFrameForStream(streamId);
+      const frame = await this.nextFrameForStream(streamId, {
+        operation: "auth_providers_response",
+        message_id: messageId,
+      });
       if (frame.type === "ack") continue;
       if (frame.type === "nack") {
         throw nackToAuthError(frame);
@@ -351,10 +363,11 @@ export class MakaiAuthClient implements MakaiAuthApi {
     const flowId = ulid();
     let outboundSequence = 1;
 
+    const startMessageId = ulid();
     this.sendOrThrow({
       type: "auth_login_start",
       stream_id: flowId,
-      message_id: ulid(),
+      message_id: startMessageId,
       sequence: outboundSequence++,
       timestamp: Date.now(),
       version: PROTOCOL_VERSION,
@@ -367,7 +380,11 @@ export class MakaiAuthClient implements MakaiAuthApi {
     let cancelled = false;
 
     while (true) {
-      const frame = await this.nextFrameForStream(flowId);
+      const frame = await this.nextFrameForStream(flowId, {
+        operation: "auth_login_result/auth_event",
+        message_id: startMessageId,
+        provider_id: providerId,
+      });
 
       if (frame.type === "ack") continue;
       if (frame.type === "nack") {
@@ -465,18 +482,26 @@ export class MakaiAuthClient implements MakaiAuthApi {
 
   private async drainLoginResult(flowId: string): Promise<void> {
     while (true) {
-      const frame = await this.nextFrameForStream(flowId);
+      const frame = await this.nextFrameForStream(flowId, {
+        operation: "auth_login_result",
+      });
       if (frame.type === "auth_login_result") return;
     }
   }
 
-  private async nextFrameForStream(streamId: string): Promise<RawEnvelope> {
+  private async nextFrameForStream(streamId: string, context: Omit<TimeoutDiagnosticContext, "timeout_ms" | "stream_id">): Promise<RawEnvelope> {
     try {
       return (await this.transport.nextFrameForStream(streamId, this.frameTimeoutMs)) as RawEnvelope;
     } catch (error) {
+      const diagnosticsContext = { ...context, timeout_ms: this.frameTimeoutMs, stream_id: streamId };
       throw new MakaiAuthError(
-        error instanceof Error ? error.message : String(error),
-        { kind: "transport_error" },
+        isTimeoutLikeError(error)
+          ? formatTimeoutMessage(diagnosticsContext)
+          : error instanceof Error ? error.message : String(error),
+        {
+          kind: "transport_error",
+          diagnostics: isTimeoutLikeError(error) ? createTimeoutDiagnostics(diagnosticsContext) : undefined,
+        },
       );
     }
   }
