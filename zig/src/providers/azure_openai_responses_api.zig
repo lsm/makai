@@ -291,6 +291,17 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     if (response.head.status != .ok) {
+        // Read error body for debugging
+        var error_buf: [4096]u8 = undefined;
+        const error_reader = compat.http.responseReader(&response, &error_buf);
+        const error_body = compat.http.allocRemainingResponse(ctx.allocator, error_reader, 8192) catch null;
+        defer if (error_body) |eb| ctx.allocator.free(eb);
+
+        std.debug.print("Azure OpenAI Responses API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), ctx.model.name });
+        if (error_body) |eb| {
+            std.debug.print("Error body: {s}\n", .{eb});
+        }
+
         ctx.stream.markThreadDone();
         ctx.stream.completeWithError("azure request failed");
         return;
