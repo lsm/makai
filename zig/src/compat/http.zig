@@ -14,6 +14,7 @@ pub const Response = std.http.Client.Response;
 pub const RequestOptions = struct {
     extra_headers: []const std.http.Header = &.{},
     keep_alive: bool = true,
+    accept_encoding: ?[]const u8 = null,
 };
 
 /// Thin HTTP client wrapper for the Zig 0.16 I/O migration seam.
@@ -38,6 +39,7 @@ pub const HttpClient = struct {
         return self.client.request(method, uri, .{
             .extra_headers = options.extra_headers,
             .keep_alive = options.keep_alive,
+            .headers = .{ .accept_encoding = if (options.accept_encoding) |value| .{ .override = value } else .default },
         });
     }
 };
@@ -84,4 +86,11 @@ test "compat http request options default to no extra headers" {
     const options = RequestOptions{};
     try std.testing.expectEqual(@as(usize, 0), options.extra_headers.len);
     try std.testing.expect(options.keep_alive);
+    try std.testing.expect(options.accept_encoding == null);
+}
+
+
+test "compat http request options can override accept encoding" {
+    const options = RequestOptions{ .accept_encoding = "identity" };
+    try std.testing.expectEqualStrings("identity", options.accept_encoding.?);
 }
