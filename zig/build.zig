@@ -398,6 +398,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "transport", .module = transport_mod },
         },
     });
