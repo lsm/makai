@@ -28,6 +28,56 @@ test("resolveMakaiBinary prefers MAKAI_BINARY_PATH override", async () => {
   }
 });
 
+test("resolveMakaiBinary rejects URL override without checksum", async () => {
+  const cacheDir = await fs.mkdtemp(path.join(os.tmpdir(), "makai-cache-"));
+  const prevUrl = process.env[ENV_BINARY_URL];
+  const prevChecksum = process.env[ENV_BINARY_SHA256];
+  const prevPath = process.env[ENV_BINARY_PATH];
+  process.env[ENV_BINARY_URL] = "http://127.0.0.1:1/makai-test.bin";
+  delete process.env[ENV_BINARY_SHA256];
+  delete process.env[ENV_BINARY_PATH];
+  try {
+    await assert.rejects(
+      () => resolveMakaiBinary({ cacheDir }),
+      /SHA256 checksum is required when downloading makai binary from URL/,
+    );
+  } finally {
+    if (prevUrl === undefined) delete process.env[ENV_BINARY_URL];
+    else process.env[ENV_BINARY_URL] = prevUrl;
+    if (prevChecksum === undefined) delete process.env[ENV_BINARY_SHA256];
+    else process.env[ENV_BINARY_SHA256] = prevChecksum;
+    if (prevPath === undefined) delete process.env[ENV_BINARY_PATH];
+    else process.env[ENV_BINARY_PATH] = prevPath;
+    await fs.rm(cacheDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveMakaiBinary rejects resolver URL option without checksum", async () => {
+  const prevUrl = process.env[ENV_BINARY_URL];
+  const prevChecksum = process.env[ENV_BINARY_SHA256];
+  const prevPath = process.env[ENV_BINARY_PATH];
+  delete process.env[ENV_BINARY_URL];
+  delete process.env[ENV_BINARY_SHA256];
+  delete process.env[ENV_BINARY_PATH];
+  try {
+    await assert.rejects(
+      () =>
+        // @ts-expect-error URL resolver options must include checksumSha256.
+        resolveMakaiBinary({
+          binaryUrl: "http://127.0.0.1:1/makai-test.bin",
+        }),
+      /SHA256 checksum is required when downloading makai binary from URL/,
+    );
+  } finally {
+    if (prevUrl === undefined) delete process.env[ENV_BINARY_URL];
+    else process.env[ENV_BINARY_URL] = prevUrl;
+    if (prevChecksum === undefined) delete process.env[ENV_BINARY_SHA256];
+    else process.env[ENV_BINARY_SHA256] = prevChecksum;
+    if (prevPath === undefined) delete process.env[ENV_BINARY_PATH];
+    else process.env[ENV_BINARY_PATH] = prevPath;
+  }
+});
+
 test("resolveMakaiBinary downloads URL override to cache with checksum", async () => {
   const payload = Buffer.from("makai-binary-content");
   const checksum = createHash("sha256").update(payload).digest("hex");
