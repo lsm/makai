@@ -201,17 +201,29 @@ void main();
 You can also configure automatic one-shot auth retry for `provider` and `agent` calls:
 
 ```ts
-const client = await createMakaiClient({
-  auth: {
-    auth_retry_policy: "auto_once",
-    handlers: {
-      onEvent: (event) => {
-        if (event.type === "auth_url") console.log(`Open ${event.url}`);
+import { createMakaiClient } from "makai";
+
+async function main(): Promise<void> {
+  const client = await createMakaiClient({
+    auth: {
+      auth_retry_policy: "auto_once",
+      handlers: {
+        onEvent: (event) => {
+          if (event.type === "auth_url") console.log(`Open ${event.url}`);
+        },
+        onPrompt: async (prompt) => prompt.allow_empty ? "" : process.env.MAKAI_AUTH_CODE ?? "",
       },
-      onPrompt: async (prompt) => prompt.allow_empty ? "" : process.env.MAKAI_AUTH_CODE ?? "",
     },
-  },
-});
+  });
+
+  try {
+    // Calls that hit auth_required can now trigger one login attempt automatically.
+  } finally {
+    await client.close();
+  }
+}
+
+void main();
 ```
 
 ## Models
@@ -261,11 +273,21 @@ void main();
 ```ts
 import { createMakaiClient } from "makai";
 
-const client = await createMakaiClient({
-  resolver: {
-    binaryPath: "/opt/makai/bin/makai",
-  },
-});
+async function main(): Promise<void> {
+  const client = await createMakaiClient({
+    resolver: {
+      binaryPath: "/opt/makai/bin/makai",
+    },
+  });
+
+  try {
+    // Use client.provider, client.agent, client.auth, or client.models here.
+  } finally {
+    await client.close();
+  }
+}
+
+void main();
 ```
 
 You can also set `MAKAI_BINARY_PATH=/opt/makai/bin/makai`.
@@ -275,13 +297,23 @@ You can also set `MAKAI_BINARY_PATH=/opt/makai/bin/makai`.
 ```ts
 import { createMakaiClient } from "makai";
 
-const client = await createMakaiClient({
-  resolver: {
-    binaryUrl: "https://example.com/releases/makai-darwin-arm64",
-    checksumSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    cacheDir: "/tmp/makai-bin-cache",
-  },
-});
+async function main(): Promise<void> {
+  const client = await createMakaiClient({
+    resolver: {
+      binaryUrl: "https://example.com/releases/makai-darwin-arm64",
+      checksumSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      cacheDir: "/tmp/makai-bin-cache",
+    },
+  });
+
+  try {
+    // Use client.provider, client.agent, client.auth, or client.models here.
+  } finally {
+    await client.close();
+  }
+}
+
+void main();
 ```
 
 Environment variable equivalents are `MAKAI_BINARY_URL` and `MAKAI_BINARY_SHA256`.
@@ -297,21 +329,33 @@ With no resolver options, Makai checks:
 ```ts
 import { createMakaiClient } from "makai";
 
-const client = await createMakaiClient({
-  // Optional transport settings:
-  args: ["--stdio"],
-  cwd: process.cwd(),
-  env: { ...process.env, MAKAI_LOG: "info" },
-  handshakeTimeoutMs: 2_000,
-  responseTimeoutMs: 30_000,
-  frameTimeoutMs: 30_000,
-});
+async function main(): Promise<void> {
+  const client = await createMakaiClient({
+    // Optional transport settings:
+    args: ["--stdio"],
+    cwd: process.cwd(),
+    env: { ...process.env, MAKAI_LOG: "info" },
+    handshakeTimeoutMs: 2_000,
+    responseTimeoutMs: 30_000,
+    frameTimeoutMs: 30_000,
+  });
+
+  try {
+    // Use client.provider, client.agent, client.auth, or client.models here.
+  } finally {
+    await client.close();
+  }
+}
+
+void main();
 ```
 
 Close clients when done:
 
 ```ts
-await client.close();
+async function closeClient(client: { close(): Promise<void> }): Promise<void> {
+  await client.close();
+}
 ```
 
 ## Error handling
