@@ -47,9 +47,7 @@ pub const HttpClient = struct {
 /// Send a request body and complete the outbound request.
 pub fn sendRequest(request: *Request, body: []const u8) !void {
     request.transfer_encoding = .{ .content_length = body.len };
-    var body_writer = try request.sendBody(&.{});
-    try body_writer.writer.writeAll(body);
-    try body_writer.end();
+    try request.sendBodyComplete(@constCast(body));
 }
 
 /// Receive the response headers/body metadata for a request.
