@@ -70,6 +70,12 @@ pub fn readAllResponse(reader: *ResponseReader, buffer: []u8) !void {
     try inner.readSliceAll(buffer);
 }
 
+/// Allocate and read the remaining response body up to `max_bytes`.
+pub fn allocRemainingResponse(allocator: std.mem.Allocator, reader: *ResponseReader, max_bytes: usize) ![]u8 {
+    const inner: *std.Io.Reader = @ptrCast(@alignCast(reader));
+    return inner.allocRemaining(allocator, std.Io.Limit.limited(max_bytes));
+}
+
 /// Return a streaming reader for a response body.
 pub fn responseReader(response: *Response, transfer_buf: []u8) *ResponseReader {
     return @ptrCast(@alignCast(response.reader(transfer_buf)));
