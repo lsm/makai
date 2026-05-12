@@ -230,7 +230,7 @@ pub const AuthStorage = struct {
         const dir_path = try std.fs.path.join(self.allocator, &.{ home, ".makai" });
         defer self.allocator.free(dir_path);
 
-        const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", "auth.json" });
+        const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", auth_file_name });
         defer self.allocator.free(file_path);
 
         const cwd = compat.fs.getCwd();
@@ -547,7 +547,7 @@ test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" 
 
     try storage.saveToFile();
 
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", "auth.json" });
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", auth_file_name });
     defer std.testing.allocator.free(file_path);
 
     const file = try std.fs.cwd().openFile(file_path, .{});
