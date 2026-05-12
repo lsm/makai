@@ -1050,6 +1050,62 @@ const ThreadCtx = struct {
     ping_interval_ms: ?u64 = null,
 };
 
+const TestCancelStage = enum {
+    connect_setup,
+    response_headers,
+    between_sse_events,
+    mid_event_payload,
+};
+
+var test_cancel_stage: ?TestCancelStage = null;
+
+fn testCancelAt(cancel_token: ?ai_types.CancelToken, stage: TestCancelStage) bool {
+    if (!@import("builtin").is_test) return false;
+    if (test_cancel_stage != stage) return false;
+    const ct = cancel_token orelse return false;
+    ct.cancelled.store(true, .release);
+    return ct.isCancelled();
+}
+
+const AnthropicHeaderSet = struct {
+    headers: std.ArrayList(std.http.Header),
+    auth_header: ?[]u8 = null,
+
+    pub fn deinit(self: *AnthropicHeaderSet, allocator: std.mem.Allocator) void {
+        if (self.auth_header) |h| allocator.free(h);
+        self.headers.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !AnthropicHeaderSet {
+    var out = AnthropicHeaderSet{ .headers = .empty };
+    errdefer out.deinit(allocator);
+
+    const is_oauth = isOAuthToken(api_key);
+
+    // OAuth tokens use Authorization: Bearer, API keys use x-api-key
+    if (is_oauth) {
+        out.auth_header = try buildBearerAuthValue(allocator, api_key);
+        try out.headers.append(allocator, .{ .name = "authorization", .value = out.auth_header.? });
+        // OAuth-specific headers (mimic Claude Code)
+        try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
+        try out.headers.append(allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" });
+        try out.headers.append(allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" });
+        try out.headers.append(allocator, .{ .name = "x-app", .value = "cli" });
+    } else {
+        try out.headers.append(allocator, .{ .name = "x-api-key", .value = api_key });
+        // Add beta headers for fine-grained tool streaming and interleaved thinking
+        try out.headers.append(allocator, .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" });
+    }
+
+    try out.headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" });
+    try out.headers.append(allocator, .{ .name = "content-type", .value = "application/json" });
+
+    return out;
+}
+
+
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1079,8 +1135,8 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
-    defer client.deinit();
+    var http_client = compat.http.HttpClient.init(allocator);
+    defer http_client.deinit();
 
     const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/messages") catch {
         allocator.free(api_key);
@@ -1101,87 +1157,7 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    const is_oauth = isOAuthToken(api_key);
-
-    // Allocate auth header for OAuth tokens (needs to persist until after request)
-    var auth_header: ?[]u8 = null;
-    defer if (auth_header) |h| allocator.free(h);
-
-    var headers: std.ArrayList(std.http.Header) = .empty;
-    defer headers.deinit(allocator);
-
-    // OAuth tokens use Authorization: Bearer, API keys use x-api-key
-    if (is_oauth) {
-        auth_header = buildBearerAuthValue(allocator, api_key) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom auth header");
-            return;
-        };
-        headers.append(allocator, .{ .name = "authorization", .value = auth_header.? }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-        // OAuth-specific headers (mimic Claude Code)
-        headers.append(allocator, .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-        headers.append(allocator, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-        headers.append(allocator, .{ .name = "user-agent", .value = "claude-cli/2.1.2 (external, cli)" }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-        headers.append(allocator, .{ .name = "x-app", .value = "cli" }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-    } else {
-        headers.append(allocator, .{ .name = "x-api-key", .value = api_key }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-        // Add beta headers for fine-grained tool streaming and interleaved thinking
-        headers.append(allocator, .{ .name = "anthropic-beta", .value = "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14" }) catch {
-            allocator.free(api_key);
-            allocator.free(request_body);
-            allocator.destroy(ctx);
-            stream.markThreadDone();
-            stream.completeWithError("oom headers");
-            return;
-        };
-    }
-
-    headers.append(allocator, .{ .name = "anthropic-version", .value = "2023-06-01" }) catch {
+    var header_set = buildAnthropicHeaders(allocator, api_key) catch {
         allocator.free(api_key);
         allocator.free(request_body);
         allocator.destroy(ctx);
@@ -1189,14 +1165,8 @@ fn runThread(ctx: *ThreadCtx) void {
         stream.completeWithError("oom headers");
         return;
     };
-    headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
-        allocator.free(api_key);
-        allocator.free(request_body);
-        allocator.destroy(ctx);
-        stream.markThreadDone();
-        stream.completeWithError("oom headers");
-        return;
-    };
+    defer header_set.deinit(allocator);
+    const headers = header_set.headers.items;
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1231,14 +1201,23 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
+        if (testCancelAt(cancel_token, .connect_setup)) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
+
         // SSE streams must not be gzip-compressed — gzip buffers the entire
         // stream before delivery, breaking real-time event delivery.
         // Use .headers.accept_encoding = .{ .override = "identity" } to
         // replace the Zig HTTP client's built-in "accept-encoding: gzip, deflate"
         // with "accept-encoding: identity" (no compression).
-        req = client.request(.POST, uri, .{
-            .extra_headers = headers.items,
-            .headers = .{ .accept_encoding = .{ .override = "identity" } },
+        req = http_client.openRequest(.POST, uri, .{
+            .extra_headers = headers,
+            .accept_encoding = "identity",
         }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
@@ -1264,8 +1243,7 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         req_initialized = true;
 
-        req.transfer_encoding = .{ .content_length = request_body.len };
-        req.sendBodyComplete(request_body) catch {
+        compat.http.sendRequest(&req, request_body) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1289,7 +1267,16 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
-        response = req.receiveHead(&head_buf) catch {
+        if (testCancelAt(cancel_token, .response_headers)) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
+
+        response = compat.http.receiveResponse(&req, &head_buf) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry_util.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1403,7 +1390,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
+    const reader = compat.http.responseReader(&response, &transfer_buf);
 
     // Track content blocks by API index
     const BlockInfo = struct {
@@ -1479,7 +1466,16 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        const n = reader.*.readSliceShort(&read_buf) catch {
+        if (testCancelAt(cancel_token, .between_sse_events)) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
+
+        const n = compat.http.readResponse(reader, &read_buf) catch {
             allocator.free(api_key);
             allocator.free(request_body);
             allocator.destroy(ctx);
@@ -1488,6 +1484,15 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         if (n == 0) break;
+
+        if (testCancelAt(cancel_token, .mid_event_payload)) {
+            allocator.free(api_key);
+            allocator.free(request_body);
+            allocator.destroy(ctx);
+            stream.markThreadDone();
+            stream.completeWithError("request cancelled");
+            return;
+        }
 
         // Accumulate raw bytes for error diagnosis (capped at 8 KB)
         if (raw_body.items.len < 8192) {
@@ -2240,6 +2245,16 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
 
+fn expectSyntheticAnthropicBoundaryCancellation(stage: TestCancelStage) !void {
+    var cancelled = std.atomic.Value(bool).init(false);
+    const cancel_token = ai_types.CancelToken{ .cancelled = &cancelled };
+
+    test_cancel_stage = stage;
+    defer test_cancel_stage = null;
+
+    try std.testing.expect(testCancelAt(cancel_token, stage));
+    try std.testing.expect(cancel_token.isCancelled());
+}
 
 test "provider_cancellation_anthropic_cancel_before_request" {
     var cancelled = std.atomic.Value(bool).init(true);
@@ -2251,4 +2266,58 @@ test "provider_cancellation_anthropic_cancel_before_request" {
         std.testing.allocator,
     );
     try expectCancelledStream(stream, std.testing.allocator);
+}
+
+test "provider_cancellation_anthropic_cancel_during_connect_setup" {
+    try expectSyntheticAnthropicBoundaryCancellation(.connect_setup);
+}
+
+test "provider_cancellation_anthropic_cancel_during_response_headers" {
+    try expectSyntheticAnthropicBoundaryCancellation(.response_headers);
+}
+
+test "provider_cancellation_anthropic_cancel_between_sse_events" {
+    try expectSyntheticAnthropicBoundaryCancellation(.between_sse_events);
+}
+
+test "provider_cancellation_anthropic_cancel_mid_event_payload" {
+    try expectSyntheticAnthropicBoundaryCancellation(.mid_event_payload);
+}
+
+test "anthropic_api_key_headers_are_forwarded_exactly" {
+    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-api-test");
+    defer header_set.deinit(std.testing.allocator);
+
+    const headers = header_set.headers.items;
+    try std.testing.expectEqual(@as(usize, 4), headers.len);
+    try std.testing.expectEqualStrings("x-api-key", headers[0].name);
+    try std.testing.expectEqualStrings("sk-ant-api-test", headers[0].value);
+    try std.testing.expectEqualStrings("anthropic-beta", headers[1].name);
+    try std.testing.expectEqualStrings("fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14", headers[1].value);
+    try std.testing.expectEqualStrings("anthropic-version", headers[2].name);
+    try std.testing.expectEqualStrings("2023-06-01", headers[2].value);
+    try std.testing.expectEqualStrings("content-type", headers[3].name);
+    try std.testing.expectEqualStrings("application/json", headers[3].value);
+}
+
+test "anthropic_oauth_headers_are_forwarded_exactly" {
+    var header_set = try buildAnthropicHeaders(std.testing.allocator, "sk-ant-oat-test");
+    defer header_set.deinit(std.testing.allocator);
+
+    const headers = header_set.headers.items;
+    try std.testing.expectEqual(@as(usize, 7), headers.len);
+    try std.testing.expectEqualStrings("authorization", headers[0].name);
+    try std.testing.expectEqualStrings("Bearer sk-ant-oat-test", headers[0].value);
+    try std.testing.expectEqualStrings("anthropic-beta", headers[1].name);
+    try std.testing.expectEqualStrings("claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14", headers[1].value);
+    try std.testing.expectEqualStrings("anthropic-dangerous-direct-browser-access", headers[2].name);
+    try std.testing.expectEqualStrings("true", headers[2].value);
+    try std.testing.expectEqualStrings("user-agent", headers[3].name);
+    try std.testing.expectEqualStrings("claude-cli/2.1.2 (external, cli)", headers[3].value);
+    try std.testing.expectEqualStrings("x-app", headers[4].name);
+    try std.testing.expectEqualStrings("cli", headers[4].value);
+    try std.testing.expectEqualStrings("anthropic-version", headers[5].name);
+    try std.testing.expectEqualStrings("2023-06-01", headers[5].value);
+    try std.testing.expectEqualStrings("content-type", headers[6].name);
+    try std.testing.expectEqualStrings("application/json", headers[6].value);
 }

@@ -1069,7 +1069,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = compat_mod.http.HttpClient.init(allocator);
     defer client.deinit();
 
     // GitHub Copilot uses /chat/completions, others use /v1/chat/completions
@@ -1182,10 +1182,10 @@ fn runThread(ctx: *ThreadCtx) void {
     const BASE_DELAY_MS: u32 = 1000;
     const max_delay_ms: u32 = if (retry_config) |rc| rc.max_retry_delay_ms orelse 60000 else 60000;
 
-    var response: std.http.Client.Response = undefined;
+    var response: compat_mod.http.Response = undefined;
     var head_buf: [4096]u8 = undefined;
     var retry_attempt: u8 = 0;
-    var req: std.http.Client.Request = undefined;
+    var req: compat_mod.http.Request = undefined;
     var req_initialized = false;
     defer if (req_initialized) req.deinit();
 
@@ -1206,7 +1206,7 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
-        req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+        req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1227,9 +1227,7 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         req_initialized = true;
 
-        req.transfer_encoding = .{ .content_length = request_body.len };
-
-        req.sendBodyComplete(request_body) catch {
+        compat_mod.http.sendRequest(&req, request_body) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1249,7 +1247,7 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
 
-        response = req.receiveHead(&head_buf) catch {
+        response = compat_mod.http.receiveResponse(&req, &head_buf) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1339,7 +1337,8 @@ fn runThread(ctx: *ThreadCtx) void {
     if (response.head.status != .ok) {
         // Read error body for debugging
         var error_buf: [4096]u8 = undefined;
-        const error_body = response.reader(&error_buf).*.allocRemaining(allocator, std.Io.Limit.limited(8192)) catch null;
+        const error_reader = compat_mod.http.responseReader(&response, &error_buf);
+        const error_body = compat_mod.http.allocRemainingResponse(allocator, error_reader, 8192) catch null;
         defer if (error_body) |eb| allocator.free(eb);
 
         std.debug.print("OpenAI API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), model.name });
@@ -1388,7 +1387,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
+    const reader = compat_mod.http.responseReader(&response, &transfer_buf);
 
     // Ping tracking
     var last_ping_time: i64 = 0;
@@ -1429,7 +1428,7 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        const n = reader.*.readSliceShort(&read_buf) catch {
+        const n = compat_mod.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("read error");

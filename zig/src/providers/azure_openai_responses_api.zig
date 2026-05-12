@@ -243,7 +243,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    var client = std.http.Client{ .allocator = ctx.allocator, .io = if (@import("builtin").is_test) std.testing.io else std.Io.Threaded.global_single_threaded.io() };
+    var client = compat.http.HttpClient.init(ctx.allocator);
     defer client.deinit();
 
     const url = std.fmt.allocPrint(ctx.allocator, "{s}/openai/v1/responses", .{ctx.base_url}) catch {
@@ -270,28 +270,38 @@ fn runThread(ctx: *ThreadCtx) void {
         return ctx.stream.completeWithError("oom headers");
     };
 
-    var req = client.request(.POST, uri, .{ .extra_headers = headers.items }) catch {
+    var req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch {
         ctx.stream.markThreadDone();
         ctx.stream.completeWithError("request failed");
         return;
     };
     defer req.deinit();
 
-    req.transfer_encoding = .{ .content_length = ctx.body.len };
-    req.sendBodyComplete(ctx.body) catch {
+    compat.http.sendRequest(&req, ctx.body) catch {
         ctx.stream.markThreadDone();
         ctx.stream.completeWithError("send failed");
         return;
     };
 
     var head_buf: [4096]u8 = undefined;
-    var response = req.receiveHead(&head_buf) catch {
+    var response = compat.http.receiveResponse(&req, &head_buf) catch {
         ctx.stream.markThreadDone();
         ctx.stream.completeWithError("receive failed");
         return;
     };
 
     if (response.head.status != .ok) {
+        // Read error body for debugging
+        var error_buf: [4096]u8 = undefined;
+        const error_reader = compat.http.responseReader(&response, &error_buf);
+        const error_body = compat.http.allocRemainingResponse(ctx.allocator, error_reader, 8192) catch null;
+        defer if (error_body) |eb| ctx.allocator.free(eb);
+
+        std.debug.print("Azure OpenAI Responses API error: status={d}, model={s}\n", .{ @intFromEnum(response.head.status), ctx.model.name });
+        if (error_body) |eb| {
+            std.debug.print("Error body: {s}\n", .{eb});
+        }
+
         ctx.stream.markThreadDone();
         ctx.stream.completeWithError("azure request failed");
         return;
@@ -302,7 +312,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     var transfer_buf: [4096]u8 = undefined;
     var read_buf: [8192]u8 = undefined;
-    const reader = response.reader(&transfer_buf);
+    const reader = compat.http.responseReader(&response, &transfer_buf);
 
     var text = std.ArrayList(u8).empty;
     defer text.deinit(ctx.allocator);
@@ -323,7 +333,7 @@ fn runThread(ctx: *ThreadCtx) void {
             }
         }
 
-        const n = reader.*.readSliceShort(&read_buf) catch {
+        const n = compat.http.readResponse(reader, &read_buf) catch {
             ctx.stream.markThreadDone();
             ctx.stream.completeWithError("read failed");
             return;
