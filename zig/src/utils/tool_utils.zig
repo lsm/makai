@@ -1,5 +1,6 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const compat = @import("compat");
 
 const Allocator = std.mem.Allocator;
 
@@ -84,9 +85,7 @@ pub fn isValidToolCallId(id: []const u8, provider: Provider) bool {
     };
 }
 
-/// Generate a Mistral-compatible tool call ID (9 alphanumeric chars).
-/// Uses random bytes for uniqueness.
-pub fn generateMistralToolCallId(allocator: Allocator) ![]u8 {
+fn generateMistralToolCallIdWithRandom(allocator: Allocator, fill_random: fn ([]u8) void) ![]u8 {
     const target_len = 9;
     var result = try allocator.alloc(u8, target_len);
     errdefer allocator.free(result);
@@ -94,13 +93,20 @@ pub fn generateMistralToolCallId(allocator: Allocator) ![]u8 {
     const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
     var random_bytes: [16]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    fill_random(&random_bytes);
 
     for (0..target_len) |i| {
         result[i] = alphabet[random_bytes[i] % alphabet.len];
     }
 
     return result;
+}
+
+/// Generate a Mistral-compatible tool call ID (9 alphanumeric chars).
+/// Uses ordinary random bytes for uniqueness; IDs are provider correlation
+/// handles, not authentication secrets.
+pub fn generateMistralToolCallId(allocator: Allocator) ![]u8 {
+    return generateMistralToolCallIdWithRandom(allocator, compat.random.fillRandomBytes);
 }
 
 /// Create a mapping from original ID to normalized ID for round-trip conversion
@@ -314,6 +320,12 @@ test "isValidToolCallId for other providers" {
     try std.testing.expect(!isValidToolCallId("", .openai));
 }
 
+fn fillDeterministicToolIdBytes(buf: []u8) void {
+    for (buf, 0..) |*byte, i| {
+        byte.* = @intCast(i);
+    }
+}
+
 test "generateMistralToolCallId produces valid IDs" {
     const id1 = try generateMistralToolCallId(std.testing.allocator);
     defer std.testing.allocator.free(id1);
@@ -331,6 +343,17 @@ test "generateMistralToolCallId produces valid IDs" {
 
     // Should be different (extremely unlikely to be same)
     try std.testing.expect(!std.mem.eql(u8, id1, id2));
+}
+
+test "generateMistralToolCallIdWithRandom is deterministic for test seam" {
+    const id1 = try generateMistralToolCallIdWithRandom(std.testing.allocator, fillDeterministicToolIdBytes);
+    defer std.testing.allocator.free(id1);
+
+    const id2 = try generateMistralToolCallIdWithRandom(std.testing.allocator, fillDeterministicToolIdBytes);
+    defer std.testing.allocator.free(id2);
+
+    try std.testing.expectEqualStrings(id1, id2);
+    try std.testing.expectEqualStrings("abcdefghi", id1);
 }
 
 test "ToolIdMapping create and lookup from AssistantContent" {

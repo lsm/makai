@@ -28,9 +28,8 @@ pub const DeterministicSource = struct {
 
 /// Fill `buf` with security-sensitive random bytes.
 ///
-/// 0.15.2: wraps `std.crypto.random.bytes`.
-/// 0.16: use `io.randomSecure` through the Makai default context while keeping
-/// raw `std.Io` out of this public signature. OAuth PKCE/state, credential
+/// Uses `io.randomSecure` through the Makai default context while keeping raw
+/// `std.Io` out of this public signature. OAuth PKCE/state, credential
 /// material, and protocol-sensitive nonces should prefer this helper.
 pub fn fillSecureBytes(buf: []u8) void {
     defaultIo().randomSecure(buf) catch |err| {
@@ -40,19 +39,16 @@ pub fn fillSecureBytes(buf: []u8) void {
 
 /// Fill `buf` with ordinary random bytes.
 ///
-/// 0.15.2: this is currently equivalent to `fillSecureBytes`; both use
-/// `std.crypto.random.bytes` until the Zig 0.16 I/O context exists.
-///
-/// 0.16: use `io.random` through the Makai default context and keep this
-/// separate from `fillSecureBytes`. Do not use this for credentials, PKCE,
-/// OAuth state, or other security-sensitive values.
+/// Uses `io.random` through the Makai default context and stays separate from
+/// `fillSecureBytes`. Do not use this for credentials, PKCE, OAuth state, or
+/// other security-sensitive values.
 pub fn fillRandomBytes(buf: []u8) void {
     defaultIo().random(buf);
 }
 
 /// Allocate and fill security-sensitive random bytes.
 ///
-/// 0.16: use `io.randomSecure` through the Makai default context.
+/// Uses `io.randomSecure` through the Makai default context.
 pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
     const buf = try allocator.alloc(u8, len);
     fillSecureBytes(buf);
@@ -61,7 +57,7 @@ pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
 
 /// Allocate and fill ordinary random bytes for non-security identifiers.
 ///
-/// 0.16: use `io.random` through the Makai default context.
+/// Uses `io.random` through the Makai default context.
 pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
     const buf = try allocator.alloc(u8, len);
     fillRandomBytes(buf);
@@ -70,9 +66,8 @@ pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
 
 /// Return a secure random integer in `[0, upper_bound)` without modulo bias.
 ///
-/// 0.15.2: delegates to `std.crypto.random.intRangeLessThan`, which uses
-/// rejection sampling. 0.16: use `io.randomSecure` through the Makai default
-/// context and preserve rejection-sampling semantics.
+/// Uses `io.randomSecure` through the Makai default context and preserves
+/// rejection-sampling semantics.
 pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
     std.debug.assert(upper_bound > 0);
 
@@ -90,9 +85,7 @@ pub fn secureIntRangeLessThan(comptime T: type, upper_bound: T) T {
 
 /// Return an ordinary random integer in `[0, upper_bound)` without modulo bias.
 ///
-/// 0.15.2: this is currently equivalent to `secureIntRangeLessThan`; both use
-/// `std.crypto.random.intRangeLessThan` until the Zig 0.16 I/O context exists.
-/// 0.16: use `io.random` through the Makai default context and preserve
+/// Uses `io.random` through the Makai default context and preserves
 /// rejection-sampling semantics.
 pub fn randomIntRangeLessThan(comptime T: type, upper_bound: T) T {
     var source: std.Random.IoSource = .{ .io = defaultIo() };
@@ -120,6 +113,14 @@ test "compat random helpers allocate requested lengths" {
 
     try std.testing.expectEqual(@as(usize, 32), secure.len);
     try std.testing.expectEqual(@as(usize, 17), ordinary.len);
+}
+
+test "compat secure and ordinary helpers remain separate production entry points" {
+    const SecureHelper = @TypeOf(fillSecureBytes);
+    const OrdinaryHelper = @TypeOf(fillRandomBytes);
+
+    try std.testing.expectEqual(SecureHelper, OrdinaryHelper);
+    try std.testing.expect(fillSecureBytes != fillRandomBytes);
 }
 
 test "compat random helpers generate non-empty bytes" {

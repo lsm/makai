@@ -17,6 +17,39 @@ if [[ -n "$all_catch_unreachable" ]]; then
   fi
 fi
 
+echo "[patterns] checking direct std.crypto.random usage..."
+all_crypto_random="$(grep -Rns "std\.crypto\.random" zig/src || true)"
+if [[ -n "$all_crypto_random" ]]; then
+  crypto_random_violations="$(printf "%s\n" "$all_crypto_random" \
+    | grep -v "zig/src/compat/random.zig" \
+    | grep -vE "^[^:]+:[0-9]+:\s*//" || true)"
+  if [[ -n "$crypto_random_violations" ]]; then
+    echo "[patterns] direct std.crypto.random usage found:" >&2
+    echo "$crypto_random_violations" >&2
+    echo "[patterns] use compat.random secure/ordinary helpers instead" >&2
+    exit 1
+  fi
+fi
+
+secure_random_files=(
+  "zig/src/oauth/pkce.zig"
+  "zig/src/utils/oauth/pkce.zig"
+  "zig/src/oauth/openai_codex.zig"
+  "zig/src/oauth/google_gemini_cli.zig"
+  "zig/src/oauth/google_antigravity.zig"
+  "zig/src/transports/websocket.zig"
+  "zig/src/protocol/provider/types.zig"
+)
+
+for file in "${secure_random_files[@]}"; do
+  if grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >/dev/null; then
+    echo "[patterns] security-sensitive random path uses ordinary entropy in $file" >&2
+    grep -nE "compat\.random\.(fillRandomBytes|randomBytes|randomIntRangeLessThan|int)\b|\.random\(" "$file" >&2
+    echo "[patterns] use compat.random secure helpers / io.randomSecure for OAuth, WebSocket, and protocol IDs" >&2
+    exit 1
+  fi
+done
+
 echo "[patterns] checking deinit poisoning in critical types..."
 required_files=(
   "zig/src/event_stream.zig"
