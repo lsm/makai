@@ -1,3 +1,11 @@
+//! Stack-allocated PKCE helper for OAuth flows under `oauth/`.
+//!
+//! This remains separate from `utils/oauth/pkce.zig` because those flows expose
+//! heap-owned verifier/challenge strings with `deinit()`, while OpenAI Codex,
+//! Google Gemini CLI, and Google Antigravity use fixed-size `PKCEPair` values.
+//! Both implementations share `compat.random.fillSecureBytes` for verifier
+//! entropy.
+
 const std = @import("std");
 const compat = @import("compat");
 

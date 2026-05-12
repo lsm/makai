@@ -1,3 +1,10 @@
+//! Heap-allocated PKCE helper for OAuth flows under `utils/oauth/`.
+//!
+//! This remains separate from `oauth/pkce.zig` because Anthropic and Google
+//! utility flows need owned verifier/challenge slices with `deinit()`, while
+//! the `oauth/` flows use fixed-size stack-allocated `PKCEPair` values. Both
+//! implementations share `compat.random.fillSecureBytes` for verifier entropy.
+
 const std = @import("std");
 const compat = @import("compat");
 

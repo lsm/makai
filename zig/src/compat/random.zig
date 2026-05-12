@@ -48,7 +48,7 @@ pub fn fillRandomBytes(buf: []u8) void {
 
 /// Allocate and fill security-sensitive random bytes.
 ///
-/// 0.16: use `io.randomSecure` through the Makai default context.
+/// Uses `io.randomSecure` through the Makai default context.
 pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
     const buf = try allocator.alloc(u8, len);
     fillSecureBytes(buf);
@@ -57,7 +57,7 @@ pub fn secureBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
 
 /// Allocate and fill ordinary random bytes for non-security identifiers.
 ///
-/// 0.16: use `io.random` through the Makai default context.
+/// Uses `io.random` through the Makai default context.
 pub fn randomBytes(allocator: std.mem.Allocator, len: usize) ![]u8 {
     const buf = try allocator.alloc(u8, len);
     fillRandomBytes(buf);
