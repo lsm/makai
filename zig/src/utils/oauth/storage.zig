@@ -8,6 +8,102 @@ fn defaultIo() std.Io {
         std.Io.Threaded.global_single_threaded.io();
 }
 
+const auth_file_name = "auth.json";
+const auth_temp_prefix = auth_file_name ++ ".tmp.";
+const credential_file_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+const stale_temp_min_age_ms = 24 * 60 * 60 * 1000;
+
+fn secureFree(allocator: std.mem.Allocator, data: []const u8) void {
+    if (data.len == 0) {
+        allocator.free(data);
+        return;
+    }
+
+    const writable: []u8 = @constCast(data);
+    std.crypto.secureZero(u8, writable);
+    allocator.free(data);
+}
+
+fn isAuthTempFile(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, auth_temp_prefix);
+}
+
+fn parseAuthTempTimestampMillis(name: []const u8) ?i64 {
+    if (!isAuthTempFile(name)) return null;
+
+    const suffix = name[auth_temp_prefix.len..];
+    const dot_index = std.mem.indexOfScalar(u8, suffix, '.') orelse return null;
+    if (dot_index == 0) return null;
+
+    return std.fmt.parseInt(i64, suffix[0..dot_index], 10) catch null;
+}
+
+fn isStaleAuthTempFile(name: []const u8, now_ms: i64) bool {
+    const created_ms = parseAuthTempTimestampMillis(name) orelse return false;
+    return created_ms <= now_ms - stale_temp_min_age_ms;
+}
+
+fn cleanupStaleAuthTempFiles(auth_dir: std.Io.Dir) !void {
+    var iterable_dir = try auth_dir.openDir(defaultIo(), ".", .{ .iterate = true });
+    defer iterable_dir.close(defaultIo());
+
+    const now_ms = compat.time.nowMillis();
+    var iter = iterable_dir.iterate();
+    while (try iter.next(defaultIo())) |entry| {
+        if (entry.kind == .file and isStaleAuthTempFile(entry.name, now_ms)) {
+            // Stale temp cleanup is best-effort: credential writes must not fail
+            // merely because an unrelated orphan is locked or owned by another UID.
+            auth_dir.deleteFile(defaultIo(), entry.name) catch {};
+        }
+    }
+}
+
+fn cleanupExistingAuthDirectory(cwd: std.Io.Dir, dir_path: []const u8) void {
+    var auth_dir = cwd.openDir(defaultIo(), dir_path, .{ .iterate = true }) catch return;
+    defer auth_dir.close(defaultIo());
+
+    cleanupStaleAuthTempFiles(auth_dir) catch {};
+}
+
+fn prepareAuthDirectory(cwd: std.Io.Dir, dir_path: []const u8) !void {
+    try compat.fs.createDir(cwd, dir_path);
+}
+
+fn atomicSaveCredentials(cwd: std.Io.Dir, dir_path: []const u8, file_path: []const u8, data: []const u8, allocator: std.mem.Allocator) !void {
+    var auth_dir = try cwd.openDir(defaultIo(), dir_path, .{});
+    defer auth_dir.close(defaultIo());
+
+    const tmp_name = try std.fmt.allocPrint(allocator, "{s}{d}.{x}", .{ auth_temp_prefix, compat.time.nowMillis(), compat.random.int(u64) });
+    defer allocator.free(tmp_name);
+
+    var cleanup_tmp = false;
+    defer if (cleanup_tmp) auth_dir.deleteFile(defaultIo(), tmp_name) catch {};
+
+    {
+        var file = try auth_dir.createFile(defaultIo(), tmp_name, .{ .exclusive = true, .truncate = false, .permissions = credential_file_permissions });
+        cleanup_tmp = true;
+        defer file.close(defaultIo());
+        try file.writeStreamingAll(defaultIo(), data);
+        try file.sync(defaultIo());
+        file.setPermissions(defaultIo(), credential_file_permissions) catch |err| switch (err) {
+            error.PermissionDenied => return err,
+            else => {},
+        };
+    }
+
+    try auth_dir.rename(tmp_name, auth_dir, auth_file_name, defaultIo());
+    cleanup_tmp = false;
+
+    // Re-apply restrictive permissions after rename so the credential file is
+    // 0600 even on filesystems that do not preserve create-time permissions.
+    var final_file = try compat.fs.openFile(cwd, file_path, .{ .mode = .write_only });
+    defer final_file.close(defaultIo());
+    final_file.setPermissions(defaultIo(), credential_file_permissions) catch |err| switch (err) {
+        error.PermissionDenied => return err,
+        else => {},
+    };
+}
+
 pub const Credentials = struct {
     refresh: []const u8,
     access: []const u8,
@@ -15,10 +111,10 @@ pub const Credentials = struct {
     provider_data: ?[]const u8 = null,
 
     pub fn deinit(self: *const Credentials, allocator: std.mem.Allocator) void {
-        allocator.free(self.refresh);
-        allocator.free(self.access);
+        secureFree(allocator, self.refresh);
+        secureFree(allocator, self.access);
         if (self.provider_data) |data| {
-            allocator.free(data);
+            secureFree(allocator, data);
         }
     }
 };
@@ -37,7 +133,7 @@ pub const ProviderAuth = union(enum) {
 
     pub fn deinit(self: *const ProviderAuth, allocator: std.mem.Allocator) void {
         switch (self.*) {
-            .api_key => |key| allocator.free(key),
+            .api_key => |key| secureFree(allocator, key),
             .oauth => |creds| creds.deinit(allocator),
         }
     }
@@ -55,10 +151,14 @@ pub const AuthStorage = struct {
     pub fn loadFromFile(allocator: std.mem.Allocator) !AuthStorage {
         const home = compat.getEnvVarOwned(allocator, "HOME") catch return error.NoHomeDir;
         defer allocator.free(home);
-        const path = try std.fs.path.join(allocator, &.{ home, ".makai", "auth.json" });
+        const dir_path = try std.fs.path.join(allocator, &.{ home, ".makai" });
+        defer allocator.free(dir_path);
+        const path = try std.fs.path.join(allocator, &.{ home, ".makai", auth_file_name });
         defer allocator.free(path);
 
         const cwd = compat.fs.getCwd();
+        cleanupExistingAuthDirectory(cwd, dir_path);
+
         var file = compat.fs.openFile(cwd, path, .{}) catch {
             // File doesn't exist, return empty storage
             return .{
@@ -130,17 +230,12 @@ pub const AuthStorage = struct {
         const dir_path = try std.fs.path.join(self.allocator, &.{ home, ".makai" });
         defer self.allocator.free(dir_path);
 
-        // Ensure directory exists
-        const cwd = compat.fs.getCwd();
-        compat.fs.createDir(cwd, dir_path) catch {};
-
-        const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", "auth.json" });
+        const file_path = try std.fs.path.join(self.allocator, &.{ home, ".makai", auth_file_name });
         defer self.allocator.free(file_path);
 
-        // Write to temporary file with a unique suffix (timestamp + random)
-        // to avoid collisions when two processes write concurrently.
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}.{x}", .{ file_path, compat.time.nowMillis(), compat.random.int(u64) });
-        defer self.allocator.free(tmp_path);
+        const cwd = compat.fs.getCwd();
+        try prepareAuthDirectory(cwd, dir_path);
+        cleanupExistingAuthDirectory(cwd, dir_path);
 
         // Build JSON
         var json_buf = std.ArrayList(u8).empty;
@@ -196,10 +291,7 @@ pub const AuthStorage = struct {
 
         try json_buf.appendSlice(self.allocator, "\n}\n");
 
-        // Atomic replace writes with restrictive permissions at the filesystem
-        // compatibility seam. Crash-safety hardening remains in the dedicated
-        // filesystem wrapper PR.
-        try compat.fs.atomicReplace(cwd, file_path, tmp_path, json_buf.items);
+        try atomicSaveCredentials(cwd, dir_path, file_path, json_buf.items, self.allocator);
     }
 
     pub fn hasRefreshableCredentials(self: *const AuthStorage, provider_id: []const u8) bool {
@@ -423,9 +515,17 @@ fn countAuthTempFiles(home: []const u8) !usize {
     var count: usize = 0;
     var it = dir.iterate();
     while (try it.next()) |entry| {
-        if (std.mem.startsWith(u8, entry.name, "auth.json.tmp.")) count += 1;
+        if (isAuthTempFile(entry.name)) count += 1;
     }
     return count;
+}
+
+fn staleAuthTempName(allocator: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}{d}.{s}", .{ auth_temp_prefix, compat.time.nowMillis() - stale_temp_min_age_ms - 1000, suffix });
+}
+
+fn activeAuthTempName(allocator: std.mem.Allocator, suffix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(allocator, "{s}{d}.{s}", .{ auth_temp_prefix, compat.time.nowMillis(), suffix });
 }
 
 test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" {
@@ -447,7 +547,7 @@ test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" 
 
     try storage.saveToFile();
 
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", "auth.json" });
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", auth_file_name });
     defer std.testing.allocator.free(file_path);
 
     const file = try std.fs.cwd().openFile(file_path, .{});
@@ -466,7 +566,7 @@ test "oauth_storage_saveToFile_direct_sets_0600_and_same_directory_temp_rename" 
     try std.testing.expectEqual(@as(usize, 0), try countAuthTempFiles(home));
 }
 
-test "oauth_storage_saveToFile_rename_failure_leaves_target_unchanged_and_temp_visible_for_cleanup" {
+test "oauth_storage_saveToFile_rename_failure_leaves_target_unchanged_and_cleans_temp" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -478,7 +578,7 @@ test "oauth_storage_saveToFile_rename_failure_leaves_target_unchanged_and_temp_v
     defer std.testing.allocator.free(makai_path);
     try std.fs.cwd().makePath(makai_path);
 
-    const blocker_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", "auth.json" });
+    const blocker_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", auth_file_name });
     defer std.testing.allocator.free(blocker_path);
     try std.fs.cwd().makePath(blocker_path);
 
@@ -495,7 +595,117 @@ test "oauth_storage_saveToFile_rename_failure_leaves_target_unchanged_and_temp_v
 
     const stat = try std.fs.cwd().statFile(blocker_path);
     try std.testing.expectEqual(std.fs.File.Kind.directory, stat.kind);
+    try std.testing.expectEqual(@as(usize, 0), try countAuthTempFiles(home));
+}
 
-    const temp_count = try countAuthTempFiles(home);
-    try std.testing.expect(temp_count >= 1);
+fn writeAuthTestFile(home: []const u8, name: []const u8, content: []const u8) !void {
+    const path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", name });
+    defer std.testing.allocator.free(path);
+    var file = try std.fs.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+test "oauth_storage_loadFromFile_cleans_stale_temp_files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = tmp.sub_path[0..];
+    const previous_home = try setHomeForTest(std.testing.allocator, home);
+    defer restoreHomeForTest(std.testing.allocator, previous_home);
+
+    const makai_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
+    defer std.testing.allocator.free(makai_path);
+    try std.fs.cwd().makePath(makai_path);
+
+    const stale_tmp = try staleAuthTempName(std.testing.allocator, "stale");
+    defer std.testing.allocator.free(stale_tmp);
+    try writeAuthTestFile(home, stale_tmp, "orphaned");
+    try writeAuthTestFile(home, auth_file_name, "{\"provider\":{\"api_key\":\"key\"}}\n");
+
+    var storage = try AuthStorage.loadFromFile(std.testing.allocator);
+    defer storage.deinit();
+
+    try std.testing.expect(storage.providers.contains("provider"));
+    try std.testing.expectEqual(@as(usize, 0), try countAuthTempFiles(home));
+}
+
+test "oauth_storage_saveToFile_replaces_existing_file_without_requiring_temp_cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = tmp.sub_path[0..];
+    const previous_home = try setHomeForTest(std.testing.allocator, home);
+    defer restoreHomeForTest(std.testing.allocator, previous_home);
+
+    const makai_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
+    defer std.testing.allocator.free(makai_path);
+    try std.fs.cwd().makePath(makai_path);
+
+    const auth_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", auth_file_name });
+    defer std.testing.allocator.free(auth_path);
+    try std.fs.cwd().writeFile(.{ .sub_path = auth_path, .data = "original-credentials" });
+
+    const active_tmp = try activeAuthTempName(std.testing.allocator, "active");
+    defer std.testing.allocator.free(active_tmp);
+    try writeAuthTestFile(home, active_tmp, "active-writer");
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    const api_key = try std.testing.allocator.dupe(u8, "replacement-key");
+    try putOwnedAuth(&storage, "provider", .{ .api_key = api_key });
+
+    try storage.saveToFile();
+
+    const content = try std.fs.cwd().readFileAlloc(auth_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.find(u8, content, "replacement-key") != null);
+
+    const active_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", active_tmp });
+    defer std.testing.allocator.free(active_path);
+    const active_content = try std.fs.cwd().readFileAlloc(active_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(active_content);
+    try std.testing.expectEqualStrings("active-writer", active_content);
+}
+
+// POSIX-only because Windows directory permission semantics do not model a
+// writable/searchable but non-readable directory in the same way.
+test "oauth_storage_saveToFile_does_not_require_directory_iteration" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = tmp.sub_path[0..];
+    const previous_home = try setHomeForTest(std.testing.allocator, home);
+    defer restoreHomeForTest(std.testing.allocator, previous_home);
+
+    const makai_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai" });
+    defer std.testing.allocator.free(makai_path);
+    try std.fs.cwd().makePath(makai_path);
+    var makai_dir = try std.Io.Dir.cwd().openDir(defaultIo(), makai_path, .{});
+    defer makai_dir.close(defaultIo());
+    try makai_dir.setPermissions(defaultIo(), @enumFromInt(0o300));
+    defer makai_dir.setPermissions(defaultIo(), @enumFromInt(0o700)) catch {};
+
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+
+    const api_key = try std.testing.allocator.dupe(u8, "search-only-key");
+    try putOwnedAuth(&storage, "provider", .{ .api_key = api_key });
+
+    try storage.saveToFile();
+
+    const auth_path = try std.fs.path.join(std.testing.allocator, &.{ home, ".makai", auth_file_name });
+    defer std.testing.allocator.free(auth_path);
+    const content = try std.fs.cwd().readFileAlloc(auth_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.find(u8, content, "search-only-key") != null);
 }
