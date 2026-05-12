@@ -1,35 +1,25 @@
 //! WebSocket Transport (Beta)
 //!
 //! This implementation is suitable for development and testing.
-//! Production use requires TLS termination via reverse proxy.
-//! See PROTOCOL.md for current limitations.
+//! Production use requires TLS termination via reverse proxy: `wss://` is parsed
+//! but still rejected with `error.TlsNotSupported` because this transport only
+//! wraps plain TCP streams.
+//!
+//! Networking is routed through Makai's `compat.net` seam, which currently uses
+//! the project default `std.Io.Threaded` context (`std.testing.io` in tests).
+//! Zig 0.16 `std.Io.Evented` networking remains unsupported by that seam.
+//!
+//! Handshake validation checks status/upgrade headers and the presence of
+//! `Sec-WebSocket-Accept`; it does not yet verify the accept value against the
+//! request nonce.
 
 const std = @import("std");
 const transport = @import("transport");
 const ai_types = @import("ai_types");
 const compat = @import("compat");
 
-fn defaultIo() std.Io {
-    return if (@import("builtin").is_test)
-        std.testing.io
-    else
-        std.Io.Threaded.global_single_threaded.io();
-}
-
-fn streamFromSocketHandle(handle: std.Io.net.Socket.Handle) std.Io.net.Stream {
-    return .{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } };
-}
-
-fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
-    var reader = stream.reader(defaultIo(), &.{});
-    return reader.interface.readSliceShort(buffer);
-}
-
-fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
-    var written: usize = 0;
-    while (written < data.len) {
-        written += try defaultIo().vtable.netWrite(defaultIo().userdata, stream.socket.handle, &.{}, &.{data[written..]}, 1);
-    }
+fn streamFromSocketHandle(handle: std.Io.net.Socket.Handle) compat.net.Stream {
+    return compat.net.Stream.init(.{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } });
 }
 
 pub const WebSocketClient = struct {
@@ -37,7 +27,7 @@ pub const WebSocketClient = struct {
     state: ConnectionState,
 
     // Connection state
-    tcp_stream: ?std.Io.net.Stream = null,
+    tcp_stream: ?compat.net.Stream = null,
 
     // For async operation
     send_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
@@ -105,21 +95,16 @@ pub const WebSocketClient = struct {
             return error.InvalidUrl;
         };
 
-        // Check for TLS (wss://)
+        // Check for TLS (wss://). This transport intentionally remains a
+        // plain-TCP WebSocket client after the Zig 0.16 networking migration.
         if (parsed.tls) {
-            // TODO: TLS support not implemented in this phase
-            // Will be added in a future update
             self.state = .disconnected;
             return error.TlsNotSupported;
         }
 
-        // Resolve and connect
-        const address = std.Io.net.IpAddress.resolve(defaultIo(), parsed.host, parsed.port) catch {
-            self.state = .disconnected;
-            return error.ConnectionFailed;
-        };
-
-        self.tcp_stream = address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }) catch {
+        // Resolve and connect through Makai's networking wrapper so std.Io
+        // backend selection stays below the public transport interface.
+        self.tcp_stream = compat.net.tcpConnectHost(self.allocator, parsed.host, parsed.port) catch {
             self.state = .disconnected;
             return error.ConnectionFailed;
         };
@@ -127,7 +112,8 @@ pub const WebSocketClient = struct {
         // Perform WebSocket handshake
         performHandshake(self, parsed.host, parsed.port, parsed.path, headers) catch |err| {
             if (self.tcp_stream) |stream| {
-                stream.close(defaultIo());
+                var closable = stream;
+                closable.close();
                 self.tcp_stream = null;
             }
             self.state = .disconnected;
@@ -156,7 +142,8 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
-        try streamWriteAll(stream, encoded);
+        var writable = stream;
+        try writable.writeAll(encoded);
     }
 
     /// Receive a message (blocking)
@@ -208,7 +195,8 @@ pub const WebSocketClient = struct {
 
             // Need more data - read from stream
             var read_buf: [4096]u8 = undefined;
-            const bytes_read = streamRead(stream, &read_buf) catch |err| {
+            var readable = stream;
+            const bytes_read = readable.read(&read_buf) catch |err| {
                 if (err == error.EndOfStream) {
                     self.state = .closed;
                     return null;
@@ -228,6 +216,7 @@ pub const WebSocketClient = struct {
     /// Close the connection
     pub fn close(self: *Self) void {
         if (self.tcp_stream) |stream| {
+            var closable = stream;
             // Send close frame if connected
             if (self.state == .connected) {
                 const close_frame = Frame{
@@ -238,10 +227,10 @@ pub const WebSocketClient = struct {
                 };
                 if (encodeFrame(close_frame, self.allocator)) |encoded| {
                     defer self.allocator.free(encoded);
-                    streamWriteAll(stream, encoded) catch {}; // Ignore errors on close
+                    closable.writeAll(encoded) catch {}; // Ignore errors on close
                 } else |_| {}
             }
-            stream.close(defaultIo());
+            closable.close();
             self.tcp_stream = null;
         }
         self.send_buffer.clearRetainingCapacity();
@@ -283,7 +272,8 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
-        try streamWriteAll(stream, encoded);
+        var writable = stream;
+        try writable.writeAll(encoded);
     }
 
     fn resetPingState(self: *Self) void {
@@ -595,11 +585,12 @@ fn performHandshake(
     try request.print(client.allocator, "\r\n", .{});
 
     // Send request
-    try streamWriteAll(stream, request.items);
+    var io_stream = stream;
+    try io_stream.writeAll(request.items);
 
     // Read response
     var response_buf: [4096]u8 = undefined;
-    const response_len = try streamRead(stream, &response_buf);
+    const response_len = try io_stream.read(&response_buf);
     const response = response_buf[0..response_len];
 
     // Verify response
@@ -622,12 +613,12 @@ fn performHandshake(
         return error.HandshakeFailed;
     }
 
-    // Verify Sec-WebSocket-Accept header
-    // The accept key is base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-    // For simplicity, just verify the header exists
-    if (std.mem.find(u8, response, "Sec-WebSocket-Accept:") == null and
-        std.mem.find(u8, response, "Sec-WebSocket-Protocol:") == null)
-    {
+    // Verify Sec-WebSocket-Accept header.
+    // The expected accept key is base64(sha1(key ++
+    // "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")). Full value verification is
+    // intentionally deferred; this migration preserves existing behavior by
+    // only requiring the accept header to be present.
+    if (std.mem.find(u8, response, "Sec-WebSocket-Accept:") == null) {
         return error.HandshakeFailed;
     }
 }
@@ -926,6 +917,16 @@ test "WebSocketClient reconnect attempts clear stale buffers and remain retryabl
     try std.testing.expectError(error.InvalidUrl, client.connect("still-not-a-websocket-url", null));
 }
 
+test "WebSocketClient connect rejects wss TLS before networking" {
+    const allocator = std.testing.allocator;
+
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+
+    try std.testing.expectError(error.TlsNotSupported, client.connect("wss://127.0.0.1/socket", null));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.disconnected, client.state);
+}
+
 test "WebSocketClient ping timeout triggers without pong" {
     const allocator = std.testing.allocator;
 
@@ -958,7 +959,8 @@ test "WebSocketClient receive close frame enters closing state" {
     const allocator = std.testing.allocator;
 
     const pipe = try std.Io.Threaded.pipe2(.{});
-    defer streamFromSocketHandle(pipe[1]).close(defaultIo());
+    var peer_stream = streamFromSocketHandle(pipe[1]);
+    defer peer_stream.close();
 
     var client = WebSocketClient.init(allocator);
     defer client.deinit();
@@ -979,7 +981,8 @@ test "WebSocketClient close from closing state finalizes cleanup" {
     const allocator = std.testing.allocator;
 
     const pipe = try std.Io.Threaded.pipe2(.{});
-    defer streamFromSocketHandle(pipe[1]).close(defaultIo());
+    var peer_stream = streamFromSocketHandle(pipe[1]);
+    defer peer_stream.close();
 
     var client = WebSocketClient.init(allocator);
     defer client.deinit();
@@ -1063,8 +1066,10 @@ test "performHandshake validates response" {
 
     // We can't easily test performHandshake with a pipe because it needs bidirectional communication
     // So just close the pipes and verify no crash
-    streamFromSocketHandle(pipe[0]).close(defaultIo());
-    streamFromSocketHandle(pipe[1]).close(defaultIo());
+    var read_stream = streamFromSocketHandle(pipe[0]);
+    read_stream.close();
+    var write_stream = streamFromSocketHandle(pipe[1]);
+    write_stream.close();
     client.tcp_stream = null;
 }
 
