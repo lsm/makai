@@ -3,12 +3,35 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-export type BinaryResolverOptions = {
-  binaryPath?: string;
-  binaryUrl?: string;
-  checksumSha256?: string;
+type BinaryResolverBaseOptions = {
   cacheDir?: string;
 };
+
+type BinaryPathResolverOptions = BinaryResolverBaseOptions & {
+  type?: "path";
+  binaryPath: string;
+  binaryUrl?: undefined;
+  checksumSha256?: string;
+};
+
+type BinaryUrlResolverOptions = BinaryResolverBaseOptions & {
+  type?: "url";
+  binaryPath?: undefined;
+  binaryUrl: string;
+  checksumSha256: string;
+};
+
+type BinaryAutoResolverOptions = BinaryResolverBaseOptions & {
+  type?: "auto";
+  binaryPath?: undefined;
+  binaryUrl?: undefined;
+  checksumSha256?: string;
+};
+
+export type BinaryResolverOptions =
+  | BinaryPathResolverOptions
+  | BinaryUrlResolverOptions
+  | BinaryAutoResolverOptions;
 
 const ENV_BINARY_PATH = "MAKAI_BINARY_PATH";
 const ENV_BINARY_URL = "MAKAI_BINARY_URL";
@@ -38,8 +61,14 @@ function sha256(content: Buffer): string {
   return createHash("sha256").update(content).digest("hex");
 }
 
-async function verifyChecksumIfPresent(filePath: string, checksumSha256?: string): Promise<void> {
-  if (!checksumSha256) return;
+function requireChecksumForUrl(binaryUrl: string, checksumSha256: string | undefined): string {
+  if (!checksumSha256) {
+    throw new Error(`SHA256 checksum is required when downloading makai binary from URL: ${binaryUrl}`);
+  }
+  return checksumSha256;
+}
+
+async function verifyChecksum(filePath: string, checksumSha256: string): Promise<void> {
   const content = await fs.readFile(filePath);
   const actual = sha256(content);
   if (actual !== checksumSha256.toLowerCase()) {
@@ -47,7 +76,7 @@ async function verifyChecksumIfPresent(filePath: string, checksumSha256?: string
   }
 }
 
-async function downloadToCache(url: string, targetPath: string, checksumSha256?: string): Promise<void> {
+async function downloadToCache(url: string, targetPath: string, checksumSha256: string): Promise<void> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`failed to download binary: ${response.status} ${response.statusText}`);
@@ -55,11 +84,9 @@ async function downloadToCache(url: string, targetPath: string, checksumSha256?:
   const arrayBuffer = await response.arrayBuffer();
   const content = Buffer.from(arrayBuffer);
 
-  if (checksumSha256) {
-    const actual = sha256(content);
-    if (actual !== checksumSha256.toLowerCase()) {
-      throw new Error(`binary checksum mismatch: expected ${checksumSha256}, got ${actual}`);
-    }
+  const actual = sha256(content);
+  if (actual !== checksumSha256.toLowerCase()) {
+    throw new Error(`binary checksum mismatch: expected ${checksumSha256}, got ${actual}`);
   }
 
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
@@ -82,6 +109,7 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
   const binaryUrl = process.env[ENV_BINARY_URL] ?? options.binaryUrl;
   const checksumSha256 = process.env[ENV_BINARY_SHA256] ?? options.checksumSha256;
   if (binaryUrl) {
+    const requiredChecksumSha256 = requireChecksumForUrl(binaryUrl, checksumSha256);
     const binaryName = binaryNameForPlatform();
     const cacheDir = options.cacheDir ?? path.join(os.homedir(), ".cache", "makai", "bin");
     const urlPathName = new URL(binaryUrl).pathname;
@@ -90,7 +118,7 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
 
     if (await fileExists(cachePath)) {
       try {
-        await verifyChecksumIfPresent(cachePath, checksumSha256);
+        await verifyChecksum(cachePath, requiredChecksumSha256);
         return cachePath;
       } catch (error: unknown) {
         if (error instanceof Error && error.message.startsWith("binary checksum mismatch")) {
@@ -102,7 +130,7 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
     }
 
     if (!(await fileExists(cachePath))) {
-      await downloadToCache(binaryUrl, cachePath, checksumSha256);
+      await downloadToCache(binaryUrl, cachePath, requiredChecksumSha256);
       return cachePath;
     }
 
