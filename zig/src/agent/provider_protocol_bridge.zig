@@ -108,8 +108,9 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
 
 fn runStreamThread(ctx: *StreamThreadContext) void {
     defer {
-        ctx.out_stream.markThreadDone();
+        const out_stream = ctx.out_stream;
         ctx.deinit();
+        out_stream.markThreadDone();
     }
 
     var pipe = in_process.createSerializedPipe(ctx.allocator);
@@ -223,7 +224,7 @@ test "InProcessProviderProtocolBridge smoke test" {
             s.* = event_stream.AssistantMessageEventStream.init(a);
 
             s.push(.{ .start = .{ .partial = .{
-                .content = &.{.{ .text = .{ .text = "ok" } }},
+                .content = &.{},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
@@ -233,8 +234,8 @@ test "InProcessProviderProtocolBridge smoke test" {
                 .is_owned = false,
             } } }) catch {};
 
-            s.complete(.{
-                .content = &.{},
+            s.complete(try ai_types.cloneAssistantMessage(a, .{
+                .content = &.{.{ .text = .{ .text = "ok" } }},
                 .api = "mock-api",
                 .provider = "mock",
                 .model = "mock-model",
@@ -242,7 +243,7 @@ test "InProcessProviderProtocolBridge smoke test" {
                 .stop_reason = .stop,
                 .timestamp = compat.time.nowMillis(),
                 .is_owned = false,
-            });
+            }));
             s.markThreadDone();
             return s;
         }
