@@ -1,6 +1,7 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
 import { BinaryResolverOptions, resolveMakaiBinary } from "./binary_resolver";
+import { getNoopLogger, type MakaiLogger } from "./logger";
 
 /** A single JSON-line protocol frame exchanged with `makai --stdio`. */
 export type StdioFrame = {
@@ -17,6 +18,7 @@ export type MakaiStdioClientOptions = {
   expectedProtocolVersion?: string;
   handshakeTimeoutMs?: number;
   streamFrameQueueTtlMs?: number;
+  logger?: MakaiLogger;
 };
 
 /** @deprecated Use MakaiStdioClientOptions. Kept for backward compatibility. */
@@ -60,6 +62,7 @@ const STREAM_FRAME_QUEUE_TTL_MS = 30_000;
 export class MakaiStdioClient {
   private readonly options: Required<Pick<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">> &
     Omit<MakaiStdioClientOptions, "args" | "expectedProtocolVersion" | "handshakeTimeoutMs" | "streamFrameQueueTtlMs">;
+  private readonly logger: MakaiLogger;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: ReadlineInterface | null = null;
   private pendingHandshake: PendingHandshake | null = null;
@@ -80,6 +83,7 @@ export class MakaiStdioClient {
       handshakeTimeoutMs: options.handshakeTimeoutMs ?? 1500,
       streamFrameQueueTtlMs: options.streamFrameQueueTtlMs ?? STREAM_FRAME_QUEUE_TTL_MS,
     };
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   /**
@@ -92,6 +96,8 @@ export class MakaiStdioClient {
       throw new Error("client is already connected");
     }
 
+    this.logger.debug("stdio: spawning process", { command: this.options.command, args: this.options.args });
+
     const child = spawn(this.options.command, this.options.args, {
       cwd: this.options.cwd,
       env: this.options.env,
@@ -100,11 +106,13 @@ export class MakaiStdioClient {
     this.child = child;
 
     child.on("error", (error) => {
+      this.logger.error("stdio: process error event", { error: error.message });
       this.failHandshakeIfPending(error);
       this.failPendingFrameWaiters(error);
     });
 
     child.on("exit", (code, signal) => {
+      this.logger.debug("stdio: process exited", { code, signal: signal ?? undefined });
       const error = new Error(`stdio process exited (code=${code}, signal=${signal})`);
       this.failHandshakeIfPending(error);
       this.failPendingFrameWaiters(error);
@@ -114,6 +122,7 @@ export class MakaiStdioClient {
     this.lineReader = createInterface({ input: child.stdout });
     this.lineReader.on("line", (line) => this.handleLine(line));
 
+    this.logger.debug("stdio: waiting for handshake", { timeout_ms: this.options.handshakeTimeoutMs });
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error(`stdio handshake timed out after ${this.options.handshakeTimeoutMs}ms`));
@@ -121,6 +130,7 @@ export class MakaiStdioClient {
       }, this.options.handshakeTimeoutMs);
       this.pendingHandshake = { resolve, reject, timer };
     });
+    this.logger.info("stdio: handshake complete");
   }
 
   /**
@@ -133,6 +143,7 @@ export class MakaiStdioClient {
     if (!this.child) {
       throw new Error("client is not connected");
     }
+    this.logger.debug("stdio: sending frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
     this.child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
 
@@ -251,6 +262,7 @@ export class MakaiStdioClient {
   async close(): Promise<void> {
     if (!this.child) return;
 
+    this.logger.debug("stdio: closing transport");
     const child = this.child;
     child.stdin.end();
     await Promise.race([
@@ -343,9 +355,12 @@ export class MakaiStdioClient {
     try {
       frame = JSON.parse(line) as StdioFrame;
     } catch {
+      this.logger.error("stdio: invalid JSON frame received", { line: line.length > 200 ? line.slice(0, 200) + "..." : line });
       this.failHandshakeIfPending(new Error(`invalid JSON frame: ${line}`));
       return;
     }
+
+    this.logger.debug("stdio: received frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
 
     if (this.pendingHandshake) {
       const pending = this.pendingHandshake;
@@ -422,6 +437,7 @@ function isNextFrameTimeout(error: unknown, timeoutMs: number): boolean {
 export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {
   command?: string;
   resolver?: BinaryResolverOptions;
+  logger?: MakaiLogger;
 };
 
 /** @deprecated Use CreateMakaiStdioClientOptions. Kept for backward compatibility. */
@@ -447,5 +463,6 @@ export async function createMakaiStdioClient(
     expectedProtocolVersion: options.expectedProtocolVersion,
     handshakeTimeoutMs: options.handshakeTimeoutMs,
     streamFrameQueueTtlMs: options.streamFrameQueueTtlMs,
+    logger: options.logger,
   });
 }

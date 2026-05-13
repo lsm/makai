@@ -20,6 +20,7 @@
  */
 
 import { ulid } from "ulid";
+import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
   AuthStatus,
   ListModelsRequest,
@@ -91,6 +92,8 @@ const KNOWN_REASONING_LEVELS: ReadonlySet<string> = new Set([
 export interface ModelsApiOptions {
   /** How long `list` / `resolve` waits for a terminal response frame. */
   responseTimeoutMs?: number;
+  /** Optional structured logger for models API diagnostics. */
+  logger?: MakaiLogger;
 }
 
 /**
@@ -121,12 +124,14 @@ const MALFORMED_RESPONSE_CODE = "malformed_response";
 
 class StdioModelsApi implements MakaiModelsApi {
   private readonly responseTimeoutMs: number;
+  private readonly logger: MakaiLogger;
 
   constructor(
     private readonly client: MakaiStdioClient,
     options: ModelsApiOptions,
   ) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   async list(request: ListModelsRequest = {}): Promise<ListModelsResponse> {
@@ -187,6 +192,7 @@ class StdioModelsApi implements MakaiModelsApi {
 
   private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
     const streamId = ulid();
+    this.logger.debug("models: sending models_request", { stream_id: streamId, provider_id: request.provider_id, api: request.api });
     const envelope: StdioFrame = {
       type: "models_request",
       stream_id: streamId,
@@ -224,8 +230,11 @@ class StdioModelsApi implements MakaiModelsApi {
           continue;
         case "nack":
           throw nackToError(frame);
-        case "models_response":
-          return parseModelsResponse(frame);
+        case "models_response": {
+          const response = parseModelsResponse(frame);
+          this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
+          return response;
+        }
         default:
           throw malformedResponseError(
             `unexpected frame type while awaiting models_response: ${frame.type}`,
