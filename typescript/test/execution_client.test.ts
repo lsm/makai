@@ -9,6 +9,7 @@ import {
   createMakaiProviderApi,
   MakaiStdioClient,
   MakaiAuthRequiredError,
+  MakaiProtocolError,
   MakaiStreamError,
   type AgentStreamEvent,
   type ProviderStreamEvent,
@@ -1434,5 +1435,179 @@ test("acceptance: provider and agent execution accept the same model_ref", async
   } finally {
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// --- model_ref input validation tests ---
+
+test("provider.complete rejects model_ref exceeding 512 characters before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longModelRef = "x/@" + "a".repeat(510); // 513 chars total
+    await assert.rejects(
+      () => provider.complete({ model_ref: longModelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref exceeds maximum length of 512 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.stream rejects model_ref exceeding 512 characters before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longModelRef = "x/@" + "a".repeat(510); // 513 chars total
+    await assert.rejects(
+      async () => collect(provider.stream({ model_ref: longModelRef, messages: [{ role: "user", content: "hi" }] })),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref exceeds maximum length of 512 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.complete rejects model_ref without '/' separator before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    await assert.rejects(
+      () => provider.complete({ model_ref: "no-slash-here", messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.stream rejects model_ref without '/' separator before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    await assert.rejects(
+      async () => collect(provider.stream({ model_ref: "no-slash-here", messages: [{ role: "user", content: "hi" }] })),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("agent.run rejects model_ref exceeding 512 characters before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const longModelRef = "x/@" + "a".repeat(510); // 513 chars total
+    await assert.rejects(
+      () => agent.run({ model_ref: longModelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref exceeds maximum length of 512 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("agent.stream rejects model_ref exceeding 512 characters before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const longModelRef = "x/@" + "a".repeat(510); // 513 chars total
+    await assert.rejects(
+      async () => collect(agent.stream({ model_ref: longModelRef, messages: [{ role: "user", content: "hi" }] })),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref exceeds maximum length of 512 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("agent.run rejects model_ref without '/' separator before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run({ model_ref: "no-slash-here", messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("agent.stream rejects model_ref without '/' separator before transport I/O", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      async () => collect(agent.stream({ model_ref: "no-slash-here", messages: [{ role: "user", content: "hi" }] })),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.complete accepts model_ref at exactly 512 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    // Build a valid model_ref of exactly 512 chars: provider/api@model
+    const modelId = "a".repeat(512 - "provider/api@".length);
+    const modelRef = `provider/api@${modelId}`;
+    assert.equal(modelRef.length, 512);
+    // This should NOT throw - it will send to the transport and get a response
+    await provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] });
+    const logged = readLoggedRequests(harness.logPath);
+    assert.equal(logged.length, 1);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.complete accepts model_ref at 511 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const modelId = "a".repeat(511 - "provider/api@".length);
+    const modelRef = `provider/api@${modelId}`;
+    assert.equal(modelRef.length, 511);
+    await provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] });
+    const logged = readLoggedRequests(harness.logPath);
+    assert.equal(logged.length, 1);
+  } finally {
+    await harness.cleanup();
   }
 });

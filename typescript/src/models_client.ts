@@ -47,6 +47,8 @@ import {
 const ENVELOPE_VERSION = 1;
 const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omits
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
+const MAX_PROVIDER_ID_LENGTH = 256;
+const MAX_MODEL_ID_LENGTH = 256;
 
 const KNOWN_AUTH_STATUSES: ReadonlySet<string> = new Set([
   "authenticated",
@@ -143,8 +145,20 @@ class StdioModelsApi implements MakaiModelsApi {
     if (!request || typeof request.provider_id !== "string" || request.provider_id.length === 0) {
       throw new MakaiProtocolError("resolve requires provider_id", "invalid_request");
     }
+    if (request.provider_id.length > MAX_PROVIDER_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `provider_id exceeds maximum length of ${MAX_PROVIDER_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
     if (typeof request.model_id !== "string" || request.model_id.length === 0) {
       throw new MakaiProtocolError("resolve requires model_id", "invalid_request");
+    }
+    if (request.model_id.length > MAX_MODEL_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `model_id exceeds maximum length of ${MAX_MODEL_ID_LENGTH} characters`,
+        "invalid_request",
+      );
     }
 
     const response = await this.dispatch({

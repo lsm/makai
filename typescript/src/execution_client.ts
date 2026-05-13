@@ -5,7 +5,7 @@ import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthA
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
-import type { MakaiModelsApi } from "./models_types";
+import { MakaiProtocolError, type MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
 import {
   createTimeoutDiagnostics,
@@ -524,9 +524,24 @@ function buildAgentMessagePayload(
   return payload;
 }
 
+const MAX_MODEL_REF_LENGTH = 512;
+const MODEL_REF_REQUIRED_SEPARATOR = "/";
+
 function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunRequest): void {
   if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
     throw new TypeError("request requires opaque model_ref");
+  }
+  if (request.model_ref.length > MAX_MODEL_REF_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref exceeds maximum length of ${MAX_MODEL_REF_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  if (!request.model_ref.includes(MODEL_REF_REQUIRED_SEPARATOR)) {
+    throw new MakaiProtocolError(
+      "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
+      "invalid_request",
+    );
   }
   if (!Array.isArray(request.messages)) {
     throw new TypeError("request requires messages array");
