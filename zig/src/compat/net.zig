@@ -25,10 +25,8 @@ pub const AddressList = struct {
 
 /// TCP stream wrapper used as the stable Makai networking boundary.
 ///
-/// Zig 0.15.2: owns a `std.net.Stream` and forwards byte reads/writes.
-/// 0.16: use streams produced by Makai default-context networking helpers
-/// (`std.Io.net.tcpConnect` internally) without exposing raw `std.Io` in this
-/// public wrapper API.
+/// Uses streams produced by Makai default-context networking helpers without
+/// exposing raw `std.Io` in this public wrapper API.
 pub const Stream = struct {
     inner: std.Io.net.Stream,
 
@@ -72,10 +70,7 @@ pub const Connection = struct {
     address: Address,
 };
 
-/// Return the bound listener address.
-///
-/// Zig 0.15.2: reads `std.net.Server.listen_address`.
-/// 0.16: route through Makai's selected networking backend internally.
+/// Return the bound listener address through Makai's selected networking backend.
 pub fn listenAddress(server: *const Server) Address {
     return server.socket.address;
 }
@@ -87,8 +82,7 @@ pub fn closeServer(server: *Server) void {
 
 /// Accept a TCP connection and wrap its stream at the Makai compatibility seam.
 ///
-/// Zig 0.15.2: wraps `std.net.Server.accept`.
-/// 0.16: preserve this helper shape over Makai's selected networking backend.
+/// Preserves this helper shape over Makai's selected networking backend.
 pub fn accept(server: *Server) !Connection {
     const stream = try server.accept(defaultIo());
     return .{
@@ -99,10 +93,9 @@ pub fn accept(server: *Server) !Connection {
 
 /// Resolve a host/port into an address.
 ///
-/// Zig 0.15.2: wraps `std.net.getAddressList` and returns the first resolved
-/// address, preserving DNS hostname support in addition to literal IP inputs.
-/// 0.16: keep this public signature and route through the selected Makai
-/// networking context internally.
+/// Returns the first resolved address, preserving DNS hostname support in
+/// addition to literal IP inputs. Keeps this public signature while routing
+/// through the selected Makai networking context internally.
 ///
 /// `allocator` owns temporary DNS resolver allocations during this call.
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !Address {
@@ -176,18 +169,12 @@ pub fn tcpConnectHost(allocator: std.mem.Allocator, host: []const u8, port: u16)
     return tcpConnectAny(list);
 }
 
-/// Connect to a TCP peer.
-///
-/// Zig 0.15.2: wraps `std.net.tcpConnectToAddress`.
-/// 0.16: use std.Io.net.tcpConnect internally.
+/// Connect to a TCP peer through the Makai default I/O context.
 pub fn tcpConnect(address: Address) !Stream {
     return Stream.init(try address.connect(defaultIo(), .{ .mode = .stream, .protocol = .tcp }));
 }
 
-/// Listen for TCP connections on `address`.
-///
-/// Zig 0.15.2: wraps `std.net.Address.listen`.
-/// 0.16: use std.Io.net.tcpListen internally.
+/// Listen for TCP connections on `address` through the Makai default I/O context.
 pub fn tcpListen(address: Address, options: ListenOptions) !Server {
     return address.listen(defaultIo(), options);
 }

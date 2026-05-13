@@ -26,7 +26,7 @@ fn onPrompt(prompt: oauth.Prompt) []const u8 {
     stdout_file.writeAll(prompt.message) catch return "";
     stdout_file.writeAll(" ") catch return "";
 
-    // Read line from stdin using new Zig 0.15 API
+    // Read line from stdin using the Zig 0.16 file reader API.
     var reader = stdin_file.reader(&reader_buf);
     const line = reader.interface.takeDelimiter('\n') catch return "";
     

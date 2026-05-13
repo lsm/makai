@@ -26,7 +26,14 @@ zig build test-unit-transport     # transport, stdio, sse, websocket, in_process
 zig build test-unit-protocol      # content_partial, partial_serializer, protocol types/envelope/reconstructor, server, client, agent types, tool types
 zig build test-unit-providers     # api_registry, stream, register_builtins, all provider APIs
 zig build test-unit-utils         # github_copilot, oauth/pkce, oauth/mod, overflow, retry, sanitize, pre_transform
-zig build test-unit-agent         # agent types, agent_loop, agent module, agent unit test
+zig build test-unit-makai-cli     # makai CLI unit tests
+zig build test-unit-agent         # aggregate agent unit tests
+zig build test-unit-agent-types   # agent types
+zig build test-unit-agent-loop    # agent loop
+zig build test-unit-agent-mod     # agent module
+zig build test-unit-agent-bridge  # agent provider protocol bridge
+zig build test-unit-agent-unit    # agent unit test file
+zig build test-unit-agent-chain   # agent protocol chain tests
 ```
 
 E2E tests require API keys (set via env vars, see `.github/workflows/ci.yml`):
@@ -46,7 +53,7 @@ There is no single-test command. Tests are inline in each `.zig` file using Zig'
 
 ## Dependencies
 
-No external Zig package dependencies are currently declared in `zig/build.zig.zon`.
+No external Zig package dependencies are currently declared in `zig/build.zig.zon`; the unused `libxev` declaration was removed during the Zig 0.16.0 migration.
 
 ## Architecture
 

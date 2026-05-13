@@ -216,10 +216,10 @@ pub const AsyncStdioReceiver = struct {
 
         const thread = try std.Thread.spawn(.{}, producerThread, .{thread_ctx});
 
-        // TODO(zig-0.16-migration): deprecate this legacy receiveStream() path
-        // once transport migration callers use receiveStreamWithHandle(). It
-        // detaches the producer for backward compatibility, while the handle
-        // API below keeps lifecycle ownership explicit.
+        // Keep this legacy receiveStream() path for transport interface callers
+        // that do not yet use receiveStreamWithHandle(). It detaches the producer
+        // for backward compatibility, while the handle API below keeps lifecycle
+        // ownership explicit.
         thread.detach();
 
         return stream;
