@@ -618,6 +618,53 @@ pub const ProtocolClient = struct {
         }
         return null;
     }
+
+    /// Read protocol envelopes from a Receiver and process them, applying retry
+    /// with exponential backoff for transient transport errors.
+    ///
+    /// This is the primary integration point for `retry_options`. When
+    /// `retry_options` is set on this client, transient read errors (connection
+    /// reset, timeout, etc.) are retried up to `max_retries` times. Frames that
+    /// fail deserialization are skipped (transient decode error tolerance).
+    ///
+    /// When `retry_options` is null (default), no retry is applied — reads fail
+    /// immediately on the first error, matching the historical behavior.
+    ///
+    /// The loop terminates when the receiver returns null (EOF) or when a
+    /// non-retryable read error exhausts all retry attempts.
+    pub fn receiveLoopWithRetry(
+        self: *Self,
+        receiver: *const transport.Receiver,
+        allocator: std.mem.Allocator,
+    ) !void {
+        // Null retry_options → no retry (max_retries = 0).
+        const opts = self.options.retry_options orelse
+            transport_retry.TransportRetryOptions{ .max_retries = 0 };
+
+        while (true) {
+            const line = transport_retry.retryableRead(receiver, allocator, &opts) catch |err| {
+                const err_name = @errorName(err);
+                const msg = std.fmt.allocPrint(allocator, "Transport read error: {s}", .{err_name}) catch
+                    "Transport read error";
+                defer if (std.mem.startsWith(u8, msg, "Transport read error: ")) allocator.free(msg);
+                try self.setLastError(msg);
+                return err;
+            };
+
+            if (line) |data| {
+                defer allocator.free(data);
+
+                // Skip frames that fail deserialization (transient decode tolerance)
+                var env = envelope.deserializeEnvelope(data, allocator) catch continue;
+                defer env.deinit(allocator);
+
+                try self.processEnvelope(env);
+            } else {
+                // EOF — normal termination
+                break;
+            }
+        }
+    }
 };
 
 // Custom error set
@@ -1565,4 +1612,173 @@ test "sendAbortRequest without active stream returns error" {
     // No stream ID set
     const result = client.sendAbortRequest(null);
     try std.testing.expectError(error.NoActiveStream, result);
+}
+
+test "receiveLoopWithRetry processes envelopes with retry on transient errors" {
+    const allocator = std.testing.allocator;
+
+    // Build a valid protocol envelope JSON
+    const message_id = protocol_types.generateUlid();
+    const stream_id = protocol_types.generateUlid();
+    var env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = message_id,
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .ack = .{
+            .acknowledged_id = message_id,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const env_json = try envelope.serializeEnvelope(env, allocator);
+    defer allocator.free(env_json);
+
+    // Mock receiver that fails 2 times then returns the envelope
+    const MockReceiver = struct {
+        items: []const []const u8,
+        index: usize = 0,
+        remaining_failures: u32,
+
+        fn readFn(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.remaining_failures > 0) {
+                self.remaining_failures -= 1;
+                return error.ConnectionResetByPeer;
+            }
+            if (self.index >= self.items.len) return null;
+            const result = try alloc.dupe(u8, self.items[self.index]);
+            self.index += 1;
+            return result;
+        }
+    };
+
+    const items = [_][]const u8{ env_json };
+    var mock = MockReceiver{
+        .items = &items,
+        .remaining_failures = 2,
+    };
+
+    var receiver = transport.Receiver{
+        .context = @ptrCast(&mock),
+        .read_fn = MockReceiver.readFn,
+    };
+
+    var client = ProtocolClient.init(allocator, .{
+        .retry_options = .{
+            .max_retries = 3,
+            .base_delay_ms = 1,
+            .max_delay_ms = 5,
+        },
+    });
+    defer client.deinit();
+
+    // Store a pending request so the ack can correlate
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .stream_id = stream_id,
+        .sent_at = compat.time.nowMillis(),
+        .timeout_ms = 30_000,
+    });
+
+    // Run the retry-enabled receive loop
+    try client.receiveLoopWithRetry(&receiver, allocator);
+
+    // Verify the ack was processed (pending request removed, current_stream_id set)
+    try std.testing.expect(!client.pending_requests.contains(message_id));
+    try std.testing.expect(client.current_stream_id != null);
+}
+
+test "receiveLoopWithRetry skips bad frames and processes valid ones" {
+    const allocator = std.testing.allocator;
+
+    // Build a valid protocol envelope JSON
+    const message_id = protocol_types.generateUlid();
+    const stream_id = protocol_types.generateUlid();
+    var env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = message_id,
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .ack = .{
+            .acknowledged_id = message_id,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const env_json = try envelope.serializeEnvelope(env, allocator);
+    defer allocator.free(env_json);
+
+    // Mock receiver: bad frame, good frame, EOF
+    const MockReceiver = struct {
+        items: []const []const u8,
+        index: usize = 0,
+
+        fn readFn(ctx: *anyopaque, alloc: std.mem.Allocator) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.index >= self.items.len) return null;
+            const result = try alloc.dupe(u8, self.items[self.index]);
+            self.index += 1;
+            return result;
+        }
+    };
+
+    const items = [_][]const u8{
+        "not valid json", // Bad frame — should be skipped
+        env_json, // Good frame
+    };
+    var mock = MockReceiver{ .items = &items };
+
+    var receiver = transport.Receiver{
+        .context = @ptrCast(&mock),
+        .read_fn = MockReceiver.readFn,
+    };
+
+    var client = ProtocolClient.init(allocator, .{
+        .retry_options = .{ .max_retries = 0, .base_delay_ms = 1 },
+    });
+    defer client.deinit();
+
+    try client.pending_requests.put(message_id, .{
+        .message_id = message_id,
+        .stream_id = stream_id,
+        .sent_at = compat.time.nowMillis(),
+        .timeout_ms = 30_000,
+    });
+
+    try client.receiveLoopWithRetry(&receiver, allocator);
+
+    // The valid ack was processed despite the bad frame
+    try std.testing.expect(!client.pending_requests.contains(message_id));
+}
+
+test "receiveLoopWithRetry without retry_options fails on first error" {
+    const allocator = std.testing.allocator;
+
+    const MockReceiver = struct {
+        attempt_count: u32 = 0,
+
+        fn readFn(ctx: *anyopaque, _: std.mem.Allocator) anyerror!?[]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.attempt_count += 1;
+            return error.ConnectionRefused;
+        }
+    };
+
+    var mock = MockReceiver{};
+    var receiver = transport.Receiver{
+        .context = @ptrCast(&mock),
+        .read_fn = MockReceiver.readFn,
+    };
+
+    var client = ProtocolClient.init(allocator, .{
+        .retry_options = null, // No retry configured
+    });
+    defer client.deinit();
+
+    const result = client.receiveLoopWithRetry(&receiver, allocator);
+    try std.testing.expectError(error.ConnectionRefused, result);
+
+    // Only one attempt — no retry
+    try std.testing.expectEqual(@as(u32, 1), mock.attempt_count);
 }
