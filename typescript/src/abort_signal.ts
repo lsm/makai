@@ -52,20 +52,37 @@ export function raceWithAbort<T>(
   }
 
   return new Promise<T>((resolve, reject) => {
+    // Guard ensures first-settled-wins: a promise that already settled
+    // (queued a microtask) should not be overridden by a synchronous abort
+    // that fires before the microtask queue drains.
+    let settled = false;
+
     const onAbort = (): void => {
-      const error = new Error(context);
-      error.name = "AbortError";
-      reject(error);
+      // Schedule via queueMicrotask so abort rejection runs at the same
+      // scheduling level as the .then callbacks.  This prevents a
+      // synchronous abort from winning over an already-queued resolution
+      // from Promise.resolve(...).
+      queueMicrotask(() => {
+        if (settled) return;
+        settled = true;
+        const error = new Error(context);
+        error.name = "AbortError";
+        reject(error);
+      });
     };
 
     signal.addEventListener("abort", onAbort, { once: true });
 
     promise.then(
       (result) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener("abort", onAbort);
         resolve(result);
       },
       (error) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener("abort", onAbort);
         reject(error);
       },
