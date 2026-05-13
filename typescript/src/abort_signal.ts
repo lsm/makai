@@ -43,6 +43,11 @@ export function raceWithAbort<T>(
   if (signal.aborted) {
     const error = new Error(context);
     error.name = "AbortError";
+    // Attach a no-op catch to prevent unhandled rejection if the caller's
+    // promise rejects later.  The promise was constructed before we checked
+    // the signal, so without this a late rejection could crash Node processes
+    // configured to fail on unhandled rejections.
+    promise.catch(() => {});
     return Promise.reject(error);
   }
 

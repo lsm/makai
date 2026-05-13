@@ -1116,7 +1116,11 @@ async function withAuthRetry<T>(
       const providerId = error.provider_id ?? options.fallbackProviderId;
       if (!providerId) throw error;
       try {
-        await options.auth.login(providerId, options.authHandlers, { signal: options.signal });
+        await raceWithAbort(
+          options.auth.login(providerId, options.authHandlers, { signal: options.signal }),
+          options.signal,
+          "operation aborted during auth login",
+        );
       } catch (loginError) {
         if (isAbortError(loginError)) {
           throw loginError;
