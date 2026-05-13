@@ -159,10 +159,10 @@ For agent streaming, iterate over `client.agent.stream(request)` and handle `age
 
 ### Agent model discovery
 
-`client.agent.models` is a convenience alias for `client.models` — both invoke the same underlying model-discovery API over the shared transport. This means `client.agent.models.list()` returns the same results as `client.models.list()`.
+`client.agent.models` is a separate `MakaiModelsApi` instance that delegates to the same underlying model-discovery API over the shared transport as `client.models`. The two instances produce the same results but are not the same object (`client.agent.models !== client.models`).
 
 ```ts
-// These are equivalent:
+// Both call the same underlying API and return the same results:
 const { models } = await client.models.list();
 const { models: agentModels } = await client.agent.models.list();
 ```
