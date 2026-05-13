@@ -93,6 +93,8 @@ export interface RunOptions {
   auth_retry_policy?: AuthRetryPolicy;
   session_id?: string;
   metadata?: Record<string, string>;
+  /** Abort signal to cancel in-flight execution. */
+  signal?: AbortSignal;
 }
 
 /** Token usage reported by a provider or aggregated by an agent run. */

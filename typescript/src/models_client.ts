@@ -20,6 +20,7 @@
  */
 
 import { ulid } from "ulid";
+import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import {
   AuthStatus,
   ListModelsRequest,
@@ -130,7 +131,7 @@ class StdioModelsApi implements MakaiModelsApi {
   }
 
   async list(request: ListModelsRequest = {}): Promise<ListModelsResponse> {
-    return this.dispatch(request);
+    return this.dispatch(request, request.signal);
   }
 
   async resolve(request: ResolveModelRequest): Promise<ResolveModelResponse> {
@@ -145,7 +146,7 @@ class StdioModelsApi implements MakaiModelsApi {
       provider_id: request.provider_id,
       api: request.api,
       model_id: request.model_id,
-    });
+    }, request.signal);
 
     if (response.models.length === 0) {
       throw new MakaiProtocolError("model not found", "invalid_request");
@@ -171,10 +172,11 @@ class StdioModelsApi implements MakaiModelsApi {
     return { model };
   }
 
-  private async nextFrameForStream(streamId: string, timeoutMs: number, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
+  private async nextFrameForStream(streamId: string, timeoutMs: number, context: TimeoutDiagnosticContext, signal?: AbortSignal): Promise<StdioFrame> {
     try {
-      return await this.client.nextFrameForStream(streamId, timeoutMs);
+      return await raceWithAbort(this.client.nextFrameForStream(streamId, timeoutMs), signal, "models.list aborted");
     } catch (error) {
+      if (isAbortError(error)) throw error;
       throw new MakaiProtocolError(
         isTimeoutLikeError(error)
           ? formatTimeoutMessage(context)
@@ -185,7 +187,8 @@ class StdioModelsApi implements MakaiModelsApi {
     }
   }
 
-  private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
+  private async dispatch(request: ListModelsRequest, signal?: AbortSignal): Promise<ListModelsResponse> {
+    checkAbort(signal, "models.list aborted before start");
     const streamId = ulid();
     const envelope: StdioFrame = {
       type: "models_request",
@@ -209,6 +212,7 @@ class StdioModelsApi implements MakaiModelsApi {
     };
     const deadline = Date.now() + this.responseTimeoutMs;
     while (true) {
+      checkAbort(signal, "models.list aborted");
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw new MakaiProtocolError(
@@ -217,7 +221,7 @@ class StdioModelsApi implements MakaiModelsApi {
           { diagnostics: createTimeoutDiagnostics(timeoutContext) },
         );
       }
-      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext);
+      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
 
       switch (frame.type) {
         case "ack":

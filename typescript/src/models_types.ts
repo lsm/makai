@@ -81,6 +81,8 @@ export interface ListModelsRequest {
   model_id?: string;
   include_deprecated?: boolean;
   include_login_required?: boolean;
+  /** Abort signal to cancel in-flight model list/resolve. */
+  signal?: AbortSignal;
 }
 
 /** Response returned by {@link MakaiModelsApi.list}. */
@@ -95,6 +97,8 @@ export interface ResolveModelRequest {
   provider_id: ProviderId;
   api?: ApiId;
   model_id: string;
+  /** Abort signal to cancel in-flight model resolve. */
+  signal?: AbortSignal;
 }
 
 /** Response returned by {@link MakaiModelsApi.resolve}. */
