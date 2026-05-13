@@ -26,8 +26,19 @@ const noopLogger: MakaiLogger = {
  * Returns the no-op logger singleton.
  *
  * Every call returns the same object, so identity checks like
- * `logger === noopLogger` can be used for branching in hot paths.
+ * `logger === getNoopLogger()` can be used for branching in hot paths.
  */
 export function getNoopLogger(): MakaiLogger {
   return noopLogger;
+}
+
+/**
+ * Tests whether a logger is the no-op singleton.
+ *
+ * Use this to skip context-object allocation on hot paths when logging is
+ * disabled. Identity comparison is safe because `getNoopLogger()` always
+ * returns the same object.
+ */
+export function isNoopLogger(logger: MakaiLogger): boolean {
+  return logger === noopLogger;
 }

@@ -1,7 +1,7 @@
 import { ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface, Interface as ReadlineInterface } from "node:readline";
 import { BinaryResolverOptions, resolveMakaiBinary } from "./binary_resolver";
-import { getNoopLogger, type MakaiLogger } from "./logger";
+import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 
 /** A single JSON-line protocol frame exchanged with `makai --stdio`. */
 export type StdioFrame = {
@@ -143,7 +143,9 @@ export class MakaiStdioClient {
     if (!this.child) {
       throw new Error("client is not connected");
     }
-    this.logger.debug("stdio: sending frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("stdio: sending frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
+    }
     this.child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
 
@@ -437,7 +439,6 @@ function isNextFrameTimeout(error: unknown, timeoutMs: number): boolean {
 export type CreateMakaiStdioClientOptions = Omit<MakaiStdioClientOptions, "command"> & {
   command?: string;
   resolver?: BinaryResolverOptions;
-  logger?: MakaiLogger;
 };
 
 /** @deprecated Use CreateMakaiStdioClientOptions. Kept for backward compatibility. */
@@ -453,7 +454,10 @@ export type CreateMakaiClientOptions = CreateMakaiStdioClientOptions;
 export async function createMakaiStdioClient(
   options: CreateMakaiStdioClientOptions = {},
 ): Promise<MakaiStdioClient> {
-  const command = options.command ?? (await resolveMakaiBinary(options.resolver));
+  const resolverWithLogger: BinaryResolverOptions = options.logger
+    ? { ...options.resolver, logger: options.logger }
+    : options.resolver ?? {};
+  const command = options.command ?? (await resolveMakaiBinary(resolverWithLogger));
   const args = options.args ?? ["--stdio"];
   return new MakaiStdioClient({
     command,

@@ -5,11 +5,13 @@ import path from "node:path";
 import test from "node:test";
 import {
   createMakaiAgentApi,
+  createMakaiAgentApiWithModels,
   createMakaiProviderApi,
   MakaiStdioClient,
   MakaiStreamError,
   type MakaiLogger,
   getNoopLogger,
+  isNoopLogger,
   resolveMakaiBinary,
 } from "../src";
 
@@ -322,5 +324,50 @@ test("logger captures envelope type and stream_id in frame send context", async 
     assert.ok((streamId as string).length >= 10, "stream_id should be a ULID");
   } finally {
     await harness.cleanup();
+  }
+});
+
+test("isNoopLogger identifies no-op logger and distinguishes custom loggers", () => {
+  assert.ok(isNoopLogger(getNoopLogger()), "getNoopLogger() should be identified as no-op");
+  const custom = createCapturingLogger();
+  assert.ok(!isNoopLogger(custom), "custom logger should not be identified as no-op");
+});
+
+test("no-op logger skips context allocation on send hot path", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "ready-server.js")],
+    handshakeTimeoutMs: 5000,
+    // No logger — default no-op
+  });
+
+  await client.connect();
+  // Send should not allocate context objects with no-op logger
+  client.send({ type: "stream_request", stream_id: "s1" });
+  const frame = await client.nextFrame(5000);
+  assert.ok(frame);
+  await client.close();
+});
+
+test("createMakaiAgentApiWithModels forwards logger to nested models API", async () => {
+  const logger = createCapturingLogger();
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: path.join(os.tmpdir(), "makai-agent-models-test.log") },
+    handshakeTimeoutMs: 5000,
+    logger,
+  });
+
+  await client.connect();
+  try {
+    const agentWithModels = createMakaiAgentApiWithModels(client, { logger, responseTimeoutMs: 5000 });
+    await agentWithModels.models.list();
+
+    // The models API should have logged via the provided logger
+    const modelsLog = logger.entries.find((e) => e.message === "models: sending models_request");
+    assert.ok(modelsLog, "expected models API to log via forwarded logger");
+  } finally {
+    await client.close();
   }
 });

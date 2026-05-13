@@ -114,7 +114,7 @@ export function createMakaiAgentApiWithModels(
   options: ExecutionOptions = {},
 ): MakaiAgentModelsApi {
   return Object.assign(new StdioAgentApi(transport, options), {
-    models: createMakaiModelsApi(transport, { responseTimeoutMs: options.responseTimeoutMs }),
+    models: createMakaiModelsApi(transport, { responseTimeoutMs: options.responseTimeoutMs, logger: options.logger }),
   });
 }
 

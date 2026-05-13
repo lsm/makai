@@ -81,6 +81,7 @@ export {
 export {
   type MakaiLogger,
   getNoopLogger,
+  isNoopLogger,
 } from "./logger";
 
 export {
