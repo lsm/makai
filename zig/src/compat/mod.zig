@@ -1,10 +1,10 @@
-//! Compatibility seams for the Zig 0.15.2 -> 0.16.0 migration.
+//! Makai-owned I/O compatibility seams for Zig 0.16.0.
 //!
 //! These modules intentionally expose Makai-owned wrapper boundaries, not raw
 //! `std.Io`, matching `docs/zig-0.16.0-io-architecture-decision.md`.
-//! Current implementations are thin Zig 0.15.2-compatible pass-throughs; later
-//! migration PRs will remap internals to Zig 0.16 `std.Io.Threaded`/default
-//! context plumbing without changing these stable names unnecessarily.
+//! Implementations route through the selected Zig 0.16 `std.Io.Threaded`/default
+//! context plumbing without forcing callers to thread `std.Io` through Makai
+//! public APIs.
 //!
 //! Names intentionally follow the task's stable helper list where it is more
 //! specific than the architecture note's examples (`monotonicNanos`, `sleepNs`,
