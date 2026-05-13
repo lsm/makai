@@ -10,7 +10,7 @@
  *
  * @param signal Optional abort signal to check.
  * @param context Optional context string for the error message.
- * @throws {MakaiStreamError} with `kind: "aborted"` if the signal is already aborted.
+ * @throws {Error} with `name: "AbortError"` if the signal is already aborted.
  */
 export function checkAbort(signal: AbortSignal | undefined, context = "operation aborted"): void {
   if (signal?.aborted) {

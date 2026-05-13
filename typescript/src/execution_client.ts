@@ -1,7 +1,7 @@
 import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
-import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
+import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
@@ -136,7 +136,7 @@ class StdioProviderApi implements MakaiProviderApi {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
       () => this.completeOnce(request, effectivePolicy, signal),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request) },
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request), signal },
     );
   }
 
@@ -180,7 +180,7 @@ class StdioProviderApi implements MakaiProviderApi {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
-              await raceWithAbort(this.auth.login(providerId, this.authHandlers), signal, "provider.stream aborted during auth retry");
+              await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "provider.stream aborted during auth retry");
             } catch (authError) {
               if (isAbortError(authError)) throw authError;
               throw authRequiredError(providerId, error.message);
@@ -263,6 +263,7 @@ class StdioAgentApi implements MakaiAgentApi {
         authHandlers: this.authHandlers,
         authRetryPolicy: effectivePolicy,
         fallbackProviderId: providerIdFromRequest(request),
+        signal,
         beforeRetry: () => {
           retryRequest = {
             ...request,
@@ -332,7 +333,7 @@ class StdioAgentApi implements MakaiAgentApi {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
-              await raceWithAbort(this.auth.login(providerId, this.authHandlers), signal, "agent.stream aborted during auth retry");
+              await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "agent.stream aborted during auth retry");
             } catch (authError) {
               if (isAbortError(authError)) throw authError;
               throw authRequiredError(providerId, error.message);
@@ -1103,23 +1104,39 @@ async function withAuthRetry<T>(
     authRetryPolicy?: RunOptions["auth_retry_policy"];
     fallbackProviderId?: string;
     beforeRetry?: () => void;
+    signal?: AbortSignal;
   },
 ): Promise<T> {
   try {
     return await operation();
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (isRetryableAuthError(error) && options.authRetryPolicy === "auto_once" && options.auth) {
+      checkAbort(options.signal, "operation aborted during auth retry");
       const providerId = error.provider_id ?? options.fallbackProviderId;
       if (!providerId) throw error;
       try {
-        await options.auth.login(providerId, options.authHandlers);
-      } catch {
+        await options.auth.login(providerId, options.authHandlers, { signal: options.signal });
+      } catch (loginError) {
+        if (isAbortError(loginError)) {
+          throw loginError;
+        }
+        // MakaiAuthError(kind: "cancelled") due to an actual abort signal should
+        // surface as AbortError; non-signal cancellations (e.g. missing onPrompt
+        // handler) should fall through to the authRequiredError path.
+        if (loginError instanceof MakaiAuthError && loginError.kind === "cancelled" && options.signal?.aborted) {
+          const abortError = new Error("operation aborted during auth retry");
+          abortError.name = "AbortError";
+          throw abortError;
+        }
         throw authRequiredError(providerId, error.message);
       }
+      checkAbort(options.signal, "operation aborted before retry");
       options.beforeRetry?.();
       try {
         return await operation();
       } catch (retryError) {
+        if (isAbortError(retryError)) throw retryError;
         if (isRetryableAuthError(retryError)) {
           const retryProviderId = retryError.provider_id ?? providerId;
           throw authRequiredError(retryProviderId, retryError.message);

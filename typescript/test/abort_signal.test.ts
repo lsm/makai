@@ -396,6 +396,114 @@ test("abort rejection is a plain Error with name 'AbortError', not MakaiStreamEr
 });
 
 // ---------------------------------------------------------------------------
+// Abort during withAuthRetry (auth_required + auto_once)
+// ---------------------------------------------------------------------------
+
+test("provider.complete withAuthRetry aborts before auth retry sends second envelope", async () => {
+  // Transport that yields an auth_required nack, then blocks (never resolves).
+  // The abort should cancel the retry without sending a second complete_request.
+  const transport = new AbortTestTransport();
+  transport.nextFrameForStream = async (streamId: string, _timeoutMs?: number) => {
+    return {
+      stream_id: streamId,
+      type: "nack",
+      payload: { reason: "login required", error_code: "auth_required", provider_id: "fixture" },
+    };
+  };
+  const auth = {
+    loginCalls: 0,
+    async listProviders() { return []; },
+    async login(_providerId: string, _handlers?: unknown, options?: { signal?: AbortSignal }): Promise<{ status: "success" }> {
+      this.loginCalls += 1;
+      return new Promise<{ status: "success" }>((resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+          return;
+        }
+        const onAbort = () => {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  };
+  const controller = new AbortController();
+  // Abort before the retry attempt can proceed
+  const completePromise = createMakaiProviderApi(transport as never, {
+    auth,
+    authRetryPolicy: "auto_once",
+  }).complete({ ...REQUEST, options: { auth_retry_policy: "auto_once", signal: controller.signal } });
+
+  // Give time for the nack to be received and withAuthRetry to enter the login call
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => completePromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Only the initial complete_request should have been sent; no retry envelope
+  assert.equal(transport.sent.filter((f) => f.type === "complete_request").length, 1);
+  assert.equal(auth.loginCalls, 1);
+});
+
+test("agent.run withAuthRetry aborts before retry sends second agent_start", async () => {
+  const transport = new AbortTestTransport();
+  transport.nextFrameForSession = async (sessionId: string, _timeoutMs?: number) => {
+    return {
+      session_id: sessionId,
+      type: "nack",
+      payload: { reason: "login required", error_code: "auth_required", provider_id: "fixture" },
+    };
+  };
+  const auth = {
+    loginCalls: 0,
+    async listProviders() { return []; },
+    async login(_providerId: string, _handlers?: unknown, options?: { signal?: AbortSignal }): Promise<{ status: "success" }> {
+      this.loginCalls += 1;
+      return new Promise<{ status: "success" }>((resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+          return;
+        }
+        const onAbort = () => {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  };
+  const controller = new AbortController();
+  const runPromise = createMakaiAgentApi(transport as never, {
+    auth,
+    authRetryPolicy: "auto_once",
+  }).run({ ...REQUEST, options: { auth_retry_policy: "auto_once", signal: controller.signal } });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => runPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Only one agent_start should have been sent
+  assert.equal(transport.sent.filter((f) => f.type === "agent_start").length, 1);
+  assert.equal(auth.loginCalls, 1);
+});
+
+// ---------------------------------------------------------------------------
 // Helper: count abort listeners on a signal
 // ---------------------------------------------------------------------------
 

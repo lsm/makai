@@ -1,4 +1,10 @@
 export {
+  checkAbort,
+  isAbortError,
+  raceWithAbort,
+} from "./abort_signal";
+
+export {
   MakaiStdioClient,
   StdioProtocolError,
   createMakaiStdioClient,

@@ -370,6 +370,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
     const effective = handlers ?? this.defaultHandlers;
     const flowId = ulid();
     let outboundSequence = 1;
+    let loginStarted = false;
 
     const startMessageId = ulid();
     this.sendOrThrow({
@@ -381,6 +382,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       version: PROTOCOL_VERSION,
       payload: { provider_id: providerId },
     });
+    loginStarted = true;
 
     let lastErrorEvent:
       | { code?: string; message: string }
@@ -389,6 +391,9 @@ export class MakaiAuthClient implements MakaiAuthApi {
 
     while (true) {
       if (signal?.aborted) {
+        if (loginStarted) {
+          this.bestEffortCancel(flowId, outboundSequence++);
+        }
         throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
       }
       const frame = await this.nextFrameForStream(flowId, {
@@ -509,6 +514,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       return (await raceWithAbort(this.transport.nextFrameForStream(streamId, this.frameTimeoutMs), signal, "auth.login aborted")) as RawEnvelope;
     } catch (error) {
       if (isAbortError(error)) {
+        this.bestEffortCancel(streamId, 999);
         throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
       }
       const diagnosticsContext = { ...context, timeout_ms: this.frameTimeoutMs, stream_id: streamId };
