@@ -526,8 +526,6 @@ test("models.resolve accepts provider_id at exactly 256 characters", async () =>
   const harness = await setupHarness({ response: makeResponse([descriptor]) });
   try {
     const api = createMakaiModelsApi(harness.client);
-    // This should NOT throw — the request is valid; it will reach the server
-    // and either resolve or fail at a later check (model not found etc.)
     await api.resolve({ provider_id: "a".repeat(256), model_id: "claude-sonnet-4-5" });
   } catch (err) {
     // Expected: may fail at model mismatch check, but NOT at length validation
@@ -562,12 +560,13 @@ test("models.resolve accepts model_id at exactly 256 characters", async () => {
   }
 });
 
-test("models.resolve rejects provider_id at 257 characters (boundary +1)", async () => {
+test("models.list rejects provider_id filter exceeding 256 characters before transport I/O", async () => {
   const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
   try {
     const api = createMakaiModelsApi(harness.client);
+    const longProviderId = "a".repeat(257);
     await assert.rejects(
-      () => api.resolve({ provider_id: "b".repeat(257), model_id: "model" }),
+      () => api.list({ provider_id: longProviderId }),
       (err: unknown) =>
         err instanceof MakaiProtocolError &&
         err.code === "invalid_request" &&
@@ -579,12 +578,13 @@ test("models.resolve rejects provider_id at 257 characters (boundary +1)", async
   }
 });
 
-test("models.resolve rejects model_id at 257 characters (boundary +1)", async () => {
+test("models.list rejects model_id filter exceeding 256 characters before transport I/O", async () => {
   const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
   try {
     const api = createMakaiModelsApi(harness.client);
+    const longModelId = "a".repeat(257);
     await assert.rejects(
-      () => api.resolve({ provider_id: "anthropic", model_id: "c".repeat(257) }),
+      () => api.list({ model_id: longModelId }),
       (err: unknown) =>
         err instanceof MakaiProtocolError &&
         err.code === "invalid_request" &&

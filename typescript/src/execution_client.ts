@@ -525,7 +525,6 @@ function buildAgentMessagePayload(
 }
 
 const MAX_MODEL_REF_LENGTH = 512;
-const MODEL_REF_REQUIRED_SEPARATOR = "/";
 
 function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunRequest): void {
   if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
@@ -534,12 +533,6 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
   if (request.model_ref.length > MAX_MODEL_REF_LENGTH) {
     throw new MakaiProtocolError(
       `model_ref exceeds maximum length of ${MAX_MODEL_REF_LENGTH} characters`,
-      "invalid_request",
-    );
-  }
-  if (!request.model_ref.includes(MODEL_REF_REQUIRED_SEPARATOR)) {
-    throw new MakaiProtocolError(
-      "model_ref must contain a '/' separator (expected format: {provider_id}/{...})",
       "invalid_request",
     );
   }

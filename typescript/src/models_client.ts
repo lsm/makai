@@ -138,6 +138,18 @@ class StdioModelsApi implements MakaiModelsApi {
   }
 
   async list(request: ListModelsRequest = {}): Promise<ListModelsResponse> {
+    if (typeof request.provider_id === "string" && request.provider_id.length > MAX_PROVIDER_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `provider_id exceeds maximum length of ${MAX_PROVIDER_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
+    if (typeof request.model_id === "string" && request.model_id.length > MAX_MODEL_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `model_id exceeds maximum length of ${MAX_MODEL_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
     return this.dispatch(request, request.signal);
   }
 
