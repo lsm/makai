@@ -6,6 +6,7 @@ const partial_reconstructor = @import("partial_reconstructor.zig");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const transport = @import("transport");
+const transport_retry = @import("transport_retry");
 const oom = @import("oom");
 const owned_slice_mod = @import("owned_slice");
 
@@ -26,6 +27,15 @@ pub const ProtocolClient = struct {
     pub const Options = struct {
         include_partial: bool = false,
         request_timeout_ms: u64 = 30_000,
+
+        /// Retry configuration for transient transport errors.
+        /// When set, the client applies retry with exponential backoff to:
+        /// - Transport connection (handshake failures)
+        /// - Frame reads (transient decode errors)
+        ///
+        /// Set to null (default) to use default retry behavior (no retry).
+        /// Set to a TransportRetryOptions with max_retries: 0 to explicitly disable.
+        retry_options: ?transport_retry.TransportRetryOptions = null,
     };
 
     pub const StreamRequestRef = struct {

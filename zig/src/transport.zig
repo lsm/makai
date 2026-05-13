@@ -230,7 +230,7 @@ pub fn receiveStream(
 ///   accumulated message state. If `partial.is_owned` is true, the
 ///   partial owns its content and must be freed.
 /// - Call this function when done with an event to prevent memory leaks.
-fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
+pub fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Allocator) void {
     switch (ev) {
         .start => |e| {
             if (e.partial.is_owned) {
@@ -318,7 +318,7 @@ fn freeEventStrings(ev: ai_types.AssistantMessageEvent, allocator: std.mem.Alloc
 }
 
 /// Free allocated strings in a control message
-fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
+pub fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
     switch (ctrl) {
         .ack => |a| {
             var id = a.acknowledged_id;
@@ -350,7 +350,7 @@ fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) void {
 }
 
 /// Free allocated strings in a MessageOrControl
-fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
+pub fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
     switch (msg) {
         .event => |ev| freeEventStrings(ev, allocator),
         .result => |r| {
