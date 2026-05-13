@@ -2,7 +2,7 @@ import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
 import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
-import { getNoopLogger, type MakaiLogger } from "./logger";
+import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
@@ -144,7 +144,9 @@ class StdioProviderApi implements MakaiProviderApi {
   private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<ProviderCompleteResponse> {
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
-    this.logger.debug("provider: sending complete_request", { stream_id: streamId, model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: sending complete_request", { stream_id: streamId, model_ref: request.model_ref });
+    }
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider complete_response", this.responseTimeoutMs, streamId, request);
     while (true) {
@@ -167,7 +169,9 @@ class StdioProviderApi implements MakaiProviderApi {
     let yielded = false;
     let retried = false;
 
-    this.logger.debug("provider: starting stream", { model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: starting stream", { model_ref: request.model_ref });
+    }
 
     while (true) {
       let result;
@@ -203,12 +207,16 @@ class StdioProviderApi implements MakaiProviderApi {
   private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<ProviderStreamEvent> {
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
-    this.logger.debug("provider: sending stream_request", { stream_id: streamId, model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: sending stream_request", { stream_id: streamId, model_ref: request.model_ref });
+    }
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider stream event", this.responseTimeoutMs, streamId, request);
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
-    this.logger.debug("provider: stream started", { stream_id: streamId });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: stream started", { stream_id: streamId });
+    }
     try {
       while (!terminal) {
         const frame = await nextFrame(this.transport, streamId, timeoutContext);
@@ -277,7 +285,9 @@ class StdioAgentApi implements MakaiAgentApi {
   private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<AgentRunResponse> {
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
-    this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    }
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
     const events: AgentStreamEvent[] = [];
@@ -319,7 +329,9 @@ class StdioAgentApi implements MakaiAgentApi {
     let yielded = false;
     let retried = false;
 
-    this.logger.debug("agent: starting stream", { model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: starting stream", { model_ref: request.model_ref });
+    }
 
     while (true) {
       let result;
@@ -359,7 +371,9 @@ class StdioAgentApi implements MakaiAgentApi {
   private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<AgentStreamEvent> {
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
-    this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    }
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
     let terminal = false;
@@ -367,7 +381,9 @@ class StdioAgentApi implements MakaiAgentApi {
     let started = false;
     let aggregateUsage: UsageSummary | undefined;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
-    this.logger.debug("agent: stream started", { session_id: sessionId });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: stream started", { session_id: sessionId });
+    }
     try {
       while (!terminal) {
         const frame = await nextAgentFrame(this.transport, sessionId, timeoutContext);

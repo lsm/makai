@@ -362,7 +362,9 @@ export class MakaiStdioClient {
       return;
     }
 
-    this.logger.debug("stdio: received frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("stdio: received frame", { type: frame.type, stream_id: frame.stream_id, session_id: frame.session_id, sequence: frame.sequence });
+    }
 
     if (this.pendingHandshake) {
       const pending = this.pendingHandshake;
