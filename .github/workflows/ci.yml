@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, transport, protocol, providers, utils, agent-types, agent-loop, agent-mod, agent-bridge, agent-unit, agent-chain]
+        group: [core, transport, protocol, providers, utils, makai-cli, agent-types, agent-loop, agent-mod, agent-bridge, agent-unit, agent-chain]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
