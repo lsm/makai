@@ -138,12 +138,14 @@ pub fn receiveStreamWithRetry(
     while (true) {
         const line = retryableRead(receiver, allocator, &opts) catch |err| {
             const err_name = @errorName(err);
-            // Include the specific error name for debuggability
-            const msg = std.fmt.allocPrint(allocator, "Transport read error: {s}", .{err_name}) catch
-                "Transport read error: unknown";
-            defer if (std.mem.indexOf(u8, msg, "Transport read error: ") != null) allocator.free(msg);
+            // Include the specific error name for debuggability.
+            // Track allocation to avoid freeing a string literal fallback.
+            const allocated_msg = std.fmt.allocPrint(allocator, "Transport read error: {s}", .{err_name}) catch
+                @as(?[]const u8, null);
+            const msg: []const u8 = allocated_msg orelse "Transport read error: unknown";
+            defer if (allocated_msg != null) allocator.free(msg);
             stream.completeWithError(msg);
-            return;
+            return error.TransportReadFailed;
         };
 
         if (line) |data| {

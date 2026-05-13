@@ -644,9 +644,11 @@ pub const ProtocolClient = struct {
         while (true) {
             const line = transport_retry.retryableRead(receiver, allocator, &opts) catch |err| {
                 const err_name = @errorName(err);
-                const msg = std.fmt.allocPrint(allocator, "Transport read error: {s}", .{err_name}) catch
-                    "Transport read error";
-                defer if (std.mem.startsWith(u8, msg, "Transport read error: ")) allocator.free(msg);
+                // Track allocation to avoid freeing a string literal fallback.
+                const allocated_msg = std.fmt.allocPrint(allocator, "Transport read error: {s}", .{err_name}) catch
+                    @as(?[]const u8, null);
+                const msg: []const u8 = allocated_msg orelse "Transport read error";
+                defer if (allocated_msg != null) allocator.free(msg);
                 try self.setLastError(msg);
                 return err;
             };
@@ -654,8 +656,12 @@ pub const ProtocolClient = struct {
             if (line) |data| {
                 defer allocator.free(data);
 
-                // Skip frames that fail deserialization (transient decode tolerance)
-                var env = envelope.deserializeEnvelope(data, allocator) catch continue;
+                // Skip frames that fail deserialization (transient decode tolerance),
+                // but propagate fatal errors like OOM to avoid corrupted state.
+                var env = envelope.deserializeEnvelope(data, allocator) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    continue;
+                };
                 defer env.deinit(allocator);
 
                 try self.processEnvelope(env);
