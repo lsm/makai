@@ -79,6 +79,12 @@ export {
 } from "./timeout_diagnostics";
 
 export {
+  type MakaiLogger,
+  getNoopLogger,
+  isNoopLogger,
+} from "./logger";
+
+export {
   MakaiProtocolError,
   // Note: `AuthStatus` and `ProviderId` are re-exported from `./auth_protocol`
   // above. The structurally-identical aliases in `./models_types` are kept
