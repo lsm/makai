@@ -452,6 +452,7 @@ class StdioAgentApi implements MakaiAgentApi {
         this.logger.error("agent: stream error", { kind: error.kind, code: error.code, message: error.message });
         throw error;
       }
+      if (isAbortError(error)) throw error;
       this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
