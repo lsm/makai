@@ -730,16 +730,26 @@ fn deserializeStreamRequest(
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
 
-    // Allocate each field separately with errdefer to avoid leaks on OOM
-    const id = try allocator.dupe(u8, model_obj.get("id").?.string);
+    // Validate and allocate each field separately with errdefer to avoid leaks on OOM
+    const id_str = model_obj.get("id").?.string;
+    try validateLength(id_str, MAX_MODEL_FIELD_LENGTH);
+    const id = try allocator.dupe(u8, id_str);
     errdefer allocator.free(id);
-    const name = try allocator.dupe(u8, model_obj.get("name").?.string);
+    const name_str = model_obj.get("name").?.string;
+    try validateLength(name_str, MAX_MODEL_FIELD_LENGTH);
+    const name = try allocator.dupe(u8, name_str);
     errdefer allocator.free(name);
-    const api = try allocator.dupe(u8, model_obj.get("api").?.string);
+    const api_str = model_obj.get("api").?.string;
+    try validateLength(api_str, MAX_IDENTIFIER_LENGTH);
+    const api = try allocator.dupe(u8, api_str);
     errdefer allocator.free(api);
-    const provider = try allocator.dupe(u8, model_obj.get("provider").?.string);
+    const provider_str = model_obj.get("provider").?.string;
+    try validateLength(provider_str, MAX_IDENTIFIER_LENGTH);
+    const provider = try allocator.dupe(u8, provider_str);
     errdefer allocator.free(provider);
-    const base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string);
+    const base_url_str = model_obj.get("base_url").?.string;
+    try validateLength(base_url_str, MAX_MODEL_FIELD_LENGTH);
+    const base_url = try allocator.dupe(u8, base_url_str);
     errdefer allocator.free(base_url);
 
     const model = ai_types.Model{
@@ -787,16 +797,26 @@ fn deserializeCompleteRequest(
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
 
-    // Allocate each field separately with errdefer to avoid leaks on OOM
-    const id = try allocator.dupe(u8, model_obj.get("id").?.string);
+    // Validate and allocate each field separately with errdefer to avoid leaks on OOM
+    const id_str = model_obj.get("id").?.string;
+    try validateLength(id_str, MAX_MODEL_FIELD_LENGTH);
+    const id = try allocator.dupe(u8, id_str);
     errdefer allocator.free(id);
-    const name = try allocator.dupe(u8, model_obj.get("name").?.string);
+    const name_str = model_obj.get("name").?.string;
+    try validateLength(name_str, MAX_MODEL_FIELD_LENGTH);
+    const name = try allocator.dupe(u8, name_str);
     errdefer allocator.free(name);
-    const api = try allocator.dupe(u8, model_obj.get("api").?.string);
+    const api_str = model_obj.get("api").?.string;
+    try validateLength(api_str, MAX_IDENTIFIER_LENGTH);
+    const api = try allocator.dupe(u8, api_str);
     errdefer allocator.free(api);
-    const provider = try allocator.dupe(u8, model_obj.get("provider").?.string);
+    const provider_str = model_obj.get("provider").?.string;
+    try validateLength(provider_str, MAX_IDENTIFIER_LENGTH);
+    const provider = try allocator.dupe(u8, provider_str);
     errdefer allocator.free(provider);
-    const base_url = try allocator.dupe(u8, model_obj.get("base_url").?.string);
+    const base_url_str = model_obj.get("base_url").?.string;
+    try validateLength(base_url_str, MAX_MODEL_FIELD_LENGTH);
+    const base_url = try allocator.dupe(u8, base_url_str);
     errdefer allocator.free(base_url);
 
     const model = ai_types.Model{
@@ -853,10 +873,10 @@ fn deserializeModelsRequest(
     obj: std.json.ObjectMap,
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsRequest {
-    const provider_id = if (obj.get("provider_id")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
-    else
-        protocol_types.OwnedSlice(u8).initBorrowed("");
+    const provider_id = if (obj.get("provider_id")) |value| blk: {
+        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+    } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = provider_id;
         mutable.deinit(allocator);
@@ -871,10 +891,10 @@ fn deserializeModelsRequest(
         mutable.deinit(allocator);
     }
 
-    const model_id = if (obj.get("model_id")) |value|
-        protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string))
-    else
-        protocol_types.OwnedSlice(u8).initBorrowed("");
+    const model_id = if (obj.get("model_id")) |value| blk: {
+        try validateLength(value.string, MAX_IDENTIFIER_LENGTH);
+        break :blk protocol_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, value.string));
+    } else protocol_types.OwnedSlice(u8).initBorrowed("");
     errdefer {
         var mutable = model_id;
         mutable.deinit(allocator);
@@ -1583,7 +1603,22 @@ pub const EnvelopeError = error{
     UnknownContentPartType,
     MissingContent,
     InvalidEnumValue,
+    InputTooLong,
 };
+
+/// Maximum allowed length for user-supplied provider_id and model_id strings.
+/// Client-side TS SDK enforces the same 256-char cap.
+pub const MAX_IDENTIFIER_LENGTH: usize = 256;
+
+/// Maximum allowed length for user-supplied model fields in stream/complete requests.
+/// These come from client-side model_ref parsing and carry similar size constraints.
+pub const MAX_MODEL_FIELD_LENGTH: usize = 512;
+
+/// Validate that a string slice does not exceed the given maximum length.
+/// Returns an error if the input is too long.
+fn validateLength(slice: []const u8, max_len: usize) EnvelopeError!void {
+    if (slice.len > max_len) return error.InputTooLong;
+}
 
 // Tests
 
@@ -2527,4 +2562,197 @@ test "serializeEnvelope and deserializeEnvelope roundtrip with models_response" 
     try std.testing.expectEqual(protocol_types.ErrorCode.not_implemented, parseErrorCode("not_implemented"));
 
     original.deinit(allocator);
+}
+
+test "deserializeEnvelope rejects models_request with oversized provider_id" {
+    const allocator = std.testing.allocator;
+    const long_id = "a" ** 257; // 257 chars, exceeds MAX_IDENTIFIER_LENGTH (256)
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "models_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "provider_id": "{s}"
+        \\  }}
+        \\}}
+    , .{long_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    const result = deserializeEnvelope(json, allocator);
+    try std.testing.expectError(error.InputTooLong, result);
+}
+
+test "deserializeEnvelope rejects models_request with oversized model_id" {
+    const allocator = std.testing.allocator;
+    const long_id = "b" ** 257;
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "models_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "model_id": "{s}"
+        \\  }}
+        \\}}
+    , .{long_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    const result = deserializeEnvelope(json, allocator);
+    try std.testing.expectError(error.InputTooLong, result);
+}
+
+test "deserializeEnvelope accepts models_request with provider_id at exactly 256 chars" {
+    const allocator = std.testing.allocator;
+    const exact_id = "a" ** 256;
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "models_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "provider_id": "{s}"
+        \\  }}
+        \\}}
+    , .{exact_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    var env = try deserializeEnvelope(json, allocator);
+    defer env.deinit(allocator);
+    try std.testing.expect(env.payload == .models_request);
+    try std.testing.expectEqualStrings(exact_id, env.payload.models_request.provider_id.slice());
+}
+
+test "deserializeEnvelope rejects stream_request with oversized model id" {
+    const allocator = std.testing.allocator;
+    const long_id = "a" ** 513; // exceeds MAX_MODEL_FIELD_LENGTH (512)
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "stream_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "model": {{
+        \\      "id": "{s}",
+        \\      "name": "test",
+        \\      "api": "test-api",
+        \\      "provider": "test-provider",
+        \\      "base_url": ""
+        \\    }},
+        \\    "context": {{ "messages": [] }}
+        \\  }}
+        \\}}
+    , .{long_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    const result = deserializeEnvelope(json, allocator);
+    try std.testing.expectError(error.InputTooLong, result);
+}
+
+test "deserializeEnvelope rejects stream_request with oversized provider" {
+    const allocator = std.testing.allocator;
+    const long_provider = "p" ** 257; // exceeds MAX_IDENTIFIER_LENGTH (256)
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "stream_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "model": {{
+        \\      "id": "test-model",
+        \\      "name": "test",
+        \\      "api": "test-api",
+        \\      "provider": "{s}",
+        \\      "base_url": ""
+        \\    }},
+        \\    "context": {{ "messages": [] }}
+        \\  }}
+        \\}}
+    , .{long_provider}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    const result = deserializeEnvelope(json, allocator);
+    try std.testing.expectError(error.InputTooLong, result);
+}
+
+test "deserializeEnvelope rejects complete_request with oversized model id" {
+    const allocator = std.testing.allocator;
+    const long_id = "x" ** 513;
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "complete_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "model": {{
+        \\      "id": "{s}",
+        \\      "name": "test",
+        \\      "api": "test-api",
+        \\      "provider": "test-provider",
+        \\      "base_url": ""
+        \\    }},
+        \\    "context": {{ "messages": [] }}
+        \\  }}
+        \\}}
+    , .{long_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    const result = deserializeEnvelope(json, allocator);
+    try std.testing.expectError(error.InputTooLong, result);
+}
+
+test "deserializeEnvelope accepts stream_request with model id at exactly 512 chars" {
+    const allocator = std.testing.allocator;
+    const exact_id = "a" ** 512;
+
+    const json = std.fmt.allocPrint(allocator,
+        \\{{
+        \\  "type": "stream_request",
+        \\  "stream_id": "014D2PF2DBSQQZXQ5TK1V58CGG",
+        \\  "message_id": "0J6HB7H6NWVVRFXX5TK1V58CGG",
+        \\  "sequence": 1,
+        \\  "timestamp": 1708234567890,
+        \\  "version": 1,
+        \\  "payload": {{
+        \\    "model": {{
+        \\      "id": "{s}",
+        \\      "name": "test",
+        \\      "api": "test-api",
+        \\      "provider": "test-provider",
+        \\      "base_url": ""
+        \\    }},
+        \\    "context": {{ "messages": [] }}
+        \\  }}
+        \\}}
+    , .{exact_id}) catch @panic("OOM");
+    defer allocator.free(json);
+
+    var env = try deserializeEnvelope(json, allocator);
+    defer env.deinit(allocator);
+    try std.testing.expect(env.payload == .stream_request);
+    try std.testing.expectEqualStrings(exact_id, env.payload.stream_request.model.id);
 }
