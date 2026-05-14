@@ -85,6 +85,13 @@ export {
 } from "./timeout_diagnostics";
 
 export {
+  bestEffortCancelStream,
+  bestEffortCancelAgent,
+  drainStreamFrames,
+  drainSessionFrames,
+} from "./cancel_helpers";
+
+export {
   type MakaiLogger,
   getNoopLogger,
   isNoopLogger,

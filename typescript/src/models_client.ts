@@ -21,6 +21,7 @@
 
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
+import { bestEffortCancelStream, drainStreamFrames } from "./cancel_helpers";
 import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
   AuthStatus,
@@ -49,56 +50,6 @@ const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omi
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_ID_LENGTH = 256;
 const MAX_MODEL_ID_LENGTH = 256;
-
-// ---------------------------------------------------------------------------
-// Best-effort cancel + drain helpers for models
-// ---------------------------------------------------------------------------
-
-/**
- * Sends an `abort_request` envelope for the given models stream, swallowing
- * any transport errors so the original abort error propagates cleanly.
- */
-function bestEffortCancelModelsStream(client: MakaiStdioClient, streamId: string): void {
-  try {
-    client.send({
-      type: "abort_request",
-      stream_id: streamId,
-      message_id: ulid(),
-      sequence: 999,
-      timestamp: Date.now(),
-      version: ENVELOPE_VERSION,
-      payload: { target_stream_id: streamId, reason: "client aborted" },
-    });
-  } catch {
-    // Best-effort cancellation; ignore transport errors here so we keep
-    // surfacing the original failure to the caller.
-  }
-}
-
-/**
- * Drains remaining in-flight frames for an abandoned models stream from the
- * transport buffer. Prevents orphaned frames from interfering with
- * subsequent operations on the shared transport.
- *
- * Uses a Promise.race with a per-iteration timeout so it never blocks
- * indefinitely even if the transport mock doesn't respect timeoutMs.
- */
-async function drainModelsStreamFrames(client: MakaiStdioClient, streamId: string, timeoutMs = 200): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    const perFrameMs = Math.min(remaining, 50);
-    try {
-      await Promise.race([
-        client.nextFrameForStream(streamId, perFrameMs).catch(() => undefined),
-        new Promise<void>((resolve) => setTimeout(resolve, perFrameMs)),
-      ]);
-    } catch {
-      break;
-    }
-  }
-}
 
 const KNOWN_AUTH_STATUSES: ReadonlySet<string> = new Set([
   "authenticated",
@@ -324,8 +275,8 @@ class StdioModelsApi implements MakaiModelsApi {
       }
     } catch (error) {
       if (isAbortError(error)) {
-        bestEffortCancelModelsStream(this.client, streamId);
-        await drainModelsStreamFrames(this.client, streamId);
+        bestEffortCancelStream(this.client, streamId);
+        await drainStreamFrames(this.client, streamId);
       }
       throw error;
     }

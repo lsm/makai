@@ -2,6 +2,7 @@ import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
+import { bestEffortCancelStream, bestEffortCancelAgent, drainStreamFrames, drainSessionFrames } from "./cancel_helpers";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
@@ -216,11 +217,7 @@ class StdioProviderApi implements MakaiProviderApi {
           result = await raceWithAbort(iterator.next(), signal, "provider.stream aborted");
         } catch (error) {
           if (isAbortError(error)) {
-            const streamId = activeStreamId.value;
-            if (streamId) {
-              bestEffortCancelStream(this.transport, streamId);
-              await drainStreamFrames(this.transport, streamId);
-            }
+            // Cancel+drain handled by outer catch to avoid triple-send.
             throw error;
           }
           if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
@@ -230,11 +227,7 @@ class StdioProviderApi implements MakaiProviderApi {
                 await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "provider.stream aborted during auth retry");
               } catch (authError) {
                 if (isAbortError(authError)) {
-                  const streamId = activeStreamId.value;
-                  if (streamId) {
-                    bestEffortCancelStream(this.transport, streamId);
-                    await drainStreamFrames(this.transport, streamId);
-                  }
+                  // Cancel+drain handled by outer catch.
                   throw authError;
                 }
                 throw authRequiredError(providerId, error.message);
@@ -307,8 +300,7 @@ class StdioProviderApi implements MakaiProviderApi {
         throw error;
       }
       if (isAbortError(error)) {
-        bestEffortCancelStream(this.transport, streamId);
-        await drainStreamFrames(this.transport, streamId);
+        // Cancel+drain handled by outer stream() catch to avoid triple-send.
         throw error;
       }
       this.logger.error("provider: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
@@ -440,11 +432,7 @@ class StdioAgentApi implements MakaiAgentApi {
           result = await raceWithAbort(iterator.next(), signal, "agent.stream aborted");
         } catch (error) {
           if (isAbortError(error)) {
-            const sessionId = activeSessionId.value;
-            if (sessionId) {
-              bestEffortCancelAgent(this.transport, sessionId);
-              await drainSessionFrames(this.transport, sessionId);
-            }
+            // Cancel+drain handled by outer catch to avoid triple-send.
             throw error;
           }
           if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
@@ -454,11 +442,7 @@ class StdioAgentApi implements MakaiAgentApi {
                 await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "agent.stream aborted during auth retry");
               } catch (authError) {
                 if (isAbortError(authError)) {
-                  const sessionId = activeSessionId.value;
-                  if (sessionId) {
-                    bestEffortCancelAgent(this.transport, sessionId);
-                    await drainSessionFrames(this.transport, sessionId);
-                  }
+                  // Cancel+drain handled by outer catch.
                   throw authError;
                 }
                 throw authRequiredError(providerId, error.message);
@@ -558,8 +542,7 @@ class StdioAgentApi implements MakaiAgentApi {
         throw error;
       }
       if (isAbortError(error)) {
-        bestEffortCancelAgent(this.transport, sessionId);
-        await drainSessionFrames(this.transport, sessionId);
+        // Cancel+drain handled by outer agent.stream() catch to avoid triple-send.
         throw error;
       }
       this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
@@ -1289,103 +1272,6 @@ function firstKey(value: Record<string, unknown>): string {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// ---------------------------------------------------------------------------
-// Best-effort cancel + drain helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Sends an `abort_request` envelope for the given stream, swallowing any
- * transport errors so the original abort error propagates cleanly.
- *
- * This mirrors `MakaiAuthClient.bestEffortCancel()` in auth_protocol.ts.
- */
-function bestEffortCancelStream(transport: MakaiStdioClient, streamId: string): void {
-  try {
-    transport.send({
-      type: "abort_request",
-      stream_id: streamId,
-      message_id: ulid(),
-      sequence: 999,
-      timestamp: Date.now(),
-      version: ENVELOPE_VERSION,
-      payload: { target_stream_id: streamId, reason: "client aborted" },
-    });
-  } catch {
-    // Best-effort cancellation; ignore transport errors here so we keep
-    // surfacing the original failure to the caller.
-  }
-}
-
-/**
- * Sends an `agent_stop` envelope for the given session, swallowing any
- * transport errors so the original abort error propagates cleanly.
- */
-function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: string): void {
-  try {
-    transport.send({
-      type: "agent_stop",
-      session_id: sessionId,
-      message_id: ulid(),
-      sequence: 999,
-      timestamp: Date.now(),
-      version: ENVELOPE_VERSION,
-      payload: { session_id: sessionId, reason: "client aborted" },
-    });
-  } catch {
-    // Best-effort cancellation; ignore transport errors here so we keep
-    // surfacing the original failure to the caller.
-  }
-}
-
-/**
- * Drains remaining in-flight frames for an abandoned stream from the
- * transport buffer. Prevents orphaned frames from interfering with
- * subsequent operations on the shared transport.
- *
- * Returns once the transport buffer is empty for the given stream_id or
- * the timeout expires. Analogous to `drainLoginResult()` in auth_protocol.ts.
- *
- * Uses a Promise.race with a per-iteration timeout so it never blocks
- * indefinitely even if the transport mock doesn't respect timeoutMs.
- */
-async function drainStreamFrames(transport: MakaiStdioClient, streamId: string, timeoutMs = 200): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    const perFrameMs = Math.min(remaining, 50);
-    try {
-      await Promise.race([
-        transport.nextFrameForStream(streamId, perFrameMs).catch(() => undefined),
-        new Promise<void>((resolve) => setTimeout(resolve, perFrameMs)),
-      ]);
-    } catch {
-      break;
-    }
-  }
-}
-
-/**
- * Drains remaining in-flight frames for an abandoned agent session from the
- * transport buffer.
- */
-async function drainSessionFrames(transport: MakaiStdioClient, sessionId: string, timeoutMs = 200): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    const perFrameMs = Math.min(remaining, 50);
-    try {
-      await Promise.race([
-        transport.nextFrameForSession(sessionId, perFrameMs).catch(() => undefined),
-        new Promise<void>((resolve) => setTimeout(resolve, perFrameMs)),
-      ]);
-    } catch {
-      break;
-    }
-  }
 }
 
 function isRetryableAuthError(error: unknown): error is MakaiStreamError {

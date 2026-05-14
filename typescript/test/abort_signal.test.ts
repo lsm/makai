@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createMakaiAgentApi,
+  createMakaiModelsApi,
   createMakaiProviderApi,
   MakaiAuthError,
   MakaiStreamError,
@@ -659,10 +660,10 @@ test("provider.stream sends abort_request cancel envelope on abort", async () =>
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify abort_request was sent
-  const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
-  assert.ok(cancelFrame, "expected abort_request frame");
-  const payload = cancelFrame!.payload as Record<string, unknown>;
+  // Verify exactly one abort_request was sent (no triple-cancel)
+  const cancelFrames = transport.sent.filter((f) => f.type === "abort_request");
+  assert.equal(cancelFrames.length, 1, "expected exactly one abort_request frame");
+  const payload = cancelFrames[0]!.payload as Record<string, unknown>;
   assert.equal(payload.reason, "client aborted");
   const requestFrame = transport.sent.find((f) => f.type === "stream_request");
   assert.equal(payload.target_stream_id, requestFrame?.stream_id);
@@ -732,10 +733,10 @@ test("agent.stream sends agent_stop cancel envelope on abort", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
 
-  // Verify agent_stop was sent
-  const cancelFrame = transport.sent.find((f) => f.type === "agent_stop");
-  assert.ok(cancelFrame, "expected agent_stop frame");
-  const payload = cancelFrame!.payload as Record<string, unknown>;
+  // Verify exactly one agent_stop was sent (no triple-cancel)
+  const cancelFrames = transport.sent.filter((f) => f.type === "agent_stop");
+  assert.equal(cancelFrames.length, 1, "expected exactly one agent_stop frame");
+  const payload = cancelFrames[0]!.payload as Record<string, unknown>;
   assert.equal(payload.reason, "client aborted");
 
   transport.rejectAll();
@@ -805,6 +806,39 @@ test("provider.complete withAuthRetry sends cancel on abort during auth login", 
   assert.ok(cancelFrame, "expected abort_request frame from withAuthRetry onAbort");
   const payload = cancelFrame!.payload as Record<string, unknown>;
   assert.equal(payload.reason, "client aborted");
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+// ---------------------------------------------------------------------------
+// models cancel envelope verification
+// ---------------------------------------------------------------------------
+
+test("models.list sends abort_request cancel envelope on abort", async () => {
+  const transport = new AbortTestTransport();
+  const models = createMakaiModelsApi(transport as never);
+  const controller = new AbortController();
+
+  const listPromise = models.list({ provider_id: "anthropic", signal: controller.signal });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => listPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify abort_request was sent with correct fields
+  const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
+  assert.ok(cancelFrame, "expected abort_request frame");
+  const payload = cancelFrame!.payload as Record<string, unknown>;
+  assert.equal(typeof payload.target_stream_id, "string");
+  assert.equal(payload.reason, "client aborted");
+  // target_stream_id should match the stream_id from the original models_request
+  const requestFrame = transport.sent.find((f) => f.type === "models_request");
+  assert.equal(payload.target_stream_id, requestFrame?.stream_id);
 
   transport.rejectAll();
   await flushMicrotasks();
