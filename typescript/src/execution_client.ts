@@ -3,6 +3,7 @@ import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
+import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
 import type { MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
@@ -49,6 +50,7 @@ type ExecutionOptions = {
   authRetryPolicy?: RunOptions["auth_retry_policy"];
   auth?: MakaiAuthApi;
   authHandlers?: AuthFlowHandlers;
+  logger?: MakaiLogger;
 };
 
 /** Root Makai SDK client returned by {@link createMakaiClient}. */
@@ -113,7 +115,7 @@ export function createMakaiAgentApiWithModels(
   options: ExecutionOptions = {},
 ): MakaiAgentModelsApi {
   return Object.assign(new StdioAgentApi(transport, options), {
-    models: createMakaiModelsApi(transport, { responseTimeoutMs: options.responseTimeoutMs }),
+    models: createMakaiModelsApi(transport, { responseTimeoutMs: options.responseTimeoutMs, logger: options.logger }),
   });
 }
 
@@ -122,12 +124,14 @@ class StdioProviderApi implements MakaiProviderApi {
   private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
   private readonly auth?: MakaiAuthApi;
   private readonly authHandlers?: AuthFlowHandlers;
+  private readonly logger: MakaiLogger;
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     this.authRetryPolicy = options.authRetryPolicy;
     this.auth = options.auth;
     this.authHandlers = options.authHandlers;
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   async complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
@@ -136,7 +140,7 @@ class StdioProviderApi implements MakaiProviderApi {
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
       () => this.completeOnce(request, effectivePolicy, signal),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request), signal },
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request), signal, logger: this.logger },
     );
   }
 
@@ -144,6 +148,9 @@ class StdioProviderApi implements MakaiProviderApi {
     checkAbort(signal, "provider.complete aborted");
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: sending complete_request", { stream_id: streamId, model_ref: request.model_ref });
+    }
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider complete_response", this.responseTimeoutMs, streamId, request);
     while (true) {
@@ -168,6 +175,10 @@ class StdioProviderApi implements MakaiProviderApi {
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
     let retried = false;
+
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: starting stream", { model_ref: request.model_ref });
+    }
 
     while (true) {
       checkAbort(signal, "provider.stream aborted");
@@ -207,10 +218,16 @@ class StdioProviderApi implements MakaiProviderApi {
     checkAbort(signal, "provider.stream aborted");
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: sending stream_request", { stream_id: streamId, model_ref: request.model_ref });
+    }
     this.transport.send(buildEnvelope("stream_request", streamId, buildExecutionPayload(request, { suppressPartial: true, authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider stream event", this.responseTimeoutMs, streamId, request);
     let terminal = false;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("provider: stream started", { stream_id: streamId });
+    }
     try {
       while (!terminal) {
         checkAbort(signal, "provider.stream aborted");
@@ -231,8 +248,12 @@ class StdioProviderApi implements MakaiProviderApi {
         yield event;
       }
     } catch (error) {
-      if (error instanceof MakaiStreamError) throw error;
+      if (error instanceof MakaiStreamError) {
+        this.logger.error("provider: stream error", { kind: error.kind, code: error.code, message: error.message });
+        throw error;
+      }
       if (isAbortError(error)) throw error;
+      this.logger.error("provider: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
   }
@@ -243,12 +264,14 @@ class StdioAgentApi implements MakaiAgentApi {
   private readonly authRetryPolicy?: RunOptions["auth_retry_policy"];
   private readonly auth?: MakaiAuthApi;
   private readonly authHandlers?: AuthFlowHandlers;
+  private readonly logger: MakaiLogger;
 
   constructor(private readonly transport: MakaiStdioClient, options: ExecutionOptions) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
     this.authRetryPolicy = options.authRetryPolicy;
     this.auth = options.auth;
     this.authHandlers = options.authHandlers;
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
@@ -264,6 +287,7 @@ class StdioAgentApi implements MakaiAgentApi {
         authRetryPolicy: effectivePolicy,
         fallbackProviderId: providerIdFromRequest(request),
         signal,
+        logger: this.logger,
         beforeRetry: () => {
           retryRequest = {
             ...request,
@@ -278,6 +302,9 @@ class StdioAgentApi implements MakaiAgentApi {
     checkAbort(signal, "agent.run aborted");
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    }
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
     const events: AgentStreamEvent[] = [];
@@ -322,6 +349,10 @@ class StdioAgentApi implements MakaiAgentApi {
     let yielded = false;
     let retried = false;
 
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: starting stream", { model_ref: request.model_ref });
+    }
+
     while (true) {
       checkAbort(signal, "agent.stream aborted");
       let result;
@@ -364,6 +395,9 @@ class StdioAgentApi implements MakaiAgentApi {
     checkAbort(signal, "agent.stream aborted");
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
+    }
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
     let terminal = false;
@@ -371,6 +405,9 @@ class StdioAgentApi implements MakaiAgentApi {
     let started = false;
     let aggregateUsage: UsageSummary | undefined;
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
+    if (!isNoopLogger(this.logger)) {
+      this.logger.debug("agent: stream started", { session_id: sessionId });
+    }
     try {
       while (!terminal) {
         checkAbort(signal, "agent.stream aborted");
@@ -411,8 +448,11 @@ class StdioAgentApi implements MakaiAgentApi {
         }
       }
     } catch (error) {
-      if (error instanceof MakaiStreamError) throw error;
-      if (isAbortError(error)) throw error;
+      if (error instanceof MakaiStreamError) {
+        this.logger.error("agent: stream error", { kind: error.kind, code: error.code, message: error.message });
+        throw error;
+      }
+      this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
   }
@@ -1105,6 +1145,7 @@ async function withAuthRetry<T>(
     fallbackProviderId?: string;
     beforeRetry?: () => void;
     signal?: AbortSignal;
+    logger?: MakaiLogger;
   },
 ): Promise<T> {
   try {
@@ -1115,6 +1156,8 @@ async function withAuthRetry<T>(
       checkAbort(options.signal, "operation aborted during auth retry");
       const providerId = error.provider_id ?? options.fallbackProviderId;
       if (!providerId) throw error;
+      const logger = options.logger ?? getNoopLogger();
+      logger.info("execution: auto-retrying after auth_required", { provider_id: providerId });
       try {
         await raceWithAbort(
           options.auth.login(providerId, options.authHandlers, { signal: options.signal }),
@@ -1125,9 +1168,6 @@ async function withAuthRetry<T>(
         if (isAbortError(loginError)) {
           throw loginError;
         }
-        // MakaiAuthError(kind: "cancelled") due to an actual abort signal should
-        // surface as AbortError; non-signal cancellations (e.g. missing onPrompt
-        // handler) should fall through to the authRequiredError path.
         if (loginError instanceof MakaiAuthError && loginError.kind === "cancelled" && options.signal?.aborted) {
           const abortError = new Error("operation aborted during auth retry");
           abortError.name = "AbortError";
@@ -1180,19 +1220,20 @@ async function withAuthRetry<T>(
  * ```
  */
 export async function createMakaiClient(options: CreateMakaiClientOptions = {}): Promise<MakaiClient> {
-  const { auth: authOptions, responseTimeoutMs, frameTimeoutMs, ...transportOptions } = options;
-  const transport = await createMakaiStdioClient(transportOptions);
+  const { auth: authOptions, responseTimeoutMs, frameTimeoutMs, logger, ...transportOptions } = options;
+  const transport = await createMakaiStdioClient({ ...transportOptions, logger });
   await transport.connect();
-  const authClient = new MakaiAuthClient(transport, { handlers: authOptions?.handlers, frameTimeoutMs });
+  const authClient = new MakaiAuthClient(transport, { handlers: authOptions?.handlers, frameTimeoutMs, logger });
   const executionOptions = {
     responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs,
     authRetryPolicy: authOptions?.auth_retry_policy,
     auth: authClient,
     authHandlers: authOptions?.handlers,
+    logger,
   };
   return {
     auth: authClient,
-    models: createMakaiModelsApi(transport, { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs }),
+    models: createMakaiModelsApi(transport, { responseTimeoutMs: responseTimeoutMs ?? frameTimeoutMs, logger }),
     agent: createMakaiAgentApiWithModels(transport, executionOptions),
     provider: createMakaiProviderApi(transport, executionOptions),
     close: () => transport.close(),

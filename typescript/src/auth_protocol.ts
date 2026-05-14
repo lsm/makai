@@ -1,6 +1,7 @@
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import { BinaryResolverOptions } from "./binary_resolver";
+import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
   MakaiStdioClient,
   StdioFrame,
@@ -281,6 +282,8 @@ export interface MakaiAuthClientOptions {
    * caller's onPrompt to drive progress.
    */
   frameTimeoutMs?: number;
+  /** Optional structured logger for auth protocol diagnostics. */
+  logger?: MakaiLogger;
 }
 
 /**
@@ -294,6 +297,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
   private readonly transport: MakaiStdioClient;
   private readonly defaultHandlers?: AuthFlowHandlers;
   private readonly frameTimeoutMs: number;
+  private readonly logger: MakaiLogger;
 
   /**
    * @param transport Connected stdio transport used for auth envelopes.
@@ -303,6 +307,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
     this.transport = transport;
     this.defaultHandlers = options.handlers;
     this.frameTimeoutMs = options.frameTimeoutMs ?? 30_000;
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   /**
@@ -324,6 +329,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       payload: {},
     };
 
+    this.logger.debug("auth: sending auth_providers_request", { stream_id: streamId });
     this.sendOrThrow(envelope);
 
     while (true) {
@@ -336,7 +342,9 @@ export class MakaiAuthClient implements MakaiAuthApi {
         throw nackToAuthError(frame);
       }
       if (frame.type === "auth_providers_response") {
-        return parseProviders(frame);
+        const providers = parseProviders(frame);
+        this.logger.debug("auth: received providers list", { count: providers.length });
+        return providers;
       }
       throw new MakaiAuthError(
         `unexpected envelope type while awaiting auth_providers_response: ${String(frame.type)}`,
@@ -371,6 +379,8 @@ export class MakaiAuthClient implements MakaiAuthApi {
     const flowId = ulid();
     let outboundSequence = 1;
     let loginStarted = false;
+
+    this.logger.info("auth: starting login flow", { provider_id: providerId, flow_id: flowId });
 
     const startMessageId = ulid();
     this.sendOrThrow({
@@ -410,6 +420,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       if (frame.type === "auth_event") {
         const eventPayload = readPayload(frame);
         const event = flattenAuthEvent(eventPayload);
+        this.logger.debug("auth: received auth event", { event_type: event.type, flow_id: flowId, provider_id: providerId });
         try {
           effective?.onEvent?.(event);
         } catch (err) {
@@ -471,8 +482,12 @@ export class MakaiAuthClient implements MakaiAuthApi {
       if (frame.type === "auth_login_result") {
         const payload = readPayload(frame);
         const status = typeof payload["status"] === "string" ? payload["status"] : undefined;
-        if (status === "success") return { status: "success" };
+        if (status === "success") {
+          this.logger.info("auth: login succeeded", { provider_id: providerId, flow_id: flowId });
+          return { status: "success" };
+        }
         if (status === "cancelled") {
+          this.logger.warn("auth: login cancelled", { provider_id: providerId, flow_id: flowId });
           throw new MakaiAuthError(
             lastErrorEvent?.message ??
               (cancelled
@@ -482,6 +497,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
           );
         }
         if (status === "failed") {
+          this.logger.error("auth: login failed", { provider_id: providerId, flow_id: flowId });
           throw new MakaiAuthError(
             lastErrorEvent?.message ?? "auth login failed",
             { kind: "provider_error", code: lastErrorEvent?.code },
@@ -637,6 +653,8 @@ export type CreateMakaiAuthClientOptions = CreateMakaiStdioClientOptions & {
   frameTimeoutMs?: number;
   /** Resolver options for locating the makai binary. */
   resolver?: BinaryResolverOptions;
+  /** Optional structured logger for diagnostics. */
+  logger?: MakaiLogger;
 };
 
 /** Handle returned by {@link createMakaiAuthClient}. */
@@ -665,10 +683,10 @@ export interface MakaiAuthClientHandle {
 export async function createMakaiAuthClient(
   options: CreateMakaiAuthClientOptions = {},
 ): Promise<MakaiAuthClientHandle> {
-  const { handlers, frameTimeoutMs, ...transportOptions } = options;
-  const transport = await createMakaiStdioClient(transportOptions);
+  const { handlers, frameTimeoutMs, logger, ...transportOptions } = options;
+  const transport = await createMakaiStdioClient({ ...transportOptions, logger });
   await transport.connect();
-  const auth = new MakaiAuthClient(transport, { handlers, frameTimeoutMs });
+  const auth = new MakaiAuthClient(transport, { handlers, frameTimeoutMs, logger });
   return {
     auth,
     close: () => transport.close(),

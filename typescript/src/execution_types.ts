@@ -1,6 +1,7 @@
 import type { ApiId, ProviderId } from "./models_types";
 import type { AuthFlowHandlers } from "./auth_protocol";
 import type { TimeoutDiagnostics } from "./timeout_diagnostics";
+import type { MakaiLogger } from "./logger";
 
 /** Controls whether execution APIs automatically retry once after an authentication challenge. */
 export type AuthRetryPolicy = "manual" | "auto_once";
@@ -247,4 +248,6 @@ export interface MakaiClientOptions {
   };
   responseTimeoutMs?: number;
   frameTimeoutMs?: number;
+  /** Optional structured logger for SDK diagnostics. */
+  logger?: MakaiLogger;
 }
