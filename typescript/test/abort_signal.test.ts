@@ -133,16 +133,21 @@ test("provider.complete rejects when signal is aborted during frame wait", async
 test("provider.complete with AbortSignal.timeout aborts after timeout", async () => {
   const transport = new AbortTestTransport();
   const provider = createMakaiProviderApi(transport as never);
-  // 5ms timeout — should abort while waiting for frames
-  const signal = AbortSignal.timeout(5);
-
-  await assert.rejects(
-    () => provider.complete({ ...REQUEST, options: { signal } }),
-    (error: unknown) =>
-      error instanceof Error && error.name === "AbortError",
-  );
-  transport.rejectAll();
-  await flushMicrotasks();
+  // Use manual AbortController + setTimeout instead of AbortSignal.timeout(5)
+  // to avoid the internal timer outliving the test boundary on Node 22 CI.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5);
+  try {
+    await assert.rejects(
+      () => provider.complete({ ...REQUEST, options: { signal: controller.signal } }),
+      (error: unknown) =>
+        error instanceof Error && error.name === "AbortError",
+    );
+  } finally {
+    clearTimeout(timer);
+    transport.rejectAll();
+    await flushMicrotasks();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -196,15 +201,19 @@ test("provider.stream stops iteration when signal is aborted during streaming", 
 test("provider.stream with AbortSignal.timeout aborts after timeout", async () => {
   const transport = new AbortTestTransport();
   const provider = createMakaiProviderApi(transport as never);
-  const signal = AbortSignal.timeout(5);
-
-  await assert.rejects(
-    () => collect(provider.stream({ ...REQUEST, options: { signal } })),
-    (error: unknown) =>
-      error instanceof Error && error.name === "AbortError",
-  );
-  transport.rejectAll();
-  await flushMicrotasks();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5);
+  try {
+    await assert.rejects(
+      () => collect(provider.stream({ ...REQUEST, options: { signal: controller.signal } })),
+      (error: unknown) =>
+        error instanceof Error && error.name === "AbortError",
+    );
+  } finally {
+    clearTimeout(timer);
+    transport.rejectAll();
+    await flushMicrotasks();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -296,15 +305,19 @@ test("agent.stream stops iteration when signal is aborted during streaming", asy
 test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
   const transport = new AbortTestTransport();
   const agent = createMakaiAgentApi(transport as never);
-  const signal = AbortSignal.timeout(5);
-
-  await assert.rejects(
-    () => collect(agent.stream({ ...REQUEST, options: { signal } })),
-    (error: unknown) =>
-      error instanceof Error && error.name === "AbortError",
-  );
-  transport.rejectAll();
-  await flushMicrotasks();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5);
+  try {
+    await assert.rejects(
+      () => collect(agent.stream({ ...REQUEST, options: { signal: controller.signal } })),
+      (error: unknown) =>
+        error instanceof Error && error.name === "AbortError",
+    );
+  } finally {
+    clearTimeout(timer);
+    transport.rejectAll();
+    await flushMicrotasks();
+  }
 });
 
 // ---------------------------------------------------------------------------
