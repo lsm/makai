@@ -833,26 +833,36 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // 3. Clean up partial state, event stream, and cancel flag.
+        // 3. Deinit partial state immediately (no blocking wait).
         var partial = removed.value.partial_state;
         partial.deinit();
-        removed.value.event_stream.deinit();
-        server.allocator.destroy(removed.value.event_stream);
-        if (removed.value.cancelled) |c| {
-            server.allocator.destroy(c);
-        }
+
+        // 4. Put the stream back into active_streams in its completed state.
+        //    cleanupCompletedStreams will pick it up on the next pump cycle and
+        //    handle the blocking deinit there — after the ACK has been returned.
+        //    This avoids blocking the abort ACK for up to 120s while waiting
+        //    for the producer thread to exit.
+        server.active_streams.put(request.target_stream_id, removed.value) catch {
+            // If put fails (OOM), do the blocking deinit now as fallback.
+            removed.value.event_stream.deinit();
+            server.allocator.destroy(removed.value.event_stream);
+            if (removed.value.cancelled) |c| {
+                server.allocator.destroy(c);
+            }
+        };
 
         // Get sequence for ACK first (sent immediately by runtime before outbox items).
         const seq = server.nextSequence(request.target_stream_id);
 
-        // Get sequence for the stream_cancelled outbox message (sent after ACK).
-        const err_seq = server.nextSequence(request.target_stream_id);
+        // Derive err_seq from seq to avoid a second nextSequence call, which
+        // could return the same value under OOM (put failure in nextSequence).
+        const err_seq = seq + 1;
 
         // Remove counters before returning.
         _ = server.sequence_counters.remove(request.target_stream_id);
         _ = server.expected_sequences.remove(request.target_stream_id);
 
-        // 4. Queue a stream_error envelope to the outbox so the runtime can
+        // 5. Queue a stream_error envelope to the outbox so the runtime can
         //    forward it to the client (informing them the stream was cancelled).
         //    The outbox is drained after the immediate ACK response, so err_seq
         //    must be higher than seq to preserve per-stream monotonic ordering.
@@ -2134,7 +2144,10 @@ test "handleAbortRequest cancels stream" {
     // stream_cancelled outbox envelope gets seq 3.
     try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
 
-    // Verify stream was removed
+    // Stream is back in active_streams for deferred cleanup (non-blocking ACK).
+    // Run cleanup to drain it.
+    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 
     // Verify a stream_cancelled error was queued to the outbox
@@ -2799,7 +2812,8 @@ test "handleAbortRequest signals CancelToken so provider stops early" {
     try std.testing.expect(abort_resp != null);
     try std.testing.expect(abort_resp.?.payload == .ack);
 
-    // Verify stream was removed
+    // Stream is back in active_streams for deferred cleanup (non-blocking ACK).
+    server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 
     // Verify outbox has a stream_cancelled error

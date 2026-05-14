@@ -339,6 +339,9 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
     _ = try runtime.pumpServerOutbox();
     try runtime.pumpServerMessagesIntoClient(&client);
 
+    // Stream goes back into active_streams for deferred cleanup after abort.
+    server.cleanupCompletedStreams();
+
     // Verify stream was removed
     try testing.expect(server.activeStreamCount() == 0);
 
