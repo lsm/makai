@@ -5,7 +5,7 @@ import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthA
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
-import type { MakaiModelsApi } from "./models_types";
+import { MakaiProtocolError, type MakaiModelsApi } from "./models_types";
 import { type CreateMakaiStdioClientOptions, createMakaiStdioClient, MakaiStdioClient, type StdioFrame } from "./stdio_client";
 import {
   createTimeoutDiagnostics,
@@ -524,18 +524,69 @@ function buildAgentMessagePayload(
   return payload;
 }
 
+// Must accommodate max valid canonical ref: 256 (provider) + 1 (/) + 256 (api) + 1 (@) +
+// 512 model_id bytes fully percent-encoded (512 * 3 = 1536) = 2050 chars.  Using 4096
+// for a clean power-of-2 cap with margin against pathological multi-KB strings.
+const MAX_MODEL_REF_LENGTH = 4096;
+const MAX_IDENTIFIER_LENGTH = 256;
+const MAX_MODEL_FIELD_LENGTH = 512;
+
 function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunRequest): void {
   if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
     throw new TypeError("request requires opaque model_ref");
   }
+  if (request.model_ref.length > MAX_MODEL_REF_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref exceeds maximum length of ${MAX_MODEL_REF_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  validateModelRefSegments(request.model_ref);
   if (!Array.isArray(request.messages)) {
     throw new TypeError("request requires messages array");
+  }
+}
+
+/**
+ * Best-effort segment-level length validation on model_ref.
+ * Tries canonical parse first, then fallback slice extraction.
+ * When neither applies (fully opaque ref), validates total length
+ * against MAX_MODEL_FIELD_LENGTH since the entire ref becomes model.id/model.name
+ * which the server caps at that limit.
+ */
+function validateModelRefSegments(modelRef: string): void {
+  try {
+    const parsed = parseModelRef(modelRef);
+    validateModelSegments(parsed.providerId, parsed.api, parsed.modelId);
+    return;
+  } catch {
+    // Not a canonical ref — try fallback extraction
+  }
+  const slashIndex = modelRef.indexOf("/");
+  const atIndex = modelRef.indexOf("@");
+  if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
+    const provider = modelRef.slice(0, slashIndex);
+    const api = modelRef.slice(slashIndex + 1, atIndex);
+    const id = modelRef.slice(atIndex + 1);
+    if (provider.length > 0 && api.length > 0) {
+      validateModelSegments(provider, api, id);
+      return;
+    }
+  }
+  // Fully opaque ref: the entire string becomes model.id/model.name on the wire.
+  // The server caps those fields at MAX_MODEL_FIELD_LENGTH (512).
+  if (modelRef.length > MAX_MODEL_FIELD_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref exceeds maximum length of ${MAX_MODEL_FIELD_LENGTH} characters for opaque refs`,
+      "invalid_request",
+    );
   }
 }
 
 function modelFromRef(modelRef: string): Record<string, unknown> {
   try {
     const parsed = parseModelRef(modelRef);
+    validateModelSegments(parsed.providerId, parsed.api, parsed.modelId);
     return {
       id: parsed.modelId,
       name: parsed.modelId,
@@ -553,6 +604,7 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
       const api = modelRef.slice(slashIndex + 1, atIndex);
       const id = modelRef.slice(atIndex + 1);
       if (provider.length > 0 && api.length > 0) {
+        validateModelSegments(provider, api, id);
         return {
           id,
           name: id,
@@ -563,6 +615,27 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
       }
     }
     return opaqueModel(modelRef);
+  }
+}
+
+function validateModelSegments(provider: string, api: string, id: string): void {
+  if (provider.length > MAX_IDENTIFIER_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref provider segment exceeds maximum length of ${MAX_IDENTIFIER_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  if (api.length > MAX_IDENTIFIER_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref api segment exceeds maximum length of ${MAX_IDENTIFIER_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  if (id.length > MAX_MODEL_FIELD_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref model_id segment exceeds maximum length of ${MAX_MODEL_FIELD_LENGTH} characters`,
+      "invalid_request",
+    );
   }
 }
 

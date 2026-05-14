@@ -479,3 +479,119 @@ test("models.resolve rejects locally when provider_id or model_id is missing", a
     await harness.cleanup();
   }
 });
+
+// --- provider_id / model_id input length validation tests ---
+
+test("models.resolve rejects provider_id exceeding 256 characters before transport I/O", async () => {
+  const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    const longProviderId = "a".repeat(257);
+    await assert.rejects(
+      () => api.resolve({ provider_id: longProviderId, model_id: "claude-sonnet-4-5" }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "provider_id exceeds maximum length of 256 characters",
+    );
+    assert.equal(readLoggedRequests(harness.logPath).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.resolve rejects model_id exceeding 256 characters before transport I/O", async () => {
+  const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    const longModelId = "a".repeat(257);
+    await assert.rejects(
+      () => api.resolve({ provider_id: "anthropic", model_id: longModelId }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_id exceeds maximum length of 256 characters",
+    );
+    assert.equal(readLoggedRequests(harness.logPath).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.resolve accepts provider_id at exactly 256 characters", async () => {
+  const descriptor = makeDescriptor({
+    provider_id: "a".repeat(256),
+    model_ref: `${"a".repeat(256)}/anthropic-messages@claude-sonnet-4-5`,
+  });
+  const harness = await setupHarness({ response: makeResponse([descriptor]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await api.resolve({ provider_id: "a".repeat(256), model_id: "claude-sonnet-4-5" });
+  } catch (err) {
+    // Expected: may fail at model mismatch check, but NOT at length validation
+    assert.ok(err instanceof MakaiProtocolError && err.code === "invalid_request");
+    assert.ok(
+      !err.message.includes("exceeds maximum length"),
+      `unexpected length validation error: ${err.message}`,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.resolve accepts model_id at exactly 256 characters", async () => {
+  const longModelId = "a".repeat(256);
+  const descriptor = makeDescriptor({
+    model_id: longModelId,
+    model_ref: `anthropic/anthropic-messages@${longModelId}`,
+  });
+  const harness = await setupHarness({ response: makeResponse([descriptor]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    await api.resolve({ provider_id: "anthropic", model_id: longModelId });
+  } catch (err) {
+    assert.ok(err instanceof MakaiProtocolError && err.code === "invalid_request");
+    assert.ok(
+      !err.message.includes("exceeds maximum length"),
+      `unexpected length validation error: ${err.message}`,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.list rejects provider_id filter exceeding 256 characters before transport I/O", async () => {
+  const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    const longProviderId = "a".repeat(257);
+    await assert.rejects(
+      () => api.list({ provider_id: longProviderId }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "provider_id exceeds maximum length of 256 characters",
+    );
+    assert.equal(readLoggedRequests(harness.logPath).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("models.list rejects model_id filter exceeding 256 characters before transport I/O", async () => {
+  const harness = await setupHarness({ response: makeResponse([makeDescriptor()]) });
+  try {
+    const api = createMakaiModelsApi(harness.client);
+    const longModelId = "a".repeat(257);
+    await assert.rejects(
+      () => api.list({ model_id: longModelId }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_id exceeds maximum length of 256 characters",
+    );
+    assert.equal(readLoggedRequests(harness.logPath).length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
