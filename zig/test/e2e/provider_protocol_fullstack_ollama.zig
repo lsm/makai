@@ -334,7 +334,15 @@ test "ProviderProtocol: Ollama abort through protocol layer" {
     // Process abort request
     try runtime.pumpClientMessages();
 
-    // Verify stream was removed
+    // Drain the server outbox (contains the stream_cancelled error envelope)
+    // and deliver all pending messages to the client so owned strings are freed.
+    _ = try runtime.pumpServerOutbox();
+    try runtime.pumpServerMessagesIntoClient(&client);
+
+    // Stream is in pending_cleanup (not active_streams), drain it to free resources.
+    server.cleanupCompletedStreams();
+
+    // Verify stream was removed from active_streams
     try testing.expect(server.activeStreamCount() == 0);
 
     // Verify we got at least one event before abort
