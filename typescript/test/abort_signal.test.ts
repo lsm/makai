@@ -31,8 +31,8 @@ class AbortTestTransport {
   public readonly sent: StdioFrame[] = [];
   private readonly frames: StdioFrame[];
   private readonly failWith?: Error;
-  /** Tracks whether pending promises were rejected (resource leak check). */
-  public rejectedCount = 0;
+  /** Pending promise reject functions — call rejectAll() to clean up. */
+  private readonly pendingRejects: Array<(reason?: unknown) => void> = [];
 
   constructor(frames: StdioFrame[] = [], failWith?: Error) {
     this.frames = [...frames];
@@ -43,13 +43,23 @@ class AbortTestTransport {
     this.sent.push(frame);
   }
 
+  /** Reject all pending promises to prevent dangling promise leaks in node:test. */
+  rejectAll(): void {
+    for (const reject of this.pendingRejects.splice(0)) {
+      reject(new Error("transport cleaned up"));
+    }
+  }
+
   async nextFrameForStream(streamId: string, _timeoutMs?: number): Promise<StdioFrame> {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) {
-      // Return a promise that never resolves (simulates waiting for a frame).
-      // The abort signal should cancel it.
-      return new Promise<StdioFrame>(() => {});
+      // Return a promise that stays pending until abort resolves it or
+      // rejectAll() cleans it up.  We track the reject function so the
+      // test harness can prevent dangling-promise leaks.
+      return new Promise<StdioFrame>((_resolve, reject) => {
+        this.pendingRejects.push(reject);
+      });
     }
     return { stream_id: streamId, ...frame };
   }
@@ -58,7 +68,9 @@ class AbortTestTransport {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) {
-      return new Promise<StdioFrame>(() => {});
+      return new Promise<StdioFrame>((_resolve, reject) => {
+        this.pendingRejects.push(reject);
+      });
     }
     return { session_id: sessionId, ...frame };
   }
@@ -86,6 +98,7 @@ test("provider.complete rejects immediately when AbortSignal.abort() is passed",
   );
   // No frames should have been sent since abort was checked before transport I/O.
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 test("provider.complete rejects when signal is aborted during frame wait", async () => {
@@ -107,6 +120,7 @@ test("provider.complete rejects when signal is aborted during frame wait", async
   // The initial envelope should have been sent.
   assert.equal(transport.sent.length, 1);
   assert.equal(transport.sent[0]?.type, "complete_request");
+  transport.rejectAll();
 });
 
 test("provider.complete with AbortSignal.timeout aborts after timeout", async () => {
@@ -120,6 +134,7 @@ test("provider.complete with AbortSignal.timeout aborts after timeout", async ()
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -137,6 +152,7 @@ test("provider.stream rejects immediately when AbortSignal.abort() is passed", a
       error instanceof Error && error.name === "AbortError",
   );
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 test("provider.stream stops iteration when signal is aborted during streaming", async () => {
@@ -164,6 +180,7 @@ test("provider.stream stops iteration when signal is aborted during streaming", 
   );
   // Should have received at least one event before abort.
   assert.ok(events.length >= 1, "expected at least one event before abort");
+  transport.rejectAll();
 });
 
 test("provider.stream with AbortSignal.timeout aborts after timeout", async () => {
@@ -176,6 +193,7 @@ test("provider.stream with AbortSignal.timeout aborts after timeout", async () =
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -193,6 +211,7 @@ test("agent.run rejects immediately when AbortSignal.abort() is passed", async (
       error instanceof Error && error.name === "AbortError",
   );
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 test("agent.run rejects when signal is aborted during frame wait", async () => {
@@ -212,6 +231,7 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
   );
   assert.equal(transport.sent.length, 1);
   assert.equal(transport.sent[0]?.type, "agent_start");
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -229,6 +249,7 @@ test("agent.stream rejects immediately when AbortSignal.abort() is passed", asyn
       error instanceof Error && error.name === "AbortError",
   );
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 test("agent.stream stops iteration when signal is aborted during streaming", async () => {
@@ -254,6 +275,7 @@ test("agent.stream stops iteration when signal is aborted during streaming", asy
       error instanceof Error && error.name === "AbortError",
   );
   assert.ok(events.length >= 1, "expected at least one event before abort");
+  transport.rejectAll();
 });
 
 test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
@@ -266,6 +288,7 @@ test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -293,6 +316,7 @@ test("provider.complete removes abort listener after rejection", async () => {
 
   // After rejection, no lingering abort listeners.
   assert.equal(listenerCount(signal), listenersBefore);
+  transport.rejectAll();
 });
 
 test("agent.stream removes abort listener after rejection", async () => {
@@ -313,6 +337,7 @@ test("agent.stream removes abort listener after rejection", async () => {
   );
 
   assert.equal(listenerCount(signal), listenersBefore);
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -330,6 +355,7 @@ test("provider.stream with pre-aborted signal does not send envelope", async () 
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 test("agent.run with pre-aborted signal does not send envelope", async () => {
@@ -343,6 +369,7 @@ test("agent.run with pre-aborted signal does not send envelope", async () => {
     (error: unknown) => error instanceof Error && error.name === "AbortError",
   );
   assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -393,6 +420,7 @@ test("abort rejection is a plain Error with name 'AbortError', not MakaiStreamEr
     assert.equal(error.name, "AbortError");
     assert.equal(error instanceof MakaiStreamError, false);
   }
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
@@ -451,6 +479,7 @@ test("provider.complete withAuthRetry aborts before auth retry sends second enve
   // Only the initial complete_request should have been sent; no retry envelope
   assert.equal(transport.sent.filter((f) => f.type === "complete_request").length, 1);
   assert.equal(auth.loginCalls, 1);
+  transport.rejectAll();
 });
 
 test("agent.run withAuthRetry aborts before retry sends second agent_start", async () => {
@@ -501,6 +530,7 @@ test("agent.run withAuthRetry aborts before retry sends second agent_start", asy
   // Only one agent_start should have been sent
   assert.equal(transport.sent.filter((f) => f.type === "agent_start").length, 1);
   assert.equal(auth.loginCalls, 1);
+  transport.rejectAll();
 });
 
 // ---------------------------------------------------------------------------
