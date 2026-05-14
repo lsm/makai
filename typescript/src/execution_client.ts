@@ -524,9 +524,10 @@ function buildAgentMessagePayload(
   return payload;
 }
 
-// Must accommodate max valid canonical ref: 256 (provider) + 1 (/) + 256 (api) + 1 (@) + 512 (model_id) = 1026.
-// Using 2048 to also cover percent-encoded model_id expansion (up to 3x) with margin.
-const MAX_MODEL_REF_LENGTH = 2048;
+// Must accommodate max valid canonical ref: 256 (provider) + 1 (/) + 256 (api) + 1 (@) +
+// 512 model_id bytes fully percent-encoded (512 * 3 = 1536) = 2050 chars.  Using 4096
+// for a clean power-of-2 cap with margin against pathological multi-KB strings.
+const MAX_MODEL_REF_LENGTH = 4096;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_MODEL_FIELD_LENGTH = 512;
 
@@ -549,24 +550,36 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
 /**
  * Best-effort segment-level length validation on model_ref.
  * Tries canonical parse first, then fallback slice extraction.
- * If neither applies (fully opaque ref), silently skips — the server
- * validates individual fields as the trust boundary.
+ * When neither applies (fully opaque ref), validates total length
+ * against MAX_MODEL_FIELD_LENGTH since the entire ref becomes model.id/model.name
+ * which the server caps at that limit.
  */
 function validateModelRefSegments(modelRef: string): void {
   try {
     const parsed = parseModelRef(modelRef);
     validateModelSegments(parsed.providerId, parsed.api, parsed.modelId);
+    return;
   } catch {
-    const slashIndex = modelRef.indexOf("/");
-    const atIndex = modelRef.indexOf("@");
-    if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
-      const provider = modelRef.slice(0, slashIndex);
-      const api = modelRef.slice(slashIndex + 1, atIndex);
-      const id = modelRef.slice(atIndex + 1);
-      if (provider.length > 0 && api.length > 0) {
-        validateModelSegments(provider, api, id);
-      }
+    // Not a canonical ref — try fallback extraction
+  }
+  const slashIndex = modelRef.indexOf("/");
+  const atIndex = modelRef.indexOf("@");
+  if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
+    const provider = modelRef.slice(0, slashIndex);
+    const api = modelRef.slice(slashIndex + 1, atIndex);
+    const id = modelRef.slice(atIndex + 1);
+    if (provider.length > 0 && api.length > 0) {
+      validateModelSegments(provider, api, id);
+      return;
     }
+  }
+  // Fully opaque ref: the entire string becomes model.id/model.name on the wire.
+  // The server caps those fields at MAX_MODEL_FIELD_LENGTH (512).
+  if (modelRef.length > MAX_MODEL_FIELD_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref exceeds maximum length of ${MAX_MODEL_FIELD_LENGTH} characters for opaque refs`,
+      "invalid_request",
+    );
   }
 }
 
