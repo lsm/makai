@@ -82,6 +82,11 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   return events;
 }
 
+/** Flush the microtask queue so pending rejections are processed before node:test checks. */
+async function flushMicrotasks(): Promise<void> {
+  await new Promise<void>((resolve) => queueMicrotask(resolve));
+}
+
 // ---------------------------------------------------------------------------
 // provider.complete abort tests
 // ---------------------------------------------------------------------------
@@ -99,6 +104,7 @@ test("provider.complete rejects immediately when AbortSignal.abort() is passed",
   // No frames should have been sent since abort was checked before transport I/O.
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("provider.complete rejects when signal is aborted during frame wait", async () => {
@@ -121,6 +127,7 @@ test("provider.complete rejects when signal is aborted during frame wait", async
   assert.equal(transport.sent.length, 1);
   assert.equal(transport.sent[0]?.type, "complete_request");
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("provider.complete with AbortSignal.timeout aborts after timeout", async () => {
@@ -135,6 +142,7 @@ test("provider.complete with AbortSignal.timeout aborts after timeout", async ()
       error instanceof Error && error.name === "AbortError",
   );
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -153,6 +161,7 @@ test("provider.stream rejects immediately when AbortSignal.abort() is passed", a
   );
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("provider.stream stops iteration when signal is aborted during streaming", async () => {
@@ -181,6 +190,7 @@ test("provider.stream stops iteration when signal is aborted during streaming", 
   // Should have received at least one event before abort.
   assert.ok(events.length >= 1, "expected at least one event before abort");
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("provider.stream with AbortSignal.timeout aborts after timeout", async () => {
@@ -194,6 +204,7 @@ test("provider.stream with AbortSignal.timeout aborts after timeout", async () =
       error instanceof Error && error.name === "AbortError",
   );
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -212,6 +223,7 @@ test("agent.run rejects immediately when AbortSignal.abort() is passed", async (
   );
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.run rejects when signal is aborted during frame wait", async () => {
@@ -232,6 +244,7 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
   assert.equal(transport.sent.length, 1);
   assert.equal(transport.sent[0]?.type, "agent_start");
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -250,6 +263,7 @@ test("agent.stream rejects immediately when AbortSignal.abort() is passed", asyn
   );
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.stream stops iteration when signal is aborted during streaming", async () => {
@@ -276,6 +290,7 @@ test("agent.stream stops iteration when signal is aborted during streaming", asy
   );
   assert.ok(events.length >= 1, "expected at least one event before abort");
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
@@ -289,6 +304,7 @@ test("agent.stream with AbortSignal.timeout aborts after timeout", async () => {
       error instanceof Error && error.name === "AbortError",
   );
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -317,6 +333,7 @@ test("provider.complete removes abort listener after rejection", async () => {
   // After rejection, no lingering abort listeners.
   assert.equal(listenerCount(signal), listenersBefore);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.stream removes abort listener after rejection", async () => {
@@ -338,6 +355,7 @@ test("agent.stream removes abort listener after rejection", async () => {
 
   assert.equal(listenerCount(signal), listenersBefore);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -356,6 +374,7 @@ test("provider.stream with pre-aborted signal does not send envelope", async () 
   );
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.run with pre-aborted signal does not send envelope", async () => {
@@ -370,6 +389,7 @@ test("agent.run with pre-aborted signal does not send envelope", async () => {
   );
   assert.equal(transport.sent.length, 0);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -421,6 +441,7 @@ test("abort rejection is a plain Error with name 'AbortError', not MakaiStreamEr
     assert.equal(error instanceof MakaiStreamError, false);
   }
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
@@ -480,6 +501,7 @@ test("provider.complete withAuthRetry aborts before auth retry sends second enve
   assert.equal(transport.sent.filter((f) => f.type === "complete_request").length, 1);
   assert.equal(auth.loginCalls, 1);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 test("agent.run withAuthRetry aborts before retry sends second agent_start", async () => {
@@ -531,6 +553,7 @@ test("agent.run withAuthRetry aborts before retry sends second agent_start", asy
   assert.equal(transport.sent.filter((f) => f.type === "agent_start").length, 1);
   assert.equal(auth.loginCalls, 1);
   transport.rejectAll();
+  await flushMicrotasks();
 });
 
 // ---------------------------------------------------------------------------
