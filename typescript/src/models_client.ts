@@ -50,6 +50,56 @@ const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
 const MAX_PROVIDER_ID_LENGTH = 256;
 const MAX_MODEL_ID_LENGTH = 256;
 
+// ---------------------------------------------------------------------------
+// Best-effort cancel + drain helpers for models
+// ---------------------------------------------------------------------------
+
+/**
+ * Sends an `abort_request` envelope for the given models stream, swallowing
+ * any transport errors so the original abort error propagates cleanly.
+ */
+function bestEffortCancelModelsStream(client: MakaiStdioClient, streamId: string): void {
+  try {
+    client.send({
+      type: "abort_request",
+      stream_id: streamId,
+      message_id: ulid(),
+      sequence: 999,
+      timestamp: Date.now(),
+      version: ENVELOPE_VERSION,
+      payload: { target_stream_id: streamId, reason: "client aborted" },
+    });
+  } catch {
+    // Best-effort cancellation; ignore transport errors here so we keep
+    // surfacing the original failure to the caller.
+  }
+}
+
+/**
+ * Drains remaining in-flight frames for an abandoned models stream from the
+ * transport buffer. Prevents orphaned frames from interfering with
+ * subsequent operations on the shared transport.
+ *
+ * Uses a Promise.race with a per-iteration timeout so it never blocks
+ * indefinitely even if the transport mock doesn't respect timeoutMs.
+ */
+async function drainModelsStreamFrames(client: MakaiStdioClient, streamId: string, timeoutMs = 200): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const perFrameMs = Math.min(remaining, 50);
+    try {
+      await Promise.race([
+        client.nextFrameForStream(streamId, perFrameMs).catch(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, perFrameMs)),
+      ]);
+    } catch {
+      break;
+    }
+  }
+}
+
 const KNOWN_AUTH_STATUSES: ReadonlySet<string> = new Set([
   "authenticated",
   "login_required",
@@ -243,33 +293,41 @@ class StdioModelsApi implements MakaiModelsApi {
       model_id: request.model_id,
     };
     const deadline = Date.now() + this.responseTimeoutMs;
-    while (true) {
-      checkAbort(signal, "models.list aborted");
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new MakaiProtocolError(
-          formatTimeoutMessage(timeoutContext),
-          undefined,
-          { diagnostics: createTimeoutDiagnostics(timeoutContext) },
-        );
-      }
-      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
-
-      switch (frame.type) {
-        case "ack":
-          continue;
-        case "nack":
-          throw nackToError(frame);
-        case "models_response": {
-          const response = parseModelsResponse(frame);
-          this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
-          return response;
-        }
-        default:
-          throw malformedResponseError(
-            `unexpected frame type while awaiting models_response: ${frame.type}`,
+    try {
+      while (true) {
+        checkAbort(signal, "models.list aborted");
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new MakaiProtocolError(
+            formatTimeoutMessage(timeoutContext),
+            undefined,
+            { diagnostics: createTimeoutDiagnostics(timeoutContext) },
           );
+        }
+        const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
+
+        switch (frame.type) {
+          case "ack":
+            continue;
+          case "nack":
+            throw nackToError(frame);
+          case "models_response": {
+            const response = parseModelsResponse(frame);
+            this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
+            return response;
+          }
+          default:
+            throw malformedResponseError(
+              `unexpected frame type while awaiting models_response: ${frame.type}`,
+            );
+        }
       }
+    } catch (error) {
+      if (isAbortError(error)) {
+        bestEffortCancelModelsStream(this.client, streamId);
+        await drainModelsStreamFrames(this.client, streamId);
+      }
+      throw error;
     }
   }
 }
