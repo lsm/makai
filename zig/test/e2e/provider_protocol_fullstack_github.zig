@@ -258,12 +258,12 @@ test "ProviderProtocol: GitHub Copilot abort through protocol layer" {
     // Process abort request
     try runtime.pumpClientMessages();
 
-    // Drain the server outbox and clean up the deferred-completed stream.
+    // Drain the server outbox and clean up the deferred stream in pending_cleanup.
     _ = try runtime.pumpServerOutbox();
     try runtime.pumpServerMessagesIntoClient(&client);
     server.cleanupCompletedStreams();
 
-    // Verify stream was removed
+    // Verify stream was removed from active_streams
     try testing.expect(server.activeStreamCount() == 0);
 
     // Verify we got at least one event before abort

@@ -222,6 +222,10 @@ pub const ProtocolServer = struct {
     /// Queued outbound server envelopes that must be emitted after immediate ACK.
     outbox: std.ArrayList(protocol_types.Envelope),
 
+    /// Streams removed by abort but awaiting deferred cleanup (blocking deinit).
+    /// Not iterated by pumpProviderEvents, so no duplicate terminal forwarding.
+    pending_cleanup: std.ArrayList(ActiveStream),
+
     /// Options
     options: Options,
 
@@ -279,6 +283,7 @@ pub const ProtocolServer = struct {
             .sequence_counters = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
             .expected_sequences = std.AutoHashMap(protocol_types.Ulid, u64).init(allocator),
             .outbox = std.ArrayList(protocol_types.Envelope).empty,
+            .pending_cleanup = std.ArrayList(ActiveStream).empty,
             .options = options,
             .refresh_lock = refresh_lock_mod.RefreshLock.init(allocator),
         };
@@ -306,6 +311,17 @@ pub const ProtocolServer = struct {
             out.deinit(self.allocator);
         }
         self.outbox.deinit(self.allocator);
+
+        // Drain pending cleanup (aborted streams awaiting deferred deinit)
+        for (self.pending_cleanup.items) |*stream| {
+            stream.partial_state.deinit();
+            stream.event_stream.deinit();
+            self.allocator.destroy(stream.event_stream);
+            if (stream.cancelled) |c| {
+                self.allocator.destroy(c);
+            }
+        }
+        self.pending_cleanup.deinit(self.allocator);
 
         // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
@@ -444,6 +460,20 @@ pub const ProtocolServer = struct {
             _ = self.sequence_counters.remove(stream_id);
             _ = self.expected_sequences.remove(stream_id);
         }
+
+        // Drain deferred abort cleanups (streams moved here by handleAbortRequest).
+        // These are not in active_streams so pumpProviderEvents never sees them.
+        var cleanup_list = self.pending_cleanup;
+        self.pending_cleanup = std.ArrayList(ActiveStream).empty;
+        for (cleanup_list.items) |*stream| {
+            stream.partial_state.deinit();
+            stream.event_stream.deinit();
+            self.allocator.destroy(stream.event_stream);
+            if (stream.cancelled) |c| {
+                self.allocator.destroy(c);
+            }
+        }
+        cleanup_list.deinit(self.allocator);
     }
 
     /// Get active stream count
@@ -833,16 +863,15 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // 3. Put the stream back into active_streams in its completed state.
-        //    cleanupCompletedStreams will pick it up on the next pump cycle and
-        //    handle the full cleanup (partial_state deinit + blocking event_stream
-        //    deinit) there — after the ACK has been returned. This avoids blocking
-        //    the abort ACK for up to 120s while waiting for the producer thread.
+        // 3. Defer cleanup to pending_cleanup list (separate from active_streams).
+        //    This keeps the stream invisible to pumpProviderEvents so no duplicate
+        //    terminal frame is forwarded. cleanupCompletedStreams drains this list
+        //    and handles the blocking deinit there — after the ACK has been returned.
         //    NOTE: Do NOT deinit partial_state here — it is a shallow copy, so
-        //    deinit would leave dangling pointers in removed.value and cause a
-        //    double-free when cleanupCompletedStreams processes the re-inserted entry.
-        server.active_streams.put(request.target_stream_id, removed.value) catch {
-            // If put fails (OOM), do full cleanup now as fallback.
+        //    deinit would leave dangling pointers and cause a double-free when
+        //    cleanupCompletedStreams processes the deferred entry.
+        server.pending_cleanup.append(server.allocator, removed.value) catch {
+            // If append fails (OOM), do full cleanup now as fallback.
             var partial = removed.value.partial_state;
             partial.deinit();
             removed.value.event_stream.deinit();
@@ -2145,11 +2174,10 @@ test "handleAbortRequest cancels stream" {
     // stream_cancelled outbox envelope gets seq 3.
     try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
 
-    // Stream is back in active_streams for deferred cleanup (non-blocking ACK).
-    // Run cleanup to drain it.
-    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
-    server.cleanupCompletedStreams();
+    // Stream removed from active_streams and moved to pending_cleanup for
+    // deferred blocking deinit (non-blocking ACK).
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+    server.cleanupCompletedStreams(); // drains pending_cleanup
 
     // Verify a stream_cancelled error was queued to the outbox
     var outbox_env = server.popOutbound();
@@ -2813,9 +2841,9 @@ test "handleAbortRequest signals CancelToken so provider stops early" {
     try std.testing.expect(abort_resp != null);
     try std.testing.expect(abort_resp.?.payload == .ack);
 
-    // Stream is back in active_streams for deferred cleanup (non-blocking ACK).
-    server.cleanupCompletedStreams();
+    // Stream moved to pending_cleanup (not active_streams) for deferred deinit.
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+    server.cleanupCompletedStreams(); // drains pending_cleanup
 
     // Verify outbox has a stream_cancelled error
     var outbox_env = server.popOutbound();
