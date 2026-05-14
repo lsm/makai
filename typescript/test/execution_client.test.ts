@@ -1512,6 +1512,105 @@ test("agent.stream rejects model_ref exceeding 512 characters before transport I
   }
 });
 
+// --- model_ref segment-level validation tests ---
+
+test("provider.complete rejects canonical model_ref with provider segment exceeding 256 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longProvider = "a".repeat(257);
+    const modelRef = `${longProvider}/anthropic-messages@claude-sonnet-4-5`;
+    await assert.rejects(
+      () => provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref provider segment exceeds maximum length of 256 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.stream rejects canonical model_ref with api segment exceeding 256 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longApi = "a".repeat(257);
+    const modelRef = `anthropic/${longApi}@claude-sonnet-4-5`;
+    await assert.rejects(
+      async () => collect(provider.stream({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] })),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref api segment exceeds maximum length of 256 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("agent.run rejects canonical model_ref with api segment exceeding 256 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const longApi = "a".repeat(257);
+    const modelRef = `anthropic/${longApi}@claude-sonnet-4-5`;
+    await assert.rejects(
+      () => agent.run({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref api segment exceeds maximum length of 256 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.complete rejects fallback model_ref with provider segment exceeding 256 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longProvider = "a".repeat(257);
+    // Use colon in model_id to force parseModelRef failure, triggering fallback path
+    const modelRef = `${longProvider}/anthropic-messages@model:id`;
+    await assert.rejects(
+      () => provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref provider segment exceeds maximum length of 256 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("provider.complete rejects fallback model_ref with api segment exceeding 256 characters", async () => {
+  const harness = await setupHarness();
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const longApi = "a".repeat(257);
+    // Use colon in model_id to force parseModelRef failure, triggering fallback path
+    const modelRef = `anthropic/${longApi}@model:id`;
+    await assert.rejects(
+      () => provider.complete({ model_ref: modelRef, messages: [{ role: "user", content: "hi" }] }),
+      (err: unknown) =>
+        err instanceof MakaiProtocolError &&
+        err.code === "invalid_request" &&
+        err.message === "model_ref api segment exceeds maximum length of 256 characters",
+    );
+    assert.deepEqual(readLoggedRequests(harness.logPath), []);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("provider.complete accepts model_ref at exactly 512 characters", async () => {
   const harness = await setupHarness();
   try {

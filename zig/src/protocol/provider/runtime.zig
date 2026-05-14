@@ -103,7 +103,12 @@ pub const ProviderProtocolRuntime = struct {
         while (try receiver.readLine(self.allocator)) |line| {
             defer self.allocator.free(line);
 
-            var env = envelope.deserializeEnvelope(line, self.allocator) catch continue;
+            var env = envelope.deserializeEnvelope(line, self.allocator) catch |err| {
+                if (err == error.InputTooLong) {
+                    self.sendNackForOversizedInput(line) catch {};
+                }
+                continue;
+            };
             defer env.deinit(self.allocator);
 
             if (try self.server.handleEnvelope(env)) |response| {
@@ -118,6 +123,49 @@ pub const ProviderProtocolRuntime = struct {
                 try sender.flush();
             }
         }
+    }
+
+    /// Attempt to send a NACK for an oversized envelope that failed deserialization.
+    /// Best-effort: extracts stream_id/message_id from raw JSON to construct the NACK.
+    /// If parsing fails, silently skips — the client will time out regardless.
+    fn sendNackForOversizedInput(self: *Self, raw_json: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw_json, .{}) catch return;
+        defer parsed.deinit();
+
+        const obj = parsed.value.object;
+
+        const stream_id_str = obj.get("stream_id") orelse return;
+        if (stream_id_str != .string) return;
+        const stream_id = protocol_types.parseUlid(stream_id_str.string) orelse return;
+
+        const message_id_str = obj.get("message_id") orelse return;
+        if (message_id_str != .string) return;
+        const message_id = protocol_types.parseUlid(message_id_str.string) orelse return;
+
+        // Construct a minimal envelope for the NACK
+        const dummy_envelope = protocol_types.Envelope{
+            .stream_id = stream_id,
+            .message_id = message_id,
+            .sequence = 0,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .ping,
+        };
+
+        const nack = try envelope.createNack(
+            dummy_envelope,
+            "input field exceeds maximum allowed length",
+            .invalid_request,
+            self.allocator,
+        );
+        var mut_nack = nack;
+        defer mut_nack.deinit(self.allocator);
+
+        const json = try envelope.serializeEnvelope(mut_nack, self.allocator);
+        defer self.allocator.free(json);
+
+        var sender = self.pipe.serverSender();
+        try sender.write(json);
+        try sender.flush();
     }
 
     pub fn pumpServerOutbox(self: *Self) !usize {

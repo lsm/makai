@@ -525,6 +525,8 @@ function buildAgentMessagePayload(
 }
 
 const MAX_MODEL_REF_LENGTH = 512;
+const MAX_IDENTIFIER_LENGTH = 256;
+const MAX_MODEL_FIELD_LENGTH = 512;
 
 function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunRequest): void {
   if (!request || typeof request.model_ref !== "string" || request.model_ref.length === 0) {
@@ -536,14 +538,40 @@ function validateExecutionRequest(request: ProviderCompleteRequest | AgentRunReq
       "invalid_request",
     );
   }
+  validateModelRefSegments(request.model_ref);
   if (!Array.isArray(request.messages)) {
     throw new TypeError("request requires messages array");
+  }
+}
+
+/**
+ * Best-effort segment-level length validation on model_ref.
+ * Tries canonical parse first, then fallback slice extraction.
+ * If neither applies (fully opaque ref), silently skips — the server
+ * validates individual fields as the trust boundary.
+ */
+function validateModelRefSegments(modelRef: string): void {
+  try {
+    const parsed = parseModelRef(modelRef);
+    validateModelSegments(parsed.providerId, parsed.api, parsed.modelId);
+  } catch {
+    const slashIndex = modelRef.indexOf("/");
+    const atIndex = modelRef.indexOf("@");
+    if (slashIndex !== -1 && atIndex !== -1 && slashIndex < atIndex) {
+      const provider = modelRef.slice(0, slashIndex);
+      const api = modelRef.slice(slashIndex + 1, atIndex);
+      const id = modelRef.slice(atIndex + 1);
+      if (provider.length > 0 && api.length > 0) {
+        validateModelSegments(provider, api, id);
+      }
+    }
   }
 }
 
 function modelFromRef(modelRef: string): Record<string, unknown> {
   try {
     const parsed = parseModelRef(modelRef);
+    validateModelSegments(parsed.providerId, parsed.api, parsed.modelId);
     return {
       id: parsed.modelId,
       name: parsed.modelId,
@@ -561,6 +589,7 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
       const api = modelRef.slice(slashIndex + 1, atIndex);
       const id = modelRef.slice(atIndex + 1);
       if (provider.length > 0 && api.length > 0) {
+        validateModelSegments(provider, api, id);
         return {
           id,
           name: id,
@@ -571,6 +600,27 @@ function modelFromRef(modelRef: string): Record<string, unknown> {
       }
     }
     return opaqueModel(modelRef);
+  }
+}
+
+function validateModelSegments(provider: string, api: string, id: string): void {
+  if (provider.length > MAX_IDENTIFIER_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref provider segment exceeds maximum length of ${MAX_IDENTIFIER_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  if (api.length > MAX_IDENTIFIER_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref api segment exceeds maximum length of ${MAX_IDENTIFIER_LENGTH} characters`,
+      "invalid_request",
+    );
+  }
+  if (id.length > MAX_MODEL_FIELD_LENGTH) {
+    throw new MakaiProtocolError(
+      `model_ref model_id segment exceeds maximum length of ${MAX_MODEL_FIELD_LENGTH} characters`,
+      "invalid_request",
+    );
   }
 }
 
