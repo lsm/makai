@@ -12,6 +12,7 @@ const hive_array = @import("hive_array");
 const auth_resolver = @import("auth_resolver");
 const oauth_storage = @import("oauth/storage");
 const refresh_lock_mod = @import("oauth/refresh_lock");
+const oom = @import("oom");
 
 pub const AuthStorage = oauth_storage.AuthStorage;
 
@@ -234,6 +235,10 @@ pub const ProtocolServer = struct {
         event_stream: *event_stream.AssistantMessageEventStream,
         partial_state: partial_serializer.PartialState,
         started_at: i64,
+        /// Atomic bool allocated on the heap. When the server receives an
+        /// abort_request for this stream it sets the flag so the in-flight
+        /// provider thread can notice and stop early (CancelToken path).
+        cancelled: ?*std.atomic.Value(bool) = null,
     };
 
     pub const DynamicCatalogFetchFn = *const fn (
@@ -289,6 +294,10 @@ pub const ProtocolServer = struct {
             // Clean up the event stream
             active_stream.event_stream.deinit();
             self.allocator.destroy(active_stream.event_stream);
+            // Free the cancel flag if allocated
+            if (active_stream.cancelled) |c| {
+                self.allocator.destroy(c);
+            }
         }
         self.active_streams.deinit();
         self.sequence_counters.deinit();
@@ -410,6 +419,9 @@ pub const ProtocolServer = struct {
                 partial.deinit();
                 removed.value.event_stream.deinit();
                 self.allocator.destroy(removed.value.event_stream);
+                if (removed.value.cancelled) |c| {
+                    self.allocator.destroy(c);
+                }
             }
             _ = self.sequence_counters.remove(stream_id);
             _ = self.expected_sequences.remove(stream_id);
@@ -425,6 +437,9 @@ pub const ProtocolServer = struct {
                 partial.deinit();
                 removed.value.event_stream.deinit();
                 self.allocator.destroy(removed.value.event_stream);
+                if (removed.value.cancelled) |c| {
+                    self.allocator.destroy(c);
+                }
             }
             _ = self.sequence_counters.remove(stream_id);
             _ = self.expected_sequences.remove(stream_id);
@@ -508,6 +523,17 @@ fn injectApiKey(
 fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.StreamOptions) void {
     injected.api_key.deinit(allocator);
     injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
+}
+
+/// Merge a server-side CancelToken into the caller's StreamOptions.
+/// Preserves any existing fields; only sets cancel_token.
+fn injectCancelToken(
+    options: ?ai_types.StreamOptions,
+    cancel_token: ai_types.CancelToken,
+) ai_types.StreamOptions {
+    var resolved = options orelse ai_types.StreamOptions{};
+    resolved.cancel_token = cancel_token;
+    return resolved;
 }
 
 fn authProvider(provider: api_registry.ApiProvider) ?oauth_storage.OAuthProvider {
@@ -726,8 +752,18 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
 
+    // Allocate a cancel flag so the server can signal the provider thread to stop
+    // on abort_request. Freed when the ActiveStream is cleaned up.
+    const cancelled = oom.unreachableOnOom(server.allocator.create(std.atomic.Value(bool)));
+    cancelled.* = std.atomic.Value(bool).init(false);
+    const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
+
+    // Inject cancel token into options so the provider can observe it.
+    const options_with_cancel = injectCancelToken(request.options, cancel_token);
+
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
-    const stream = streamWithRefresh(server, provider, request.model, request.context, request.options) catch |err| {
+    const stream = streamWithRefresh(server, provider, request.model, request.context, options_with_cancel) catch |err| {
+        server.allocator.destroy(cancelled);
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             providerErrorMessage(err),
@@ -746,6 +782,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         .event_stream = stream,
         .partial_state = partial_serializer.PartialState.init(server.allocator),
         .started_at = compat.time.nowMillis(),
+        .cancelled = cancelled,
     };
 
     // Store in active_streams
@@ -771,7 +808,14 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     };
 }
 
-/// Handle abort_request - cancel stream, return ack
+/// Handle abort_request - cancel stream, return ack.
+///
+/// On success the server:
+///   1. Signals the provider's CancelToken so the in-flight HTTP stream stops early.
+///   2. Marks the event stream complete with an error so consumers unblock.
+///   3. Queues a `stream_error` (code `stream_cancelled`) to the outbox so the
+///      runtime pump can forward it to the client before the stream disappears.
+///   4. Cleans up partial state and frees the cancel flag.
 fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
     // Validate sequence for existing stream using validateAndUpdateSequence
     server.validateAndUpdateSequence(request.target_stream_id, received_seq) catch |err| {
@@ -780,17 +824,46 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
 
     // Find stream by stream_id
     if (server.active_streams.fetchRemove(request.target_stream_id)) |removed| {
-        // Complete the stream with an error
+        // 1. Signal cancellation so the provider thread stops streaming.
+        if (removed.value.cancelled) |c| {
+            c.store(true, .release);
+        }
+
+        // 2. Complete the event stream so waiters unblock.
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // Clean up - need to copy to mutable for deinit
+        // Get sequence for the stream_cancelled outbox message BEFORE removing counters.
+        const err_seq = server.nextSequence(request.target_stream_id);
+
+        // 3. Queue a stream_error envelope to the outbox so the runtime can
+        //    forward it to the client (informing them the stream was cancelled).
+        const err_msg = try server.allocator.dupe(u8, reason);
+        server.outbox.append(server.allocator, .{
+            .stream_id = request.target_stream_id,
+            .message_id = protocol_types.generateUlid(),
+            .sequence = err_seq,
+            .in_reply_to = in_reply_to,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_error = .{
+                .code = .stream_cancelled,
+                .message = protocol_types.OwnedSlice(u8).initOwned(err_msg),
+            } },
+        }) catch {
+            // Outbox append is best-effort; don't fail the ACK on OOM.
+            server.allocator.free(err_msg);
+        };
+
+        // 4. Clean up partial state, event stream, and cancel flag.
         var partial = removed.value.partial_state;
         partial.deinit();
         removed.value.event_stream.deinit();
         server.allocator.destroy(removed.value.event_stream);
+        if (removed.value.cancelled) |c| {
+            server.allocator.destroy(c);
+        }
 
-        // Get sequence BEFORE removing counter, then remove
+        // Get sequence for ACK and remove counters.
         const seq = server.nextSequence(request.target_stream_id);
         _ = server.sequence_counters.remove(request.target_stream_id);
         _ = server.expected_sequences.remove(request.target_stream_id);
@@ -2048,10 +2121,21 @@ test "handleAbortRequest cancels stream" {
     const abort_response = try server.handleEnvelope(abort_env);
     try std.testing.expect(abort_response != null);
     try std.testing.expect(abort_response.?.payload == .ack);
-    try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
+    // Sequence is now 3 because handleAbortRequest first generates a
+    // stream_cancelled outbox envelope (seq 2) before the ACK (seq 3).
+    try std.testing.expectEqual(@as(u64, 3), abort_response.?.sequence);
 
     // Verify stream was removed
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+
+    // Verify a stream_cancelled error was queued to the outbox
+    var outbox_env = server.popOutbound();
+    try std.testing.expect(outbox_env != null);
+    if (outbox_env) |*env| {
+        try std.testing.expect(env.payload == .stream_error);
+        try std.testing.expectEqual(protocol_types.ErrorCode.stream_cancelled, env.payload.stream_error.code);
+        env.deinit(std.testing.allocator);
+    }
 }
 
 test "handleAbortRequest returns ack for unknown stream (idempotent)" {
@@ -2491,6 +2575,393 @@ test "handleAbortRequest rejects sequence gap" {
         var mutable_resp = r;
         mutable_resp.deinit(std.testing.allocator);
     }
+}
+
+// ===========================================================================
+// Abort / Cancel Integration Tests
+// ===========================================================================
+
+/// State shared between the cancel-aware mock stream and the test.
+const CancelMockState = struct {
+    var received_cancel_token: ?ai_types.CancelToken = null;
+
+    fn reset() void {
+        received_cancel_token = null;
+    }
+};
+
+/// Mock stream that captures the cancel_token from StreamOptions so
+/// tests can verify it was injected by handleStreamRequest.
+/// Completes immediately with a result (no background thread).
+fn cancelCapturingStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    // Capture the cancel token from options
+    if (options) |opts| {
+        CancelMockState.received_cancel_token = opts.cancel_token;
+    }
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+
+    // Complete immediately for tests
+    const result = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+    };
+    s.complete(result);
+    s.markThreadDone();
+
+    return s;
+}
+
+test "handleStreamRequest injects CancelToken into provider stream options" {
+    CancelMockState.reset();
+    defer CancelMockState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "cancel-test-api",
+        .stream = cancelCapturingStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "cancel-test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const stream_id = protocol_types.generateUlid();
+    var req = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.payload == .ack);
+    req.deinit(std.testing.allocator);
+
+    // Verify the cancel token was passed through to the provider
+    try std.testing.expect(CancelMockState.received_cancel_token != null);
+    if (CancelMockState.received_cancel_token) |ct| {
+        // Should not be cancelled initially
+        try std.testing.expect(!ct.isCancelled());
+    }
+
+    // Verify the cancelled flag is stored in the active stream
+    const active = server.active_streams.get(stream_id);
+    try std.testing.expect(active != null);
+    if (active) |a| {
+        try std.testing.expect(a.cancelled != null);
+        if (a.cancelled) |c| {
+            try std.testing.expect(!c.load(.acquire));
+        }
+    }
+}
+
+fn cancelCapturingStreamSimple(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.SimpleStreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = model;
+    _ = context;
+
+    if (options) |opts| {
+        CancelMockState.received_cancel_token = opts.cancel_token;
+    }
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.complete(.{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+    });
+    s.markThreadDone();
+    return s;
+}
+
+test "handleAbortRequest signals CancelToken so provider stops early" {
+    CancelMockState.reset();
+    defer CancelMockState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "cancel-test-api-2",
+        .stream = cancelCapturingStream,
+        .stream_simple = cancelCapturingStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "cancel-test-api-2",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    const stream_id = protocol_types.generateUlid();
+    var req = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(req);
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.payload == .ack);
+    req.deinit(std.testing.allocator);
+
+    // Verify cancel token was passed to the provider and is not cancelled yet
+    try std.testing.expect(CancelMockState.received_cancel_token != null);
+    if (CancelMockState.received_cancel_token) |ct| {
+        try std.testing.expect(!ct.isCancelled());
+    }
+
+    // Now send abort
+    const abort_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .abort_request = .{
+            .target_stream_id = stream_id,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed("User cancelled"),
+        } },
+    };
+
+    const abort_resp = try server.handleEnvelope(abort_env);
+    try std.testing.expect(abort_resp != null);
+    try std.testing.expect(abort_resp.?.payload == .ack);
+
+    // Verify stream was removed
+    try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+
+    // Verify outbox has a stream_cancelled error
+    var outbox_env = server.popOutbound();
+    try std.testing.expect(outbox_env != null);
+    if (outbox_env) |*env| {
+        try std.testing.expect(env.payload == .stream_error);
+        try std.testing.expectEqual(protocol_types.ErrorCode.stream_cancelled, env.payload.stream_error.code);
+        try std.testing.expectEqualStrings("User cancelled", env.payload.stream_error.message.slice());
+        env.deinit(std.testing.allocator);
+    }
+}
+
+test "handleAbortRequest with custom reason propagates to outbox stream_error" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    // Create stream
+    const stream_id = protocol_types.generateUlid();
+    var stream_req = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const create_resp = try server.handleEnvelope(stream_req);
+    try std.testing.expect(create_resp != null);
+    stream_req.deinit(std.testing.allocator);
+
+    // Abort with a custom reason
+    const abort_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .abort_request = .{
+            .target_stream_id = stream_id,
+            .reason = protocol_types.OwnedSlice(u8).initBorrowed("AbortSignal triggered"),
+        } },
+    };
+
+    const abort_resp = try server.handleEnvelope(abort_env);
+    try std.testing.expect(abort_resp != null);
+    try std.testing.expect(abort_resp.?.payload == .ack);
+
+    // Verify outbox has the custom reason
+    var outbox_env = server.popOutbound();
+    try std.testing.expect(outbox_env != null);
+    if (outbox_env) |*env| {
+        try std.testing.expect(env.payload == .stream_error);
+        try std.testing.expectEqual(protocol_types.ErrorCode.stream_cancelled, env.payload.stream_error.code);
+        try std.testing.expectEqualStrings("AbortSignal triggered", env.payload.stream_error.message.slice());
+        env.deinit(std.testing.allocator);
+    }
+
+    // Verify no more outbox messages
+    try std.testing.expect(server.popOutbound() == null);
+}
+
+test "cleanupCompletedStreams frees cancel flag for completed streams" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const provider = api_registry.ApiProvider{
+        .api = "test-api",
+        .stream = mockStream,
+        .stream_simple = mockStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://api.test.com",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+
+    // Create a stream
+    const stream_id = protocol_types.generateUlid();
+    var stream_req = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+
+    const resp = try server.handleEnvelope(stream_req);
+    try std.testing.expect(resp != null);
+    stream_req.deinit(std.testing.allocator);
+
+    // Stream is already complete (mockStream completes immediately)
+    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+
+    // Cleanup should free the cancel flag without leaks
+    server.cleanupCompletedStreams();
+    try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
+}
+
+test "ErrorCode.stream_cancelled serializes and deserializes in stream_error" {
+    const allocator = std.testing.allocator;
+
+    const msg = try allocator.dupe(u8, "Client aborted");
+    var env = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_error = .{
+            .code = .stream_cancelled,
+            .message = protocol_types.OwnedSlice(u8).initOwned(msg),
+        } },
+    };
+
+    const json = try envelope.serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.find(u8, json, "\"code\":\"stream_cancelled\"") != null);
+    try std.testing.expect(std.mem.find(u8, json, "\"message\":\"Client aborted\"") != null);
+
+    // Roundtrip
+    var parsed = try envelope.deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .stream_error);
+    try std.testing.expectEqual(protocol_types.ErrorCode.stream_cancelled, parsed.payload.stream_error.code);
+    try std.testing.expectEqualStrings("Client aborted", parsed.payload.stream_error.message.slice());
+
+    env.deinit(allocator);
 }
 
 // ===========================================================================
