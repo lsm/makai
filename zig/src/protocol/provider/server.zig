@@ -833,17 +833,18 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // 3. Deinit partial state immediately (no blocking wait).
-        var partial = removed.value.partial_state;
-        partial.deinit();
-
-        // 4. Put the stream back into active_streams in its completed state.
+        // 3. Put the stream back into active_streams in its completed state.
         //    cleanupCompletedStreams will pick it up on the next pump cycle and
-        //    handle the blocking deinit there — after the ACK has been returned.
-        //    This avoids blocking the abort ACK for up to 120s while waiting
-        //    for the producer thread to exit.
+        //    handle the full cleanup (partial_state deinit + blocking event_stream
+        //    deinit) there — after the ACK has been returned. This avoids blocking
+        //    the abort ACK for up to 120s while waiting for the producer thread.
+        //    NOTE: Do NOT deinit partial_state here — it is a shallow copy, so
+        //    deinit would leave dangling pointers in removed.value and cause a
+        //    double-free when cleanupCompletedStreams processes the re-inserted entry.
         server.active_streams.put(request.target_stream_id, removed.value) catch {
-            // If put fails (OOM), do the blocking deinit now as fallback.
+            // If put fails (OOM), do full cleanup now as fallback.
+            var partial = removed.value.partial_state;
+            partial.deinit();
             removed.value.event_stream.deinit();
             server.allocator.destroy(removed.value.event_stream);
             if (removed.value.cancelled) |c| {
