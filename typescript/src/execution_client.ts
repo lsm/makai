@@ -524,7 +524,9 @@ function buildAgentMessagePayload(
   return payload;
 }
 
-const MAX_MODEL_REF_LENGTH = 512;
+// Must accommodate max valid canonical ref: 256 (provider) + 1 (/) + 256 (api) + 1 (@) + 512 (model_id) = 1026.
+// Using 2048 to also cover percent-encoded model_id expansion (up to 3x) with margin.
+const MAX_MODEL_REF_LENGTH = 2048;
 const MAX_IDENTIFIER_LENGTH = 256;
 const MAX_MODEL_FIELD_LENGTH = 512;
 
