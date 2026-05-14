@@ -856,21 +856,25 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         //    forward it to the client (informing them the stream was cancelled).
         //    The outbox is drained after the immediate ACK response, so err_seq
         //    must be higher than seq to preserve per-stream monotonic ordering.
-        const err_msg = try server.allocator.dupe(u8, reason);
-        server.outbox.append(server.allocator, .{
-            .stream_id = request.target_stream_id,
-            .message_id = protocol_types.generateUlid(),
-            .sequence = err_seq,
-            .in_reply_to = in_reply_to,
-            .timestamp = compat.time.nowMillis(),
-            .payload = .{ .stream_error = .{
-                .code = .stream_cancelled,
-                .message = protocol_types.OwnedSlice(u8).initOwned(err_msg),
-            } },
-        }) catch {
-            // Outbox append is best-effort; don't fail the ACK on OOM.
-            server.allocator.free(err_msg);
-        };
+        //    Both the dupe and the append are best-effort: the ACK must always
+        //    be returned even under OOM conditions.
+        const err_msg = server.allocator.dupe(u8, reason) catch null;
+        if (err_msg) |msg| {
+            server.outbox.append(server.allocator, .{
+                .stream_id = request.target_stream_id,
+                .message_id = protocol_types.generateUlid(),
+                .sequence = err_seq,
+                .in_reply_to = in_reply_to,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .stream_error = .{
+                    .code = .stream_cancelled,
+                    .message = protocol_types.OwnedSlice(u8).initOwned(msg),
+                } },
+            }) catch {
+                // Outbox append is best-effort; don't fail the ACK on OOM.
+                server.allocator.free(msg);
+            };
+        }
 
         // Return ack
         return .{
