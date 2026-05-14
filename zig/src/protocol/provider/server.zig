@@ -833,11 +833,29 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
         const reason = request.getReason() orelse "Stream aborted";
         removed.value.event_stream.completeWithError(reason);
 
-        // Get sequence for the stream_cancelled outbox message BEFORE removing counters.
+        // 3. Clean up partial state, event stream, and cancel flag.
+        var partial = removed.value.partial_state;
+        partial.deinit();
+        removed.value.event_stream.deinit();
+        server.allocator.destroy(removed.value.event_stream);
+        if (removed.value.cancelled) |c| {
+            server.allocator.destroy(c);
+        }
+
+        // Get sequence for ACK first (sent immediately by runtime before outbox items).
+        const seq = server.nextSequence(request.target_stream_id);
+
+        // Get sequence for the stream_cancelled outbox message (sent after ACK).
         const err_seq = server.nextSequence(request.target_stream_id);
 
-        // 3. Queue a stream_error envelope to the outbox so the runtime can
+        // Remove counters before returning.
+        _ = server.sequence_counters.remove(request.target_stream_id);
+        _ = server.expected_sequences.remove(request.target_stream_id);
+
+        // 4. Queue a stream_error envelope to the outbox so the runtime can
         //    forward it to the client (informing them the stream was cancelled).
+        //    The outbox is drained after the immediate ACK response, so err_seq
+        //    must be higher than seq to preserve per-stream monotonic ordering.
         const err_msg = try server.allocator.dupe(u8, reason);
         server.outbox.append(server.allocator, .{
             .stream_id = request.target_stream_id,
@@ -853,20 +871,6 @@ fn handleAbortRequest(server: *ProtocolServer, request: protocol_types.AbortRequ
             // Outbox append is best-effort; don't fail the ACK on OOM.
             server.allocator.free(err_msg);
         };
-
-        // 4. Clean up partial state, event stream, and cancel flag.
-        var partial = removed.value.partial_state;
-        partial.deinit();
-        removed.value.event_stream.deinit();
-        server.allocator.destroy(removed.value.event_stream);
-        if (removed.value.cancelled) |c| {
-            server.allocator.destroy(c);
-        }
-
-        // Get sequence for ACK and remove counters.
-        const seq = server.nextSequence(request.target_stream_id);
-        _ = server.sequence_counters.remove(request.target_stream_id);
-        _ = server.expected_sequences.remove(request.target_stream_id);
 
         // Return ack
         return .{
@@ -2121,9 +2125,10 @@ test "handleAbortRequest cancels stream" {
     const abort_response = try server.handleEnvelope(abort_env);
     try std.testing.expect(abort_response != null);
     try std.testing.expect(abort_response.?.payload == .ack);
-    // Sequence is now 3 because handleAbortRequest first generates a
-    // stream_cancelled outbox envelope (seq 2) before the ACK (seq 3).
-    try std.testing.expectEqual(@as(u64, 3), abort_response.?.sequence);
+    // ACK is seq 2 because handleAbortRequest assigns the ACK sequence first
+    // (runtime sends immediate responses before outbox items), then the
+    // stream_cancelled outbox envelope gets seq 3.
+    try std.testing.expectEqual(@as(u64, 2), abort_response.?.sequence);
 
     // Verify stream was removed
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
