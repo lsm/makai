@@ -1,6 +1,7 @@
 import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
-import { MakaiAuthClient, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
+import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
+import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
@@ -134,14 +135,17 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   async complete(request: ProviderCompleteRequest): Promise<ProviderCompleteResponse> {
+    const signal = request.options?.signal;
+    checkAbort(signal, "provider.complete aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     return withAuthRetry(
-      () => this.completeOnce(request, effectivePolicy),
-      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request), logger: this.logger },
+      () => this.completeOnce(request, effectivePolicy, signal),
+      { auth: this.auth, authHandlers: this.authHandlers, authRetryPolicy: effectivePolicy, fallbackProviderId: providerIdFromRequest(request), signal, logger: this.logger },
     );
   }
 
-  private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<ProviderCompleteResponse> {
+  private async completeOnce(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal): Promise<ProviderCompleteResponse> {
+    checkAbort(signal, "provider.complete aborted");
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -150,7 +154,8 @@ class StdioProviderApi implements MakaiProviderApi {
     this.transport.send(buildEnvelope("complete_request", streamId, buildExecutionPayload(request, { authRetryPolicy: effectivePolicy })));
     const timeoutContext = executionTimeoutContext("provider complete_response", this.responseTimeoutMs, streamId, request);
     while (true) {
-      const frame = await nextFrame(this.transport, streamId, timeoutContext);
+      checkAbort(signal, "provider.complete aborted");
+      const frame = await raceWithAbort(nextFrame(this.transport, streamId, timeoutContext), signal, "provider.complete aborted");
       if (frame.type === "ack") continue;
       if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "stream_error") throw streamErrorFrameToError(frame);
@@ -162,9 +167,11 @@ class StdioProviderApi implements MakaiProviderApi {
   }
 
   async *stream(request: ProviderCompleteRequest): AsyncIterable<ProviderStreamEvent> {
+    const signal = request.options?.signal;
+    checkAbort(signal, "provider.stream aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     const fallbackProviderId = providerIdFromRequest(request);
-    let attempt = this.streamAttempt(request, effectivePolicy);
+    let attempt = this.streamAttempt(request, effectivePolicy, signal);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
     let retried = false;
@@ -174,20 +181,23 @@ class StdioProviderApi implements MakaiProviderApi {
     }
 
     while (true) {
+      checkAbort(signal, "provider.stream aborted");
       let result;
       try {
-        result = await iterator.next();
+        result = await raceWithAbort(iterator.next(), signal, "provider.stream aborted");
       } catch (error) {
+        if (isAbortError(error)) throw error;
         if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
-              await this.auth.login(providerId, this.authHandlers);
-            } catch {
+              await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "provider.stream aborted during auth retry");
+            } catch (authError) {
+              if (isAbortError(authError)) throw authError;
               throw authRequiredError(providerId, error.message);
             }
             retried = true;
-            attempt = this.streamAttempt(request, effectivePolicy);
+            attempt = this.streamAttempt(request, effectivePolicy, signal);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
           }
@@ -204,7 +214,8 @@ class StdioProviderApi implements MakaiProviderApi {
     }
   }
 
-  private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<ProviderStreamEvent> {
+  private async *streamAttempt(request: ProviderCompleteRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal): AsyncIterable<ProviderStreamEvent> {
+    checkAbort(signal, "provider.stream aborted");
     const streamId = ulid();
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -219,7 +230,8 @@ class StdioProviderApi implements MakaiProviderApi {
     }
     try {
       while (!terminal) {
-        const frame = await nextFrame(this.transport, streamId, timeoutContext);
+        checkAbort(signal, "provider.stream aborted");
+        const frame = await raceWithAbort(nextFrame(this.transport, streamId, timeoutContext), signal, "provider.stream aborted");
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         const event = normalizeProviderFrame(frame, toolBuffers);
@@ -240,6 +252,7 @@ class StdioProviderApi implements MakaiProviderApi {
         this.logger.error("provider: stream error", { kind: error.kind, code: error.code, message: error.message });
         throw error;
       }
+      if (isAbortError(error)) throw error;
       this.logger.error("provider: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
@@ -262,15 +275,18 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async run(request: AgentRunRequest): Promise<AgentRunResponse> {
+    const signal = request.options?.signal;
+    checkAbort(signal, "agent.run aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     let retryRequest = request;
     return withAuthRetry(
-      () => this.runOnce(retryRequest, effectivePolicy),
+      () => this.runOnce(retryRequest, effectivePolicy, signal),
       {
         auth: this.auth,
         authHandlers: this.authHandlers,
         authRetryPolicy: effectivePolicy,
         fallbackProviderId: providerIdFromRequest(request),
+        signal,
         logger: this.logger,
         beforeRetry: () => {
           retryRequest = {
@@ -282,7 +298,8 @@ class StdioAgentApi implements MakaiAgentApi {
     );
   }
 
-  private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): Promise<AgentRunResponse> {
+  private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal): Promise<AgentRunResponse> {
+    checkAbort(signal, "agent.run aborted");
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -294,7 +311,8 @@ class StdioAgentApi implements MakaiAgentApi {
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
     while (true) {
-      const frame = await nextAgentFrame(this.transport, sessionId, timeoutContext);
+      checkAbort(signal, "agent.run aborted");
+      const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext), signal, "agent.run aborted");
       if (frame.type === "ack") continue;
       if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
       if (frame.type === "agent_error") throw streamErrorFrameToError(frame);
@@ -321,10 +339,12 @@ class StdioAgentApi implements MakaiAgentApi {
   }
 
   async *stream(request: AgentRunRequest): AsyncIterable<AgentStreamEvent> {
+    const signal = request.options?.signal;
+    checkAbort(signal, "agent.stream aborted before start");
     const effectivePolicy = request.options?.auth_retry_policy ?? this.authRetryPolicy;
     const fallbackProviderId = providerIdFromRequest(request);
     let streamRequest = request;
-    let attempt = this.streamAttempt(streamRequest, effectivePolicy);
+    let attempt = this.streamAttempt(streamRequest, effectivePolicy, signal);
     let iterator = attempt[Symbol.asyncIterator]();
     let yielded = false;
     let retried = false;
@@ -334,16 +354,19 @@ class StdioAgentApi implements MakaiAgentApi {
     }
 
     while (true) {
+      checkAbort(signal, "agent.stream aborted");
       let result;
       try {
-        result = await iterator.next();
+        result = await raceWithAbort(iterator.next(), signal, "agent.stream aborted");
       } catch (error) {
+        if (isAbortError(error)) throw error;
         if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
           const providerId = error.provider_id ?? fallbackProviderId;
           if (providerId) {
             try {
-              await this.auth.login(providerId, this.authHandlers);
-            } catch {
+              await raceWithAbort(this.auth.login(providerId, this.authHandlers, { signal }), signal, "agent.stream aborted during auth retry");
+            } catch (authError) {
+              if (isAbortError(authError)) throw authError;
               throw authRequiredError(providerId, error.message);
             }
             retried = true;
@@ -351,7 +374,7 @@ class StdioAgentApi implements MakaiAgentApi {
               ...request,
               options: { ...request.options, session_id: generateNanoId() },
             };
-            attempt = this.streamAttempt(streamRequest, effectivePolicy);
+            attempt = this.streamAttempt(streamRequest, effectivePolicy, signal);
             iterator = attempt[Symbol.asyncIterator]();
             continue;
           }
@@ -368,7 +391,8 @@ class StdioAgentApi implements MakaiAgentApi {
     }
   }
 
-  private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined): AsyncIterable<AgentStreamEvent> {
+  private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal): AsyncIterable<AgentStreamEvent> {
+    checkAbort(signal, "agent.stream aborted");
     const sessionId = agentSessionId(request);
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -386,7 +410,8 @@ class StdioAgentApi implements MakaiAgentApi {
     }
     try {
       while (!terminal) {
-        const frame = await nextAgentFrame(this.transport, sessionId, timeoutContext);
+        checkAbort(signal, "agent.stream aborted");
+        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext), signal, "agent.stream aborted");
         if (frame.type === "ack") continue;
         if (frame.type === "nack") throw nackToStreamError(frame, fallbackProviderId);
         if (frame.type === "agent_started" && !messageSent) {
@@ -427,6 +452,7 @@ class StdioAgentApi implements MakaiAgentApi {
         this.logger.error("agent: stream error", { kind: error.kind, code: error.code, message: error.message });
         throw error;
       }
+      if (isAbortError(error)) throw error;
       this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
@@ -1119,26 +1145,43 @@ async function withAuthRetry<T>(
     authRetryPolicy?: RunOptions["auth_retry_policy"];
     fallbackProviderId?: string;
     beforeRetry?: () => void;
+    signal?: AbortSignal;
     logger?: MakaiLogger;
   },
 ): Promise<T> {
   try {
     return await operation();
   } catch (error) {
+    if (isAbortError(error)) throw error;
     if (isRetryableAuthError(error) && options.authRetryPolicy === "auto_once" && options.auth) {
+      checkAbort(options.signal, "operation aborted during auth retry");
       const providerId = error.provider_id ?? options.fallbackProviderId;
       if (!providerId) throw error;
       const logger = options.logger ?? getNoopLogger();
       logger.info("execution: auto-retrying after auth_required", { provider_id: providerId });
       try {
-        await options.auth.login(providerId, options.authHandlers);
-      } catch {
+        await raceWithAbort(
+          options.auth.login(providerId, options.authHandlers, { signal: options.signal }),
+          options.signal,
+          "operation aborted during auth login",
+        );
+      } catch (loginError) {
+        if (isAbortError(loginError)) {
+          throw loginError;
+        }
+        if (loginError instanceof MakaiAuthError && loginError.kind === "cancelled" && options.signal?.aborted) {
+          const abortError = new Error("operation aborted during auth retry");
+          abortError.name = "AbortError";
+          throw abortError;
+        }
         throw authRequiredError(providerId, error.message);
       }
+      checkAbort(options.signal, "operation aborted before retry");
       options.beforeRetry?.();
       try {
         return await operation();
       } catch (retryError) {
+        if (isAbortError(retryError)) throw retryError;
         if (isRetryableAuthError(retryError)) {
           const retryProviderId = retryError.provider_id ?? providerId;
           throw authRequiredError(retryProviderId, retryError.message);

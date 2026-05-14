@@ -1,4 +1,5 @@
 import { ulid } from "ulid";
+import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import { BinaryResolverOptions } from "./binary_resolver";
 import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
@@ -140,6 +141,7 @@ export interface MakaiAuthApi {
   login(
     providerId: ProviderId,
     handlers?: AuthFlowHandlers,
+    options?: { signal?: AbortSignal },
   ): Promise<{ status: "success" }>;
 }
 
@@ -356,13 +358,19 @@ export class MakaiAuthClient implements MakaiAuthApi {
    *
    * @param providerId Provider to authenticate.
    * @param handlers Optional per-call handlers; these replace client defaults.
+   * @param options Optional AbortSignal to cancel the login flow.
    * @returns Success status when login completes.
    * @throws {@link MakaiAuthError} if login fails, is cancelled, or the protocol errors.
    */
   async login(
     providerId: ProviderId,
     handlers?: AuthFlowHandlers,
+    options?: { signal?: AbortSignal },
   ): Promise<{ status: "success" }> {
+    const signal = options?.signal;
+    if (signal?.aborted) {
+      throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
+    }
     // Spec §3.6: per-call handlers > client-level defaults > none.
     // Whole-object replacement: per-call handlers entirely replace defaults
     // (not per-property merge), so `{ onPrompt }` intentionally drops a
@@ -370,6 +378,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
     const effective = handlers ?? this.defaultHandlers;
     const flowId = ulid();
     let outboundSequence = 1;
+    let loginStarted = false;
 
     this.logger.info("auth: starting login flow", { provider_id: providerId, flow_id: flowId });
 
@@ -383,6 +392,7 @@ export class MakaiAuthClient implements MakaiAuthApi {
       version: PROTOCOL_VERSION,
       payload: { provider_id: providerId },
     });
+    loginStarted = true;
 
     let lastErrorEvent:
       | { code?: string; message: string }
@@ -390,11 +400,17 @@ export class MakaiAuthClient implements MakaiAuthApi {
     let cancelled = false;
 
     while (true) {
+      if (signal?.aborted) {
+        if (loginStarted) {
+          this.bestEffortCancel(flowId, outboundSequence++);
+        }
+        throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
+      }
       const frame = await this.nextFrameForStream(flowId, {
         operation: "auth_login_result/auth_event",
         message_id: startMessageId,
         provider_id: providerId,
-      });
+      }, signal, () => outboundSequence++);
 
       if (frame.type === "ack") continue;
       if (frame.type === "nack") {
@@ -430,8 +446,12 @@ export class MakaiAuthClient implements MakaiAuthApi {
           }
           let answer: string;
           try {
-            answer = await effective.onPrompt(event);
+            answer = await raceWithAbort(Promise.resolve(effective.onPrompt(event)), signal, "auth.login aborted during prompt");
           } catch (err) {
+            if (isAbortError(err)) {
+              this.bestEffortCancel(flowId, outboundSequence++);
+              throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
+            }
             this.bestEffortCancel(flowId, outboundSequence++);
             await this.drainLoginResult(flowId);
             throw new MakaiAuthError(
@@ -505,10 +525,15 @@ export class MakaiAuthClient implements MakaiAuthApi {
     }
   }
 
-  private async nextFrameForStream(streamId: string, context: Omit<TimeoutDiagnosticContext, "timeout_ms" | "stream_id">): Promise<RawEnvelope> {
+  private async nextFrameForStream(streamId: string, context: Omit<TimeoutDiagnosticContext, "timeout_ms" | "stream_id">, signal?: AbortSignal, nextCancelSequence?: () => number): Promise<RawEnvelope> {
     try {
-      return (await this.transport.nextFrameForStream(streamId, this.frameTimeoutMs)) as RawEnvelope;
+      return (await raceWithAbort(this.transport.nextFrameForStream(streamId, this.frameTimeoutMs), signal, "auth.login aborted")) as RawEnvelope;
     } catch (error) {
+      if (isAbortError(error)) {
+        const seq = nextCancelSequence ? nextCancelSequence() : 999;
+        this.bestEffortCancel(streamId, seq);
+        throw new MakaiAuthError("auth login aborted", { kind: "cancelled" });
+      }
       const diagnosticsContext = { ...context, timeout_ms: this.frameTimeoutMs, stream_id: streamId };
       throw new MakaiAuthError(
         isTimeoutLikeError(error)
