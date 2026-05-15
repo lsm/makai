@@ -151,11 +151,15 @@ class StdioProviderApi implements MakaiProviderApi {
         fallbackProviderId: providerIdFromRequest(request),
         signal,
         logger: this.logger,
-        onAbort: async () => {
+        onAbort: () => {
           const streamId = activeStreamId.value;
           if (streamId) {
             bestEffortCancelStream(this.transport, streamId);
-            await drainStreamFrames(this.transport, streamId);
+            // Fire-and-forget: the aborted nextFrameForStream may still hold
+            // withStreamReadLock, so awaiting drain would block until that
+            // lock is released (up to responseTimeoutMs). Drain runs in the
+            // background instead.
+            drainStreamFrames(this.transport, streamId);
           }
         },
       },
@@ -187,7 +191,9 @@ class StdioProviderApi implements MakaiProviderApi {
     } catch (error) {
       if (isAbortError(error)) {
         bestEffortCancelStream(this.transport, streamId);
-        await drainStreamFrames(this.transport, streamId);
+        // Fire-and-forget: avoids blocking behind withStreamReadLock held by
+        // the aborted nextFrameForStream call.
+        drainStreamFrames(this.transport, streamId);
       }
       throw error;
     }
@@ -347,11 +353,12 @@ class StdioAgentApi implements MakaiAgentApi {
             options: { ...request.options, session_id: generateNanoId() },
           };
         },
-        onAbort: async () => {
+        onAbort: () => {
           const sessionId = activeSessionId.value;
           if (sessionId) {
             bestEffortCancelAgent(this.transport, sessionId);
-            await drainSessionFrames(this.transport, sessionId);
+            // Fire-and-forget: avoids blocking behind withStreamReadLock.
+            drainSessionFrames(this.transport, sessionId);
           }
         },
       },
@@ -401,7 +408,8 @@ class StdioAgentApi implements MakaiAgentApi {
     } catch (error) {
       if (isAbortError(error)) {
         bestEffortCancelAgent(this.transport, sessionId);
-        await drainSessionFrames(this.transport, sessionId);
+        // Fire-and-forget: avoids blocking behind withStreamReadLock.
+        drainSessionFrames(this.transport, sessionId);
       }
       throw error;
     }
@@ -1313,7 +1321,7 @@ async function withAuthRetry<T>(
     signal?: AbortSignal;
     logger?: MakaiLogger;
     /** Called when abort fires during auth retry to cancel the abandoned stream/session. */
-    onAbort?: () => Promise<void>;
+    onAbort?: () => void;
   },
 ): Promise<T> {
   try {
@@ -1334,11 +1342,11 @@ async function withAuthRetry<T>(
         );
       } catch (loginError) {
         if (isAbortError(loginError)) {
-          await options.onAbort?.();
+          options.onAbort?.();
           throw loginError;
         }
         if (loginError instanceof MakaiAuthError && loginError.kind === "cancelled" && options.signal?.aborted) {
-          await options.onAbort?.();
+          options.onAbort?.();
           const abortError = new Error("operation aborted during auth retry");
           abortError.name = "AbortError";
           throw abortError;

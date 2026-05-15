@@ -276,7 +276,9 @@ class StdioModelsApi implements MakaiModelsApi {
     } catch (error) {
       if (isAbortError(error)) {
         bestEffortCancelStream(this.client, streamId);
-        await drainStreamFrames(this.client, streamId);
+        // Fire-and-forget: avoids blocking behind withStreamReadLock held by
+        // the aborted nextFrameForStream call.
+        drainStreamFrames(this.client, streamId);
       }
       throw error;
     }
