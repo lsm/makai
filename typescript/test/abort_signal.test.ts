@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createMakaiAgentApi,
+  createMakaiModelsApi,
   createMakaiProviderApi,
   MakaiAuthError,
   MakaiStreamError,
@@ -31,8 +32,8 @@ class AbortTestTransport {
   public readonly sent: StdioFrame[] = [];
   private readonly frames: StdioFrame[];
   private readonly failWith?: Error;
-  /** Pending promise reject functions — call rejectAll() to clean up. */
-  private readonly pendingRejects: Array<(reason?: unknown) => void> = [];
+  /** Pending promise entries — call rejectAll() to clean up. */
+  private readonly pendingEntries: Array<{ reject: (reason?: unknown) => void; timer: NodeJS.Timeout }> = [];
 
   constructor(frames: StdioFrame[] = [], failWith?: Error) {
     this.frames = [...frames];
@@ -45,31 +46,39 @@ class AbortTestTransport {
 
   /** Reject all pending promises to prevent dangling promise leaks in node:test. */
   rejectAll(): void {
-    for (const reject of this.pendingRejects.splice(0)) {
-      reject(new Error("transport cleaned up"));
+    for (const entry of this.pendingEntries.splice(0)) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error("transport cleaned up"));
     }
   }
 
-  async nextFrameForStream(streamId: string, _timeoutMs?: number): Promise<StdioFrame> {
+  async nextFrameForStream(streamId: string, timeoutMs?: number): Promise<StdioFrame> {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) {
-      // Return a promise that stays pending until abort resolves it or
-      // rejectAll() cleans it up.  We track the reject function so the
-      // test harness can prevent dangling-promise leaks.
       return new Promise<StdioFrame>((_resolve, reject) => {
-        this.pendingRejects.push(reject);
+        const timer = setTimeout(() => {
+          const idx = this.pendingEntries.findIndex((e) => e.reject === reject);
+          if (idx >= 0) this.pendingEntries.splice(idx, 1);
+          reject(new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs ?? 1000}ms`));
+        }, timeoutMs ?? 1000);
+        this.pendingEntries.push({ reject, timer });
       });
     }
     return { stream_id: streamId, ...frame };
   }
 
-  async nextFrameForSession(sessionId: string, _timeoutMs?: number): Promise<StdioFrame> {
+  async nextFrameForSession(sessionId: string, timeoutMs?: number): Promise<StdioFrame> {
     if (this.failWith) throw this.failWith;
     const frame = this.frames.shift();
     if (!frame) {
       return new Promise<StdioFrame>((_resolve, reject) => {
-        this.pendingRejects.push(reject);
+        const timer = setTimeout(() => {
+          const idx = this.pendingEntries.findIndex((e) => e.reject === reject);
+          if (idx >= 0) this.pendingEntries.splice(idx, 1);
+          reject(new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs ?? 1000}ms`));
+        }, timeoutMs ?? 1000);
+        this.pendingEntries.push({ reject, timer });
       });
     }
     return { session_id: sessionId, ...frame };
@@ -123,9 +132,10 @@ test("provider.complete rejects when signal is aborted during frame wait", async
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  // The initial envelope should have been sent.
-  assert.equal(transport.sent.length, 1);
+  // The initial envelope and the abort_request cancel should have been sent.
+  assert.equal(transport.sent.length, 2);
   assert.equal(transport.sent[0]?.type, "complete_request");
+  assert.equal(transport.sent[1]?.type, "abort_request");
   transport.rejectAll();
   await flushMicrotasks();
 });
@@ -250,8 +260,10 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
     (error: unknown) =>
       error instanceof Error && error.name === "AbortError",
   );
-  assert.equal(transport.sent.length, 1);
+  // The agent_start and the agent_stop cancel should have been sent.
+  assert.equal(transport.sent.length, 2);
   assert.equal(transport.sent[0]?.type, "agent_start");
+  assert.equal(transport.sent[1]?.type, "agent_stop");
   transport.rejectAll();
   await flushMicrotasks();
 });
@@ -583,3 +595,251 @@ function listenerCount(signal: AbortSignal): number {
   // Fallback: no reliable way to count in all environments.
   return 0;
 }
+
+// ---------------------------------------------------------------------------
+// Cancel envelope verification tests
+// ---------------------------------------------------------------------------
+
+test("provider.complete sends abort_request cancel envelope on abort", async () => {
+  const transport = new AbortTestTransport();
+  const provider = createMakaiProviderApi(transport as never);
+  const controller = new AbortController();
+
+  const completePromise = provider.complete({ ...REQUEST, options: { signal: controller.signal } });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => completePromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify abort_request was sent with correct fields
+  const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
+  assert.ok(cancelFrame, "expected abort_request frame");
+  const payload = cancelFrame!.payload as Record<string, unknown>;
+  assert.equal(typeof payload.target_stream_id, "string");
+  assert.equal(payload.reason, "client aborted");
+  // target_stream_id should match the stream_id from the original complete_request
+  const requestFrame = transport.sent.find((f) => f.type === "complete_request");
+  assert.equal(payload.target_stream_id, requestFrame?.stream_id);
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+test("provider.stream sends abort_request cancel envelope on abort", async () => {
+  // Use a transport that yields a start frame then a text_delta, giving time
+  // for abort to fire. The text_delta triggers a yield, then the next
+  // raceWithAbort catches the already-aborted signal.
+  const transport = new AbortTestTransport();
+  let frameCount = 0;
+  transport.nextFrameForStream = async (streamId: string, _timeoutMs?: number) => {
+    frameCount++;
+    if (frameCount === 1) {
+      return { stream_id: streamId, type: "event", payload: { type: "message_start" } };
+    }
+    // Yield a text delta so the generator continues; abort was already called
+    // so the next raceWithAbort will catch it.
+    return { stream_id: streamId, type: "event", payload: { type: "text_delta", delta: "hi" } };
+  };
+  const provider = createMakaiProviderApi(transport as never);
+  const controller = new AbortController();
+
+  const events: unknown[] = [];
+  const streamPromise = (async () => {
+    for await (const event of provider.stream({ ...REQUEST, options: { signal: controller.signal } })) {
+      events.push(event);
+      controller.abort();
+    }
+  })();
+
+  await assert.rejects(
+    () => streamPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify exactly one abort_request was sent (no triple-cancel)
+  const cancelFrames = transport.sent.filter((f) => f.type === "abort_request");
+  assert.equal(cancelFrames.length, 1, "expected exactly one abort_request frame");
+  const payload = cancelFrames[0]!.payload as Record<string, unknown>;
+  assert.equal(payload.reason, "client aborted");
+  const requestFrame = transport.sent.find((f) => f.type === "stream_request");
+  assert.equal(payload.target_stream_id, requestFrame?.stream_id);
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+test("agent.run sends agent_stop cancel envelope on abort", async () => {
+  const transport = new AbortTestTransport();
+  const agent = createMakaiAgentApi(transport as never);
+  const controller = new AbortController();
+
+  const runPromise = agent.run({ ...REQUEST, options: { signal: controller.signal } });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => runPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify agent_stop was sent with correct fields
+  const cancelFrame = transport.sent.find((f) => f.type === "agent_stop");
+  assert.ok(cancelFrame, "expected agent_stop frame");
+  const payload = cancelFrame!.payload as Record<string, unknown>;
+  assert.equal(payload.reason, "client aborted");
+  // session_id should match the original agent_start
+  const startFrame = transport.sent.find((f) => f.type === "agent_start");
+  assert.equal(cancelFrame!.session_id, startFrame?.session_id);
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+test("agent.stream sends agent_stop cancel envelope on abort", async () => {
+  // Use a transport that yields agent_started then turn_start, giving time
+  // for abort to fire.
+  const transport = new AbortTestTransport();
+  let frameCount = 0;
+  transport.nextFrameForSession = async (sessionId: string, _timeoutMs?: number) => {
+    frameCount++;
+    if (frameCount === 1) {
+      return { session_id: sessionId, type: "agent_started", payload: {} };
+    }
+    // Return a non-terminal event so the generator continues
+    return {
+      session_id: sessionId,
+      type: "agent_event",
+      payload: { event_json: JSON.stringify({ type: "turn_start" }) },
+    };
+  };
+  const agent = createMakaiAgentApi(transport as never);
+  const controller = new AbortController();
+
+  const events: unknown[] = [];
+  const streamPromise = (async () => {
+    for await (const event of agent.stream({ ...REQUEST, options: { signal: controller.signal } })) {
+      events.push(event);
+      controller.abort();
+    }
+  })();
+
+  await assert.rejects(
+    () => streamPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify exactly one agent_stop was sent (no triple-cancel)
+  const cancelFrames = transport.sent.filter((f) => f.type === "agent_stop");
+  assert.equal(cancelFrames.length, 1, "expected exactly one agent_stop frame");
+  const payload = cancelFrames[0]!.payload as Record<string, unknown>;
+  assert.equal(payload.reason, "client aborted");
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+test("cancel is not sent when abort occurs before transport I/O", async () => {
+  const transport = new AbortTestTransport();
+  const provider = createMakaiProviderApi(transport as never);
+
+  await assert.rejects(
+    () => provider.complete({ ...REQUEST, options: { signal: AbortSignal.abort() } }),
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // No frames should have been sent (neither request nor cancel)
+  assert.equal(transport.sent.length, 0);
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+test("provider.complete withAuthRetry sends cancel on abort during auth login", async () => {
+  const transport = new AbortTestTransport();
+  transport.nextFrameForStream = async (streamId: string, _timeoutMs?: number) => {
+    return {
+      stream_id: streamId,
+      type: "nack",
+      payload: { reason: "login required", error_code: "auth_required", provider_id: "fixture" },
+    };
+  };
+  const auth = {
+    async listProviders() { return []; },
+    async login(_providerId: string, _handlers?: unknown, options?: { signal?: AbortSignal }): Promise<{ status: "success" }> {
+      return new Promise<{ status: "success" }>((resolve, reject) => {
+        const signal = options?.signal;
+        if (signal?.aborted) {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+          return;
+        }
+        const onAbort = () => {
+          const error = new Error("login aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    },
+  };
+  const controller = new AbortController();
+  const completePromise = createMakaiProviderApi(transport as never, {
+    auth,
+    authRetryPolicy: "auto_once",
+  }).complete({ ...REQUEST, options: { auth_retry_policy: "auto_once", signal: controller.signal } });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => completePromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify abort_request was sent for the original stream
+  const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
+  assert.ok(cancelFrame, "expected abort_request frame from withAuthRetry onAbort");
+  const payload = cancelFrame!.payload as Record<string, unknown>;
+  assert.equal(payload.reason, "client aborted");
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});
+
+// ---------------------------------------------------------------------------
+// models cancel envelope verification
+// ---------------------------------------------------------------------------
+
+test("models.list sends abort_request cancel envelope on abort", async () => {
+  const transport = new AbortTestTransport();
+  const models = createMakaiModelsApi(transport as never);
+  const controller = new AbortController();
+
+  const listPromise = models.list({ provider_id: "anthropic", signal: controller.signal });
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  controller.abort();
+
+  await assert.rejects(
+    () => listPromise,
+    (error: unknown) => error instanceof Error && error.name === "AbortError",
+  );
+
+  // Verify abort_request was sent with correct fields
+  const cancelFrame = transport.sent.find((f) => f.type === "abort_request");
+  assert.ok(cancelFrame, "expected abort_request frame");
+  const payload = cancelFrame!.payload as Record<string, unknown>;
+  assert.equal(typeof payload.target_stream_id, "string");
+  assert.equal(payload.reason, "client aborted");
+  // target_stream_id should match the stream_id from the original models_request
+  const requestFrame = transport.sent.find((f) => f.type === "models_request");
+  assert.equal(payload.target_stream_id, requestFrame?.stream_id);
+
+  transport.rejectAll();
+  await flushMicrotasks();
+});

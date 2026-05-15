@@ -21,6 +21,7 @@
 
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
+import { bestEffortCancelStream, drainStreamFrames } from "./cancel_helpers";
 import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
   AuthStatus,
@@ -243,33 +244,43 @@ class StdioModelsApi implements MakaiModelsApi {
       model_id: request.model_id,
     };
     const deadline = Date.now() + this.responseTimeoutMs;
-    while (true) {
-      checkAbort(signal, "models.list aborted");
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new MakaiProtocolError(
-          formatTimeoutMessage(timeoutContext),
-          undefined,
-          { diagnostics: createTimeoutDiagnostics(timeoutContext) },
-        );
-      }
-      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
-
-      switch (frame.type) {
-        case "ack":
-          continue;
-        case "nack":
-          throw nackToError(frame);
-        case "models_response": {
-          const response = parseModelsResponse(frame);
-          this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
-          return response;
-        }
-        default:
-          throw malformedResponseError(
-            `unexpected frame type while awaiting models_response: ${frame.type}`,
+    try {
+      while (true) {
+        checkAbort(signal, "models.list aborted");
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw new MakaiProtocolError(
+            formatTimeoutMessage(timeoutContext),
+            undefined,
+            { diagnostics: createTimeoutDiagnostics(timeoutContext) },
           );
+        }
+        const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
+
+        switch (frame.type) {
+          case "ack":
+            continue;
+          case "nack":
+            throw nackToError(frame);
+          case "models_response": {
+            const response = parseModelsResponse(frame);
+            this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
+            return response;
+          }
+          default:
+            throw malformedResponseError(
+              `unexpected frame type while awaiting models_response: ${frame.type}`,
+            );
+        }
       }
+    } catch (error) {
+      if (isAbortError(error)) {
+        bestEffortCancelStream(this.client, streamId);
+        // Fire-and-forget: avoids blocking behind withStreamReadLock held by
+        // the aborted nextFrameForStream call.
+        drainStreamFrames(this.client, streamId);
+      }
+      throw error;
     }
   }
 }
