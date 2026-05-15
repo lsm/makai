@@ -692,6 +692,7 @@ const ThreadCtx = struct {
     allocator: std.mem.Allocator,
     stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
+    context: ai_types.Context,
     api_key: []u8,
     body: []u8,
     project: []u8,
@@ -700,6 +701,19 @@ const ThreadCtx = struct {
     retry_config: ?ai_types.RetryConfig = null,
     cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
+
+    /// Clean up all owned resources (model, context, api_key, body, project, location, self).
+    fn deinit(self: *ThreadCtx) void {
+        self.allocator.free(self.project);
+        self.allocator.free(self.location);
+        self.allocator.free(self.api_key);
+        self.allocator.free(self.body);
+        var mut_context = self.context;
+        mut_context.deinit(self.allocator);
+        var mut_model = self.model;
+        mut_model.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
 };
 
 fn runThread(ctx: *ThreadCtx) void {
@@ -716,11 +730,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("request cancelled");
             return;
@@ -733,11 +743,7 @@ fn runThread(ctx: *ThreadCtx) void {
     // Vertex AI URL structure:
     // https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
     const url = buildVertexStreamUrl(allocator, location, project, model.id, api_key) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom url");
         return;
@@ -745,11 +751,7 @@ fn runThread(ctx: *ThreadCtx) void {
     defer allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("invalid URL");
         return;
@@ -784,20 +786,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     retry_attempt += 1;
                     continue;
                 }
-                allocator.free(project);
-                allocator.free(location);
-                allocator.free(api_key);
-                allocator.free(body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("request failed");
                 return;
             }
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("request failed");
             return;
@@ -812,20 +806,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     retry_attempt += 1;
                     continue;
                 }
-                allocator.free(project);
-                allocator.free(location);
-                allocator.free(api_key);
-                allocator.free(body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("send failed");
                 return;
             }
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("send failed");
             return;
@@ -839,20 +825,12 @@ fn runThread(ctx: *ThreadCtx) void {
                     retry_attempt += 1;
                     continue;
                 }
-                allocator.free(project);
-                allocator.free(location);
-                allocator.free(api_key);
-                allocator.free(body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("receive failed");
                 return;
             }
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("receive failed");
             return;
@@ -909,11 +887,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
             // Wait before retry
             if (!retry_util.sleepMs(delay, null)) {
-                allocator.free(project);
-                allocator.free(location);
-                allocator.free(api_key);
-                allocator.free(body);
-                allocator.destroy(ctx);
+                ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("vertex request failed");
                 return;
@@ -929,11 +903,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // After retry loop, check final status
     if (response.head.status != .ok) {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("vertex request failed");
         return;
@@ -981,11 +951,7 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         const n = compat.http.readResponse(reader, &read_buf) catch {
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("read failed");
             return;
@@ -993,11 +959,7 @@ fn runThread(ctx: *ThreadCtx) void {
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            allocator.free(project);
-            allocator.free(location);
-            allocator.free(api_key);
-            allocator.free(body);
-            allocator.destroy(ctx);
+            ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("parse failed");
             return;
@@ -1287,11 +1249,7 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom content");
         return;
@@ -1309,11 +1267,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
 
-    allocator.free(project);
-    allocator.free(location);
-    allocator.free(api_key);
-    allocator.free(body);
-    allocator.destroy(ctx);
+    ctx.deinit();
 
     stream.markThreadDone();
     stream.complete(out);
@@ -1369,10 +1323,28 @@ pub fn streamGoogleVertex(
     };
     errdefer allocator.free(api_key);
 
-    const body = buildBody(context, o, model, allocator) catch {
+    // Clone model to own the memory (background thread outlives caller's memory)
+    const owned_model = ai_types.cloneModel(allocator, model) catch return error.OutOfMemory;
+    errdefer {
+        var mut_m = owned_model;
+        mut_m.deinit(allocator);
+    }
+
+    // Clone context to own the memory (background thread outlives caller's memory)
+    const owned_context = ai_types.cloneContext(allocator, context) catch return error.OutOfMemory;
+    errdefer {
+        var mut_ctx = owned_context;
+        mut_ctx.deinit(allocator);
+    }
+
+    const body = buildBody(owned_context, o, owned_model, allocator) catch {
         allocator.free(project);
         allocator.free(location);
         allocator.free(api_key);
+        var mut_ctx_in = owned_context;
+        mut_ctx_in.deinit(allocator);
+        var mut_m_in = owned_model;
+        mut_m_in.deinit(allocator);
         return error.InvalidConfiguration;
     };
     errdefer allocator.free(body);
@@ -1382,10 +1354,15 @@ pub fn streamGoogleVertex(
         allocator.free(location);
         allocator.free(api_key);
         allocator.free(body);
+        var mut_ctx_in = owned_context;
+        mut_ctx_in.deinit(allocator);
+        var mut_m_in = owned_model;
+        mut_m_in.deinit(allocator);
         return error.InvalidConfiguration;
     };
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.wait_for_thread_on_deinit = true;
 
     const ctx = allocator.create(ThreadCtx) catch {
         allocator.free(project);
@@ -1393,13 +1370,18 @@ pub fn streamGoogleVertex(
         allocator.free(api_key);
         allocator.free(body);
         allocator.destroy(s);
+        var mut_ctx_in = owned_context;
+        mut_ctx_in.deinit(allocator);
+        var mut_m_in = owned_model;
+        mut_m_in.deinit(allocator);
         return error.InvalidConfiguration;
     };
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
         .stream = s,
-        .model = model,
+        .model = owned_model,
+        .context = owned_context,
         .api_key = api_key,
         .body = body,
         .project = project,
@@ -1411,11 +1393,7 @@ pub fn streamGoogleVertex(
     };
 
     const th = std.Thread.spawn(.{}, runThread, .{ctx}) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(ctx);
+        ctx.deinit();
         allocator.destroy(s);
         return error.InvalidConfiguration;
     };

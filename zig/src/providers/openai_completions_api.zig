@@ -1781,6 +1781,7 @@ pub fn streamOpenAICompletions(
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.wait_for_thread_on_deinit = true;
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer {

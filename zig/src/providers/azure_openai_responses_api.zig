@@ -220,20 +220,28 @@ const ThreadCtx = struct {
     allocator: std.mem.Allocator,
     stream: *event_stream.AssistantMessageEventStream,
     model: ai_types.Model,
+    context: ai_types.Context,
     api_key: []u8,
     base_url: []u8,
     body: []u8,
     cancel_token: ?ai_types.CancelToken = null,
     ping_interval_ms: ?u64 = null,
+
+    /// Clean up all owned resources (model, context, api_key, base_url, body, self).
+    fn deinit(self: *ThreadCtx) void {
+        self.allocator.free(self.api_key);
+        self.allocator.free(self.base_url);
+        self.allocator.free(self.body);
+        var mut_context = self.context;
+        mut_context.deinit(self.allocator);
+        var mut_model = self.model;
+        mut_model.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
 };
 
 fn runThread(ctx: *ThreadCtx) void {
-    defer {
-        ctx.allocator.free(ctx.api_key);
-        ctx.allocator.free(ctx.base_url);
-        ctx.allocator.free(ctx.body);
-        ctx.allocator.destroy(ctx);
-    }
+    defer ctx.deinit();
 
     if (ctx.cancel_token) |ct| {
         if (ct.isCancelled()) {
@@ -414,16 +422,31 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     };
     errdefer allocator.free(base_url);
 
-    const body = try buildBody(model, context, o, allocator);
+    // Clone model to own the memory (background thread outlives caller's memory)
+    const owned_model = try ai_types.cloneModel(allocator, model);
+    errdefer {
+        var mut_m = owned_model;
+        mut_m.deinit(allocator);
+    }
+
+    // Clone context to own the memory (background thread outlives caller's memory)
+    const owned_context = try ai_types.cloneContext(allocator, context);
+    errdefer {
+        var mut_ctx = owned_context;
+        mut_ctx.deinit(allocator);
+    }
+
+    const body = try buildBody(owned_model, owned_context, o, allocator);
     errdefer allocator.free(body);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.wait_for_thread_on_deinit = true;
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
-    ctx.* = .{ .allocator = allocator, .stream = s, .model = model, .api_key = api_key, .base_url = base_url, .body = body, .cancel_token = o.cancel_token, .ping_interval_ms = o.ping_interval_ms };
+    ctx.* = .{ .allocator = allocator, .stream = s, .model = owned_model, .context = owned_context, .api_key = api_key, .base_url = base_url, .body = body, .cancel_token = o.cancel_token, .ping_interval_ms = o.ping_interval_ms };
 
     const th = try std.Thread.spawn(.{}, runThread, .{ctx});
     th.detach();
