@@ -438,6 +438,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const transport_retry_mod = b.createModule(.{
+        .root_source_file = b.path("src/transports/transport_retry.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
     // Standalone protocol helper modules (no runtime wiring in M-003 scope).
     const protocol_model_ref_mod = b.createModule(.{
         .root_source_file = b.path("src/protocol/model_ref.zig"),
@@ -555,6 +567,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oom", .module = oom_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "transport_retry", .module = transport_retry_mod },
         },
     });
 
@@ -1063,6 +1076,8 @@ pub fn build(b: *std.Build) void {
 
     const in_process_transport_test = b.addTest(.{ .root_module = in_process_transport_mod });
 
+    const transport_retry_test = b.addTest(.{ .root_module = transport_retry_mod });
+
     const protocol_model_ref_test = b.addTest(.{ .root_module = protocol_model_ref_mod });
     const protocol_model_catalog_types_test = b.addTest(.{ .root_module = protocol_model_catalog_types_mod });
 
@@ -1298,6 +1313,7 @@ pub fn build(b: *std.Build) void {
     test_unit_transport_step.dependOn(&b.addRunArtifact(sse_transport_test).step);
     test_unit_transport_step.dependOn(&b.addRunArtifact(websocket_transport_test).step);
     test_unit_transport_step.dependOn(&b.addRunArtifact(in_process_transport_test).step);
+    test_unit_transport_step.dependOn(&b.addRunArtifact(transport_retry_test).step);
 
     const test_unit_protocol_step = b.step("test-unit-protocol", "Run protocol layer unit tests");
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
