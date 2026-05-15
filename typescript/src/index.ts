@@ -1,4 +1,10 @@
 export {
+  checkAbort,
+  isAbortError,
+  raceWithAbort,
+} from "./abort_signal";
+
+export {
   MakaiStdioClient,
   StdioProtocolError,
   createMakaiStdioClient,
@@ -77,6 +83,12 @@ export {
   type TimeoutDiagnosticContext,
   type TimeoutDiagnostics,
 } from "./timeout_diagnostics";
+
+export {
+  type MakaiLogger,
+  getNoopLogger,
+  isNoopLogger,
+} from "./logger";
 
 export {
   MakaiProtocolError,

@@ -192,6 +192,13 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
 
+            // Free previous error message if this stream was already completed
+            // with an error (e.g., provider thread completed before abort).
+            if (self.err_msg) |old| {
+                self.allocator.free(old);
+                self.err_msg = null;
+            }
+
             // Always dupe the message so the stream owns its memory
             // This allows callers to free their copy immediately after this call
             // On OOM, store null (losing the error message is better than crashing)

@@ -327,6 +327,8 @@ pub const ErrorCode = enum {
     auth_refresh_failed,
     /// Stored credentials are expired and cannot be refreshed (no refresh token).
     auth_expired,
+    /// Stream was cancelled by the client via abort_request.
+    stream_cancelled,
 };
 
 /// Stream error payload
@@ -563,10 +565,11 @@ test "ErrorCode enum values match protocol spec" {
         .auth_required,
         .auth_refresh_failed,
         .auth_expired,
+        .stream_cancelled,
     };
 
-    // Verify enum has exactly 15 values
-    try std.testing.expectEqual(@as(usize, 15), codes.len);
+    // Verify enum has exactly 16 values
+    try std.testing.expectEqual(@as(usize, 16), codes.len);
 
     // Verify each can be instantiated
     inline for (codes) |code| {

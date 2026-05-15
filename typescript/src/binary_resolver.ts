@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { getNoopLogger, type MakaiLogger } from "./logger";
 
 /** Shared binary resolver options. */
 type BinaryResolverBaseOptions = {
   cacheDir?: string;
+  logger?: MakaiLogger;
 };
 
 /** Resolve Makai from an explicit filesystem path. */
@@ -119,10 +121,14 @@ async function downloadToCache(url: string, targetPath: string, checksumSha256: 
  * @throws If an explicit binary is missing, download fails, or checksum verification fails.
  */
 export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): Promise<string> {
+  const logger = options.logger ?? getNoopLogger();
+
   const explicitBinaryPath = process.env[ENV_BINARY_PATH] ?? options.binaryPath;
   if (explicitBinaryPath) {
     const resolved = path.resolve(explicitBinaryPath);
+    logger.debug("binary: resolving from explicit path", { path: resolved });
     await ensureFileExists(resolved);
+    logger.debug("binary: resolved from explicit path", { path: resolved });
     return resolved;
   }
 
@@ -135,13 +141,16 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
     const urlPathName = new URL(binaryUrl).pathname;
     const fileName = path.basename(urlPathName) || binaryName;
     const cachePath = path.join(cacheDir, fileName);
+    logger.debug("binary: resolving from URL", { url: binaryUrl, cache_path: cachePath });
 
     if (await fileExists(cachePath)) {
       try {
         await verifyChecksum(cachePath, requiredChecksumSha256);
+        logger.debug("binary: cached file checksum verified", { path: cachePath, sha256: requiredChecksumSha256 });
         return cachePath;
       } catch (error: unknown) {
         if (error instanceof Error && error.message.startsWith("binary checksum mismatch")) {
+          logger.warn("binary: cached file checksum mismatch, re-downloading", { path: cachePath });
           await fs.rm(cachePath, { force: true });
         } else {
           throw error;
@@ -150,7 +159,9 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
     }
 
     if (!(await fileExists(cachePath))) {
+      logger.debug("binary: downloading from URL", { url: binaryUrl, target: cachePath });
       await downloadToCache(binaryUrl, cachePath, requiredChecksumSha256);
+      logger.info("binary: download complete", { path: cachePath, sha256: requiredChecksumSha256 });
       return cachePath;
     }
 
@@ -163,10 +174,13 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
     path.resolve(process.cwd(), "zig", "zig-out", "bin", binaryName),
   ];
   for (const candidate of localCandidates) {
+    logger.debug("binary: checking local candidate", { path: candidate });
     if (await fileExists(candidate)) {
+      logger.debug("binary: resolved from local candidate", { path: candidate });
       return candidate;
     }
   }
 
+  logger.debug("binary: falling back to PATH lookup", { binary: binaryName });
   return "makai";
 }

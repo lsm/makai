@@ -20,6 +20,8 @@
  */
 
 import { ulid } from "ulid";
+import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
+import { getNoopLogger, type MakaiLogger } from "./logger";
 import {
   AuthStatus,
   ListModelsRequest,
@@ -45,6 +47,8 @@ import {
 const ENVELOPE_VERSION = 1;
 const DEFAULT_CACHE_MAX_AGE_MS = 300_000; // spec §2.3 fallback when server omits
 const DEFAULT_RESPONSE_TIMEOUT_MS = 5_000;
+const MAX_PROVIDER_ID_LENGTH = 256;
+const MAX_MODEL_ID_LENGTH = 256;
 
 const KNOWN_AUTH_STATUSES: ReadonlySet<string> = new Set([
   "authenticated",
@@ -91,6 +95,8 @@ const KNOWN_REASONING_LEVELS: ReadonlySet<string> = new Set([
 export interface ModelsApiOptions {
   /** How long `list` / `resolve` waits for a terminal response frame. */
   responseTimeoutMs?: number;
+  /** Optional structured logger for models API diagnostics. */
+  logger?: MakaiLogger;
 }
 
 /**
@@ -121,31 +127,57 @@ const MALFORMED_RESPONSE_CODE = "malformed_response";
 
 class StdioModelsApi implements MakaiModelsApi {
   private readonly responseTimeoutMs: number;
+  private readonly logger: MakaiLogger;
 
   constructor(
     private readonly client: MakaiStdioClient,
     options: ModelsApiOptions,
   ) {
     this.responseTimeoutMs = options.responseTimeoutMs ?? DEFAULT_RESPONSE_TIMEOUT_MS;
+    this.logger = options.logger ?? getNoopLogger();
   }
 
   async list(request: ListModelsRequest = {}): Promise<ListModelsResponse> {
-    return this.dispatch(request);
+    if (typeof request.provider_id === "string" && request.provider_id.length > MAX_PROVIDER_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `provider_id exceeds maximum length of ${MAX_PROVIDER_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
+    if (typeof request.model_id === "string" && request.model_id.length > MAX_MODEL_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `model_id exceeds maximum length of ${MAX_MODEL_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
+    return this.dispatch(request, request.signal);
   }
 
   async resolve(request: ResolveModelRequest): Promise<ResolveModelResponse> {
     if (!request || typeof request.provider_id !== "string" || request.provider_id.length === 0) {
       throw new MakaiProtocolError("resolve requires provider_id", "invalid_request");
     }
+    if (request.provider_id.length > MAX_PROVIDER_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `provider_id exceeds maximum length of ${MAX_PROVIDER_ID_LENGTH} characters`,
+        "invalid_request",
+      );
+    }
     if (typeof request.model_id !== "string" || request.model_id.length === 0) {
       throw new MakaiProtocolError("resolve requires model_id", "invalid_request");
+    }
+    if (request.model_id.length > MAX_MODEL_ID_LENGTH) {
+      throw new MakaiProtocolError(
+        `model_id exceeds maximum length of ${MAX_MODEL_ID_LENGTH} characters`,
+        "invalid_request",
+      );
     }
 
     const response = await this.dispatch({
       provider_id: request.provider_id,
       api: request.api,
       model_id: request.model_id,
-    });
+    }, request.signal);
 
     if (response.models.length === 0) {
       throw new MakaiProtocolError("model not found", "invalid_request");
@@ -171,10 +203,11 @@ class StdioModelsApi implements MakaiModelsApi {
     return { model };
   }
 
-  private async nextFrameForStream(streamId: string, timeoutMs: number, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
+  private async nextFrameForStream(streamId: string, timeoutMs: number, context: TimeoutDiagnosticContext, signal?: AbortSignal): Promise<StdioFrame> {
     try {
-      return await this.client.nextFrameForStream(streamId, timeoutMs);
+      return await raceWithAbort(this.client.nextFrameForStream(streamId, timeoutMs), signal, "models.list aborted");
     } catch (error) {
+      if (isAbortError(error)) throw error;
       throw new MakaiProtocolError(
         isTimeoutLikeError(error)
           ? formatTimeoutMessage(context)
@@ -185,8 +218,10 @@ class StdioModelsApi implements MakaiModelsApi {
     }
   }
 
-  private async dispatch(request: ListModelsRequest): Promise<ListModelsResponse> {
+  private async dispatch(request: ListModelsRequest, signal?: AbortSignal): Promise<ListModelsResponse> {
+    checkAbort(signal, "models.list aborted before start");
     const streamId = ulid();
+    this.logger.debug("models: sending models_request", { stream_id: streamId, provider_id: request.provider_id, api: request.api });
     const envelope: StdioFrame = {
       type: "models_request",
       stream_id: streamId,
@@ -209,6 +244,7 @@ class StdioModelsApi implements MakaiModelsApi {
     };
     const deadline = Date.now() + this.responseTimeoutMs;
     while (true) {
+      checkAbort(signal, "models.list aborted");
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         throw new MakaiProtocolError(
@@ -217,15 +253,18 @@ class StdioModelsApi implements MakaiModelsApi {
           { diagnostics: createTimeoutDiagnostics(timeoutContext) },
         );
       }
-      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext);
+      const frame = await this.nextFrameForStream(streamId, remaining, timeoutContext, signal);
 
       switch (frame.type) {
         case "ack":
           continue;
         case "nack":
           throw nackToError(frame);
-        case "models_response":
-          return parseModelsResponse(frame);
+        case "models_response": {
+          const response = parseModelsResponse(frame);
+          this.logger.debug("models: received models_response", { count: response.models.length, stream_id: streamId });
+          return response;
+        }
         default:
           throw malformedResponseError(
             `unexpected frame type while awaiting models_response: ${frame.type}`,
