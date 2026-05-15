@@ -259,7 +259,9 @@ class StdioProviderApi implements MakaiProviderApi {
         const streamId = activeStreamId.value;
         if (streamId) {
           bestEffortCancelStream(this.transport, streamId);
-          await drainStreamFrames(this.transport, streamId);
+          // Fire-and-forget: avoids blocking behind withStreamReadLock held by
+          // the aborted nextFrameForStream call from streamAttempt.
+          drainStreamFrames(this.transport, streamId);
         }
       }
       throw error;
@@ -480,7 +482,8 @@ class StdioAgentApi implements MakaiAgentApi {
         const sessionId = activeSessionId.value;
         if (sessionId) {
           bestEffortCancelAgent(this.transport, sessionId);
-          await drainSessionFrames(this.transport, sessionId);
+          // Fire-and-forget: avoids blocking behind withStreamReadLock.
+          drainSessionFrames(this.transport, sessionId);
         }
       }
       throw error;
