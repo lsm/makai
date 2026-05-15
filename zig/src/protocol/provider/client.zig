@@ -650,6 +650,14 @@ pub const ProtocolClient = struct {
                 const msg: []const u8 = allocated_msg orelse "Transport read error";
                 defer if (allocated_msg != null) allocator.free(msg);
                 try self.setLastError(msg);
+
+                // Mark all pending streams as failed so waitResultFor doesn't block
+                // until timeout. The transport is dead, so no more envelopes will arrive.
+                var pending_it = self.pending_requests.iterator();
+                while (pending_it.next()) |entry| {
+                    self.setStreamError(entry.value_ptr.stream_id, msg) catch {};
+                }
+
                 return err;
             };
 

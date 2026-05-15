@@ -75,9 +75,11 @@ pub const TransportRetryOptions = struct {
     /// Adds random jitter in range `[base_delay_ms, capped]` to prevent thundering herd
     /// when multiple clients retry simultaneously.
     pub fn calculateBackoff(self: *const TransportRetryOptions, attempt: u32) u64 {
-        // Exponential backoff: base * 2^attempt
+        // Exponential backoff: base * 2^attempt, with overflow protection.
+        // If the left shift would overflow u64, clamp to max_delay_ms directly.
         const shift: u5 = @intCast(@min(attempt, 30));
-        const exponential: u64 = self.base_delay_ms << shift;
+        const shl_result = @shlWithOverflow(self.base_delay_ms, shift);
+        const exponential: u64 = if (shl_result.@"1" != 0) self.max_delay_ms else shl_result.@"0";
         const capped = @min(exponential, self.max_delay_ms);
 
         // Full jitter: random value in [base_delay_ms, capped]
@@ -155,7 +157,7 @@ pub fn receiveStreamWithRetry(
                 // Only skip decode/parse errors; propagate fatal errors like OOM
                 if (err == error.OutOfMemory) {
                     stream.completeWithError("Out of memory during deserialization");
-                    return;
+                    return error.OutOfMemory;
                 }
                 // Transient decode error — skip this frame and continue reading
                 continue;
