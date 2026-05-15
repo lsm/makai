@@ -219,41 +219,10 @@ pub const InProcessTransport = struct {
 
     fn handleControlMessage(ctrl: transport_mod.ControlMessage, allocator: std.mem.Allocator) void {
         // Free control message strings
-        freeControlStrings(ctrl, allocator);
+        transport_mod.freeControlStrings(ctrl, allocator);
     }
 };
 
-/// Free allocated strings in a control message (local copy since transport.freeControlStrings is not pub)
-fn freeControlStrings(ctrl: transport_mod.ControlMessage, allocator: std.mem.Allocator) void {
-    switch (ctrl) {
-        .ack => |a| {
-            var id = a.acknowledged_id;
-            id.deinit(allocator);
-        },
-        .nack => |n| {
-            var rejected_id = n.rejected_id;
-            rejected_id.deinit(allocator);
-
-            var reason = n.reason;
-            reason.deinit(allocator);
-
-            var error_code = n.error_code;
-            error_code.deinit(allocator);
-        },
-        .goodbye => |g| {
-            var reason = g;
-            reason.deinit(allocator);
-        },
-        .sync => |s| {
-            var stream_id = s.stream_id;
-            stream_id.deinit(allocator);
-
-            var partial = s.partial;
-            partial.deinit(allocator);
-        },
-        .ping, .pong, .sync_request => {},
-    }
-}
 
 /// Create a connected pair of in-process transports.
 /// Returns client (for sending) and server (for receiving).
