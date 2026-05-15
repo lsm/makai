@@ -619,6 +619,20 @@ pub const ProtocolClient = struct {
         return null;
     }
 
+    /// Mark all incomplete streams as failed with the given error message.
+    /// Iterates `stream_complete_flags` (not just `pending_requests`) so
+    /// acknowledged streams that are still producing events are also covered.
+    /// Clears `pending_requests` afterward to prevent stale accumulation.
+    fn failAllIncompleteStreams(self: *Self, msg: []const u8) void {
+        var flag_it = self.stream_complete_flags.iterator();
+        while (flag_it.next()) |entry| {
+            if (!entry.value_ptr.*) {
+                self.setStreamError(entry.key_ptr.*, msg) catch {};
+            }
+        }
+        self.pending_requests.clearRetainingCapacity();
+    }
+
     /// Read protocol envelopes from a Receiver and process them, applying retry
     /// with exponential backoff for transient transport errors.
     ///
@@ -651,12 +665,10 @@ pub const ProtocolClient = struct {
                 defer if (allocated_msg != null) allocator.free(msg);
                 try self.setLastError(msg);
 
-                // Mark all pending streams as failed so waitResultFor doesn't block
-                // until timeout. The transport is dead, so no more envelopes will arrive.
-                var pending_it = self.pending_requests.iterator();
-                while (pending_it.next()) |entry| {
-                    self.setStreamError(entry.value_ptr.stream_id, msg) catch {};
-                }
+                // Mark all incomplete streams as failed (including acknowledged ones)
+                // so waitResultFor doesn't block until timeout. Clear pending_requests
+                // to prevent stale accumulation on reconnect.
+                self.failAllIncompleteStreams(msg);
 
                 return err;
             };
@@ -674,7 +686,9 @@ pub const ProtocolClient = struct {
 
                 try self.processEnvelope(env);
             } else {
-                // EOF — normal termination
+                // EOF — mark any incomplete streams as failed so callers don't
+                // block until timeout. Peer closed before sending terminal frames.
+                self.failAllIncompleteStreams("Transport closed unexpectedly");
                 break;
             }
         }

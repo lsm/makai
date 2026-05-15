@@ -168,7 +168,7 @@ pub fn receiveStreamWithRetry(
                     stream.push(ev) catch {
                         transport.freeEventStrings(ev, allocator);
                         stream.completeWithError("Stream queue full");
-                        return;
+                        return error.StreamQueueFull;
                     };
                 },
                 .result => |r| {
