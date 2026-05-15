@@ -23,7 +23,7 @@ export function bestEffortCancelStream(transport: MakaiStdioClient, streamId: st
       type: "abort_request",
       stream_id: streamId,
       message_id: ulid(),
-      sequence: 999,
+      sequence: 2, // Initial request is sequence 1; abort is the next per-stream message
       timestamp: Date.now(),
       version: ENVELOPE_VERSION,
       payload: { target_stream_id: streamId, reason: "client aborted" },
