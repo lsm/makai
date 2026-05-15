@@ -98,8 +98,17 @@ export function createMakaiAgentApi(
   return new StdioAgentApi(transport, options);
 }
 
-/** Agent API augmented with the model-discovery API for convenience. */
+/**
+ * Agent API augmented with the model-discovery API for convenience.
+ *
+ * `client.agent.models` is a separate {@link MakaiModelsApi} instance that
+ * delegates to the same underlying model-discovery API over the shared
+ * transport as `client.models`. Prefer `client.models` when you don't also
+ * need agent methods; use `client.agent.models` when chaining discovery with
+ * an agent call on the same namespace.
+ */
 export interface MakaiAgentModelsApi extends MakaiAgentApi {
+  /** Convenience accessor for model discovery; delegates to the same API as {@link MakaiClient.models}. */
   models: MakaiModelsApi;
 }
 

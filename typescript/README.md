@@ -157,6 +157,18 @@ void main();
 
 For agent streaming, iterate over `client.agent.stream(request)` and handle `agent_start`, `turn_start`, `tool_execution_start`, `tool_execution_end`, provider deltas, and the terminal `agent_end` event.
 
+### Agent model discovery
+
+`client.agent.models` is a separate `MakaiModelsApi` instance that delegates to the same underlying model-discovery API over the shared transport as `client.models`. The two instances produce the same results but are not the same object (`client.agent.models !== client.models`).
+
+```ts
+// Both call the same underlying API and return the same results:
+const { models } = await client.models.list();
+const { models: agentModels } = await client.agent.models.list();
+```
+
+Prefer `client.models` when you only need model discovery. Use `client.agent.models` when chaining discovery with an agent call on the same namespace.
+
 ## Auth
 
 Use `client.auth.listProviders()` to inspect auth state, and `client.auth.login(providerId, handlers)` to start an interactive login flow. Token material is owned by the runtime and is not exposed by the SDK.
@@ -429,6 +441,7 @@ import type {
   ListModelsRequest,
   ListModelsResponse,
   MakaiAgentApi,
+  MakaiAgentModelsApi,
   MakaiAuthApi,
   MakaiClient,
   MakaiModelsApi,
@@ -475,7 +488,7 @@ Core namespaces:
 type MakaiClient = {
   auth: MakaiAuthApi;
   models: MakaiModelsApi;
-  agent: MakaiAgentApi;
+  agent: MakaiAgentModelsApi; // extends MakaiAgentApi with a `models` convenience alias
   provider: MakaiProviderApi;
   close(): Promise<void>;
 };
