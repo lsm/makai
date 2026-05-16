@@ -1255,26 +1255,38 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
+    // Dupe metadata strings BEFORE composing `out` so a mid-dupe OOM can cascade-free
+    // both content_slice and any prior successful dupes without leaking.
+    const api_dup = allocator.dupe(u8, model.api) catch {
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
+    const provider_dup = allocator.dupe(u8, model.provider) catch {
+        allocator.free(api_dup);
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
+    const model_dup = allocator.dupe(u8, model.id) catch {
+        allocator.free(provider_dup);
+        allocator.free(api_dup);
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
+
     const out = ai_types.AssistantMessage{
         .content = content_slice,
-        .api = allocator.dupe(u8, model.api) catch {
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
-        .provider = allocator.dupe(u8, model.provider) catch {
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
-        .model = allocator.dupe(u8, model.id) catch {
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
+        .api = api_dup,
+        .provider = provider_dup,
+        .model = model_dup,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),

@@ -350,6 +350,36 @@ pub const AssistantMessage = struct {
     }
 };
 
+/// Free a built-up `AssistantContent` slice owned by the caller. Used by providers
+/// to clean up `content_blocks` when assembling a final `AssistantMessage` fails
+/// partway (e.g., a `model.api` duplicate triggers OOM). Mirrors the per-block
+/// cleanup in `AssistantMessage.deinit` but does not touch any metadata strings.
+pub fn deinitAssistantContent(allocator: std.mem.Allocator, blocks: []AssistantContent) void {
+    for (blocks) |block| {
+        switch (block) {
+            .text => |t| {
+                if (t.text.len > 0) allocator.free(t.text);
+                if (t.text_signature) |s| allocator.free(s);
+            },
+            .thinking => |t| {
+                if (t.thinking.len > 0) allocator.free(t.thinking);
+                if (t.thinking_signature) |s| allocator.free(s);
+            },
+            .tool_call => |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
+                if (tc.thought_signature) |s| allocator.free(s);
+            },
+            .image => |img| {
+                allocator.free(img.data);
+                allocator.free(img.mime_type);
+            },
+        }
+    }
+    allocator.free(blocks);
+}
+
 pub const ToolResultMessage = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,

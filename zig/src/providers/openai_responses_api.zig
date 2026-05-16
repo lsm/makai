@@ -1291,9 +1291,10 @@ fn runThread(ctx: *ThreadCtx) void {
     const content_count: usize = if (has_thinking) 1 else 0;
     const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0) + tool_call_count;
 
+    // Build content slice first (single empty text block when no content was streamed).
+    var content_slice: []ai_types.AssistantContent = undefined;
     if (content_count_final == 0) {
-        // No content - create empty text block
-        var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
+        content_slice = allocator.alloc(ai_types.AssistantContent, 1) catch {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
@@ -1301,103 +1302,100 @@ fn runThread(ctx: *ThreadCtx) void {
             stream.completeWithError("oom result");
             return;
         };
-        content[0] = .{ .text = .{ .text = "" } };
-        const out = ai_types.AssistantMessage{
-            .content = content,
-            .api = model.api,
-            .provider = model.provider,
-            .model = model.id,
-            .usage = usage,
-            .stop_reason = stop_reason,
-            .timestamp = compat.time.nowMillis(),
+        content_slice[0] = .{ .text = .{ .text = "" } };
+    } else {
+        content_slice = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
+            allocator.free(auth);
+            allocator.free(url);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom building result");
+            return;
         };
-        allocator.free(auth);
-        allocator.free(url);
-        ctx.deinit();
-        stream.markThreadDone();
-        stream.complete(out);
-        return;
-    }
+        var idx: usize = 0;
 
-    var content = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
-        allocator.free(auth);
-        allocator.free(url);
-        ctx.deinit();
-        stream.markThreadDone();
-        stream.completeWithError("oom building result");
-        return;
-    };
-    var idx: usize = 0;
-
-    if (has_thinking) {
-        content[idx] = .{ .thinking = .{
-            .thinking = allocator.dupe(u8, thinking.items) catch {
-                allocator.free(content);
-                allocator.free(auth);
-                allocator.free(url);
-                ctx.deinit();
-                stream.markThreadDone();
-                stream.completeWithError("oom building thinking");
-                return;
-            },
-        } };
-        idx += 1;
-    }
-
-    if (has_text) {
-        content[idx] = .{
-            .text = .{
-                .text = allocator.dupe(u8, text.items) catch {
-                    // Free previously allocated content
-                    for (content[0..idx]) |*block| {
-                        switch (block.*) {
-                            .thinking => |t| allocator.free(t.thinking),
-                            else => {},
-                        }
-                    }
-                    allocator.free(content);
+        if (has_thinking) {
+            content_slice[idx] = .{ .thinking = .{
+                .thinking = allocator.dupe(u8, thinking.items) catch {
+                    allocator.free(content_slice);
                     allocator.free(auth);
                     allocator.free(url);
                     ctx.deinit();
                     stream.markThreadDone();
-                    stream.completeWithError("oom building text");
+                    stream.completeWithError("oom building thinking");
                     return;
                 },
-            },
-        };
-        idx += 1;
+            } };
+            idx += 1;
+        }
+
+        if (has_text) {
+            content_slice[idx] = .{
+                .text = .{
+                    .text = allocator.dupe(u8, text.items) catch {
+                        // Free previously allocated content
+                        for (content_slice[0..idx]) |*block| {
+                            switch (block.*) {
+                                .thinking => |t| allocator.free(t.thinking),
+                                else => {},
+                            }
+                        }
+                        allocator.free(content_slice);
+                        allocator.free(auth);
+                        allocator.free(url);
+                        ctx.deinit();
+                        stream.markThreadDone();
+                        stream.completeWithError("oom building text");
+                        return;
+                    },
+                },
+            };
+            idx += 1;
+        }
+
+        // Note: tool calls are already emitted via toolcall_end events during streaming
+        // and completed in the tracker. We don't need to iterate again here since
+        // output_item_done events already handled them.
     }
 
-    // Note: tool calls are already emitted via toolcall_end events during streaming
-    // and completed in the tracker. We don't need to iterate again here since
-    // output_item_done events already handled them.
+    // Dupe metadata strings BEFORE composing `out` so a mid-dupe OOM can cascade-free
+    // both content_slice and any prior successful dupes without leaking.
+    const api_dup = allocator.dupe(u8, model.api) catch {
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        allocator.free(auth);
+        allocator.free(url);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
+    const provider_dup = allocator.dupe(u8, model.provider) catch {
+        allocator.free(api_dup);
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        allocator.free(auth);
+        allocator.free(url);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
+    const model_dup = allocator.dupe(u8, model.id) catch {
+        allocator.free(provider_dup);
+        allocator.free(api_dup);
+        ai_types.deinitAssistantContent(allocator, content_slice);
+        allocator.free(auth);
+        allocator.free(url);
+        ctx.deinit();
+        stream.markThreadDone();
+        stream.completeWithError("oom");
+        return;
+    };
 
     const out = ai_types.AssistantMessage{
-        .content = content,
-        .api = allocator.dupe(u8, model.api) catch {
-            allocator.free(auth);
-            allocator.free(url);
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
-        .provider = allocator.dupe(u8, model.provider) catch {
-            allocator.free(auth);
-            allocator.free(url);
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
-        .model = allocator.dupe(u8, model.id) catch {
-            allocator.free(auth);
-            allocator.free(url);
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom");
-            return;
-        },
+        .content = content_slice,
+        .api = api_dup,
+        .provider = provider_dup,
+        .model = model_dup,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
