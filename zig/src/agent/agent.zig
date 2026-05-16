@@ -731,6 +731,10 @@ pub const Agent = struct {
             .get_api_key_ctx = self._get_api_key_ctx,
         };
 
+        // Track how many messages context has before the loop so we can tell
+        // whether any prompts were actually consumed.
+        const initial_message_count = context.messages.items.len;
+
         // Run loop
         const stream = if (messages.*) |msgs|
             try agent_loop.agentLoop(self._allocator, msgs, &context, config)
@@ -780,11 +784,20 @@ pub const Agent = struct {
             self.emit(event);
         }
 
-        // Transfer ownership only if the stream completed successfully.
-        // If runLoop failed before consuming all prompts, the caller retains
-        // ownership and its cleanup path will free them.
-        if (stream.getError() == null) {
+        // Transfer ownership if any prompts were actually consumed (appended to
+        // context). This avoids a double-free when consumed prompts were
+        // shallow-copied into context, while still letting the caller clean up
+        // unconsumed prompts on early failure.
+        if (context.messages.items.len > initial_message_count) {
             messages.* = null;
+        }
+
+        // Surface background-loop errors so callers do not receive ok when the
+        // agent loop aborted.
+        if (stream.getResult()) |result| {
+            if (result.final_message.stop_reason == .@"error") {
+                return error.AgentLoopFailed;
+            }
         }
 
         self._state.is_streaming = false;
