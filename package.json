@@ -21,7 +21,7 @@
   "type": "commonjs",
   "files": [
     "dist/src/**/*",
-    "typescript/README.md"
+    "README.md"
   ],
   "devDependencies": {
     "@types/node": "^24.0.0",

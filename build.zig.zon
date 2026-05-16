@@ -7,6 +7,7 @@
         "build.zig.zon",
         "zig",
         "docs",
+        "CHANGELOG.md",
     },
     .fingerprint = 0x2810735ca1ee9efd,
 }
