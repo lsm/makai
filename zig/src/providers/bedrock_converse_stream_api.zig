@@ -2,7 +2,6 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const api_registry = @import("api_registry");
-const std = @import("std");
 
 /// Native Bedrock API provider placeholder.
 /// Legacy bridge removed; full AWS event-stream implementation pending in this interface layer.

@@ -80,21 +80,19 @@ fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
-fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const u8, model_id: []const u8, api_key: []const u8) ![]const u8 {
+fn buildStreamGenerateContentUrl(allocator: std.mem.Allocator, base_url: []const u8, model_id: []const u8) ![]const u8 {
     var sb = StringBuilder{};
     sb.count(base_url);
     sb.count("/v1beta/models/");
     sb.count(model_id);
-    sb.count(":streamGenerateContent?alt=sse&key=");
-    sb.count(api_key);
+    sb.count(":streamGenerateContent?alt=sse");
     try sb.allocate(allocator);
     errdefer sb.deinit(allocator);
 
     _ = sb.append(base_url);
     _ = sb.append("/v1beta/models/");
     _ = sb.append(model_id);
-    _ = sb.append(":streamGenerateContent?alt=sse&key=");
-    _ = sb.append(api_key);
+    _ = sb.append(":streamGenerateContent?alt=sse");
 
     std.debug.assert(sb.len == sb.cap);
     const out = sb.ptr.?[0..sb.cap];
@@ -768,7 +766,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = compat.http.HttpClient.init(allocator);
     defer client.deinit();
 
-    const url = buildStreamGenerateContentUrl(allocator, base_url, model.id, api_key) catch {
+    const url = buildStreamGenerateContentUrl(allocator, base_url, model.id) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom url");
@@ -783,7 +781,10 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    const headers = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
+    const headers = [_]std.http.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-goog-api-key", .value = api_key },
+    };
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1372,7 +1373,9 @@ fn runThread(ctx: *ThreadCtx) void {
         .is_owned = true, // Strings were duped above
     };
 
-    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+    // Do NOT push a .done event here — the same AssistantMessage would be
+    // referenced by both the event and complete(), causing a double-free when
+    // the consumer deinits either one.
 
     // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();

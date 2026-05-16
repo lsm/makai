@@ -1202,7 +1202,9 @@ fn runThread(ctx: *ThreadCtx) void {
         .is_owned = true, // Strings were duped above
     };
 
-    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+    // Do NOT push a .done event here — the same AssistantMessage would be
+    // referenced by both the event and complete(), causing a double-free when
+    // the consumer deinits either one.
 
     // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();

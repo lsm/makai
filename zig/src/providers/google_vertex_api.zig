@@ -36,7 +36,7 @@ fn env(allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
     return compat.getEnvVarOwned(allocator, name) catch null;
 }
 
-fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, project: []const u8, model_id: []const u8, api_key: []const u8) ![]const u8 {
+fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, project: []const u8, model_id: []const u8) ![]const u8 {
     var sb = StringBuilder{};
     sb.count("https://");
     sb.count(location);
@@ -46,8 +46,7 @@ fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, proj
     sb.count(location);
     sb.count("/publishers/google/models/");
     sb.count(model_id);
-    sb.count(":streamGenerateContent?alt=sse&key=");
-    sb.count(api_key);
+    sb.count(":streamGenerateContent?alt=sse");
     try sb.allocate(allocator);
     errdefer sb.deinit(allocator);
 
@@ -59,8 +58,7 @@ fn buildVertexStreamUrl(allocator: std.mem.Allocator, location: []const u8, proj
     _ = sb.append(location);
     _ = sb.append("/publishers/google/models/");
     _ = sb.append(model_id);
-    _ = sb.append(":streamGenerateContent?alt=sse&key=");
-    _ = sb.append(api_key);
+    _ = sb.append(":streamGenerateContent?alt=sse");
 
     std.debug.assert(sb.len == sb.cap);
     const out = sb.ptr.?[0..sb.cap];
@@ -742,7 +740,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
     // Vertex AI URL structure:
     // https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/publishers/google/models/<model>:streamGenerateContent?alt=sse
-    const url = buildVertexStreamUrl(allocator, location, project, model.id, api_key) catch {
+    const url = buildVertexStreamUrl(allocator, location, project, model.id) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom url");
@@ -757,7 +755,14 @@ fn runThread(ctx: *ThreadCtx) void {
         return;
     };
 
-    const headers = [_]std.http.Header{.{ .name = "content-type", .value = "application/json" }};
+    // TODO: Vertex AI officially uses Authorization: Bearer via OAuth/ADC.
+    // x-goog-api-key works for now because resolveApiKey falls back to a
+    // placeholder when ADC is not set up, but this should become a proper
+    // Bearer token once ADC/OAuth integration is implemented.
+    const headers = [_]std.http.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "x-goog-api-key", .value = api_key },
+    };
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1293,7 +1298,9 @@ fn runThread(ctx: *ThreadCtx) void {
         .is_owned = true, // Strings were duped above
     };
 
-    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+    // Do NOT push a .done event here — the same AssistantMessage would be
+    // referenced by both the event and complete(), causing a double-free when
+    // the consumer deinits either one.
 
     // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();
