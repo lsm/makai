@@ -62,7 +62,6 @@ jobs:
         run: |
           set -euo pipefail
           OUT_ROOT="$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}"
-          cd zig
           zig build install -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe --prefix "$OUT_ROOT"
 
       - name: Package tar.gz

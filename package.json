@@ -1,6 +1,6 @@
 {
   "name": "makai",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "TypeScript SDK for Makai stdio client transport",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",
@@ -19,6 +19,10 @@
   "author": "makai contributors",
   "license": "ISC",
   "type": "commonjs",
+  "files": [
+    "dist/src/**/*",
+    "typescript/README.md"
+  ],
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3"
