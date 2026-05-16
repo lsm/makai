@@ -1257,16 +1257,33 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const out = ai_types.AssistantMessage{
         .content = content_slice,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
+        .api = allocator.dupe(u8, model.api) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
+        .provider = allocator.dupe(u8, model.provider) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
+        .model = allocator.dupe(u8, model.id) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
+        .is_owned = true, // Strings were duped above
     };
 
     stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
 
+    // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();
 
     stream.markThreadDone();
@@ -1301,12 +1318,10 @@ pub fn streamGoogleVertex(
         if (ct.isCancelled()) break :blk try allocator.dupe(u8, "us-central1");
         break :blk try resolveLocation(null, allocator) orelse {
             std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
-            allocator.free(project);
             return error.MissingLocation;
         };
     } else try resolveLocation(null, allocator) orelse {
         std.log.err("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION environment variable.", .{});
-        allocator.free(project);
         return error.MissingLocation;
     };
     errdefer allocator.free(location);
@@ -1317,8 +1332,6 @@ pub fn streamGoogleVertex(
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
         std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
-        allocator.free(project);
-        allocator.free(location);
         return error.MissingApiKey;
     };
     errdefer allocator.free(api_key);
@@ -1337,45 +1350,15 @@ pub fn streamGoogleVertex(
         mut_ctx.deinit(allocator);
     }
 
-    const body = buildBody(owned_context, o, owned_model, allocator) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        var mut_ctx_in = owned_context;
-        mut_ctx_in.deinit(allocator);
-        var mut_m_in = owned_model;
-        mut_m_in.deinit(allocator);
-        return error.InvalidConfiguration;
-    };
+    const body = buildBody(owned_context, o, owned_model, allocator) catch return error.InvalidConfiguration;
     errdefer allocator.free(body);
 
-    const s = allocator.create(event_stream.AssistantMessageEventStream) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        var mut_ctx_in = owned_context;
-        mut_ctx_in.deinit(allocator);
-        var mut_m_in = owned_model;
-        mut_m_in.deinit(allocator);
-        return error.InvalidConfiguration;
-    };
+    const s = allocator.create(event_stream.AssistantMessageEventStream) catch return error.InvalidConfiguration;
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
 
-    const ctx = allocator.create(ThreadCtx) catch {
-        allocator.free(project);
-        allocator.free(location);
-        allocator.free(api_key);
-        allocator.free(body);
-        allocator.destroy(s);
-        var mut_ctx_in = owned_context;
-        mut_ctx_in.deinit(allocator);
-        var mut_m_in = owned_model;
-        mut_m_in.deinit(allocator);
-        return error.InvalidConfiguration;
-    };
+    const ctx = allocator.create(ThreadCtx) catch return error.InvalidConfiguration;
     errdefer allocator.destroy(ctx);
     ctx.* = .{
         .allocator = allocator,
@@ -1392,11 +1375,7 @@ pub fn streamGoogleVertex(
         .ping_interval_ms = o.ping_interval_ms,
     };
 
-    const th = std.Thread.spawn(.{}, runThread, .{ctx}) catch {
-        ctx.deinit();
-        allocator.destroy(s);
-        return error.InvalidConfiguration;
-    };
+    const th = std.Thread.spawn(.{}, runThread, .{ctx}) catch return error.InvalidConfiguration;
     th.detach();
     return s;
 }

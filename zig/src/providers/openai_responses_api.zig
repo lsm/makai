@@ -1374,15 +1374,37 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
+        .api = allocator.dupe(u8, model.api) catch {
+            allocator.free(auth);
+            allocator.free(url);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
+        .provider = allocator.dupe(u8, model.provider) catch {
+            allocator.free(auth);
+            allocator.free(url);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
+        .model = allocator.dupe(u8, model.id) catch {
+            allocator.free(auth);
+            allocator.free(url);
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom");
+            return;
+        },
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat.time.nowMillis(),
+        .is_owned = true, // Strings were duped above
     };
 
-    // Free ctx allocations before completing
+    // Free ctx allocations before completing (out owns its strings, no UAF)
     allocator.free(auth);
     allocator.free(url);
     ctx.deinit();
