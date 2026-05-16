@@ -651,11 +651,12 @@ fn runLoop(
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
-                    // Free the local copy if owned (state already has clones via setFinalMessage)
-                    if (assistant_message.is_owned) {
-                        var am = assistant_message;
-                        am.deinit(allocator);
-                    }
+                    // NOTE: We intentionally do NOT deinit assistant_message here.
+                    // AgentEventStream.push performs shallow copies, so event consumers
+                    // may read message fields after this branch exits. Deiniting would
+                    // cause use-after-free. The state clones (setFinalMessage/
+                    // appendClonedStateMessage) own independent copies; this local copy
+                    // is kept alive for the event stream lifetime.
                     break :outer;
                 },
                 .stop, .length, .content_filter => {
