@@ -798,7 +798,9 @@ pub const Agent = struct {
 
         // Surface background-loop errors so callers do not receive ok when the
         // agent loop aborted. completeWithError sets err_msg; complete(result)
-        // with an error stop_reason is checked via getResult().
+        // with an error stop_reason is checked via getResult(); a completed
+        // stream with neither result nor error (e.g., OOM in completeWithError)
+        // is also treated as failure.
         if (stream.getError() != null) {
             return error.AgentLoopFailed;
         }
@@ -806,6 +808,8 @@ pub const Agent = struct {
             if (result.final_message.stop_reason == .@"error") {
                 return error.AgentLoopFailed;
             }
+        } else if (stream.isDone()) {
+            return error.AgentLoopFailed;
         }
 
         self._state.is_streaming = false;
