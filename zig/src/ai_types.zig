@@ -631,6 +631,10 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, e))
     else
         OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var em = error_msg;
+        em.deinit(allocator);
+    }
 
     const api = try allocator.dupe(u8, msg.api);
     errdefer allocator.free(api);
