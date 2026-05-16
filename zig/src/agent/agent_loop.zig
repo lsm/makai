@@ -476,7 +476,9 @@ fn streamAssistantResponse(
     // Fallback for providers that don't emit .done (e.g. OpenAI Completions, Anthropic)
     if (final_message == null) {
         if (provider_stream.getResult()) |result| {
-            final_message = try ai_types.cloneAssistantMessage(allocator, result);
+            var cloned = try ai_types.cloneAssistantMessage(allocator, result);
+            errdefer cloned.deinit(allocator);
+            final_message = cloned;
             const msg: ai_types.Message = .{ .assistant = final_message.? };
             try event_stream.push(.{ .message_end = .{
                 .message = msg,
