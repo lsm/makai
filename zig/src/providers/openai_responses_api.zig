@@ -933,7 +933,6 @@ fn runThread(ctx: *ThreadCtx) void {
     }
 
     var next_content_index: usize = 0;
-    var tool_call_count: usize = 0;
     var thinking_started = false;
     var thinking_content_index: ?usize = null;
     var text_content_index: ?usize = null;
@@ -1066,7 +1065,6 @@ fn runThread(ctx: *ThreadCtx) void {
 
                         const content_index = next_content_index;
                         next_content_index += 1;
-                        tool_call_count += 1;
 
                         // Store mapping from item_id to content_index
                         const duped_item_id = allocator.dupe(u8, item_id) catch {
@@ -1285,15 +1283,20 @@ fn runThread(ctx: *ThreadCtx) void {
         usage.cost.total *= tier_multiplier;
     }
 
-    // Build content blocks - thinking first if present, then text, then tool calls
+    // Build content blocks - thinking first if present, then text.
+    // Tool calls are NOT included here: they're emitted via toolcall_end events
+    // during streaming and completed in the tracker; the final AssistantMessage
+    // content slice only carries thinking + text. Sizing the alloc to the actual
+    // number of filled slots prevents uninitialized union entries from being
+    // dereferenced by `deinitAssistantContent` on the OOM cleanup paths below.
     const has_thinking = thinking.items.len > 0;
     const has_text = text.items.len > 0;
-    const content_count: usize = if (has_thinking) 1 else 0;
-    const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0) + tool_call_count;
+    const filled_count: usize = (if (has_thinking) @as(usize, 1) else @as(usize, 0)) +
+        (if (has_text) @as(usize, 1) else @as(usize, 0));
 
     // Build content slice first (single empty text block when no content was streamed).
     var content_slice: []ai_types.AssistantContent = undefined;
-    if (content_count_final == 0) {
+    if (filled_count == 0) {
         content_slice = allocator.alloc(ai_types.AssistantContent, 1) catch {
             allocator.free(auth);
             allocator.free(url);
@@ -1304,7 +1307,7 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         content_slice[0] = .{ .text = .{ .text = "" } };
     } else {
-        content_slice = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
+        content_slice = allocator.alloc(ai_types.AssistantContent, filled_count) catch {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
@@ -1353,9 +1356,7 @@ fn runThread(ctx: *ThreadCtx) void {
             idx += 1;
         }
 
-        // Note: tool calls are already emitted via toolcall_end events during streaming
-        // and completed in the tracker. We don't need to iterate again here since
-        // output_item_done events already handled them.
+        std.debug.assert(idx == filled_count);
     }
 
     // Dupe metadata strings BEFORE composing `out` so a mid-dupe OOM can cascade-free
