@@ -760,37 +760,88 @@ fn runLoop(
 }
 
 /// Thread context for background agent loop execution.
-/// Caller must keep prompts and config data alive until the stream completes.
+///
+/// Lifetime requirements on the caller:
+/// - `prompts` and the strings inside each Message must stay alive until the
+///   stream completes (they are shallow-copied into context.messages).
+/// - `config.model` string fields must stay alive until the stream completes.
+/// - `config.tools` slice and the string fields inside each AgentTool must stay
+///   alive until the stream completes.
+/// - All `config.*_ctx` callback context pointers must stay valid until the
+///   stream completes.
+/// - `api_key` and `session_id` are cloned into owned memory by agentLoop and
+///   freed automatically by the background thread; the caller may free its
+///   copies immediately after the call returns.
 const RunLoopThreadCtx = struct {
     allocator: std.mem.Allocator,
     prompts: ?[]const ai_types.Message,
     context: *AgentContext,
     config: AgentLoopConfig,
     stream: *AgentEventStream,
+    owned_api_key: ?[]u8 = null,
+    owned_session_id: ?[]u8 = null,
 };
 
 /// Background thread entry point for the agent loop.
 fn runLoopThread(ctx: *RunLoopThreadCtx) void {
+    const allocator = ctx.allocator;
     const stream = ctx.stream;
 
-    runLoop(ctx.allocator, ctx.prompts, ctx.context, ctx.config, stream) catch |err| {
+    runLoop(allocator, ctx.prompts, ctx.context, ctx.config, stream) catch |err| {
         stream.completeWithError(@errorName(err));
     };
 
+    if (ctx.owned_api_key) |key| allocator.free(key);
+    if (ctx.owned_session_id) |sid| allocator.free(sid);
+
+    allocator.destroy(ctx);
     stream.markThreadDone();
-    ctx.allocator.destroy(ctx);
+}
+
+/// Clone config string fields that are commonly borrowed by callers.
+fn cloneConfigStrings(
+    allocator: std.mem.Allocator,
+    config: AgentLoopConfig,
+    out_owned_api_key: *?[]u8,
+    out_owned_session_id: *?[]u8,
+) !AgentLoopConfig {
+    var cloned = config;
+    if (config.api_key) |key| {
+        out_owned_api_key.* = try allocator.dupe(u8, key);
+        cloned.api_key = out_owned_api_key.*;
+    }
+    if (config.session_id) |sid| {
+        out_owned_session_id.* = try allocator.dupe(u8, sid);
+        cloned.session_id = out_owned_session_id.*;
+    }
+    return cloned;
 }
 
 /// Start an agent loop with new prompt messages.
 /// Returns an event stream that emits events during execution.
 /// Caller owns the returned stream and must call deinit().
-/// Caller must keep prompts alive until the stream completes.
+///
+/// Lifetime: the caller must keep `prompts` and all borrowed fields inside
+/// `config` alive until the stream completes. Specifically:
+/// - `prompts` messages (shallow-copied into context)
+/// - `config.model` strings
+/// - `config.tools` slice and tool string fields
+/// - `config.*_ctx` callback context pointers
+/// `api_key` and `session_id` are cloned internally and may be freed by the
+/// caller immediately after this call returns.
 pub fn agentLoop(
     allocator: std.mem.Allocator,
     prompts: []const ai_types.Message,
     context: *AgentContext,
     config: AgentLoopConfig,
 ) !*AgentEventStream {
+    var owned_api_key: ?[]u8 = null;
+    var owned_session_id: ?[]u8 = null;
+    const thread_config = cloneConfigStrings(allocator, config, &owned_api_key, &owned_session_id) catch |err| {
+        if (owned_api_key) |key| allocator.free(key);
+        return err;
+    };
+
     const stream = try allocator.create(AgentEventStream);
     errdefer allocator.destroy(stream);
     stream.* = AgentEventStream.init(allocator);
@@ -802,8 +853,10 @@ pub fn agentLoop(
         .allocator = allocator,
         .prompts = prompts,
         .context = context,
-        .config = config,
+        .config = thread_config,
         .stream = stream,
+        .owned_api_key = owned_api_key,
+        .owned_session_id = owned_session_id,
     };
 
     const th = try std.Thread.spawn(.{}, runLoopThread, .{ctx});
@@ -814,11 +867,20 @@ pub fn agentLoop(
 
 /// Continue an agent loop from the current context without adding new messages.
 /// Used for retries - context already has user message or tool results.
+///
+/// Lifetime: same borrowed-field rules as agentLoop apply.
 pub fn agentLoopContinue(
     allocator: std.mem.Allocator,
     context: *AgentContext,
     config: AgentLoopConfig,
 ) !*AgentEventStream {
+    var owned_api_key: ?[]u8 = null;
+    var owned_session_id: ?[]u8 = null;
+    const thread_config = cloneConfigStrings(allocator, config, &owned_api_key, &owned_session_id) catch |err| {
+        if (owned_api_key) |key| allocator.free(key);
+        return err;
+    };
+
     const stream = try allocator.create(AgentEventStream);
     errdefer allocator.destroy(stream);
     stream.* = AgentEventStream.init(allocator);
@@ -830,8 +892,10 @@ pub fn agentLoopContinue(
         .allocator = allocator,
         .prompts = null,
         .context = context,
-        .config = config,
+        .config = thread_config,
         .stream = stream,
+        .owned_api_key = owned_api_key,
+        .owned_session_id = owned_session_id,
     };
 
     const th = try std.Thread.spawn(.{}, runLoopThread, .{ctx});

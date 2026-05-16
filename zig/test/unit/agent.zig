@@ -104,6 +104,13 @@ const MockProtocolState = struct {
     stop_reason: ai_types.StopReason = .stop,
     call_count: usize = 0,
     last_options: ?ProtocolOptions = null,
+
+    pub fn deinit(self: *MockProtocolState, allocator: std.mem.Allocator) void {
+        if (self.last_options) |opts| {
+            if (opts.api_key) |k| allocator.free(k);
+            if (opts.session_id) |s| allocator.free(s);
+        }
+    }
 };
 
 fn createModel() ai_types.Model {
@@ -153,7 +160,15 @@ fn mockProtocolStream(
 
     const state: *MockProtocolState = @ptrCast(@alignCast(ctx));
     state.call_count += 1;
-    state.last_options = options;
+    state.last_options = .{
+        .api_key = if (options.api_key) |k| try allocator.dupe(u8, k) else null,
+        .session_id = if (options.session_id) |s| try allocator.dupe(u8, s) else null,
+        .cancel_token = options.cancel_token,
+        .thinking_budgets = options.thinking_budgets,
+        .max_retry_delay_ms = options.max_retry_delay_ms,
+        .temperature = options.temperature,
+        .max_tokens = options.max_tokens,
+    };
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -365,6 +380,7 @@ test "ProtocolOptions: passed through to protocol client" {
     const allocator = testing.allocator;
 
     var state = MockProtocolState{ .mode = .done, .text = "options" };
+    defer state.deinit(allocator);
 
     var ctx = AgentContext.init(allocator);
     defer ctx.deinit();
