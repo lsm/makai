@@ -737,11 +737,6 @@ pub const Agent = struct {
         else
             try agent_loop.agentLoopContinue(self._allocator, &context, config);
 
-        // agentLoop has successfully copied the prompt payloads into its result
-        // stream. The caller no longer owns the per-message payloads and should
-        // only release the outer slice container.
-        messages.* = null;
-
         defer {
             stream.deinit();
             self._allocator.destroy(stream);
@@ -783,6 +778,13 @@ pub const Agent = struct {
 
             // Emit to listeners
             self.emit(event);
+        }
+
+        // Transfer ownership only if the stream completed successfully.
+        // If runLoop failed before consuming all prompts, the caller retains
+        // ownership and its cleanup path will free them.
+        if (stream.getError() == null) {
+            messages.* = null;
         }
 
         self._state.is_streaming = false;
