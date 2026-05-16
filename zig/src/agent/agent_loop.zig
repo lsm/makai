@@ -473,7 +473,17 @@ fn streamAssistantResponse(
         }
     }
 
-    // Return final message (required to be set by done/error)
+    // Fallback for providers that don't emit .done (e.g. OpenAI Completions, Anthropic)
+    if (final_message == null) {
+        if (provider_stream.getResult()) |result| {
+            final_message = try ai_types.cloneAssistantMessage(allocator, result);
+            const msg: ai_types.Message = .{ .assistant = final_message.? };
+            try event_stream.push(.{ .message_end = .{
+                .message = msg,
+            } });
+        }
+    }
+
     return final_message orelse error.NoFinalMessage;
 }
 
