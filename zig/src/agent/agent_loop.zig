@@ -759,9 +759,32 @@ fn runLoop(
     event_stream.complete(result);
 }
 
+/// Thread context for background agent loop execution.
+/// Caller must keep prompts and config data alive until the stream completes.
+const RunLoopThreadCtx = struct {
+    allocator: std.mem.Allocator,
+    prompts: ?[]const ai_types.Message,
+    context: *AgentContext,
+    config: AgentLoopConfig,
+    stream: *AgentEventStream,
+};
+
+/// Background thread entry point for the agent loop.
+fn runLoopThread(ctx: *RunLoopThreadCtx) void {
+    const stream = ctx.stream;
+
+    runLoop(ctx.allocator, ctx.prompts, ctx.context, ctx.config, stream) catch |err| {
+        stream.completeWithError(@errorName(err));
+    };
+
+    stream.markThreadDone();
+    ctx.allocator.destroy(ctx);
+}
+
 /// Start an agent loop with new prompt messages.
 /// Returns an event stream that emits events during execution.
 /// Caller owns the returned stream and must call deinit().
+/// Caller must keep prompts alive until the stream completes.
 pub fn agentLoop(
     allocator: std.mem.Allocator,
     prompts: []const ai_types.Message,
@@ -769,10 +792,22 @@ pub fn agentLoop(
     config: AgentLoopConfig,
 ) !*AgentEventStream {
     const stream = try allocator.create(AgentEventStream);
+    errdefer allocator.destroy(stream);
     stream.* = AgentEventStream.init(allocator);
+    stream.wait_for_thread_on_deinit = true;
 
-    // Run the loop (in a real implementation, this would be async/threaded)
-    try runLoop(allocator, prompts, context, config, stream);
+    const ctx = try allocator.create(RunLoopThreadCtx);
+    errdefer allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = allocator,
+        .prompts = prompts,
+        .context = context,
+        .config = config,
+        .stream = stream,
+    };
+
+    const th = try std.Thread.spawn(.{}, runLoopThread, .{ctx});
+    th.detach();
 
     return stream;
 }
@@ -785,10 +820,22 @@ pub fn agentLoopContinue(
     config: AgentLoopConfig,
 ) !*AgentEventStream {
     const stream = try allocator.create(AgentEventStream);
+    errdefer allocator.destroy(stream);
     stream.* = AgentEventStream.init(allocator);
+    stream.wait_for_thread_on_deinit = true;
 
-    // Run the loop without initial prompts
-    try runLoop(allocator, null, context, config, stream);
+    const ctx = try allocator.create(RunLoopThreadCtx);
+    errdefer allocator.destroy(ctx);
+    ctx.* = .{
+        .allocator = allocator,
+        .prompts = null,
+        .context = context,
+        .config = config,
+        .stream = stream,
+    };
+
+    const th = try std.Thread.spawn(.{}, runLoopThread, .{ctx});
+    th.detach();
 
     return stream;
 }
