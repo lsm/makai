@@ -651,6 +651,11 @@ fn runLoop(
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
+                    // Free the local copy if owned (state already has clones via setFinalMessage)
+                    if (assistant_message.is_owned) {
+                        var am = assistant_message;
+                        am.deinit(allocator);
+                    }
                     break :outer;
                 },
                 .stop, .length, .content_filter => {
