@@ -1760,7 +1760,10 @@ fn runThread(ctx: *ThreadCtx) void {
         .is_owned = true, // Strings were duped above
     };
 
-    stream.push(.{ .done = .{ .reason = stop_reason, .message = out } }) catch {};
+    // Do NOT push a .done event here — the same AssistantMessage would be
+    // referenced by both the event and complete(), causing a double-free when
+    // the consumer deinits either one. OpenAI Completions uses the same
+    // pattern (complete() only, no preceding .done event).
 
     // Free ctx allocations before completing
     ctx.deinit();
