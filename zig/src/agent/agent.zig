@@ -687,6 +687,10 @@ pub const Agent = struct {
         var cancelled = std.atomic.Value(bool).init(false);
         self._cancel_token = .{ .cancelled = &cancelled };
         self._state.is_streaming = true;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
         self._state.stream_message = null;
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
