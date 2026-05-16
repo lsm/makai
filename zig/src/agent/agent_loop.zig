@@ -473,7 +473,19 @@ fn streamAssistantResponse(
         }
     }
 
-    // Return final message (required to be set by done/error)
+    // Fallback for providers that don't emit .done (e.g. OpenAI Completions, Anthropic)
+    if (final_message == null) {
+        if (provider_stream.getResult()) |result| {
+            var cloned = try ai_types.cloneAssistantMessage(allocator, result);
+            errdefer cloned.deinit(allocator);
+            final_message = cloned;
+            const msg: ai_types.Message = .{ .assistant = final_message.? };
+            try event_stream.push(.{ .message_end = .{
+                .message = msg,
+            } });
+        }
+    }
+
     return final_message orelse error.NoFinalMessage;
 }
 
@@ -639,6 +651,12 @@ fn runLoop(
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
+                    // NOTE: We intentionally do NOT deinit assistant_message here.
+                    // AgentEventStream.push performs shallow copies, so event consumers
+                    // may read message fields after this branch exits. Deiniting would
+                    // cause use-after-free. The state clones (setFinalMessage/
+                    // appendClonedStateMessage) own independent copies; this local copy
+                    // is kept alive for the event stream lifetime.
                     break :outer;
                 },
                 .stop, .length, .content_filter => {

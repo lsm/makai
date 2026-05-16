@@ -890,6 +890,15 @@ test "processEnvelope routes events to per-stream event stream" {
     const e2 = s2.poll();
     try std.testing.expect(e1 != null and e1.? == .start);
     try std.testing.expect(e2 != null and e2.? == .start);
+
+    if (e1) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
+    if (e2) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
 }
 
 test "processEnvelope handles ack" {
@@ -1001,6 +1010,11 @@ test "processEnvelope handles events" {
     const evt = client.event_stream.poll();
     try std.testing.expect(evt != null);
     try std.testing.expect(evt.? == .start);
+
+    if (evt) |ev| {
+        var mutable_ev = ev;
+        ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
+    }
 
     env.deinit(allocator);
 }

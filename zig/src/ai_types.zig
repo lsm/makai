@@ -631,16 +631,28 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         OwnedSlice(u8).initOwned(try allocator.dupe(u8, e))
     else
         OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var em = error_msg;
+        em.deinit(allocator);
+    }
+
+    const api = try allocator.dupe(u8, msg.api);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, msg.provider);
+    errdefer allocator.free(provider);
+    const model_str = try allocator.dupe(u8, msg.model);
+    errdefer allocator.free(model_str);
 
     return .{
         .content = content,
-        .api = msg.api, // Borrowed reference, not owned
-        .provider = msg.provider, // Borrowed reference, not owned
-        .model = msg.model, // Borrowed reference, not owned
+        .api = api,
+        .provider = provider,
+        .model = model_str,
         .usage = msg.usage,
         .stop_reason = msg.stop_reason,
         .error_message = error_msg,
         .timestamp = msg.timestamp,
+        .is_owned = true,
     };
 }
 
