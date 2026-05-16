@@ -841,6 +841,10 @@ pub fn agentLoop(
         if (owned_api_key) |key| allocator.free(key);
         return err;
     };
+    errdefer {
+        if (owned_api_key) |key| allocator.free(key);
+        if (owned_session_id) |sid| allocator.free(sid);
+    }
 
     const stream = try allocator.create(AgentEventStream);
     errdefer allocator.destroy(stream);
@@ -880,6 +884,10 @@ pub fn agentLoopContinue(
         if (owned_api_key) |key| allocator.free(key);
         return err;
     };
+    errdefer {
+        if (owned_api_key) |key| allocator.free(key);
+        if (owned_session_id) |sid| allocator.free(sid);
+    }
 
     const stream = try allocator.create(AgentEventStream);
     errdefer allocator.destroy(stream);
