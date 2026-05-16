@@ -687,6 +687,10 @@ pub const Agent = struct {
         var cancelled = std.atomic.Value(bool).init(false);
         self._cancel_token = .{ .cancelled = &cancelled };
         self._state.is_streaming = true;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
         self._state.stream_message = null;
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
@@ -731,16 +735,15 @@ pub const Agent = struct {
             .get_api_key_ctx = self._get_api_key_ctx,
         };
 
+        // Track how many messages context has before the loop so we can tell
+        // whether any prompts were actually consumed.
+        const initial_message_count = context.messages.items.len;
+
         // Run loop
         const stream = if (messages.*) |msgs|
             try agent_loop.agentLoop(self._allocator, msgs, &context, config)
         else
             try agent_loop.agentLoopContinue(self._allocator, &context, config);
-
-        // agentLoop has successfully copied the prompt payloads into its result
-        // stream. The caller no longer owns the per-message payloads and should
-        // only release the outer slice container.
-        messages.* = null;
 
         defer {
             stream.deinit();
@@ -783,6 +786,30 @@ pub const Agent = struct {
 
             // Emit to listeners
             self.emit(event);
+        }
+
+        // Transfer ownership if any prompts were actually consumed (appended to
+        // context). This avoids a double-free when consumed prompts were
+        // shallow-copied into context, while still letting the caller clean up
+        // unconsumed prompts on early failure.
+        if (context.messages.items.len > initial_message_count) {
+            messages.* = null;
+        }
+
+        // Surface background-loop errors so callers do not receive ok when the
+        // agent loop aborted. completeWithError sets err_msg; complete(result)
+        // with an error stop_reason is checked via getResult(); a completed
+        // stream with neither result nor error (e.g., OOM in completeWithError)
+        // is also treated as failure.
+        if (stream.getError() != null) {
+            return error.AgentLoopFailed;
+        }
+        if (stream.getResult()) |result| {
+            if (result.final_message.stop_reason == .@"error") {
+                return error.AgentLoopFailed;
+            }
+        } else if (stream.isDone()) {
+            return error.AgentLoopFailed;
         }
 
         self._state.is_streaming = false;
