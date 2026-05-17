@@ -134,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum makai-* > SHA256SUMS.txt
+          sha256sum makai-*.tar.gz makai-*.zip > SHA256SUMS.txt
 
       - name: Upload checksums
         uses: actions/upload-artifact@v4
@@ -183,7 +183,7 @@ jobs:
         run: |
           set -euo pipefail
           TAG_VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$TAG_VERSION" --no-git-tag-version
+          npm version "$TAG_VERSION" --no-git-tag-version --allow-same-version
 
       - name: Build TypeScript SDK
         run: npm run build:sdk
