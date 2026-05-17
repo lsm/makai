@@ -23,7 +23,7 @@ const PLATFORMS = [
   { target: "darwin-x64", os: "darwin", cpu: "x64", binary: "makai-darwin-x64" },
   { target: "linux-arm64", os: "linux", cpu: "arm64", binary: "makai-linux-arm64" },
   { target: "linux-x64", os: "linux", cpu: "x64", binary: "makai-linux-x64" },
-  { target: "win32-x64", os: "win32", cpu: "x64", binary: "makai.exe" },
+  { target: "win32-x64", os: "win32", cpu: "x64", binary: "makai-win32-x64" },
 ];
 
 console.log(`Packaging npm packages (version ${VERSION})...\n`);
@@ -38,14 +38,12 @@ for (const { target, os, cpu, binary } of PLATFORMS) {
   const srcBinary = join(BIN_DIR, binary);
   const destBinary = join(binDir, os === "win32" ? "makai.exe" : "makai");
 
-  try {
-    copyFileSync(srcBinary, destBinary);
-    if (os !== "win32") {
-      chmodSync(destBinary, 0o755);
-    }
-  } catch {
-    console.warn(`  Warning: Binary not found: ${srcBinary} (skipping ${pkgName})`);
-    continue;
+  if (!require("fs").existsSync(srcBinary)) {
+    throw new Error(`Binary not found: ${srcBinary} (required for ${pkgName})`);
+  }
+  copyFileSync(srcBinary, destBinary);
+  if (os !== "win32") {
+    chmodSync(destBinary, 0o755);
   }
 
   writeFileSync(
@@ -88,8 +86,16 @@ mkdirSync(destSrcDir, { recursive: true });
 
 // Read existing package.json and update for packaging
 const mainPkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
+mainPkg.version = VERSION;
 mainPkg.bin = { makai: "makai.js" };
 mainPkg.files = ["dist/src/", "makai.js", "README.md"];
+if (mainPkg.optionalDependencies) {
+  for (const dep of Object.keys(mainPkg.optionalDependencies)) {
+    if (dep.startsWith("@makai/cli-")) {
+      mainPkg.optionalDependencies[dep] = VERSION;
+    }
+  }
+}
 
 writeFileSync(
   join(mainDir, "package.json"),

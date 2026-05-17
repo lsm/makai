@@ -104,11 +104,19 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Stage binary for npm packaging
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist-npm-upload"
+          cp "$GITHUB_WORKSPACE/dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}" \
+             "$GITHUB_WORKSPACE/dist-npm-upload/makai-${{ matrix.npm_target }}"
+
       - name: Upload binary for npm packaging
         uses: actions/upload-artifact@v4
         with:
           name: npm-binary-${{ matrix.npm_target }}
-          path: dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}
+          path: dist-npm-upload/makai-${{ matrix.npm_target }}
           if-no-files-found: error
 
   checksums:
