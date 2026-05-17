@@ -19,10 +19,21 @@
   "author": "makai contributors",
   "license": "ISC",
   "type": "commonjs",
+  "bin": {
+    "makai": "bin/makai.js"
+  },
   "files": [
     "dist/src/**/*",
+    "bin/makai.js",
     "README.md"
   ],
+  "optionalDependencies": {
+    "@makai/cli-darwin-arm64": "0.1.0",
+    "@makai/cli-darwin-x64": "0.1.0",
+    "@makai/cli-linux-arm64": "0.1.0",
+    "@makai/cli-linux-x64": "0.1.0",
+    "@makai/cli-win32-x64": "0.1.0"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3"

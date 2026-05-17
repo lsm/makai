@@ -23,30 +23,35 @@ jobs:
             arch_name: arm64
             archive: tar.gz
             binary_name: makai
+            npm_target: darwin-arm64
           - runner: macos-latest
             target: x86_64-macos
             os_name: macos
             arch_name: x64
             archive: tar.gz
             binary_name: makai
+            npm_target: darwin-x64
           - runner: ubuntu-latest
             target: aarch64-linux
             os_name: linux
             arch_name: arm64
             archive: tar.gz
             binary_name: makai
+            npm_target: linux-arm64
           - runner: ubuntu-latest
             target: x86_64-linux
             os_name: linux
             arch_name: x64
             archive: tar.gz
             binary_name: makai
+            npm_target: linux-x64
           - runner: windows-latest
             target: x86_64-windows
             os_name: windows
             arch_name: x64
             archive: zip
             binary_name: makai.exe
+            npm_target: win32-x64
 
     steps:
       - name: Checkout code
@@ -99,6 +104,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+      - name: Upload binary for npm packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-binary-${{ matrix.npm_target }}
+          path: dist-root/${{ matrix.os_name }}-${{ matrix.arch_name }}/bin/${{ matrix.binary_name }}
+          if-no-files-found: error
+
   checksums:
     name: Generate checksums
     runs-on: ubuntu-latest
@@ -142,11 +154,11 @@ jobs:
             dist/makai-*.zip
             dist/SHA256SUMS.txt
 
-  publish-npm:
-    name: Publish npm package
+  package-npm:
+    name: Package npm platforms
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [checksums]
+    needs: [build-binaries]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -155,21 +167,101 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/bin
+          pattern: npm-binary-*
+          merge-multiple: true
 
-      - name: Build TypeScript SDK
-        run: npm run build:sdk
+      - name: Move binaries to expected locations
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bin-flat
+          for f in dist/bin/*; do
+            binary=$(basename "$f")
+            mv "$f" "dist/bin-flat/$binary"
+            chmod +x "dist/bin-flat/$binary" 2>/dev/null || true
+          done
+          rm -rf dist/bin
+          mv dist/bin-flat dist/bin
 
-      - name: Align package version with tag
+      - name: Package npm packages
+        run: npx tsx scripts/package-npm.ts --version "${GITHUB_REF_NAME#v}"
+
+      - name: Align main package version with tag
         run: |
           set -euo pipefail
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           npm version "$TAG_VERSION" --no-git-tag-version
 
-      - name: Publish package
-        run: npm publish --access public
+      - name: Upload npm packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm/
+          if-no-files-found: error
+
+  publish-npm:
+    name: Publish npm packages
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [package-npm]
+    steps:
+      - name: Download npm packages
+        uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish platform packages
+        run: |
+          set -euo pipefail
+          FAILED=0
+          for pkg in dist/npm/cli-*; do
+            PKG_NAME=$(basename "$pkg")
+            echo "Publishing $PKG_NAME..."
+            if OUTPUT=$(cd "$pkg" && npm publish --access public 2>&1); then
+              echo "$OUTPUT"
+              echo "$PKG_NAME published successfully"
+            else
+              echo "$OUTPUT"
+              if echo "$OUTPUT" | grep -qiE "previously published|cannot publish over|EPUBLISHCONFLICT"; then
+                echo "::warning::$PKG_NAME already published, skipping"
+              else
+                echo "::error::Failed to publish $PKG_NAME"
+                FAILED=1
+              fi
+            fi
+          done
+          if [ "$FAILED" -eq 1 ]; then
+            echo "One or more platform packages failed to publish"
+            exit 1
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Publish main package
+        run: |
+          set -euo pipefail
+          if OUTPUT=$(cd dist/npm/makai && npm publish --access public 2>&1); then
+            echo "$OUTPUT"
+            echo "makai published successfully"
+          else
+            echo "$OUTPUT"
+            if echo "$OUTPUT" | grep -qiE "previously published|cannot publish over|EPUBLISHCONFLICT"; then
+              echo "::warning::makai already published, skipping"
+            else
+              echo "::error::Failed to publish makai"
+              exit 1
+            fi
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
