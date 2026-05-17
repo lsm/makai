@@ -29,7 +29,8 @@ if (!packageName) {
 
 let binaryPath;
 try {
-  binaryPath = require.resolve(`${packageName}/bin/makai`);
+  const binaryName = process.platform === "win32" ? "makai.exe" : "makai";
+  binaryPath = require.resolve(`${packageName}/bin/${binaryName}`);
 } catch {
   console.error(
     `Error: Could not find Makai binary for ${platformKey}.\n` +
