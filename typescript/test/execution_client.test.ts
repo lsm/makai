@@ -13,6 +13,7 @@ import {
   MakaiStreamError,
   type AgentStreamEvent,
   type ProviderStreamEvent,
+  type StdioFrame,
 } from "../src";
 
 const sourceFixturesDir = path.resolve(__dirname, "../../typescript/test/fixtures");
@@ -226,6 +227,64 @@ test("client.agent.run resolves with correct AgentRunResponse", async () => {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("client.agent.run executes tool_execute frames and continues awaiting result", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "tool_execute",
+        session_id: "testNanoIdSess1234567",
+        message_id: "tool-request-1",
+        sequence: 3,
+        payload: { tool_call_id: "call-1", tool_name: "sum", args_json: "{\"a\":2,\"b\":3}" },
+      },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            messages: [{
+              role: "assistant",
+              content: "done",
+              usage: { input: 1, output: 1 },
+              provider: "anthropic",
+              api: "anthropic-messages",
+              model: "claude-sonnet-4-5",
+              stop_reason: "end_turn",
+            }],
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  const result = await agent.run({
+    ...request(),
+    tools: [{
+      name: "sum",
+      description: "sum numbers",
+      parameters_schema_json: "{}",
+      execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
+    }],
+  });
+
+  const toolResult = transport.sent.find((frame) => frame.type === "tool_result");
+  assert.equal(toolResult?.session_id, "testNanoIdSess1234567");
+  assert.equal(toolResult?.in_reply_to, "tool-request-1");
+  assert.deepEqual(toolResult?.payload, {
+    tool_call_id: "call-1",
+    result_json: JSON.stringify([{ type: "text", text: "sum=5" }]),
+    is_error: false,
+  });
+  assert.equal(result.message.content, "done");
 });
 
 test("agent.run timeout includes actionable diagnostics", async () => {

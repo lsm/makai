@@ -174,6 +174,61 @@ test("agent stream parses event_type encoded lifecycle events", async () => {
   assert.deepEqual(events.at(-1), { type: "agent_end", stop_reason: "end_turn" });
 });
 
+test("agent stream executes tool_execute frames and sends tool_result", async () => {
+  const transport = new ScriptedTransport([
+    { type: "agent_started", payload: {} },
+    {
+      type: "tool_execute",
+      message_id: "tool-request-1",
+      sequence: 3,
+      payload: { tool_call_id: "call-1", tool_name: "sum", args_json: "{\"a\":2,\"b\":3}" },
+    },
+    { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+  ]);
+
+  const events = await collect(createMakaiAgentApi(transport as never).stream({
+    ...REQUEST,
+    tools: [{
+      name: "sum",
+      description: "sum numbers",
+      parameters_schema_json: "{}",
+      execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
+    }],
+  }));
+
+  const toolResult = transport.sent.find((frame) => frame.type === "tool_result");
+  assert.equal(toolResult?.session_id, transport.sent[0]?.session_id);
+  assert.equal(toolResult?.in_reply_to, "tool-request-1");
+  assert.equal(toolResult?.sequence, 4);
+  assert.deepEqual(toolResult?.payload, {
+    tool_call_id: "call-1",
+    result_json: JSON.stringify([{ type: "text", text: "sum=5" }]),
+    is_error: false,
+  });
+  assert.equal(events.at(-1)?.type, "agent_end");
+});
+
+test("agent stream returns tool error for non-executable tool_execute frames", async () => {
+  const transport = new ScriptedTransport([
+    { type: "agent_started", payload: {} },
+    {
+      type: "tool_execute",
+      message_id: "tool-request-1",
+      sequence: 3,
+      payload: { tool_call_id: "call-1", tool_name: "missing", args_json: "{}" },
+    },
+    { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+  ]);
+
+  await collect(createMakaiAgentApi(transport as never).stream(REQUEST));
+  const toolResult = transport.sent.find((frame) => frame.type === "tool_result");
+  assert.deepEqual(toolResult?.payload, {
+    tool_call_id: "call-1",
+    result_json: JSON.stringify([{ type: "text", text: "Tool 'missing' is not executable by this client" }]),
+    is_error: true,
+  });
+});
+
 test("agent stream auth_required error retries before synthetic agent_start", async () => {
   const attempts: StdioFrame[][] = [
     [

@@ -84,6 +84,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters_schema_json: string;
+  execute?: (args: Record<string, unknown>, context: { tool_call_id: string; tool_name: string; args_json: string }) => Promise<string | TextContentPart[]> | string | TextContentPart[];
 }
 
 /** Optional execution controls shared by agent and provider requests. */
