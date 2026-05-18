@@ -245,6 +245,7 @@ pub const AgentProtocolServer = struct {
             return try self.makeError(env.session_id, env.message_id, .invalid_request, "invalid sequence");
         }
 
+        const stop_sequence = self.nextOutgoingSequence(req.session_id);
         const removed = self.sessions.fetchRemove(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
@@ -259,7 +260,7 @@ pub const AgentProtocolServer = struct {
         return .{
             .session_id = req.session_id,
             .message_id = agent_types.generateUlid(),
-            .sequence = env.sequence,
+            .sequence = stop_sequence,
             .in_reply_to = env.message_id,
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_stopped = .{
@@ -830,6 +831,49 @@ test "AgentProtocolServer start message status stop" {
     var stop_resp = (try server.handleEnvelope(stop)).?;
     defer stop_resp.deinit(allocator);
     try std.testing.expect(stop_resp.payload == .agent_stopped);
+}
+
+test "AgentProtocolServer uses outgoing sequence for stop after published events" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    var start = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = sid,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer start.deinit(allocator);
+
+    var start_resp = (try server.handleEnvelope(start)).?;
+    defer start_resp.deinit(allocator);
+    try std.testing.expect(start_resp.payload == .agent_started);
+    try std.testing.expectEqual(@as(u64, 1), start_resp.sequence);
+
+    try server.publishAgentEvent(sid, "{}");
+    var event = server.popOutbound().?;
+    defer event.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), event.sequence);
+
+    var stop = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stop = .{ .session_id = sid } },
+    };
+    defer stop.deinit(allocator);
+
+    var stop_resp = (try server.handleEnvelope(stop)).?;
+    defer stop_resp.deinit(allocator);
+    try std.testing.expect(stop_resp.payload == .agent_stopped);
+    try std.testing.expectEqual(@as(u64, 3), stop_resp.sequence);
 }
 
 test "AgentProtocolServer rejects out-of-order stop without removing session" {
