@@ -263,7 +263,9 @@ test("agent.run rejects when signal is aborted during frame wait", async () => {
   // The agent_start and the agent_stop cancel should have been sent.
   assert.equal(transport.sent.length, 2);
   assert.equal(transport.sent[0]?.type, "agent_start");
+  assert.equal(transport.sent[0]?.sequence, 1);
   assert.equal(transport.sent[1]?.type, "agent_stop");
+  assert.equal(transport.sent[1]?.sequence, 2);
   transport.rejectAll();
   await flushMicrotasks();
 });
@@ -310,6 +312,8 @@ test("agent.stream stops iteration when signal is aborted during streaming", asy
       error instanceof Error && error.name === "AbortError",
   );
   assert.ok(events.length >= 1, "expected at least one event before abort");
+  assert.deepEqual(transport.sent.map((frame) => frame.type), ["agent_start", "agent_message", "agent_stop"]);
+  assert.deepEqual(transport.sent.map((frame) => frame.sequence), [1, 2, 3]);
   transport.rejectAll();
   await flushMicrotasks();
 });
