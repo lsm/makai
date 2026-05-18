@@ -16,6 +16,194 @@ pub const AgentToolResult = types.AgentToolResult;
 pub const ProtocolClient = types.ProtocolClient;
 pub const ProtocolOptions = types.ProtocolOptions;
 
+const ByteTokenEstimate = struct {
+    bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+};
+
+const ToolResultUsage = struct {
+    result_bytes: u64 = 0,
+    details_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    artifact_count: u32 = 0,
+};
+
+const ContextUsage = struct {
+    system_prompt: ByteTokenEstimate = .{},
+    messages: ByteTokenEstimate = .{},
+    tools: ByteTokenEstimate = .{},
+
+    fn totalBytes(self: ContextUsage) u64 {
+        return self.system_prompt.bytes + self.messages.bytes + self.tools.bytes;
+    }
+
+    fn totalEstimatedTokens(self: ContextUsage) u64 {
+        return self.system_prompt.estimated_tokens + self.messages.estimated_tokens + self.tools.estimated_tokens;
+    }
+};
+
+fn estimateTextTokens(len: usize) u64 {
+    if (len == 0) return 0;
+    return @intCast((len + 3) / 4);
+}
+
+fn addText(est: *ByteTokenEstimate, text: []const u8) void {
+    est.bytes += text.len;
+    est.estimated_tokens += estimateTextTokens(text.len);
+}
+
+fn addImage(est: *ByteTokenEstimate, image: ai_types.ImageContent) void {
+    est.bytes += image.data.len + image.mime_type.len;
+    est.estimated_tokens += 850;
+}
+
+fn estimateUserContentPart(part: ai_types.UserContentPart) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{};
+    switch (part) {
+        .text => |text| addText(&est, text.text),
+        .image => |image| addImage(&est, image),
+    }
+    return est;
+}
+
+fn estimateUserContentParts(parts: []const ai_types.UserContentPart) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{};
+    for (parts) |part| {
+        const part_est = estimateUserContentPart(part);
+        est.bytes += part_est.bytes;
+        est.estimated_tokens += part_est.estimated_tokens;
+    }
+    return est;
+}
+
+fn estimateAssistantContent(block: ai_types.AssistantContent) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{};
+    switch (block) {
+        .text => |text| addText(&est, text.text),
+        .thinking => |thinking| addText(&est, thinking.thinking),
+        .image => |image| addImage(&est, image),
+        .tool_call => |tool_call| {
+            addText(&est, tool_call.id);
+            addText(&est, tool_call.name);
+            addText(&est, tool_call.arguments_json);
+            est.estimated_tokens += 50;
+        },
+    }
+    return est;
+}
+
+fn estimateMessage(message: ai_types.Message) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{ .estimated_tokens = 5 };
+    switch (message) {
+        .user => |user| switch (user.content) {
+            .text => |text| addText(&est, text),
+            .parts => |parts| {
+                const parts_est = estimateUserContentParts(parts);
+                est.bytes += parts_est.bytes;
+                est.estimated_tokens += parts_est.estimated_tokens;
+            },
+        },
+        .assistant => |assistant| {
+            for (assistant.content) |block| {
+                const block_est = estimateAssistantContent(block);
+                est.bytes += block_est.bytes;
+                est.estimated_tokens += block_est.estimated_tokens;
+            }
+        },
+        .tool_result => |tool_result| {
+            addText(&est, tool_result.tool_call_id);
+            addText(&est, tool_result.tool_name);
+            const parts_est = estimateUserContentParts(tool_result.content);
+            est.bytes += parts_est.bytes;
+            est.estimated_tokens += parts_est.estimated_tokens;
+            if (tool_result.getDetailsJson()) |details| addText(&est, details);
+        },
+    }
+    return est;
+}
+
+fn estimateMessages(messages: []const ai_types.Message) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{};
+    for (messages) |message| {
+        const msg_est = estimateMessage(message);
+        est.bytes += msg_est.bytes;
+        est.estimated_tokens += msg_est.estimated_tokens;
+    }
+    return est;
+}
+
+fn estimateToolDefinitions(tools: ?[]const ai_types.Tool) ByteTokenEstimate {
+    var est: ByteTokenEstimate = .{};
+    const defs = tools orelse return est;
+    for (defs) |tool| {
+        addText(&est, tool.name);
+        addText(&est, tool.description);
+        addText(&est, tool.parameters_schema_json);
+        est.estimated_tokens += 12;
+    }
+    return est;
+}
+
+fn estimateContextUsage(context: ai_types.Context) ContextUsage {
+    const system_prompt = context.getSystemPrompt() orelse "";
+    return .{
+        .system_prompt = .{
+            .bytes = system_prompt.len,
+            .estimated_tokens = estimateTextTokens(system_prompt.len),
+        },
+        .messages = estimateMessages(context.messages),
+        .tools = estimateToolDefinitions(context.tools),
+    };
+}
+
+fn emitContextUsage(event_stream: *AgentEventStream, context: ai_types.Context) !void {
+    const usage = estimateContextUsage(context);
+    const system_prompt: []const u8 = context.getSystemPrompt() orelse "";
+    try event_stream.push(.{ .prompt_segment_usage = .{
+        .segment = .system_prompt,
+        .cache_role = .stable,
+        .bytes = usage.system_prompt.bytes,
+        .estimated_tokens = usage.system_prompt.estimated_tokens,
+        .item_count = if (system_prompt.len > 0) 1 else 0,
+    } });
+    try event_stream.push(.{ .prompt_segment_usage = .{
+        .segment = .tool_definitions,
+        .cache_role = .stable,
+        .bytes = usage.tools.bytes,
+        .estimated_tokens = usage.tools.estimated_tokens,
+        .item_count = if (context.tools) |tools| @intCast(tools.len) else 0,
+    } });
+    try event_stream.push(.{ .prompt_segment_usage = .{
+        .segment = .message_history,
+        .cache_role = .dynamic,
+        .bytes = usage.messages.bytes,
+        .estimated_tokens = usage.messages.estimated_tokens,
+        .item_count = @intCast(context.messages.len),
+    } });
+    try event_stream.push(.{ .context_usage = .{
+        .system_prompt_bytes = usage.system_prompt.bytes,
+        .message_bytes = usage.messages.bytes,
+        .tool_definition_bytes = usage.tools.bytes,
+        .total_bytes = usage.totalBytes(),
+        .estimated_tokens = usage.totalEstimatedTokens(),
+        .message_count = @intCast(context.messages.len),
+        .tool_count = if (context.tools) |tools| @intCast(tools.len) else 0,
+    } });
+}
+
+fn measureToolResult(result: AgentToolResult) ToolResultUsage {
+    const content = estimateUserContentParts(result.content.slice());
+    const details_bytes: u64 = if (result.getDetailsJson()) |details| details.len else 0;
+    return .{
+        .result_bytes = content.bytes,
+        .details_bytes = details_bytes,
+        .total_bytes = content.bytes + details_bytes,
+        .estimated_tokens = content.estimated_tokens + estimateTextTokens(@intCast(details_bytes)),
+        .artifact_count = @intCast(result.artifacts.slice().len),
+    };
+}
+
 /// Build tool definitions array for LLM request
 fn buildToolsArray(
     allocator: std.mem.Allocator,
@@ -90,12 +278,22 @@ fn createToolResultMessage(
             ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, details))
     else
         ai_types.OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = details_json;
+        mutable.deinit(allocator);
+    }
+
+    const artifacts = if (result.artifacts.is_owned)
+        ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(@constCast(result.artifacts.slice()))
+    else
+        ai_types.OwnedSlice(ai_types.ArtifactReference).initBorrowed(result.artifacts.slice());
 
     return .{
         .tool_call_id = try allocator.dupe(u8, tool_call.id),
         .tool_name = try allocator.dupe(u8, tool_call.name),
         .content = result.content.slice(),
         .details_json = details_json,
+        .artifacts = artifacts,
         .is_error = is_error,
         .timestamp = compat.time.nowMillis(),
     };
@@ -162,6 +360,55 @@ fn skipToolCall(
     };
 }
 
+fn finalizeToolExecution(
+    allocator: std.mem.Allocator,
+    config: AgentLoopConfig,
+    event_stream: *AgentEventStream,
+    results: *std.ArrayList(ai_types.ToolResultMessage),
+    tool_call: ai_types.ToolCall,
+    args_json: []const u8,
+    result: *AgentToolResult,
+    is_error: bool,
+) !void {
+    const raw_usage = measureToolResult(result.*);
+
+    if (config.tool_output_middleware_fn) |middleware| {
+        try middleware(config.tool_output_middleware_ctx, .{
+            .tool_call_id = tool_call.id,
+            .tool_name = tool_call.name,
+            .args_json = args_json,
+            .is_error = is_error,
+            .raw_result_bytes = raw_usage.result_bytes,
+            .raw_details_bytes = raw_usage.details_bytes,
+            .raw_total_bytes = raw_usage.total_bytes,
+        }, result, allocator);
+    }
+
+    const returned_usage = measureToolResult(result.*);
+    const result_json = result.getDetailsJson() orelse "null";
+    const args_bytes: u64 = @intCast(args_json.len);
+
+    try event_stream.push(.{ .tool_execution_end = .{
+        .tool_call_id = tool_call.id,
+        .tool_name = tool_call.name,
+        .result_json = result_json,
+        .is_error = is_error,
+        .args_bytes = args_bytes,
+        .raw_result_bytes = raw_usage.result_bytes,
+        .returned_result_bytes = returned_usage.result_bytes,
+        .raw_details_bytes = raw_usage.details_bytes,
+        .returned_details_bytes = returned_usage.details_bytes,
+        .raw_total_bytes = raw_usage.total_bytes + args_bytes,
+        .returned_total_bytes = returned_usage.total_bytes + args_bytes,
+        .estimated_returned_tokens = returned_usage.estimated_tokens + estimateTextTokens(args_json.len),
+        .artifact_count = returned_usage.artifact_count,
+        .artifacts = result.artifacts.slice(),
+    } });
+
+    const tool_result_msg = try createToolResultMessage(allocator, tool_call, result.*, is_error);
+    try results.append(allocator, tool_result_msg);
+}
+
 /// Result from tool execution phase
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
@@ -215,24 +462,17 @@ fn executeToolCalls(
 
         var result: AgentToolResult = undefined;
         var is_error = false;
+        var execution_args = tool_call.arguments_json;
 
         if (tool) |t| {
             // Validate tool arguments against schema
             const validated_args = validateToolArguments(allocator, t, tool_call.arguments_json) catch |err| {
                 result = try createErrorResult(allocator, err);
                 is_error = true;
-                // Still need to emit end event even on validation error
-                const result_json = result.getDetailsJson() orelse "null";
-                try event_stream.push(.{ .tool_execution_end = .{
-                    .tool_call_id = tool_call.id,
-                    .tool_name = tool_call.name,
-                    .result_json = result_json,
-                    .is_error = is_error,
-                } });
-                const tool_result_msg = try createToolResultMessage(allocator, tool_call, result, is_error);
-                try results.append(allocator, tool_result_msg);
+                try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                 continue;
             };
+            execution_args = validated_args;
 
             // Create context for tool update callback
             var update_ctx = ToolUpdateContext{
@@ -278,20 +518,7 @@ fn executeToolCalls(
             is_error = true;
         }
 
-        // Build result JSON for event
-        const result_json = result.getDetailsJson() orelse "null";
-
-        // Emit end event
-        try event_stream.push(.{ .tool_execution_end = .{
-            .tool_call_id = tool_call.id,
-            .tool_name = tool_call.name,
-            .result_json = result_json,
-            .is_error = is_error,
-        } });
-
-        // Create tool result message
-        const tool_result_msg = try createToolResultMessage(allocator, tool_call, result, is_error);
-        try results.append(allocator, tool_result_msg);
+        try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
 
         // Check for steering messages - skip remaining tools if any
         if (config.get_steering_messages_fn) |get_steering| {
@@ -361,6 +588,7 @@ fn streamAssistantResponse(
         .tools = tools,
         .is_owned = false,
     };
+    try emitContextUsage(event_stream, llm_context);
 
     // Build protocol options
     const options = ProtocolOptions{
@@ -995,6 +1223,115 @@ test "createErrorResult creates valid result" {
     try std.testing.expect(result.content.slice()[0] == .text);
 }
 
+fn mockContextUsageStream(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_module.AssistantMessageEventStream {
+    _ = ctx;
+    _ = model;
+    _ = context;
+    _ = options;
+
+    const stream = try allocator.create(event_stream_module.AssistantMessageEventStream);
+    stream.* = event_stream_module.AssistantMessageEventStream.init(allocator);
+
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    stream.complete(.{
+        .content = content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    });
+
+    return stream;
+}
+
+test "streamAssistantResponse emits context and prompt segment usage" {
+    const allocator = std.testing.allocator;
+
+    var context = AgentContext.init(allocator);
+    defer context.deinit();
+    context.system_prompt = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "stable system prompt"));
+
+    const user_text = try allocator.dupe(u8, "dynamic user prompt");
+    try context.appendMessage(.{ .user = .{
+        .content = .{ .text = user_text },
+        .timestamp = 0,
+    } });
+
+    const tools = [_]AgentTool{.{
+        .label = "Search",
+        .name = "search",
+        .description = "Search indexed artifacts",
+        .parameters_schema_json = "{\"type\":\"object\"}",
+        .execute = undefined,
+    }};
+    context.tools = &tools;
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var final = try streamAssistantResponse(
+        allocator,
+        &context,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = mockContextUsageStream },
+        },
+        &agent_events,
+    );
+    defer final.deinit(allocator);
+
+    var saw_context_usage = false;
+    var segment_count: usize = 0;
+    while (agent_events.poll()) |evt| {
+        switch (evt) {
+            .context_usage => |usage| {
+                saw_context_usage = true;
+                try std.testing.expectEqual(@as(u32, 1), usage.message_count);
+                try std.testing.expectEqual(@as(u32, 1), usage.tool_count);
+                try std.testing.expect(usage.system_prompt_bytes > 0);
+                try std.testing.expect(usage.message_bytes > 0);
+                try std.testing.expect(usage.tool_definition_bytes > 0);
+                try std.testing.expect(usage.estimated_tokens > 0);
+            },
+            .prompt_segment_usage => |segment| {
+                segment_count += 1;
+                if (segment.segment == .system_prompt or segment.segment == .tool_definitions) {
+                    try std.testing.expectEqual(types.PromptSegmentCacheRole.stable, segment.cache_role);
+                }
+                if (segment.segment == .message_history) {
+                    try std.testing.expectEqual(types.PromptSegmentCacheRole.dynamic, segment.cache_role);
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_context_usage);
+    try std.testing.expectEqual(@as(usize, 3), segment_count);
+}
+
 const MockProtocolToolContext = struct {
     call_count: usize = 0,
     saw_update: bool = false,
@@ -1051,6 +1388,69 @@ fn mockProtocolExecuteCancelled(
         if (token.isCancelled()) return error.Cancelled;
     }
     return error.Cancelled;
+}
+
+fn mockLargeOutputTool(
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?types.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, "raw log line 1\nraw log line 2\nraw log line 3"),
+    } };
+    return .{
+        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
+        .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"raw\":true,\"lines\":3}")),
+    };
+}
+
+const MiddlewareRecorder = struct {
+    raw_total_bytes: u64 = 0,
+    call_count: usize = 0,
+};
+
+fn compactToolOutputMiddleware(
+    ctx: ?*anyopaque,
+    input: types.ToolOutputMiddlewareInput,
+    result: *AgentToolResult,
+    allocator: std.mem.Allocator,
+) anyerror!void {
+    const recorder: *MiddlewareRecorder = @ptrCast(@alignCast(ctx.?));
+    recorder.raw_total_bytes = input.raw_total_bytes;
+    recorder.call_count += 1;
+
+    result.content.deinit(allocator);
+    result.details_json.deinit(allocator);
+
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, "3 raw log lines stored as artifact"),
+    } };
+
+    const artifacts = try allocator.alloc(ai_types.ArtifactReference, 1);
+    artifacts[0] = .{
+        .artifact_id = try allocator.dupe(u8, "artifact-log-1"),
+        .uri = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "makai-artifact://artifact-log-1")),
+        .mime_type = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "text/plain")),
+        .byte_size = input.raw_total_bytes,
+        .description = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "raw tool output")),
+    };
+
+    result.* = .{
+        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
+        .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"summary\":true}")),
+        .artifacts = types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
+    };
 }
 
 test "executeToolCalls uses protocol executor when configured" {
@@ -1125,6 +1525,87 @@ test "executeToolCalls uses protocol executor when configured" {
     }
     try std.testing.expect(protocol_ctx.saw_update);
     try std.testing.expect(saw_update);
+}
+
+test "executeToolCalls applies output middleware and reports byte telemetry" {
+    const allocator = std.testing.allocator;
+
+    const tools = [_]AgentTool{
+        .{
+            .label = "Logs",
+            .name = "logs",
+            .description = "Collect logs",
+            .parameters_schema_json = "{}",
+            .execute = mockLargeOutputTool,
+        },
+    };
+
+    const assistant_content = [_]ai_types.AssistantContent{
+        .{ .tool_call = .{
+            .id = "call_logs",
+            .name = "logs",
+            .arguments_json = "{\"path\":\"server.log\"}",
+        } },
+    };
+    const assistant_message = ai_types.AssistantMessage{
+        .content = &assistant_content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var recorder = MiddlewareRecorder{};
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var tool_result = try executeToolCalls(
+        allocator,
+        assistant_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &tools,
+            .tool_output_middleware_fn = compactToolOutputMiddleware,
+            .tool_output_middleware_ctx = &recorder,
+        },
+        &agent_events,
+    );
+    defer tool_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), recorder.call_count);
+    try std.testing.expect(recorder.raw_total_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
+    try std.testing.expectEqualStrings("3 raw log lines stored as artifact", tool_result.tool_results[0].content[0].text.text);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results[0].artifacts.slice().len);
+    try std.testing.expectEqualStrings("artifact-log-1", tool_result.tool_results[0].artifacts.slice()[0].artifact_id);
+
+    var saw_end = false;
+    while (agent_events.poll()) |evt| {
+        if (evt == .tool_execution_end) {
+            saw_end = true;
+            try std.testing.expect(evt.tool_execution_end.raw_total_bytes > evt.tool_execution_end.returned_total_bytes);
+            try std.testing.expectEqual(@as(u32, 1), evt.tool_execution_end.artifact_count);
+            try std.testing.expectEqual(@as(usize, 1), evt.tool_execution_end.artifacts.len);
+            try std.testing.expectEqualStrings("artifact-log-1", evt.tool_execution_end.artifacts[0].artifact_id);
+        }
+    }
+    try std.testing.expect(saw_end);
 }
 
 test "executeToolCalls emits terminal events on protocol cancellation" {

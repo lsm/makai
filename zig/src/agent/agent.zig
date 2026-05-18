@@ -598,22 +598,106 @@ pub const Agent = struct {
 
     fn cloneToolResultMessage(self: *Agent, msg: ai_types.ToolResultMessage) !ai_types.ToolResultMessage {
         var content = try self._allocator.alloc(ai_types.UserContentPart, msg.content.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (content[0..initialized]) |*part| part.deinit(self._allocator);
+            self._allocator.free(content);
+        }
         for (msg.content, 0..) |c, i| {
             content[i] = .{ .text = .{ .text = try self._allocator.dupe(u8, c.text.text) } };
+            initialized += 1;
         }
 
         const details_json = if (msg.getDetailsJson()) |d|
             ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, d))
         else
             ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = details_json;
+            mutable.deinit(self._allocator);
+        }
+
+        const artifacts = try self.cloneArtifactReferences(msg.artifacts.slice());
+        errdefer {
+            var mutable = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts);
+            mutable.deinit(self._allocator);
+        }
+
+        const tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id);
+        errdefer self._allocator.free(tool_call_id);
+        const tool_name = try self._allocator.dupe(u8, msg.tool_name);
+        errdefer self._allocator.free(tool_name);
 
         return .{
-            .tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id),
-            .tool_name = try self._allocator.dupe(u8, msg.tool_name),
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
             .content = content,
             .details_json = details_json,
+            .artifacts = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
             .is_error = msg.is_error,
             .timestamp = msg.timestamp,
+        };
+    }
+
+    fn cloneArtifactReferences(self: *Agent, artifacts: []const ai_types.ArtifactReference) ![]ai_types.ArtifactReference {
+        const cloned = try self._allocator.alloc(ai_types.ArtifactReference, artifacts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |*artifact| artifact.deinit(self._allocator);
+            self._allocator.free(cloned);
+        }
+
+        for (artifacts, 0..) |artifact, i| {
+            cloned[i] = try self.cloneArtifactReference(artifact);
+            initialized += 1;
+        }
+
+        return cloned;
+    }
+
+    fn cloneArtifactReference(self: *Agent, artifact: ai_types.ArtifactReference) !ai_types.ArtifactReference {
+        const artifact_id = try self._allocator.dupe(u8, artifact.artifact_id);
+        errdefer self._allocator.free(artifact_id);
+
+        const uri = if (artifact.getUri()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = uri;
+            mutable.deinit(self._allocator);
+        }
+
+        const mime_type = if (artifact.getMimeType()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = mime_type;
+            mutable.deinit(self._allocator);
+        }
+
+        const sha256 = if (artifact.getSha256()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = sha256;
+            mutable.deinit(self._allocator);
+        }
+
+        const description = if (artifact.getDescription()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+
+        return .{
+            .artifact_id = artifact_id,
+            .uri = uri,
+            .mime_type = mime_type,
+            .byte_size = artifact.byte_size,
+            .sha256 = sha256,
+            .description = description,
         };
     }
 

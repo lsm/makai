@@ -1437,6 +1437,24 @@ fn serializeAgentLoopEvent(
                 try writeUsageField(&w, payload.message.assistant.usage);
             }
         },
+        .context_usage => |payload| {
+            try w.writeStringField("type", "context_usage");
+            try w.writeIntField("system_prompt_bytes", payload.system_prompt_bytes);
+            try w.writeIntField("message_bytes", payload.message_bytes);
+            try w.writeIntField("tool_definition_bytes", payload.tool_definition_bytes);
+            try w.writeIntField("total_bytes", payload.total_bytes);
+            try w.writeIntField("estimated_tokens", payload.estimated_tokens);
+            try w.writeIntField("message_count", payload.message_count);
+            try w.writeIntField("tool_count", payload.tool_count);
+        },
+        .prompt_segment_usage => |payload| {
+            try w.writeStringField("type", "prompt_segment_usage");
+            try w.writeStringField("segment", @tagName(payload.segment));
+            try w.writeStringField("cache_role", @tagName(payload.cache_role));
+            try w.writeIntField("bytes", payload.bytes);
+            try w.writeIntField("estimated_tokens", payload.estimated_tokens);
+            try w.writeIntField("item_count", payload.item_count);
+        },
         .tool_execution_start => |payload| {
             try w.writeStringField("type", "tool_execution_start");
             try w.writeStringField("tool_call_id", payload.tool_call_id);
@@ -1455,6 +1473,16 @@ fn serializeAgentLoopEvent(
             try w.writeStringField("tool_name", payload.tool_name);
             try w.writeStringField("result_json", payload.result_json);
             try w.writeBoolField("is_error", payload.is_error);
+            try w.writeIntField("args_bytes", payload.args_bytes);
+            try w.writeIntField("raw_result_bytes", payload.raw_result_bytes);
+            try w.writeIntField("returned_result_bytes", payload.returned_result_bytes);
+            try w.writeIntField("raw_details_bytes", payload.raw_details_bytes);
+            try w.writeIntField("returned_details_bytes", payload.returned_details_bytes);
+            try w.writeIntField("raw_total_bytes", payload.raw_total_bytes);
+            try w.writeIntField("returned_total_bytes", payload.returned_total_bytes);
+            try w.writeIntField("estimated_returned_tokens", payload.estimated_returned_tokens);
+            try w.writeIntField("artifact_count", payload.artifact_count);
+            try writeArtifactReferences(&w, payload.artifacts);
         },
     }
     try w.endObject();
@@ -1462,6 +1490,23 @@ fn serializeAgentLoopEvent(
     const out = try allocator.dupe(u8, buffer.items);
     buffer.deinit(allocator);
     return out;
+}
+
+fn writeArtifactReferences(w: *json_writer.JsonWriter, artifacts: []const ai_types.ArtifactReference) !void {
+    if (artifacts.len == 0) return;
+    try w.writeKey("artifacts");
+    try w.beginArray();
+    for (artifacts) |artifact| {
+        try w.beginObject();
+        try w.writeStringField("artifact_id", artifact.artifact_id);
+        if (artifact.getUri()) |uri| try w.writeStringField("uri", uri);
+        if (artifact.getMimeType()) |mime_type| try w.writeStringField("mime_type", mime_type);
+        if (artifact.byte_size) |byte_size| try w.writeIntField("byte_size", byte_size);
+        if (artifact.getSha256()) |sha256| try w.writeStringField("sha256", sha256);
+        if (artifact.getDescription()) |description| try w.writeStringField("description", description);
+        try w.endObject();
+    }
+    try w.endArray();
 }
 
 fn serializeAgentErrorEvent(allocator: std.mem.Allocator, message: []const u8, code: []const u8) ![]u8 {
