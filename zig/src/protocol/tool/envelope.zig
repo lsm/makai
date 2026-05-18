@@ -278,6 +278,27 @@ fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
     return tool_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
+fn parseJsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |s| s,
+        else => error.InvalidPayloadType,
+    };
+}
+
+fn parseJsonArray(value: std.json.Value) !std.json.Array {
+    return switch (value) {
+        .array => |a| a,
+        else => error.InvalidPayloadType,
+    };
+}
+
+fn parseJsonObject(value: std.json.Value) !std.json.ObjectMap {
+    return switch (value) {
+        .object => |o| o,
+        else => error.InvalidPayloadType,
+    };
+}
+
 fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
     return switch (value) {
         .integer => |n| std.math.cast(T, n) orelse error.InvalidPayloadType,
@@ -291,15 +312,15 @@ fn parseOptionalUnsignedJsonInteger(comptime T: type, value: ?std.json.Value) !?
 
 fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
     var artifact = tool_types.ArtifactReference{
-        .artifact_id = try allocator.dupe(u8, obj.get("artifact_id").?.string),
+        .artifact_id = try allocator.dupe(u8, try parseJsonString(obj.get("artifact_id").?)),
     };
     errdefer artifact.deinit(allocator);
 
-    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-    if (obj.get("byte_size")) |v| artifact.byte_size = @as(u64, @intCast(v.integer));
-    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+    if (obj.get("byte_size")) |v| artifact.byte_size = try parseUnsignedJsonInteger(u64, v);
+    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
+    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
 
     return artifact;
 }
@@ -313,7 +334,7 @@ fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Alloc
     }
 
     for (array.items, 0..) |item, i| {
-        artifacts[i] = try deserializeArtifactReference(item.object, allocator);
+        artifacts[i] = try deserializeArtifactReference(try parseJsonObject(item), allocator);
         initialized += 1;
     }
 
@@ -390,9 +411,16 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .is_error = if (payload.get("is_error")) |v| v.bool else false,
             .duration_ms = @as(u32, @intCast(payload.get("duration_ms").?.integer)),
         };
+        errdefer {
+            allocator.free(result.tool_call_id);
+            allocator.free(result.result_json);
+            result.error_message.deinit(allocator);
+            result.details_json.deinit(allocator);
+            result.artifacts.deinit(allocator);
+        }
         if (payload.get("error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         if (payload.get("details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(v.array, allocator));
+        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(try parseJsonArray(v), allocator));
         return .{ .tool_result = result };
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
@@ -447,10 +475,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .artifact_retrieved = res };
     }
     if (std.mem.eql(u8, type_str, "artifact_search")) {
-        return .{ .artifact_search = .{
+        var req = tool_types.ArtifactSearchRequest{
             .query = try allocator.dupe(u8, payload.get("query").?.string),
-            .limit = if (payload.get("limit")) |v| @as(u32, @intCast(v.integer)) else null,
-        } };
+        };
+        errdefer allocator.free(req.query);
+
+        req.limit = try parseOptionalUnsignedJsonInteger(u32, payload.get("limit"));
+        return .{ .artifact_search = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_search_result")) {
         const values = payload.get("results").?.array;
@@ -480,11 +511,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .artifact_search_result = .{ .results = results } };
     }
     if (std.mem.eql(u8, type_str, "hashline_read")) {
-        return .{ .hashline_read = .{
+        var req = tool_types.HashlineReadRequest{
             .path = try allocator.dupe(u8, payload.get("path").?.string),
             .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
-            .byte_limit = if (payload.get("byte_limit")) |v| @as(u64, @intCast(v.integer)) else null,
-        } };
+        };
+        errdefer allocator.free(req.path);
+
+        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        return .{ .hashline_read = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_read_result")) {
         const values = payload.get("lines").?.array;
@@ -497,12 +531,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         for (values.items, 0..) |item, i| {
             const obj = item.object;
             lines[i] = blk: {
+                const line = try parseUnsignedJsonInteger(u32, obj.get("line").?);
                 const hash = try allocator.dupe(u8, obj.get("hash").?.string);
                 errdefer allocator.free(hash);
                 const text = try allocator.dupe(u8, obj.get("text").?.string);
                 errdefer allocator.free(text);
                 break :blk .{
-                    .line = @as(u32, @intCast(obj.get("line").?.integer)),
+                    .line = line,
                     .hash = hash,
                     .text = text,
                 };
@@ -522,15 +557,17 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .start_hash = "",
             .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
         };
+        var owns_start_hash = false;
         errdefer {
             allocator.free(req.path);
-            allocator.free(req.start_hash);
+            if (owns_start_hash) allocator.free(req.start_hash);
             req.end_hash.deinit(allocator);
             req.replacement.deinit(allocator);
         }
         req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, payload.get("operation").?.string) orelse return error.InvalidPayloadType;
         req.start_line = try parseUnsignedJsonInteger(u32, payload.get("start_line").?);
         req.start_hash = try allocator.dupe(u8, payload.get("start_hash").?.string);
+        owns_start_hash = true;
         if (payload.get("end_line")) |v| req.end_line = try parseUnsignedJsonInteger(u32, v);
         if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
@@ -816,4 +853,37 @@ test "tool envelope rejects malformed hashline edit without leaks" {
 
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(invalid_operation, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_start_line, allocator));
+}
+
+test "tool envelope rejects malformed artifact references without leaks" {
+    const allocator = std.testing.allocator;
+    const negative_byte_size =
+        "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\",\"byte_size\":-1}}}";
+    const non_string_uri =
+        "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\",\"uri\":42}}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_byte_size, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_uri, allocator));
+}
+
+test "tool envelope rejects non-array tool result artifacts without leaks" {
+    const allocator = std.testing.allocator;
+    const json =
+        "{\"type\":\"tool_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"execution_id\":\"00000000000000000000000003\",\"tool_call_id\":\"call_1\",\"result_json\":\"{}\",\"duration_ms\":1,\"artifacts\":\"not-array\"}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(json, allocator));
+}
+
+test "tool envelope rejects remaining negative unsigned fields without leaks" {
+    const allocator = std.testing.allocator;
+    const negative_search_limit =
+        "{\"type\":\"artifact_search\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"query\":\"needle\",\"limit\":-1}}";
+    const negative_read_limit =
+        "{\"type\":\"hashline_read\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"byte_limit\":-1}}";
+    const negative_result_line =
+        "{\"type\":\"hashline_read_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"lines\":[{\"line\":-1,\"hash\":\"abc\",\"text\":\"bad\"}]}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_search_limit, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_read_limit, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_result_line, allocator));
 }
