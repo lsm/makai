@@ -187,6 +187,7 @@ const StdioToolBridge = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         if (!self.hasInFlightLocked(result.session_id, result.tool_call_id)) return false;
+        if (self.hasResultLocked(result.session_id, result.tool_call_id)) return false;
         try self.results.append(allocator, result);
         return true;
     }
@@ -209,9 +210,48 @@ const StdioToolBridge = struct {
         self.removeInFlightLocked(allocator, session_id, tool_call_id);
     }
 
+    fn discardSession(self: *StdioToolBridge, allocator: std.mem.Allocator, session_id: AgentProtocolTypes.SessionId) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var request_idx: usize = 0;
+        while (request_idx < self.requests.items.len) {
+            if (std.mem.eql(u8, &self.requests.items[request_idx].session_id, &session_id)) {
+                var removed = self.requests.orderedRemove(request_idx);
+                removed.deinit(allocator);
+                continue;
+            }
+            request_idx += 1;
+        }
+        var in_flight_idx: usize = 0;
+        while (in_flight_idx < self.in_flight.items.len) {
+            if (std.mem.eql(u8, &self.in_flight.items[in_flight_idx].session_id, &session_id)) {
+                var removed = self.in_flight.orderedRemove(in_flight_idx);
+                removed.deinit(allocator);
+                continue;
+            }
+            in_flight_idx += 1;
+        }
+        var result_idx: usize = 0;
+        while (result_idx < self.results.items.len) {
+            if (std.mem.eql(u8, &self.results.items[result_idx].session_id, &session_id)) {
+                var removed = self.results.orderedRemove(result_idx);
+                removed.deinit(allocator);
+                continue;
+            }
+            result_idx += 1;
+        }
+    }
+
     fn hasInFlightLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) bool {
         for (self.in_flight.items) |key| {
             if (std.mem.eql(u8, &key.session_id, &session_id) and std.mem.eql(u8, key.tool_call_id, tool_call_id)) return true;
+        }
+        return false;
+    }
+
+    fn hasResultLocked(self: *StdioToolBridge, session_id: AgentProtocolTypes.SessionId, tool_call_id: []const u8) bool {
+        for (self.results.items) |result| {
+            if (std.mem.eql(u8, &result.session_id, &session_id) and std.mem.eql(u8, result.tool_call_id, tool_call_id)) return true;
         }
         return false;
     }
@@ -603,6 +643,7 @@ const StdioProtocolLoop = struct {
         if (self.findActiveAgentRun(session_id)) |idx| {
             self.active_agent_runs.items[idx].cancel();
         }
+        self.tool_bridge.discardSession(self.allocator, session_id);
     }
 
     fn publishAgentLoopError(self: *Self, session_id: AgentProtocolTypes.SessionId, message: []const u8) !void {
@@ -2676,9 +2717,60 @@ test "stdio tool bridge publishes tool requests and consumes tool results" {
     defer allocator.free(result_json);
 
     try std.testing.expect(try stdio_loop.dispatchInboundLine(result_json));
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(result_json)));
+    try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.results.items.len);
     var result = stdio_loop.tool_bridge.popResult(allocator, session_id, "call-1").?;
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"done\"}]", result.result_json);
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
+}
+
+test "stdio tool bridge clears queued and in-flight calls when cancelling session" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    clearOwnedLines(allocator, &outbound);
+
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, "queued-call", "lookup", "{}");
+    try stdio_loop.tool_bridge.markInFlight(allocator, session_id, "running-call");
+    try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 1), stdio_loop.tool_bridge.in_flight.items.len);
+
+    stdio_loop.cancelAgentRun(session_id);
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.requests.items.len);
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.in_flight.items.len);
+
+    var late_env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_result = .{
+            .tool_call_id = try allocator.dupe(u8, "running-call"),
+            .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"late\"}]"),
+        } },
+    };
+    defer late_env.deinit(allocator);
+    const late_json = try agent_protocol_envelope.serializeEnvelope(late_env, allocator);
+    defer allocator.free(late_json);
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(late_json)));
+    try std.testing.expectEqual(@as(usize, 0), stdio_loop.tool_bridge.results.items.len);
 }
 
 test "stdio tool bridge drops queued requests for stopped sessions" {
