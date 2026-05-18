@@ -90,6 +90,97 @@ const PreparedAgentRun = struct {
     }
 };
 
+const StdioToolRequest = struct {
+    session_id: AgentProtocolTypes.SessionId,
+    tool_call_id: []u8,
+    tool_name: []u8,
+    args_json: []u8,
+
+    fn deinit(self: *StdioToolRequest, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.tool_name);
+        allocator.free(self.args_json);
+        self.* = undefined;
+    }
+};
+
+const StdioToolResult = struct {
+    tool_call_id: []u8,
+    result_json: []u8,
+    details_json: []u8,
+    is_error: bool,
+
+    fn deinit(self: *StdioToolResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_call_id);
+        allocator.free(self.result_json);
+        allocator.free(self.details_json);
+        self.* = undefined;
+    }
+};
+
+const StdioToolBridge = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    requests: std.ArrayList(StdioToolRequest) = .empty,
+    results: std.ArrayList(StdioToolResult) = .empty,
+
+    fn deinit(self: *StdioToolBridge, allocator: std.mem.Allocator) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        for (self.requests.items) |*request| request.deinit(allocator);
+        self.requests.deinit(allocator);
+        for (self.results.items) |*result| result.deinit(allocator);
+        self.results.deinit(allocator);
+        self.mutex.unlock();
+        self.* = undefined;
+    }
+
+    fn enqueueRequest(
+        self: *StdioToolBridge,
+        allocator: std.mem.Allocator,
+        session_id: AgentProtocolTypes.SessionId,
+        tool_call_id: []const u8,
+        tool_name: []const u8,
+        args_json: []const u8,
+    ) !void {
+        const owned_tool_call_id = try allocator.dupe(u8, tool_call_id);
+        errdefer allocator.free(owned_tool_call_id);
+        const owned_tool_name = try allocator.dupe(u8, tool_name);
+        errdefer allocator.free(owned_tool_name);
+        const owned_args_json = try allocator.dupe(u8, args_json);
+        errdefer allocator.free(owned_args_json);
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        try self.requests.append(allocator, .{
+            .session_id = session_id,
+            .tool_call_id = owned_tool_call_id,
+            .tool_name = owned_tool_name,
+            .args_json = owned_args_json,
+        });
+    }
+
+    fn enqueueResult(self: *StdioToolBridge, allocator: std.mem.Allocator, result: StdioToolResult) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        try self.results.append(allocator, result);
+    }
+
+    fn popResult(self: *StdioToolBridge, tool_call_id: []const u8) ?StdioToolResult {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        for (self.results.items, 0..) |result, idx| {
+            if (std.mem.eql(u8, result.tool_call_id, tool_call_id)) {
+                return self.results.orderedRemove(idx);
+            }
+        }
+        return null;
+    }
+};
+
+const StdioAgentToolExecutor = struct {
+    bridge: *StdioToolBridge,
+    session_id: AgentProtocolTypes.SessionId,
+};
+
 const ActiveAgentRun = struct {
     session_id: AgentProtocolTypes.SessionId,
     stream: *agent_loop.AgentEventStream,
@@ -98,6 +189,7 @@ const ActiveAgentRun = struct {
     prompts: []ai_types.Message,
     tools: []agent_loop.AgentTool,
     cancel_flag: *std.atomic.Value(bool),
+    tool_executor: *StdioAgentToolExecutor,
 
     fn cancel(self: *ActiveAgentRun) void {
         self.cancel_flag.store(true, .release);
@@ -113,6 +205,7 @@ const ActiveAgentRun = struct {
         allocator.free(self.prompts);
         deinitAgentTools(allocator, self.tools);
         allocator.destroy(self.cancel_flag);
+        allocator.destroy(self.tool_executor);
         self.* = undefined;
     }
 };
@@ -134,6 +227,7 @@ const StdioProtocolLoop = struct {
     agent_pipe: in_process.SerializedPipe,
     provider_bridge: agent_bridge.InProcessProviderProtocolBridge,
     active_agent_runs: std.ArrayList(ActiveAgentRun),
+    tool_bridge: StdioToolBridge,
     auth_server: AuthProtocolServer,
     auth_pipe: in_process.SerializedPipe,
 
@@ -156,6 +250,7 @@ const StdioProtocolLoop = struct {
             .agent_pipe = in_process.createSerializedPipe(allocator),
             .provider_bridge = agent_bridge.InProcessProviderProtocolBridge.init(registry),
             .active_agent_runs = std.ArrayList(ActiveAgentRun).empty,
+            .tool_bridge = .{},
             .auth_server = AuthProtocolServer.init(allocator, auth_options),
             .auth_pipe = in_process.createSerializedPipe(allocator),
         };
@@ -184,6 +279,7 @@ const StdioProtocolLoop = struct {
     pub fn deinit(self: *Self) void {
         for (self.active_agent_runs.items) |*run| run.deinit(self.allocator);
         self.active_agent_runs.deinit(self.allocator);
+        self.tool_bridge.deinit(self.allocator);
         self.provider_server.deinit();
         self.provider_pipe.deinit();
         self.agent_server.deinit();
@@ -217,6 +313,11 @@ const StdioProtocolLoop = struct {
             },
             .agent => {
                 if (!hasValidAgentEnvelopeShape(line, self.allocator)) return false;
+                const tool_result = try parseStdioToolResultFromLine(line, self.allocator);
+                if (tool_result) |result| {
+                    try self.tool_bridge.enqueueResult(self.allocator, result);
+                    return true;
+                }
                 const stopped_session = validatedAgentStopSessionFromLine(line, self.allocator);
                 const had_stop_session = if (stopped_session) |session_id|
                     self.agent_server.hasSession(session_id)
@@ -271,6 +372,7 @@ const StdioProtocolLoop = struct {
         };
         forwarded += try self.startPendingAgentRuns();
         forwarded += try self.pumpAgentRuns();
+        forwarded += try self.publishPendingToolRequests();
         forwarded += try agent_runtime.pumpServerOutbox();
 
         var auth_runtime = AuthProtocolRuntime{
@@ -341,6 +443,14 @@ const StdioProtocolLoop = struct {
         errdefer if (!cancel_owned_by_run) self.allocator.destroy(cancel_flag);
         cancel_flag.* = std.atomic.Value(bool).init(false);
 
+        const tool_executor = try self.allocator.create(StdioAgentToolExecutor);
+        var tool_executor_owned_by_run = false;
+        errdefer if (!tool_executor_owned_by_run) self.allocator.destroy(tool_executor);
+        tool_executor.* = .{
+            .bridge = &self.tool_bridge,
+            .session_id = pending.session_id,
+        };
+
         const session_id_text = try AgentProtocolTypes.sessionIdToString(pending.session_id, self.allocator);
         defer self.allocator.free(session_id_text);
 
@@ -348,6 +458,8 @@ const StdioProtocolLoop = struct {
             .model = prepared.model,
             .protocol = (&self.provider_bridge).protocolClient(),
             .tools = prepared.tools,
+            .execute_tool_via_protocol_fn = executeStdioToolViaAgentProtocol,
+            .execute_tool_via_protocol_ctx = tool_executor,
             .temperature = prepared.options.temperature,
             .max_tokens = prepared.options.max_tokens,
             .max_iterations = prepared.options.max_iterations,
@@ -371,10 +483,12 @@ const StdioProtocolLoop = struct {
             .prompts = prepared.prompts,
             .tools = prepared.tools,
             .cancel_flag = cancel_flag,
+            .tool_executor = tool_executor,
         };
         prepared.options.deinit(self.allocator);
         context_owned_by_run = true;
         cancel_owned_by_run = true;
+        tool_executor_owned_by_run = true;
         stream_owned_by_run = true;
         prepared.disarm();
 
@@ -445,6 +559,37 @@ const StdioProtocolLoop = struct {
         self.agent_server.publishAgentError(session_id, .internal_error, message) catch |err| {
             if (err == error.OutOfMemory) return err;
         };
+    }
+
+    fn publishPendingToolRequests(self: *Self) !usize {
+        var published: usize = 0;
+        while (true) {
+            while (!self.tool_bridge.mutex.tryLock()) std.atomic.spinLoopHint();
+            const maybe_request = if (self.tool_bridge.requests.items.len > 0)
+                self.tool_bridge.requests.orderedRemove(0)
+            else
+                null;
+            self.tool_bridge.mutex.unlock();
+
+            var request = maybe_request orelse break;
+            defer request.deinit(self.allocator);
+
+            var env = AgentProtocolTypes.Envelope{
+                .session_id = request.session_id,
+                .message_id = AgentProtocolTypes.generateUlid(),
+                .sequence = 0,
+                .timestamp = compat.time.nowMillis(),
+                .payload = .{ .tool_execute = .{
+                    .tool_call_id = try self.allocator.dupe(u8, request.tool_call_id),
+                    .tool_name = try self.allocator.dupe(u8, request.tool_name),
+                    .args_json = try self.allocator.dupe(u8, request.args_json),
+                } },
+            };
+            errdefer env.deinit(self.allocator);
+            try self.agent_server.enqueueEnvelope(env);
+            published += 1;
+        }
+        return published;
     }
 
     fn detectDispatchTarget(self: *Self, line: []const u8) ?DispatchTarget {
@@ -544,7 +689,7 @@ fn prepareAgentRun(
     const system_prompt = try allocator.dupe(u8, system_prompt_builder.items);
     errdefer allocator.free(system_prompt);
 
-    const options = try parseAgentRunOptions(allocator, pending.options_json);
+    const options = try parseAgentRunOptions(allocator, message_obj, pending.options_json);
 
     return .{
         .model = model,
@@ -587,20 +732,48 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     return model;
 }
 
-fn parseAgentRunOptions(allocator: std.mem.Allocator, options_json: []const u8) !AgentRunOptions {
-    if (options_json.len == 0) return .{};
+fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
+    const message_options = if (message_obj.get("options")) |value|
+        if (value == .object) value.object else null
+    else
+        null;
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return .{};
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*value| value.deinit();
+    var envelope_options: ?std.json.ObjectMap = null;
+    if (options_json.len > 0) {
+        parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
+        if (parsed.?.value == .object) envelope_options = parsed.?.value.object;
+    }
 
-    const obj = parsed.value.object;
     return .{
-        .temperature = if (obj.get("temperature")) |value| valueAsF32(value) else null,
-        .max_tokens = if (obj.get("max_tokens")) |value| valueAsU32(value) else null,
-        .max_iterations = if (obj.get("max_iterations")) |value| valueAsU32(value) else null,
-        .api_key = if (getStringField(obj, "api_key")) |key| try allocator.dupe(u8, key) else null,
+        .temperature = optionF32(envelope_options, message_options, "temperature"),
+        .max_tokens = optionU32(envelope_options, message_options, "max_tokens"),
+        .max_iterations = optionU32(envelope_options, message_options, "max_iterations"),
+        .api_key = if (optionString(envelope_options, message_options, "api_key")) |key| try allocator.dupe(u8, key) else null,
     };
+}
+
+fn optionValue(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    if (primary) |obj| {
+        if (obj.get(key)) |value| return value;
+    }
+    if (fallback) |obj| {
+        if (obj.get(key)) |value| return value;
+    }
+    return null;
+}
+
+fn optionF32(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?f32 {
+    return if (optionValue(primary, fallback, key)) |value| valueAsF32(value) else null;
+}
+
+fn optionU32(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?u32 {
+    return if (optionValue(primary, fallback, key)) |value| valueAsU32(value) else null;
+}
+
+fn optionString(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    return if (optionValue(primary, fallback, key)) |value| if (value == .string) value.string else null else null;
 }
 
 fn parseAgentTools(
@@ -704,6 +877,42 @@ fn unavailableAgentToolExecute(
     _ = on_update;
     _ = allocator;
     return error.ToolExecutionUnavailable;
+}
+
+fn executeStdioToolViaAgentProtocol(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?*const fn (?*anyopaque, []const u8, []const u8, []const u8) void,
+    allocator: std.mem.Allocator,
+) anyerror!agent_loop.AgentToolResult {
+    _ = on_update_ctx;
+    _ = on_update;
+    const executor: *StdioAgentToolExecutor = @ptrCast(@alignCast(ctx.?));
+    try executor.bridge.enqueueRequest(allocator, executor.session_id, tool_call_id, tool_name, args_json);
+
+    while (true) {
+        if (cancel_token) |token| {
+            if (token.isCancelled()) return error.Cancelled;
+        }
+        if (executor.bridge.popResult(tool_call_id)) |result| {
+            var owned_result = result;
+            defer owned_result.deinit(allocator);
+            if (owned_result.is_error) return error.RemoteToolExecutionFailed;
+            const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
+            errdefer deinitUserContentParts(allocator, content);
+            const details_json = try allocator.dupe(u8, owned_result.details_json);
+            errdefer allocator.free(details_json);
+            return .{
+                .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
+                .details_json = ai_types.OwnedSlice(u8).initOwned(details_json),
+            };
+        }
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
 }
 
 fn parseAgentMessages(
@@ -851,6 +1060,22 @@ fn parseToolResultContentParts(allocator: std.mem.Allocator, value: std.json.Val
     try appendToolResultContentParts(allocator, &parts, value);
     if (parts.items.len == 0) try appendTextContentPart(allocator, &parts, "");
     return parts.toOwnedSlice(allocator);
+}
+
+fn parseToolResultContentPartsJson(allocator: std.mem.Allocator, result_json: []const u8) ![]ai_types.UserContentPart {
+    if (result_json.len == 0) {
+        const content = try allocator.alloc(ai_types.UserContentPart, 0);
+        return content;
+    }
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result_json, .{});
+    defer parsed.deinit();
+    return parseToolResultContentParts(allocator, parsed.value);
+}
+
+fn deinitUserContentParts(allocator: std.mem.Allocator, parts: []ai_types.UserContentPart) void {
+    for (parts) |*part| part.deinit(allocator);
+    allocator.free(parts);
 }
 
 fn firstToolResultStringField(value: ?std.json.Value, key: []const u8) ?[]const u8 {
@@ -1200,6 +1425,28 @@ fn valueAsF32(value: std.json.Value) ?f32 {
         .integer => |i| @floatFromInt(i),
         .float => |f| @floatCast(f),
         else => null,
+    };
+}
+
+fn parseStdioToolResultFromLine(line: []const u8, allocator: std.mem.Allocator) !?StdioToolResult {
+    var env = agent_protocol_envelope.deserializeEnvelope(line, allocator) catch return null;
+    defer env.deinit(allocator);
+    if (env.payload != .tool_result) return null;
+
+    const result = env.payload.tool_result;
+    const owned_tool_call_id = try allocator.dupe(u8, result.tool_call_id);
+    errdefer allocator.free(owned_tool_call_id);
+    const owned_result_json = try allocator.dupe(u8, result.result_json);
+    errdefer allocator.free(owned_result_json);
+    const details = result.details_json.slice();
+    const owned_details_json = try allocator.dupe(u8, details);
+    errdefer allocator.free(owned_details_json);
+
+    return .{
+        .tool_call_id = owned_tool_call_id,
+        .result_json = owned_result_json,
+        .details_json = owned_details_json,
+        .is_error = result.is_error,
     };
 }
 
@@ -2181,6 +2428,8 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
     const prompts = try allocator.alloc(ai_types.Message, 0);
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const tool_executor = try allocator.create(StdioAgentToolExecutor);
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -2190,6 +2439,7 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
         .prompts = prompts,
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .tool_executor = tool_executor,
     });
 
     const session_text = try AgentProtocolTypes.sessionIdToString(session_id, allocator);
@@ -2229,6 +2479,29 @@ test "prepareAgentRun preserves requested tools" {
     try std.testing.expect(std.mem.find(u8, prepared.tools[0].parameters_schema_json, "\"path\"") != null);
 }
 
+test "prepareAgentRun parses SDK-style request options from message json" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var pending = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"options":{"temperature":0.25,"max_tokens":64,"max_iterations":7}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer pending.deinit(allocator);
+
+    var prepared = try prepareAgentRun(allocator, pending);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(?f32, 0.25), prepared.options.temperature);
+    try std.testing.expectEqual(@as(?u32, 64), prepared.options.max_tokens);
+    try std.testing.expectEqual(@as(?u32, 7), prepared.options.max_iterations);
+}
+
 test "parseToolResultHistoryMessage preserves structured tool_result content" {
     const allocator = std.testing.allocator;
 
@@ -2266,6 +2539,49 @@ test "parseAssistantHistoryMessage preserves image content blocks" {
     try std.testing.expect(message.assistant.content[0] == .image);
     try std.testing.expectEqualStrings("aW1hZ2U=", message.assistant.content[0].image.data);
     try std.testing.expectEqualStrings("image/png", message.assistant.content[0].image.mime_type);
+}
+
+test "stdio tool bridge publishes tool requests and consumes tool results" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    try stdio_loop.tool_bridge.enqueueRequest(allocator, session_id, "call-1", "lookup", "{\"query\":\"zig\"}");
+    try std.testing.expectEqual(@as(usize, 1), try stdio_loop.publishPendingToolRequests());
+    _ = try stdio_loop.pumpBackground();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expectEqual(@as(usize, 1), outbound.items.len);
+    try std.testing.expect(std.mem.find(u8, outbound.items[0], "\"type\":\"tool_execute\"") != null);
+
+    var result_env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_result = .{
+            .tool_call_id = try allocator.dupe(u8, "call-1"),
+            .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"done\"}]"),
+        } },
+    };
+    defer result_env.deinit(allocator);
+    const result_json = try agent_protocol_envelope.serializeEnvelope(result_env, allocator);
+    defer allocator.free(result_json);
+
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(result_json));
+    var result = stdio_loop.tool_bridge.popResult("call-1").?;
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"done\"}]", result.result_json);
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {
@@ -2476,6 +2792,8 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
 
     const cancel_flag = try allocator.create(std.atomic.Value(bool));
     cancel_flag.* = std.atomic.Value(bool).init(false);
+    const tool_executor = try allocator.create(StdioAgentToolExecutor);
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
@@ -2485,6 +2803,7 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
         .prompts = try allocator.alloc(ai_types.Message, 0),
         .tools = try allocator.alloc(agent_loop.AgentTool, 0),
         .cancel_flag = cancel_flag,
+        .tool_executor = tool_executor,
     });
 
     try pumpAndDrainStdioLoop(&stdio_loop, &outbound);

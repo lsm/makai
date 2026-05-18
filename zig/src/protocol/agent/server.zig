@@ -454,6 +454,10 @@ pub const AgentProtocolServer = struct {
         });
     }
 
+    pub fn enqueueEnvelope(self: *Self, env: agent_types.Envelope) !void {
+        try self.outbox.append(self.allocator, env);
+    }
+
     pub fn popOutbound(self: *Self) ?agent_types.Envelope {
         if (self.outbox.items.len == 0) return null;
         return self.outbox.orderedRemove(0);
