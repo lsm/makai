@@ -278,6 +278,17 @@ fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
     return tool_types.parseUlid(str) orelse error.InvalidUlid;
 }
 
+fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
+    return switch (value) {
+        .integer => |n| std.math.cast(T, n) orelse error.InvalidPayloadType,
+        else => error.InvalidPayloadType,
+    };
+}
+
+fn parseOptionalUnsignedJsonInteger(comptime T: type, value: ?std.json.Value) !?T {
+    return if (value) |v| try parseUnsignedJsonInteger(T, v) else null;
+}
+
 fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
     var artifact = tool_types.ArtifactReference{
         .artifact_id = try allocator.dupe(u8, obj.get("artifact_id").?.string),
@@ -418,11 +429,14 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         } };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieve")) {
-        return .{ .artifact_retrieve = .{
+        var req = tool_types.ArtifactRetrieveRequest{
             .artifact_id = try allocator.dupe(u8, payload.get("artifact_id").?.string),
-            .byte_offset = if (payload.get("byte_offset")) |v| @as(u64, @intCast(v.integer)) else null,
-            .byte_limit = if (payload.get("byte_limit")) |v| @as(u64, @intCast(v.integer)) else null,
-        } };
+        };
+        errdefer allocator.free(req.artifact_id);
+
+        req.byte_offset = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_offset"));
+        req.byte_limit = try parseOptionalUnsignedJsonInteger(u64, payload.get("byte_limit"));
+        return .{ .artifact_retrieve = req };
     }
     if (std.mem.eql(u8, type_str, "artifact_retrieved")) {
         var res = tool_types.ArtifactRetrieveResponse{
@@ -503,9 +517,9 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
     if (std.mem.eql(u8, type_str, "hashline_edit")) {
         var req = tool_types.HashlineEditRequest{
             .path = try allocator.dupe(u8, payload.get("path").?.string),
-            .operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, payload.get("operation").?.string) orelse return error.InvalidPayloadType,
-            .start_line = @as(u32, @intCast(payload.get("start_line").?.integer)),
-            .start_hash = try allocator.dupe(u8, payload.get("start_hash").?.string),
+            .operation = undefined,
+            .start_line = undefined,
+            .start_hash = "",
             .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
         };
         errdefer {
@@ -514,7 +528,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             req.end_hash.deinit(allocator);
             req.replacement.deinit(allocator);
         }
-        if (payload.get("end_line")) |v| req.end_line = @as(u32, @intCast(v.integer));
+        req.operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, payload.get("operation").?.string) orelse return error.InvalidPayloadType;
+        req.start_line = try parseUnsignedJsonInteger(u32, payload.get("start_line").?);
+        req.start_hash = try allocator.dupe(u8, payload.get("start_hash").?.string);
+        if (payload.get("end_line")) |v| req.end_line = try parseUnsignedJsonInteger(u32, v);
         if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         return .{ .hashline_edit = req };
@@ -777,4 +794,26 @@ test "tool envelope roundtrip hashline edit" {
     try std.testing.expectEqual(tool_types.HashlineEditOperation.replace_range, parsed.payload.hashline_edit.operation);
     try std.testing.expectEqualStrings("a1b2", parsed.payload.hashline_edit.start_hash);
     try std.testing.expectEqualStrings("const x = 1;", parsed.payload.hashline_edit.replacement.slice());
+}
+
+test "tool envelope rejects negative artifact retrieve byte ranges" {
+    const allocator = std.testing.allocator;
+    const negative_offset =
+        "{\"type\":\"artifact_retrieve\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact_id\":\"artifact-1\",\"byte_offset\":-1}}";
+    const negative_limit =
+        "{\"type\":\"artifact_retrieve\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact_id\":\"artifact-1\",\"byte_limit\":-1}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_offset, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_limit, allocator));
+}
+
+test "tool envelope rejects malformed hashline edit without leaks" {
+    const allocator = std.testing.allocator;
+    const invalid_operation =
+        "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"invalid\",\"start_line\":1,\"start_hash\":\"a1b2\"}}";
+    const negative_start_line =
+        "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":-1,\"start_hash\":\"a1b2\"}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(invalid_operation, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_start_line, allocator));
 }
