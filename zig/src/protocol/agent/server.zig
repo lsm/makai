@@ -407,7 +407,7 @@ pub const AgentProtocolServer = struct {
         };
     }
 
-    fn nextOutgoingSequence(self: *Self, session_id: agent_types.SessionId) u64 {
+    pub fn nextOutgoingSequence(self: *Self, session_id: agent_types.SessionId) u64 {
         const cur = self.outgoing_sequences.get(session_id) orelse 0;
         const next = cur + 1;
         self.outgoing_sequences.put(session_id, next) catch {};
