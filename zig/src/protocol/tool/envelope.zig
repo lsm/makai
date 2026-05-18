@@ -299,6 +299,13 @@ fn parseJsonObject(value: std.json.Value) !std.json.ObjectMap {
     };
 }
 
+fn parseJsonBool(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidPayloadType,
+    };
+}
+
 fn parseRequiredJsonString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
     return parseJsonString(obj.get(key) orelse return error.InvalidPayloadType);
 }
@@ -309,6 +316,10 @@ fn parseRequiredJsonArray(obj: std.json.ObjectMap, key: []const u8) !std.json.Ar
 
 fn parseRequiredJsonObject(obj: std.json.ObjectMap, key: []const u8) !std.json.ObjectMap {
     return parseJsonObject(obj.get(key) orelse return error.InvalidPayloadType);
+}
+
+fn parseRequiredJsonBool(obj: std.json.ObjectMap, key: []const u8) !bool {
+    return parseJsonBool(obj.get(key) orelse return error.InvalidPayloadType);
 }
 
 fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
@@ -523,9 +534,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .artifact_search_result = .{ .results = results } };
     }
     if (std.mem.eql(u8, type_str, "hashline_read")) {
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
         var req = tool_types.HashlineReadRequest{
             .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
-            .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
+            .feature_enabled = feature_enabled,
         };
         errdefer allocator.free(req.path);
 
@@ -562,12 +574,13 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         } };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit")) {
+        const feature_enabled = if (payload.get("feature_enabled")) |v| try parseJsonBool(v) else false;
         var req = tool_types.HashlineEditRequest{
             .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
             .operation = undefined,
             .start_line = undefined,
             .start_hash = "",
-            .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
+            .feature_enabled = feature_enabled,
         };
         var owns_start_hash = false;
         errdefer {
@@ -586,9 +599,10 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         return .{ .hashline_edit = req };
     }
     if (std.mem.eql(u8, type_str, "hashline_edit_result")) {
+        const applied = try parseRequiredJsonBool(payload, "applied");
         var res = tool_types.HashlineEditResponse{
             .path = try allocator.dupe(u8, try parseRequiredJsonString(payload, "path")),
-            .applied = payload.get("applied").?.bool,
+            .applied = applied,
         };
         errdefer res.deinit(allocator);
         if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(try parseJsonObject(v), allocator);
@@ -866,11 +880,14 @@ test "tool envelope rejects malformed hashline edit without leaks" {
         "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"a1b2\",\"end_hash\":42}}";
     const non_string_replacement =
         "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"a1b2\",\"replacement\":42}}";
+    const non_bool_feature_enabled =
+        "{\"type\":\"hashline_edit\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"a1b2\",\"feature_enabled\":\"yes\"}}";
 
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(invalid_operation, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_start_line, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_end_hash, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_replacement, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
 }
 
 test "tool envelope rejects malformed artifact references without leaks" {
@@ -938,4 +955,23 @@ test "tool envelope rejects malformed hashline read results without leaks" {
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_object_line, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_hash, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_text, allocator));
+}
+
+test "tool envelope rejects malformed hashline read request feature flag without leaks" {
+    const allocator = std.testing.allocator;
+    const non_bool_feature_enabled =
+        "{\"type\":\"hashline_read\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"feature_enabled\":\"yes\"}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_feature_enabled, allocator));
+}
+
+test "tool envelope rejects malformed hashline edit results without leaks" {
+    const allocator = std.testing.allocator;
+    const missing_applied =
+        "{\"type\":\"hashline_edit_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\"}}";
+    const non_bool_applied =
+        "{\"type\":\"hashline_edit_result\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"path\":\"src/main.zig\",\"applied\":\"yes\"}}";
+
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_applied, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_bool_applied, allocator));
 }
