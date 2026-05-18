@@ -581,8 +581,8 @@ fn runThread(ctx: *ThreadCtx) void {
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request cancelled");
+            stream.markThreadDone();
             return;
         }
     }
@@ -592,16 +592,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const url = buildUrlWithSuffix(allocator, base_url, "/api/chat") catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom url");
+        stream.markThreadDone();
         return;
     };
     defer allocator.free(url);
 
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("invalid URL");
+        stream.markThreadDone();
         return;
     };
 
@@ -609,8 +609,8 @@ fn runThread(ctx: *ThreadCtx) void {
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
 
@@ -620,14 +620,14 @@ fn runThread(ctx: *ThreadCtx) void {
     if (api_key) |k| {
         auth_value = buildBearerAuthValue(allocator, k) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom auth header");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "authorization", .value = auth_value.? }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom headers");
+            stream.markThreadDone();
             return;
         };
     }
@@ -649,8 +649,8 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -671,13 +671,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request failed");
+            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -692,13 +692,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("send failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -712,13 +712,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("receive failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -775,8 +775,8 @@ fn runThread(ctx: *ThreadCtx) void {
             if (!retry_util.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
 
@@ -791,8 +791,8 @@ fn runThread(ctx: *ThreadCtx) void {
     // After retry loop, check final status
     if (response.head.status != .ok) {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("ollama request failed");
+        stream.markThreadDone();
         return;
     }
 
@@ -836,16 +836,16 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
 
         const n = compat.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("read failed");
+            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
@@ -987,8 +987,8 @@ fn runThread(ctx: *ThreadCtx) void {
             } else {
                 line.append(allocator, ch) catch {
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom line");
+                    stream.markThreadDone();
                     return;
                 };
             }
@@ -1159,8 +1159,8 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom content");
+        stream.markThreadDone();
         return;
     };
 
@@ -1169,16 +1169,16 @@ fn runThread(ctx: *ThreadCtx) void {
     const api_dup = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const provider_dup = allocator.dupe(u8, model.provider) catch {
         allocator.free(api_dup);
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const model_dup = allocator.dupe(u8, model.id) catch {
@@ -1186,8 +1186,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(api_dup);
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
 
@@ -1209,8 +1209,8 @@ fn runThread(ctx: *ThreadCtx) void {
     // Free ctx allocations before completing (out owns its strings, no UAF)
     ctx.deinit();
 
-    stream.markThreadDone();
     stream.complete(out);
+    stream.markThreadDone();
 }
 
 pub fn streamOllama(
@@ -1576,7 +1576,6 @@ test "parseLineExtended - tool call with array arguments" {
     try std.testing.expect(std.mem.find(u8, tc.arguments_json, "[\"ls\",\"pwd\",\"whoami\"]") != null);
 }
 
-
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
     return .{
         .id = "regression-model",
@@ -1615,7 +1614,6 @@ fn expectCancelledStream(stream: *event_stream.AssistantMessageEventStream, allo
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
-
 
 test "provider_cancellation_ollama_cancel_before_request" {
     var cancelled = std.atomic.Value(bool).init(true);
