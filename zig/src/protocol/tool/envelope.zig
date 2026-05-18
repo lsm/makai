@@ -96,6 +96,14 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             try w.writeBoolField("is_error", res.is_error);
             if (res.getErrorMessage()) |msg| try w.writeStringField("error_message", msg);
             if (res.getDetailsJson()) |details| try w.writeStringField("details_json", details);
+            if (res.artifacts.slice().len > 0) {
+                try w.writeKey("artifacts");
+                try w.beginArray();
+                for (res.artifacts.slice()) |artifact| {
+                    try serializeArtifactReference(w, artifact);
+                }
+                try w.endArray();
+            }
             try w.writeIntField("duration_ms", res.duration_ms);
         },
         .tool_cancel => |req| {
@@ -130,6 +138,72 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
             try w.writeIntField("started_at", info.started_at);
             if (info.completed_at) |completed_at| try w.writeIntField("completed_at", completed_at);
         },
+        .artifact_retrieve => |req| {
+            try w.writeStringField("artifact_id", req.artifact_id);
+            if (req.byte_offset) |offset| try w.writeIntField("byte_offset", offset);
+            if (req.byte_limit) |limit| try w.writeIntField("byte_limit", limit);
+        },
+        .artifact_retrieved => |res| {
+            try w.writeKey("artifact");
+            try serializeArtifactReference(w, res.artifact);
+            if (res.getContentJson()) |content_json| try w.writeStringField("content_json", content_json);
+        },
+        .artifact_search => |req| {
+            try w.writeStringField("query", req.query);
+            if (req.limit) |limit| try w.writeIntField("limit", limit);
+        },
+        .artifact_search_result => |res| {
+            try w.writeKey("results");
+            try w.beginArray();
+            for (res.results) |result| {
+                try w.beginObject();
+                try w.writeKey("artifact");
+                try serializeArtifactReference(w, result.artifact);
+                if (result.getSnippet()) |snippet| try w.writeStringField("snippet", snippet);
+                if (result.score) |score| {
+                    try w.writeKey("score");
+                    try w.writeFloat(score);
+                }
+                try w.endObject();
+            }
+            try w.endArray();
+        },
+        .hashline_read => |req| {
+            try w.writeStringField("path", req.path);
+            try w.writeBoolField("feature_enabled", req.feature_enabled);
+            if (req.byte_limit) |limit| try w.writeIntField("byte_limit", limit);
+        },
+        .hashline_read_result => |res| {
+            try w.writeStringField("path", res.path);
+            try w.writeKey("lines");
+            try w.beginArray();
+            for (res.lines) |line| {
+                try w.beginObject();
+                try w.writeIntField("line", line.line);
+                try w.writeStringField("hash", line.hash);
+                try w.writeStringField("text", line.text);
+                try w.endObject();
+            }
+            try w.endArray();
+        },
+        .hashline_edit => |req| {
+            try w.writeStringField("path", req.path);
+            try w.writeStringField("operation", @tagName(req.operation));
+            try w.writeIntField("start_line", req.start_line);
+            try w.writeStringField("start_hash", req.start_hash);
+            if (req.end_line) |line| try w.writeIntField("end_line", line);
+            if (req.getEndHash()) |hash| try w.writeStringField("end_hash", hash);
+            if (req.getReplacement()) |replacement| try w.writeStringField("replacement", replacement);
+            try w.writeBoolField("feature_enabled", req.feature_enabled);
+        },
+        .hashline_edit_result => |res| {
+            try w.writeStringField("path", res.path);
+            try w.writeBoolField("applied", res.applied);
+            if (res.new_artifact) |artifact| {
+                try w.writeKey("new_artifact");
+                try serializeArtifactReference(w, artifact);
+            }
+        },
         .ping => {},
         .pong => |pong| try w.writeStringField("ping_id", pong.ping_id.slice()),
         .goodbye => |goodbye| {
@@ -137,6 +211,17 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: tool_types.Payload, all
         },
     }
 
+    try w.endObject();
+}
+
+fn serializeArtifactReference(w: *json_writer.JsonWriter, artifact: tool_types.ArtifactReference) !void {
+    try w.beginObject();
+    try w.writeStringField("artifact_id", artifact.artifact_id);
+    if (artifact.getUri()) |uri| try w.writeStringField("uri", uri);
+    if (artifact.getMimeType()) |mime_type| try w.writeStringField("mime_type", mime_type);
+    if (artifact.byte_size) |byte_size| try w.writeIntField("byte_size", byte_size);
+    if (artifact.getSha256()) |sha256| try w.writeStringField("sha256", sha256);
+    if (artifact.getDescription()) |description| try w.writeStringField("description", description);
     try w.endObject();
 }
 
@@ -191,6 +276,37 @@ pub fn deserializeEnvelope(json: []const u8, allocator: std.mem.Allocator) !tool
 
 fn parseUlidRequired(str: []const u8) !tool_types.Ulid {
     return tool_types.parseUlid(str) orelse error.InvalidUlid;
+}
+
+fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
+    var artifact = tool_types.ArtifactReference{
+        .artifact_id = try allocator.dupe(u8, obj.get("artifact_id").?.string),
+    };
+    errdefer artifact.deinit(allocator);
+
+    if (obj.get("uri")) |v| artifact.uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+    if (obj.get("mime_type")) |v| artifact.mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+    if (obj.get("byte_size")) |v| artifact.byte_size = @as(u64, @intCast(v.integer));
+    if (obj.get("sha256")) |v| artifact.sha256 = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+    if (obj.get("description")) |v| artifact.description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+
+    return artifact;
+}
+
+fn deserializeArtifactReferences(array: std.json.Array, allocator: std.mem.Allocator) ![]tool_types.ArtifactReference {
+    const artifacts = try allocator.alloc(tool_types.ArtifactReference, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (artifacts[0..initialized]) |*artifact| artifact.deinit(allocator);
+        allocator.free(artifacts);
+    }
+
+    for (array.items, 0..) |item, i| {
+        artifacts[i] = try deserializeArtifactReference(item.object, allocator);
+        initialized += 1;
+    }
+
+    return artifacts;
 }
 
 fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.Payload {
@@ -265,6 +381,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         };
         if (payload.get("error_message")) |v| result.error_message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
         if (payload.get("details_json")) |v| result.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (payload.get("artifacts")) |v| result.artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(try deserializeArtifactReferences(v.array, allocator));
         return .{ .tool_result = result };
     }
     if (std.mem.eql(u8, type_str, "tool_cancel")) {
@@ -299,6 +416,117 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .started_at = payload.get("started_at").?.integer,
             .completed_at = if (payload.get("completed_at")) |v| v.integer else null,
         } };
+    }
+    if (std.mem.eql(u8, type_str, "artifact_retrieve")) {
+        return .{ .artifact_retrieve = .{
+            .artifact_id = try allocator.dupe(u8, payload.get("artifact_id").?.string),
+            .byte_offset = if (payload.get("byte_offset")) |v| @as(u64, @intCast(v.integer)) else null,
+            .byte_limit = if (payload.get("byte_limit")) |v| @as(u64, @intCast(v.integer)) else null,
+        } };
+    }
+    if (std.mem.eql(u8, type_str, "artifact_retrieved")) {
+        var res = tool_types.ArtifactRetrieveResponse{
+            .artifact = try deserializeArtifactReference(payload.get("artifact").?.object, allocator),
+        };
+        errdefer res.deinit(allocator);
+        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        return .{ .artifact_retrieved = res };
+    }
+    if (std.mem.eql(u8, type_str, "artifact_search")) {
+        return .{ .artifact_search = .{
+            .query = try allocator.dupe(u8, payload.get("query").?.string),
+            .limit = if (payload.get("limit")) |v| @as(u32, @intCast(v.integer)) else null,
+        } };
+    }
+    if (std.mem.eql(u8, type_str, "artifact_search_result")) {
+        const values = payload.get("results").?.array;
+        const results = try allocator.alloc(tool_types.ArtifactSearchResult, values.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (results[0..initialized]) |*result| result.deinit(allocator);
+            allocator.free(results);
+        }
+        for (values.items, 0..) |item, i| {
+            const obj = item.object;
+            results[i] = blk: {
+                var result = tool_types.ArtifactSearchResult{
+                    .artifact = try deserializeArtifactReference(obj.get("artifact").?.object, allocator),
+                };
+                errdefer result.deinit(allocator);
+                if (obj.get("snippet")) |v| result.snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+                if (obj.get("score")) |v| result.score = switch (v) {
+                    .float => |f| @floatCast(f),
+                    .integer => |n| @floatFromInt(n),
+                    else => null,
+                };
+                break :blk result;
+            };
+            initialized += 1;
+        }
+        return .{ .artifact_search_result = .{ .results = results } };
+    }
+    if (std.mem.eql(u8, type_str, "hashline_read")) {
+        return .{ .hashline_read = .{
+            .path = try allocator.dupe(u8, payload.get("path").?.string),
+            .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
+            .byte_limit = if (payload.get("byte_limit")) |v| @as(u64, @intCast(v.integer)) else null,
+        } };
+    }
+    if (std.mem.eql(u8, type_str, "hashline_read_result")) {
+        const values = payload.get("lines").?.array;
+        const lines = try allocator.alloc(tool_types.HashlineLine, values.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (lines[0..initialized]) |*line| line.deinit(allocator);
+            allocator.free(lines);
+        }
+        for (values.items, 0..) |item, i| {
+            const obj = item.object;
+            lines[i] = blk: {
+                const hash = try allocator.dupe(u8, obj.get("hash").?.string);
+                errdefer allocator.free(hash);
+                const text = try allocator.dupe(u8, obj.get("text").?.string);
+                errdefer allocator.free(text);
+                break :blk .{
+                    .line = @as(u32, @intCast(obj.get("line").?.integer)),
+                    .hash = hash,
+                    .text = text,
+                };
+            };
+            initialized += 1;
+        }
+        return .{ .hashline_read_result = .{
+            .path = try allocator.dupe(u8, payload.get("path").?.string),
+            .lines = lines,
+        } };
+    }
+    if (std.mem.eql(u8, type_str, "hashline_edit")) {
+        var req = tool_types.HashlineEditRequest{
+            .path = try allocator.dupe(u8, payload.get("path").?.string),
+            .operation = std.meta.stringToEnum(tool_types.HashlineEditOperation, payload.get("operation").?.string) orelse return error.InvalidPayloadType,
+            .start_line = @as(u32, @intCast(payload.get("start_line").?.integer)),
+            .start_hash = try allocator.dupe(u8, payload.get("start_hash").?.string),
+            .feature_enabled = if (payload.get("feature_enabled")) |v| v.bool else false,
+        };
+        errdefer {
+            allocator.free(req.path);
+            allocator.free(req.start_hash);
+            req.end_hash.deinit(allocator);
+            req.replacement.deinit(allocator);
+        }
+        if (payload.get("end_line")) |v| req.end_line = @as(u32, @intCast(v.integer));
+        if (payload.get("end_hash")) |v| req.end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (payload.get("replacement")) |v| req.replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        return .{ .hashline_edit = req };
+    }
+    if (std.mem.eql(u8, type_str, "hashline_edit_result")) {
+        var res = tool_types.HashlineEditResponse{
+            .path = try allocator.dupe(u8, payload.get("path").?.string),
+            .applied = payload.get("applied").?.bool,
+        };
+        errdefer res.deinit(allocator);
+        if (payload.get("new_artifact")) |v| res.new_artifact = try deserializeArtifactReference(v.object, allocator);
+        return .{ .hashline_edit_result = res };
     }
     if (std.mem.eql(u8, type_str, "ping")) return .ping;
     if (std.mem.eql(u8, type_str, "pong")) {
@@ -440,4 +668,113 @@ test "tool envelope negative timeout error" {
 
     try std.testing.expect(env.payload == .tool_error);
     try std.testing.expectEqual(tool_types.ToolErrorCode.tool_timeout, env.payload.tool_error.code);
+}
+
+test "tool envelope roundtrip artifact search response" {
+    const allocator = std.testing.allocator;
+
+    const results = try allocator.alloc(tool_types.ArtifactSearchResult, 1);
+    results[0] = .{
+        .artifact = .{
+            .artifact_id = try allocator.dupe(u8, "artifact-1"),
+            .uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "makai-artifact://artifact-1")),
+            .mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "text/plain")),
+            .byte_size = 128,
+            .description = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "raw logs")),
+        },
+        .snippet = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "error line")),
+        .score = 0.75,
+    };
+
+    var env = tool_types.Envelope{
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
+        .sequence = 3,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .artifact_search_result = .{ .results = results } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .artifact_search_result);
+    try std.testing.expectEqual(@as(usize, 1), parsed.payload.artifact_search_result.results.len);
+    try std.testing.expectEqualStrings("artifact-1", parsed.payload.artifact_search_result.results[0].artifact.artifact_id);
+    try std.testing.expectEqualStrings("error line", parsed.payload.artifact_search_result.results[0].snippet.slice());
+}
+
+test "tool envelope roundtrip tool result artifacts" {
+    const allocator = std.testing.allocator;
+
+    const artifacts = try allocator.alloc(tool_types.ArtifactReference, 1);
+    artifacts[0] = .{
+        .artifact_id = try allocator.dupe(u8, "artifact-tool-output"),
+        .uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "makai-artifact://artifact-tool-output")),
+        .mime_type = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "application/json")),
+        .byte_size = 4096,
+    };
+
+    var env = tool_types.Envelope{
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
+        .sequence = 4,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .tool_result = .{
+            .execution_id = tool_types.generateUlid(),
+            .tool_call_id = try allocator.dupe(u8, "call_1"),
+            .result_json = try allocator.dupe(u8, "[{\"type\":\"text\",\"text\":\"summary\"}]"),
+            .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"summary\":true}")),
+            .artifacts = OwnedSlice(tool_types.ArtifactReference).initOwned(artifacts),
+            .duration_ms = 25,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .tool_result);
+    try std.testing.expectEqual(@as(usize, 1), parsed.payload.tool_result.artifacts.slice().len);
+    try std.testing.expectEqualStrings("artifact-tool-output", parsed.payload.tool_result.artifacts.slice()[0].artifact_id);
+}
+
+test "tool envelope roundtrip hashline edit" {
+    const allocator = std.testing.allocator;
+
+    var env = tool_types.Envelope{
+        .server_id = tool_types.generateUlid(),
+        .message_id = tool_types.generateUlid(),
+        .sequence = 5,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .hashline_edit = .{
+            .path = try allocator.dupe(u8, "src/main.zig"),
+            .operation = .replace_range,
+            .start_line = 10,
+            .start_hash = try allocator.dupe(u8, "a1b2"),
+            .end_line = 12,
+            .end_hash = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "c3d4")),
+            .replacement = OwnedSlice(u8).initOwned(try allocator.dupe(u8, "const x = 1;")),
+            .feature_enabled = true,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.payload == .hashline_edit);
+    try std.testing.expect(parsed.payload.hashline_edit.feature_enabled);
+    try std.testing.expectEqual(tool_types.HashlineEditOperation.replace_range, parsed.payload.hashline_edit.operation);
+    try std.testing.expectEqualStrings("a1b2", parsed.payload.hashline_edit.start_hash);
+    try std.testing.expectEqualStrings("const x = 1;", parsed.payload.hashline_edit.replacement.slice());
 }

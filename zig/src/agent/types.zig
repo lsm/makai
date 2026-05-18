@@ -5,6 +5,7 @@ const event_stream = @import("event_stream");
 const owned_slice_mod = @import("owned_slice");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
+pub const ArtifactReference = ai_types.ArtifactReference;
 
 // ============================================================================
 // Agent Event Types
@@ -49,6 +50,37 @@ pub const MessageEndPayload = struct {
     message: ai_types.Message,
 };
 
+/// Aggregate byte/token pressure for one provider request context.
+pub const ContextUsagePayload = struct {
+    system_prompt_bytes: u64 = 0,
+    message_bytes: u64 = 0,
+    tool_definition_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    message_count: u32 = 0,
+    tool_count: u32 = 0,
+};
+
+pub const PromptSegmentKind = enum {
+    system_prompt,
+    message_history,
+    tool_definitions,
+};
+
+pub const PromptSegmentCacheRole = enum {
+    stable,
+    dynamic,
+};
+
+/// Cache-aware prompt segment accounting for TUI context-pressure views.
+pub const PromptSegmentUsagePayload = struct {
+    segment: PromptSegmentKind,
+    cache_role: PromptSegmentCacheRole,
+    bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    item_count: u32 = 0,
+};
+
 /// Payload for tool_execution_start event
 pub const ToolExecutionStartPayload = struct {
     tool_call_id: []const u8,
@@ -70,6 +102,16 @@ pub const ToolExecutionEndPayload = struct {
     tool_name: []const u8,
     result_json: []const u8,
     is_error: bool,
+    args_bytes: u64 = 0,
+    raw_result_bytes: u64 = 0,
+    returned_result_bytes: u64 = 0,
+    raw_details_bytes: u64 = 0,
+    returned_details_bytes: u64 = 0,
+    raw_total_bytes: u64 = 0,
+    returned_total_bytes: u64 = 0,
+    estimated_returned_tokens: u64 = 0,
+    artifact_count: u32 = 0,
+    artifacts: []const ArtifactReference = &.{},
 };
 
 /// Agent event types emitted during execution
@@ -86,6 +128,8 @@ pub const AgentEvent = union(enum) {
     message_start: MessageStartPayload,
     message_update: MessageUpdatePayload,
     message_end: MessageEndPayload,
+    context_usage: ContextUsagePayload,
+    prompt_segment_usage: PromptSegmentUsagePayload,
 
     // Tool execution lifecycle
     tool_execution_start: ToolExecutionStartPayload,
@@ -101,6 +145,7 @@ pub const AgentEvent = union(enum) {
 pub const AgentToolResult = struct {
     content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
 
     pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
         const details = self.details_json.slice();
@@ -110,6 +155,7 @@ pub const AgentToolResult = struct {
     pub fn deinit(self: *AgentToolResult, allocator: std.mem.Allocator) void {
         self.content.deinit(allocator);
         self.details_json.deinit(allocator);
+        self.artifacts.deinit(allocator);
     }
 };
 
@@ -142,6 +188,28 @@ pub const ToolProtocolExecuteFn = *const fn (
     on_update: ?ToolUpdateCallback,
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
+
+pub const ToolOutputMiddlewareInput = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    is_error: bool,
+    raw_result_bytes: u64,
+    raw_details_bytes: u64,
+    raw_total_bytes: u64,
+};
+
+/// Hook point for reversible tool-output filtering/artifact backing.
+///
+/// Implementations may mutate `result` in place, for example by replacing a
+/// large text payload with a compact summary plus `ArtifactReference` entries.
+/// The hook owns any memory it puts into `result`.
+pub const ToolOutputMiddlewareFn = *const fn (
+    ctx: ?*anyopaque,
+    input: ToolOutputMiddlewareInput,
+    result: *AgentToolResult,
+    allocator: std.mem.Allocator,
+) anyerror!void;
 
 /// Agent tool definition
 pub const AgentTool = struct {
@@ -274,6 +342,8 @@ pub const AgentLoopConfig = struct {
     tools: ?[]const AgentTool = null,
     execute_tool_via_protocol_fn: ?ToolProtocolExecuteFn = null,
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
+    tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
+    tool_output_middleware_ctx: ?*anyopaque = null,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,

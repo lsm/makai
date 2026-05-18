@@ -35,6 +35,9 @@ pub const ToolErrorCode = enum {
     internal_error,
     tool_unavailable,
     invalid_arguments,
+    artifact_not_found,
+    hashline_disabled,
+    stale_anchor,
 };
 
 /// Tool metadata for registration
@@ -151,6 +154,8 @@ pub const ToolExecuteResult = struct {
     error_message: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     /// Additional details JSON
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    /// Raw output artifacts retained outside context for retrieval.
+    artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
     /// Execution duration in milliseconds
     duration_ms: u32,
 
@@ -196,6 +201,164 @@ pub const ToolExecutionInfo = struct {
     completed_at: ?i64 = null,
 };
 
+/// Reference to raw tool output or analysis data kept outside model context.
+pub const ArtifactReference = struct {
+    artifact_id: []const u8,
+    uri: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    mime_type: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    byte_size: ?u64 = null,
+    sha256: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    description: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getUri(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.uri.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getMimeType(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.mime_type.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getSha256(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.sha256.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getDescription(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.description.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ArtifactReference, allocator: std.mem.Allocator) void {
+        allocator.free(self.artifact_id);
+        self.uri.deinit(allocator);
+        self.mime_type.deinit(allocator);
+        self.sha256.deinit(allocator);
+        self.description.deinit(allocator);
+    }
+};
+
+pub const ArtifactRetrieveRequest = struct {
+    artifact_id: []const u8,
+    byte_offset: ?u64 = null,
+    byte_limit: ?u64 = null,
+};
+
+pub const ArtifactRetrieveResponse = struct {
+    artifact: ArtifactReference,
+    content_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getContentJson(self: *const ArtifactRetrieveResponse) ?[]const u8 {
+        const value = self.content_json.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ArtifactRetrieveResponse, allocator: std.mem.Allocator) void {
+        self.artifact.deinit(allocator);
+        self.content_json.deinit(allocator);
+    }
+};
+
+pub const ArtifactSearchRequest = struct {
+    query: []const u8,
+    limit: ?u32 = null,
+};
+
+pub const ArtifactSearchResult = struct {
+    artifact: ArtifactReference,
+    snippet: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    score: ?f32 = null,
+
+    pub fn getSnippet(self: *const ArtifactSearchResult) ?[]const u8 {
+        const value = self.snippet.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ArtifactSearchResult, allocator: std.mem.Allocator) void {
+        self.artifact.deinit(allocator);
+        self.snippet.deinit(allocator);
+    }
+};
+
+pub const ArtifactSearchResponse = struct {
+    results: []const ArtifactSearchResult,
+
+    pub fn deinit(self: *ArtifactSearchResponse, allocator: std.mem.Allocator) void {
+        const mut_results: []ArtifactSearchResult = @constCast(self.results);
+        for (mut_results) |*result| result.deinit(allocator);
+        allocator.free(self.results);
+    }
+};
+
+pub const HashlineEditOperation = enum {
+    replace_range,
+    insert_before,
+    insert_after,
+    delete_range,
+};
+
+pub const HashlineReadRequest = struct {
+    path: []const u8,
+    feature_enabled: bool = false,
+    byte_limit: ?u64 = null,
+};
+
+pub const HashlineLine = struct {
+    line: u32,
+    hash: []const u8,
+    text: []const u8,
+
+    pub fn deinit(self: *HashlineLine, allocator: std.mem.Allocator) void {
+        allocator.free(self.hash);
+        allocator.free(self.text);
+    }
+};
+
+pub const HashlineReadResponse = struct {
+    path: []const u8,
+    lines: []const HashlineLine,
+
+    pub fn deinit(self: *HashlineReadResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        const mut_lines: []HashlineLine = @constCast(self.lines);
+        for (mut_lines) |*line| line.deinit(allocator);
+        allocator.free(self.lines);
+    }
+};
+
+pub const HashlineEditRequest = struct {
+    path: []const u8,
+    operation: HashlineEditOperation,
+    start_line: u32,
+    start_hash: []const u8,
+    end_line: ?u32 = null,
+    end_hash: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    replacement: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    feature_enabled: bool = false,
+
+    pub fn getEndHash(self: *const HashlineEditRequest) ?[]const u8 {
+        const value = self.end_hash.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getReplacement(self: *const HashlineEditRequest) ?[]const u8 {
+        const value = self.replacement.slice();
+        return if (value.len > 0) value else null;
+    }
+};
+
+pub const HashlineEditResponse = struct {
+    path: []const u8,
+    applied: bool,
+    new_artifact: ?ArtifactReference = null,
+
+    pub fn deinit(self: *HashlineEditResponse, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        if (self.new_artifact) |*artifact| artifact.deinit(allocator);
+    }
+};
+
 pub const Goodbye = struct {
     reason: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
 
@@ -230,6 +393,19 @@ pub const Payload = union(enum) {
     tool_error: struct { execution_id: Ulid, code: ToolErrorCode, message: []const u8 },
     tool_status: struct { execution_id: Ulid },
     tool_status_response: ToolExecutionInfo,
+
+    // Artifact retrieval/search for reversible compression.
+    artifact_retrieve: ArtifactRetrieveRequest,
+    artifact_retrieved: ArtifactRetrieveResponse,
+    artifact_search: ArtifactSearchRequest,
+    artifact_search_result: ArtifactSearchResponse,
+
+    // Experimental hashline edit harness messages. Servers must require the
+    // feature flag before applying edits.
+    hashline_read: HashlineReadRequest,
+    hashline_read_result: HashlineReadResponse,
+    hashline_edit: HashlineEditRequest,
+    hashline_edit_result: HashlineEditResponse,
 
     // Keepalive
     ping: void,
@@ -285,10 +461,24 @@ pub const Payload = union(enum) {
                 allocator.free(res.result_json);
                 res.error_message.deinit(allocator);
                 res.details_json.deinit(allocator);
+                res.artifacts.deinit(allocator);
             },
             .tool_cancel => |*req| req.reason.deinit(allocator),
             .tool_error => |*err| allocator.free(err.message),
             .tool_status_response => |*info| allocator.free(info.tool_name),
+            .artifact_retrieve => |*req| allocator.free(req.artifact_id),
+            .artifact_retrieved => |*res| res.deinit(allocator),
+            .artifact_search => |*req| allocator.free(req.query),
+            .artifact_search_result => |*res| res.deinit(allocator),
+            .hashline_read => |*req| allocator.free(req.path),
+            .hashline_read_result => |*res| res.deinit(allocator),
+            .hashline_edit => |*req| {
+                allocator.free(req.path);
+                allocator.free(req.start_hash);
+                req.end_hash.deinit(allocator);
+                req.replacement.deinit(allocator);
+            },
+            .hashline_edit_result => |*res| res.deinit(allocator),
             .pong => |*p| p.ping_id.deinit(allocator),
             .goodbye => |*g| g.deinit(allocator),
             .ping, .tool_cancelled, .tool_status => {},

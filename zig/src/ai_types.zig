@@ -296,6 +296,44 @@ pub const UserMessage = struct {
     }
 };
 
+/// Reference to raw data stored outside the model transcript.
+pub const ArtifactReference = struct {
+    artifact_id: []const u8,
+    uri: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    mime_type: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    byte_size: ?u64 = null,
+    sha256: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    description: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getUri(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.uri.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getMimeType(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.mime_type.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getSha256(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.sha256.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getDescription(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.description.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ArtifactReference, allocator: std.mem.Allocator) void {
+        allocator.free(self.artifact_id);
+        self.uri.deinit(allocator);
+        self.mime_type.deinit(allocator);
+        self.sha256.deinit(allocator);
+        self.description.deinit(allocator);
+    }
+};
+
 pub const AssistantMessage = struct {
     content: []const AssistantContent,
     api: []const u8,
@@ -385,6 +423,7 @@ pub const ToolResultMessage = struct {
     tool_name: []const u8,
     content: []const UserContentPart,
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
     is_error: bool,
     timestamp: i64,
 
@@ -404,6 +443,7 @@ pub const ToolResultMessage = struct {
         }
         allocator.free(self.content);
         self.details_json.deinit(allocator);
+        self.artifacts.deinit(allocator);
     }
 };
 
@@ -911,6 +951,12 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
         OwnedSlice(u8).initBorrowed("");
     errdefer details_json.deinit(allocator);
 
+    const cloned_artifacts = try cloneArtifactReferences(allocator, tr.artifacts.slice());
+    errdefer {
+        var artifacts = OwnedSlice(ArtifactReference).initOwned(cloned_artifacts);
+        artifacts.deinit(allocator);
+    }
+
     const tool_call_id = try allocator.dupe(u8, tr.tool_call_id);
     errdefer allocator.free(tool_call_id);
     const tool_name = try allocator.dupe(u8, tr.tool_name);
@@ -921,8 +967,75 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
         .tool_name = tool_name,
         .content = cloned_content,
         .details_json = details_json,
+        .artifacts = OwnedSlice(ArtifactReference).initOwned(cloned_artifacts),
         .is_error = tr.is_error,
         .timestamp = tr.timestamp,
+    };
+}
+
+fn cloneArtifactReferences(allocator: std.mem.Allocator, artifacts: []const ArtifactReference) ![]ArtifactReference {
+    const cloned = try allocator.alloc(ArtifactReference, artifacts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*artifact| artifact.deinit(allocator);
+        allocator.free(cloned);
+    }
+
+    for (artifacts, 0..) |artifact, i| {
+        cloned[i] = try cloneArtifactReference(allocator, artifact);
+        initialized += 1;
+    }
+
+    return cloned;
+}
+
+fn cloneArtifactReference(allocator: std.mem.Allocator, artifact: ArtifactReference) !ArtifactReference {
+    const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+    errdefer allocator.free(artifact_id);
+
+    const uri = if (artifact.getUri()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = uri;
+        mutable.deinit(allocator);
+    }
+
+    const mime_type = if (artifact.getMimeType()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = mime_type;
+        mutable.deinit(allocator);
+    }
+
+    const sha256 = if (artifact.getSha256()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = sha256;
+        mutable.deinit(allocator);
+    }
+
+    const description = if (artifact.getDescription()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = description;
+        mutable.deinit(allocator);
+    }
+
+    return .{
+        .artifact_id = artifact_id,
+        .uri = uri,
+        .mime_type = mime_type,
+        .byte_size = artifact.byte_size,
+        .sha256 = sha256,
+        .description = description,
     };
 }
 
