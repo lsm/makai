@@ -7,9 +7,27 @@ pub const SessionState = struct {
     session_id: agent_types.SessionId,
     status: agent_types.AgentStatus,
     model: []const u8,
+    config_json: []const u8,
+    system_prompt: []const u8,
     message_count: u32,
     created_at: i64,
     updated_at: i64,
+};
+
+pub const PendingAgentMessage = struct {
+    session_id: agent_types.SessionId,
+    message_json: []const u8,
+    options_json: []const u8,
+    config_json: []const u8,
+    system_prompt: []const u8,
+
+    pub fn deinit(self: *PendingAgentMessage, allocator: std.mem.Allocator) void {
+        allocator.free(self.message_json);
+        allocator.free(self.options_json);
+        allocator.free(self.config_json);
+        allocator.free(self.system_prompt);
+        self.* = undefined;
+    }
 };
 
 /// Delegate that resolves a passthrough `models_request` by calling into the
@@ -51,6 +69,7 @@ pub const AgentProtocolServer = struct {
     expected_sequences: std.AutoHashMap(agent_types.SessionId, u64),
     outgoing_sequences: std.AutoHashMap(agent_types.SessionId, u64),
     outbox: std.ArrayList(agent_types.Envelope),
+    pending_messages: std.ArrayList(PendingAgentMessage),
     options: Options,
 
     const Self = @This();
@@ -66,6 +85,7 @@ pub const AgentProtocolServer = struct {
             .expected_sequences = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .outgoing_sequences = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .outbox = std.ArrayList(agent_types.Envelope).empty,
+            .pending_messages = std.ArrayList(PendingAgentMessage).empty,
             .options = options,
         };
     }
@@ -74,6 +94,8 @@ pub const AgentProtocolServer = struct {
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.value_ptr.model);
+            self.allocator.free(entry.value_ptr.config_json);
+            self.allocator.free(entry.value_ptr.system_prompt);
         }
         self.sessions.deinit();
         self.expected_sequences.deinit();
@@ -81,6 +103,9 @@ pub const AgentProtocolServer = struct {
 
         for (self.outbox.items) |*env| env.deinit(self.allocator);
         self.outbox.deinit(self.allocator);
+
+        for (self.pending_messages.items) |*pending| pending.deinit(self.allocator);
+        self.pending_messages.deinit(self.allocator);
 
         self.* = undefined;
     }
@@ -134,17 +159,29 @@ pub const AgentProtocolServer = struct {
             return try self.makeError(env.session_id, env.message_id, .agent_busy, "session already exists");
         }
 
+        const model = try self.allocator.dupe(u8, "unknown");
+        errdefer self.allocator.free(model);
+        const config_json = try self.allocator.dupe(u8, req.config_json);
+        errdefer self.allocator.free(config_json);
+        const system_prompt = try self.allocator.dupe(u8, req.getSystemPrompt() orelse "");
+        errdefer self.allocator.free(system_prompt);
+
+        try self.expected_sequences.put(session_id, 2);
+        errdefer _ = self.expected_sequences.remove(session_id);
+        try self.outgoing_sequences.put(session_id, 0);
+        errdefer _ = self.outgoing_sequences.remove(session_id);
+
         const now = compat.time.nowMillis();
         try self.sessions.put(session_id, .{
             .session_id = session_id,
             .status = .ready,
-            .model = try self.allocator.dupe(u8, "unknown"),
+            .model = model,
+            .config_json = config_json,
+            .system_prompt = system_prompt,
             .message_count = 0,
             .created_at = now,
             .updated_at = now,
         });
-        try self.expected_sequences.put(session_id, 2);
-        try self.outgoing_sequences.put(session_id, 0);
 
         return .{
             .session_id = session_id,
@@ -165,7 +202,31 @@ pub const AgentProtocolServer = struct {
         if (env.sequence != expected) {
             return try self.makeError(env.session_id, env.message_id, .invalid_request, "invalid sequence");
         }
+
+        if (session.status == .processing) {
+            return try self.makeError(env.session_id, env.message_id, .agent_busy, "session already processing a message");
+        }
+
+        const message_json = try self.allocator.dupe(u8, req.message_json);
+        errdefer self.allocator.free(message_json);
+        const options_json = try self.allocator.dupe(u8, req.getOptionsJson() orelse "");
+        errdefer self.allocator.free(options_json);
+        const config_json = try self.allocator.dupe(u8, session.config_json);
+        errdefer self.allocator.free(config_json);
+        const system_prompt = try self.allocator.dupe(u8, session.system_prompt);
+        errdefer self.allocator.free(system_prompt);
+
+        const pending = PendingAgentMessage{
+            .session_id = req.session_id,
+            .message_json = message_json,
+            .options_json = options_json,
+            .config_json = config_json,
+            .system_prompt = system_prompt,
+        };
+
         try self.expected_sequences.put(req.session_id, expected + 1);
+        errdefer self.expected_sequences.put(req.session_id, expected) catch {};
+        try self.pending_messages.append(self.allocator, pending);
 
         session.status = .processing;
         session.message_count += 1;
@@ -175,12 +236,24 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleStop(self: *Self, req: agent_types.AgentStopRequest, env: agent_types.Envelope) !?agent_types.Envelope {
+        if (!self.sessions.contains(req.session_id)) {
+            return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
+        }
+
+        const expected = self.expected_sequences.get(req.session_id) orelse 1;
+        if (env.sequence != expected) {
+            return try self.makeError(env.session_id, env.message_id, .invalid_request, "invalid sequence");
+        }
+
         const removed = self.sessions.fetchRemove(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
         self.allocator.free(removed.value.model);
+        self.allocator.free(removed.value.config_json);
+        self.allocator.free(removed.value.system_prompt);
         _ = self.expected_sequences.remove(req.session_id);
         _ = self.outgoing_sequences.remove(req.session_id);
+        self.removePendingMessages(req.session_id);
 
         const reason = if (req.getReason()) |r| try self.allocator.dupe(u8, r) else try self.allocator.dupe(u8, "stopped");
         return .{
@@ -353,7 +426,9 @@ pub const AgentProtocolServer = struct {
     }
 
     pub fn publishAgentResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
-        if (!self.sessions.contains(session_id)) return error.SessionNotFound;
+        const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        session.status = .ready;
+        session.updated_at = compat.time.nowMillis();
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
@@ -363,9 +438,61 @@ pub const AgentProtocolServer = struct {
         });
     }
 
+    pub fn publishAgentError(self: *Self, session_id: agent_types.SessionId, code: agent_types.AgentErrorCode, message: []const u8) !void {
+        const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        session.status = .@"error";
+        session.updated_at = compat.time.nowMillis();
+        try self.outbox.append(self.allocator, .{
+            .session_id = session_id,
+            .message_id = agent_types.generateUlid(),
+            .sequence = self.nextOutgoingSequence(session_id),
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .agent_error = .{
+                .code = code,
+                .message = try self.allocator.dupe(u8, message),
+            } },
+        });
+    }
+
     pub fn popOutbound(self: *Self) ?agent_types.Envelope {
         if (self.outbox.items.len == 0) return null;
         return self.outbox.orderedRemove(0);
+    }
+
+    pub fn popPendingAgentMessage(self: *Self) ?PendingAgentMessage {
+        if (self.pending_messages.items.len == 0) return null;
+        return self.pending_messages.orderedRemove(0);
+    }
+
+    pub fn hasSession(self: *Self, session_id: agent_types.SessionId) bool {
+        return self.sessions.contains(session_id);
+    }
+
+    pub fn updateSessionModel(self: *Self, session_id: agent_types.SessionId, model: []const u8) !void {
+        const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        const next = try self.allocator.dupe(u8, model);
+        self.allocator.free(session.model);
+        session.model = next;
+        session.updated_at = compat.time.nowMillis();
+    }
+
+    pub fn markSessionError(self: *Self, session_id: agent_types.SessionId) void {
+        if (self.sessions.getPtr(session_id)) |session| {
+            session.status = .@"error";
+            session.updated_at = compat.time.nowMillis();
+        }
+    }
+
+    fn removePendingMessages(self: *Self, session_id: agent_types.SessionId) void {
+        var idx: usize = 0;
+        while (idx < self.pending_messages.items.len) {
+            if (std.mem.eql(u8, &self.pending_messages.items[idx].session_id, &session_id)) {
+                var removed = self.pending_messages.orderedRemove(idx);
+                removed.deinit(self.allocator);
+                continue;
+            }
+            idx += 1;
+        }
     }
 };
 
@@ -690,7 +817,7 @@ test "AgentProtocolServer start message status stop" {
     var stop = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
-        .sequence = 4,
+        .sequence = 3,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .agent_stop = .{ .session_id = sid } },
     };
@@ -699,4 +826,42 @@ test "AgentProtocolServer start message status stop" {
     var stop_resp = (try server.handleEnvelope(stop)).?;
     defer stop_resp.deinit(allocator);
     try std.testing.expect(stop_resp.payload == .agent_stopped);
+}
+
+test "AgentProtocolServer rejects out-of-order stop without removing session" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    var start = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = sid,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer start.deinit(allocator);
+
+    var start_resp = (try server.handleEnvelope(start)).?;
+    defer start_resp.deinit(allocator);
+    try std.testing.expect(start_resp.payload == .agent_started);
+
+    const stale_stop = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stop = .{ .session_id = sid } },
+    };
+
+    var stop_resp = (try server.handleEnvelope(stale_stop)).?;
+    defer stop_resp.deinit(allocator);
+    try std.testing.expect(stop_resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, stop_resp.payload.agent_error.code);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
+    try std.testing.expect(server.hasSession(sid));
 }

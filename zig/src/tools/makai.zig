@@ -14,6 +14,11 @@ const auth_protocol_runtime = @import("auth_runtime");
 const auth_protocol_envelope = @import("auth_envelope");
 const auth_cli = @import("auth_cli");
 const event_stream = @import("event_stream");
+const agent_loop = @import("agent_loop");
+const agent_bridge = @import("agent_bridge");
+const transport = @import("transport");
+const model_ref = @import("model_ref");
+const json_writer = @import("json_writer");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
 
@@ -37,11 +42,79 @@ const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30; // ~30ms with STDIO_IDLE_SLEEP_NS.
+const TEST_AGENT_POLL_ITERS_DEFAULT: usize = 2_000; // ~2s with STDIO_IDLE_SLEEP_NS.
 
 const RuntimeErrorCode = enum {
     dispatch_error,
     unknown_envelope,
     runtime_error,
+};
+
+const AgentRunOptions = struct {
+    temperature: ?f32 = null,
+    max_tokens: ?u32 = null,
+    max_iterations: ?u32 = null,
+    api_key: ?[]u8 = null,
+
+    fn deinit(self: *AgentRunOptions, allocator: std.mem.Allocator) void {
+        if (self.api_key) |key| allocator.free(key);
+        self.api_key = null;
+    }
+};
+
+const PreparedAgentRun = struct {
+    model: ai_types.Model,
+    prompts: []ai_types.Message,
+    system_prompt: []u8,
+    tools: []agent_loop.AgentTool,
+    options: AgentRunOptions,
+
+    fn deinit(self: *PreparedAgentRun, allocator: std.mem.Allocator) void {
+        self.model.deinit(allocator);
+        for (self.prompts) |*message| {
+            message.deinit(allocator);
+        }
+        allocator.free(self.prompts);
+        allocator.free(self.system_prompt);
+        deinitAgentTools(allocator, self.tools);
+        self.options.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn disarm(self: *PreparedAgentRun) void {
+        self.model.is_owned = false;
+        self.prompts = &.{};
+        self.system_prompt = &.{};
+        self.tools = &.{};
+        self.options.api_key = null;
+    }
+};
+
+const ActiveAgentRun = struct {
+    session_id: AgentProtocolTypes.SessionId,
+    stream: *agent_loop.AgentEventStream,
+    context: *agent_loop.AgentContext,
+    model: ai_types.Model,
+    prompts: []ai_types.Message,
+    tools: []agent_loop.AgentTool,
+    cancel_flag: *std.atomic.Value(bool),
+
+    fn cancel(self: *ActiveAgentRun) void {
+        self.cancel_flag.store(true, .release);
+    }
+
+    fn deinit(self: *ActiveAgentRun, allocator: std.mem.Allocator) void {
+        self.cancel();
+        self.stream.deinit();
+        allocator.destroy(self.stream);
+        self.context.deinit();
+        allocator.destroy(self.context);
+        self.model.deinit(allocator);
+        allocator.free(self.prompts);
+        deinitAgentTools(allocator, self.tools);
+        allocator.destroy(self.cancel_flag);
+        self.* = undefined;
+    }
 };
 
 // NOTE: legacy auth-context globals (`g_auth_ctx`, `AuthContext`, OAuth-callback
@@ -59,6 +132,8 @@ const StdioProtocolLoop = struct {
     provider_pipe: in_process.SerializedPipe,
     agent_server: AgentProtocolServer,
     agent_pipe: in_process.SerializedPipe,
+    provider_bridge: agent_bridge.InProcessProviderProtocolBridge,
+    active_agent_runs: std.ArrayList(ActiveAgentRun),
     auth_server: AuthProtocolServer,
     auth_pipe: in_process.SerializedPipe,
 
@@ -79,6 +154,8 @@ const StdioProtocolLoop = struct {
             .provider_pipe = in_process.createSerializedPipe(allocator),
             .agent_server = AgentProtocolServer.init(allocator),
             .agent_pipe = in_process.createSerializedPipe(allocator),
+            .provider_bridge = agent_bridge.InProcessProviderProtocolBridge.init(registry),
+            .active_agent_runs = std.ArrayList(ActiveAgentRun).empty,
             .auth_server = AuthProtocolServer.init(allocator, auth_options),
             .auth_pipe = in_process.createSerializedPipe(allocator),
         };
@@ -105,6 +182,8 @@ const StdioProtocolLoop = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.active_agent_runs.items) |*run| run.deinit(self.allocator);
+        self.active_agent_runs.deinit(self.allocator);
         self.provider_server.deinit();
         self.provider_pipe.deinit();
         self.agent_server.deinit();
@@ -137,6 +216,12 @@ const StdioProtocolLoop = struct {
                 _ = try runtime.pumpServerOutbox();
             },
             .agent => {
+                if (!hasValidAgentEnvelopeShape(line, self.allocator)) return false;
+                const stopped_session = validatedAgentStopSessionFromLine(line, self.allocator);
+                const had_stop_session = if (stopped_session) |session_id|
+                    self.agent_server.hasSession(session_id)
+                else
+                    false;
                 var sender = self.agent_pipe.clientSender();
                 try sender.write(line);
                 try sender.flush();
@@ -146,6 +231,11 @@ const StdioProtocolLoop = struct {
                     .allocator = self.allocator,
                 };
                 try runtime.pumpClientMessages();
+                if (stopped_session) |session_id| {
+                    if (had_stop_session and !self.agent_server.hasSession(session_id)) {
+                        self.cancelAgentRun(session_id);
+                    }
+                }
             },
             .auth => {
                 var sender = self.auth_pipe.clientSender();
@@ -179,6 +269,8 @@ const StdioProtocolLoop = struct {
             .pipe = &self.agent_pipe,
             .allocator = self.allocator,
         };
+        forwarded += try self.startPendingAgentRuns();
+        forwarded += try self.pumpAgentRuns();
         forwarded += try agent_runtime.pumpServerOutbox();
 
         var auth_runtime = AuthProtocolRuntime{
@@ -202,8 +294,157 @@ const StdioProtocolLoop = struct {
         return self.provider_server.activeStreamCount() > 0;
     }
 
+    pub fn hasActiveAgentRuns(self: *Self) bool {
+        return self.active_agent_runs.items.len > 0;
+    }
+
     pub fn hasActiveAuthFlows(self: *Self) bool {
         return self.auth_server.activeFlowCount() > 0;
+    }
+
+    fn startPendingAgentRuns(self: *Self) !usize {
+        var started: usize = 0;
+        while (self.agent_server.popPendingAgentMessage()) |pending| {
+            var owned_pending = pending;
+            defer owned_pending.deinit(self.allocator);
+
+            self.startAgentRun(owned_pending) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try self.publishAgentLoopError(owned_pending.session_id, @errorName(err));
+                self.agent_server.markSessionError(owned_pending.session_id);
+                continue;
+            };
+            started += 1;
+        }
+        return started;
+    }
+
+    fn startAgentRun(self: *Self, pending: agent_protocol_server.PendingAgentMessage) !void {
+        if (self.findActiveAgentRun(pending.session_id) != null) return error.AgentBusy;
+
+        var prepared = try prepareAgentRun(self.allocator, pending);
+        errdefer prepared.deinit(self.allocator);
+
+        self.agent_server.updateSessionModel(pending.session_id, prepared.model.id) catch {};
+
+        const context = try self.allocator.create(agent_loop.AgentContext);
+        var context_owned_by_run = false;
+        errdefer if (!context_owned_by_run) self.allocator.destroy(context);
+        context.* = agent_loop.AgentContext.init(self.allocator);
+        errdefer if (!context_owned_by_run) context.deinit();
+        context.system_prompt = ai_types.OwnedSlice(u8).initOwned(prepared.system_prompt);
+        prepared.system_prompt = &.{};
+        context.tools = prepared.tools;
+
+        const cancel_flag = try self.allocator.create(std.atomic.Value(bool));
+        var cancel_owned_by_run = false;
+        errdefer if (!cancel_owned_by_run) self.allocator.destroy(cancel_flag);
+        cancel_flag.* = std.atomic.Value(bool).init(false);
+
+        const session_id_text = try AgentProtocolTypes.sessionIdToString(pending.session_id, self.allocator);
+        defer self.allocator.free(session_id_text);
+
+        const config = agent_loop.AgentLoopConfig{
+            .model = prepared.model,
+            .protocol = (&self.provider_bridge).protocolClient(),
+            .tools = prepared.tools,
+            .temperature = prepared.options.temperature,
+            .max_tokens = prepared.options.max_tokens,
+            .max_iterations = prepared.options.max_iterations,
+            .session_id = session_id_text,
+            .api_key = prepared.options.api_key,
+            .cancel_token = .{ .cancelled = cancel_flag },
+        };
+
+        const stream = try agent_loop.agentLoop(self.allocator, prepared.prompts, context, config);
+        var stream_owned_by_run = false;
+        errdefer if (!stream_owned_by_run) {
+            stream.deinit();
+            self.allocator.destroy(stream);
+        };
+
+        var run = ActiveAgentRun{
+            .session_id = pending.session_id,
+            .stream = stream,
+            .context = context,
+            .model = prepared.model,
+            .prompts = prepared.prompts,
+            .tools = prepared.tools,
+            .cancel_flag = cancel_flag,
+        };
+        prepared.options.deinit(self.allocator);
+        context_owned_by_run = true;
+        cancel_owned_by_run = true;
+        stream_owned_by_run = true;
+        prepared.disarm();
+
+        var appended = false;
+        errdefer if (!appended) run.deinit(self.allocator);
+        try self.active_agent_runs.append(self.allocator, run);
+        appended = true;
+    }
+
+    fn pumpAgentRuns(self: *Self) !usize {
+        var forwarded: usize = 0;
+        var idx: usize = 0;
+        while (idx < self.active_agent_runs.items.len) {
+            var run = &self.active_agent_runs.items[idx];
+
+            if (!self.agent_server.hasSession(run.session_id)) {
+                run.cancel();
+            }
+
+            while (run.stream.poll()) |event| {
+                const event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
+                defer self.allocator.free(event_json);
+                self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
+                forwarded += 1;
+            }
+
+            if (!run.stream.isDone()) {
+                idx += 1;
+                continue;
+            }
+
+            if (run.stream.getError()) |msg| {
+                try self.publishAgentLoopError(run.session_id, msg);
+                self.agent_server.markSessionError(run.session_id);
+                forwarded += 1;
+            } else if (run.stream.getResult()) |result| {
+                const result_json = try transport.serializeResult(result.final_message, self.allocator);
+                defer self.allocator.free(result_json);
+                self.agent_server.publishAgentResult(run.session_id, result_json) catch {};
+                forwarded += 1;
+            }
+
+            var removed = self.active_agent_runs.orderedRemove(idx);
+            removed.deinit(self.allocator);
+        }
+        return forwarded;
+    }
+
+    fn findActiveAgentRun(self: *Self, session_id: AgentProtocolTypes.SessionId) ?usize {
+        for (self.active_agent_runs.items, 0..) |run, idx| {
+            if (std.mem.eql(u8, run.session_id[0..], session_id[0..])) return idx;
+        }
+        return null;
+    }
+
+    fn cancelAgentRun(self: *Self, session_id: AgentProtocolTypes.SessionId) void {
+        if (self.findActiveAgentRun(session_id)) |idx| {
+            self.active_agent_runs.items[idx].cancel();
+        }
+    }
+
+    fn publishAgentLoopError(self: *Self, session_id: AgentProtocolTypes.SessionId, message: []const u8) !void {
+        const event_json = try serializeAgentErrorEvent(self.allocator, message, "internal_error");
+        defer self.allocator.free(event_json);
+        self.agent_server.publishAgentEvent(session_id, event_json) catch |err| {
+            if (err == error.OutOfMemory) return err;
+        };
+        self.agent_server.publishAgentError(session_id, .internal_error, message) catch |err| {
+            if (err == error.OutOfMemory) return err;
+        };
     }
 
     fn detectDispatchTarget(self: *Self, line: []const u8) ?DispatchTarget {
@@ -256,6 +497,787 @@ const StdioProtocolLoop = struct {
         return drained;
     }
 };
+
+fn prepareAgentRun(
+    allocator: std.mem.Allocator,
+    pending: agent_protocol_server.PendingAgentMessage,
+) !PreparedAgentRun {
+    var message_parsed = try std.json.parseFromSlice(std.json.Value, allocator, pending.message_json, .{});
+    defer message_parsed.deinit();
+    if (message_parsed.value != .object) return error.InvalidAgentMessageJson;
+    const message_obj = message_parsed.value.object;
+
+    var config_parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (config_parsed) |*parsed| parsed.deinit();
+    var config_obj: ?std.json.ObjectMap = null;
+    if (pending.config_json.len > 0) {
+        config_parsed = try std.json.parseFromSlice(std.json.Value, allocator, pending.config_json, .{});
+        if (config_parsed.?.value == .object) {
+            config_obj = config_parsed.?.value.object;
+        }
+    }
+
+    const model_ref_text = getStringField(message_obj, "model_ref") orelse blk: {
+        if (config_obj) |obj| break :blk getStringField(obj, "model_ref");
+        break :blk null;
+    } orelse return error.MissingModelRef;
+
+    var model = try modelFromCanonicalRef(allocator, model_ref_text);
+    errdefer model.deinit(allocator);
+
+    var system_prompt_builder = std.ArrayList(u8).empty;
+    defer system_prompt_builder.deinit(allocator);
+    if (pending.system_prompt.len > 0) {
+        try appendSystemPromptText(&system_prompt_builder, allocator, pending.system_prompt);
+    }
+
+    const messages_value = message_obj.get("messages") orelse return error.MissingMessages;
+    const prompts = try parseAgentMessages(allocator, messages_value, &system_prompt_builder);
+    errdefer {
+        for (prompts) |*message| message.deinit(allocator);
+        allocator.free(prompts);
+    }
+
+    const tools = try parseAgentTools(allocator, message_obj, config_obj);
+    errdefer deinitAgentTools(allocator, tools);
+
+    const system_prompt = try allocator.dupe(u8, system_prompt_builder.items);
+    errdefer allocator.free(system_prompt);
+
+    const options = try parseAgentRunOptions(allocator, pending.options_json);
+
+    return .{
+        .model = model,
+        .prompts = prompts,
+        .system_prompt = system_prompt,
+        .tools = tools,
+        .options = options,
+    };
+}
+
+fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_types.Model {
+    var parsed = model_ref.parseModelRef(allocator, ref) catch return error.InvalidModelRef;
+    errdefer parsed.deinit(allocator);
+
+    const name = try allocator.dupe(u8, parsed.model_id);
+    errdefer allocator.free(name);
+
+    const base_url = try allocator.dupe(u8, "");
+    errdefer allocator.free(base_url);
+
+    const input = try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(input);
+
+    const model = ai_types.Model{
+        .id = parsed.model_id,
+        .name = name,
+        .api = parsed.api,
+        .provider = parsed.provider_id,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200_000,
+        .max_tokens = 4_096,
+        .is_owned = true,
+    };
+    parsed.provider_id = &.{};
+    parsed.api = &.{};
+    parsed.model_id = &.{};
+    return model;
+}
+
+fn parseAgentRunOptions(allocator: std.mem.Allocator, options_json: []const u8) !AgentRunOptions {
+    if (options_json.len == 0) return .{};
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    const obj = parsed.value.object;
+    return .{
+        .temperature = if (obj.get("temperature")) |value| valueAsF32(value) else null,
+        .max_tokens = if (obj.get("max_tokens")) |value| valueAsU32(value) else null,
+        .max_iterations = if (obj.get("max_iterations")) |value| valueAsU32(value) else null,
+        .api_key = if (getStringField(obj, "api_key")) |key| try allocator.dupe(u8, key) else null,
+    };
+}
+
+fn parseAgentTools(
+    allocator: std.mem.Allocator,
+    message_obj: std.json.ObjectMap,
+    config_obj: ?std.json.ObjectMap,
+) ![]agent_loop.AgentTool {
+    const tools_value = message_obj.get("tools") orelse blk: {
+        if (config_obj) |obj| break :blk obj.get("tools");
+        break :blk null;
+    } orelse return try allocator.alloc(agent_loop.AgentTool, 0);
+
+    if (tools_value != .array) return error.InvalidTools;
+
+    var tools = std.ArrayList(agent_loop.AgentTool).empty;
+    errdefer {
+        for (tools.items) |*tool| deinitAgentToolFields(allocator, tool);
+        tools.deinit(allocator);
+    }
+
+    for (tools_value.array.items) |item| {
+        try tools.append(allocator, try parseAgentTool(allocator, item));
+    }
+
+    return tools.toOwnedSlice(allocator);
+}
+
+fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_loop.AgentTool {
+    if (value != .object) return error.InvalidToolDefinition;
+
+    const outer_obj = value.object;
+    const tool_obj = if (std.mem.eql(u8, getStringField(outer_obj, "type") orelse "", "function")) blk: {
+        const function_value = outer_obj.get("function") orelse return error.InvalidToolDefinition;
+        if (function_value != .object) return error.InvalidToolDefinition;
+        break :blk function_value.object;
+    } else outer_obj;
+
+    const name_text = getStringField(tool_obj, "name") orelse return error.InvalidToolDefinition;
+    const description_text = getStringField(tool_obj, "description") orelse "";
+    const label_text = getStringField(tool_obj, "label") orelse getStringField(outer_obj, "label") orelse name_text;
+
+    const label = try allocator.dupe(u8, label_text);
+    errdefer allocator.free(label);
+    const name = try allocator.dupe(u8, name_text);
+    errdefer allocator.free(name);
+    const description = try allocator.dupe(u8, description_text);
+    errdefer allocator.free(description);
+    const parameters_schema_json = try parseToolSchemaJson(allocator, tool_obj);
+    errdefer allocator.free(parameters_schema_json);
+
+    return .{
+        .label = label,
+        .name = name,
+        .description = description,
+        .parameters_schema_json = parameters_schema_json,
+        .execute = unavailableAgentToolExecute,
+    };
+}
+
+fn parseToolSchemaJson(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    if (getStringField(obj, "parameters_schema_json")) |schema| return try allocator.dupe(u8, schema);
+    if (getStringField(obj, "input_schema_json")) |schema| return try allocator.dupe(u8, schema);
+    if (getStringField(obj, "schema_json")) |schema| return try allocator.dupe(u8, schema);
+
+    const schema_value = obj.get("parameters_schema") orelse
+        obj.get("input_schema") orelse
+        obj.get("parameters") orelse
+        obj.get("schema");
+
+    if (schema_value) |schema| {
+        return try std.json.Stringify.valueAlloc(allocator, schema, .{});
+    }
+
+    return try allocator.dupe(u8, "{}");
+}
+
+fn deinitAgentTools(allocator: std.mem.Allocator, tools: []agent_loop.AgentTool) void {
+    for (tools) |*tool| deinitAgentToolFields(allocator, tool);
+    allocator.free(tools);
+}
+
+fn deinitAgentToolFields(allocator: std.mem.Allocator, tool: *agent_loop.AgentTool) void {
+    allocator.free(tool.label);
+    allocator.free(tool.name);
+    allocator.free(tool.description);
+    allocator.free(tool.parameters_schema_json);
+}
+
+fn unavailableAgentToolExecute(
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?*const fn (?*anyopaque, []const u8, []const u8, []const u8) void,
+    allocator: std.mem.Allocator,
+) anyerror!agent_loop.AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.ToolExecutionUnavailable;
+}
+
+fn parseAgentMessages(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+    system_prompt_builder: *std.ArrayList(u8),
+) ![]ai_types.Message {
+    if (value != .array) return error.InvalidMessages;
+
+    var messages = std.ArrayList(ai_types.Message).empty;
+    errdefer {
+        for (messages.items) |*message| message.deinit(allocator);
+        messages.deinit(allocator);
+    }
+
+    for (value.array.items) |item| {
+        if (item != .object) return error.InvalidMessage;
+        const obj = item.object;
+        const role = getStringField(obj, "role") orelse return error.MissingRole;
+
+        if (std.mem.eql(u8, role, "system") or std.mem.eql(u8, role, "developer")) {
+            if (obj.get("content")) |content| {
+                try appendContentTextToSystemPrompt(system_prompt_builder, allocator, content);
+            }
+            continue;
+        }
+
+        const message = if (std.mem.eql(u8, role, "user"))
+            try parseUserMessage(allocator, obj)
+        else if (std.mem.eql(u8, role, "assistant"))
+            try parseAssistantHistoryMessage(allocator, obj)
+        else if (std.mem.eql(u8, role, "tool") or std.mem.eql(u8, role, "tool_result"))
+            try parseToolResultHistoryMessage(allocator, obj)
+        else
+            return error.UnsupportedMessageRole;
+
+        try messages.append(allocator, message);
+    }
+
+    return messages.toOwnedSlice(allocator);
+}
+
+fn parseUserMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ai_types.Message {
+    const content_value = obj.get("content") orelse return error.MissingContent;
+    const content = try parseUserContent(allocator, content_value);
+    errdefer {
+        var mutable = content;
+        mutable.deinit(allocator);
+    }
+
+    return .{ .user = .{
+        .content = content,
+        .timestamp = parseTimestamp(obj),
+    } };
+}
+
+fn parseAssistantHistoryMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ai_types.Message {
+    const content = if (obj.get("content")) |value|
+        try parseAssistantContentBlocks(allocator, value)
+    else
+        try allocator.alloc(ai_types.AssistantContent, 0);
+    errdefer ai_types.deinitAssistantContent(allocator, content);
+
+    const api = try allocator.dupe(u8, getStringField(obj, "api") orelse "");
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, getStringField(obj, "provider_id") orelse getStringField(obj, "provider") orelse "");
+    errdefer allocator.free(provider);
+    const model = try allocator.dupe(u8, getStringField(obj, "model_id") orelse getStringField(obj, "model") orelse "");
+    errdefer allocator.free(model);
+
+    return .{ .assistant = .{
+        .content = content,
+        .api = api,
+        .provider = provider,
+        .model = model,
+        .usage = .{},
+        .stop_reason = if (getStringField(obj, "stop_reason")) |reason| parseStopReason(reason) else .stop,
+        .timestamp = parseTimestamp(obj),
+        .is_owned = true,
+    } };
+}
+
+fn parseToolResultHistoryMessage(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !ai_types.Message {
+    const content_value = obj.get("content");
+    const tool_call_id = try allocator.dupe(u8, getStringField(obj, "tool_call_id") orelse getStringField(obj, "id") orelse firstToolResultStringField(content_value, "tool_call_id") orelse firstToolResultStringField(content_value, "tool_use_id") orelse "");
+    errdefer allocator.free(tool_call_id);
+    const tool_name = try allocator.dupe(u8, getStringField(obj, "tool_name") orelse getStringField(obj, "name") orelse firstToolResultStringField(content_value, "tool_name") orelse "");
+    errdefer allocator.free(tool_name);
+
+    const content = if (content_value) |value|
+        try parseToolResultContentParts(allocator, value)
+    else
+        try allocator.alloc(ai_types.UserContentPart, 0);
+    errdefer {
+        for (content) |*part| part.deinit(allocator);
+        allocator.free(content);
+    }
+
+    var details_json = if (getStringField(obj, "details_json")) |details|
+        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, details))
+    else if (firstToolResultStringField(content_value, "details_json")) |details|
+        ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, details))
+    else
+        ai_types.OwnedSlice(u8).initBorrowed("");
+    errdefer details_json.deinit(allocator);
+
+    return .{ .tool_result = .{
+        .tool_call_id = tool_call_id,
+        .tool_name = tool_name,
+        .content = content,
+        .details_json = details_json,
+        .is_error = if (obj.get("is_error")) |value| value == .bool and value.bool else firstToolResultBoolField(content_value, "is_error") orelse false,
+        .timestamp = parseTimestamp(obj),
+    } };
+}
+
+fn parseUserContent(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.UserContent {
+    switch (value) {
+        .string => |text| return .{ .text = try allocator.dupe(u8, text) },
+        .array => |array| {
+            var parts = std.ArrayList(ai_types.UserContentPart).empty;
+            errdefer {
+                for (parts.items) |*part| part.deinit(allocator);
+                parts.deinit(allocator);
+            }
+            for (array.items) |item| {
+                if (try parseUserContentPart(allocator, item)) |part| {
+                    try parts.append(allocator, part);
+                }
+            }
+            if (parts.items.len == 0) return .{ .text = try allocator.dupe(u8, "") };
+            return .{ .parts = try parts.toOwnedSlice(allocator) };
+        },
+        else => return error.InvalidContent,
+    }
+}
+
+fn parseToolResultContentParts(allocator: std.mem.Allocator, value: std.json.Value) ![]ai_types.UserContentPart {
+    var parts = std.ArrayList(ai_types.UserContentPart).empty;
+    errdefer {
+        for (parts.items) |*part| part.deinit(allocator);
+        parts.deinit(allocator);
+    }
+
+    try appendToolResultContentParts(allocator, &parts, value);
+    if (parts.items.len == 0) try appendTextContentPart(allocator, &parts, "");
+    return parts.toOwnedSlice(allocator);
+}
+
+fn firstToolResultStringField(value: ?std.json.Value, key: []const u8) ?[]const u8 {
+    const actual = value orelse return null;
+    switch (actual) {
+        .array => |array| {
+            for (array.items) |item| {
+                if (firstToolResultStringField(item, key)) |found| return found;
+            }
+        },
+        .object => |obj| {
+            if (std.mem.eql(u8, getStringField(obj, "type") orelse "", "tool_result")) {
+                if (getStringField(obj, key)) |found| return found;
+            }
+            if (obj.get("content")) |content| return firstToolResultStringField(content, key);
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn firstToolResultBoolField(value: ?std.json.Value, key: []const u8) ?bool {
+    const actual = value orelse return null;
+    switch (actual) {
+        .array => |array| {
+            for (array.items) |item| {
+                if (firstToolResultBoolField(item, key)) |found| return found;
+            }
+        },
+        .object => |obj| {
+            if (std.mem.eql(u8, getStringField(obj, "type") orelse "", "tool_result")) {
+                if (obj.get(key)) |found| {
+                    if (found == .bool) return found.bool;
+                }
+            }
+            if (obj.get("content")) |content| return firstToolResultBoolField(content, key);
+        },
+        else => {},
+    }
+    return null;
+}
+
+fn appendToolResultContentParts(
+    allocator: std.mem.Allocator,
+    parts: *std.ArrayList(ai_types.UserContentPart),
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .string => |text| try appendTextContentPart(allocator, parts, text),
+        .array => |array| {
+            for (array.items) |item| {
+                try appendToolResultContentParts(allocator, parts, item);
+            }
+        },
+        .object => |obj| {
+            if (std.mem.eql(u8, getStringField(obj, "type") orelse "", "tool_result")) {
+                if (obj.get("content")) |content| {
+                    try appendToolResultContentParts(allocator, parts, content);
+                }
+                return;
+            }
+
+            if (try parseUserContentPart(allocator, value)) |part| {
+                parts.append(allocator, part) catch |err| {
+                    var owned = part;
+                    owned.deinit(allocator);
+                    return err;
+                };
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendTextContentPart(
+    allocator: std.mem.Allocator,
+    parts: *std.ArrayList(ai_types.UserContentPart),
+    text: []const u8,
+) !void {
+    const owned = try allocator.dupe(u8, text);
+    errdefer allocator.free(owned);
+    try parts.append(allocator, .{ .text = .{ .text = owned } });
+}
+
+fn parseUserContentPart(allocator: std.mem.Allocator, value: std.json.Value) !?ai_types.UserContentPart {
+    if (value != .object) return null;
+    const obj = value.object;
+    const ty = getStringField(obj, "type") orelse return null;
+    if (std.mem.eql(u8, ty, "text")) {
+        return .{ .text = .{
+            .text = try allocator.dupe(u8, getStringField(obj, "text") orelse ""),
+        } };
+    }
+    if (std.mem.eql(u8, ty, "image")) {
+        const data = try allocator.dupe(u8, getStringField(obj, "data") orelse "");
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, getStringField(obj, "mime_type") orelse "application/octet-stream");
+        errdefer allocator.free(mime_type);
+        return .{ .image = .{
+            .data = data,
+            .mime_type = mime_type,
+        } };
+    }
+    return null;
+}
+
+fn parseAssistantContentBlocks(allocator: std.mem.Allocator, value: std.json.Value) ![]ai_types.AssistantContent {
+    switch (value) {
+        .string => |text| {
+            const blocks = try allocator.alloc(ai_types.AssistantContent, 1);
+            errdefer allocator.free(blocks);
+            blocks[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+            return blocks;
+        },
+        .array => |array| {
+            var blocks = std.ArrayList(ai_types.AssistantContent).empty;
+            errdefer {
+                for (blocks.items) |*block| deinitAssistantContentBlock(allocator, block);
+                blocks.deinit(allocator);
+            }
+            for (array.items) |item| {
+                if (try parseAssistantContentBlock(allocator, item)) |block| {
+                    try blocks.append(allocator, block);
+                }
+            }
+            return blocks.toOwnedSlice(allocator);
+        },
+        else => return error.InvalidContent,
+    }
+}
+
+fn parseAssistantContentBlock(allocator: std.mem.Allocator, value: std.json.Value) !?ai_types.AssistantContent {
+    if (value != .object) return null;
+    const obj = value.object;
+    const ty = getStringField(obj, "type") orelse return null;
+    if (std.mem.eql(u8, ty, "text")) {
+        return .{ .text = .{ .text = try allocator.dupe(u8, getStringField(obj, "text") orelse "") } };
+    }
+    if (std.mem.eql(u8, ty, "thinking")) {
+        return .{ .thinking = .{ .thinking = try allocator.dupe(u8, getStringField(obj, "thinking") orelse "") } };
+    }
+    if (std.mem.eql(u8, ty, "image")) {
+        const data = try allocator.dupe(u8, getStringField(obj, "data") orelse "");
+        errdefer allocator.free(data);
+        const mime_type = try allocator.dupe(u8, getStringField(obj, "mime_type") orelse "application/octet-stream");
+        errdefer allocator.free(mime_type);
+        return .{ .image = .{
+            .data = data,
+            .mime_type = mime_type,
+        } };
+    }
+    if (std.mem.eql(u8, ty, "tool_call") or std.mem.eql(u8, ty, "tool_use")) {
+        const args_json = if (getStringField(obj, "arguments_json")) |args|
+            try allocator.dupe(u8, args)
+        else if (obj.get("arguments")) |args_value|
+            try std.json.Stringify.valueAlloc(allocator, args_value, .{})
+        else
+            try allocator.dupe(u8, "{}");
+        errdefer allocator.free(args_json);
+        const id = try allocator.dupe(u8, getStringField(obj, "id") orelse getStringField(obj, "tool_call_id") orelse "");
+        errdefer allocator.free(id);
+        const name = try allocator.dupe(u8, getStringField(obj, "name") orelse "");
+        errdefer allocator.free(name);
+        return .{ .tool_call = .{
+            .id = id,
+            .name = name,
+            .arguments_json = args_json,
+        } };
+    }
+    return null;
+}
+
+fn deinitAssistantContentBlock(allocator: std.mem.Allocator, block: *ai_types.AssistantContent) void {
+    switch (block.*) {
+        .text => |text| {
+            allocator.free(text.text);
+            if (text.text_signature) |signature| allocator.free(signature);
+        },
+        .thinking => |thinking| {
+            allocator.free(thinking.thinking);
+            if (thinking.thinking_signature) |signature| allocator.free(signature);
+        },
+        .tool_call => |tool_call| {
+            allocator.free(tool_call.id);
+            allocator.free(tool_call.name);
+            allocator.free(tool_call.arguments_json);
+            if (tool_call.thought_signature) |signature| allocator.free(signature);
+        },
+        .image => |image| {
+            allocator.free(image.data);
+            allocator.free(image.mime_type);
+        },
+    }
+}
+
+fn appendContentTextToSystemPrompt(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, value: std.json.Value) !void {
+    switch (value) {
+        .string => |text| try appendSystemPromptText(builder, allocator, text),
+        .array => |array| {
+            for (array.items) |item| {
+                if (item != .object) continue;
+                const obj = item.object;
+                if (std.mem.eql(u8, getStringField(obj, "type") orelse "", "text")) {
+                    try appendSystemPromptText(builder, allocator, getStringField(obj, "text") orelse "");
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+fn appendSystemPromptText(builder: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    if (text.len == 0) return;
+    if (builder.items.len > 0) try builder.append(allocator, '\n');
+    try builder.appendSlice(allocator, text);
+}
+
+fn serializeAgentLoopEvent(
+    allocator: std.mem.Allocator,
+    session_id: AgentProtocolTypes.SessionId,
+    event: agent_loop.AgentEvent,
+) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var w = json_writer.JsonWriter.init(&buffer, allocator);
+
+    try w.beginObject();
+    switch (event) {
+        .agent_start => {
+            const session_text = try AgentProtocolTypes.sessionIdToString(session_id, allocator);
+            defer allocator.free(session_text);
+            try w.writeStringField("type", "agent_start");
+            try w.writeStringField("session_id", session_text);
+        },
+        .agent_end => {
+            try w.writeStringField("type", "agent_end");
+        },
+        .turn_start => {
+            try w.writeStringField("type", "turn_start");
+        },
+        .turn_end => |payload| {
+            try w.writeStringField("type", "turn_end");
+            try w.writeStringField("stop_reason", @tagName(payload.message.stop_reason));
+        },
+        .message_start => |payload| {
+            try w.writeStringField("type", "message_start");
+            writeMessageMetadata(&w, payload.message) catch {};
+        },
+        .message_update => |payload| {
+            const provider_event_json = try transport.serializeEvent(payload.event, allocator);
+            defer allocator.free(provider_event_json);
+            try w.writeStringField("type", "message_update");
+            try w.writeKey("event");
+            try w.writeRawJson(provider_event_json);
+        },
+        .message_end => |payload| {
+            try w.writeStringField("type", "message_end");
+            if (payload.message == .assistant) {
+                try w.writeStringField("stop_reason", @tagName(payload.message.assistant.stop_reason));
+                try writeUsageField(&w, payload.message.assistant.usage);
+            }
+        },
+        .tool_execution_start => |payload| {
+            try w.writeStringField("type", "tool_execution_start");
+            try w.writeStringField("tool_call_id", payload.tool_call_id);
+            try w.writeStringField("tool_name", payload.tool_name);
+            try w.writeStringField("args_json", payload.args_json);
+        },
+        .tool_execution_update => |payload| {
+            try w.writeStringField("type", "tool_execution_update");
+            try w.writeStringField("tool_call_id", payload.tool_call_id);
+            try w.writeStringField("tool_name", payload.tool_name);
+            try w.writeStringField("partial_result_json", payload.partial_result_json);
+        },
+        .tool_execution_end => |payload| {
+            try w.writeStringField("type", "tool_execution_end");
+            try w.writeStringField("tool_call_id", payload.tool_call_id);
+            try w.writeStringField("tool_name", payload.tool_name);
+            try w.writeStringField("result_json", payload.result_json);
+            try w.writeBoolField("is_error", payload.is_error);
+        },
+    }
+    try w.endObject();
+
+    const out = try allocator.dupe(u8, buffer.items);
+    buffer.deinit(allocator);
+    return out;
+}
+
+fn serializeAgentErrorEvent(allocator: std.mem.Allocator, message: []const u8, code: []const u8) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var w = json_writer.JsonWriter.init(&buffer, allocator);
+    try w.beginObject();
+    try w.writeStringField("type", "error");
+    try w.writeStringField("message", message);
+    try w.writeStringField("code", code);
+    try w.endObject();
+    const out = try allocator.dupe(u8, buffer.items);
+    buffer.deinit(allocator);
+    return out;
+}
+
+fn writeMessageMetadata(w: *json_writer.JsonWriter, message: ai_types.Message) !void {
+    if (message != .assistant) return;
+    try w.writeStringField("api", message.assistant.api);
+    try w.writeStringField("provider", message.assistant.provider);
+    try w.writeStringField("model", message.assistant.model);
+}
+
+fn writeUsageField(w: *json_writer.JsonWriter, usage: ai_types.Usage) !void {
+    try w.writeKey("usage");
+    try w.beginObject();
+    try w.writeIntField("input", usage.input);
+    try w.writeIntField("output", usage.output);
+    try w.writeIntField("cache_read", usage.cache_read);
+    try w.writeIntField("cache_write", usage.cache_write);
+    try w.endObject();
+}
+
+fn getStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn parseTimestamp(obj: std.json.ObjectMap) i64 {
+    if (obj.get("timestamp")) |value| {
+        if (value == .integer) return value.integer;
+    }
+    return compat.time.nowMillis();
+}
+
+fn parseStopReason(reason: []const u8) ai_types.StopReason {
+    return std.meta.stringToEnum(ai_types.StopReason, reason) orelse .stop;
+}
+
+fn valueAsU32(value: std.json.Value) ?u32 {
+    return switch (value) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        .float => |f| if (f >= 0 and f <= @as(f64, @floatFromInt(std.math.maxInt(u32)))) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+fn valueAsF32(value: std.json.Value) ?f32 {
+    return switch (value) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| @floatCast(f),
+        else => null,
+    };
+}
+
+fn validatedAgentStopSessionFromLine(line: []const u8, allocator: std.mem.Allocator) ?AgentProtocolTypes.SessionId {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+    if (!std.mem.eql(u8, getStringField(root, "type") orelse "", "agent_stop")) return null;
+
+    const top_session = getStringField(root, "session_id") orelse return null;
+    if (AgentProtocolTypes.parseSessionId(top_session) == null) return null;
+    const message_id = getStringField(root, "message_id") orelse return null;
+    if (AgentProtocolTypes.parseUlid(message_id) == null) return null;
+    if (!hasIntegerField(root, "sequence")) return null;
+    if (!hasIntegerField(root, "timestamp")) return null;
+    if (!hasIntegerField(root, "version")) return null;
+
+    const payload = root.get("payload") orelse return null;
+    if (payload != .object) return null;
+    const payload_session = getStringField(payload.object, "session_id") orelse return null;
+    return AgentProtocolTypes.parseSessionId(payload_session);
+}
+
+fn hasValidAgentEnvelopeShape(line: []const u8, allocator: std.mem.Allocator) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return false;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return false;
+    const root = parsed.value.object;
+    const ty = getStringField(root, "type") orelse return false;
+    const session_id = getStringField(root, "session_id") orelse return false;
+    if (AgentProtocolTypes.parseSessionId(session_id) == null) return false;
+    const message_id = getStringField(root, "message_id") orelse return false;
+    if (AgentProtocolTypes.parseUlid(message_id) == null) return false;
+    if (!hasIntegerField(root, "sequence")) return false;
+    if (!hasIntegerField(root, "timestamp")) return false;
+    if (!hasIntegerField(root, "version")) return false;
+
+    const payload = root.get("payload") orelse return false;
+    if (payload != .object) return false;
+    return hasValidAgentPayloadShape(ty, payload.object);
+}
+
+fn hasValidAgentPayloadShape(ty: []const u8, payload: std.json.ObjectMap) bool {
+    if (std.mem.eql(u8, ty, "agent_start")) return hasStringField(payload, "config_json");
+    if (std.mem.eql(u8, ty, "agent_message")) {
+        const session_id = getStringField(payload, "session_id") orelse return false;
+        return AgentProtocolTypes.parseSessionId(session_id) != null and hasStringField(payload, "message_json");
+    }
+    if (std.mem.eql(u8, ty, "agent_stop")) {
+        const session_id = getStringField(payload, "session_id") orelse return false;
+        return AgentProtocolTypes.parseSessionId(session_id) != null;
+    }
+    if (std.mem.eql(u8, ty, "agent_status")) {
+        const session_id = getStringField(payload, "session_id") orelse return false;
+        return AgentProtocolTypes.parseSessionId(session_id) != null;
+    }
+    if (std.mem.eql(u8, ty, "tool_result")) {
+        return hasStringField(payload, "tool_call_id") and hasStringField(payload, "result_json");
+    }
+    if (std.mem.eql(u8, ty, "models_request")) return true;
+    if (std.mem.eql(u8, ty, "tool_list")) return true;
+    if (std.mem.eql(u8, ty, "ping")) return true;
+    if (std.mem.eql(u8, ty, "goodbye")) return true;
+    return false;
+}
+
+fn hasIntegerField(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value == .integer;
+}
+
+fn hasStringField(obj: std.json.ObjectMap, key: []const u8) bool {
+    const value = obj.get(key) orelse return false;
+    return value == .string;
+}
 
 fn clearOwnedLines(allocator: std.mem.Allocator, lines: *std.ArrayList([]const u8)) void {
     for (lines.items) |line| allocator.free(line);
@@ -345,7 +1367,7 @@ fn runStdioMode(allocator: std.mem.Allocator, stdin: std.Io.File, stdout: std.Io
             did_work = true;
         }
 
-        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams() and !stdio_loop.hasActiveAuthFlows()) {
+        if (stdin_stream.isDone() and !did_work and !stdio_loop.hasActiveProviderStreams() and !stdio_loop.hasActiveAgentRuns() and !stdio_loop.hasActiveAuthFlows()) {
             break;
         }
 
@@ -588,6 +1610,51 @@ fn makeAgentPingEnvelopeJson(allocator: std.mem.Allocator) ![]u8 {
         .timestamp = compat.time.nowMillis(),
         .payload = .ping,
     };
+    return agent_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAgentStartEnvelopeJson(
+    allocator: std.mem.Allocator,
+    session_id: AgentProtocolTypes.SessionId,
+    model_ref_text: []const u8,
+) ![]u8 {
+    const config_json = try std.fmt.allocPrint(allocator, "{{\"model_ref\":\"{s}\",\"tools\":[]}}", .{model_ref_text});
+    var env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .config_json = config_json,
+            .session_id = session_id,
+        } },
+    };
+    defer env.deinit(allocator);
+    return agent_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
+fn makeAgentMessageEnvelopeJson(
+    allocator: std.mem.Allocator,
+    session_id: AgentProtocolTypes.SessionId,
+    model_ref_text: []const u8,
+) ![]u8 {
+    const message_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"model_ref\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hello\"}}],\"tools\":[]}}",
+        .{model_ref_text},
+    );
+    var env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_message = .{
+            .session_id = session_id,
+            .message_json = message_json,
+            .options_json = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"api_key\":\"test-key\"}")),
+        } },
+    };
+    defer env.deinit(allocator);
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
 }
 
@@ -1094,6 +2161,113 @@ test "stdio protocol loop rejects malformed json dispatch line" {
     try std.testing.expectEqual(@as(usize, 0), outbound.items.len);
 }
 
+test "stdio protocol loop ignores malformed agent_stop for cancellation" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    const stream = try allocator.create(agent_loop.AgentEventStream);
+    stream.* = agent_loop.AgentEventStream.init(allocator);
+
+    const context = try allocator.create(agent_loop.AgentContext);
+    context.* = agent_loop.AgentContext.init(allocator);
+
+    const prompts = try allocator.alloc(ai_types.Message, 0);
+    const cancel_flag = try allocator.create(std.atomic.Value(bool));
+    cancel_flag.* = std.atomic.Value(bool).init(false);
+
+    try stdio_loop.active_agent_runs.append(allocator, .{
+        .session_id = session_id,
+        .stream = stream,
+        .context = context,
+        .model = try modelFromCanonicalRef(allocator, "fixture/fixture-ok-api@fixture-model"),
+        .prompts = prompts,
+        .tools = try allocator.alloc(agent_loop.AgentTool, 0),
+        .cancel_flag = cancel_flag,
+    });
+
+    const session_text = try AgentProtocolTypes.sessionIdToString(session_id, allocator);
+    defer allocator.free(session_text);
+    const malformed_stop = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent_stop\",\"session_id\":\"{s}\"}}",
+        .{session_text},
+    );
+    defer allocator.free(malformed_stop);
+
+    try std.testing.expect(!(try stdio_loop.dispatchInboundLine(malformed_stop)));
+    try std.testing.expect(!cancel_flag.load(.acquire));
+}
+
+test "prepareAgentRun preserves requested tools" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var pending = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"name":"read_file","description":"Read a file","parameters_schema":{"type":"object","properties":{"path":{"type":"string"}}}}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer pending.deinit(allocator);
+
+    var prepared = try prepareAgentRun(allocator, pending);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), prepared.tools.len);
+    try std.testing.expectEqualStrings("read_file", prepared.tools[0].name);
+    try std.testing.expectEqualStrings("Read a file", prepared.tools[0].description);
+    try std.testing.expect(std.mem.find(u8, prepared.tools[0].parameters_schema_json, "\"path\"") != null);
+}
+
+test "parseToolResultHistoryMessage preserves structured tool_result content" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"role":"tool","content":[{"type":"tool_result","tool_call_id":"call-1","tool_name":"lookup","content":"found item","details_json":"{\"ok\":true}","is_error":true}]}
+    , .{});
+    defer parsed.deinit();
+
+    var message = try parseToolResultHistoryMessage(allocator, parsed.value.object);
+    defer message.deinit(allocator);
+
+    try std.testing.expect(message == .tool_result);
+    try std.testing.expectEqualStrings("call-1", message.tool_result.tool_call_id);
+    try std.testing.expectEqualStrings("lookup", message.tool_result.tool_name);
+    try std.testing.expectEqual(true, message.tool_result.is_error);
+    try std.testing.expectEqualStrings("{\"ok\":true}", message.tool_result.details_json.slice());
+    try std.testing.expectEqual(@as(usize, 1), message.tool_result.content.len);
+    try std.testing.expect(message.tool_result.content[0] == .text);
+    try std.testing.expectEqualStrings("found item", message.tool_result.content[0].text.text);
+}
+
+test "parseAssistantHistoryMessage preserves image content blocks" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"role":"assistant","content":[{"type":"image","data":"aW1hZ2U=","mime_type":"image/png"}]}
+    , .{});
+    defer parsed.deinit();
+
+    var message = try parseAssistantHistoryMessage(allocator, parsed.value.object);
+    defer message.deinit(allocator);
+
+    try std.testing.expect(message == .assistant);
+    try std.testing.expectEqual(@as(usize, 1), message.assistant.content.len);
+    try std.testing.expect(message.assistant.content[0] == .image);
+    try std.testing.expectEqualStrings("aW1hZ2U=", message.assistant.content[0].image.data);
+    try std.testing.expectEqualStrings("image/png", message.assistant.content[0].image.mime_type);
+}
+
 test "stdio protocol loop forwards provider event result and error envelopes" {
     const allocator = std.testing.allocator;
 
@@ -1153,6 +2327,183 @@ test "stdio protocol loop forwards provider event result and error envelopes" {
     try std.testing.expect(saw_event);
     try std.testing.expect(saw_result);
     try std.testing.expect(saw_stream_error);
+}
+
+test "stdio protocol loop executes agent messages through real agent loop" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-ok-api",
+        .stream = fixtureOkStream,
+        .stream_simple = fixtureOkStreamSimple,
+    }, "test-fixtures");
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-ok-api@fixture-model";
+
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    try std.testing.expectEqual(@as(usize, 1), outbound.items.len);
+    {
+        var env = try agent_protocol_envelope.deserializeEnvelope(outbound.items[0], allocator);
+        defer env.deinit(allocator);
+        try std.testing.expect(env.payload == .agent_started);
+    }
+    clearOwnedLines(allocator, &outbound);
+
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+
+    var saw_result_line = false;
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            if (std.mem.find(u8, line, "\"type\":\"agent_result\"") != null) {
+                saw_result_line = true;
+                break;
+            }
+        }
+        if (saw_result_line) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+
+    var saw_agent_event = false;
+    var saw_agent_result = false;
+    for (outbound.items) |line| {
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .agent_event => saw_agent_event = true,
+            .agent_result => {
+                saw_agent_result = true;
+                try std.testing.expect(std.mem.find(u8, env.payload.agent_result, "\"type\":\"result\"") != null);
+                try std.testing.expect(std.mem.find(u8, env.payload.agent_result, "\"model\":\"fixture-model\"") != null);
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_agent_event);
+    try std.testing.expect(saw_agent_result);
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+}
+
+test "stdio protocol loop emits terminal agent_error when agent startup fails" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    clearOwnedLines(allocator, &outbound);
+
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, "invalid-model-ref");
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+
+    var saw_error_event = false;
+    var saw_terminal_error = false;
+    for (outbound.items) |line| {
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .agent_event => saw_error_event = std.mem.find(u8, env.payload.agent_event, "\"type\":\"error\"") != null,
+            .agent_error => saw_terminal_error = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_error_event);
+    try std.testing.expect(saw_terminal_error);
+}
+
+test "stdio protocol loop emits terminal agent_error when active run fails" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    clearOwnedLines(allocator, &outbound);
+
+    const stream = try allocator.create(agent_loop.AgentEventStream);
+    stream.* = agent_loop.AgentEventStream.init(allocator);
+    stream.completeWithError("agent loop failed");
+
+    const context = try allocator.create(agent_loop.AgentContext);
+    context.* = agent_loop.AgentContext.init(allocator);
+
+    const cancel_flag = try allocator.create(std.atomic.Value(bool));
+    cancel_flag.* = std.atomic.Value(bool).init(false);
+
+    try stdio_loop.active_agent_runs.append(allocator, .{
+        .session_id = session_id,
+        .stream = stream,
+        .context = context,
+        .model = try modelFromCanonicalRef(allocator, "fixture/fixture-ok-api@fixture-model"),
+        .prompts = try allocator.alloc(ai_types.Message, 0),
+        .tools = try allocator.alloc(agent_loop.AgentTool, 0),
+        .cancel_flag = cancel_flag,
+    });
+
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+
+    var saw_error_event = false;
+    var saw_terminal_error = false;
+    for (outbound.items) |line| {
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .agent_event => saw_error_event = std.mem.find(u8, env.payload.agent_event, "\"type\":\"error\"") != null,
+            .agent_error => saw_terminal_error = true,
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_error_event);
+    try std.testing.expect(saw_terminal_error);
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
 }
 
 test "writeOwnedLinesAndClear clears owned lines on write failure" {
