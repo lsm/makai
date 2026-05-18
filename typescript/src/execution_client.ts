@@ -30,6 +30,7 @@ import {
   type ProviderCompleteResponse,
   type ProviderStreamEvent,
   type RunOptions,
+  type TextContentPart,
   type ToolDefinition,
   type UsageSummary,
 } from "./execution_types";
@@ -53,6 +54,8 @@ type ExecutionOptions = {
   authHandlers?: AuthFlowHandlers;
   logger?: MakaiLogger;
 };
+
+type AgentToolExecutionResult = string | TextContentPart[];
 
 /** Root Makai SDK client returned by {@link createMakaiClient}. */
 export interface MakaiClient {
@@ -405,6 +408,10 @@ class StdioAgentApi implements MakaiAgentApi {
         }
         if (frame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(frame, "result_json"));
         if (frame.type === "result" || frame.type === "complete_response") return parseCompletionResponse(frame.payload ?? frame);
+        if (frame.type === "tool_execute") {
+          this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
+          continue;
+        }
 
         const normalized = normalizeAgentFrame(frame, toolBuffers);
         if (normalized.length === 0) {
@@ -528,6 +535,10 @@ class StdioAgentApi implements MakaiAgentApi {
           messageSent = true;
           continue;
         }
+        if (frame.type === "tool_execute") {
+          this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
+          continue;
+        }
         const events = normalizeAgentFrame(frame, toolBuffers);
         for (const rawEvent of events) {
           let event = rawEvent;
@@ -593,6 +604,58 @@ function buildAgentEnvelope(type: string, sessionId: string, sequence: number, p
     version: ENVELOPE_VERSION,
     payload,
   };
+}
+
+function buildAgentReplyEnvelope(type: string, requestFrame: StdioFrame, payload: Record<string, unknown>): StdioFrame {
+  return {
+    type,
+    session_id: requestFrame.session_id,
+    message_id: ulid(),
+    sequence: numericValue(requestFrame.sequence, 0) + 1,
+    timestamp: Date.now(),
+    version: ENVELOPE_VERSION,
+    in_reply_to: requestFrame.message_id,
+    payload,
+  };
+}
+
+async function executeAgentToolFrame(frame: StdioFrame, tools: ToolDefinition[]): Promise<StdioFrame> {
+  const payload = readPayloadOrFrame(frame);
+  const toolCallId = stringValue(payload.tool_call_id);
+  const toolName = stringValue(payload.tool_name);
+  const argsJson = stringValue(payload.args_json);
+  const tool = tools.find((candidate) => candidate.name === toolName);
+
+  if (!tool?.execute) {
+    return buildToolResultEnvelope(frame, toolCallId, `Tool '${toolName}' is not executable by this client`, true);
+  }
+
+  try {
+    const args = parseToolArguments(argsJson);
+    const result = await tool.execute(args, { tool_call_id: toolCallId, tool_name: toolName, args_json: argsJson });
+    return buildToolResultEnvelope(frame, toolCallId, result, false);
+  } catch (error) {
+    return buildToolResultEnvelope(frame, toolCallId, error instanceof Error ? error.message : String(error), true);
+  }
+}
+
+function buildToolResultEnvelope(frame: StdioFrame, toolCallId: string, result: AgentToolExecutionResult, isError: boolean): StdioFrame {
+  return buildAgentReplyEnvelope("tool_result", frame, {
+    tool_call_id: toolCallId,
+    result_json: serializeToolResultContent(result),
+    is_error: isError,
+  });
+}
+
+function parseToolArguments(argsJson: string): Record<string, unknown> {
+  const parsed = argsJson.length > 0 ? JSON.parse(argsJson) : {};
+  if (!isObject(parsed)) throw new Error("tool arguments must be a JSON object");
+  return parsed;
+}
+
+function serializeToolResultContent(result: AgentToolExecutionResult): string {
+  if (typeof result === "string") return JSON.stringify([{ type: "text", text: result }]);
+  return JSON.stringify(result);
 }
 
 function buildExecutionPayload(
