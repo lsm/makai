@@ -299,6 +299,10 @@ fn parseJsonObject(value: std.json.Value) !std.json.ObjectMap {
     };
 }
 
+fn parseRequiredJsonString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
+    return parseJsonString(obj.get(key) orelse return error.InvalidPayloadType);
+}
+
 fn parseUnsignedJsonInteger(comptime T: type, value: std.json.Value) !T {
     return switch (value) {
         .integer => |n| std.math.cast(T, n) orelse error.InvalidPayloadType,
@@ -312,7 +316,7 @@ fn parseOptionalUnsignedJsonInteger(comptime T: type, value: ?std.json.Value) !?
 
 fn deserializeArtifactReference(obj: std.json.ObjectMap, allocator: std.mem.Allocator) !tool_types.ArtifactReference {
     var artifact = tool_types.ArtifactReference{
-        .artifact_id = try allocator.dupe(u8, try parseJsonString(obj.get("artifact_id").?)),
+        .artifact_id = try allocator.dupe(u8, try parseRequiredJsonString(obj, "artifact_id")),
     };
     errdefer artifact.deinit(allocator);
 
@@ -471,7 +475,7 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
             .artifact = try deserializeArtifactReference(payload.get("artifact").?.object, allocator),
         };
         errdefer res.deinit(allocator);
-        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
+        if (payload.get("content_json")) |v| res.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, try parseJsonString(v)));
         return .{ .artifact_retrieved = res };
     }
     if (std.mem.eql(u8, type_str, "artifact_search")) {
@@ -857,13 +861,19 @@ test "tool envelope rejects malformed hashline edit without leaks" {
 
 test "tool envelope rejects malformed artifact references without leaks" {
     const allocator = std.testing.allocator;
+    const missing_artifact_id =
+        "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"uri\":\"makai-artifact://artifact-1\"}}}";
     const negative_byte_size =
         "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\",\"byte_size\":-1}}}";
     const non_string_uri =
         "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\",\"uri\":42}}}";
+    const non_string_content_json =
+        "{\"type\":\"artifact_retrieved\",\"server_id\":\"00000000000000000000000001\",\"message_id\":\"00000000000000000000000002\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{\"artifact\":{\"artifact_id\":\"artifact-1\"},\"content_json\":42}}";
 
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(missing_artifact_id, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(negative_byte_size, allocator));
     try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_uri, allocator));
+    try std.testing.expectError(error.InvalidPayloadType, deserializeEnvelope(non_string_content_json, allocator));
 }
 
 test "tool envelope rejects non-array tool result artifacts without leaks" {
