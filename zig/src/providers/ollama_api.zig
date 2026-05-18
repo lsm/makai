@@ -563,6 +563,8 @@ fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
     const stream = ctx.stream;
+    defer stream.markThreadDone();
+
     const model = ctx.model;
     const base_url = ctx.base_url;
     const api_key = ctx.api_key;
@@ -582,7 +584,6 @@ fn runThread(ctx: *ThreadCtx) void {
         if (ct.isCancelled()) {
             ctx.deinit();
             stream.completeWithError("request cancelled");
-            stream.markThreadDone();
             return;
         }
     }
@@ -593,7 +594,6 @@ fn runThread(ctx: *ThreadCtx) void {
     const url = buildUrlWithSuffix(allocator, base_url, "/api/chat") catch {
         ctx.deinit();
         stream.completeWithError("oom url");
-        stream.markThreadDone();
         return;
     };
     defer allocator.free(url);
@@ -601,7 +601,6 @@ fn runThread(ctx: *ThreadCtx) void {
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
         stream.completeWithError("invalid URL");
-        stream.markThreadDone();
         return;
     };
 
@@ -610,7 +609,6 @@ fn runThread(ctx: *ThreadCtx) void {
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         ctx.deinit();
         stream.completeWithError("oom headers");
-        stream.markThreadDone();
         return;
     };
 
@@ -621,13 +619,11 @@ fn runThread(ctx: *ThreadCtx) void {
         auth_value = buildBearerAuthValue(allocator, k) catch {
             ctx.deinit();
             stream.completeWithError("oom auth header");
-            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "authorization", .value = auth_value.? }) catch {
             ctx.deinit();
             stream.completeWithError("oom headers");
-            stream.markThreadDone();
             return;
         };
     }
@@ -650,7 +646,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (ct.isCancelled()) {
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
         }
@@ -672,12 +667,10 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("request failed");
-            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -693,12 +686,10 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("send failed");
-            stream.markThreadDone();
             return;
         };
 
@@ -713,12 +704,10 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
             stream.completeWithError("receive failed");
-            stream.markThreadDone();
             return;
         };
 
@@ -776,7 +765,6 @@ fn runThread(ctx: *ThreadCtx) void {
                 // Sleep was cancelled
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
 
@@ -792,7 +780,6 @@ fn runThread(ctx: *ThreadCtx) void {
     if (response.head.status != .ok) {
         ctx.deinit();
         stream.completeWithError("ollama request failed");
-        stream.markThreadDone();
         return;
     }
 
@@ -837,7 +824,6 @@ fn runThread(ctx: *ThreadCtx) void {
             if (ct.isCancelled()) {
                 ctx.deinit();
                 stream.completeWithError("request cancelled");
-                stream.markThreadDone();
                 return;
             }
         }
@@ -845,7 +831,6 @@ fn runThread(ctx: *ThreadCtx) void {
         const n = compat.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
             stream.completeWithError("read failed");
-            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
@@ -988,7 +973,6 @@ fn runThread(ctx: *ThreadCtx) void {
                 line.append(allocator, ch) catch {
                     ctx.deinit();
                     stream.completeWithError("oom line");
-                    stream.markThreadDone();
                     return;
                 };
             }
@@ -1160,7 +1144,6 @@ fn runThread(ctx: *ThreadCtx) void {
     const content_slice = content_blocks.toOwnedSlice(allocator) catch {
         ctx.deinit();
         stream.completeWithError("oom content");
-        stream.markThreadDone();
         return;
     };
 
@@ -1170,7 +1153,6 @@ fn runThread(ctx: *ThreadCtx) void {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
         stream.completeWithError("oom");
-        stream.markThreadDone();
         return;
     };
     const provider_dup = allocator.dupe(u8, model.provider) catch {
@@ -1178,7 +1160,6 @@ fn runThread(ctx: *ThreadCtx) void {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
         stream.completeWithError("oom");
-        stream.markThreadDone();
         return;
     };
     const model_dup = allocator.dupe(u8, model.id) catch {
@@ -1187,7 +1168,6 @@ fn runThread(ctx: *ThreadCtx) void {
         ai_types.deinitAssistantContent(allocator, content_slice);
         ctx.deinit();
         stream.completeWithError("oom");
-        stream.markThreadDone();
         return;
     };
 
@@ -1210,7 +1190,6 @@ fn runThread(ctx: *ThreadCtx) void {
     ctx.deinit();
 
     stream.complete(out);
-    stream.markThreadDone();
 }
 
 pub fn streamOllama(
