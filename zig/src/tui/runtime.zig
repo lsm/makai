@@ -21,6 +21,8 @@ const ApprovalContext = struct {
     callback: ?ToolApprovalCallback,
     original_ctx: ?*anyopaque,
     original_callback: ?agent.ToolApprovalFn,
+    original_ui_ctx: ?*anyopaque,
+    original_ui_callback: ?agent.ToolApprovalUiFn,
     tool_name: []const u8,
 };
 
@@ -169,6 +171,10 @@ pub const TuiRuntime = struct {
     }
 
     pub fn switchModel(self: *TuiRuntime, model_id: []const u8) !void {
+        if (self.local_agent) |*local| {
+            if (!local.isIdle()) return error.AgentAlreadyStreaming;
+        }
+
         for (self.models, 0..) |model, i| {
             if (std.mem.eql(u8, model.id, model_id)) {
                 self.selected_model_index = i;
@@ -257,6 +263,8 @@ pub const TuiRuntime = struct {
                 .callback = self.tool_approval_callback,
                 .original_ctx = tool.approval_ctx,
                 .original_callback = tool.approval_fn,
+                .original_ui_ctx = tool.approval_ui_ctx,
+                .original_ui_callback = tool.approval_ui_fn,
                 .tool_name = tool.name,
             };
             self.wrapped_tools[i] = .{
@@ -359,8 +367,11 @@ pub const TuiRuntime = struct {
 };
 
 fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allocator: std.mem.Allocator) void {
-    _ = allocator;
     const approval_ctx: *ApprovalContext = @ptrCast(@alignCast(ctx.?));
+    if (approval_ctx.original_ui_callback) |callback| {
+        callback(approval_ctx.original_ui_ctx, request, allocator);
+    }
+
     const runtime = approval_ctx.runtime;
     runtime.push(.{ .tool_approval_requested = .{
         .tool_call_id = runtime.dupeOwned(request.tool_call_id) catch OwnedSlice(u8).initBorrowed(""),
@@ -654,6 +665,7 @@ test "runtime cancel emits cancelled agent_end" {
 
 const ApprovalCtx = struct { decision: ToolApprovalDecision, calls: usize = 0 };
 const OriginalApprovalCtx = struct { decision: agent.ToolApprovalDecision, calls: usize = 0 };
+const OriginalApprovalUiCtx = struct { calls: usize = 0 };
 
 fn approvalCallback(ctx: ?*anyopaque, request: ToolApprovalRequest) ToolApprovalDecision {
     _ = request;
@@ -667,6 +679,13 @@ fn originalApprovalCallback(ctx: ?*anyopaque, request: agent.ToolApprovalRequest
     const approval: *OriginalApprovalCtx = @ptrCast(@alignCast(ctx.?));
     approval.calls += 1;
     return approval.decision;
+}
+
+fn originalApprovalUiCallback(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allocator: std.mem.Allocator) void {
+    _ = request;
+    _ = allocator;
+    const approval: *OriginalApprovalUiCtx = @ptrCast(@alignCast(ctx.?));
+    approval.calls += 1;
 }
 
 fn demoTool(
@@ -835,6 +854,47 @@ test "preserves original tool approval when wrapping" {
     try std.testing.expect(saw_rejected_tool);
 }
 
+test "preserves original tool approval UI when wrapping" {
+    var original_ctx = OriginalApprovalUiCtx{};
+    const tools = [_]agent.AgentTool{.{
+        .label = "Demo",
+        .name = "demo_tool",
+        .description = "Demo tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .approval_ui_ctx = &original_ctx,
+        .approval_ui_fn = originalApprovalUiCallback,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{ .tool_first = true };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("use tool");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_tui_approval = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .tool_approval_requested => saw_tui_approval = true,
+            .agent_end => break,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), original_ctx.calls);
+    try std.testing.expect(saw_tui_approval);
+}
+
 test "model switch affects next turn" {
     var mock = MockProtocolCtx{};
     const models = [_]ai_types.Model{ test_model_a, test_model_b };
@@ -855,6 +915,22 @@ test "model switch affects next turn" {
     collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
 
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
+}
+
+test "model switch is rejected while async turn is running" {
+    var mock = MockProtocolCtx{ .wait_for_cancel = true };
+    const models = [_]ai_types.Model{ test_model_a, test_model_b };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("hi");
+    try std.testing.expectError(error.AgentAlreadyStreaming, tui_session.switchModel("model-b"));
+    tui_session.cancel();
+    if (runtime.local_agent) |*local| local.waitForIdle();
+    try tui_session.switchModel("model-b");
+    try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
 }
 
 test "async submit without selected model fails before stream reset" {

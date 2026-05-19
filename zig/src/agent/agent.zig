@@ -524,6 +524,9 @@ pub const Agent = struct {
         if (self._state.is_streaming or self._thread != null) {
             return error.AgentAlreadyStreaming;
         }
+        if (self._state.model == null) {
+            return error.NoModelConfigured;
+        }
 
         const request = try self.prepareContinueFromContextLocked();
         errdefer {
@@ -1243,6 +1246,17 @@ test "Agent async completion signals waitForIdle" {
     agent.waitForIdle();
 
     try std.testing.expect(agent.isIdle());
+    try std.testing.expect(agent._thread == null);
+}
+
+test "Agent continueFromContextAsync rejects missing model" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+
+    const text = try std.testing.allocator.dupe(u8, "hi");
+    try agent.appendMessage(.{ .user = .{ .content = .{ .text = text }, .timestamp = 0 } });
+    try std.testing.expectError(error.NoModelConfigured, agent.continueFromContextAsync());
+    try std.testing.expect(!agent.isStreaming());
     try std.testing.expect(agent._thread == null);
 }
 
