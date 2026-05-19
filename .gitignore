@@ -23,6 +23,7 @@ yarn-error.log*
 zig-cache/
 zig-out/
 .zig-cache/
+zig/zig-pkg/
 *.o
 *.a
 *.so

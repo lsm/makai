@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const vaxis_mod = vaxis_dep.module("vaxis");
 
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("src/ai_types.zig"),
@@ -1221,6 +1226,23 @@ pub fn build(b: *std.Build) void {
         .name = "makai",
         .root_module = makai_cli_module,
     });
+
+    const tui_module = b.createModule(.{
+        .root_source_file = b.path("src/tui/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "vaxis", .module = vaxis_mod },
+        },
+    });
+    const tui_exe = b.addExecutable(.{
+        .name = "makai-tui",
+        .root_module = tui_module,
+    });
+    b.installArtifact(tui_exe);
+    const tui_build_step = b.step("tui", "Build the libvaxis TUI spike");
+    tui_build_step.dependOn(&tui_exe.step);
+
     const makai_cli_test = b.addTest(.{ .root_module = makai_cli_module });
     const makai_cli_test_run = b.addRunArtifact(makai_cli_test);
     const auth_cli_test = b.addTest(.{ .root_module = auth_cli_mod });
@@ -1233,6 +1255,13 @@ pub fn build(b: *std.Build) void {
     }
     const run_step = b.step("run", "Run the Makai CLI");
     run_step.dependOn(&run_cmd.step);
+
+    const run_tui_cmd = b.addRunArtifact(tui_exe);
+    if (b.args) |args| {
+        run_tui_cmd.addArgs(args);
+    }
+    const run_tui_step = b.step("run-tui", "Run the libvaxis TUI spike");
+    run_tui_step.dependOn(&run_tui_cmd.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
