@@ -21,6 +21,7 @@ const model_ref = @import("model_ref");
 const json_writer = @import("json_writer");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
+const zz = @import("zigzag");
 
 pub const VERSION = "0.0.1";
 
@@ -1801,16 +1802,124 @@ fn printUsage(file: std.Io.File) !void {
         \\Usage:
         \\  makai --version
         \\  makai --stdio
+        \\  makai --tui
         \\  makai auth providers [--json]
         \\  makai auth login --provider <id> [--json]
         \\
         \\Commands:
         \\  --version        Print binary version
         \\  --stdio          Start stdio mode
+        \\  --tui            Start ZigZag terminal UI preview
         \\  auth providers   List oauth-capable providers
         \\  auth login       Run OAuth flow and persist credentials
         \\
     );
+}
+
+const TuiModel = struct {
+    composer: zz.TextInput,
+    transcript: zz.RichLog,
+    status: zz.StatusBar,
+    outbound_events: usize = 0,
+
+    pub const Msg = union(enum) {
+        key: zz.KeyEvent,
+        stream_delta: []const u8,
+        stream_done: void,
+        tick: struct {
+            timestamp: u64,
+            delta: u64,
+        },
+        quit: void,
+    };
+
+    pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
+        self.composer = zz.TextInput.init(ctx.allocator);
+        self.composer.setPrompt("> ");
+        self.composer.setPlaceholder("Ask Makai...");
+        self.composer.setSuggestions(&.{ "summarize", "test", "review", "auth providers" });
+
+        self.transcript = zz.RichLog.init(ctx.allocator, 1024);
+        self.transcript.show_timestamps = false;
+        self.transcript.append(ctx.io, .info, "Makai ZigZag TUI preview") catch {};
+        self.transcript.append(ctx.io, .info, "Enter submits composer, Ctrl+C quits") catch {};
+
+        self.status = zz.StatusBar.init(ctx.allocator);
+        self.refreshStatus(ctx) catch {};
+        return .{ .every = std.time.ns_per_s };
+    }
+
+    pub fn deinit(self: *TuiModel) void {
+        self.composer.deinit();
+        self.transcript.deinit();
+        self.status.deinit();
+    }
+
+    pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
+        switch (msg) {
+            .key => |key| {
+                if (key.modifiers.ctrl) {
+                    switch (key.key) {
+                        .char => |c| if (c == 'c') return .quit,
+                        else => {},
+                    }
+                }
+                switch (key.key) {
+                    .enter => {
+                        const text = self.composer.getValue();
+                        if (text.len > 0) {
+                            self.transcript.append(ctx.io, .info, text) catch {};
+                            self.outbound_events += 1;
+                            self.composer.setValue("") catch {};
+                            self.refreshStatus(ctx) catch {};
+                        }
+                    },
+                    .up, .page_up => self.transcript.scrollUp(1),
+                    .down, .page_down => self.transcript.scrollDown(1) catch {},
+                    else => self.composer.handleKey(key),
+                }
+            },
+            .stream_delta => |delta| {
+                self.transcript.append(ctx.io, .debug, delta) catch {};
+                self.refreshStatus(ctx) catch {};
+            },
+            .stream_done => {
+                self.transcript.append(ctx.io, .info, "stream complete") catch {};
+                self.refreshStatus(ctx) catch {};
+            },
+            .tick => self.refreshStatus(ctx) catch {},
+            .quit => return .quit,
+        }
+        return .none;
+    }
+
+    pub fn view(self: *TuiModel, ctx: *const zz.Context) []const u8 {
+        const width: u16 = @max(ctx.width, 20);
+        const height: u16 = @max(ctx.height, 5);
+        self.transcript.setSize(width, height -| 3);
+        self.composer.setWidth(width);
+        self.status.setWidth(width);
+
+        const transcript_view = self.transcript.view(ctx.allocator) catch "";
+        const input_view = self.composer.view(ctx.allocator) catch "";
+        const status_view = self.status.view(ctx.allocator) catch "";
+        return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}", .{ transcript_view, input_view, status_view }) catch "";
+    }
+
+    fn refreshStatus(self: *TuiModel, ctx: *zz.Context) !void {
+        try self.status.setLeft("Makai", null);
+        try self.status.setCenter("ZigZag TUI", null);
+        try self.status.setRight(try std.fmt.allocPrint(ctx.allocator, "events:{d}", .{self.outbound_events}), null);
+    }
+};
+
+fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
+    var environ_map = try compat.createEnvMap(allocator);
+    defer environ_map.deinit();
+
+    var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
+    defer program.deinit();
+    try program.run();
 }
 
 /// Production auth-server options for the CLI wrapper. Real OAuth flows are
@@ -3461,6 +3570,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (std.mem.eql(u8, args[1], "--stdio")) {
         try runStdioMode(allocator, stdin, stdout);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "--tui")) {
+        try runTui(allocator, init.io);
         return;
     }
 

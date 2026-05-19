@@ -1,7 +1,12 @@
 .{
     .name = .zig,
     .version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zigzag = .{
+            .url = "git+https://github.com/lsm/zigzag?ref=thread-safe-queue#41861f92d7ccca31177774a27e0391d35a0e69cf",
+            .hash = "zigzag-0.1.2-YXwYS6fxEQDh9dYk9zjF-VXrzPuBssdeohEfPg-glz8r",
+        },
+    },
     .paths = .{""},
     .fingerprint = 0xc1ce1081631dd09f,
 }
