@@ -1820,7 +1820,10 @@ const TuiModel = struct {
     composer: zz.TextInput,
     transcript: zz.RichLog,
     status: zz.StatusBar,
+    initialized: bool = false,
     outbound_events: usize = 0,
+    status_right_buf: [32]u8 = undefined,
+    status_right: []const u8 = "",
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -1834,25 +1837,32 @@ const TuiModel = struct {
     };
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
-        self.composer = zz.TextInput.init(ctx.allocator);
+        self.initialized = false;
+        self.outbound_events = 0;
+        self.status_right = "";
+
+        self.composer = zz.TextInput.init(ctx.persistent_allocator);
         self.composer.setPrompt("> ");
         self.composer.setPlaceholder("Ask Makai...");
         self.composer.setSuggestions(&.{ "summarize", "test", "review", "auth providers" });
 
-        self.transcript = zz.RichLog.init(ctx.allocator, 1024);
+        self.transcript = zz.RichLog.init(ctx.persistent_allocator, 1024);
         self.transcript.show_timestamps = false;
         self.transcript.append(ctx.io, .info, "Makai ZigZag TUI preview") catch {};
         self.transcript.append(ctx.io, .info, "Enter submits composer, Ctrl+C quits") catch {};
 
-        self.status = zz.StatusBar.init(ctx.allocator);
-        self.refreshStatus(ctx) catch {};
+        self.status = zz.StatusBar.init(ctx.persistent_allocator);
+        self.initialized = true;
+        self.refreshStatus() catch {};
         return .{ .every = std.time.ns_per_s };
     }
 
     pub fn deinit(self: *TuiModel) void {
+        if (!self.initialized) return;
         self.composer.deinit();
         self.transcript.deinit();
         self.status.deinit();
+        self.initialized = false;
     }
 
     pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -1871,7 +1881,7 @@ const TuiModel = struct {
                             self.transcript.append(ctx.io, .info, text) catch {};
                             self.outbound_events += 1;
                             self.composer.setValue("") catch {};
-                            self.refreshStatus(ctx) catch {};
+                            self.refreshStatus() catch {};
                         }
                     },
                     .up, .page_up => self.transcript.scrollUp(1),
@@ -1881,13 +1891,13 @@ const TuiModel = struct {
             },
             .stream_delta => |delta| {
                 self.transcript.append(ctx.io, .debug, delta) catch {};
-                self.refreshStatus(ctx) catch {};
+                self.refreshStatus() catch {};
             },
             .stream_done => {
                 self.transcript.append(ctx.io, .info, "stream complete") catch {};
-                self.refreshStatus(ctx) catch {};
+                self.refreshStatus() catch {};
             },
-            .tick => self.refreshStatus(ctx) catch {},
+            .tick => self.refreshStatus() catch {},
             .quit => return .quit,
         }
         return .none;
@@ -1906,10 +1916,11 @@ const TuiModel = struct {
         return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}", .{ transcript_view, input_view, status_view }) catch "";
     }
 
-    fn refreshStatus(self: *TuiModel, ctx: *zz.Context) !void {
+    fn refreshStatus(self: *TuiModel) !void {
+        self.status_right = try std.fmt.bufPrint(&self.status_right_buf, "events:{d}", .{self.outbound_events});
         try self.status.setLeft("Makai", null);
         try self.status.setCenter("ZigZag TUI", null);
-        try self.status.setRight(try std.fmt.allocPrint(ctx.allocator, "events:{d}", .{self.outbound_events}), null);
+        try self.status.setRight(self.status_right, null);
     }
 };
 
