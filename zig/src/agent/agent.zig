@@ -487,6 +487,26 @@ pub const Agent = struct {
         return !self._state.is_streaming;
     }
 
+    /// Continue from current context asynchronously.
+    /// Use waitForIdle() to block until completion.
+    pub fn continueFromContextAsync(self: *Agent) !void {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._state.is_streaming or self._thread != null) {
+            return error.AgentAlreadyStreaming;
+        }
+        if (self._state.messages.items.len == 0) {
+            return error.NoMessagesToContinue;
+        }
+
+        const messages = try self._allocator.alloc(ai_types.Message, 0);
+        errdefer self._allocator.free(messages);
+
+        self._done_event.reset();
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, messages, false });
+    }
+
     /// Wait for the agent to become idle.
     /// Blocks until the current operation completes.
     /// Returns immediately if not streaming.
@@ -519,7 +539,7 @@ pub const Agent = struct {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
 
-        if (self._state.is_streaming) {
+        if (self._state.is_streaming or self._thread != null) {
             return error.AgentAlreadyStreaming;
         }
 
@@ -588,40 +608,7 @@ pub const Agent = struct {
     }
 
     fn cloneAssistantMessage(self: *Agent, msg: ai_types.AssistantMessage) !ai_types.AssistantMessage {
-        var content = try self._allocator.alloc(ai_types.AssistantContent, msg.content.len);
-        for (msg.content, 0..) |c, i| {
-            content[i] = try self.cloneAssistantContent(c);
-        }
-        return .{
-            .content = content,
-            .api = try self._allocator.dupe(u8, msg.api),
-            .provider = try self._allocator.dupe(u8, msg.provider),
-            .model = try self._allocator.dupe(u8, msg.model),
-            .usage = msg.usage,
-            .stop_reason = msg.stop_reason,
-            .error_message = if (msg.getErrorMessage()) |e|
-                ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, e))
-            else
-                ai_types.OwnedSlice(u8).initBorrowed(""),
-            .timestamp = msg.timestamp,
-            .is_owned = true,
-        };
-    }
-
-    fn cloneAssistantContent(self: *Agent, content: ai_types.AssistantContent) !ai_types.AssistantContent {
-        return switch (content) {
-            .text => |t| .{ .text = .{ .text = try self._allocator.dupe(u8, t.text) } },
-            .thinking => |t| .{ .thinking = .{ .thinking = try self._allocator.dupe(u8, t.thinking) } },
-            .tool_call => |tc| .{ .tool_call = .{
-                .id = try self._allocator.dupe(u8, tc.id),
-                .name = try self._allocator.dupe(u8, tc.name),
-                .arguments_json = try self._allocator.dupe(u8, tc.arguments_json),
-            } },
-            .image => |i| .{ .image = .{
-                .data = try self._allocator.dupe(u8, i.data),
-                .mime_type = try self._allocator.dupe(u8, i.mime_type),
-            } },
-        };
+        return ai_types.cloneAssistantMessage(self._allocator, msg);
     }
 
     fn cloneToolResultMessage(self: *Agent, msg: ai_types.ToolResultMessage) !ai_types.ToolResultMessage {
@@ -754,6 +741,9 @@ pub const Agent = struct {
         }
 
         var run_messages: ?[]const ai_types.Message = if (messages.len > 0) messages else null;
+        if (messages.len == 0 and self._state.messages.items.len == 0) {
+            return;
+        }
 
         // Run the loop. runLoopInternal only clears run_messages after the
         // prompt slice has been consumed successfully. If an error occurs before
@@ -817,9 +807,11 @@ pub const Agent = struct {
         context.system_prompt = types.OwnedSlice(u8).initBorrowed(self._state.system_prompt);
         context.tools = self._state.tools;
 
-        // Copy existing messages
+        // Copy existing state messages into the loop context. AgentContext owns
+        // its messages and frees them on deinit, while AgentState also owns its
+        // history, so context must receive independent clones.
         for (self._state.messages.items) |msg| {
-            try context.appendMessage(msg);
+            try context.appendMessage(try self.cloneMessage(msg));
         }
 
         // Build config. Agent remains auth-agnostic; provider layer owns credentials.
@@ -1240,4 +1232,32 @@ test "Agent cloneMessage" {
 
     try std.testing.expect(cloned == .user);
     try std.testing.expectEqualStrings("Hello, world!", cloned.user.content.text);
+}
+
+test "Agent cloneMessage preserves assistant signatures" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
+    defer agent.deinit();
+
+    const content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "text", .text_signature = "text-sig" } },
+        .{ .thinking = .{ .thinking = "thought", .thinking_signature = "thinking-sig" } },
+        .{ .tool_call = .{ .id = "tool-id", .name = "tool", .arguments_json = "{}", .thought_signature = "thought-sig" } },
+    };
+    const original = ai_types.Message{ .assistant = .{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 12345,
+    } };
+
+    var cloned = try agent.cloneMessage(original);
+    defer cloned.deinit(std.testing.allocator);
+
+    try std.testing.expect(cloned == .assistant);
+    try std.testing.expectEqualStrings("text-sig", cloned.assistant.content[0].text.text_signature.?);
+    try std.testing.expectEqualStrings("thinking-sig", cloned.assistant.content[1].thinking.thinking_signature.?);
+    try std.testing.expectEqualStrings("thought-sig", cloned.assistant.content[2].tool_call.thought_signature.?);
 }

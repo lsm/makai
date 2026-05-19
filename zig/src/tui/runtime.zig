@@ -58,6 +58,7 @@ pub const TuiRuntime = struct {
     completed: bool = false,
     started: bool = false,
     stream_active: bool = false,
+    last_turn_stop_reason: ?ai_types.StopReason = null,
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
@@ -184,9 +185,11 @@ pub const TuiRuntime = struct {
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.run_async) local.waitForIdle();
                 self.resetEventStreamForTurn();
                 self.cancelled = false;
                 self.completed = false;
+                self.last_turn_stop_reason = null;
                 if (self.run_async) {
                     const owned_text = try self.allocator.dupe(u8, text);
                     errdefer self.allocator.free(owned_text);
@@ -214,10 +217,16 @@ pub const TuiRuntime = struct {
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.run_async) local.waitForIdle();
                 self.resetEventStreamForTurn();
                 self.cancelled = false;
                 self.completed = false;
-                try local.continueFromContext();
+                self.last_turn_stop_reason = null;
+                if (self.run_async) {
+                    try local.continueFromContextAsync();
+                } else {
+                    try local.continueFromContext();
+                }
             },
         }
     }
@@ -232,7 +241,7 @@ pub const TuiRuntime = struct {
     }
 
     fn resetEventStreamForTurn(self: *TuiRuntime) void {
-        if (!self.stream_active) {
+        if (!self.stream_active or self.event_stream.isDone()) {
             self.event_stream.deinit();
             self.event_stream = TuiEventStream.init(self.allocator);
         }
@@ -313,9 +322,12 @@ pub const TuiRuntime = struct {
                 .result_json = try self.dupeOwned(payload.result_json),
                 .is_error = payload.is_error,
             } }),
-            .turn_end => |payload| self.push(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } }),
+            .turn_end => |payload| {
+                self.last_turn_stop_reason = payload.message.stop_reason;
+                self.push(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
+            },
             .agent_end => {
-                const reason: TuiEndReason = if (self.cancelled) .cancelled else .completed;
+                const reason: TuiEndReason = if (self.cancelled) .cancelled else if (self.last_turn_stop_reason == .@"error") .@"error" else .completed;
                 self.completed = true;
                 self.push(.{ .agent_end = .{ .reason = reason } });
                 self.event_stream.complete(.{ .reason = reason });
@@ -440,6 +452,7 @@ const MockProtocolCtx = struct {
     last_model_id: []const u8 = "",
     wait_for_cancel: bool = false,
     tool_first: bool = false,
+    force_error: bool = false,
 };
 
 fn makeAssistantMessage(allocator: std.mem.Allocator, model: ai_types.Model, content: []const ai_types.AssistantContent, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
@@ -505,7 +518,11 @@ fn pushDoneAndComplete(stream: *event_stream.AssistantMessageEventStream, alloca
         var msg = result_message;
         msg.deinit(allocator);
     }
-    try stream.push(.{ .done = .{ .reason = reason, .message = event_message } });
+    if (reason == .@"error") {
+        try stream.push(.{ .@"error" = .{ .reason = reason, .err = event_message } });
+    } else {
+        try stream.push(.{ .done = .{ .reason = reason, .message = event_message } });
+    }
     stream.complete(result_message);
 }
 
@@ -532,6 +549,11 @@ fn mockStream(
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
+
+    if (mock.force_error) {
+        stream.completeWithError("forced provider error");
+        return stream;
+    }
 
     if (mock.wait_for_cancel) {
         if (options.cancel_token) |token| {
@@ -739,14 +761,12 @@ test "tool approval approve and reject paths emit tool events" {
 test "event stream resets between turns" {
     var mock = MockProtocolCtx{};
     const models = [_]ai_types.Model{test_model_a};
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
     defer runtime.deinit();
 
     var tui_session = runtime.createSession();
     try tui_session.start();
     try tui_session.submitTurn("first");
-    if (runtime.local_agent) |*local| local.waitForIdle();
-    runtime.stop();
 
     var saw_turn_start = false;
     var saw_message_start = false;
@@ -834,6 +854,32 @@ test "model switch affects next turn" {
     collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
 
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
+}
+
+test "failed turns emit error end reason" {
+    var mock = MockProtocolCtx{ .force_error = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectError(error.AgentLoopFailed, tui_session.submitTurn("fail"));
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_error_end = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .agent_end => {
+                saw_error_end = ev.agent_end.reason == .@"error";
+                break;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_error_end);
 }
 
 test "remote mode start returns not implemented" {
