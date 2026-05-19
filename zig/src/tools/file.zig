@@ -56,7 +56,7 @@ pub fn writeExecute(tool_call_id: []const u8, args_json: []const u8, cancel_toke
     const workspace_root = try common.requiredString(obj, "workspace_root");
     const path = try common.requiredString(obj, "path");
     const content = try common.requiredString(obj, "content");
-    try common.writeWorkspaceFile(workspace_root, path, content);
+    try common.writeWorkspaceFile(allocator, workspace_root, path, content);
     const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = content.len, .written_bytes = content.len });
     errdefer allocator.free(details);
     const text = try std.fmt.allocPrint(allocator, "wrote {d} bytes to {s}", .{ content.len, path });
@@ -74,7 +74,7 @@ pub fn statExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     const obj = parsed.value.object;
     const workspace_root = try common.requiredString(obj, "workspace_root");
     const path = try common.requiredString(obj, "path");
-    const st = try common.statWorkspaceFile(workspace_root, path);
+    const st = try common.statWorkspaceFile(allocator, workspace_root, path);
     const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = 0, .size = st.size, .kind = @tagName(st.kind), .mtime_ns = st.mtime.toNanoseconds() });
     errdefer allocator.free(details);
     const text = try std.fmt.allocPrint(allocator, "{s}: {s}, {d} bytes", .{ path, @tagName(st.kind), st.size });
@@ -102,7 +102,7 @@ test "file read write stat" {
     try std.testing.expect(std.mem.indexOf(u8, st.getDetailsJson().?, "\"size\":5") != null);
 }
 
-test "file read rejects missing and binary" {
+test "file read rejects missing binary and workspace escape" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
@@ -116,4 +116,11 @@ test "file read rejects missing and binary" {
     const bin_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"bin.dat\"}}", .{root});
     defer std.testing.allocator.free(bin_args);
     try std.testing.expectError(error.BinaryFileRejected, readExecute("call", bin_args, null, null, null, std.testing.allocator));
+    const escape_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"{s}.outside\"}}", .{ root, root });
+    defer std.testing.allocator.free(escape_args);
+    try std.testing.expectError(error.PathEscapesWorkspace, readExecute("call", escape_args, null, null, null, std.testing.allocator));
+    try std.testing.expectError(error.PathEscapesWorkspace, statExecute("call", escape_args, null, null, null, std.testing.allocator));
+    const write_escape_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"{s}.outside\",\"content\":\"nope\"}}", .{ root, root });
+    defer std.testing.allocator.free(write_escape_args);
+    try std.testing.expectError(error.PathEscapesWorkspace, writeExecute("call", write_escape_args, null, null, null, std.testing.allocator));
 }

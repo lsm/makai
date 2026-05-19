@@ -32,7 +32,7 @@ pub fn applyExecute(tool_call_id: []const u8, args_json: []const u8, cancel_toke
         break :blk try applyFindReplace(allocator, original, find, replace, &replacement_count);
     } else if (std.mem.eql(u8, operation, "line_replace")) blk: {
         const start_line = common.optionalUsize(obj, "start_line", 0);
-        const end_line = common.optionalUsize(obj, "end_line", 0);
+        const end_line = common.optionalUsize(obj, "end_line", start_line);
         const content = try common.requiredString(obj, "content");
         break :blk try applyLineRange(allocator, original, start_line, end_line, content, &replacement_count);
     } else if (std.mem.eql(u8, operation, "insert")) blk: {
@@ -46,7 +46,7 @@ pub fn applyExecute(tool_call_id: []const u8, args_json: []const u8, cancel_toke
     } else return error.InvalidEditOperation;
     defer allocator.free(edited);
 
-    try common.writeWorkspaceFile(workspace_root, path, edited);
+    try common.writeWorkspaceFile(allocator, workspace_root, path, edited);
     const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .operation = operation, .duration_ms = common.durationMs(start_ms), .raw_bytes = original.len, .returned_bytes = edited.len, .replacement_count = replacement_count });
     errdefer allocator.free(details);
     const text = try std.fmt.allocPrint(allocator, "edited {s}: {d} replacement(s)", .{ path, replacement_count });
@@ -132,4 +132,11 @@ test "edit line replace insert delete" {
     const data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("one\nTWO\nthree\n", data);
+    const default_end_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"line_replace\",\"start_line\":2,\"content\":\"two\"}}", .{root});
+    defer std.testing.allocator.free(default_end_args);
+    var default_end_result = try applyExecute("call", default_end_args, null, null, null, std.testing.allocator);
+    defer default_end_result.deinit(std.testing.allocator);
+    const default_end_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(default_end_data);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", default_end_data);
 }

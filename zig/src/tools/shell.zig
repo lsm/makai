@@ -39,7 +39,10 @@ pub fn execute(
     var dir = try common.openWorkspace(workspace_root, false);
     defer dir.close(common.defaultIo());
 
-    const argv = [_][]const u8{ "/bin/sh", "-c", command };
+    const argv = if (@import("builtin").os.tag == .windows)
+        [_][]const u8{ "cmd.exe", "/C", command }
+    else
+        [_][]const u8{ "/bin/sh", "-c", command };
     const result = std.process.run(allocator, common.defaultIo(), .{
         .argv = &argv,
         .cwd = .{ .dir = dir },

@@ -81,8 +81,10 @@ pub fn gitStatusExecute(tool_call_id: []const u8, args_json: []const u8, cancel_
     var parsed = try common.parseArgs(allocator, args_json);
     defer parsed.deinit();
     const workspace_root = try common.requiredString(parsed.value.object, "workspace_root");
+    var dir = try common.openWorkspace(workspace_root, false);
+    defer dir.close(common.defaultIo());
     const argv = [_][]const u8{ "git", "status", "--short" };
-    const result = std.process.run(allocator, common.defaultIo(), .{ .argv = &argv, .cwd = .{ .path = workspace_root }, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .boot } } }) catch |err| {
+    const result = std.process.run(allocator, common.defaultIo(), .{ .argv = &argv, .cwd = .{ .dir = dir }, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .boot } } }) catch |err| {
         const details = try common.jsonString(allocator, .{ .ok = false, .err = @errorName(err), .duration_ms = common.durationMs(start_ms), .raw_bytes = 0 });
         errdefer allocator.free(details);
         const text = try std.fmt.allocPrint(allocator, "git status failed: {s}", .{@errorName(err)});
@@ -108,15 +110,18 @@ fn detectProjectRoot(allocator: std.mem.Allocator, workspace_root: []const u8) !
         const git_path = try std.Io.Dir.path.join(allocator, &.{ current, ".git" });
         defer allocator.free(git_path);
         std.Io.Dir.cwd().access(common.defaultIo(), git_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => {
+                if (std.Io.Dir.path.dirname(current)) |parent| {
+                    if (std.mem.eql(u8, parent, current)) return current;
+                    const next = try allocator.dupe(u8, parent);
+                    allocator.free(current);
+                    current = next;
+                    continue;
+                } else return current;
+            },
             else => return current,
         };
-        if (std.Io.Dir.path.dirname(current)) |parent| {
-            if (std.mem.eql(u8, parent, current)) return current;
-            const next = try allocator.dupe(u8, parent);
-            allocator.free(current);
-            current = next;
-        } else return current;
+        return current;
     }
 }
 
@@ -133,7 +138,7 @@ test "workspace info list and git status" {
     defer std.testing.allocator.free(args);
     var info = try infoExecute("call", args, null, null, null, std.testing.allocator);
     defer info.deinit(std.testing.allocator);
-    try std.testing.expect(std.mem.indexOf(u8, info.content.slice()[0].text.text, "project_root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.content.slice()[0].text.text, root) != null);
     var list = try listExecute("call", args, null, null, null, std.testing.allocator);
     defer list.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, list.content.slice()[0].text.text, "a.txt") != null);

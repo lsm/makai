@@ -82,45 +82,42 @@ pub fn openWorkspace(workspace_root: []const u8, iterate: bool) !std.Io.Dir {
     return std.Io.Dir.openDirAbsolute(defaultIo(), workspace_root, .{ .iterate = iterate });
 }
 
-pub fn resolveRelativePath(allocator: std.mem.Allocator, path_value: []const u8) ![]u8 {
-    if (std.Io.Dir.path.isAbsolute(path_value)) return try allocator.dupe(u8, path_value);
+pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8) ![]u8 {
+    if (std.Io.Dir.path.isAbsolute(path_value)) {
+        if (!std.mem.startsWith(u8, path_value, workspace_root)) return error.PathEscapesWorkspace;
+        if (path_value.len == workspace_root.len) return try allocator.dupe(u8, "");
+        const sep = path_value[workspace_root.len];
+        if (sep != std.Io.Dir.path.sep) return error.PathEscapesWorkspace;
+        return try allocator.dupe(u8, path_value[workspace_root.len + 1 ..]);
+    }
     if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
     return try allocator.dupe(u8, path_value);
 }
 
 pub fn readWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8, max_bytes: usize) ![]u8 {
-    if (std.Io.Dir.path.isAbsolute(path_value)) {
-        return std.Io.Dir.cwd().readFileAlloc(defaultIo(), path_value, allocator, .limited(max_bytes));
-    }
-    if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
+    const relative_path = try resolveWorkspacePath(allocator, workspace_root, path_value);
+    defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    return dir.readFileAlloc(defaultIo(), path_value, allocator, .limited(max_bytes));
+    return dir.readFileAlloc(defaultIo(), relative_path, allocator, .limited(max_bytes));
 }
 
-pub fn writeWorkspaceFile(workspace_root: []const u8, path_value: []const u8, data: []const u8) !void {
-    if (std.Io.Dir.path.isAbsolute(path_value)) {
-        var file = try std.Io.Dir.cwd().createFile(defaultIo(), path_value, .{ .truncate = true, .permissions = compat.fs.default_file_mode });
-        defer file.close(defaultIo());
-        try file.writeStreamingAll(defaultIo(), data);
-        return;
-    }
-    if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
+pub fn writeWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8, data: []const u8) !void {
+    const relative_path = try resolveWorkspacePath(allocator, workspace_root, path_value);
+    defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    var file = try dir.createFile(defaultIo(), path_value, .{ .truncate = true, .permissions = compat.fs.default_file_mode });
+    var file = try dir.createFile(defaultIo(), relative_path, .{ .truncate = true, .permissions = compat.fs.default_file_mode });
     defer file.close(defaultIo());
     try file.writeStreamingAll(defaultIo(), data);
 }
 
-pub fn statWorkspaceFile(workspace_root: []const u8, path_value: []const u8) !std.Io.File.Stat {
-    if (std.Io.Dir.path.isAbsolute(path_value)) {
-        return std.Io.Dir.cwd().statFile(defaultIo(), path_value, .{});
-    }
-    if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
+pub fn statWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8) !std.Io.File.Stat {
+    const relative_path = try resolveWorkspacePath(allocator, workspace_root, path_value);
+    defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    return dir.statFile(defaultIo(), path_value, .{});
+    return dir.statFile(defaultIo(), relative_path, .{});
 }
 
 pub fn isBinary(data: []const u8) bool {
