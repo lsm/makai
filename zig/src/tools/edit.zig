@@ -41,7 +41,7 @@ pub fn applyExecute(tool_call_id: []const u8, args_json: []const u8, cancel_toke
         break :blk try applyLineRange(allocator, original, start_line, start_line -| 1, content, &replacement_count);
     } else if (std.mem.eql(u8, operation, "delete")) blk: {
         const start_line = common.optionalUsize(obj, "start_line", 0);
-        const end_line = common.optionalUsize(obj, "end_line", 0);
+        const end_line = common.optionalUsize(obj, "end_line", start_line);
         break :blk try applyLineRange(allocator, original, start_line, end_line, "", &replacement_count);
     } else return error.InvalidEditOperation;
     defer allocator.free(edited);
@@ -139,4 +139,11 @@ test "edit line replace insert delete" {
     const default_end_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(default_end_data);
     try std.testing.expectEqualStrings("one\ntwo\nthree\n", default_end_data);
+    const delete_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"delete\",\"start_line\":2}}", .{root});
+    defer std.testing.allocator.free(delete_args);
+    var delete_result = try applyExecute("call", delete_args, null, null, null, std.testing.allocator);
+    defer delete_result.deinit(std.testing.allocator);
+    const delete_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(delete_data);
+    try std.testing.expectEqualStrings("one\nthree\n", delete_data);
 }

@@ -81,21 +81,38 @@ fn lessMatch(_: void, a: Match, b: Match) bool {
 fn regexLikeMatch(pattern: []const u8, text: []const u8) bool {
     // Minimal regex surface for local TUI search bootstrap: literal substring,
     // `.` wildcard, and `.*` gaps. Full indexing/regex engine belongs later.
-    return matchFrom(pattern, text) or blk: {
-        for (text, 0..) |_, i| if (matchFrom(pattern, text[i..])) break :blk true;
-        break :blk false;
-    };
+    var start: usize = 0;
+    while (start <= text.len) : (start += 1) {
+        if (matchFromIterative(pattern, text[start..])) return true;
+        if (start == text.len) break;
+    }
+    return false;
 }
 
-fn matchFrom(pattern: []const u8, text: []const u8) bool {
-    if (pattern.len == 0) return true;
-    if (std.mem.startsWith(u8, pattern, ".*")) {
-        if (matchFrom(pattern[2..], text)) return true;
-        return text.len > 0 and matchFrom(pattern, text[1..]);
+fn matchFromIterative(pattern: []const u8, text: []const u8) bool {
+    var pattern_index: usize = 0;
+    var text_index: usize = 0;
+    var star_pattern_index: ?usize = null;
+    var star_text_index: usize = 0;
+
+    while (text_index < text.len) {
+        if (pattern_index == pattern.len) return true;
+        if (pattern_index + 1 < pattern.len and pattern[pattern_index] == '.' and pattern[pattern_index + 1] == '*') {
+            star_pattern_index = pattern_index;
+            pattern_index += 2;
+            star_text_index = text_index;
+        } else if (pattern_index < pattern.len and (pattern[pattern_index] == '.' or pattern[pattern_index] == text[text_index])) {
+            pattern_index += 1;
+            text_index += 1;
+        } else if (star_pattern_index) |star| {
+            pattern_index = star + 2;
+            star_text_index += 1;
+            text_index = star_text_index;
+        } else return false;
     }
-    if (text.len == 0) return false;
-    if (pattern[0] == '.' or pattern[0] == text[0]) return matchFrom(pattern[1..], text[1..]);
-    return false;
+
+    while (pattern_index + 1 < pattern.len and pattern[pattern_index] == '.' and pattern[pattern_index + 1] == '*') pattern_index += 2;
+    return pattern_index == pattern.len;
 }
 
 fn globMatches(pattern: []const u8, path: []const u8) bool {
@@ -126,4 +143,13 @@ test "search regex returns file line content and empty results" {
     var empty = try regexExecute("call", empty_args, null, null, null, std.testing.allocator);
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", empty.content.slice()[0].text.text);
+    const long_line = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(long_line);
+    @memset(long_line, 'a');
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "long.txt", .data = long_line });
+    const long_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\".*z\",\"glob\":\"*.txt\"}}", .{root});
+    defer std.testing.allocator.free(long_args);
+    var long = try regexExecute("call", long_args, null, null, null, std.testing.allocator);
+    defer long.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", long.content.slice()[0].text.text);
 }

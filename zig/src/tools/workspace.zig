@@ -55,6 +55,7 @@ pub fn listExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
         paths.deinit(allocator);
     }
     while (try walker.next(common.defaultIo())) |entry| {
+        if (common.isCancelled(cancel_token)) return error.Cancelled;
         if (paths.items.len >= max) break;
         if (entry.kind == .file) try paths.append(allocator, try allocator.dupe(u8, entry.path));
     }
@@ -142,6 +143,9 @@ test "workspace info list and git status" {
     var list = try listExecute("call", args, null, null, null, std.testing.allocator);
     defer list.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, list.content.slice()[0].text.text, "a.txt") != null);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const token = ai_types.CancelToken{ .cancelled = &cancelled };
+    try std.testing.expectError(error.Cancelled, listExecute("call", args, token, null, null, std.testing.allocator));
     var status = try gitStatusExecute("call", args, null, null, null, std.testing.allocator);
     defer status.deinit(std.testing.allocator);
     try std.testing.expect(status.getDetailsJson().?.len > 0);

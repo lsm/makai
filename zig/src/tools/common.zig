@@ -59,14 +59,29 @@ pub fn optionalU64(obj: std.json.ObjectMap, key: []const u8, default: u64) u64 {
     const value = obj.get(key) orelse return default;
     return switch (value) {
         .integer => |i| if (i < 0) default else @intCast(i),
-        .float => |f| if (f < 0) default else @intFromFloat(f),
+        .float => |f| floatToU64(f) orelse default,
         .number_string => |s| std.fmt.parseUnsigned(u64, s, 10) catch default,
         else => default,
     };
 }
 
 pub fn optionalUsize(obj: std.json.ObjectMap, key: []const u8, default: usize) usize {
-    return @intCast(optionalU64(obj, key, default));
+    const value = optionalU64(obj, key, default);
+    if (value > std.math.maxInt(usize)) return default;
+    return @intCast(value);
+}
+
+fn floatToU64(value: f64) ?u64 {
+    if (!std.math.isFinite(value) or value < 0 or value >= 18446744073709551616.0) return null;
+    return @intFromFloat(value);
+}
+
+test "optional numeric helpers reject overflow floats" {
+    var parsed = try parseArgs(std.testing.allocator, "{\"timeout_ms\":1e30,\"ok\":42}");
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(u64, 30_000), optionalU64(obj, "timeout_ms", 30_000));
+    try std.testing.expectEqual(@as(usize, 42), optionalUsize(obj, "ok", 0));
 }
 
 pub fn hasParentTraversal(path: []const u8) bool {
@@ -84,11 +99,16 @@ pub fn openWorkspace(workspace_root: []const u8, iterate: bool) !std.Io.Dir {
 
 pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8) ![]u8 {
     if (std.Io.Dir.path.isAbsolute(path_value)) {
-        if (!std.mem.startsWith(u8, path_value, workspace_root)) return error.PathEscapesWorkspace;
-        if (path_value.len == workspace_root.len) return try allocator.dupe(u8, "");
-        const sep = path_value[workspace_root.len];
+        const normalized_root = try std.Io.Dir.path.resolve(allocator, &.{workspace_root});
+        defer allocator.free(normalized_root);
+        const normalized_path = try std.Io.Dir.path.resolve(allocator, &.{path_value});
+        defer allocator.free(normalized_path);
+        if (std.mem.eql(u8, normalized_path, normalized_root)) return try allocator.dupe(u8, "");
+        if (!std.mem.startsWith(u8, normalized_path, normalized_root)) return error.PathEscapesWorkspace;
+        if (normalized_path.len <= normalized_root.len) return error.PathEscapesWorkspace;
+        const sep = normalized_path[normalized_root.len];
         if (sep != std.Io.Dir.path.sep) return error.PathEscapesWorkspace;
-        return try allocator.dupe(u8, path_value[workspace_root.len + 1 ..]);
+        return try allocator.dupe(u8, normalized_path[normalized_root.len + 1 ..]);
     }
     if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
     return try allocator.dupe(u8, path_value);

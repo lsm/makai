@@ -123,4 +123,7 @@ test "file read rejects missing binary and workspace escape" {
     const write_escape_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"{s}.outside\",\"content\":\"nope\"}}", .{ root, root });
     defer std.testing.allocator.free(write_escape_args);
     try std.testing.expectError(error.PathEscapesWorkspace, writeExecute("call", write_escape_args, null, null, null, std.testing.allocator));
+    const traversal_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"{s}/../outside.txt\"}}", .{ root, root });
+    defer std.testing.allocator.free(traversal_args);
+    try std.testing.expectError(error.PathEscapesWorkspace, readExecute("call", traversal_args, null, null, null, std.testing.allocator));
 }
