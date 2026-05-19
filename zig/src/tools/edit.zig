@@ -139,11 +139,47 @@ test "edit line replace insert delete" {
     const default_end_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(default_end_data);
     try std.testing.expectEqualStrings("one\ntwo\nthree\n", default_end_data);
+    const insert_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"insert\",\"start_line\":2,\"content\":\"INSERTED\"}}", .{root});
+    defer std.testing.allocator.free(insert_args);
+    var insert_result = try applyExecute("call", insert_args, null, null, null, std.testing.allocator);
+    defer insert_result.deinit(std.testing.allocator);
+    const insert_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(insert_data);
+    try std.testing.expectEqualStrings("one\nINSERTED\ntwo\nthree\n", insert_data);
     const delete_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"delete\",\"start_line\":2}}", .{root});
     defer std.testing.allocator.free(delete_args);
     var delete_result = try applyExecute("call", delete_args, null, null, null, std.testing.allocator);
     defer delete_result.deinit(std.testing.allocator);
     const delete_data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(delete_data);
-    try std.testing.expectEqualStrings("one\nthree\n", delete_data);
+    try std.testing.expectEqualStrings("one\ntwo\nthree\n", delete_data);
+}
+
+test "edit rejects invalid inputs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "a.txt", .data = "one\ntwo\n" });
+    const empty_find_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"find_replace\",\"find\":\"\",\"replace\":\"x\"}}", .{root});
+    defer std.testing.allocator.free(empty_find_args);
+    try std.testing.expectError(error.EmptyFind, applyExecute("call", empty_find_args, null, null, null, std.testing.allocator));
+    const absent_find_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"find_replace\",\"find\":\"absent\",\"replace\":\"x\"}}", .{root});
+    defer std.testing.allocator.free(absent_find_args);
+    try std.testing.expectError(error.FindNotFound, applyExecute("call", absent_find_args, null, null, null, std.testing.allocator));
+    const line_oob_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"line_replace\",\"start_line\":9,\"content\":\"x\"}}", .{root});
+    defer std.testing.allocator.free(line_oob_args);
+    try std.testing.expectError(error.LineOutOfBounds, applyExecute("call", line_oob_args, null, null, null, std.testing.allocator));
+    const delete_oob_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"delete\",\"start_line\":9}}", .{root});
+    defer std.testing.allocator.free(delete_oob_args);
+    try std.testing.expectError(error.LineOutOfBounds, applyExecute("call", delete_oob_args, null, null, null, std.testing.allocator));
+    const insert_oob_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"insert\",\"start_line\":9,\"content\":\"x\"}}", .{root});
+    defer std.testing.allocator.free(insert_oob_args);
+    try std.testing.expectError(error.LineOutOfBounds, applyExecute("call", insert_oob_args, null, null, null, std.testing.allocator));
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "bin.dat", .data = "a\x00b" });
+    const binary_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"bin.dat\",\"operation\":\"find_replace\",\"find\":\"a\",\"replace\":\"b\"}}", .{root});
+    defer std.testing.allocator.free(binary_args);
+    try std.testing.expectError(error.BinaryFileRejected, applyExecute("call", binary_args, null, null, null, std.testing.allocator));
 }

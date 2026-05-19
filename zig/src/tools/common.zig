@@ -169,3 +169,36 @@ pub fn makeTextResultOwned(allocator: std.mem.Allocator, text: []u8, details_jso
 pub fn jsonString(allocator: std.mem.Allocator, value: anytype) ![]u8 {
     return std.json.Stringify.valueAlloc(allocator, value, .{});
 }
+
+test "common path and binary helpers" {
+    const cwd = try std.process.currentPathAlloc(defaultIo(), std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", "common-test-root" });
+    defer std.testing.allocator.free(root);
+    const inside_abs = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "dir", "file.txt" });
+    defer std.testing.allocator.free(inside_abs);
+    const inside_rel = try resolveWorkspacePath(std.testing.allocator, root, inside_abs);
+    defer std.testing.allocator.free(inside_rel);
+    try std.testing.expectEqualStrings("dir/file.txt", inside_rel);
+    const root_rel = try resolveWorkspacePath(std.testing.allocator, root, root);
+    defer std.testing.allocator.free(root_rel);
+    try std.testing.expectEqualStrings("", root_rel);
+    const outside = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "outside.txt" });
+    defer std.testing.allocator.free(outside);
+    try std.testing.expectError(error.PathEscapesWorkspace, resolveWorkspacePath(std.testing.allocator, root, outside));
+    const traversal = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "..", "outside.txt" });
+    defer std.testing.allocator.free(traversal);
+    try std.testing.expectError(error.PathEscapesWorkspace, resolveWorkspacePath(std.testing.allocator, root, traversal));
+    try std.testing.expect(hasParentTraversal("a/../b"));
+    try std.testing.expect(hasParentTraversal("a\\..\\b"));
+    try std.testing.expect(!hasParentTraversal("a/..b/c"));
+    try std.testing.expect(!isBinary(""));
+    try std.testing.expect(!isBinary("abc"));
+    try std.testing.expect(isBinary("a\x00b"));
+    var boundary = [_]u8{'a'} ** 4097;
+    boundary[4095] = 0;
+    try std.testing.expect(isBinary(&boundary));
+    boundary[4095] = 'a';
+    boundary[4096] = 0;
+    try std.testing.expect(!isBinary(&boundary));
+}
