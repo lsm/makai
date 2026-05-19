@@ -1817,10 +1817,9 @@ fn printUsage(file: std.Io.File) !void {
 }
 
 const TuiModel = struct {
-    composer: zz.TextInput,
-    transcript: zz.RichLog,
-    status: zz.StatusBar,
-    initialized: bool = false,
+    composer: ?zz.TextInput = null,
+    transcript: ?zz.RichLog = null,
+    status: ?zz.StatusBar = null,
     outbound_events: usize = 0,
     status_right_buf: [32]u8 = undefined,
     status_right: []const u8 = "",
@@ -1837,32 +1836,40 @@ const TuiModel = struct {
     };
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
-        self.initialized = false;
+        self.deinit();
         self.outbound_events = 0;
         self.status_right = "";
 
-        self.composer = zz.TextInput.init(ctx.persistent_allocator);
-        self.composer.setPrompt("> ");
-        self.composer.setPlaceholder("Ask Makai...");
-        self.composer.setSuggestions(&.{ "summarize", "test", "review", "auth providers" });
+        var composer = zz.TextInput.init(ctx.persistent_allocator);
+        composer.setPrompt("> ");
+        composer.setPlaceholder("Ask Makai...");
+        composer.setSuggestions(&.{ "summarize", "test", "review", "auth providers" });
+        self.composer = composer;
 
-        self.transcript = zz.RichLog.init(ctx.persistent_allocator, 1024);
-        self.transcript.show_timestamps = false;
-        self.transcript.append(ctx.io, .info, "Makai ZigZag TUI preview") catch {};
-        self.transcript.append(ctx.io, .info, "Enter submits composer, Ctrl+C quits") catch {};
+        var transcript = zz.RichLog.init(ctx.persistent_allocator, 1024);
+        transcript.show_timestamps = false;
+        transcript.append(ctx.io, .info, "Makai ZigZag TUI preview") catch {};
+        transcript.append(ctx.io, .info, "Enter submits composer, Ctrl+C quits") catch {};
+        self.transcript = transcript;
 
         self.status = zz.StatusBar.init(ctx.persistent_allocator);
-        self.initialized = true;
         self.refreshStatus() catch {};
         return .{ .every = std.time.ns_per_s };
     }
 
     pub fn deinit(self: *TuiModel) void {
-        if (!self.initialized) return;
-        self.composer.deinit();
-        self.transcript.deinit();
-        self.status.deinit();
-        self.initialized = false;
+        if (self.composer) |*composer| {
+            composer.deinit();
+            self.composer = null;
+        }
+        if (self.transcript) |*transcript| {
+            transcript.deinit();
+            self.transcript = null;
+        }
+        if (self.status) |*status| {
+            status.deinit();
+            self.status = null;
+        }
     }
 
     pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -1876,25 +1883,25 @@ const TuiModel = struct {
                 }
                 switch (key.key) {
                     .enter => {
-                        const text = self.composer.getValue();
+                        const text = if (self.composer) |*composer| composer.getValue() else "";
                         if (text.len > 0) {
-                            self.transcript.append(ctx.io, .info, text) catch {};
+                            if (self.transcript) |*transcript| transcript.append(ctx.io, .info, text) catch {};
                             self.outbound_events += 1;
-                            self.composer.setValue("") catch {};
+                            if (self.composer) |*composer| composer.setValue("") catch {};
                             self.refreshStatus() catch {};
                         }
                     },
-                    .up, .page_up => self.transcript.scrollUp(1),
-                    .down, .page_down => self.transcript.scrollDown(1) catch {},
-                    else => self.composer.handleKey(key),
+                    .up, .page_up => if (self.transcript) |*transcript| transcript.scrollUp(1),
+                    .down, .page_down => if (self.transcript) |*transcript| transcript.scrollDown(1) catch {},
+                    else => if (self.composer) |*composer| composer.handleKey(key),
                 }
             },
             .stream_delta => |delta| {
-                self.transcript.append(ctx.io, .debug, delta) catch {};
+                if (self.transcript) |*transcript| transcript.append(ctx.io, .debug, delta) catch {};
                 self.refreshStatus() catch {};
             },
             .stream_done => {
-                self.transcript.append(ctx.io, .info, "stream complete") catch {};
+                if (self.transcript) |*transcript| transcript.append(ctx.io, .info, "stream complete") catch {};
                 self.refreshStatus() catch {};
             },
             .tick => self.refreshStatus() catch {},
@@ -1906,21 +1913,23 @@ const TuiModel = struct {
     pub fn view(self: *TuiModel, ctx: *const zz.Context) []const u8 {
         const width: u16 = @max(ctx.width, 20);
         const height: u16 = @max(ctx.height, 5);
-        self.transcript.setSize(width, height -| 3);
-        self.composer.setWidth(width);
-        self.status.setWidth(width);
+        if (self.transcript) |*transcript| transcript.setSize(width, height -| 3);
+        if (self.composer) |*composer| composer.setWidth(width);
+        if (self.status) |*status| status.setWidth(width);
 
-        const transcript_view = self.transcript.view(ctx.allocator) catch "";
-        const input_view = self.composer.view(ctx.allocator) catch "";
-        const status_view = self.status.view(ctx.allocator) catch "";
+        const transcript_view = if (self.transcript) |*transcript| transcript.view(ctx.allocator) catch "" else "";
+        const input_view = if (self.composer) |*composer| composer.view(ctx.allocator) catch "" else "";
+        const status_view = if (self.status) |*status| status.view(ctx.allocator) catch "" else "";
         return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}", .{ transcript_view, input_view, status_view }) catch "";
     }
 
     fn refreshStatus(self: *TuiModel) !void {
         self.status_right = try std.fmt.bufPrint(&self.status_right_buf, "events:{d}", .{self.outbound_events});
-        try self.status.setLeft("Makai", null);
-        try self.status.setCenter("ZigZag TUI", null);
-        try self.status.setRight(self.status_right, null);
+        if (self.status) |*status| {
+            try status.setLeft("Makai", null);
+            try status.setCenter("ZigZag TUI", null);
+            try status.setRight(self.status_right, null);
+        }
     }
 };
 
@@ -1929,6 +1938,7 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
     defer environ_map.deinit();
 
     var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
+    program.model = .{};
     defer program.deinit();
     try program.run();
 }
