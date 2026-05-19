@@ -289,6 +289,23 @@ pub const TuiRuntime = struct {
         };
     }
 
+    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+        while (true) {
+            self.event_stream.push(event) catch |err| switch (err) {
+                error.QueueFull => {
+                    if (self.event_stream.poll()) |dropped| {
+                        var mutable = dropped;
+                        mutable.deinit(self.allocator);
+                    } else {
+                        std.Thread.yield() catch {};
+                    }
+                    continue;
+                },
+            };
+            return;
+        }
+    }
+
     fn dupeOwned(self: *TuiRuntime, value: []const u8) !OwnedSlice(u8) {
         return OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, value));
     }
@@ -334,12 +351,12 @@ pub const TuiRuntime = struct {
             } }),
             .turn_end => |payload| {
                 self.last_turn_stop_reason = payload.message.stop_reason;
-                self.push(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
+                self.pushTerminal(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
             },
             .agent_end => {
                 const reason: TuiEndReason = if (self.cancelled.load(.acquire)) .cancelled else if (self.last_turn_stop_reason == .@"error") .@"error" else .completed;
                 self.completed = true;
-                self.push(.{ .agent_end = .{ .reason = reason } });
+                self.pushTerminal(.{ .agent_end = .{ .reason = reason } });
                 self.event_stream.complete(.{ .reason = reason });
                 self.stream_active = false;
             },
@@ -464,6 +481,7 @@ const MockProtocolCtx = struct {
     call_count: usize = 0,
     last_model_id: []const u8 = "",
     wait_for_cancel: bool = false,
+    flood_count: usize = 0,
     tool_first: bool = false,
     force_error: bool = false,
 };
@@ -577,6 +595,19 @@ fn mockStream(
         }
         try stream.push(.{ .done = .{ .reason = .aborted, .message = emptyAssistantMessage(model, .aborted) } });
         stream.complete(emptyAssistantMessage(model, .aborted));
+        return stream;
+    }
+
+    if (mock.flood_count > 0) {
+        const partial = emptyAssistantMessage(model, .stop);
+        try stream.push(.{ .start = .{ .partial = partial } });
+        var i: usize = 0;
+        while (i < mock.flood_count) : (i += 1) {
+            try stream.push(.{ .text_delta = .{ .content_index = 0, .delta = "x", .partial = partial } });
+            if (stream.poll()) |_| {}
+        }
+        const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "done" } }};
+        try pushDoneAndComplete(stream, allocator, model, &content, .stop);
         return stream;
     }
 
@@ -812,6 +843,35 @@ test "event stream resets between turns" {
     try std.testing.expect(saw_text_delta);
     try std.testing.expect(saw_message_end);
     try std.testing.expect(saw_turn_end);
+}
+
+test "terminal events survive full TUI queue" {
+    var mock = MockProtocolCtx{ .flood_count = 300 };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("flood");
+
+    var saw_turn_end = false;
+    var saw_agent_end = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .turn_end => saw_turn_end = true,
+            .agent_end => {
+                saw_agent_end = true;
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_turn_end);
+    try std.testing.expect(saw_agent_end);
 }
 
 test "preserves original tool approval when wrapping" {

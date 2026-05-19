@@ -78,6 +78,7 @@ pub const Agent = struct {
 
     // Control
     _cancel_token: ?ai_types.CancelToken,
+    _pending_cancel: std.atomic.Value(bool),
     _is_running: bool,
 
     // Message queues
@@ -120,6 +121,7 @@ pub const Agent = struct {
             ._protocol = options.protocol,
             ._listeners = std.ArrayList(Listener).empty,
             ._cancel_token = null,
+            ._pending_cancel = std.atomic.Value(bool).init(false),
             ._is_running = false,
             ._steering_queue = std.ArrayList(ai_types.Message).empty,
             ._follow_up_queue = std.ArrayList(ai_types.Message).empty,
@@ -499,6 +501,7 @@ pub const Agent = struct {
 
     /// Abort the current operation.
     pub fn abort(self: *Agent) void {
+        self._pending_cancel.store(true, .release);
         if (self._cancel_token) |token| {
             token.cancelled.store(true, .release);
         }
@@ -553,9 +556,14 @@ pub const Agent = struct {
             self._allocator.free(request.messages);
         }
 
+        self._pending_cancel.store(false, .release);
+        self._cancel_token = .{ .cancelled = &self._pending_cancel };
         self._done_event.reset();
         self._state.is_streaming = true;
-        errdefer self._state.is_streaming = false;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
         self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, request.messages, request.skip_steering });
     }
 
@@ -571,16 +579,16 @@ pub const Agent = struct {
             return;
         }
 
-        // Wait for the done event (blocks until set)
+        // Wait for the done event (blocks until worker cleanup is complete).
         self._done_event.waitUncancelable(defaultIo());
 
-        // Join the thread if it exists
         self._mutex.lockUncancelable(defaultIo());
-        defer self._mutex.unlock(defaultIo());
+        const thread = self._thread;
+        self._thread = null;
+        self._mutex.unlock(defaultIo());
 
-        if (self._thread) |t| {
+        if (thread) |t| {
             t.join();
-            self._thread = null;
         }
     }
 
@@ -607,9 +615,15 @@ pub const Agent = struct {
         // Deep copy messages for thread ownership
         const owned_messages = try self.copyMessagesForThread(messages);
 
-        // Reset done event and set streaming flag
+        // Reset cancellation, done event, and streaming flag before spawning.
+        self._pending_cancel.store(false, .release);
+        self._cancel_token = .{ .cancelled = &self._pending_cancel };
         self._done_event.reset();
         self._state.is_streaming = true;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
 
         // Spawn thread
         self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, false });
@@ -779,13 +793,12 @@ pub const Agent = struct {
             }
             self._allocator.free(messages);
 
-            // Signal completion
-            self._done_event.set(defaultIo());
-
-            // Update state under lock
+            // Finish worker-visible cleanup before waking waiters.
             self._mutex.lockUncancelable(defaultIo());
             self._state.is_streaming = false;
             self._mutex.unlock(defaultIo());
+
+            self._done_event.set(defaultIo());
         }
 
         if (messages.len > 0 and self._state.model == null) {
@@ -837,9 +850,11 @@ pub const Agent = struct {
     ) !void {
         const model = self._state.model orelse return error.NoModelConfigured;
 
-        // Set up cancel token
-        var cancelled = std.atomic.Value(bool).init(false);
-        self._cancel_token = .{ .cancelled = &cancelled };
+        // Set up cancel token. promptAsync/continueFromContextAsync install this
+        // before spawning so immediate aborts reach provider options.
+        if (self._cancel_token == null) {
+            self._cancel_token = .{ .cancelled = &self._pending_cancel };
+        }
         self._state.is_streaming = true;
         errdefer {
             self._state.is_streaming = false;
@@ -959,18 +974,28 @@ pub const Agent = struct {
         // stream with neither result nor error (e.g., OOM in completeWithError)
         // is also treated as failure.
         if (stream.getError() != null) {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+            self._pending_cancel.store(false, .release);
             return error.AgentLoopFailed;
         }
         if (stream.getResult()) |result| {
             if (result.final_message.stop_reason == .@"error") {
+                self._state.is_streaming = false;
+                self._cancel_token = null;
+                self._pending_cancel.store(false, .release);
                 return error.AgentLoopFailed;
             }
         } else if (stream.isDone()) {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+            self._pending_cancel.store(false, .release);
             return error.AgentLoopFailed;
         }
 
         self._state.is_streaming = false;
         self._cancel_token = null;
+        self._pending_cancel.store(false, .release);
     }
 
     fn emit(self: *Agent, event: AgentEvent) void {
@@ -1314,6 +1339,18 @@ test "Agent continueFromContextAsync mirrors sync resume checks" {
     try std.testing.expectEqual(@as(usize, 0), agent._steering_queue.items.len);
 }
 
+test "Agent installs cancel token before async worker can run" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    const msg = ai_types.Message{ .user = .{ .content = .{ .text = "cancel me" }, .timestamp = 0 } };
+    try agent.promptAsync(msg);
+    try std.testing.expect(agent._cancel_token != null);
+    agent.abort();
+    try std.testing.expect(agent._cancel_token.?.isCancelled());
+    agent.waitForIdle();
+}
 test "Agent cloneMessage" {
     var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
