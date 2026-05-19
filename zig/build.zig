@@ -864,6 +864,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },

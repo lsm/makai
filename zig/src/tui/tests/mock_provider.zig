@@ -75,10 +75,11 @@ pub const MockProvider = struct {
             .tool_calls => |calls| try pushToolCalls(stream_ptr, allocator, model, calls),
             .provider_error => |message| stream_ptr.completeWithError(message),
             .wait_for_cancel => {
-                if (options.cancel_token) |token| {
-                    while (!token.isCancelled()) {
-                        compat.time.sleepMs(1);
-                    }
+                const token = options.cancel_token orelse return error.MissingCancelToken;
+                var waits: usize = 0;
+                while (!token.isCancelled()) : (waits += 1) {
+                    if (waits >= 1_000) return error.CancelNotObserved;
+                    compat.time.sleepMs(1);
                 }
                 try pushDoneAndComplete(stream_ptr, allocator, model, &.{}, .aborted);
             },

@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_session = @import("tui_session");
 const mock_provider = @import("tui_tests_mock_provider");
@@ -19,28 +20,34 @@ const EventSummary = struct {
     cancelled: bool = false,
 };
 
-fn drainUntilAgentEnd(session: *TuiSession, summary: *EventSummary) void {
-    while (session.waitEvent()) |event| {
-        var ev = event;
-        defer ev.deinit(std.testing.allocator);
-        switch (ev) {
-            .turn_start => summary.turn_start = true,
-            .message_start => |payload| {
-                if (payload.role == .assistant) summary.assistant_start = true;
-            },
-            .text_delta => summary.text_delta = true,
-            .message_end => |payload| {
-                if (payload.role == .assistant) summary.assistant_end = true;
-            },
-            .turn_end => summary.turn_end = true,
-            .agent_end => |payload| {
-                summary.agent_end = true;
-                summary.cancelled = payload.reason == .cancelled;
-                break;
-            },
-            else => {},
+fn drainUntilAgentEnd(session: *TuiSession, summary: *EventSummary) !void {
+    var waits: usize = 0;
+    while (waits < 1_000) : (waits += 1) {
+        if (session.waitEvent()) |event| {
+            var ev = event;
+            defer ev.deinit(std.testing.allocator);
+            switch (ev) {
+                .turn_start => summary.turn_start = true,
+                .message_start => |payload| {
+                    if (payload.role == .assistant) summary.assistant_start = true;
+                },
+                .text_delta => summary.text_delta = true,
+                .message_end => |payload| {
+                    if (payload.role == .assistant) summary.assistant_end = true;
+                },
+                .turn_end => summary.turn_end = true,
+                .agent_end => |payload| {
+                    summary.agent_end = true;
+                    summary.cancelled = payload.reason == .cancelled;
+                    return;
+                },
+                else => {},
+            }
+        } else {
+            compat.time.sleepMs(1);
         }
     }
+    return error.AgentEndTimeout;
 }
 
 test "local runtime lifecycle submits turn and supports cancel" {
@@ -59,7 +66,7 @@ test "local runtime lifecycle submits turn and supports cancel" {
     try session.submitTurn("hello");
 
     var summary = EventSummary{};
-    drainUntilAgentEnd(&session, &summary);
+    try drainUntilAgentEnd(&session, &summary);
     try std.testing.expect(summary.turn_start);
     try std.testing.expect(summary.assistant_start);
     try std.testing.expect(summary.text_delta);
@@ -86,7 +93,7 @@ test "local runtime lifecycle submits turn and supports cancel" {
     if (cancel_runtime.local_agent) |*local| local.waitForIdle();
 
     var cancel_summary = EventSummary{};
-    drainUntilAgentEnd(&cancel_session, &cancel_summary);
+    try drainUntilAgentEnd(&cancel_session, &cancel_summary);
     try std.testing.expect(cancel_summary.agent_end);
     try std.testing.expect(cancel_summary.cancelled);
 }
