@@ -64,9 +64,10 @@ pub const MockTransport = struct {
         const self: *MockTransport = @ptrCast(@alignCast(ctx));
         if (self.read_index >= self.inbound.items.len) return null;
         const frame = self.inbound.items[self.read_index];
+        const copy = try allocator.dupe(u8, frame);
         self.read_index += 1;
-        defer self.allocator.free(frame);
-        return try allocator.dupe(u8, frame);
+        self.allocator.free(frame);
+        return copy;
     }
 
     fn closeFn(ctx: *anyopaque) void {

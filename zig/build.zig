@@ -859,8 +859,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tui_tests_harness_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/harness.zig"),
+    const tui_tests_scenarios_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/tests/scenario_tests.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1202,7 +1202,8 @@ pub fn build(b: *std.Build) void {
     const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
     const tui_session_test = b.addTest(.{ .root_module = tui_session_mod });
     const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
-    const tui_tests_harness_test = b.addTest(.{ .root_module = tui_tests_harness_mod });
+    const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
+    const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
     // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
     // The bridge test uses in-process threading + condition variables that trigger
     // a known backend bug; LLVM handles it fine.
@@ -1367,7 +1368,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_session_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
-    test_step.dependOn(&b.addRunArtifact(tui_tests_harness_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
@@ -1489,7 +1491,8 @@ pub fn build(b: *std.Build) void {
     const test_unit_tui_step = b.step("test-unit-tui", "Run TUI runtime unit tests");
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
-    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_harness_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
