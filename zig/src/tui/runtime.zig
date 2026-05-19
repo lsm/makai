@@ -19,6 +19,8 @@ const ApprovalContext = struct {
     runtime: *TuiRuntime,
     callback_ctx: ?*anyopaque,
     callback: ?ToolApprovalCallback,
+    original_ctx: ?*anyopaque,
+    original_callback: ?agent.ToolApprovalFn,
     tool_name: []const u8,
 };
 
@@ -55,6 +57,7 @@ pub const TuiRuntime = struct {
     cancelled: bool = false,
     completed: bool = false,
     started: bool = false,
+    stream_active: bool = false,
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
@@ -181,6 +184,7 @@ pub const TuiRuntime = struct {
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                self.resetEventStreamForTurn();
                 self.cancelled = false;
                 self.completed = false;
                 if (self.run_async) {
@@ -210,6 +214,9 @@ pub const TuiRuntime = struct {
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                self.resetEventStreamForTurn();
+                self.cancelled = false;
+                self.completed = false;
                 try local.continueFromContext();
             },
         }
@@ -224,12 +231,22 @@ pub const TuiRuntime = struct {
         return &self.event_stream;
     }
 
+    fn resetEventStreamForTurn(self: *TuiRuntime) void {
+        if (!self.stream_active) {
+            self.event_stream.deinit();
+            self.event_stream = TuiEventStream.init(self.allocator);
+        }
+        self.stream_active = true;
+    }
+
     fn rebuildWrappedTools(self: *TuiRuntime) void {
         for (self.original_tools, 0..) |tool, i| {
             self.approval_contexts[i] = .{
                 .runtime = self,
                 .callback_ctx = self.tool_approval_ctx,
                 .callback = self.tool_approval_callback,
+                .original_ctx = tool.approval_ctx,
+                .original_callback = tool.approval_fn,
                 .tool_name = tool.name,
             };
             self.wrapped_tools[i] = .{
@@ -302,6 +319,7 @@ pub const TuiRuntime = struct {
                 self.completed = true;
                 self.push(.{ .agent_end = .{ .reason = reason } });
                 self.event_stream.complete(.{ .reason = reason });
+                self.stream_active = false;
             },
             .context_usage, .prompt_segment_usage => {},
         }
@@ -340,6 +358,9 @@ fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allo
 
 fn approveTool(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolApprovalDecision {
     const approval_ctx: *ApprovalContext = @ptrCast(@alignCast(ctx.?));
+    if (approval_ctx.original_callback) |callback| {
+        if (callback(approval_ctx.original_ctx, request) == .reject) return .reject;
+    }
     if (approval_ctx.callback) |callback| {
         return switch (callback(approval_ctx.callback_ctx, .{
             .tool_call_id = request.tool_call_id,
@@ -609,10 +630,18 @@ test "runtime cancel emits cancelled agent_end" {
 }
 
 const ApprovalCtx = struct { decision: ToolApprovalDecision, calls: usize = 0 };
+const OriginalApprovalCtx = struct { decision: agent.ToolApprovalDecision, calls: usize = 0 };
 
 fn approvalCallback(ctx: ?*anyopaque, request: ToolApprovalRequest) ToolApprovalDecision {
     _ = request;
     const approval: *ApprovalCtx = @ptrCast(@alignCast(ctx.?));
+    approval.calls += 1;
+    return approval.decision;
+}
+
+fn originalApprovalCallback(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolApprovalDecision {
+    _ = request;
+    const approval: *OriginalApprovalCtx = @ptrCast(@alignCast(ctx.?));
     approval.calls += 1;
     return approval.decision;
 }
@@ -705,6 +734,84 @@ test "tool approval approve and reject paths emit tool events" {
     }
     try std.testing.expectEqual(@as(usize, 1), reject_ctx.calls);
     try std.testing.expect(reject_saw_error_tool);
+}
+
+test "event stream resets between turns" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+    runtime.stop();
+
+    var saw_turn_start = false;
+    var saw_message_start = false;
+    var saw_text_delta = false;
+    var saw_message_end = false;
+    var saw_turn_end = false;
+    collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
+
+    try tui_session.submitTurn("second");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    saw_turn_start = false;
+    saw_message_start = false;
+    saw_text_delta = false;
+    saw_message_end = false;
+    saw_turn_end = false;
+    collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
+
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expect(saw_turn_start);
+    try std.testing.expect(saw_message_start);
+    try std.testing.expect(saw_text_delta);
+    try std.testing.expect(saw_message_end);
+    try std.testing.expect(saw_turn_end);
+}
+
+test "preserves original tool approval when wrapping" {
+    var original_ctx = OriginalApprovalCtx{ .decision = .reject };
+    const tools = [_]agent.AgentTool{.{
+        .label = "Demo",
+        .name = "demo_tool",
+        .description = "Demo tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .approval_ctx = &original_ctx,
+        .approval_fn = originalApprovalCallback,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{ .tool_first = true };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("use tool");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_rejected_tool = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .tool_execution_end => saw_rejected_tool = ev.tool_execution_end.is_error,
+            .agent_end => break,
+            else => {},
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), original_ctx.calls);
+    try std.testing.expect(saw_rejected_tool);
 }
 
 test "model switch affects next turn" {
