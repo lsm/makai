@@ -211,6 +211,30 @@ pub const ToolOutputMiddlewareFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!void;
 
+pub const ToolApprovalDecision = enum {
+    approve,
+    reject,
+};
+
+pub const ToolApprovalRequest = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+};
+
+pub const ToolApprovalUiFn = *const fn (
+    ctx: ?*anyopaque,
+    request: ToolApprovalRequest,
+    allocator: std.mem.Allocator,
+) void;
+
+pub const ToolApprovalDecisionFn = *const fn (
+    ctx: ?*anyopaque,
+    request: ToolApprovalRequest,
+) ToolApprovalDecision;
+
+pub const ToolApprovalFn = ToolApprovalDecisionFn;
+
 /// Agent tool definition
 pub const AgentTool = struct {
     label: []const u8, // Human-readable label for UI
@@ -218,6 +242,10 @@ pub const AgentTool = struct {
     description: []const u8,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
+    approval_ctx: ?*anyopaque = null,
+    approval_fn: ?ToolApprovalFn = null,
+    approval_ui_ctx: ?*anyopaque = null,
+    approval_ui_fn: ?ToolApprovalUiFn = null,
 
     /// Convert to ai_types.Tool for LLM requests
     pub fn toTool(self: AgentTool, allocator: std.mem.Allocator) !ai_types.Tool {

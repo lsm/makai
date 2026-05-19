@@ -795,6 +795,32 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tui_session_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const tui_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
     // Tests
     const owned_slice_test = b.addTest(.{ .root_module = owned_slice_mod });
     const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
@@ -1123,6 +1149,8 @@ pub fn build(b: *std.Build) void {
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
 
     const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
+    const tui_session_test = b.addTest(.{ .root_module = tui_session_mod });
+    const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
     // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
     // The bridge test uses in-process threading + condition variables that trigger
     // a known backend bug; LLVM handles it fine.
@@ -1284,6 +1312,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
@@ -1379,6 +1409,8 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
@@ -1399,6 +1431,10 @@ pub fn build(b: *std.Build) void {
 
     const test_unit_agent_chain_step = b.step("test-unit-agent-chain", "Run agent protocol chain unit tests");
     test_unit_agent_chain_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
+
+    const test_unit_tui_step = b.step("test-unit-tui", "Run TUI runtime unit tests");
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);

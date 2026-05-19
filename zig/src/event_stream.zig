@@ -102,12 +102,23 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 break :blk false;
             };
 
+            const event_has_deinit = comptime blk: {
+                const info = @typeInfo(T);
+                switch (info) {
+                    .@"struct", .@"union", .@"enum", .@"opaque" => break :blk @hasDecl(T, "deinit"),
+                    else => break :blk false,
+                }
+            };
+
             while (self.poll()) |event| {
                 if (comptime is_assistant_message_event) {
                     if (self.owns_events) {
                         var ev = event;
                         ai_types.deinitAssistantMessageEvent(self.allocator, &ev);
                     }
+                } else if (comptime event_has_deinit) {
+                    var ev = event;
+                    ev.deinit(self.allocator);
                 }
             }
 
