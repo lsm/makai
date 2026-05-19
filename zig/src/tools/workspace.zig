@@ -9,7 +9,9 @@ pub const schema_info =
 pub const schema_list =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root"],"additionalProperties":false}
 ;
-pub const schema_git_status = schema_info;
+pub const schema_git_status =
+    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["workspace_root"],"additionalProperties":false}
+;
 
 pub const info_tool = agent.AgentTool{ .label = "Workspace Info", .name = "workspace_info", .description = "Return workspace root metadata and detected project root.", .parameters_schema_json = schema_info, .execute = infoExecute };
 pub const list_tool = agent.AgentTool{ .label = "Workspace List", .name = "workspace_list", .description = "List files under workspace root.", .parameters_schema_json = schema_list, .execute = listExecute };
@@ -81,11 +83,13 @@ pub fn gitStatusExecute(tool_call_id: []const u8, args_json: []const u8, cancel_
     const start_ms = common.nowMs();
     var parsed = try common.parseArgs(allocator, args_json);
     defer parsed.deinit();
-    const workspace_root = try common.requiredString(parsed.value.object, "workspace_root");
+    const obj = parsed.value.object;
+    const workspace_root = try common.requiredString(obj, "workspace_root");
+    const timeout_ms = @min(common.optionalU64(obj, "timeout_ms", 30_000), @as(u64, std.math.maxInt(i64)));
     var dir = try common.openWorkspace(workspace_root, false);
     defer dir.close(common.defaultIo());
     const argv = [_][]const u8{ "git", "status", "--short" };
-    const result = std.process.run(allocator, common.defaultIo(), .{ .argv = &argv, .cwd = .{ .dir = dir }, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(5000), .clock = .boot } } }) catch |err| {
+    const result = std.process.run(allocator, common.defaultIo(), .{ .argv = &argv, .cwd = .{ .dir = dir }, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } } }) catch |err| {
         const details = try common.jsonString(allocator, .{ .ok = false, .err = @errorName(err), .duration_ms = common.durationMs(start_ms), .raw_bytes = 0 });
         errdefer allocator.free(details);
         const text = try std.fmt.allocPrint(allocator, "git status failed: {s}", .{@errorName(err)});

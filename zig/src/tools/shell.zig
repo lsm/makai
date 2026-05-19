@@ -34,7 +34,7 @@ pub fn execute(
     const obj = parsed.value.object;
     const workspace_root = try common.requiredString(obj, "workspace_root");
     const command = try common.requiredString(obj, "command");
-    const timeout_ms = common.optionalU64(obj, "timeout_ms", 30_000);
+    const timeout_ms = @min(common.optionalU64(obj, "timeout_ms", 30_000), @as(u64, std.math.maxInt(i64)));
 
     var dir = try common.openWorkspace(workspace_root, false);
     defer dir.close(common.defaultIo());
@@ -105,7 +105,7 @@ test "shell execute captures stdout" {
     try std.testing.expect(result.getDetailsJson().?.len > 0);
 }
 
-test "shell execute reports timeout" {
+test "shell execute reports timeout and clamps large timeout" {
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"command\":\"sleep 1\",\"timeout_ms\":1}}", .{cwd});
@@ -113,4 +113,9 @@ test "shell execute reports timeout" {
     var result = try execute("call", args, null, null, null, std.testing.allocator);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, result.getDetailsJson().?, "Timeout") != null);
+    const huge_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"command\":\"echo ok\",\"timeout_ms\":\"18446744073709551615\"}}", .{cwd});
+    defer std.testing.allocator.free(huge_args);
+    var huge = try execute("call", huge_args, null, null, null, std.testing.allocator);
+    defer huge.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, huge.content.slice()[0].text.text, "ok") != null);
 }

@@ -119,7 +119,14 @@ pub fn readWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u
     defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    return dir.readFileAlloc(defaultIo(), relative_path, allocator, .limited(max_bytes));
+    try ensureNoSymlinkComponents(allocator, dir, relative_path);
+    var file = try dir.openFile(defaultIo(), relative_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    defer file.close(defaultIo());
+    var file_reader = file.reader(defaultIo(), &.{});
+    return file_reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.ReadFailed => return file_reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
 }
 
 pub fn writeWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8, data: []const u8) !void {
@@ -127,7 +134,8 @@ pub fn writeWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const 
     defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    var file = try dir.createFile(defaultIo(), relative_path, .{ .truncate = true, .permissions = compat.fs.default_file_mode });
+    try ensureNoSymlinkComponents(allocator, dir, relative_path);
+    var file = try dir.createFile(defaultIo(), relative_path, .{ .truncate = true, .permissions = compat.fs.default_file_mode, .resolve_beneath = true });
     defer file.close(defaultIo());
     try file.writeStreamingAll(defaultIo(), data);
 }
@@ -137,7 +145,25 @@ pub fn statWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u
     defer allocator.free(relative_path);
     var dir = try openWorkspace(workspace_root, false);
     defer dir.close(defaultIo());
-    return dir.statFile(defaultIo(), relative_path, .{});
+    try ensureNoSymlinkComponents(allocator, dir, relative_path);
+    return dir.statFile(defaultIo(), relative_path, .{ .follow_symlinks = false });
+}
+
+fn ensureNoSymlinkComponents(allocator: std.mem.Allocator, dir: std.Io.Dir, relative_path: []const u8) !void {
+    if (relative_path.len == 0) return error.InvalidFilePath;
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(allocator);
+    var it = std.mem.tokenizeAny(u8, relative_path, "/\\");
+    while (it.next()) |part| {
+        if (prefix.items.len != 0) try prefix.append(allocator, std.Io.Dir.path.sep);
+        try prefix.appendSlice(allocator, part);
+        dir.access(defaultIo(), prefix.items, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        const st = try dir.statFile(defaultIo(), prefix.items, .{ .follow_symlinks = false });
+        if (st.kind == .sym_link) return error.PathEscapesWorkspace;
+    }
 }
 
 pub fn isBinary(data: []const u8) bool {
@@ -189,6 +215,12 @@ test "common path and binary helpers" {
     const traversal = try std.Io.Dir.path.join(std.testing.allocator, &.{ root, "..", "outside.txt" });
     defer std.testing.allocator.free(traversal);
     try std.testing.expectError(error.PathEscapesWorkspace, resolveWorkspacePath(std.testing.allocator, root, traversal));
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(tmp_root);
+    try tmp.dir.symLink(defaultIo(), "/", "link", .{ .is_directory = true });
+    try std.testing.expectError(error.PathEscapesWorkspace, readWorkspaceFile(std.testing.allocator, tmp_root, "link/passwd", 1024));
     try std.testing.expect(hasParentTraversal("a/../b"));
     try std.testing.expect(hasParentTraversal("a\\..\\b"));
     try std.testing.expect(!hasParentTraversal("a/..b/c"));

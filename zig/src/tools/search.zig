@@ -3,15 +3,16 @@ const ai_types = @import("ai_types");
 const agent = @import("agent");
 const common = @import("tools/common");
 
-pub const schema_regex =
+pub const schema_text =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"query":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root","query"],"additionalProperties":false}
 ;
 
-pub const regex_tool = agent.AgentTool{ .label = "Regex Search", .name = "search_regex", .description = "Search workspace text files using a regex, optional glob substring filter, and return file:line:content results.", .parameters_schema_json = schema_regex, .execute = regexExecute };
+pub const text_tool = agent.AgentTool{ .label = "Text Search", .name = "search_text", .description = "Search workspace text files using literal text plus '.' wildcard and '.*' gaps, optional glob substring filter, and return file:line:content results.", .parameters_schema_json = schema_text, .execute = textExecute };
+pub const regex_tool = text_tool;
 
 const Match = struct { path: []u8, line: usize, content: []u8 };
 
-pub fn regexExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
+pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
     _ = tool_call_id;
     _ = on_update_ctx;
     _ = on_update;
@@ -49,7 +50,8 @@ pub fn regexExecute(tool_call_id: []const u8, args_json: []const u8, cancel_toke
         var line_no: usize = 1;
         var line_it = std.mem.splitScalar(u8, data, '\n');
         while (line_it.next()) |line| {
-            if (regexLikeMatch(query, line)) {
+            if (common.isCancelled(cancel_token)) return error.Cancelled;
+            if (textLikeMatch(query, line)) {
                 try matches.append(allocator, .{ .path = try allocator.dupe(u8, entry.path), .line = line_no, .content = try allocator.dupe(u8, line) });
                 if (matches.items.len >= max) break;
             }
@@ -78,9 +80,9 @@ fn lessMatch(_: void, a: Match, b: Match) bool {
     return a.line < b.line;
 }
 
-fn regexLikeMatch(pattern: []const u8, text: []const u8) bool {
-    // Minimal regex surface for local TUI search bootstrap: literal substring,
-    // `.` wildcard, and `.*` gaps. Full indexing/regex engine belongs later.
+fn textLikeMatch(pattern: []const u8, text: []const u8) bool {
+    // Minimal text search surface for local TUI search bootstrap: literal substring,
+    // `.` wildcard, and `.*` gaps. Full indexing belongs later.
     var start: usize = 0;
     while (start <= text.len) : (start += 1) {
         if (matchFromIterative(pattern, text[start..])) return true;
@@ -124,7 +126,7 @@ fn globMatches(pattern: []const u8, path: []const u8) bool {
     return std.mem.indexOf(u8, path, cleaned) != null;
 }
 
-test "search regex returns file line content and empty results" {
+test "search text returns file line content and empty results" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
@@ -135,12 +137,12 @@ test "search regex returns file line content and empty results" {
     try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "b.txt", .data = "nothing\n" });
     const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\"needle\",\"glob\":\"*.zig\"}}", .{root});
     defer std.testing.allocator.free(args);
-    var result = try regexExecute("call", args, null, null, null, std.testing.allocator);
+    var result = try textExecute("call", args, null, null, null, std.testing.allocator);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("a.zig:1:const needle = 1;\n", result.content.slice()[0].text.text);
     const empty_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\"absent\"}}", .{root});
     defer std.testing.allocator.free(empty_args);
-    var empty = try regexExecute("call", empty_args, null, null, null, std.testing.allocator);
+    var empty = try textExecute("call", empty_args, null, null, null, std.testing.allocator);
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", empty.content.slice()[0].text.text);
     const long_line = try std.testing.allocator.alloc(u8, 1024 * 1024);
@@ -149,7 +151,10 @@ test "search regex returns file line content and empty results" {
     try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "long.txt", .data = long_line });
     const long_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\".*z\",\"glob\":\"*.txt\"}}", .{root});
     defer std.testing.allocator.free(long_args);
-    var long = try regexExecute("call", long_args, null, null, null, std.testing.allocator);
+    var long = try textExecute("call", long_args, null, null, null, std.testing.allocator);
     defer long.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", long.content.slice()[0].text.text);
+    var cancelled = std.atomic.Value(bool).init(true);
+    const token = ai_types.CancelToken{ .cancelled = &cancelled };
+    try std.testing.expectError(error.Cancelled, textExecute("call", long_args, token, null, null, std.testing.allocator));
 }

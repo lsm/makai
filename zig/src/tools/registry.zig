@@ -44,7 +44,7 @@ pub fn defaultTools() []const agent.AgentTool {
         file.write_tool,
         file.stat_tool,
         edit.apply_tool,
-        search.regex_tool,
+        search.text_tool,
         workspace.info_tool,
         workspace.list_tool,
         workspace.git_status_tool,
