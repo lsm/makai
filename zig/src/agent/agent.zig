@@ -17,6 +17,10 @@ pub const AgentEvent = types.AgentEvent;
 pub const AgentEventStream = types.AgentEventStream;
 pub const AgentLoopResult = types.AgentLoopResult;
 pub const AgentTool = types.AgentTool;
+const Listener = struct {
+    callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void,
+    ctx: ?*anyopaque = null,
+};
 pub const AgentToolResult = types.AgentToolResult;
 pub const AgentState = types.AgentState;
 pub const AgentContext = types.AgentContext;
@@ -65,7 +69,7 @@ pub const Agent = struct {
     _protocol: ProtocolClient,
 
     // Subscribers
-    _listeners: std.ArrayList(*const fn (event: AgentEvent) void),
+    _listeners: std.ArrayList(Listener),
 
     // Control
     _cancel_token: ?ai_types.CancelToken,
@@ -109,7 +113,7 @@ pub const Agent = struct {
             ._state = initial_state.?,
             ._allocator = allocator,
             ._protocol = options.protocol,
-            ._listeners = std.ArrayList(*const fn (event: AgentEvent) void).empty,
+            ._listeners = std.ArrayList(Listener).empty,
             ._cancel_token = null,
             ._is_running = false,
             ._steering_queue = std.ArrayList(ai_types.Message).empty,
@@ -162,16 +166,40 @@ pub const Agent = struct {
 
     // === Subscribe ===
 
+    fn legacyListenerShim(ctx: ?*anyopaque, event: AgentEvent) void {
+        const callback: *const fn (event: AgentEvent) void = @ptrCast(@alignCast(ctx.?));
+        callback(event);
+    }
+
     /// Subscribe to agent events.
     /// Returns a token that can be used to unsubscribe.
     pub fn subscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
-        self._listeners.append(self._allocator, callback) catch {};
+        self.subscribeWithContext(@constCast(@ptrCast(callback)), legacyListenerShim);
+    }
+
+    /// Subscribe to agent events with caller context.
+    pub fn subscribeWithContext(
+        self: *Agent,
+        ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void,
+    ) void {
+        self._listeners.append(self._allocator, .{ .callback = callback, .ctx = ctx }) catch {};
     }
 
     /// Unsubscribe from agent events.
     pub fn unsubscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
         for (self._listeners.items, 0..) |listener, i| {
-            if (listener == callback) {
+            if (listener.callback == legacyListenerShim and listener.ctx == @as(?*anyopaque, @constCast(@ptrCast(callback)))) {
+                _ = self._listeners.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Unsubscribe a contextual agent event listener.
+    pub fn unsubscribeWithContext(self: *Agent, ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void) void {
+        for (self._listeners.items, 0..) |listener, i| {
+            if (listener.callback == callback and listener.ctx == ctx) {
                 _ = self._listeners.orderedRemove(i);
                 return;
             }
@@ -845,8 +873,9 @@ pub const Agent = struct {
                     self._state.stream_message = .{ .assistant = e.message };
                 },
                 .message_end => |e| {
-                    // Add message to state
-                    try self._state.messages.append(self._allocator, e.message);
+                    // Add an owned copy to Agent state; event payloads may be borrowed
+                    // from loop context/provider buffers and are freed elsewhere.
+                    try self._state.messages.append(self._allocator, try self.cloneMessage(e.message));
                     self._state.stream_message = null;
                 },
                 .tool_execution_start => |e| {
@@ -902,7 +931,7 @@ pub const Agent = struct {
 
     fn emit(self: *Agent, event: AgentEvent) void {
         for (self._listeners.items) |listener| {
-            listener(event);
+            listener.callback(listener.ctx, event);
         }
     }
 

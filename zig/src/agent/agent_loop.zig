@@ -264,6 +264,17 @@ fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResu
     };
 }
 
+fn rejectedToolResult(allocator: std.mem.Allocator) !AgentToolResult {
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{
+        .text = try allocator.dupe(u8, "Tool execution rejected by user"),
+    } };
+    return .{
+        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
+        .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"rejected\":true}")),
+    };
+}
+
 /// Create a tool result message from execution result
 fn createToolResultMessage(
     allocator: std.mem.Allocator,
@@ -473,6 +484,24 @@ fn executeToolCalls(
                 continue;
             };
             execution_args = validated_args;
+
+            const approval_request = types.ToolApprovalRequest{
+                .tool_call_id = tool_call.id,
+                .tool_name = tool_call.name,
+                .args_json = validated_args,
+            };
+            if (t.approval_ui_fn) |notify| {
+                notify(t.approval_ui_ctx, approval_request, allocator);
+            }
+            if (t.approval_fn) |approval| {
+                const decision = approval(t.approval_ctx, approval_request);
+                if (decision == .reject) {
+                    result = try rejectedToolResult(allocator);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
+                }
+            }
 
             // Create context for tool update callback
             var update_ctx = ToolUpdateContext{
