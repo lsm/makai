@@ -72,7 +72,7 @@ pub const TuiRuntime = struct {
         var tool_registry = local_tools.ToolRegistry.init();
         errdefer tool_registry.deinit(allocator);
         try tool_registry.registerDefaults(allocator);
-        for (options.tools) |tool| try tool_registry.register(allocator, tool);
+        for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
 
         const original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
         errdefer allocator.free(original_tools);
@@ -654,12 +654,14 @@ fn collectUntilEnd(tui_session: *TuiSession, saw_turn_start: *bool, saw_message_
     }
 }
 
-test "runtime registers default local tools" {
+test "runtime registers default local tools and allows overrides" {
     var mock = MockProtocolCtx{};
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .run_async = false });
+    const replacement = agent.AgentTool{ .label = "Wrapped Shell", .name = "shell_execute", .description = "Wrapped shell tool", .parameters_schema_json = "{}", .execute = demoTool };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .tools = &.{replacement}, .run_async = false });
     defer runtime.deinit();
     try std.testing.expect(runtime.tool_registry.resolve("shell_execute") != null);
     try std.testing.expect(runtime.tool_registry.resolve("file_read") != null);
+    try std.testing.expectEqualStrings("Wrapped Shell", runtime.tool_registry.resolve("shell_execute").?.label);
     try std.testing.expect(runtime.original_tools.len >= 9);
 }
 

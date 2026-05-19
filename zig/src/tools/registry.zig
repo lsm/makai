@@ -23,6 +23,16 @@ pub const ToolRegistry = struct {
         try self.tools.append(allocator, tool);
     }
 
+    pub fn replaceOrRegister(self: *ToolRegistry, allocator: std.mem.Allocator, tool: agent.AgentTool) !void {
+        for (self.tools.items) |*existing| {
+            if (std.mem.eql(u8, existing.name, tool.name)) {
+                existing.* = tool;
+                return;
+            }
+        }
+        try self.tools.append(allocator, tool);
+    }
+
     pub fn registerDefaults(self: *ToolRegistry, allocator: std.mem.Allocator) !void {
         for (defaultTools()) |tool| try self.register(allocator, tool);
     }
@@ -59,4 +69,8 @@ test "registry registers resolves and lists defaults" {
     try std.testing.expect(registry.resolve("file_read") != null);
     try std.testing.expectEqual(@as(usize, 9), registry.list().len);
     try std.testing.expectError(error.DuplicateTool, registry.register(std.testing.allocator, shell.execute_tool));
+    const replacement = agent.AgentTool{ .label = "Replacement Shell", .name = "shell_execute", .description = "Replacement shell tool.", .parameters_schema_json = shell.schema_execute, .execute = shell.execute };
+    try registry.replaceOrRegister(std.testing.allocator, replacement);
+    try std.testing.expectEqualStrings("Replacement Shell", registry.resolve("shell_execute").?.label);
+    try std.testing.expectEqual(@as(usize, 9), registry.list().len);
 }

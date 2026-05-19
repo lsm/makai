@@ -106,6 +106,10 @@ pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []cons
         const normalized_path = try std.Io.Dir.path.resolve(allocator, &.{path_value});
         defer allocator.free(normalized_path);
         if (std.mem.eql(u8, normalized_path, normalized_root)) return try allocator.dupe(u8, "");
+        if (std.mem.eql(u8, normalized_root, &.{std.Io.Dir.path.sep})) {
+            if (!std.mem.startsWith(u8, normalized_path, normalized_root)) return error.PathEscapesWorkspace;
+            return try allocator.dupe(u8, normalized_path[1..]);
+        }
         if (!std.mem.startsWith(u8, normalized_path, normalized_root)) return error.PathEscapesWorkspace;
         if (normalized_path.len <= normalized_root.len) return error.PathEscapesWorkspace;
         const sep = normalized_path[normalized_root.len];
@@ -215,6 +219,11 @@ test "common path and binary helpers" {
     const root_rel = try resolveWorkspacePath(std.testing.allocator, root, root);
     defer std.testing.allocator.free(root_rel);
     try std.testing.expectEqualStrings("", root_rel);
+    if (@import("builtin").os.tag != .windows) {
+        const root_child = try resolveWorkspacePath(std.testing.allocator, "/", "/tmp/root-child.txt");
+        defer std.testing.allocator.free(root_child);
+        try std.testing.expectEqualStrings("tmp/root-child.txt", root_child);
+    }
     const outside = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "outside.txt" });
     defer std.testing.allocator.free(outside);
     try std.testing.expectError(error.PathEscapesWorkspace, resolveWorkspacePath(std.testing.allocator, root, outside));
