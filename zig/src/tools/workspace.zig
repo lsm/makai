@@ -91,6 +91,7 @@ pub fn gitStatusExecute(tool_call_id: []const u8, args_json: []const u8, cancel_
     defer dir.close(common.defaultIo());
     const argv = [_][]const u8{ "git", "status", "--short" };
     const result = process_runner.run(allocator, &argv, .{ .dir = dir }, timeout_ms, cancel_token) catch |err| {
+        if (err == error.Cancelled) return err;
         const details = try common.jsonString(allocator, .{ .ok = false, .err = @errorName(err), .duration_ms = common.durationMs(start_ms), .raw_bytes = 0 });
         errdefer allocator.free(details);
         const text = try std.fmt.allocPrint(allocator, "git status failed: {s}", .{@errorName(err)});

@@ -45,6 +45,7 @@ pub fn execute(
     else
         [_][]const u8{ "/bin/sh", "-c", command };
     const result = process_runner.run(allocator, &argv, .{ .dir = dir }, timeout_ms, cancel_token) catch |err| {
+        if (err == error.Cancelled) return err;
         const duration_ms = common.durationMs(start_ms);
         const details = try common.jsonString(allocator, .{
             .ok = false,

@@ -36,6 +36,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
     while (true) {
         if (common.isCancelled(cancel_token)) return error.Cancelled;
         if (common.durationMs(start_ms) >= timeout_ms) return error.Timeout;
+        const term = try pollTerm(&child);
         if (!pipes_closed) {
             multi_reader.fill(64, poll_timeout) catch |err| switch (err) {
                 error.Timeout => {},
@@ -44,16 +45,14 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
             };
             if (stdout_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
             if (stderr_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
-        } else {
-            if (try pollTerm(&child)) |term| {
-                try multi_reader.checkAnyError();
-                const stdout = try multi_reader.toOwnedSlice(0);
-                errdefer allocator.free(stdout);
-                const stderr = try multi_reader.toOwnedSlice(1);
-                errdefer allocator.free(stderr);
-                return .{ .term = term, .stdout = stdout, .stderr = stderr };
-            }
-            common.defaultIo().sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
+        } else common.defaultIo().sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
+        if (term) |t| {
+            if (pipes_closed) try multi_reader.checkAnyError();
+            const stdout = try multi_reader.toOwnedSlice(0);
+            errdefer allocator.free(stdout);
+            const stderr = try multi_reader.toOwnedSlice(1);
+            errdefer allocator.free(stderr);
+            return .{ .term = t, .stdout = stdout, .stderr = stderr };
         }
     }
 }
@@ -102,8 +101,44 @@ fn statusToTerm(status: u32) std.process.Child.Term {
 }
 
 fn pollTermWindows(child: *std.process.Child) !?std.process.Child.Term {
-    _ = child;
-    return null;
+    if (child.id == null) return null;
+    const windows = std.os.windows;
+    const handle = child.id.?;
+    const minimal_timeout: windows.LARGE_INTEGER = -1;
+    return switch (windows.ntdll.NtWaitForSingleObject(handle, .FALSE, &minimal_timeout)) {
+        windows.NTSTATUS.WAIT_0 => {
+            var info: windows.PROCESS.BASIC_INFORMATION = undefined;
+            const term: std.process.Child.Term = switch (windows.ntdll.NtQueryInformationProcess(
+                handle,
+                .BasicInformation,
+                &info,
+                @sizeOf(windows.PROCESS.BASIC_INFORMATION),
+                null,
+            )) {
+                .SUCCESS => .{ .exited = @as(u8, @truncate(@intFromEnum(info.ExitStatus))) },
+                else => .{ .unknown = 0 },
+            };
+            windows.CloseHandle(handle);
+            child.id = null;
+            windows.CloseHandle(child.thread_handle);
+            child.thread_handle = undefined;
+            if (child.stdin) |stdin| {
+                stdin.close(common.defaultIo());
+                child.stdin = null;
+            }
+            if (child.stdout) |stdout| {
+                stdout.close(common.defaultIo());
+                child.stdout = null;
+            }
+            if (child.stderr) |stderr| {
+                stderr.close(common.defaultIo());
+                child.stderr = null;
+            }
+            return term;
+        },
+        .TIMEOUT => null,
+        else => |status| return windows.unexpectedStatus(status),
+    };
 }
 
 test "process runner honors cancellation" {
@@ -125,6 +160,15 @@ test "process runner captures output beyond small std process defaults" {
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
     try std.testing.expect(result.stdout.len >= 70_000);
+}
+
+test "process runner returns after child exits with inherited background pipe" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "sleep 2 &" };
+    const result = try run(std.testing.allocator, &argv, .inherit, 1_000, null);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
 }
 
 test "process runner enforces timeout after pipe eof" {

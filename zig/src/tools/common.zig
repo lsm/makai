@@ -106,9 +106,11 @@ pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []cons
         const normalized_path = try std.Io.Dir.path.resolve(allocator, &.{path_value});
         defer allocator.free(normalized_path);
         if (std.mem.eql(u8, normalized_path, normalized_root)) return try allocator.dupe(u8, "");
-        if (std.mem.eql(u8, normalized_root, &.{std.Io.Dir.path.sep})) {
+        if (isFilesystemRoot(normalized_root)) {
             if (!std.mem.startsWith(u8, normalized_path, normalized_root)) return error.PathEscapesWorkspace;
-            return try allocator.dupe(u8, normalized_path[1..]);
+            const offset: usize = if (std.mem.endsWith(u8, normalized_root, &.{std.Io.Dir.path.sep})) normalized_root.len else normalized_root.len + 1;
+            if (normalized_path.len < offset) return try allocator.dupe(u8, "");
+            return try allocator.dupe(u8, normalized_path[offset..]);
         }
         if (!std.mem.startsWith(u8, normalized_path, normalized_root)) return error.PathEscapesWorkspace;
         if (normalized_path.len <= normalized_root.len) return error.PathEscapesWorkspace;
@@ -118,6 +120,14 @@ pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []cons
     }
     if (hasParentTraversal(path_value)) return error.PathEscapesWorkspace;
     return try allocator.dupe(u8, path_value);
+}
+
+fn isFilesystemRoot(path: []const u8) bool {
+    if (std.mem.eql(u8, path, &.{std.Io.Dir.path.sep})) return true;
+    if (@import("builtin").os.tag == .windows) {
+        return path.len == 3 and std.ascii.isAlphabetic(path[0]) and path[1] == ':' and (path[2] == '/' or path[2] == '\\');
+    }
+    return false;
 }
 
 pub fn readWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8, max_bytes: usize) ![]u8 {
@@ -223,6 +233,8 @@ test "common path and binary helpers" {
         const root_child = try resolveWorkspacePath(std.testing.allocator, "/", "/tmp/root-child.txt");
         defer std.testing.allocator.free(root_child);
         try std.testing.expectEqualStrings("tmp/root-child.txt", root_child);
+    } else {
+        try std.testing.expect(isFilesystemRoot("C:\\"));
     }
     const outside = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "outside.txt" });
     defer std.testing.allocator.free(outside);
