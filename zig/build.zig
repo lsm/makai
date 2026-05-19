@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const zigzag_dep = b.dependency("zigzag", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigzag_mod = zigzag_dep.module("zigzag");
 
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("src/ai_types.zig"),
@@ -1241,6 +1246,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
+            .{ .name = "zigzag", .module = zigzag_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
