@@ -228,6 +228,25 @@ pub const Agent = struct {
         return self._steering_queue.items.len > 0 or self._follow_up_queue.items.len > 0;
     }
 
+    /// Validate continueFromContext without mutating queues.
+    pub fn validateContinueFromContext(self: *Agent) !void {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._state.is_streaming or self._thread != null) {
+            return error.AgentAlreadyStreaming;
+        }
+        if (self._state.model == null) {
+            return error.NoModelConfigured;
+        }
+
+        const messages = self._state.messages.items;
+        if (messages.len == 0) return error.NoMessagesToContinue;
+        if (messages[messages.len - 1] == .assistant and self._steering_queue.items.len == 0 and self._follow_up_queue.items.len == 0) {
+            return error.CannotContinueFromAssistant;
+        }
+    }
+
     // === State Mutators ===
 
     /// Set the system prompt.
@@ -1247,6 +1266,15 @@ test "Agent async completion signals waitForIdle" {
 
     try std.testing.expect(agent.isIdle());
     try std.testing.expect(agent._thread == null);
+}
+
+test "Agent validateContinueFromContext reports resume errors" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoModelConfigured, agent.validateContinueFromContext());
+    agent.setModel(test_model);
+    try std.testing.expectError(error.NoMessagesToContinue, agent.validateContinueFromContext());
 }
 
 test "Agent continueFromContextAsync rejects missing model" {

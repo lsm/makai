@@ -56,7 +56,7 @@ pub const TuiRuntime = struct {
     approval_contexts: []ApprovalContext,
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
-    cancelled: bool = false,
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
     stream_active: bool = false,
@@ -194,7 +194,7 @@ pub const TuiRuntime = struct {
                 if (self.currentModel() == null) return error.NoModelConfigured;
                 if (self.run_async) local.waitForIdle();
                 self.resetEventStreamForTurn();
-                self.cancelled = false;
+                self.cancelled.store(false, .release);
                 self.completed = false;
                 self.last_turn_stop_reason = null;
                 if (self.run_async) {
@@ -225,8 +225,9 @@ pub const TuiRuntime = struct {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 if (self.run_async) local.waitForIdle();
+                try local.validateContinueFromContext();
                 self.resetEventStreamForTurn();
-                self.cancelled = false;
+                self.cancelled.store(false, .release);
                 self.completed = false;
                 self.last_turn_stop_reason = null;
                 if (self.run_async) {
@@ -239,7 +240,7 @@ pub const TuiRuntime = struct {
     }
 
     pub fn cancel(self: *TuiRuntime) void {
-        self.cancelled = true;
+        self.cancelled.store(true, .release);
         if (self.local_agent) |*local| local.abort();
     }
 
@@ -336,7 +337,7 @@ pub const TuiRuntime = struct {
                 self.push(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
             },
             .agent_end => {
-                const reason: TuiEndReason = if (self.cancelled) .cancelled else if (self.last_turn_stop_reason == .@"error") .@"error" else .completed;
+                const reason: TuiEndReason = if (self.cancelled.load(.acquire)) .cancelled else if (self.last_turn_stop_reason == .@"error") .@"error" else .completed;
                 self.completed = true;
                 self.push(.{ .agent_end = .{ .reason = reason } });
                 self.event_stream.complete(.{ .reason = reason });
@@ -931,6 +932,20 @@ test "model switch is rejected while async turn is running" {
     if (runtime.local_agent) |*local| local.waitForIdle();
     try tui_session.switchModel("model-b");
     try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "failed resume does not reset event stream" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectError(error.NoMessagesToContinue, tui_session.resumeSession());
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+    try std.testing.expect(!runtime.stream_active);
+    try std.testing.expect(tui_session.popEvent() == null);
 }
 
 test "async submit without selected model fails before stream reset" {
