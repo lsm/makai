@@ -61,6 +61,11 @@ pub const AgentOptions = struct {
 /// High-level Agent class that manages state, subscriptions, and message queues.
 /// Provides a stateful wrapper around the low-level agent loop.
 pub const Agent = struct {
+    const ContinueRequest = struct {
+        messages: []ai_types.Message,
+        skip_steering: bool,
+    };
+
     // Internal state
     _state: AgentState,
     _allocator: std.mem.Allocator,
@@ -487,6 +492,29 @@ pub const Agent = struct {
         return !self._state.is_streaming;
     }
 
+    fn prepareContinueFromContextLocked(self: *Agent) !ContinueRequest {
+        const messages = self._state.messages.items;
+        if (messages.len == 0) {
+            return error.NoMessagesToContinue;
+        }
+
+        if (messages[messages.len - 1] == .assistant) {
+            if (self._steering_queue.items.len > 0) {
+                const steering = try self.dequeueSteeringMessagesLocked();
+                return .{ .messages = steering, .skip_steering = true };
+            }
+
+            if (self._follow_up_queue.items.len > 0) {
+                const follow_up = try self.dequeueFollowUpMessagesLocked();
+                return .{ .messages = follow_up, .skip_steering = false };
+            }
+
+            return error.CannotContinueFromAssistant;
+        }
+
+        return .{ .messages = try self._allocator.alloc(ai_types.Message, 0), .skip_steering = false };
+    }
+
     /// Continue from current context asynchronously.
     /// Use waitForIdle() to block until completion.
     pub fn continueFromContextAsync(self: *Agent) !void {
@@ -496,15 +524,17 @@ pub const Agent = struct {
         if (self._state.is_streaming or self._thread != null) {
             return error.AgentAlreadyStreaming;
         }
-        if (self._state.messages.items.len == 0) {
-            return error.NoMessagesToContinue;
+
+        const request = try self.prepareContinueFromContextLocked();
+        errdefer {
+            for (request.messages) |*msg| msg.deinit(self._allocator);
+            self._allocator.free(request.messages);
         }
 
-        const messages = try self._allocator.alloc(ai_types.Message, 0);
-        errdefer self._allocator.free(messages);
-
         self._done_event.reset();
-        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, messages, false });
+        self._state.is_streaming = true;
+        errdefer self._state.is_streaming = false;
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, request.messages, request.skip_steering });
     }
 
     /// Wait for the agent to become idle.
@@ -927,23 +957,15 @@ pub const Agent = struct {
         }
     }
 
-    fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
-        self._mutex.lockUncancelable(defaultIo());
-        defer self._mutex.unlock(defaultIo());
-
+    fn dequeueSteeringMessagesLocked(self: *Agent) ![]ai_types.Message {
         if (self._steering_mode == .one_at_a_time) {
-            if (self._steering_queue.items.len > 0) {
-                const first = self._steering_queue.orderedRemove(0);
-                const result = try self._allocator.alloc(ai_types.Message, 1);
-                result[0] = first;
-                return result;
-            }
-            return null;
+            const first = self._steering_queue.orderedRemove(0);
+            const result = try self._allocator.alloc(ai_types.Message, 1);
+            result[0] = first;
+            return result;
         }
 
         const count = self._steering_queue.items.len;
-        if (count == 0) return null;
-
         const result = try self._allocator.alloc(ai_types.Message, count);
         for (self._steering_queue.items, 0..) |msg, i| {
             result[i] = msg;
@@ -952,29 +974,37 @@ pub const Agent = struct {
         return result;
     }
 
-    fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
+    fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
 
+        if (self._steering_queue.items.len == 0) return null;
+        return try self.dequeueSteeringMessagesLocked();
+    }
+
+    fn dequeueFollowUpMessagesLocked(self: *Agent) ![]ai_types.Message {
         if (self._follow_up_mode == .one_at_a_time) {
-            if (self._follow_up_queue.items.len > 0) {
-                const first = self._follow_up_queue.orderedRemove(0);
-                const result = try self._allocator.alloc(ai_types.Message, 1);
-                result[0] = first;
-                return result;
-            }
-            return null;
+            const first = self._follow_up_queue.orderedRemove(0);
+            const result = try self._allocator.alloc(ai_types.Message, 1);
+            result[0] = first;
+            return result;
         }
 
         const count = self._follow_up_queue.items.len;
-        if (count == 0) return null;
-
         const result = try self._allocator.alloc(ai_types.Message, count);
         for (self._follow_up_queue.items, 0..) |msg, i| {
             result[i] = msg;
         }
         self._follow_up_queue.clearRetainingCapacity();
         return result;
+    }
+
+    fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._follow_up_queue.items.len == 0) return null;
+        return try self.dequeueFollowUpMessagesLocked();
     }
 
     // === Static Callbacks ===
@@ -1214,6 +1244,32 @@ test "Agent async completion signals waitForIdle" {
 
     try std.testing.expect(agent.isIdle());
     try std.testing.expect(agent._thread == null);
+}
+
+test "Agent continueFromContextAsync mirrors sync resume checks" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    const assistant = ai_types.Message{ .assistant = .{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    } };
+    try agent.appendMessage(assistant);
+
+    try std.testing.expectError(error.CannotContinueFromAssistant, agent.continueFromContextAsync());
+
+    const steering_text = try std.testing.allocator.dupe(u8, "steer");
+    try agent.steer(.{ .user = .{ .content = .{ .text = steering_text }, .timestamp = 1 } });
+    try agent.continueFromContextAsync();
+    try std.testing.expect(agent.isStreaming());
+    agent.waitForIdle();
+    try std.testing.expectEqual(@as(usize, 0), agent._steering_queue.items.len);
 }
 
 test "Agent cloneMessage" {

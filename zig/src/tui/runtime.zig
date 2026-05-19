@@ -185,6 +185,7 @@ pub const TuiRuntime = struct {
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.currentModel() == null) return error.NoModelConfigured;
                 if (self.run_async) local.waitForIdle();
                 self.resetEventStreamForTurn();
                 self.cancelled = false;
@@ -854,6 +855,19 @@ test "model switch affects next turn" {
     collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
 
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
+}
+
+test "async submit without selected model fails before stream reset" {
+    var mock = MockProtocolCtx{};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectError(error.NoModelConfigured, tui_session.submitTurn("hi"));
+    try std.testing.expectEqual(@as(usize, 0), mock.call_count);
+    try std.testing.expect(!runtime.stream_active);
+    try std.testing.expect(tui_session.popEvent() == null);
 }
 
 test "failed turns emit error end reason" {
