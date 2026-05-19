@@ -17,19 +17,6 @@ pub const test_model = ai_types.Model{
     .max_tokens = 1024,
 };
 
-pub const alternate_model = ai_types.Model{
-    .id = "tui-fixture-model-alt",
-    .name = "TUI Fixture Model Alt",
-    .api = "tui-fixture-api",
-    .provider = "tui-fixture-provider",
-    .base_url = "https://example.invalid",
-    .reasoning = false,
-    .input = &.{"text"},
-    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-    .context_window = 8192,
-    .max_tokens = 1024,
-};
-
 pub const ToolCallSpec = struct {
     id: []const u8,
     name: []const u8,
@@ -73,7 +60,9 @@ pub const MockProvider = struct {
         self.last_message_count = context.messages.len;
 
         const stream_ptr = try allocator.create(event_stream.AssistantMessageEventStream);
+        errdefer allocator.destroy(stream_ptr);
         stream_ptr.* = event_stream.AssistantMessageEventStream.init(allocator);
+        errdefer stream_ptr.deinit();
 
         const step = if (self.call_count < self.scenario.steps.len)
             self.scenario.steps[self.call_count]
@@ -113,10 +102,36 @@ fn emptyAssistantMessage(model: ai_types.Model, stop_reason: ai_types.StopReason
     };
 }
 
+fn deinitAssistantContentBlock(allocator: std.mem.Allocator, block: ai_types.AssistantContent) void {
+    switch (block) {
+        .text => |t| {
+            allocator.free(t.text);
+            if (t.text_signature) |s| allocator.free(s);
+        },
+        .thinking => |t| {
+            allocator.free(t.thinking);
+            if (t.thinking_signature) |s| allocator.free(s);
+        },
+        .tool_call => |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments_json);
+            if (tc.thought_signature) |s| allocator.free(s);
+        },
+        .image => |img| {
+            allocator.free(img.data);
+            allocator.free(img.mime_type);
+        },
+    }
+}
+
 fn makeAssistantMessage(allocator: std.mem.Allocator, model: ai_types.Model, content: []const ai_types.AssistantContent, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
     const blocks = try allocator.alloc(ai_types.AssistantContent, content.len);
     var initialized: usize = 0;
-    errdefer ai_types.deinitAssistantContent(allocator, blocks[0..initialized]);
+    errdefer {
+        for (blocks[0..initialized]) |block| deinitAssistantContentBlock(allocator, block);
+        allocator.free(blocks);
+    }
 
     for (content, 0..) |block, i| {
         blocks[i] = switch (block) {
@@ -207,8 +222,12 @@ test "mock provider streams canned text" {
 
     var saw_delta = false;
     while (stream_ptr.wait()) |event| {
-        if (event == .text_delta) saw_delta = std.mem.eql(u8, event.text_delta.delta, "hello");
+        var ev = event;
+        defer ai_types.deinitAssistantMessageEvent(std.testing.allocator, &ev);
+        if (ev == .text_delta) saw_delta = std.mem.eql(u8, ev.text_delta.delta, "hello");
     }
     try std.testing.expect(saw_delta);
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expectEqualStrings(test_model.id, provider.last_model_id);
+    try std.testing.expectEqual(@as(usize, 0), provider.last_message_count);
 }

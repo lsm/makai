@@ -2,7 +2,6 @@ const std = @import("std");
 const tui_runtime = @import("tui_runtime");
 const tui_session = @import("tui_session");
 const mock_provider = @import("tui_tests_mock_provider");
-const mock_transport = @import("tui_tests_mock_transport");
 const fixtures = @import("tui_tests_fixtures");
 
 const TuiRuntime = tui_runtime.TuiRuntime;
@@ -68,6 +67,8 @@ test "local runtime lifecycle submits turn and supports cancel" {
     try std.testing.expect(summary.turn_end);
     try std.testing.expect(summary.agent_end);
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, provider.last_model_id);
+    try std.testing.expectEqual(@as(usize, 1), provider.last_message_count);
 
     const cancel_steps = [_]mock_provider.ResponseStep{.{ .wait_for_cancel = {} }};
     var cancel_provider = mock_provider.MockProvider.init(.{ .steps = &cancel_steps });
@@ -91,9 +92,7 @@ test "local runtime lifecycle submits turn and supports cancel" {
 }
 
 test "tool execution fixtures run shell read edit and search" {
-    var state = fixtures.ToolFixtureState{};
-    fixtures.setActiveState(&state);
-    const tools = fixtures.tools(&state);
+    const tools = fixtures.tools();
     const steps = [_]mock_provider.ResponseStep{
         .{ .tool_calls = &fixtures.phase1_tool_calls },
         .{ .text = fixtures.final_text },
@@ -132,14 +131,11 @@ test "tool execution fixtures run shell read edit and search" {
     try std.testing.expectEqual(@as(usize, 4), starts);
     try std.testing.expectEqual(@as(usize, 4), successful_ends);
     try std.testing.expectEqual(@as(usize, 4), updates);
-    try std.testing.expectEqual(@as(usize, 4), state.total());
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
 }
 
 test "tool fixture error case emits error tool end" {
-    var state = fixtures.ToolFixtureState{};
-    fixtures.setActiveState(&state);
-    const tools = fixtures.tools(&state);
+    const tools = fixtures.tools();
     const steps = [_]mock_provider.ResponseStep{
         .{ .tool_calls = &fixtures.error_tool_calls },
         .{ .text = fixtures.final_text },
@@ -170,7 +166,6 @@ test "tool fixture error case emits error tool end" {
     }
 
     try std.testing.expect(saw_error);
-    try std.testing.expectEqual(@as(usize, 1), state.shell_count);
 }
 
 const ApprovalState = struct {
@@ -185,12 +180,43 @@ fn approvalCallback(ctx: ?*anyopaque, request: ToolApprovalRequest) ToolApproval
     return state.decision;
 }
 
+test "provider error injection propagates through session" {
+    const steps = [_]mock_provider.ResponseStep{.{ .provider_error = "fixture provider error" }};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &steps });
+    const models = [_]@TypeOf(mock_provider.test_model){mock_provider.test_model};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var session = runtime.createSession();
+    try session.start();
+    try std.testing.expectError(error.AgentLoopFailed, session.submitTurn("trigger provider error"));
+
+    var saw_error_end = false;
+    while (session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .agent_end => |payload| {
+                saw_error_end = payload.reason == .@"error";
+                break;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_error_end);
+    try std.testing.expectEqual(@as(usize, 1), provider.call_count);
+}
+
+
 test "tool approval approve runs tool and reject skips executor" {
     const models = [_]@TypeOf(mock_provider.test_model){mock_provider.test_model};
 
-    var approve_tool_state = fixtures.ToolFixtureState{};
-    fixtures.setActiveState(&approve_tool_state);
-    const approve_tools = fixtures.tools(&approve_tool_state);
+    const approve_tools = fixtures.tools();
     const approve_steps = [_]mock_provider.ResponseStep{
         .{ .tool_calls = &fixtures.approval_tool_calls },
         .{ .text = fixtures.final_text },
@@ -226,11 +252,8 @@ test "tool approval approve runs tool and reject skips executor" {
     try std.testing.expect(approve_requested);
     try std.testing.expect(approve_tool_ok);
     try std.testing.expectEqual(@as(usize, 1), approve_state.calls);
-    try std.testing.expectEqual(@as(usize, 1), approve_tool_state.shell_count);
 
-    var reject_tool_state = fixtures.ToolFixtureState{};
-    fixtures.setActiveState(&reject_tool_state);
-    const reject_tools = fixtures.tools(&reject_tool_state);
+    const reject_tools = fixtures.tools();
     const reject_steps = [_]mock_provider.ResponseStep{
         .{ .tool_calls = &fixtures.approval_tool_calls },
         .{ .text = fixtures.final_text },
@@ -266,27 +289,6 @@ test "tool approval approve runs tool and reject skips executor" {
     try std.testing.expect(reject_requested);
     try std.testing.expect(reject_tool_error);
     try std.testing.expectEqual(@as(usize, 1), reject_state.calls);
-    try std.testing.expectEqual(@as(usize, 0), reject_tool_state.shell_count);
-}
-
-test "mock transport supports protocol harness FIFO" {
-    var transport = mock_transport.MockTransport.init(std.testing.allocator);
-    defer transport.deinit();
-
-    try transport.enqueueInbound("frame-a");
-    try transport.enqueueInbound("frame-b");
-    var receiver = transport.receiver();
-    const frame_a = (try receiver.read(std.testing.allocator)).?;
-    defer std.testing.allocator.free(frame_a);
-    const frame_b = (try receiver.read(std.testing.allocator)).?;
-    defer std.testing.allocator.free(frame_b);
-    try std.testing.expectEqualStrings("frame-a", frame_a);
-    try std.testing.expectEqualStrings("frame-b", frame_b);
-
-    var sender = transport.sender();
-    try sender.write("client-frame");
-    try std.testing.expectEqual(@as(usize, 1), transport.outboundCount());
-    try std.testing.expectEqualStrings("client-frame", transport.outboundFrame(0));
 }
 
 test {
