@@ -42,6 +42,7 @@ pub const AppState = struct {
 
 pub const App = struct {
     allocator: std.mem.Allocator,
+    tty_buffer: []u8,
     tty: vaxis.Tty,
     vx: vaxis.Vaxis,
     state: AppState,
@@ -49,8 +50,10 @@ pub const App = struct {
     mock_thread: ?std.Thread = null,
 
     pub fn init(init_args: std.process.Init) !App {
-        var buffer: [1024]u8 = undefined;
-        var tty = try vaxis.Tty.init(init_args.io, &buffer);
+        const tty_buffer = try init_args.gpa.alloc(u8, 1024);
+        errdefer init_args.gpa.free(tty_buffer);
+
+        var tty = try vaxis.Tty.init(init_args.io, tty_buffer);
         errdefer tty.deinit();
 
         var vx = try vaxis.init(init_args.io, init_args.gpa, init_args.environ_map, .{
@@ -66,6 +69,7 @@ pub const App = struct {
 
         return .{
             .allocator = init_args.gpa,
+            .tty_buffer = tty_buffer,
             .tty = tty,
             .vx = vx,
             .state = state,
@@ -77,6 +81,7 @@ pub const App = struct {
         self.state.deinit();
         self.vx.deinit(self.allocator, self.tty.writer());
         self.tty.deinit();
+        self.allocator.free(self.tty_buffer);
         self.* = undefined;
     }
 
