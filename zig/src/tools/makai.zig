@@ -3557,16 +3557,14 @@ test "handleAuth login surfaces typed error for unknown provider via CLI wrapper
     try std.testing.expect(std.mem.find(u8, stderr_bytes, "auth login failed") != null);
 }
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     const stdout = compat.stdio.stdout();
     const stderr = compat.stdio.stderr();
     const stdin = compat.stdio.stdin();
 
-    const args = try init.args.toSlice(allocator);
+    const args = try init.minimal.args.toSlice(allocator);
     defer allocator.free(args);
 
     if (args.len <= 1) {
