@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const common = @import("tools/common");
+const process_runner = @import("tools/process_runner");
 
 pub const schema_execute =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["workspace_root","command"],"additionalProperties":false}
@@ -43,11 +44,7 @@ pub fn execute(
         [_][]const u8{ "cmd.exe", "/C", command }
     else
         [_][]const u8{ "/bin/sh", "-c", command };
-    const result = std.process.run(allocator, common.defaultIo(), .{
-        .argv = &argv,
-        .cwd = .{ .dir = dir },
-        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } },
-    }) catch |err| {
+    const result = process_runner.run(allocator, &argv, .{ .dir = dir }, timeout_ms, cancel_token) catch |err| {
         const duration_ms = common.durationMs(start_ms);
         const details = try common.jsonString(allocator, .{
             .ok = false,

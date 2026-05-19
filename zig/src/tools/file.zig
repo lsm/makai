@@ -31,16 +31,24 @@ pub fn readExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     const offset = common.optionalUsize(obj, "offset", 0);
     const limit = common.optionalUsize(obj, "limit", common.max_file_bytes);
 
-    const data = try common.readWorkspaceFile(allocator, workspace_root, path, common.max_file_bytes);
-    defer allocator.free(data);
-    if (common.isBinary(data)) return error.BinaryFileRejected;
-    if (offset > data.len) return error.RangeOutOfBounds;
-    const end = @min(data.len, offset + @min(limit, data.len - offset));
-    const slice = data[offset..end];
-    const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = data.len, .returned_bytes = slice.len, .offset = offset, .limit = limit });
-    errdefer allocator.free(details);
-    const text = try allocator.dupe(u8, slice);
+    var file = try common.openWorkspaceFile(allocator, workspace_root, path);
+    defer file.close(common.defaultIo());
+    const st = try file.stat(common.defaultIo());
+    if (offset > st.size) return error.RangeOutOfBounds;
+    const remaining: usize = @intCast(st.size - offset);
+    const read_len = @min(limit, remaining);
+    const text = try allocator.alloc(u8, read_len);
     errdefer allocator.free(text);
+    const bytes_read = try file.readPositionalAll(common.defaultIo(), text, offset);
+    if (common.isBinary(text[0..bytes_read])) return error.BinaryFileRejected;
+    if (bytes_read != text.len) {
+        const resized = try allocator.realloc(text, bytes_read);
+        const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = st.size, .returned_bytes = bytes_read, .offset = offset, .limit = limit });
+        errdefer allocator.free(details);
+        return common.makeTextResultOwned(allocator, resized, details);
+    }
+    const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = st.size, .returned_bytes = text.len, .offset = offset, .limit = limit });
+    errdefer allocator.free(details);
     return common.makeTextResultOwned(allocator, text, details);
 }
 
@@ -100,6 +108,26 @@ test "file read write stat" {
     var st = try statExecute("call", read_args, null, null, null, std.testing.allocator);
     defer st.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, st.getDetailsJson().?, "\"size\":5") != null);
+}
+
+test "file read supports byte ranges without loading full file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const big = try std.testing.allocator.alloc(u8, common.max_file_bytes + 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'a');
+    @memcpy(big[common.max_file_bytes + 10 .. common.max_file_bytes + 15], "range");
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "big.txt", .data = big });
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"big.txt\",\"offset\":{d},\"limit\":5}}", .{ root, common.max_file_bytes + 10 });
+    defer std.testing.allocator.free(args);
+    var result = try readExecute("call", args, null, null, null, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("range", result.content.slice()[0].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, result.getDetailsJson().?, "\"returned_bytes\":5") != null);
 }
 
 test "file read rejects missing binary and workspace escape" {

@@ -4,6 +4,8 @@ const agent = @import("agent");
 const compat = @import("compat");
 
 pub const max_file_bytes: usize = 16 * 1024 * 1024;
+pub const process_output_bytes: usize = 16 * 1024 * 1024;
+pub const process_poll_ms: u64 = 100;
 pub const max_results: usize = 200;
 
 pub fn defaultIo() std.Io {
@@ -115,12 +117,7 @@ pub fn resolveWorkspacePath(allocator: std.mem.Allocator, workspace_root: []cons
 }
 
 pub fn readWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8, max_bytes: usize) ![]u8 {
-    const relative_path = try resolveWorkspacePath(allocator, workspace_root, path_value);
-    defer allocator.free(relative_path);
-    var dir = try openWorkspace(workspace_root, false);
-    defer dir.close(defaultIo());
-    try ensureNoSymlinkComponents(allocator, dir, relative_path);
-    var file = try dir.openFile(defaultIo(), relative_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    var file = try openWorkspaceFile(allocator, workspace_root, path_value);
     defer file.close(defaultIo());
     var file_reader = file.reader(defaultIo(), &.{});
     return file_reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
@@ -147,6 +144,15 @@ pub fn statWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u
     defer dir.close(defaultIo());
     try ensureNoSymlinkComponents(allocator, dir, relative_path);
     return dir.statFile(defaultIo(), relative_path, .{ .follow_symlinks = false });
+}
+
+pub fn openWorkspaceFile(allocator: std.mem.Allocator, workspace_root: []const u8, path_value: []const u8) !std.Io.File {
+    const relative_path = try resolveWorkspacePath(allocator, workspace_root, path_value);
+    defer allocator.free(relative_path);
+    var dir = try openWorkspace(workspace_root, false);
+    defer dir.close(defaultIo());
+    try ensureNoSymlinkComponents(allocator, dir, relative_path);
+    return dir.openFile(defaultIo(), relative_path, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
 }
 
 fn ensureNoSymlinkComponents(allocator: std.mem.Allocator, dir: std.Io.Dir, relative_path: []const u8) !void {

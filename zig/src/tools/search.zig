@@ -31,6 +31,9 @@ pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     defer walker.deinit();
 
     var matches = std.ArrayList(Match).empty;
+    var scanned_files: usize = 0;
+    var skipped_oversized_files: usize = 0;
+    var skipped_read_error_files: usize = 0;
     defer {
         for (matches.items) |m| {
             allocator.free(m.path);
@@ -44,7 +47,19 @@ pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
         if (matches.items.len >= max) break;
         if (entry.kind != .file) continue;
         if (glob) |g| if (!globMatches(g, entry.path)) continue;
-        const data = root.readFileAlloc(common.defaultIo(), entry.path, allocator, .limited(1024 * 1024)) catch continue;
+        scanned_files += 1;
+        const st = root.statFile(common.defaultIo(), entry.path, .{ .follow_symlinks = false }) catch {
+            skipped_read_error_files += 1;
+            continue;
+        };
+        if (st.size >= 1024 * 1024) {
+            skipped_oversized_files += 1;
+            continue;
+        }
+        const data = root.readFileAlloc(common.defaultIo(), entry.path, allocator, .limited(1024 * 1024)) catch {
+            skipped_read_error_files += 1;
+            continue;
+        };
         defer allocator.free(data);
         if (common.isBinary(data)) continue;
         var line_no: usize = 1;
@@ -69,7 +84,7 @@ pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     }
     const text = try out.toOwnedSlice(allocator);
     errdefer allocator.free(text);
-    const details = try common.jsonString(allocator, .{ .ok = true, .query = query, .duration_ms = common.durationMs(start_ms), .raw_bytes = text.len, .returned_bytes = text.len, .match_count = matches.items.len });
+    const details = try common.jsonString(allocator, .{ .ok = true, .query = query, .duration_ms = common.durationMs(start_ms), .raw_bytes = text.len, .returned_bytes = text.len, .match_count = matches.items.len, .scanned_files = scanned_files, .skipped_oversized_files = skipped_oversized_files, .skipped_read_error_files = skipped_read_error_files });
     errdefer allocator.free(details);
     return common.makeTextResultOwned(allocator, text, details);
 }
@@ -154,6 +169,7 @@ test "search text returns file line content and empty results" {
     var long = try textExecute("call", long_args, null, null, null, std.testing.allocator);
     defer long.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("", long.content.slice()[0].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, long.getDetailsJson().?, "\"skipped_oversized_files\":1") != null);
     var cancelled = std.atomic.Value(bool).init(true);
     const token = ai_types.CancelToken{ .cancelled = &cancelled };
     try std.testing.expectError(error.Cancelled, textExecute("call", long_args, token, null, null, std.testing.allocator));

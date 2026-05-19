@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const common = @import("tools/common");
+const process_runner = @import("tools/process_runner");
 
 pub const schema_info =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"}},"required":["workspace_root"],"additionalProperties":false}
@@ -89,7 +90,7 @@ pub fn gitStatusExecute(tool_call_id: []const u8, args_json: []const u8, cancel_
     var dir = try common.openWorkspace(workspace_root, false);
     defer dir.close(common.defaultIo());
     const argv = [_][]const u8{ "git", "status", "--short" };
-    const result = std.process.run(allocator, common.defaultIo(), .{ .argv = &argv, .cwd = .{ .dir = dir }, .timeout = .{ .duration = .{ .raw = .fromMilliseconds(@intCast(timeout_ms)), .clock = .boot } } }) catch |err| {
+    const result = process_runner.run(allocator, &argv, .{ .dir = dir }, timeout_ms, cancel_token) catch |err| {
         const details = try common.jsonString(allocator, .{ .ok = false, .err = @errorName(err), .duration_ms = common.durationMs(start_ms), .raw_bytes = 0 });
         errdefer allocator.free(details);
         const text = try std.fmt.allocPrint(allocator, "git status failed: {s}", .{@errorName(err)});
