@@ -1,0 +1,129 @@
+const std = @import("std");
+const ai_types = @import("ai_types");
+const agent = @import("agent");
+const common = @import("tools/common");
+
+pub const schema_regex =
+    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"query":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root","query"],"additionalProperties":false}
+;
+
+pub const regex_tool = agent.AgentTool{ .label = "Regex Search", .name = "search_regex", .description = "Search workspace text files using a regex, optional glob substring filter, and return file:line:content results.", .parameters_schema_json = schema_regex, .execute = regexExecute };
+
+const Match = struct { path: []u8, line: usize, content: []u8 };
+
+pub fn regexExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = on_update_ctx;
+    _ = on_update;
+    if (common.isCancelled(cancel_token)) return error.Cancelled;
+    const start_ms = common.nowMs();
+    var parsed = try common.parseArgs(allocator, args_json);
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    const workspace_root = try common.requiredString(obj, "workspace_root");
+    const query = try common.requiredString(obj, "query");
+    const glob = common.optionalString(obj, "glob");
+    const max = @min(common.optionalUsize(obj, "max_results", 50), common.max_results);
+    var root = try common.openWorkspace(workspace_root, true);
+    defer root.close(common.defaultIo());
+    var walker = try root.walk(allocator);
+    defer walker.deinit();
+
+    var matches = std.ArrayList(Match).empty;
+    defer {
+        for (matches.items) |m| {
+            allocator.free(m.path);
+            allocator.free(m.content);
+        }
+        matches.deinit(allocator);
+    }
+
+    while (try walker.next(common.defaultIo())) |entry| {
+        if (common.isCancelled(cancel_token)) return error.Cancelled;
+        if (matches.items.len >= max) break;
+        if (entry.kind != .file) continue;
+        if (glob) |g| if (!globMatches(g, entry.path)) continue;
+        const data = root.readFileAlloc(common.defaultIo(), entry.path, allocator, .limited(1024 * 1024)) catch continue;
+        defer allocator.free(data);
+        if (common.isBinary(data)) continue;
+        var line_no: usize = 1;
+        var line_it = std.mem.splitScalar(u8, data, '\n');
+        while (line_it.next()) |line| {
+            if (regexLikeMatch(query, line)) {
+                try matches.append(allocator, .{ .path = try allocator.dupe(u8, entry.path), .line = line_no, .content = try allocator.dupe(u8, line) });
+                if (matches.items.len >= max) break;
+            }
+            line_no += 1;
+        }
+    }
+
+    std.mem.sort(Match, matches.items, {}, lessMatch);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (matches.items) |m| {
+        const line = try std.fmt.allocPrint(allocator, "{s}:{d}:{s}\n", .{ m.path, m.line, m.content });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+    }
+    const text = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(text);
+    const details = try common.jsonString(allocator, .{ .ok = true, .query = query, .duration_ms = common.durationMs(start_ms), .raw_bytes = text.len, .returned_bytes = text.len, .match_count = matches.items.len });
+    errdefer allocator.free(details);
+    return common.makeTextResultOwned(allocator, text, details);
+}
+
+fn lessMatch(_: void, a: Match, b: Match) bool {
+    const order = std.mem.order(u8, a.path, b.path);
+    if (order != .eq) return order == .lt;
+    return a.line < b.line;
+}
+
+fn regexLikeMatch(pattern: []const u8, text: []const u8) bool {
+    // Minimal regex surface for local TUI search bootstrap: literal substring,
+    // `.` wildcard, and `.*` gaps. Full indexing/regex engine belongs later.
+    return matchFrom(pattern, text) or blk: {
+        for (text, 0..) |_, i| if (matchFrom(pattern, text[i..])) break :blk true;
+        break :blk false;
+    };
+}
+
+fn matchFrom(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (std.mem.startsWith(u8, pattern, ".*")) {
+        if (matchFrom(pattern[2..], text)) return true;
+        return text.len > 0 and matchFrom(pattern, text[1..]);
+    }
+    if (text.len == 0) return false;
+    if (pattern[0] == '.' or pattern[0] == text[0]) return matchFrom(pattern[1..], text[1..]);
+    return false;
+}
+
+fn globMatches(pattern: []const u8, path: []const u8) bool {
+    if (pattern.len == 0 or std.mem.eql(u8, pattern, "**/*")) return true;
+    var cleaned = pattern;
+    if (std.mem.startsWith(u8, cleaned, "**/")) cleaned = cleaned[3..];
+    if (std.mem.startsWith(u8, cleaned, "*")) cleaned = cleaned[1..];
+    if (std.mem.endsWith(u8, cleaned, "*")) cleaned = cleaned[0 .. cleaned.len - 1];
+    return std.mem.indexOf(u8, path, cleaned) != null;
+}
+
+test "search regex returns file line content and empty results" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "a.zig", .data = "const needle = 1;\n" });
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "b.txt", .data = "nothing\n" });
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\"needle\",\"glob\":\"*.zig\"}}", .{root});
+    defer std.testing.allocator.free(args);
+    var result = try regexExecute("call", args, null, null, null, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("a.zig:1:const needle = 1;\n", result.content.slice()[0].text.text);
+    const empty_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"query\":\"absent\"}}", .{root});
+    defer std.testing.allocator.free(empty_args);
+    var empty = try regexExecute("call", empty_args, null, null, null, std.testing.allocator);
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", empty.content.slice()[0].text.text);
+}
