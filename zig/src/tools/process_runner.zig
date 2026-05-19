@@ -21,7 +21,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
         .stderr = .pipe,
         .create_no_window = true,
     });
-    defer child.kill(io);
+    defer cleanupChild(&child, io);
 
     var multi_reader_buffer: std.Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: std.Io.File.MultiReader = undefined;
@@ -33,28 +33,49 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
     const poll_timeout: std.Io.Timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(common.process_poll_ms), .clock = .boot } };
 
     var pipes_closed = false;
+    var term: ?std.process.Child.Term = null;
     while (true) {
         if (common.isCancelled(cancel_token)) return error.Cancelled;
         if (common.durationMs(start_ms) >= timeout_ms) return error.Timeout;
-        const term = try pollTerm(&child);
+        if (term == null) term = try pollTerm(&child);
         if (!pipes_closed) {
             multi_reader.fill(64, poll_timeout) catch |err| switch (err) {
-                error.Timeout => {},
+                error.Timeout => {
+                    if (term) |t| return finish(allocator, &multi_reader, t, false);
+                },
                 error.EndOfStream => pipes_closed = true,
                 else => |e| return e,
             };
             if (stdout_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
             if (stderr_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
         } else common.defaultIo().sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
-        if (term) |t| {
-            if (pipes_closed) try multi_reader.checkAnyError();
-            const stdout = try multi_reader.toOwnedSlice(0);
-            errdefer allocator.free(stdout);
-            const stderr = try multi_reader.toOwnedSlice(1);
-            errdefer allocator.free(stderr);
-            return .{ .term = t, .stdout = stdout, .stderr = stderr };
-        }
+        if (term) |t| if (pipes_closed) return finish(allocator, &multi_reader, t, true);
     }
+}
+
+fn cleanupChild(child: *std.process.Child, io: std.Io) void {
+    if (child.id != null) child.kill(io);
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
+    if (child.stdout) |stdout| {
+        stdout.close(io);
+        child.stdout = null;
+    }
+    if (child.stderr) |stderr| {
+        stderr.close(io);
+        child.stderr = null;
+    }
+}
+
+fn finish(allocator: std.mem.Allocator, multi_reader: *std.Io.File.MultiReader, term: std.process.Child.Term, check_errors: bool) !ProcessResult {
+    if (check_errors) try multi_reader.checkAnyError();
+    const stdout = try multi_reader.toOwnedSlice(0);
+    errdefer allocator.free(stdout);
+    const stderr = try multi_reader.toOwnedSlice(1);
+    errdefer allocator.free(stderr);
+    return .{ .term = term, .stdout = stdout, .stderr = stderr };
 }
 
 fn pollTerm(child: *std.process.Child) !?std.process.Child.Term {
@@ -72,14 +93,6 @@ fn pollTermPosix(child: *std.process.Child) !?std.process.Child.Term {
             .SUCCESS => {
                 if (result == 0) return null;
                 child.id = null;
-                if (child.stdout) |stdout| {
-                    stdout.close(common.defaultIo());
-                    child.stdout = null;
-                }
-                if (child.stderr) |stderr| {
-                    stderr.close(common.defaultIo());
-                    child.stderr = null;
-                }
                 return statusToTerm(@bitCast(status));
             },
             .INTR => continue,
@@ -125,14 +138,6 @@ fn pollTermWindows(child: *std.process.Child) !?std.process.Child.Term {
             if (child.stdin) |stdin| {
                 stdin.close(common.defaultIo());
                 child.stdin = null;
-            }
-            if (child.stdout) |stdout| {
-                stdout.close(common.defaultIo());
-                child.stdout = null;
-            }
-            if (child.stderr) |stderr| {
-                stderr.close(common.defaultIo());
-                child.stderr = null;
             }
             return term;
         },
