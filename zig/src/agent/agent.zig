@@ -56,6 +56,7 @@ pub const AgentOptions = struct {
     get_api_key_ctx: ?*anyopaque = null,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: ?u32 = 60_000,
+    compact_tool_output: bool = false,
 };
 
 /// High-level Agent class that manages state, subscriptions, and message queues.
@@ -100,6 +101,7 @@ pub const Agent = struct {
     _get_api_key_ctx: ?*anyopaque,
     _thinking_budgets: ?ai_types.ThinkingBudgets,
     _max_retry_delay_ms: ?u32,
+    _compact_tool_output: bool,
 
     // Async support
     _thread: ?std.Thread,
@@ -137,6 +139,7 @@ pub const Agent = struct {
             ._get_api_key_ctx = options.get_api_key_ctx,
             ._thinking_budgets = options.thinking_budgets,
             ._max_retry_delay_ms = options.max_retry_delay_ms,
+            ._compact_tool_output = options.compact_tool_output,
             ._thread = null,
             ._done_event = .is_set,
             ._mutex = .init,
@@ -181,7 +184,7 @@ pub const Agent = struct {
     /// Subscribe to agent events.
     /// Returns a token that can be used to unsubscribe.
     pub fn subscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
-        self.subscribeWithContext(@constCast(@ptrCast(callback)), legacyListenerShim);
+        self.subscribeWithContext(@ptrCast(@constCast(callback)), legacyListenerShim);
     }
 
     /// Subscribe to agent events with caller context.
@@ -196,7 +199,7 @@ pub const Agent = struct {
     /// Unsubscribe from agent events.
     pub fn unsubscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
         for (self._listeners.items, 0..) |listener, i| {
-            if (listener.callback == legacyListenerShim and listener.ctx == @as(?*anyopaque, @constCast(@ptrCast(callback)))) {
+            if (listener.callback == legacyListenerShim and listener.ctx == @as(?*anyopaque, @ptrCast(@constCast(callback)))) {
                 _ = self._listeners.orderedRemove(i);
                 return;
             }
@@ -272,6 +275,10 @@ pub const Agent = struct {
     /// Set the tools.
     pub fn setTools(self: *Agent, tools: []const AgentTool) void {
         self._state.tools = tools;
+    }
+
+    pub fn setCompactToolOutput(self: *Agent, enabled: bool) void {
+        self._compact_tool_output = enabled;
     }
 
     /// Set the steering mode.
@@ -894,6 +901,7 @@ pub const Agent = struct {
             .session_id = self._session_id,
             .thinking_budgets = self._thinking_budgets,
             .max_retry_delay_ms = self._max_retry_delay_ms,
+            .compact_tool_output = self._compact_tool_output,
             .transform_context_fn = self._transform_context_fn,
             .transform_context_ctx = self._transform_context_ctx,
             .get_steering_messages_fn = getSteeringMessages,

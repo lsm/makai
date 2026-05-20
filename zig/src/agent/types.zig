@@ -238,6 +238,7 @@ pub const AgentTool = struct {
     label: []const u8, // Human-readable label for UI
     name: []const u8,
     description: []const u8,
+    short_description: ?[]const u8 = null,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
     approval_ctx: ?*anyopaque = null,
@@ -250,7 +251,7 @@ pub const AgentTool = struct {
         _ = allocator;
         return .{
             .name = self.name,
-            .description = self.description,
+            .description = self.short_description orelse self.description,
             .parameters_schema_json = self.parameters_schema_json,
         };
     }
@@ -371,6 +372,7 @@ pub const AgentLoopConfig = struct {
     tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
     tool_output_middleware_ctx: ?*anyopaque = null,
     permission_engine: ?*permission.PermissionEngine = null,
+    compact_tool_output: bool = false,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,
@@ -659,13 +661,14 @@ test "AgentTool.toTool conversion" {
         .label = "Test Tool",
         .name = "test_tool",
         .description = "A test tool",
+        .short_description = "Test compact",
         .parameters_schema_json = "{}",
         .execute = undefined, // Would be a real function in practice
     };
 
     const converted = try tool.toTool(std.testing.allocator);
     try std.testing.expectEqualStrings("test_tool", converted.name);
-    try std.testing.expectEqualStrings("A test tool", converted.description);
+    try std.testing.expectEqualStrings("Test compact", converted.description);
 }
 
 test "QueueMode enum values" {

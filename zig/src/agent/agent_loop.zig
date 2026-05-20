@@ -423,6 +423,7 @@ fn finalizeToolExecution(
 /// Result from tool execution phase
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
+    compact_args: [][]u8 = &.{},
     has_steering: bool,
     steering_messages: ?[]const ai_types.Message,
 
@@ -431,6 +432,8 @@ const ToolExecutionResult = struct {
             result.deinit(allocator);
         }
         allocator.free(self.tool_results);
+        for (self.compact_args) |args| allocator.free(args);
+        allocator.free(self.compact_args);
         if (self.steering_messages) |msgs| {
             const mut_msgs: []ai_types.Message = @constCast(msgs);
             for (mut_msgs) |*msg| msg.deinit(allocator);
@@ -440,6 +443,42 @@ const ToolExecutionResult = struct {
 };
 
 /// Execute tool calls from assistant message
+fn supportsCompactToolOutput(allocator: std.mem.Allocator, tool: AgentTool) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool.parameters_schema_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const properties = parsed.value.object.get("properties") orelse return false;
+    if (properties != .object) return false;
+    return properties.object.contains("compact_output");
+}
+
+test "compact output support requires root schema property" {
+    const nested = AgentTool{
+        .label = "Nested",
+        .name = "nested",
+        .description = "Nested compact_output mention only.",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"options\":{\"type\":\"object\",\"properties\":{\"compact_output\":{\"type\":\"boolean\"}}}},\"additionalProperties\":false}",
+        .execute = undefined,
+    };
+    try std.testing.expect(!try supportsCompactToolOutput(std.testing.allocator, nested));
+    const root = AgentTool{
+        .label = "Root",
+        .name = "root",
+        .description = "Root compact_output property.",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"compact_output\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+        .execute = undefined,
+    };
+    try std.testing.expect(try supportsCompactToolOutput(std.testing.allocator, root));
+}
+
+fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try allocator.dupe(u8, args_json);
+    try parsed.value.object.put(allocator, "compact_output", .{ .bool = true });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
 fn executeToolCalls(
     allocator: std.mem.Allocator,
     assistant_message: ai_types.AssistantMessage,
@@ -457,6 +496,11 @@ fn executeToolCalls(
     }
 
     var results: std.ArrayList(ai_types.ToolResultMessage) = .empty;
+    var compact_args: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (compact_args.items) |args| allocator.free(args);
+        compact_args.deinit(allocator);
+    }
     var has_steering = false;
     var steering_messages: ?[]const ai_types.Message = null;
 
@@ -483,12 +527,28 @@ fn executeToolCalls(
                 try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                 continue;
             };
-            execution_args = validated_args;
+            const should_compact = if (config.compact_tool_output) supportsCompactToolOutput(allocator, t) catch |err| {
+                result = try createErrorResult(allocator, err);
+                is_error = true;
+                try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                continue;
+            } else false;
+            if (should_compact) {
+                const owned_args = withCompactToolOutput(allocator, validated_args) catch |err| {
+                    result = try createErrorResult(allocator, err);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
+                };
+                errdefer allocator.free(owned_args);
+                try compact_args.append(allocator, owned_args);
+                execution_args = owned_args;
+            }
 
             const approval_request = types.ToolApprovalRequest{
                 .tool_call_id = tool_call.id,
                 .tool_name = tool_call.name,
-                .args_json = validated_args,
+                .args_json = execution_args,
             };
             if (config.permission_engine) |engine| {
                 const decision = try engine.approve(tool_call.name, validated_args);
@@ -518,7 +578,7 @@ fn executeToolCalls(
                 .event_stream = event_stream,
                 .tool_call_id = tool_call.id,
                 .tool_name = tool_call.name,
-                .args_json = validated_args,
+                .args_json = execution_args,
             };
 
             result = blk: {
@@ -527,7 +587,7 @@ fn executeToolCalls(
                         config.execute_tool_via_protocol_ctx,
                         tool_call.id,
                         tool_call.name,
-                        validated_args,
+                        execution_args,
                         config.cancel_token,
                         &update_ctx,
                         onToolUpdate,
@@ -541,7 +601,7 @@ fn executeToolCalls(
 
                 break :blk t.execute(
                     tool_call.id,
-                    validated_args,
+                    execution_args,
                     config.cancel_token,
                     &update_ctx,
                     onToolUpdate,
@@ -582,6 +642,7 @@ fn executeToolCalls(
 
     return .{
         .tool_results = try results.toOwnedSlice(allocator),
+        .compact_args = try compact_args.toOwnedSlice(allocator),
         .has_steering = has_steering,
         .steering_messages = steering_messages,
     };

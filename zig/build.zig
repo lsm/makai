@@ -822,6 +822,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "compat", .module = compat_mod } } });
+    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_file_mod = b.createModule(.{ .root_source_file = b.path("src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_search_mod = b.createModule(.{ .root_source_file = b.path("src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod } } });
+
     const tui_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/tui/runtime.zig"),
         .target = target,
@@ -833,6 +843,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tools/registry", .module = tools_registry_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
@@ -1208,7 +1219,6 @@ pub fn build(b: *std.Build) void {
     const permission_test = b.addTest(.{ .root_module = permission_mod });
 
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
-
     const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
 
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
@@ -1218,6 +1228,15 @@ pub fn build(b: *std.Build) void {
     const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
     const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
     const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
+    const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
+    const tools_process_runner_test = b.addTest(.{ .root_module = tools_process_runner_mod });
+    const tools_artifact_test = b.addTest(.{ .root_module = tools_artifact_mod });
+    const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
+    const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
+    const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });
+    const tools_search_test = b.addTest(.{ .root_module = tools_search_mod });
+    const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
+    const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
     // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
     // The bridge test uses in-process threading + condition variables that trigger
     // a known backend bug; LLVM handles it fine.
@@ -1378,6 +1397,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
@@ -1385,6 +1412,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
@@ -1478,11 +1506,27 @@ pub fn build(b: *std.Build) void {
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
     test_unit_agent_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
@@ -1510,6 +1554,14 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
