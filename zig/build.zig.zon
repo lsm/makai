@@ -4,7 +4,7 @@
     .dependencies = .{
         .zigzag = .{
             .url = "git+https://github.com/lsm/zigzag?ref=main#b5a45d26269e1e0a32d7f7c32695d24725cb9d04",
-            .hash = "zigzag-0.1.2-YXwYS6fxEQDh9dYk9zjF-VXrzPuBssdeohEfPg-glz8r",
+            .hash = "zigzag-0.1.2-YXwYS_n4EQDMCCsslJC62-7pDk8b65YjRjeY5X4sNf5r",
         },
     },
     .paths = .{""},
