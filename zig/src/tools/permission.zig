@@ -164,16 +164,29 @@ pub const PermissionEngine = struct {
         const callback = self.approval_callback orelse return .reject;
         const decision = callback(ToolCallC.fromToolCall(call));
         switch (decision) {
-            .approve_always => if (canPersistDecision(call)) try self.persistDecision(call, .allow) else return .approve,
-            .reject_always => if (canPersistDecision(call)) try self.persistDecision(call, .deny) else return .reject,
+            .approve_always => if (canPersistDecision(call)) self.persistDecision(call, .allow) catch return .approve else return .approve,
+            .reject_always => if (canPersistDecision(call)) self.persistDecision(call, .deny) catch return .reject else return .reject,
             .approve, .reject => {},
         }
         return decision;
     }
 
     pub fn persistDecision(self: *Self, call: ToolCall, decision: PermissionDecision) !void {
+        var normalized_path: ?[]u8 = null;
+        defer if (normalized_path) |path| self.allocator.free(path);
+        if (call.path) |path| {
+            normalized_path = try self.normalizePathScope(path);
+        }
+        const normalized_call: ToolCall = .{
+            .tool_name = call.tool_name,
+            .args_json = call.args_json,
+            .operation = call.operation,
+            .path = normalized_path orelse call.path,
+            .command = call.command,
+        };
+
         for (self.persisted.items) |*existing| {
-            if (matchesPersisted(existing.*, call)) {
+            if (matchesPersisted(existing.*, normalized_call)) {
                 existing.decision = decision;
                 try self.save();
                 return;
@@ -181,10 +194,10 @@ pub const PermissionEngine = struct {
         }
 
         const persisted = PersistedDecision{
-            .tool_name = try self.allocator.dupe(u8, call.tool_name),
-            .operation = call.operation,
-            .path = if (call.path) |path| try self.allocator.dupe(u8, path) else null,
-            .command = if (call.command) |command| try self.allocator.dupe(u8, command) else null,
+            .tool_name = try self.allocator.dupe(u8, normalized_call.tool_name),
+            .operation = normalized_call.operation,
+            .path = if (normalized_call.path) |path| try self.allocator.dupe(u8, path) else null,
+            .command = if (normalized_call.command) |command| try self.allocator.dupe(u8, command) else null,
             .decision = decision,
         };
         try self.persisted.append(self.allocator, persisted);
@@ -268,8 +281,21 @@ pub const PermissionEngine = struct {
     }
 
     fn findPersisted(self: *Self, call: ToolCall) ?PermissionDecision {
+        var normalized_path: ?[]u8 = null;
+        defer if (normalized_path) |path| self.allocator.free(path);
+        if (call.path) |path| {
+            normalized_path = self.normalizePathScope(path) catch null;
+        }
+        const normalized_call: ToolCall = .{
+            .tool_name = call.tool_name,
+            .args_json = call.args_json,
+            .operation = call.operation,
+            .path = normalized_path orelse call.path,
+            .command = call.command,
+        };
+
         for (self.persisted.items) |decision| {
-            if (matchesPersisted(decision, call)) return decision.decision;
+            if (matchesPersisted(decision, normalized_call)) return decision.decision;
         }
         return null;
     }
@@ -281,6 +307,15 @@ pub const PermissionEngine = struct {
         var absolute_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const absolute_path = normalizeToolPath(path, normalized_root, &absolute_buffer) orelse return false;
         return pathWithinRoot(absolute_path, normalized_root);
+    }
+
+    fn normalizePathScope(self: *Self, path: []const u8) ![]u8 {
+        var normalized_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const normalized_root = normalizeAbsolutePath(self.workspace_root, &normalized_root_buffer) orelse return error.InvalidPath;
+
+        var absolute_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const absolute_path = normalizeToolPath(path, normalized_root, &absolute_buffer) orelse return error.InvalidPath;
+        return self.allocator.dupe(u8, absolute_path);
     }
 };
 
@@ -445,7 +480,7 @@ fn isSafeShell(command: []const u8) bool {
 }
 
 fn containsShellControl(command: []const u8) bool {
-    return std.mem.indexOfAny(u8, command, ";&|`$()<>") != null;
+    return std.mem.indexOfAny(u8, command, ";&|`$()<>") != null or std.mem.indexOfAny(u8, command, "\r\n") != null;
 }
 
 fn isDestructiveShell(command: []const u8) bool {
@@ -501,6 +536,7 @@ test "default policy allows safe shell and denies destructive shell" {
 
     try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("shell", "{\"command\":\"echo hello\"}"));
     try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("shell", "{\"command\":\"echo hello; cat /etc/passwd\"}"));
+    try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("shell", "{\"command\":\"echo hello\\ncat /etc/passwd\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("shell", "{\"command\":\"rm -rf /\"}"));
 }
 
@@ -613,4 +649,40 @@ test "persisted always allow decision reloads and auto-approves" {
         try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"path\":\"/workspace/file.txt\"}"));
         try std.testing.expectEqual(@as(usize, 0), approval_recorder.calls);
     }
+}
+
+test "persisted path scope matches normalized equivalent paths" {
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-permissions-normalized-path.json",
+    });
+    defer engine.deinit();
+
+    try engine.persistDecision(.{
+        .tool_name = "file:write",
+        .args_json = "{}",
+        .operation = .write,
+        .path = "a.txt",
+    }, .deny);
+
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"/workspace/a.txt\"}"));
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"./a.txt\"}"));
+}
+
+test "persist failure degrades always decisions to one shot" {
+    const persistence_path = "zig-cache/test-permissions-persist-fail";
+    compat.fs.getCwd().deleteFile(std.testing.io, persistence_path) catch {};
+    compat.fs.getCwd().deleteTree(std.testing.io, persistence_path) catch {};
+
+    approval_recorder = .{ .decision = .approve_always };
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = persistence_path,
+        .approval_callback = approvalCallback,
+    });
+    defer engine.deinit();
+    try compat.fs.createDir(compat.fs.getCwd(), persistence_path);
+    defer compat.fs.getCwd().deleteTree(std.testing.io, persistence_path) catch {};
+
+    try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"path\":\"/workspace/file.txt\"}"));
 }
