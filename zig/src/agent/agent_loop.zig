@@ -443,8 +443,32 @@ const ToolExecutionResult = struct {
 };
 
 /// Execute tool calls from assistant message
-fn supportsCompactToolOutput(tool: AgentTool) bool {
-    return std.mem.indexOf(u8, tool.parameters_schema_json, "\"compact_output\"") != null;
+fn supportsCompactToolOutput(allocator: std.mem.Allocator, tool: AgentTool) !bool {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tool.parameters_schema_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const properties = parsed.value.object.get("properties") orelse return false;
+    if (properties != .object) return false;
+    return properties.object.contains("compact_output");
+}
+
+test "compact output support requires root schema property" {
+    const nested = AgentTool{
+        .label = "Nested",
+        .name = "nested",
+        .description = "Nested compact_output mention only.",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"options\":{\"type\":\"object\",\"properties\":{\"compact_output\":{\"type\":\"boolean\"}}}},\"additionalProperties\":false}",
+        .execute = undefined,
+    };
+    try std.testing.expect(!try supportsCompactToolOutput(std.testing.allocator, nested));
+    const root = AgentTool{
+        .label = "Root",
+        .name = "root",
+        .description = "Root compact_output property.",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"compact_output\":{\"type\":\"boolean\"}},\"additionalProperties\":false}",
+        .execute = undefined,
+    };
+    try std.testing.expect(try supportsCompactToolOutput(std.testing.allocator, root));
 }
 
 fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
@@ -503,7 +527,12 @@ fn executeToolCalls(
                 try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                 continue;
             };
-            const should_compact = config.compact_tool_output and supportsCompactToolOutput(t);
+            const should_compact = if (config.compact_tool_output) supportsCompactToolOutput(allocator, t) catch |err| {
+                result = try createErrorResult(allocator, err);
+                is_error = true;
+                try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                continue;
+            } else false;
             if (should_compact) {
                 const owned_args = withCompactToolOutput(allocator, validated_args) catch |err| {
                     result = try createErrorResult(allocator, err);

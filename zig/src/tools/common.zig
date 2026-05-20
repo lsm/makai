@@ -256,7 +256,15 @@ pub fn retrieveArtifact(allocator: std.mem.Allocator, reference: []const u8, max
     if (!std.mem.startsWith(u8, reference, ".makai/tool-artifacts/")) return error.InvalidArtifactReference;
     if (hasParentTraversal(reference) or std.Io.Dir.path.isAbsolute(reference)) return error.InvalidArtifactReference;
     var cwd = std.Io.Dir.cwd();
-    return cwd.readFileAlloc(defaultIo(), reference, allocator, .limited(max_bytes));
+    const st = try cwd.statFile(defaultIo(), reference, .{ .follow_symlinks = false });
+    if (st.kind == .sym_link) return error.InvalidArtifactReference;
+    var file = try cwd.openFile(defaultIo(), reference, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    defer file.close(defaultIo());
+    var reader = file.reader(defaultIo(), &.{});
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory, error.StreamTooLong => |e| return e,
+    };
 }
 
 pub fn telemetryDetails(allocator: std.mem.Allocator, raw_bytes: usize, returned_bytes: usize, compressed: bool) ![]u8 {
@@ -431,4 +439,18 @@ test "line hash and artifact helpers" {
     try std.testing.expectEqualStrings(buf, full);
     try cleanupArtifacts();
     try std.testing.expectError(error.FileNotFound, retrieveArtifact(std.testing.allocator, made.artifact_path.?, buf.len + 1));
+}
+
+test "artifact retrieval rejects symlink targets" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var cwd = std.Io.Dir.cwd();
+    cwd.createDirPath(defaultIo(), ".makai/tool-artifacts") catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    defer cleanupArtifacts() catch {};
+    try cwd.writeFile(defaultIo(), .{ .sub_path = ".makai/artifact-outside.txt", .data = "secret" });
+    defer cwd.deleteFile(defaultIo(), ".makai/artifact-outside.txt") catch {};
+    try cwd.symLink(defaultIo(), "../artifact-outside.txt", ".makai/tool-artifacts/link.txt", .{ .is_directory = false });
+    try std.testing.expectError(error.InvalidArtifactReference, retrieveArtifact(std.testing.allocator, ".makai/tool-artifacts/link.txt", 1024));
 }
