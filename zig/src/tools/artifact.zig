@@ -21,18 +21,20 @@ pub fn executeRetrieve(
     allocator: std.mem.Allocator,
 ) anyerror!agent.AgentToolResult {
     _ = tool_call_id;
-    _ = cancel_token;
     _ = on_update_ctx;
     _ = on_update;
+    if (common.isCancelled(cancel_token)) return error.Cancelled;
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidArguments;
     const reference_value = parsed.value.object.get("reference") orelse return error.InvalidArguments;
     if (reference_value != .string) return error.InvalidArguments;
+    if (common.isCancelled(cancel_token)) return error.Cancelled;
 
     const data = try common.retrieveArtifact(allocator, reference_value.string, 64 * 1024 * 1024);
     defer allocator.free(data);
+    if (common.isCancelled(cancel_token)) return error.Cancelled;
     const details = try common.telemetryDetails(allocator, data.len, data.len, false);
     defer allocator.free(details);
     return common.makeTextResult(allocator, data, details);

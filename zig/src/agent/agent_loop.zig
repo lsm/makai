@@ -440,6 +440,10 @@ const ToolExecutionResult = struct {
 };
 
 /// Execute tool calls from assistant message
+fn supportsCompactToolOutput(tool: AgentTool) bool {
+    return std.mem.indexOf(u8, tool.parameters_schema_json, "\"compact_output\"") != null;
+}
+
 fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
@@ -491,11 +495,15 @@ fn executeToolCalls(
                 try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                 continue;
             };
-            execution_args = if (config.compact_tool_output)
-                try withCompactToolOutput(allocator, validated_args)
-            else
-                validated_args;
-            defer if (config.compact_tool_output) allocator.free(execution_args);
+            const should_compact = config.compact_tool_output and supportsCompactToolOutput(t);
+            if (should_compact) {
+                execution_args = withCompactToolOutput(allocator, validated_args) catch |err| {
+                    result = try createErrorResult(allocator, err);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
+                };
+            }
 
             const approval_request = types.ToolApprovalRequest{
                 .tool_call_id = tool_call.id,
