@@ -7,13 +7,12 @@ pub const schema_text =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"query":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root","query"],"additionalProperties":false}
 ;
 
-pub const text_tool = agent.AgentTool{ .label = "Text Search", .name = "search_text", .description = "Search workspace text files using literal text plus '.' wildcard and '.*' gaps, optional glob substring filter, and return file:line:content results.", .parameters_schema_json = schema_text, .execute = textExecute };
+pub const text_tool = agent.AgentTool{ .label = "Text Search", .name = "search_text", .description = "Search workspace text files using literal text plus '.' wildcard and '.*' gaps, optional glob substring filter, and return file:line:content results. Large result sets are stored as artifacts.", .short_description = "Search text; large results become artifact.", .parameters_schema_json = schema_text, .execute = textExecute };
 pub const regex_tool = text_tool;
 
 const Match = struct { path: []u8, line: usize, content: []u8 };
 
 pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
-    _ = tool_call_id;
     _ = on_update_ctx;
     _ = on_update;
     if (common.isCancelled(cancel_token)) return error.Cancelled;
@@ -83,10 +82,12 @@ pub fn textExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
         try out.appendSlice(allocator, line);
     }
     const text = try out.toOwnedSlice(allocator);
-    errdefer allocator.free(text);
+    defer allocator.free(text);
     const details = try common.jsonString(allocator, .{ .ok = true, .query = query, .duration_ms = common.durationMs(start_ms), .raw_bytes = text.len, .returned_bytes = text.len, .match_count = matches.items.len, .scanned_files = scanned_files, .skipped_oversized_files = skipped_oversized_files, .skipped_read_error_files = skipped_read_error_files });
-    errdefer allocator.free(details);
-    return common.makeTextResultOwned(allocator, text, details);
+    defer allocator.free(details);
+    const made = try common.makeTextResultWithArtifact(allocator, .{ .tool_name = "search_text", .call_id = tool_call_id, .text = text, .details_json = details });
+    defer if (made.artifact_path) |path| allocator.free(path);
+    return made.result;
 }
 
 fn lessMatch(_: void, a: Match, b: Match) bool {

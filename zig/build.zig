@@ -752,104 +752,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tools_common_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/common.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "owned_slice", .module = owned_slice_mod },
-        },
-    });
-
-    const tools_artifact_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/artifact.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-            .{ .name = "owned_slice", .module = owned_slice_mod },
-        },
-    });
-
-    const tools_file_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/file.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tools_edit_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/edit.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tools_shell_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/shell.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tools_search_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/search.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tools_workspace_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/workspace.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "compat", .module = compat_mod },
-            .{ .name = "ai_types", .module = ai_types_mod },
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/common", .module = tools_common_mod },
-        },
-    });
-
-    const tools_registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/registry.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "agent_types", .module = agent_types_mod },
-            .{ .name = "tools/artifact", .module = tools_artifact_mod },
-            .{ .name = "tools/file", .module = tools_file_mod },
-            .{ .name = "tools/edit", .module = tools_edit_mod },
-            .{ .name = "tools/shell", .module = tools_shell_mod },
-            .{ .name = "tools/search", .module = tools_search_mod },
-            .{ .name = "tools/workspace", .module = tools_workspace_mod },
-        },
-    });
-
     const agent_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/agent_loop.zig"),
         .target = target,
@@ -911,12 +813,13 @@ pub fn build(b: *std.Build) void {
 
     const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "compat", .module = compat_mod } } });
     const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
     const tools_file_mod = b.createModule(.{ .root_source_file = b.path("src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_search_mod = b.createModule(.{ .root_source_file = b.path("src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
-    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod } } });
+    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod } } });
 
     const tui_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/tui/runtime.zig"),
@@ -1303,15 +1206,6 @@ pub fn build(b: *std.Build) void {
 
     // Agent tests
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
-    const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
-    const tools_artifact_test = b.addTest(.{ .root_module = tools_artifact_mod });
-    const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
-    const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });
-    const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
-    const tools_search_test = b.addTest(.{ .root_module = tools_search_mod });
-    const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
-    const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
-
     const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
 
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
@@ -1323,6 +1217,7 @@ pub fn build(b: *std.Build) void {
     const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
     const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
     const tools_process_runner_test = b.addTest(.{ .root_module = tools_process_runner_mod });
+    const tools_artifact_test = b.addTest(.{ .root_module = tools_artifact_mod });
     const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
     const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
     const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });

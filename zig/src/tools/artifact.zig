@@ -1,28 +1,25 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
-const agent_types = @import("agent_types");
+const agent = @import("agent");
 const common = @import("tools/common");
-const OwnedSlice = @import("owned_slice").OwnedSlice;
 
-pub fn retrieveTool() agent_types.AgentTool {
-    return .{
-        .label = "Artifact Retrieve",
-        .name = "artifact_retrieve",
-        .description = "Retrieve full tool output previously stored as a local artifact. Use when a tool result summary references an artifact path and complete output is needed.",
-        .short_description = "Retrieve stored full tool output by artifact path.",
-        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"reference\":{\"type\":\"string\"}},\"required\":[\"reference\"]}",
-        .execute = executeRetrieve,
-    };
-}
+pub const retrieve_tool = agent.AgentTool{
+    .label = "Artifact Retrieve",
+    .name = "artifact_retrieve",
+    .description = "Retrieve full tool output previously stored as a local artifact. Use when a tool result summary references an artifact path and complete output is needed.",
+    .short_description = "Retrieve stored full tool output by artifact path.",
+    .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"reference\":{\"type\":\"string\"}},\"required\":[\"reference\"],\"additionalProperties\":false}",
+    .execute = executeRetrieve,
+};
 
 pub fn executeRetrieve(
     tool_call_id: []const u8,
     args_json: []const u8,
     cancel_token: ?ai_types.CancelToken,
     on_update_ctx: ?*anyopaque,
-    on_update: ?agent_types.ToolUpdateCallback,
+    on_update: ?agent.ToolUpdateCallback,
     allocator: std.mem.Allocator,
-) anyerror!agent_types.AgentToolResult {
+) anyerror!agent.AgentToolResult {
     _ = tool_call_id;
     _ = cancel_token;
     _ = on_update_ctx;
@@ -50,4 +47,6 @@ test "artifact_retrieve loads stored output" {
     var result = try executeRetrieve("call", args, null, null, null, allocator);
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings("full output", result.content.slice()[0].text.text);
+    try std.testing.expectError(error.InvalidArtifactReference, common.retrieveArtifact(allocator, "../build.zig", 1024));
+    try std.testing.expectError(error.InvalidArtifactReference, common.retrieveArtifact(allocator, "/tmp/not-an-artifact", 1024));
 }

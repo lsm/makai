@@ -14,9 +14,9 @@ pub const schema_git_status =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["workspace_root"],"additionalProperties":false}
 ;
 
-pub const info_tool = agent.AgentTool{ .label = "Workspace Info", .name = "workspace_info", .description = "Return workspace root metadata and detected project root.", .parameters_schema_json = schema_info, .execute = infoExecute };
-pub const list_tool = agent.AgentTool{ .label = "Workspace List", .name = "workspace_list", .description = "List files under workspace root.", .parameters_schema_json = schema_list, .execute = listExecute };
-pub const git_status_tool = agent.AgentTool{ .label = "Git Status", .name = "workspace_git_status", .description = "Return git status for workspace root.", .parameters_schema_json = schema_git_status, .execute = gitStatusExecute };
+pub const info_tool = agent.AgentTool{ .label = "Workspace Info", .name = "workspace_info", .description = "Return workspace root metadata and detected project root.", .short_description = "Show workspace path info.", .parameters_schema_json = schema_info, .execute = infoExecute };
+pub const list_tool = agent.AgentTool{ .label = "Workspace List", .name = "workspace_list", .description = "List files under workspace root.", .short_description = "List workspace files.", .parameters_schema_json = schema_list, .execute = listExecute };
+pub const git_status_tool = agent.AgentTool{ .label = "Git Status", .name = "workspace_git_status", .description = "Return git status for workspace root.", .short_description = "Show git status.", .parameters_schema_json = schema_git_status, .execute = gitStatusExecute };
 
 pub fn infoExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
     _ = tool_call_id;
