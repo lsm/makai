@@ -3,6 +3,7 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const owned_slice_mod = @import("owned_slice");
+pub const permission = @import("permission");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
 pub const ArtifactReference = ai_types.ArtifactReference;
@@ -211,10 +212,7 @@ pub const ToolOutputMiddlewareFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!void;
 
-pub const ToolApprovalDecision = enum {
-    approve,
-    reject,
-};
+pub const ToolApprovalDecision = permission.ApprovalDecision;
 
 pub const ToolApprovalRequest = struct {
     tool_call_id: []const u8,
@@ -372,6 +370,7 @@ pub const AgentLoopConfig = struct {
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
     tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
     tool_output_middleware_ctx: ?*anyopaque = null,
+    permission_engine: ?*permission.PermissionEngine = null,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,

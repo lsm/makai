@@ -490,16 +490,26 @@ fn executeToolCalls(
                 .tool_name = tool_call.name,
                 .args_json = validated_args,
             };
-            if (t.approval_ui_fn) |notify| {
-                notify(t.approval_ui_ctx, approval_request, allocator);
-            }
-            if (t.approval_fn) |approval| {
-                const decision = approval(t.approval_ctx, approval_request);
-                if (decision == .reject) {
+            if (config.permission_engine) |engine| {
+                const decision = try engine.approve(tool_call.name, validated_args);
+                if (decision == .reject or decision == .reject_always) {
                     result = try rejectedToolResult(allocator);
                     is_error = true;
                     try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                     continue;
+                }
+            } else {
+                if (t.approval_ui_fn) |notify| {
+                    notify(t.approval_ui_ctx, approval_request, allocator);
+                }
+                if (t.approval_fn) |approval| {
+                    const decision = approval(t.approval_ctx, approval_request);
+                    if (decision == .reject or decision == .reject_always) {
+                        result = try rejectedToolResult(allocator);
+                        is_error = true;
+                        try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                        continue;
+                    }
                 }
             }
 
