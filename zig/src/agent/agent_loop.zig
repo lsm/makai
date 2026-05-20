@@ -4,6 +4,8 @@ const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
 const types = @import("agent_types");
 const permission = @import("permission");
+const truncation = @import("tools/truncation");
+const artifact_store = @import("artifact/store");
 const owned_slice_mod = @import("owned_slice");
 
 // Re-export types needed by callers
@@ -1537,11 +1539,6 @@ fn mockLargeOutputTool(
     };
 }
 
-const MiddlewareRecorder = struct {
-    raw_total_bytes: u64 = 0,
-    call_count: usize = 0,
-};
-
 const ApprovalRecorder = struct {
     decision: types.ToolApprovalDecision = .approve,
     calls: usize = 0,
@@ -1552,40 +1549,6 @@ fn recordingApproval(ctx: ?*anyopaque, request: types.ToolApprovalRequest) types
     const recorder: *ApprovalRecorder = @ptrCast(@alignCast(ctx.?));
     recorder.calls += 1;
     return recorder.decision;
-}
-
-fn compactToolOutputMiddleware(
-    ctx: ?*anyopaque,
-    input: types.ToolOutputMiddlewareInput,
-    result: *AgentToolResult,
-    allocator: std.mem.Allocator,
-) anyerror!void {
-    const recorder: *MiddlewareRecorder = @ptrCast(@alignCast(ctx.?));
-    recorder.raw_total_bytes = input.raw_total_bytes;
-    recorder.call_count += 1;
-
-    result.content.deinit(allocator);
-    result.details_json.deinit(allocator);
-
-    const content = try allocator.alloc(ai_types.UserContentPart, 1);
-    content[0] = .{ .text = .{
-        .text = try allocator.dupe(u8, "3 raw log lines stored as artifact"),
-    } };
-
-    const artifacts = try allocator.alloc(ai_types.ArtifactReference, 1);
-    artifacts[0] = .{
-        .artifact_id = try allocator.dupe(u8, "artifact-log-1"),
-        .uri = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "makai-artifact://artifact-log-1")),
-        .mime_type = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "text/plain")),
-        .byte_size = input.raw_total_bytes,
-        .description = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "raw tool output")),
-    };
-
-    result.* = .{
-        .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
-        .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"summary\":true}")),
-        .artifacts = types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
-    };
 }
 
 test "executeToolCalls uses protocol executor when configured" {
@@ -1771,7 +1734,16 @@ test "executeToolCalls applies output middleware and reports byte telemetry" {
         .max_tokens = 256,
     };
 
-    var recorder = MiddlewareRecorder{};
+    var tmp = std.testing.tmpDir(.{});
+    const root_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "artifacts" });
+    defer allocator.free(root_path);
+    try compat.fs.createDir(compat.fs.getCwd(), root_path);
+    var store = try artifact_store.ArtifactStore.initWithPath(allocator, root_path, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+    var middleware = truncation.TruncationMiddleware{ .store = &store, .limits = .{ .fallback = 0 } };
     var agent_events = AgentEventStream.init(allocator);
     defer agent_events.deinit();
 
@@ -1782,28 +1754,32 @@ test "executeToolCalls applies output middleware and reports byte telemetry" {
             .model = model,
             .protocol = .{ .stream_fn = undefined },
             .tools = &tools,
-            .tool_output_middleware_fn = compactToolOutputMiddleware,
-            .tool_output_middleware_ctx = &recorder,
+            .tool_output_middleware_fn = truncation.TruncationMiddleware.middleware,
+            .tool_output_middleware_ctx = &middleware,
         },
         &agent_events,
     );
     defer tool_result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), recorder.call_count);
-    try std.testing.expect(recorder.raw_total_bytes > 0);
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
-    try std.testing.expectEqualStrings("3 raw log lines stored as artifact", tool_result.tool_results[0].content[0].text.text);
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results[0].artifacts.slice().len);
-    try std.testing.expectEqualStrings("artifact-log-1", tool_result.tool_results[0].artifacts.slice()[0].artifact_id);
+    const artifact_id = tool_result.tool_results[0].artifacts.slice()[0].artifact_id;
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.tool_results[0].content[0].text.text, artifact_id[0..12]) != null);
+
+    var stored = try store.read(artifact_id);
+    defer stored.deinit(allocator);
+    try std.testing.expect(std.mem.indexOf(u8, stored.content, "line 3") != null);
 
     var saw_end = false;
     while (agent_events.poll()) |evt| {
         if (evt == .tool_execution_end) {
             saw_end = true;
-            try std.testing.expect(evt.tool_execution_end.raw_total_bytes > evt.tool_execution_end.returned_total_bytes);
+            try std.testing.expect(evt.tool_execution_end.raw_total_bytes > 0);
+            try std.testing.expect(evt.tool_execution_end.returned_total_bytes > 0);
+            try std.testing.expect(evt.tool_execution_end.raw_total_bytes != evt.tool_execution_end.returned_total_bytes);
             try std.testing.expectEqual(@as(u32, 1), evt.tool_execution_end.artifact_count);
             try std.testing.expectEqual(@as(usize, 1), evt.tool_execution_end.artifacts.len);
-            try std.testing.expectEqualStrings("artifact-log-1", evt.tool_execution_end.artifacts[0].artifact_id);
+            try std.testing.expectEqualStrings(artifact_id, evt.tool_execution_end.artifacts[0].artifact_id);
         }
     }
     try std.testing.expect(saw_end);
