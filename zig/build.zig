@@ -774,8 +774,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tools_truncation_mod = b.createModule(.{ .root_source_file = b.path("src/tools/truncation.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent_types", .module = agent_types_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
-
     const agent_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/agent_loop.zig"),
         .target = target,
@@ -787,8 +785,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "permission", .module = permission_mod },
-            .{ .name = "tools/truncation", .module = tools_truncation_mod },
-            .{ .name = "artifact/store", .module = artifact_store_mod },
         },
     });
 
@@ -838,7 +834,7 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "compat", .module = compat_mod } } });
+    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
     const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
@@ -1248,7 +1244,6 @@ pub fn build(b: *std.Build) void {
     const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
     const tools_process_runner_test = b.addTest(.{ .root_module = tools_process_runner_mod });
     const tools_artifact_test = b.addTest(.{ .root_module = tools_artifact_mod });
-    const tools_truncation_test = b.addTest(.{ .root_module = tools_truncation_mod });
     const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
     const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
     const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });
@@ -1418,7 +1413,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_truncation_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
@@ -1529,7 +1523,6 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
-    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_truncation_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);

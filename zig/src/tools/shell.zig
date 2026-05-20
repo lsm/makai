@@ -99,7 +99,7 @@ pub fn execute(
         \\{s}
     , .{ result.stdout, result.stderr });
     defer allocator.free(text);
-    const made = try common.makeTextResultWithArtifact(allocator, .{ .tool_name = "shell_execute", .call_id = tool_call_id, .text = text, .details_json = details });
+    const made = try common.makeTextResultWithArtifact(allocator, .{ .tool_name = "shell_execute", .call_id = tool_call_id, .text = text, .details_json = details, .limits = .{ .shell = common.default_fallback_limit } });
     defer if (made.artifact_path) |path| allocator.free(path);
     return made.result;
 }
