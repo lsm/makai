@@ -152,23 +152,39 @@ pub const ArtifactStore = struct {
 
         const file_path = try self.artifactPath(artifact_id);
         defer self.allocator.free(file_path);
-        if (!fileExists(file_path)) {
+        const had_valid_blob = try blobMatches(file_path, input.content, self.allocator);
+        if (!had_valid_blob) {
             try compat.fs.writeFile(compat.fs.getCwd(), file_path, input.content);
         }
 
         if (self.findIndex(artifact_id)) |idx| {
             const entry = &self.entries.items[idx];
+            const old_last_accessed_ms = entry.last_accessed_ms;
+            const old_mime_type = entry.mime_type;
+            const old_description = entry.description;
+            const new_mime_type = try self.allocator.dupe(u8, input.mime_type);
+            var free_new_mime_type = true;
+            defer if (free_new_mime_type) self.allocator.free(new_mime_type);
+            const new_description = try self.allocator.dupe(u8, input.description);
+            var free_new_description = true;
+            defer if (free_new_description) self.allocator.free(new_description);
+
             entry.last_accessed_ms = now;
-            if (!std.mem.eql(u8, entry.mime_type, input.mime_type)) {
-                const new_mime_type = try self.allocator.dupe(u8, input.mime_type);
-                self.allocator.free(entry.mime_type);
-                entry.mime_type = new_mime_type;
-            }
-            if (!std.mem.eql(u8, entry.description, input.description)) {
-                const new_description = try self.allocator.dupe(u8, input.description);
-                self.allocator.free(entry.description);
-                entry.description = new_description;
-            }
+            entry.mime_type = new_mime_type;
+            entry.description = new_description;
+
+            self.persistIndex() catch |err| {
+                entry.last_accessed_ms = old_last_accessed_ms;
+                entry.mime_type = old_mime_type;
+                entry.description = old_description;
+                if (!had_valid_blob) deleteFileIfExists(file_path);
+                return err;
+            };
+
+            free_new_mime_type = false;
+            free_new_description = false;
+            self.allocator.free(old_mime_type);
+            self.allocator.free(old_description);
         } else {
             const entry_artifact_id = try self.allocator.dupe(u8, artifact_id);
             errdefer self.allocator.free(entry_artifact_id);
@@ -188,9 +204,15 @@ pub const ArtifactStore = struct {
                 .last_accessed_ms = now,
                 .description = entry_description,
             });
+
+            self.persistIndex() catch |err| {
+                var removed = self.entries.orderedRemove(self.entries.items.len - 1);
+                removed.deinit(self.allocator);
+                if (!had_valid_blob) deleteFileIfExists(file_path);
+                return err;
+            };
         }
 
-        try self.persistIndex();
         if (self.max_total_bytes) |limit| try self.evictUnlocked(.{ .max_total_bytes = limit });
 
         return self.referenceFor(artifact_id);
@@ -277,6 +299,7 @@ pub const ArtifactStore = struct {
             };
             const artifact_id_value = try requiredString(obj, "artifact_id");
             if (!isValidArtifactId(artifact_id_value)) return error.InvalidArtifactIndex;
+            if (self.findIndex(artifact_id_value) != null) return error.InvalidArtifactIndex;
             const sha256_value = try requiredString(obj, "sha256");
             if (!std.mem.eql(u8, artifact_id_value, sha256_value)) return error.InvalidArtifactIndex;
 
@@ -333,7 +356,7 @@ pub const ArtifactStore = struct {
             const now = policy.now_ms orelse nowMillis();
             var i: usize = 0;
             while (i < self.entries.items.len) {
-                if (now - self.entries.items[i].last_accessed_ms > age) {
+                if (isOlderThan(self.entries.items[i].last_accessed_ms, now, age)) {
                     try self.removeAt(i);
                     changed = true;
                 } else {
@@ -436,10 +459,28 @@ fn cloneStoredArtifact(allocator: std.mem.Allocator, entry: Metadata) !StoredArt
     };
 }
 
-fn fileExists(path: []const u8) bool {
-    var file = compat.fs.openFile(compat.fs.getCwd(), path, .{}) catch return false;
-    file.close(defaultIo());
-    return true;
+fn blobMatches(path: []const u8, content: []const u8, allocator: std.mem.Allocator) !bool {
+    const max_bytes = std.math.add(usize, content.len, 1) catch return error.FileTooBig;
+    const existing = compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), path, max_bytes) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer allocator.free(existing);
+    return std.mem.eql(u8, existing, content);
+}
+
+fn deleteFileIfExists(path: []const u8) void {
+    compat.fs.getCwd().deleteFile(defaultIo(), path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => {},
+    };
+}
+
+fn isOlderThan(last_accessed_ms: i64, now_ms: i64, age_ms: i64) bool {
+    if (age_ms < 0) return false;
+    if (last_accessed_ms > now_ms) return false;
+    const threshold = std.math.sub(i64, now_ms, age_ms) catch return true;
+    return last_accessed_ms < threshold;
 }
 
 fn nowMillis() i64 {
@@ -628,6 +669,75 @@ test "artifact store dedup metadata update allocates before swapping" {
     try std.testing.expectEqual(@as(usize, 1), artifacts.len);
     try std.testing.expectEqualStrings("application/json", artifacts[0].mime_type);
     try std.testing.expectEqualStrings("new", artifacts[0].description);
+}
+
+test "artifact store rewrites corrupt existing blob" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var hex_buf = sha256Hex("correct");
+    const artifact_id = hex_buf[0..];
+    const path = try store.artifactPath(artifact_id);
+    defer allocator.free(path);
+    try compat.fs.writeFile(compat.fs.getCwd(), path, "wrong");
+
+    var reference = try store.write(.{ .content = "correct", .mime_type = "text/plain" });
+    defer reference.deinit(allocator);
+
+    var result = try store.read(reference.artifact_id);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("correct", result.content);
+}
+
+test "artifact store rejects duplicate artifact ids in index" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    const root_path = try allocator.dupe(u8, store.root_path);
+    defer allocator.free(root_path);
+    defer tmp.cleanup();
+
+    var reference = try store.write(.{ .content = "duplicate", .mime_type = "text/plain" });
+    defer reference.deinit(allocator);
+    store.deinit();
+
+    const index_path = try std.fs.path.join(allocator, &.{ root_path, index_file_name });
+    defer allocator.free(index_path);
+    const original = try compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), index_path, 1024 * 1024);
+    defer allocator.free(original);
+    const duplicate = try std.mem.concat(allocator, u8, &.{ "[", original[1 .. original.len - 1], ",", original[1 .. original.len - 1], "]" });
+    defer allocator.free(duplicate);
+    try compat.fs.writeFile(compat.fs.getCwd(), index_path, duplicate);
+
+    try std.testing.expectError(error.InvalidArtifactIndex, ArtifactStore.initWithPath(allocator, root_path, null));
+}
+
+test "artifact store age eviction handles overflow safely" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var future = try store.write(.{ .content = "future", .mime_type = "text/plain" });
+    defer future.deinit(allocator);
+    store.entries.items[0].last_accessed_ms = std.math.maxInt(i64);
+
+    try store.evict(.{ .older_than_ms = 1, .now_ms = std.math.minInt(i64) });
+
+    var result = try store.read(future.artifact_id);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("future", result.content);
 }
 
 test "artifact store middleware stores large output reference" {
