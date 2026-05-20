@@ -170,14 +170,23 @@ pub const ArtifactStore = struct {
                 entry.description = new_description;
             }
         } else {
+            const entry_artifact_id = try self.allocator.dupe(u8, artifact_id);
+            errdefer self.allocator.free(entry_artifact_id);
+            const entry_mime_type = try self.allocator.dupe(u8, input.mime_type);
+            errdefer self.allocator.free(entry_mime_type);
+            const entry_sha256 = try self.allocator.dupe(u8, artifact_id);
+            errdefer self.allocator.free(entry_sha256);
+            const entry_description = try self.allocator.dupe(u8, input.description);
+            errdefer self.allocator.free(entry_description);
+
             try self.entries.append(self.allocator, .{
-                .artifact_id = try self.allocator.dupe(u8, artifact_id),
-                .mime_type = try self.allocator.dupe(u8, input.mime_type),
+                .artifact_id = entry_artifact_id,
+                .mime_type = entry_mime_type,
                 .byte_size = @intCast(input.content.len),
-                .sha256 = try self.allocator.dupe(u8, artifact_id),
+                .sha256 = entry_sha256,
                 .created_at_ms = now,
                 .last_accessed_ms = now,
-                .description = try self.allocator.dupe(u8, input.description),
+                .description = entry_description,
             });
         }
 
@@ -263,14 +272,23 @@ pub const ArtifactStore = struct {
                 .object => |object| object,
                 else => return error.InvalidArtifactIndex,
             };
+            const entry_artifact_id = try self.allocator.dupe(u8, try requiredString(obj, "artifact_id"));
+            errdefer self.allocator.free(entry_artifact_id);
+            const entry_mime_type = try self.allocator.dupe(u8, try requiredString(obj, "mime_type"));
+            errdefer self.allocator.free(entry_mime_type);
+            const entry_sha256 = try self.allocator.dupe(u8, try requiredString(obj, "sha256"));
+            errdefer self.allocator.free(entry_sha256);
+            const entry_description = try self.allocator.dupe(u8, optionalString(obj, "description") orelse "");
+            errdefer self.allocator.free(entry_description);
+
             try self.entries.append(self.allocator, .{
-                .artifact_id = try self.allocator.dupe(u8, try requiredString(obj, "artifact_id")),
-                .mime_type = try self.allocator.dupe(u8, try requiredString(obj, "mime_type")),
+                .artifact_id = entry_artifact_id,
+                .mime_type = entry_mime_type,
                 .byte_size = try requiredU64(obj, "byte_size"),
-                .sha256 = try self.allocator.dupe(u8, try requiredString(obj, "sha256")),
+                .sha256 = entry_sha256,
                 .created_at_ms = try requiredI64(obj, "created_at_ms"),
                 .last_accessed_ms = try requiredI64(obj, "last_accessed_ms"),
-                .description = try self.allocator.dupe(u8, optionalString(obj, "description") orelse ""),
+                .description = entry_description,
             });
         }
     }
@@ -375,29 +393,36 @@ pub const ArtifactStore = struct {
     fn referenceFor(self: *ArtifactStore, artifact_id: []const u8) !ai_types.ArtifactReference {
         const idx = self.findIndex(artifact_id) orelse return error.ArtifactNotFound;
         const entry = self.entries.items[idx];
-        const uri = try std.mem.concat(self.allocator, u8, &.{ uri_prefix, entry.artifact_id });
-        errdefer self.allocator.free(uri);
-        return .{
+        var reference = ai_types.ArtifactReference{
             .artifact_id = try self.allocator.dupe(u8, entry.artifact_id),
-            .uri = OwnedSlice(u8).initOwned(uri),
-            .mime_type = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.mime_type)),
             .byte_size = entry.byte_size,
-            .sha256 = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.sha256)),
-            .description = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.description)),
         };
+        errdefer reference.deinit(self.allocator);
+
+        reference.uri = OwnedSlice(u8).initOwned(try std.mem.concat(self.allocator, u8, &.{ uri_prefix, entry.artifact_id }));
+        reference.mime_type = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.mime_type));
+        reference.sha256 = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.sha256));
+        reference.description = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, entry.description));
+        return reference;
     }
 };
 
 fn cloneStoredArtifact(allocator: std.mem.Allocator, entry: Metadata) !StoredArtifact {
-    return .{
+    var cloned = StoredArtifact{
         .artifact_id = try allocator.dupe(u8, entry.artifact_id),
-        .mime_type = try allocator.dupe(u8, entry.mime_type),
+        .mime_type = "",
         .byte_size = entry.byte_size,
-        .sha256 = try allocator.dupe(u8, entry.sha256),
+        .sha256 = "",
         .created_at_ms = entry.created_at_ms,
         .last_accessed_ms = entry.last_accessed_ms,
-        .description = try allocator.dupe(u8, entry.description),
+        .description = "",
     };
+    errdefer cloned.deinit(allocator);
+
+    cloned.mime_type = try allocator.dupe(u8, entry.mime_type);
+    cloned.sha256 = try allocator.dupe(u8, entry.sha256);
+    cloned.description = try allocator.dupe(u8, entry.description);
+    return cloned;
 }
 
 fn fileExists(path: []const u8) bool {
@@ -447,12 +472,8 @@ fn expectSha256Hex(content: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, hex_buf[0..]);
 }
 
-var test_store_counter: usize = 0;
-
 fn tmpStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, max_total_bytes: ?u64) !ArtifactStore {
-    _ = tmp;
-    test_store_counter += 1;
-    const root_path = try std.fmt.allocPrint(allocator, "zig/.zig-cache/tmp/artifact-store-test-{d}", .{test_store_counter});
+    const root_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "artifacts" });
     errdefer allocator.free(root_path);
     try compat.fs.createDir(compat.fs.getCwd(), root_path);
     return ArtifactStore{
