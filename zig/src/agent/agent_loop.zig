@@ -420,6 +420,16 @@ fn finalizeToolExecution(
     try results.append(allocator, tool_result_msg);
 }
 
+fn runLegacyApproval(tool: AgentTool, approval_request: types.ToolApprovalRequest, allocator: std.mem.Allocator) types.ToolApprovalDecision {
+    if (tool.approval_ui_fn) |notify| {
+        notify(tool.approval_ui_ctx, approval_request, allocator);
+    }
+    if (tool.approval_fn) |approval| {
+        return approval(tool.approval_ctx, approval_request);
+    }
+    return .approve;
+}
+
 /// Result from tool execution phase
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
@@ -551,25 +561,37 @@ fn executeToolCalls(
                 .args_json = execution_args,
             };
             if (config.permission_engine) |engine| {
-                const decision = try engine.approve(tool_call.name, validated_args);
-                if (decision == .reject or decision == .reject_always) {
+                const policy_decision = engine.evaluate(tool_call.name, validated_args);
+                if (policy_decision == .deny) {
                     result = try rejectedToolResult(allocator);
                     is_error = true;
                     try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                     continue;
                 }
-            } else {
-                if (t.approval_ui_fn) |notify| {
-                    notify(t.approval_ui_ctx, approval_request, allocator);
-                }
-                if (t.approval_fn) |approval| {
-                    const decision = approval(t.approval_ctx, approval_request);
+                if (policy_decision == .prompt and engine.approval_callback != null) {
+                    const decision = try engine.approve(tool_call.name, validated_args);
                     if (decision == .reject or decision == .reject_always) {
                         result = try rejectedToolResult(allocator);
                         is_error = true;
                         try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                         continue;
                     }
+                } else if (policy_decision == .prompt) {
+                    const legacy_decision = runLegacyApproval(t, approval_request, allocator);
+                    if (legacy_decision == .reject or legacy_decision == .reject_always) {
+                        result = try rejectedToolResult(allocator);
+                        is_error = true;
+                        try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                        continue;
+                    }
+                }
+            } else {
+                const decision = runLegacyApproval(t, approval_request, allocator);
+                if (decision == .reject or decision == .reject_always) {
+                    result = try rejectedToolResult(allocator);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
                 }
             }
 

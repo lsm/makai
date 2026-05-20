@@ -149,7 +149,7 @@ pub const PermissionEngine = struct {
     }
 
     pub fn approve(self: *Self, tool_name: []const u8, args_json: []const u8) !ApprovalDecision {
-        const call = try parseToolCall(self.allocator, tool_name, args_json);
+        const call = parseToolCall(self.allocator, tool_name, args_json) catch return .reject;
         defer deinitParsedToolCall(self.allocator, call);
         return try self.approveCall(call);
     }
@@ -164,8 +164,8 @@ pub const PermissionEngine = struct {
         const callback = self.approval_callback orelse return .reject;
         const decision = callback(ToolCallC.fromToolCall(call));
         switch (decision) {
-            .approve_always => try self.persistDecision(call, .allow),
-            .reject_always => try self.persistDecision(call, .deny),
+            .approve_always => if (canPersistDecision(call)) try self.persistDecision(call, .allow) else return .approve,
+            .reject_always => if (canPersistDecision(call)) try self.persistDecision(call, .deny) else return .reject,
             .approve, .reject => {},
         }
         return decision;
@@ -275,8 +275,12 @@ pub const PermissionEngine = struct {
     }
 
     fn isInsideWorkspace(self: *Self, path: []const u8) bool {
-        if (!std.fs.path.isAbsolute(path)) return true;
-        return pathWithinRoot(path, self.workspace_root);
+        var normalized_root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const normalized_root = normalizeAbsolutePath(self.workspace_root, &normalized_root_buffer) orelse return false;
+
+        var absolute_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const absolute_path = normalizeToolPath(path, normalized_root, &absolute_buffer) orelse return false;
+        return pathWithinRoot(absolute_path, normalized_root);
     }
 };
 
@@ -356,6 +360,76 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
+fn canPersistDecision(call: ToolCall) bool {
+    return switch (call.operation) {
+        .read, .write => call.path != null,
+        .shell => call.command != null,
+        .unknown => false,
+    };
+}
+
+fn normalizeToolPath(path: []const u8, workspace_root: []const u8, buffer: []u8) ?[]const u8 {
+    if (std.fs.path.isAbsolute(path)) return normalizeAbsolutePath(path, buffer);
+    if (pathEscapesRoot(path)) return null;
+    const joined = std.fmt.bufPrint(buffer, "{s}/{s}", .{ workspace_root, path }) catch return null;
+    return normalizeAbsolutePathInPlace(joined, buffer);
+}
+
+fn normalizeAbsolutePath(path: []const u8, buffer: []u8) ?[]const u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    if (path.len > buffer.len) return null;
+    @memcpy(buffer[0..path.len], path);
+    return normalizeAbsolutePathInPlace(buffer[0..path.len], buffer);
+}
+
+fn normalizeAbsolutePathInPlace(path: []const u8, buffer: []u8) ?[]const u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    var segments: [128][]const u8 = undefined;
+    var segment_count: usize = 0;
+    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) {
+            if (segment_count == 0) return null;
+            segment_count -= 1;
+            continue;
+        }
+        if (segment_count == segments.len) return null;
+        segments[segment_count] = segment;
+        segment_count += 1;
+    }
+
+    var out: usize = 0;
+    buffer[out] = std.fs.path.sep;
+    out += 1;
+    for (segments[0..segment_count], 0..) |segment, idx| {
+        if (idx > 0) {
+            if (out >= buffer.len) return null;
+            buffer[out] = std.fs.path.sep;
+            out += 1;
+        }
+        if (out + segment.len > buffer.len) return null;
+        std.mem.copyForwards(u8, buffer[out .. out + segment.len], segment);
+        out += segment.len;
+    }
+    return buffer[0..out];
+}
+
+fn pathEscapesRoot(path: []const u8) bool {
+    var depth: usize = 0;
+    var it = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    while (it.next()) |segment| {
+        if (segment.len == 0 or std.mem.eql(u8, segment, ".")) continue;
+        if (std.mem.eql(u8, segment, "..")) {
+            if (depth == 0) return true;
+            depth -= 1;
+        } else {
+            depth += 1;
+        }
+    }
+    return false;
+}
+
 fn pathWithinRoot(path: []const u8, root: []const u8) bool {
     if (std.mem.eql(u8, path, root)) return true;
     if (!std.mem.startsWith(u8, path, root)) return false;
@@ -366,7 +440,12 @@ fn pathWithinRoot(path: []const u8, root: []const u8) bool {
 
 fn isSafeShell(command: []const u8) bool {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
+    if (containsShellControl(trimmed)) return false;
     return std.mem.eql(u8, trimmed, "echo") or std.mem.startsWith(u8, trimmed, "echo ");
+}
+
+fn containsShellControl(command: []const u8) bool {
+    return std.mem.indexOfAny(u8, command, ";&|`$()<>") != null;
 }
 
 fn isDestructiveShell(command: []const u8) bool {
@@ -421,6 +500,7 @@ test "default policy allows safe shell and denies destructive shell" {
     defer engine.deinit();
 
     try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("shell", "{\"command\":\"echo hello\"}"));
+    try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("shell", "{\"command\":\"echo hello; cat /etc/passwd\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("shell", "{\"command\":\"rm -rf /\"}"));
 }
 
@@ -432,8 +512,11 @@ test "path policy allows read inside workspace and denies outside write" {
     defer engine.deinit();
 
     try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:read", "{\"path\":\"/workspace/src/main.zig\"}"));
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:read", "{\"path\":\"src/main.zig\"}"));
     try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("file:write", "{\"path\":\"/workspace/src/main.zig\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"/tmp/outside.txt\"}"));
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"../../etc/passwd\"}"));
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"/workspace/../tmp/outside.txt\"}"));
 }
 
 const ApprovalRecorder = struct {
@@ -473,6 +556,34 @@ test "approval callback fires and can reject" {
 
     try std.testing.expectEqual(ApprovalDecision.reject, try engine.approve("file:write", "{\"path\":\"/workspace/file.txt\"}"));
     try std.testing.expectEqual(@as(usize, 1), approval_recorder.calls);
+}
+
+test "approve always without extracted scope does not persist wildcard" {
+    const persistence_path = "zig-cache/test-permissions-wildcard.json";
+    compat.fs.getCwd().deleteFile(std.testing.io, persistence_path) catch {};
+
+    approval_recorder = .{ .decision = .approve_always };
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = persistence_path,
+        .approval_callback = approvalCallback,
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"unknown_path_key\":\"/workspace/file.txt\"}"));
+    try std.testing.expectEqual(@as(usize, 0), engine.persisted.items.len);
+}
+
+test "malformed tool args reject without bubbling parse error" {
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-permissions-malformed.json",
+        .approval_callback = approvalCallback,
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("file:write", "{"));
+    try std.testing.expectEqual(ApprovalDecision.reject, try engine.approve("file:write", "{"));
 }
 
 test "persisted always allow decision reloads and auto-approves" {
