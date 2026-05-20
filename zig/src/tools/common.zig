@@ -317,9 +317,13 @@ pub fn makeTextResultWithArtifact(allocator: std.mem.Allocator, options: TextRes
     errdefer result.deinit(allocator);
     const artifact_refs = try allocator.alloc(ai_types.ArtifactReference, 1);
     errdefer allocator.free(artifact_refs);
+    const artifact_id = try allocator.dupe(u8, key);
+    errdefer allocator.free(artifact_id);
+    const uri = try allocator.dupe(u8, artifact_path);
+    errdefer allocator.free(uri);
     artifact_refs[0] = .{
-        .artifact_id = try allocator.dupe(u8, key),
-        .uri = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, artifact_path)),
+        .artifact_id = artifact_id,
+        .uri = ai_types.OwnedSlice(u8).initOwned(uri),
         .byte_size = raw_bytes,
     };
     errdefer artifact_refs[0].deinit(allocator);
