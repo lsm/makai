@@ -739,6 +739,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const permission_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/permission.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
     // Agent modules
     const agent_types_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/types.zig"),
@@ -748,6 +757,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "permission", .module = permission_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
@@ -762,6 +772,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "permission", .module = permission_mod },
         },
     });
 
@@ -1205,6 +1216,8 @@ pub fn build(b: *std.Build) void {
     const protocol_tool_runtime_test = b.addTest(.{ .root_module = protocol_tool_runtime_mod });
 
     // Agent tests
+    const permission_test = b.addTest(.{ .root_module = permission_mod });
+
     const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
     const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
 
@@ -1382,6 +1395,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
+    test_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
@@ -1490,6 +1504,7 @@ pub fn build(b: *std.Build) void {
     test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
 
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
+    test_unit_agent_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
@@ -1516,6 +1531,7 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
     const test_unit_agent_types_step = b.step("test-unit-agent-types", "Run agent types unit tests");
+    test_unit_agent_types_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_types_step.dependOn(&b.addRunArtifact(agent_types_test).step);
 
     const test_unit_agent_loop_step = b.step("test-unit-agent-loop", "Run agent loop unit tests");

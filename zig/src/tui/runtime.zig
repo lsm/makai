@@ -414,7 +414,10 @@ fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allo
 fn approveTool(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolApprovalDecision {
     const approval_ctx: *ApprovalContext = @ptrCast(@alignCast(ctx.?));
     if (approval_ctx.original_callback) |callback| {
-        if (callback(approval_ctx.original_ctx, request) == .reject) return .reject;
+        switch (callback(approval_ctx.original_ctx, request)) {
+            .approve, .approve_always => {},
+            .reject, .reject_always => return .reject,
+        }
     }
     if (approval_ctx.callback) |callback| {
         return switch (callback(approval_ctx.callback_ctx, .{
@@ -899,7 +902,7 @@ test "terminal events survive full TUI queue" {
 }
 
 test "preserves original tool approval when wrapping" {
-    var original_ctx = OriginalApprovalCtx{ .decision = .reject };
+    var original_ctx = OriginalApprovalCtx{ .decision = .reject_always };
     const tools = [_]agent.AgentTool{.{
         .label = "Demo",
         .name = "demo_tool",
