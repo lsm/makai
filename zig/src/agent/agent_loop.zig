@@ -423,6 +423,7 @@ fn finalizeToolExecution(
 /// Result from tool execution phase
 const ToolExecutionResult = struct {
     tool_results: []ai_types.ToolResultMessage,
+    compact_args: [][]u8 = &.{},
     has_steering: bool,
     steering_messages: ?[]const ai_types.Message,
 
@@ -431,6 +432,8 @@ const ToolExecutionResult = struct {
             result.deinit(allocator);
         }
         allocator.free(self.tool_results);
+        for (self.compact_args) |args| allocator.free(args);
+        allocator.free(self.compact_args);
         if (self.steering_messages) |msgs| {
             const mut_msgs: []ai_types.Message = @constCast(msgs);
             for (mut_msgs) |*msg| msg.deinit(allocator);
@@ -469,6 +472,11 @@ fn executeToolCalls(
     }
 
     var results: std.ArrayList(ai_types.ToolResultMessage) = .empty;
+    var compact_args: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (compact_args.items) |args| allocator.free(args);
+        compact_args.deinit(allocator);
+    }
     var has_steering = false;
     var steering_messages: ?[]const ai_types.Message = null;
 
@@ -497,12 +505,15 @@ fn executeToolCalls(
             };
             const should_compact = config.compact_tool_output and supportsCompactToolOutput(t);
             if (should_compact) {
-                execution_args = withCompactToolOutput(allocator, validated_args) catch |err| {
+                const owned_args = withCompactToolOutput(allocator, validated_args) catch |err| {
                     result = try createErrorResult(allocator, err);
                     is_error = true;
                     try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                     continue;
                 };
+                errdefer allocator.free(owned_args);
+                try compact_args.append(allocator, owned_args);
+                execution_args = owned_args;
             }
 
             const approval_request = types.ToolApprovalRequest{
@@ -592,6 +603,7 @@ fn executeToolCalls(
 
     return .{
         .tool_results = try results.toOwnedSlice(allocator),
+        .compact_args = try compact_args.toOwnedSlice(allocator),
         .has_steering = has_steering,
         .steering_messages = steering_messages,
     };
