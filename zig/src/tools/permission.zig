@@ -332,7 +332,15 @@ fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
     if (parsed.value == .object) {
         const obj = parsed.value.object;
         if (firstStringField(obj, &.{ "path", "file_path", "target_path", "cwd" })) |value| {
-            path = try allocator.dupe(u8, value);
+            if (!std.fs.path.isAbsolute(value)) {
+                if (firstStringField(obj, &.{"workspace_root"})) |workspace_root| {
+                    path = try std.fs.path.join(allocator, &.{ workspace_root, value });
+                } else {
+                    path = try allocator.dupe(u8, value);
+                }
+            } else {
+                path = try allocator.dupe(u8, value);
+            }
         }
         if (firstStringField(obj, &.{ "command", "cmd", "script" })) |value| {
             command = try allocator.dupe(u8, value);
@@ -361,10 +369,30 @@ fn inferOperation(tool_name: []const u8) Operation {
 }
 
 fn hasAnyToken(haystack: []const u8, needles: []const []const u8) bool {
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, haystack, needle) != null) return true;
+    var start: ?usize = null;
+    for (haystack, 0..) |ch, idx| {
+        if (isToolNameTokenChar(ch)) {
+            if (start == null) start = idx;
+        } else if (start) |token_start| {
+            if (tokenMatches(haystack[token_start..idx], needles)) return true;
+            start = null;
+        }
+    }
+    if (start) |token_start| {
+        if (tokenMatches(haystack[token_start..], needles)) return true;
     }
     return false;
+}
+
+fn tokenMatches(token: []const u8, needles: []const []const u8) bool {
+    for (needles) |needle| {
+        if (std.ascii.eqlIgnoreCase(token, needle)) return true;
+    }
+    return false;
+}
+
+fn isToolNameTokenChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch);
 }
 
 fn firstStringField(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
@@ -549,10 +577,22 @@ test "path policy allows read inside workspace and denies outside write" {
 
     try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:read", "{\"path\":\"/workspace/src/main.zig\"}"));
     try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:read", "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:read", "{\"workspace_root\":\"/tmp\",\"path\":\"secret.txt\"}"));
     try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("file:write", "{\"path\":\"/workspace/src/main.zig\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"/tmp/outside.txt\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"../../etc/passwd\"}"));
     try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("file:write", "{\"path\":\"/workspace/../tmp/outside.txt\"}"));
+}
+
+test "operation inference uses token boundaries" {
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-permissions-token-boundary.json",
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(PermissionDecision.prompt, engine.evaluate("thread_run", "{\"path\":\"/workspace/src/main.zig\"}"));
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file_read", "{\"path\":\"/workspace/src/main.zig\"}"));
 }
 
 const ApprovalRecorder = struct {

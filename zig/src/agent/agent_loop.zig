@@ -3,6 +3,7 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
 const types = @import("agent_types");
+const permission = @import("permission");
 const owned_slice_mod = @import("owned_slice");
 
 // Re-export types needed by callers
@@ -561,6 +562,14 @@ fn executeToolCalls(
                 .args_json = execution_args,
             };
             if (config.permission_engine) |engine| {
+                const legacy_decision = runLegacyApproval(t, approval_request, allocator);
+                if (legacy_decision == .reject or legacy_decision == .reject_always) {
+                    result = try rejectedToolResult(allocator);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
+                }
+
                 const policy_decision = engine.evaluate(tool_call.name, validated_args);
                 if (policy_decision == .deny) {
                     result = try rejectedToolResult(allocator);
@@ -571,14 +580,6 @@ fn executeToolCalls(
                 if (policy_decision == .prompt and engine.approval_callback != null) {
                     const decision = try engine.approve(tool_call.name, validated_args);
                     if (decision == .reject or decision == .reject_always) {
-                        result = try rejectedToolResult(allocator);
-                        is_error = true;
-                        try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
-                        continue;
-                    }
-                } else if (policy_decision == .prompt) {
-                    const legacy_decision = runLegacyApproval(t, approval_request, allocator);
-                    if (legacy_decision == .reject or legacy_decision == .reject_always) {
                         result = try rejectedToolResult(allocator);
                         is_error = true;
                         try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
@@ -1541,6 +1542,18 @@ const MiddlewareRecorder = struct {
     call_count: usize = 0,
 };
 
+const ApprovalRecorder = struct {
+    decision: types.ToolApprovalDecision = .approve,
+    calls: usize = 0,
+};
+
+fn recordingApproval(ctx: ?*anyopaque, request: types.ToolApprovalRequest) types.ToolApprovalDecision {
+    _ = request;
+    const recorder: *ApprovalRecorder = @ptrCast(@alignCast(ctx.?));
+    recorder.calls += 1;
+    return recorder.decision;
+}
+
 fn compactToolOutputMiddleware(
     ctx: ?*anyopaque,
     input: types.ToolOutputMiddlewareInput,
@@ -1647,6 +1660,72 @@ test "executeToolCalls uses protocol executor when configured" {
     }
     try std.testing.expect(protocol_ctx.saw_update);
     try std.testing.expect(saw_update);
+}
+
+test "executeToolCalls runs legacy approval even when permission engine allows" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var approval = ApprovalRecorder{ .decision = .reject };
+    const tools = [_]AgentTool{.{
+        .label = "Read",
+        .name = "file_read",
+        .description = "Read file",
+        .parameters_schema_json = "{}",
+        .execute = mockLargeOutputTool,
+        .approval_ctx = &approval,
+        .approval_fn = recordingApproval,
+    }};
+    const assistant_content = [_]ai_types.AssistantContent{.{ .tool_call = .{
+        .id = "call_read",
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"/workspace/src/main.zig\"}",
+    } }};
+    const assistant_message = ai_types.AssistantMessage{
+        .content = &assistant_content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    var engine = try permission.PermissionEngine.init(allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-agent-loop-permission-legacy.json",
+    });
+    defer engine.deinit();
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var tool_result = try executeToolCalls(
+        allocator,
+        assistant_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &tools,
+            .permission_engine = &engine,
+        },
+        &agent_events,
+    );
+    defer tool_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), approval.calls);
+    try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
+    try std.testing.expect(tool_result.tool_results[0].is_error);
 }
 
 test "executeToolCalls applies output middleware and reports byte telemetry" {
