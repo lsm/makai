@@ -51,11 +51,14 @@ pub const TruncationMiddleware = struct {
 
         if (raw_output.len <= limit) return;
 
-        var reference = try self.store.write(.{
+        var store_reference = try self.store.write(.{
             .content = raw_output,
             .mime_type = mime_text_plain,
             .description = "raw tool output",
         });
+        defer store_reference.deinit(self.store.allocator);
+
+        var reference = try cloneArtifactReference(allocator, store_reference);
         errdefer reference.deinit(allocator);
 
         const truncated = try truncateWithMarker(allocator, raw_output, limit, reference.artifact_id);
@@ -84,10 +87,18 @@ pub const TruncationMiddleware = struct {
 };
 
 fn classifyTool(tool_name: []const u8) ToolKind {
-    if (std.mem.indexOf(u8, tool_name, "shell") != null) return .shell;
-    if (std.mem.indexOf(u8, tool_name, "file") != null or std.mem.indexOf(u8, tool_name, "read") != null or std.mem.indexOf(u8, tool_name, "write") != null or std.mem.indexOf(u8, tool_name, "edit") != null) return .file;
-    if (std.mem.indexOf(u8, tool_name, "search") != null or std.mem.indexOf(u8, tool_name, "grep") != null) return .search;
+    if (matchesToolName(tool_name, "shell")) return .shell;
+    if (matchesToolName(tool_name, "file") or matchesToolName(tool_name, "read") or matchesToolName(tool_name, "write") or matchesToolName(tool_name, "edit")) return .file;
+    if (matchesToolName(tool_name, "search") or matchesToolName(tool_name, "grep")) return .search;
     return .other;
+}
+
+fn matchesToolName(tool_name: []const u8, token: []const u8) bool {
+    if (std.mem.eql(u8, tool_name, token)) return true;
+    if (!std.mem.startsWith(u8, tool_name, token)) return false;
+    if (tool_name.len <= token.len) return false;
+    const separator = tool_name[token.len];
+    return separator == '_' or separator == '-';
 }
 
 fn collectToolOutput(allocator: std.mem.Allocator, result: AgentToolResult) ![]u8 {
@@ -96,7 +107,6 @@ fn collectToolOutput(allocator: std.mem.Allocator, result: AgentToolResult) ![]u
         .text => |text| total += text.text.len,
         .image => {},
     };
-    if (result.getDetailsJson()) |details| total += details.len;
 
     var out = try allocator.alloc(u8, total);
     var offset: usize = 0;
@@ -107,23 +117,27 @@ fn collectToolOutput(allocator: std.mem.Allocator, result: AgentToolResult) ![]u
         },
         .image => {},
     };
-    if (result.getDetailsJson()) |details| {
-        @memcpy(out[offset .. offset + details.len], details);
-    }
     return out;
 }
 
 fn truncateWithMarker(allocator: std.mem.Allocator, raw_output: []const u8, limit: usize, artifact_id: []const u8) ![]u8 {
-    const head_len = @min(limit, raw_output.len);
-    return std.fmt.allocPrint(allocator, "{s}" ++ marker_prefix ++ "{s}" ++ marker_suffix, .{ raw_output[0..head_len], artifact_id[0..@min(artifact_id.len, 12)] });
+    const compact_id = artifact_id[0..@min(artifact_id.len, 12)];
+    const marker_len = marker_prefix.len + compact_id.len + marker_suffix.len;
+    const head_len = if (limit > marker_len) @min(limit - marker_len, raw_output.len) else 0;
+    return std.fmt.allocPrint(allocator, "{s}" ++ marker_prefix ++ "{s}" ++ marker_suffix, .{ raw_output[0..head_len], compact_id });
 }
 
 fn appendArtifactReference(allocator: std.mem.Allocator, existing: []const ai_types.ArtifactReference, new_reference: ai_types.ArtifactReference) ![]ai_types.ArtifactReference {
     const out = try allocator.alloc(ai_types.ArtifactReference, existing.len + 1);
-    errdefer allocator.free(out);
+    var cloned_count: usize = 0;
+    errdefer {
+        for (out[0..cloned_count]) |*artifact| artifact.deinit(allocator);
+        allocator.free(out);
+    }
 
     for (existing, 0..) |artifact, i| {
         out[i] = try cloneArtifactReference(allocator, artifact);
+        cloned_count += 1;
     }
     out[existing.len] = new_reference;
     return out;
@@ -209,8 +223,8 @@ test "truncation middleware stores over-limit output and returns reference" {
         tmp.cleanup();
     }
 
-    const raw_output = "abcdefghijklmnopqrstuvwxyz0123456789";
-    var middleware = TruncationMiddleware{ .store = &store, .limits = .{ .shell = 32 } };
+    const raw_output = "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789";
+    var middleware = TruncationMiddleware{ .store = &store, .limits = .{ .shell = 64 } };
     var result = try makeTextResult(allocator, raw_output, "");
     defer result.deinit(allocator);
 
@@ -219,6 +233,7 @@ test "truncation middleware stores over-limit output and returns reference" {
     try std.testing.expectEqual(@as(usize, 1), result.artifacts.slice().len);
     const artifact_id = result.artifacts.slice()[0].artifact_id;
     const text = result.content.slice()[0].text.text;
+    try std.testing.expect(text.len <= 64);
     try std.testing.expect(std.mem.startsWith(u8, text, "abc"));
     try std.testing.expect(std.mem.indexOf(u8, text, artifact_id[0..12]) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "[... truncated. artifact_id=") != null);
@@ -250,6 +265,25 @@ test "truncation middleware respects per-tool limits" {
     try std.testing.expectEqual(@as(usize, 1), search_result.artifacts.slice().len);
 }
 
+test "truncation middleware ignores unknown tools without fallback" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    var store = try tmpStore(allocator, &tmp);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var middleware = TruncationMiddleware{ .store = &store };
+    var result = try makeTextResult(allocator, "0123456789abcdefghijklmnopqrst", "");
+    defer result.deinit(allocator);
+
+    try middleware.apply(testInput("profile_read", 30), &result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.artifacts.slice().len);
+    try std.testing.expectEqualStrings("0123456789abcdefghijklmnopqrst", result.content.slice()[0].text.text);
+}
+
 test "truncation middleware preserves first bytes verbatim" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -266,5 +300,9 @@ test "truncation middleware preserves first bytes verbatim" {
 
     try middleware.apply(testInput("shell_execute", raw_output.len), &result, allocator);
 
-    try std.testing.expectEqualStrings(raw_output[0..90], result.content.slice()[0].text.text[0..90]);
+    const compact_id_len = @min(result.artifacts.slice()[0].artifact_id.len, 12);
+    const marker_len = marker_prefix.len + compact_id_len + marker_suffix.len;
+    const head_len = 90 - marker_len;
+    try std.testing.expect(result.content.slice()[0].text.text.len <= 90);
+    try std.testing.expectEqualStrings(raw_output[0..head_len], result.content.slice()[0].text.text[0..head_len]);
 }
