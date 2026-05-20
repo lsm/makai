@@ -86,6 +86,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const artifact_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/artifact/store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
     const oauth_storage_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/oauth/storage.zig"),
         .target = target,
@@ -900,6 +912,7 @@ pub fn build(b: *std.Build) void {
     const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
     const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
     const compat_test = b.addTest(.{ .root_module = compat_mod });
+    const artifact_store_test = b.addTest(.{ .root_module = artifact_store_mod });
 
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -1354,6 +1367,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_step.dependOn(&b.addRunArtifact(compat_test).step);
+    test_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
@@ -1440,6 +1454,7 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(compat_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
 
     const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
