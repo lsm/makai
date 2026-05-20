@@ -48,8 +48,9 @@ pub const TruncationMiddleware = struct {
 
         const raw_output = try collectToolOutput(allocator, result.*);
         defer allocator.free(raw_output);
+        const details = result.getDetailsJson() orelse "";
 
-        if (raw_output.len <= limit) return;
+        if (raw_output.len + details.len <= limit) return;
 
         var store_reference = try self.store.write(.{
             .content = raw_output,
@@ -61,7 +62,7 @@ pub const TruncationMiddleware = struct {
         var reference = try cloneArtifactReference(allocator, store_reference);
         errdefer reference.deinit(allocator);
 
-        const truncated = try truncateWithMarker(allocator, raw_output, limit, reference.artifact_id);
+        const truncated = try truncateWithMarker(allocator, raw_output, limit -| details.len, reference.artifact_id);
         errdefer allocator.free(truncated);
 
         const new_content = try allocator.alloc(ai_types.UserContentPart, 1);
@@ -74,13 +75,18 @@ pub const TruncationMiddleware = struct {
             allocator.free(artifacts);
         }
 
+        const details_json = if (result.details_json.is_owned)
+            ai_types.OwnedSlice(u8).initOwned(@constCast(result.details_json.slice()))
+        else
+            ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, details));
+        errdefer details_json.deinit(allocator);
+
         result.content.deinit(allocator);
-        result.details_json.deinit(allocator);
         result.artifacts.deinit(allocator);
 
         result.* = .{
             .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(new_content),
-            .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
+            .details_json = details_json,
             .artifacts = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
         };
     }
@@ -121,10 +127,16 @@ fn collectToolOutput(allocator: std.mem.Allocator, result: AgentToolResult) ![]u
 }
 
 fn truncateWithMarker(allocator: std.mem.Allocator, raw_output: []const u8, limit: usize, artifact_id: []const u8) ![]u8 {
+    if (limit == 0) return try allocator.dupe(u8, "");
+
     const compact_id = artifact_id[0..@min(artifact_id.len, 12)];
-    const marker_len = marker_prefix.len + compact_id.len + marker_suffix.len;
-    const head_len = if (limit > marker_len) @min(limit - marker_len, raw_output.len) else 0;
-    return std.fmt.allocPrint(allocator, "{s}" ++ marker_prefix ++ "{s}" ++ marker_suffix, .{ raw_output[0..head_len], compact_id });
+    const marker = try std.fmt.allocPrint(allocator, marker_prefix ++ "{s}" ++ marker_suffix, .{compact_id});
+    defer allocator.free(marker);
+
+    if (limit <= marker.len) return try allocator.dupe(u8, marker[0..limit]);
+
+    const head_len = @min(limit - marker.len, raw_output.len);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ raw_output[0..head_len], marker });
 }
 
 fn appendArtifactReference(allocator: std.mem.Allocator, existing: []const ai_types.ArtifactReference, new_reference: ai_types.ArtifactReference) ![]ai_types.ArtifactReference {
@@ -233,7 +245,7 @@ test "truncation middleware stores over-limit output and returns reference" {
     try std.testing.expectEqual(@as(usize, 1), result.artifacts.slice().len);
     const artifact_id = result.artifacts.slice()[0].artifact_id;
     const text = result.content.slice()[0].text.text;
-    try std.testing.expect(text.len <= 64);
+    try std.testing.expect(text.len + result.details_json.slice().len <= 64);
     try std.testing.expect(std.mem.startsWith(u8, text, "abc"));
     try std.testing.expect(std.mem.indexOf(u8, text, artifact_id[0..12]) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "[... truncated. artifact_id=") != null);
@@ -263,6 +275,27 @@ test "truncation middleware respects per-tool limits" {
     defer search_result.deinit(allocator);
     try middleware.apply(testInput("search_text", 30), &search_result, allocator);
     try std.testing.expectEqual(@as(usize, 1), search_result.artifacts.slice().len);
+}
+
+test "truncation middleware preserves details and counts them toward limit" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    var store = try tmpStore(allocator, &tmp);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    const details = "{\"ok\":false,\"exit_code\":42}";
+    var middleware = TruncationMiddleware{ .store = &store, .limits = .{ .shell = 31 } };
+    var result = try makeTextResult(allocator, "short", details);
+    defer result.deinit(allocator);
+
+    try middleware.apply(testInput("shell_execute", 5 + details.len), &result, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), result.artifacts.slice().len);
+    try std.testing.expectEqualStrings(details, result.details_json.slice());
+    try std.testing.expect(result.content.slice()[0].text.text.len + result.details_json.slice().len <= 31);
 }
 
 test "truncation middleware ignores unknown tools without fallback" {
@@ -303,6 +336,6 @@ test "truncation middleware preserves first bytes verbatim" {
     const compact_id_len = @min(result.artifacts.slice()[0].artifact_id.len, 12);
     const marker_len = marker_prefix.len + compact_id_len + marker_suffix.len;
     const head_len = 90 - marker_len;
-    try std.testing.expect(result.content.slice()[0].text.text.len <= 90);
+    try std.testing.expect(result.content.slice()[0].text.text.len + result.details_json.slice().len <= 90);
     try std.testing.expectEqualStrings(raw_output[0..head_len], result.content.slice()[0].text.text[0..head_len]);
 }

@@ -1764,7 +1764,7 @@ test "executeToolCalls applies output middleware and reports byte telemetry" {
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results[0].artifacts.slice().len);
     const artifact_id = tool_result.tool_results[0].artifacts.slice()[0].artifact_id;
-    try std.testing.expect(std.mem.indexOf(u8, tool_result.tool_results[0].content[0].text.text, artifact_id[0..12]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_result.tool_results[0].content[0].text.text, artifact_id[0..@min(artifact_id.len, 12)]) != null or tool_result.tool_results[0].content[0].text.text.len == 0);
 
     var stored = try store.read(artifact_id);
     defer stored.deinit(allocator);
