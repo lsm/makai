@@ -227,8 +227,12 @@ pub const ArtifactStore = struct {
         defer self.allocator.free(file_path);
         const byte_size = std.math.cast(usize, self.entries.items[idx].byte_size) orelse return error.FileTooBig;
         const max_bytes = std.math.add(usize, byte_size, 1) catch return error.FileTooBig;
-        const content = try compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), file_path, max_bytes);
+        const content = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), file_path, max_bytes) catch |err| switch (err) {
+            error.FileNotFound => return error.ArtifactNotFound,
+            else => return err,
+        };
         errdefer self.allocator.free(content);
+        if (content.len != byte_size or !contentMatchesArtifactId(content, artifact_id)) return error.ArtifactCorrupt;
 
         const reference = try self.referenceFor(artifact_id);
         errdefer reference.deinit(self.allocator);
@@ -351,59 +355,53 @@ pub const ArtifactStore = struct {
     }
 
     fn evictUnlocked(self: *ArtifactStore, policy: EvictionPolicy) !void {
-        var changed = false;
+        var remove_indexes: std.ArrayList(usize) = .empty;
+        defer remove_indexes.deinit(self.allocator);
+
         if (policy.older_than_ms) |age| {
             const now = policy.now_ms orelse nowMillis();
-            var i: usize = 0;
-            while (i < self.entries.items.len) {
-                if (isOlderThan(self.entries.items[i].last_accessed_ms, now, age)) {
-                    try self.removeAt(i);
-                    changed = true;
-                } else {
-                    i += 1;
-                }
+            for (self.entries.items, 0..) |entry, i| {
+                if (isOlderThan(entry.last_accessed_ms, now, age)) try remove_indexes.append(self.allocator, i);
             }
         }
 
         if (policy.max_total_bytes) |limit| {
-            while (self.totalBytes() > limit and self.entries.items.len > 0) {
-                const idx = self.oldestIndex();
-                try self.removeAt(idx);
-                changed = true;
+            while (try totalBytesAfterRemoving(self.entries.items, remove_indexes.items) > limit and remove_indexes.items.len < self.entries.items.len) {
+                const idx = oldestIndexExcluding(self.entries.items, remove_indexes.items);
+                try remove_indexes.append(self.allocator, idx);
             }
         }
 
-        if (changed) try self.persistIndex();
-    }
+        if (remove_indexes.items.len == 0) return;
+        sortIndexesDescending(remove_indexes.items);
 
-    fn removeAt(self: *ArtifactStore, idx: usize) !void {
-        const artifact_id = self.entries.items[idx].artifact_id;
-        const path = try self.artifactPath(artifact_id);
-        defer self.allocator.free(path);
-        compat.fs.getCwd().deleteFile(defaultIo(), path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
+        var removed_entries: std.ArrayList(Metadata) = .empty;
+        errdefer {
+            for (removed_entries.items) |*entry| entry.deinit(self.allocator);
+            removed_entries.deinit(self.allocator);
+        }
+
+        for (remove_indexes.items) |idx| {
+            try removed_entries.append(self.allocator, self.entries.orderedRemove(idx));
+        }
+
+        self.persistIndex() catch |err| {
+            var i = removed_entries.items.len;
+            while (i > 0) {
+                i -= 1;
+                const entry = removed_entries.orderedRemove(i);
+                try self.entries.insert(self.allocator, remove_indexes.items[i], entry);
+            }
+            return err;
         };
-        var removed = self.entries.orderedRemove(idx);
-        removed.deinit(self.allocator);
-    }
 
-    fn totalBytes(self: *const ArtifactStore) u64 {
-        var total: u64 = 0;
-        for (self.entries.items) |entry| total += entry.byte_size;
-        return total;
-    }
-
-    fn oldestIndex(self: *const ArtifactStore) usize {
-        var idx: usize = 0;
-        var oldest = self.entries.items[0].last_accessed_ms;
-        for (self.entries.items[1..], 1..) |entry, i| {
-            if (entry.last_accessed_ms < oldest) {
-                oldest = entry.last_accessed_ms;
-                idx = i;
-            }
+        for (removed_entries.items) |entry| {
+            const path = try self.artifactPath(entry.artifact_id);
+            defer self.allocator.free(path);
+            deleteFileIfExists(path);
         }
-        return idx;
+        for (removed_entries.items) |*entry| entry.deinit(self.allocator);
+        removed_entries.deinit(self.allocator);
     }
 
     fn artifactPath(self: *ArtifactStore, artifact_id: []const u8) ![]u8 {
@@ -463,10 +461,53 @@ fn blobMatches(path: []const u8, content: []const u8, allocator: std.mem.Allocat
     const max_bytes = std.math.add(usize, content.len, 1) catch return error.FileTooBig;
     const existing = compat.fs.readFileAlloc(allocator, compat.fs.getCwd(), path, max_bytes) catch |err| switch (err) {
         error.FileNotFound => return false,
+        error.StreamTooLong => return false,
         else => return err,
     };
     defer allocator.free(existing);
     return std.mem.eql(u8, existing, content);
+}
+
+fn contentMatchesArtifactId(content: []const u8, artifact_id: []const u8) bool {
+    var hex_buf = sha256Hex(content);
+    return std.mem.eql(u8, hex_buf[0..], artifact_id);
+}
+
+fn totalBytesAfterRemoving(entries: []const Metadata, remove_indexes: []const usize) !u64 {
+    var total: u64 = 0;
+    for (entries, 0..) |entry, i| {
+        if (containsIndex(remove_indexes, i)) continue;
+        total = try std.math.add(u64, total, entry.byte_size);
+    }
+    return total;
+}
+
+fn oldestIndexExcluding(entries: []const Metadata, exclude_indexes: []const usize) usize {
+    var idx: ?usize = null;
+    for (entries, 0..) |entry, i| {
+        if (containsIndex(exclude_indexes, i)) continue;
+        if (idx == null or entry.last_accessed_ms < entries[idx.?].last_accessed_ms) idx = i;
+    }
+    return idx.?;
+}
+
+fn containsIndex(indexes: []const usize, idx: usize) bool {
+    for (indexes) |candidate| {
+        if (candidate == idx) return true;
+    }
+    return false;
+}
+
+fn sortIndexesDescending(indexes: []usize) void {
+    var i: usize = 1;
+    while (i < indexes.len) : (i += 1) {
+        const value = indexes[i];
+        var j = i;
+        while (j > 0 and indexes[j - 1] < value) : (j -= 1) {
+            indexes[j] = indexes[j - 1];
+        }
+        indexes[j] = value;
+    }
 }
 
 fn deleteFileIfExists(path: []const u8) void {
@@ -693,6 +734,52 @@ test "artifact store rewrites corrupt existing blob" {
     var result = try store.read(reference.artifact_id);
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings("correct", result.content);
+}
+
+test "artifact store read rejects corrupt or missing blobs" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var reference = try store.write(.{ .content = "original", .mime_type = "text/plain" });
+    defer reference.deinit(allocator);
+    const path = try store.artifactPath(reference.artifact_id);
+    defer allocator.free(path);
+
+    try compat.fs.writeFile(compat.fs.getCwd(), path, "trunc");
+    try std.testing.expectError(error.ArtifactCorrupt, store.read(reference.artifact_id));
+
+    deleteFileIfExists(path);
+    try std.testing.expectError(error.ArtifactNotFound, store.read(reference.artifact_id));
+}
+
+test "artifact store rewrites oversized existing blob" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var hex_buf = sha256Hex("small");
+    const artifact_id = hex_buf[0..];
+    const path = try store.artifactPath(artifact_id);
+    defer allocator.free(path);
+    try compat.fs.writeFile(compat.fs.getCwd(), path, "small but with poison suffix");
+
+    var reference = try store.write(.{ .content = "small", .mime_type = "text/plain" });
+    defer reference.deinit(allocator);
+
+    var result = try store.read(reference.artifact_id);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("small", result.content);
 }
 
 test "artifact store rejects duplicate artifact ids in index" {
