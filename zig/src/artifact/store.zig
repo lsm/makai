@@ -146,6 +146,10 @@ pub const ArtifactStore = struct {
         const artifact_id = hex_buf[0..];
         const now = nowMillis();
 
+        if (self.max_total_bytes) |limit| {
+            if (input.content.len > limit) return error.ArtifactTooLarge;
+        }
+
         const file_path = try self.artifactPath(artifact_id);
         defer self.allocator.free(file_path);
         if (!fileExists(file_path)) {
@@ -156,12 +160,14 @@ pub const ArtifactStore = struct {
             const entry = &self.entries.items[idx];
             entry.last_accessed_ms = now;
             if (!std.mem.eql(u8, entry.mime_type, input.mime_type)) {
+                const new_mime_type = try self.allocator.dupe(u8, input.mime_type);
                 self.allocator.free(entry.mime_type);
-                entry.mime_type = try self.allocator.dupe(u8, input.mime_type);
+                entry.mime_type = new_mime_type;
             }
             if (!std.mem.eql(u8, entry.description, input.description)) {
+                const new_description = try self.allocator.dupe(u8, input.description);
                 self.allocator.free(entry.description);
-                entry.description = try self.allocator.dupe(u8, input.description);
+                entry.description = new_description;
             }
         } else {
             try self.entries.append(self.allocator, .{
@@ -186,15 +192,15 @@ pub const ArtifactStore = struct {
         defer self.mutex.unlock(defaultIo());
 
         const idx = self.findIndex(artifact_id) orelse return error.ArtifactNotFound;
-        self.entries.items[idx].last_accessed_ms = nowMillis();
-        try self.persistIndex();
-
         const file_path = try self.artifactPath(artifact_id);
         defer self.allocator.free(file_path);
         const byte_size = std.math.cast(usize, self.entries.items[idx].byte_size) orelse return error.FileTooBig;
         const max_bytes = std.math.add(usize, byte_size, 1) catch return error.FileTooBig;
         const content = try compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), file_path, max_bytes);
         errdefer self.allocator.free(content);
+
+        self.entries.items[idx].last_accessed_ms = nowMillis();
+        try self.persistIndex();
 
         return .{
             .content = content,
@@ -537,6 +543,48 @@ test "artifact store evicts oldest when size limit exceeded" {
     var result = try store.read(second.artifact_id);
     defer result.deinit(allocator);
     try std.testing.expectEqualStrings("abcde", result.content);
+}
+
+test "artifact store rejects oversized write without evicting existing artifact" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, 5);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var existing = try store.write(.{ .content = "12345", .mime_type = "text/plain" });
+    defer existing.deinit(allocator);
+
+    try std.testing.expectError(error.ArtifactTooLarge, store.write(.{ .content = "123456", .mime_type = "text/plain" }));
+
+    var result = try store.read(existing.artifact_id);
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("12345", result.content);
+}
+
+test "artifact store dedup metadata update allocates before swapping" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+
+    var store = try tmpStore(allocator, &tmp, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var first = try store.write(.{ .content = "same blob", .mime_type = "text/plain", .description = "old" });
+    defer first.deinit(allocator);
+    var second = try store.write(.{ .content = "same blob", .mime_type = "application/json", .description = "new" });
+    defer second.deinit(allocator);
+
+    const artifacts = try store.list(.{});
+    defer store.freeList(artifacts);
+    try std.testing.expectEqual(@as(usize, 1), artifacts.len);
+    try std.testing.expectEqualStrings("application/json", artifacts[0].mime_type);
+    try std.testing.expectEqualStrings("new", artifacts[0].description);
 }
 
 test "artifact store middleware stores large output reference" {
