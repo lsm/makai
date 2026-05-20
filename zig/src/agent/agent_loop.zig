@@ -440,6 +440,14 @@ const ToolExecutionResult = struct {
 };
 
 /// Execute tool calls from assistant message
+fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return try allocator.dupe(u8, args_json);
+    try parsed.value.object.put(allocator, "compact_output", .{ .bool = true });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
 fn executeToolCalls(
     allocator: std.mem.Allocator,
     assistant_message: ai_types.AssistantMessage,
@@ -483,12 +491,16 @@ fn executeToolCalls(
                 try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                 continue;
             };
-            execution_args = validated_args;
+            execution_args = if (config.compact_tool_output)
+                try withCompactToolOutput(allocator, validated_args)
+            else
+                validated_args;
+            defer if (config.compact_tool_output) allocator.free(execution_args);
 
             const approval_request = types.ToolApprovalRequest{
                 .tool_call_id = tool_call.id,
                 .tool_name = tool_call.name,
-                .args_json = validated_args,
+                .args_json = execution_args,
             };
             if (t.approval_ui_fn) |notify| {
                 notify(t.approval_ui_ctx, approval_request, allocator);
@@ -508,7 +520,7 @@ fn executeToolCalls(
                 .event_stream = event_stream,
                 .tool_call_id = tool_call.id,
                 .tool_name = tool_call.name,
-                .args_json = validated_args,
+                .args_json = execution_args,
             };
 
             result = blk: {
@@ -517,7 +529,7 @@ fn executeToolCalls(
                         config.execute_tool_via_protocol_ctx,
                         tool_call.id,
                         tool_call.name,
-                        validated_args,
+                        execution_args,
                         config.cancel_token,
                         &update_ctx,
                         onToolUpdate,
@@ -531,7 +543,7 @@ fn executeToolCalls(
 
                 break :blk t.execute(
                     tool_call.id,
-                    validated_args,
+                    execution_args,
                     config.cancel_token,
                     &update_ctx,
                     onToolUpdate,

@@ -373,6 +373,7 @@ pub const AgentLoopConfig = struct {
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
     tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
     tool_output_middleware_ctx: ?*anyopaque = null,
+    compact_tool_output: bool = false,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,

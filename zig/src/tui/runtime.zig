@@ -136,8 +136,9 @@ pub const TuiRuntime = struct {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
                 self.rebuildWrappedTools();
-                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol });
+                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
+                self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
                 self.local_agent.?.setTools(self.wrapped_tools);
                 self.started = true;

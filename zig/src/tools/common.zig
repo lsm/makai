@@ -245,6 +245,13 @@ pub fn storeArtifact(allocator: std.mem.Allocator, key: []const u8, data: []cons
     return path;
 }
 
+pub fn cleanupArtifacts() !void {
+    var cwd = std.Io.Dir.cwd();
+    if (cwd.access(defaultIo(), ".makai/tool-artifacts", .{})) {
+        try cwd.deleteTree(defaultIo(), ".makai/tool-artifacts");
+    } else |_| {}
+}
+
 pub fn retrieveArtifact(allocator: std.mem.Allocator, reference: []const u8, max_bytes: usize) ![]u8 {
     if (!std.mem.startsWith(u8, reference, ".makai/tool-artifacts/")) return error.InvalidArtifactReference;
     if (hasParentTraversal(reference) or std.Io.Dir.path.isAbsolute(reference)) return error.InvalidArtifactReference;
@@ -306,7 +313,17 @@ pub fn makeTextResultWithArtifact(allocator: std.mem.Allocator, options: TextRes
     else
         try std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":true,\"artifact_path\":\"{s}\"}}", .{ raw_bytes, summary.len, raw_bytes -| summary.len, artifact_path });
     defer allocator.free(details);
-    const result = try makeTextResult(allocator, summary, details);
+    var result = try makeTextResult(allocator, summary, details);
+    errdefer result.deinit(allocator);
+    const artifact_refs = try allocator.alloc(ai_types.ArtifactReference, 1);
+    errdefer allocator.free(artifact_refs);
+    artifact_refs[0] = .{
+        .artifact_id = try allocator.dupe(u8, key),
+        .uri = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, artifact_path)),
+        .byte_size = raw_bytes,
+    };
+    errdefer artifact_refs[0].deinit(allocator);
+    result.artifacts = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifact_refs);
     return .{ .result = result, .raw_bytes = raw_bytes, .returned_bytes = summary.len + details.len, .compressed = true, .artifact_path = artifact_path };
 }
 
@@ -400,8 +417,14 @@ test "line hash and artifact helpers" {
     defer made.deinit(std.testing.allocator);
     try std.testing.expect(made.compressed);
     try std.testing.expect(made.artifact_path != null);
+    try std.testing.expectEqual(@as(usize, 1), made.result.artifacts.slice().len);
+    try std.testing.expectEqualStrings("test:call", made.result.artifacts.slice()[0].artifact_id);
+    try std.testing.expectEqualStrings(made.artifact_path.?, made.result.artifacts.slice()[0].getUri().?);
+    try std.testing.expectEqual(@as(?u64, buf.len), made.result.artifacts.slice()[0].byte_size);
     try std.testing.expect(std.mem.indexOf(u8, made.result.content.slice()[0].text.text, "output stored as artifact") != null);
     const full = try retrieveArtifact(std.testing.allocator, made.artifact_path.?, buf.len + 1);
     defer std.testing.allocator.free(full);
     try std.testing.expectEqualStrings(buf, full);
+    try cleanupArtifacts();
+    try std.testing.expectError(error.FileNotFound, retrieveArtifact(std.testing.allocator, made.artifact_path.?, buf.len + 1));
 }

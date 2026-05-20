@@ -122,12 +122,19 @@ fn formatWithLineHashesFrom(allocator: std.mem.Allocator, content: []const u8, f
 
 fn lineNumberAtOffset(allocator: std.mem.Allocator, file: std.Io.File, offset: usize) !usize {
     if (offset == 0) return 1;
-    const prefix = try allocator.alloc(u8, @min(offset, common.max_file_bytes));
-    defer allocator.free(prefix);
-    const bytes_read = try file.readPositionalAll(common.defaultIo(), prefix, 0);
+    const chunk_size: usize = 64 * 1024;
+    const buf = try allocator.alloc(u8, chunk_size);
+    defer allocator.free(buf);
     var line_no: usize = 1;
-    for (prefix[0..bytes_read]) |c| {
-        if (c == '\n') line_no += 1;
+    var pos: usize = 0;
+    while (pos < offset) {
+        const read_len = @min(buf.len, offset - pos);
+        const bytes_read = try file.readPositionalAll(common.defaultIo(), buf[0..read_len], pos);
+        for (buf[0..bytes_read]) |c| {
+            if (c == '\n') line_no += 1;
+        }
+        if (bytes_read < read_len) break;
+        pos += bytes_read;
     }
     return line_no;
 }

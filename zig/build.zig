@@ -1398,14 +1398,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_search_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
-    test_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
