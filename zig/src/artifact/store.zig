@@ -177,7 +177,7 @@ pub const ArtifactStore = struct {
                 entry.last_accessed_ms = old_last_accessed_ms;
                 entry.mime_type = old_mime_type;
                 entry.description = old_description;
-                if (!had_valid_blob) deleteFileIfExists(file_path);
+                if (!had_valid_blob) try deleteFileIfExists(file_path);
                 return err;
             };
 
@@ -208,7 +208,7 @@ pub const ArtifactStore = struct {
             self.persistIndex() catch |err| {
                 var removed = self.entries.orderedRemove(self.entries.items.len - 1);
                 removed.deinit(self.allocator);
-                if (!had_valid_blob) deleteFileIfExists(file_path);
+                if (!had_valid_blob) try deleteFileIfExists(file_path);
                 return err;
             };
         }
@@ -229,6 +229,7 @@ pub const ArtifactStore = struct {
         const max_bytes = std.math.add(usize, byte_size, 1) catch return error.FileTooBig;
         const content = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), file_path, max_bytes) catch |err| switch (err) {
             error.FileNotFound => return error.ArtifactNotFound,
+            error.StreamTooLong => return error.ArtifactCorrupt,
             else => return err,
         };
         errdefer self.allocator.free(content);
@@ -398,7 +399,7 @@ pub const ArtifactStore = struct {
         for (removed_entries.items) |entry| {
             const path = try self.artifactPath(entry.artifact_id);
             defer self.allocator.free(path);
-            deleteFileIfExists(path);
+            try deleteFileIfExists(path);
         }
         for (removed_entries.items) |*entry| entry.deinit(self.allocator);
         removed_entries.deinit(self.allocator);
@@ -510,10 +511,10 @@ fn sortIndexesDescending(indexes: []usize) void {
     }
 }
 
-fn deleteFileIfExists(path: []const u8) void {
+fn deleteFileIfExists(path: []const u8) !void {
     compat.fs.getCwd().deleteFile(defaultIo(), path) catch |err| switch (err) {
         error.FileNotFound => {},
-        else => {},
+        else => return err,
     };
 }
 
@@ -754,7 +755,10 @@ test "artifact store read rejects corrupt or missing blobs" {
     try compat.fs.writeFile(compat.fs.getCwd(), path, "trunc");
     try std.testing.expectError(error.ArtifactCorrupt, store.read(reference.artifact_id));
 
-    deleteFileIfExists(path);
+    try compat.fs.writeFile(compat.fs.getCwd(), path, "original with extra bytes");
+    try std.testing.expectError(error.ArtifactCorrupt, store.read(reference.artifact_id));
+
+    try deleteFileIfExists(path);
     try std.testing.expectError(error.ArtifactNotFound, store.read(reference.artifact_id));
 }
 
