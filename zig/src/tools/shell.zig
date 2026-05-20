@@ -118,7 +118,7 @@ test "shell execute captures stdout" {
 test "shell execute stores large output as artifact and supports compact output" {
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
     defer std.testing.allocator.free(cwd);
-    const large_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"command\":\"python3 - <<'PY'\\nimport sys\\nsys.stdout.write('x' * 5000)\\nPY\"}}", .{cwd});
+    const large_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"command\":\"python3 - <<'PY'\\nimport sys\\nsys.stdout.write('x' * 11000)\\nPY\"}}", .{cwd});
     defer std.testing.allocator.free(large_args);
     var large = try execute("call-large", large_args, null, null, null, std.testing.allocator);
     defer large.deinit(std.testing.allocator);

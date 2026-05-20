@@ -20,7 +20,6 @@ pub const stat_tool = agent.AgentTool{ .label = "File Stat", .name = "file_stat"
 const max_hashed_output_bytes: usize = common.max_file_bytes;
 
 pub fn readExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
-    _ = tool_call_id;
     _ = on_update_ctx;
     _ = on_update;
     if (common.isCancelled(cancel_token)) return error.Cancelled;
@@ -46,8 +45,11 @@ pub fn readExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     const hashed = try formatWithLineHashesFrom(allocator, text[0..bytes_read], range.first_line_no);
     errdefer allocator.free(hashed);
     const details = try common.jsonString(allocator, .{ .ok = true, .path = path, .duration_ms = common.durationMs(start_ms), .raw_bytes = st.size, .returned_bytes = hashed.len, .saved_bytes = if (st.size > hashed.len) st.size - hashed.len else 0, .compressed = false, .offset = offset, .limit = limit });
-    errdefer allocator.free(details);
-    return common.makeTextResultOwned(allocator, hashed, details);
+    defer allocator.free(details);
+    defer allocator.free(hashed);
+    const made = try common.makeTextResultWithArtifact(allocator, .{ .tool_name = "file_read", .call_id = tool_call_id, .text = hashed, .details_json = details });
+    defer if (made.artifact_path) |artifact_path| allocator.free(artifact_path);
+    return made.result;
 }
 
 pub fn writeExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token: ?ai_types.CancelToken, on_update_ctx: ?*anyopaque, on_update: ?agent.ToolUpdateCallback, allocator: std.mem.Allocator) anyerror!agent.AgentToolResult {
@@ -215,6 +217,33 @@ test "file read write stat" {
     var st = try statExecute("call", read_args, null, null, null, std.testing.allocator);
     defer st.deinit(std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, st.getDetailsJson().?, "\"size\":5") != null);
+}
+
+test "file read stores large output as artifact" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const root = try std.Io.Dir.path.join(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer std.testing.allocator.free(root);
+    const line_count = 1200;
+    var data = std.ArrayList(u8).empty;
+    defer data.deinit(std.testing.allocator);
+    for (0..line_count) |i| {
+        const line = try std.fmt.allocPrint(std.testing.allocator, "line-{d}\n", .{i});
+        defer std.testing.allocator.free(line);
+        try data.appendSlice(std.testing.allocator, line);
+    }
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "large.txt", .data = data.items });
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"large.txt\"}}", .{root});
+    defer std.testing.allocator.free(args);
+
+    var result = try readExecute("call-large", args, null, null, null, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.slice()[0].text.text, "output stored as artifact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.getDetailsJson().?, "\"compressed\":true") != null);
+    try std.testing.expectEqual(@as(usize, 1), result.artifacts.slice().len);
+    try common.cleanupArtifacts();
 }
 
 test "file read supports byte ranges without loading full file" {

@@ -1,14 +1,37 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
+const artifact_store = @import("artifact/store");
 const compat = @import("compat");
 
 pub const max_file_bytes: usize = 16 * 1024 * 1024;
 pub const process_output_bytes: usize = 16 * 1024 * 1024;
 pub const process_poll_ms: u64 = 100;
 pub const max_results: usize = 200;
-pub const tool_output_threshold: usize = 4 * 1024;
+pub const default_shell_limit: usize = 10 * 1024;
+pub const default_file_limit: usize = 20 * 1024;
+pub const default_search_limit: usize = 15 * 1024;
+pub const default_fallback_limit: usize = 4 * 1024;
+pub const tool_output_threshold: usize = default_fallback_limit;
 pub const snippet_bytes: usize = 512;
+
+pub const ToolOutputLimits = struct {
+    shell: usize = default_shell_limit,
+    file: usize = default_file_limit,
+    search: usize = default_search_limit,
+    fallback: usize = default_fallback_limit,
+
+    pub fn forTool(self: ToolOutputLimits, tool_name: []const u8) usize {
+        return switch (classifyTool(tool_name)) {
+            .shell => self.shell,
+            .file => self.file,
+            .search => self.search,
+            .other => self.fallback,
+        };
+    }
+};
+
+const ToolKind = enum { shell, file, search, other };
 
 pub const TextResultOptions = struct {
     tool_name: []const u8,
@@ -17,6 +40,8 @@ pub const TextResultOptions = struct {
     stderr: []const u8 = "",
     details_json: []const u8 = "",
     force_artifact: bool = false,
+    limits: ToolOutputLimits = .{},
+    store: ?*artifact_store.ArtifactStore = null,
 };
 
 pub const TextResult = struct {
@@ -31,6 +56,21 @@ pub const TextResult = struct {
         if (self.artifact_path) |path| allocator.free(path);
     }
 };
+
+fn classifyTool(tool_name: []const u8) ToolKind {
+    if (matchesToolName(tool_name, "shell")) return .shell;
+    if (matchesToolName(tool_name, "file") or matchesToolName(tool_name, "read") or matchesToolName(tool_name, "write") or matchesToolName(tool_name, "edit")) return .file;
+    if (matchesToolName(tool_name, "search") or matchesToolName(tool_name, "grep")) return .search;
+    return .other;
+}
+
+fn matchesToolName(tool_name: []const u8, token: []const u8) bool {
+    if (std.mem.eql(u8, tool_name, token)) return true;
+    if (!std.mem.startsWith(u8, tool_name, token)) return false;
+    if (tool_name.len <= token.len) return false;
+    const separator = tool_name[token.len];
+    return separator == '_' or separator == '-';
+}
 
 pub fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
@@ -298,7 +338,8 @@ pub fn jsonString(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 
 pub fn makeTextResultWithArtifact(allocator: std.mem.Allocator, options: TextResultOptions) !TextResult {
     const raw_bytes = options.text.len + options.stderr.len;
-    const should_store = options.force_artifact or options.text.len > tool_output_threshold;
+    const limit = options.limits.forTool(options.tool_name);
+    const should_store = options.force_artifact or options.text.len > limit;
     if (!should_store) {
         const body = if (options.stderr.len > 0)
             try std.fmt.allocPrint(allocator, "{s}\nstderr:\n{s}", .{ options.text, options.stderr })
@@ -312,31 +353,59 @@ pub fn makeTextResultWithArtifact(allocator: std.mem.Allocator, options: TextRes
 
     const key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ options.tool_name, options.call_id });
     defer allocator.free(key);
-    const artifact_path = try storeArtifact(allocator, key, options.text);
-    errdefer allocator.free(artifact_path);
-    const summary = try summarizeArtifactBackedOutput(allocator, options.text, options.stderr, artifact_path);
+
+    var reference = if (options.store) |store|
+        try store.write(.{ .content = options.text, .mime_type = "text/plain", .description = key })
+    else
+        try makeFileArtifactReference(allocator, key, options.text, raw_bytes);
+    errdefer reference.deinit(if (options.store) |store| store.allocator else allocator);
+
+    const artifact_uri = reference.getUri() orelse reference.artifact_id;
+    const artifact_path = if (options.store == null) try allocator.dupe(u8, artifact_uri) else null;
+    errdefer if (artifact_path) |path| allocator.free(path);
+
+    const summary = try summarizeArtifactBackedOutput(allocator, options.text, options.stderr, artifact_uri);
     defer allocator.free(summary);
     const details = if (options.details_json.len > 0)
-        try std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":true,\"artifact_path\":\"{s}\",\"details\":{s}}}", .{ raw_bytes, summary.len, raw_bytes -| summary.len, artifact_path, options.details_json })
+        try std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":true,\"artifact_path\":\"{s}\",\"details\":{s}}}", .{ raw_bytes, summary.len, raw_bytes -| summary.len, artifact_uri, options.details_json })
     else
-        try std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":true,\"artifact_path\":\"{s}\"}}", .{ raw_bytes, summary.len, raw_bytes -| summary.len, artifact_path });
+        try std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":true,\"artifact_path\":\"{s}\"}}", .{ raw_bytes, summary.len, raw_bytes -| summary.len, artifact_uri });
     defer allocator.free(details);
     var result = try makeTextResult(allocator, summary, details);
     errdefer result.deinit(allocator);
     const artifact_refs = try allocator.alloc(ai_types.ArtifactReference, 1);
     errdefer allocator.free(artifact_refs);
-    const artifact_id = try allocator.dupe(u8, key);
-    errdefer allocator.free(artifact_id);
-    const uri = try allocator.dupe(u8, artifact_path);
-    errdefer allocator.free(uri);
-    artifact_refs[0] = .{
-        .artifact_id = artifact_id,
-        .uri = ai_types.OwnedSlice(u8).initOwned(uri),
-        .byte_size = raw_bytes,
-    };
+    artifact_refs[0] = if (options.store != null) try cloneArtifactReference(allocator, reference) else reference;
     errdefer artifact_refs[0].deinit(allocator);
+    if (options.store) |store| reference.deinit(store.allocator);
     result.artifacts = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifact_refs);
     return .{ .result = result, .raw_bytes = raw_bytes, .returned_bytes = summary.len + details.len, .compressed = true, .artifact_path = artifact_path };
+}
+
+fn makeFileArtifactReference(allocator: std.mem.Allocator, key: []const u8, text: []const u8, raw_bytes: usize) !ai_types.ArtifactReference {
+    const artifact_path = try storeArtifact(allocator, key, text);
+    errdefer allocator.free(artifact_path);
+    const artifact_id = try allocator.dupe(u8, key);
+    errdefer allocator.free(artifact_id);
+    return .{
+        .artifact_id = artifact_id,
+        .uri = ai_types.OwnedSlice(u8).initOwned(artifact_path),
+        .byte_size = raw_bytes,
+    };
+}
+
+fn cloneArtifactReference(allocator: std.mem.Allocator, reference: ai_types.ArtifactReference) !ai_types.ArtifactReference {
+    var cloned = ai_types.ArtifactReference{
+        .artifact_id = try allocator.dupe(u8, reference.artifact_id),
+        .byte_size = reference.byte_size,
+    };
+    errdefer cloned.deinit(allocator);
+
+    if (reference.uri.slice().len > 0) cloned.uri = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, reference.uri.slice()));
+    if (reference.mime_type.slice().len > 0) cloned.mime_type = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, reference.mime_type.slice()));
+    if (reference.sha256.slice().len > 0) cloned.sha256 = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, reference.sha256.slice()));
+    if (reference.description.slice().len > 0) cloned.description = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, reference.description.slice()));
+    return cloned;
 }
 
 fn summarizeArtifactBackedOutput(allocator: std.mem.Allocator, text: []const u8, stderr: []const u8, artifact_path: []const u8) ![]u8 {
@@ -439,6 +508,55 @@ test "line hash and artifact helpers" {
     try std.testing.expectEqualStrings(buf, full);
     try cleanupArtifacts();
     try std.testing.expectError(error.FileNotFound, retrieveArtifact(std.testing.allocator, made.artifact_path.?, buf.len + 1));
+}
+
+test "tool output limits classify by exact token prefix" {
+    const limits = ToolOutputLimits{ .shell = 8, .file = 16, .search = 24, .fallback = 4 };
+    try std.testing.expectEqual(@as(usize, 8), limits.forTool("shell_execute"));
+    try std.testing.expectEqual(@as(usize, 16), limits.forTool("file_read"));
+    try std.testing.expectEqual(@as(usize, 24), limits.forTool("search_text"));
+    try std.testing.expectEqual(@as(usize, 4), limits.forTool("profile_read"));
+    try std.testing.expectEqual(@as(usize, 4), limits.forTool("seashell_analyzer"));
+}
+
+test "artifact helper respects per-tool limits" {
+    const buf = try std.testing.allocator.alloc(u8, 12);
+    defer std.testing.allocator.free(buf);
+    @memset(buf, 'x');
+
+    var shell_made = try makeTextResultWithArtifact(std.testing.allocator, .{ .tool_name = "shell_execute", .call_id = "shell", .text = buf, .limits = .{ .shell = 8, .file = 32, .search = 32, .fallback = 32 } });
+    defer shell_made.deinit(std.testing.allocator);
+    try std.testing.expect(shell_made.compressed);
+
+    var file_made = try makeTextResultWithArtifact(std.testing.allocator, .{ .tool_name = "file_read", .call_id = "file", .text = buf, .limits = .{ .shell = 8, .file = 32, .search = 32, .fallback = 32 } });
+    defer file_made.deinit(std.testing.allocator);
+    try std.testing.expect(!file_made.compressed);
+    try cleanupArtifacts();
+}
+
+test "artifact helper uses ArtifactStore backend when provided" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    const root_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "artifacts" });
+    defer allocator.free(root_path);
+    try compat.fs.createDir(compat.fs.getCwd(), root_path);
+    var store = try artifact_store.ArtifactStore.initWithPath(allocator, root_path, null);
+    defer {
+        store.deinit();
+        tmp.cleanup();
+    }
+
+    var made = try makeTextResultWithArtifact(allocator, .{ .tool_name = "search_text", .call_id = "call", .text = "abcdefghijklmnopqrstuvwxyz", .limits = .{ .search = 8 }, .store = &store });
+    defer made.deinit(allocator);
+    try std.testing.expect(made.compressed);
+    try std.testing.expectEqual(@as(?[]const u8, null), made.artifact_path);
+    try std.testing.expectEqual(@as(usize, 1), made.result.artifacts.slice().len);
+    const artifact = made.result.artifacts.slice()[0];
+    try std.testing.expect(std.mem.startsWith(u8, artifact.getUri().?, "makai-artifact://"));
+
+    var stored = try store.read(artifact.artifact_id);
+    defer stored.deinit(allocator);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz", stored.content);
 }
 
 test "artifact retrieval rejects symlink targets" {
