@@ -913,6 +913,7 @@ fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_lo
 
     const name_text = getStringField(tool_obj, "name") orelse return error.InvalidToolDefinition;
     const description_text = getStringField(tool_obj, "description") orelse "";
+    const short_description_text = getStringField(tool_obj, "short_description") orelse getStringField(outer_obj, "short_description");
     const label_text = getStringField(tool_obj, "label") orelse getStringField(outer_obj, "label") orelse name_text;
 
     const label = try allocator.dupe(u8, label_text);
@@ -921,6 +922,8 @@ fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_lo
     errdefer allocator.free(name);
     const description = try allocator.dupe(u8, description_text);
     errdefer allocator.free(description);
+    const short_description = if (short_description_text) |text| try allocator.dupe(u8, text) else null;
+    errdefer if (short_description) |text| allocator.free(text);
     const parameters_schema_json = try parseToolSchemaJson(allocator, tool_obj);
     errdefer allocator.free(parameters_schema_json);
 
@@ -928,6 +931,7 @@ fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_lo
         .label = label,
         .name = name,
         .description = description,
+        .short_description = short_description,
         .parameters_schema_json = parameters_schema_json,
         .execute = unavailableAgentToolExecute,
     };
@@ -959,6 +963,7 @@ fn deinitAgentToolFields(allocator: std.mem.Allocator, tool: *agent_loop.AgentTo
     allocator.free(tool.label);
     allocator.free(tool.name);
     allocator.free(tool.description);
+    if (tool.short_description) |short| allocator.free(short);
     allocator.free(tool.parameters_schema_json);
 }
 

@@ -39,6 +39,7 @@ pub const TuiRuntimeOptions = struct {
     tools: []const agent.AgentTool = &.{},
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
+    compact_output: bool = false,
     run_async: bool = true,
 };
 
@@ -61,6 +62,7 @@ pub const TuiRuntime = struct {
     started: bool = false,
     stream_active: bool = false,
     last_turn_stop_reason: ?ai_types.StopReason = null,
+    compact_output: bool = false,
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
@@ -101,6 +103,7 @@ pub const TuiRuntime = struct {
             .approval_contexts = approval_contexts,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
+            .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
         return runtime;
@@ -272,6 +275,7 @@ pub const TuiRuntime = struct {
                 .label = tool.label,
                 .name = tool.name,
                 .description = tool.description,
+                .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
                 .approval_ctx = &self.approval_contexts[i],
