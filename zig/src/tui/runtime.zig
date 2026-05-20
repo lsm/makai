@@ -5,6 +5,7 @@ const event_stream = @import("event_stream");
 const agent = @import("agent");
 const agent_protocol_client = @import("agent_protocol_client");
 const session = @import("tui_session");
+const local_tools = @import("tools/registry");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const TuiSession = session.TuiSession;
@@ -39,6 +40,7 @@ pub const TuiRuntimeOptions = struct {
     tools: []const agent.AgentTool = &.{},
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
+    compact_output: bool = false,
     run_async: bool = true,
 };
 
@@ -51,6 +53,7 @@ pub const TuiRuntime = struct {
     local_agent: ?agent.Agent = null,
     remote_client: ?agent_protocol_client.AgentProtocolClient = null,
     event_stream: TuiEventStream,
+    tool_registry: local_tools.ToolRegistry,
     original_tools: []agent.AgentTool,
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
@@ -61,19 +64,25 @@ pub const TuiRuntime = struct {
     started: bool = false,
     stream_active: bool = false,
     last_turn_stop_reason: ?ai_types.StopReason = null,
+    compact_output: bool = false,
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
         const models = try allocator.dupe(ai_types.Model, options.models);
         errdefer allocator.free(models);
 
-        const original_tools = try allocator.dupe(agent.AgentTool, options.tools);
+        var tool_registry = local_tools.ToolRegistry.init();
+        errdefer tool_registry.deinit(allocator);
+        try tool_registry.registerDefaults(allocator);
+        for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
+
+        const original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
         errdefer allocator.free(original_tools);
 
-        const wrapped_tools = try allocator.alloc(agent.AgentTool, options.tools.len);
+        const wrapped_tools = try allocator.alloc(agent.AgentTool, original_tools.len);
         errdefer allocator.free(wrapped_tools);
 
-        const approval_contexts = try allocator.alloc(ApprovalContext, options.tools.len);
+        const approval_contexts = try allocator.alloc(ApprovalContext, original_tools.len);
         errdefer allocator.free(approval_contexts);
 
         var selected: ?usize = null;
@@ -96,11 +105,13 @@ pub const TuiRuntime = struct {
             .models = models,
             .selected_model_index = selected,
             .event_stream = TuiEventStream.init(allocator),
+            .tool_registry = tool_registry,
             .original_tools = original_tools,
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
+            .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
         return runtime;
@@ -113,6 +124,7 @@ pub const TuiRuntime = struct {
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
+        self.tool_registry.deinit(self.allocator);
         self.allocator.free(self.models);
         self.* = undefined;
     }
@@ -124,8 +136,9 @@ pub const TuiRuntime = struct {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
                 self.rebuildWrappedTools();
-                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol });
+                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
+                self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
                 self.local_agent.?.setTools(self.wrapped_tools);
                 self.started = true;
@@ -272,6 +285,7 @@ pub const TuiRuntime = struct {
                 .label = tool.label,
                 .name = tool.name,
                 .description = tool.description,
+                .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
                 .approval_ctx = &self.approval_contexts[i],
@@ -381,7 +395,6 @@ pub const TuiRuntime = struct {
             else => {},
         }
     }
-
 };
 
 fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allocator: std.mem.Allocator) void {
@@ -644,6 +657,17 @@ fn collectUntilEnd(tui_session: *TuiSession, saw_turn_start: *bool, saw_message_
             else => {},
         }
     }
+}
+
+test "runtime registers default local tools and allows overrides" {
+    var mock = MockProtocolCtx{};
+    const replacement = agent.AgentTool{ .label = "Wrapped Shell", .name = "shell_execute", .description = "Wrapped shell tool", .parameters_schema_json = "{}", .execute = demoTool };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .tools = &.{replacement}, .run_async = false });
+    defer runtime.deinit();
+    try std.testing.expect(runtime.tool_registry.resolve("shell_execute") != null);
+    try std.testing.expect(runtime.tool_registry.resolve("file_read") != null);
+    try std.testing.expectEqualStrings("Wrapped Shell", runtime.tool_registry.resolve("shell_execute").?.label);
+    try std.testing.expect(runtime.original_tools.len >= 9);
 }
 
 test "runtime submit turn emits normalized events" {
