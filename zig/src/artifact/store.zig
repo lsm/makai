@@ -208,12 +208,15 @@ pub const ArtifactStore = struct {
         const content = try compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), file_path, max_bytes);
         errdefer self.allocator.free(content);
 
+        const reference = try self.referenceFor(artifact_id);
+        errdefer reference.deinit(self.allocator);
+
         self.entries.items[idx].last_accessed_ms = nowMillis();
-        try self.persistIndex();
+        self.persistIndex() catch {};
 
         return .{
             .content = content,
-            .reference = try self.referenceFor(artifact_id),
+            .reference = reference,
         };
     }
 
@@ -272,11 +275,16 @@ pub const ArtifactStore = struct {
                 .object => |object| object,
                 else => return error.InvalidArtifactIndex,
             };
-            const entry_artifact_id = try self.allocator.dupe(u8, try requiredString(obj, "artifact_id"));
+            const artifact_id_value = try requiredString(obj, "artifact_id");
+            if (!isValidArtifactId(artifact_id_value)) return error.InvalidArtifactIndex;
+            const sha256_value = try requiredString(obj, "sha256");
+            if (!std.mem.eql(u8, artifact_id_value, sha256_value)) return error.InvalidArtifactIndex;
+
+            const entry_artifact_id = try self.allocator.dupe(u8, artifact_id_value);
             errdefer self.allocator.free(entry_artifact_id);
             const entry_mime_type = try self.allocator.dupe(u8, try requiredString(obj, "mime_type"));
             errdefer self.allocator.free(entry_mime_type);
-            const entry_sha256 = try self.allocator.dupe(u8, try requiredString(obj, "sha256"));
+            const entry_sha256 = try self.allocator.dupe(u8, sha256_value);
             errdefer self.allocator.free(entry_sha256);
             const entry_description = try self.allocator.dupe(u8, optionalString(obj, "description") orelse "");
             errdefer self.allocator.free(entry_description);
@@ -408,21 +416,24 @@ pub const ArtifactStore = struct {
 };
 
 fn cloneStoredArtifact(allocator: std.mem.Allocator, entry: Metadata) !StoredArtifact {
-    var cloned = StoredArtifact{
-        .artifact_id = try allocator.dupe(u8, entry.artifact_id),
-        .mime_type = "",
+    const artifact_id = try allocator.dupe(u8, entry.artifact_id);
+    errdefer allocator.free(artifact_id);
+    const mime_type = try allocator.dupe(u8, entry.mime_type);
+    errdefer allocator.free(mime_type);
+    const sha256 = try allocator.dupe(u8, entry.sha256);
+    errdefer allocator.free(sha256);
+    const description = try allocator.dupe(u8, entry.description);
+    errdefer allocator.free(description);
+
+    return .{
+        .artifact_id = artifact_id,
+        .mime_type = mime_type,
         .byte_size = entry.byte_size,
-        .sha256 = "",
+        .sha256 = sha256,
         .created_at_ms = entry.created_at_ms,
         .last_accessed_ms = entry.last_accessed_ms,
-        .description = "",
+        .description = description,
     };
-    errdefer cloned.deinit(allocator);
-
-    cloned.mime_type = try allocator.dupe(u8, entry.mime_type);
-    cloned.sha256 = try allocator.dupe(u8, entry.sha256);
-    cloned.description = try allocator.dupe(u8, entry.description);
-    return cloned;
 }
 
 fn fileExists(path: []const u8) bool {
@@ -433,6 +444,17 @@ fn fileExists(path: []const u8) bool {
 
 fn nowMillis() i64 {
     return compat.time.nowMillis();
+}
+
+fn isValidArtifactId(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |ch| {
+        switch (ch) {
+            '0'...'9', 'a'...'f' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn requiredString(obj: std.json.ObjectMap, key: []const u8) ![]const u8 {
