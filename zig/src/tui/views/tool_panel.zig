@@ -19,6 +19,13 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     for (state.tools.items) |tool| {
         if (rows >= options.height) break;
         try writer.print("\n  [{s}] {s}", .{ statusText(tool.status), tool.name });
+        if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
+            try writer.print(" ({d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
+            if (tool.estimated_returned_tokens > 0) try writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
+            try writer.writeByte(')');
+        }
+        if (tool.truncated) try writer.writeAll(" truncated/show full");
+        if (tool.artifact_refs.len > 0) try writer.print(" artifact:{s}", .{tool.artifact_refs});
         rows += 1;
         if (tool.expanded and rows < options.height) {
             try writer.writeAll(" ");

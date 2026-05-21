@@ -414,6 +414,11 @@ pub const TuiRuntime = struct {
                 .tool_name = try self.dupeOwned(payload.tool_name),
                 .result_json = try self.dupeOwned(payload.result_json),
                 .is_error = payload.is_error,
+                .raw_total_bytes = payload.raw_total_bytes,
+                .returned_total_bytes = payload.returned_total_bytes,
+                .estimated_returned_tokens = payload.estimated_returned_tokens,
+                .artifact_count = payload.artifact_count,
+                .artifact_refs = try self.formatArtifactRefs(payload.artifacts),
             } }),
             .turn_end => |payload| {
                 self.last_turn_stop_reason = payload.message.stop_reason;
@@ -426,8 +431,45 @@ pub const TuiRuntime = struct {
                 self.event_stream.complete(.{ .reason = reason });
                 self.stream_active = false;
             },
-            .context_usage, .prompt_segment_usage => {},
+            .context_usage => |payload| self.push(.{ .context_usage = .{
+                .system_prompt_bytes = payload.system_prompt_bytes,
+                .message_bytes = payload.message_bytes,
+                .tool_definition_bytes = payload.tool_definition_bytes,
+                .total_bytes = payload.total_bytes,
+                .estimated_tokens = payload.estimated_tokens,
+                .message_count = payload.message_count,
+                .tool_count = payload.tool_count,
+            } }),
+            .prompt_segment_usage => |payload| self.push(.{ .prompt_segment_usage = .{
+                .segment = switch (payload.segment) {
+                    .system_prompt => .system_prompt,
+                    .message_history => .message_history,
+                    .tool_definitions => .tool_definitions,
+                },
+                .cache_role = switch (payload.cache_role) {
+                    .stable => .stable,
+                    .dynamic => .dynamic,
+                },
+                .bytes = payload.bytes,
+                .estimated_tokens = payload.estimated_tokens,
+                .item_count = payload.item_count,
+            } }),
         }
+    }
+
+    fn formatArtifactRefs(self: *TuiRuntime, artifacts: []const ai_types.ArtifactReference) !OwnedSlice(u8) {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        const writer = &out.writer;
+        for (artifacts, 0..) |artifact, i| {
+            if (i > 0) try writer.writeAll(", ");
+            if (artifact.getUri()) |uri| {
+                try writer.writeAll(uri);
+            } else {
+                try writer.writeAll(artifact.artifact_id);
+            }
+        }
+        return OwnedSlice(u8).initOwned(try out.toOwnedSlice());
     }
 
     fn pushMessageUpdate(self: *TuiRuntime, event: ai_types.AssistantMessageEvent) !void {
