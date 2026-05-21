@@ -161,12 +161,19 @@ pub const TuiRuntime = struct {
             try bridge.loadConfigJson(config_json);
             try bridge.discover();
             try runtime.tool_registry.registerMcpBridge(allocator, bridge);
-            allocator.free(runtime.original_tools);
-            runtime.original_tools = try allocator.dupe(agent.AgentTool, runtime.tool_registry.list());
-            allocator.free(runtime.wrapped_tools);
-            runtime.wrapped_tools = try allocator.alloc(agent.AgentTool, runtime.original_tools.len);
+            const next_original_tools = try allocator.dupe(agent.AgentTool, runtime.tool_registry.list());
+            errdefer allocator.free(next_original_tools);
+            const next_wrapped_tools = try allocator.alloc(agent.AgentTool, next_original_tools.len);
+            errdefer allocator.free(next_wrapped_tools);
+            const next_approval_contexts = try allocator.alloc(ApprovalContext, next_original_tools.len);
+            errdefer allocator.free(next_approval_contexts);
+
             allocator.free(runtime.approval_contexts);
-            runtime.approval_contexts = try allocator.alloc(ApprovalContext, runtime.original_tools.len);
+            allocator.free(runtime.wrapped_tools);
+            allocator.free(runtime.original_tools);
+            runtime.original_tools = next_original_tools;
+            runtime.wrapped_tools = next_wrapped_tools;
+            runtime.approval_contexts = next_approval_contexts;
         }
         return runtime;
     }
