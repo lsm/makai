@@ -4,6 +4,10 @@ const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const agent = @import("agent");
 const agent_protocol_client = @import("agent_protocol_client");
+const agent_envelope = @import("agent_envelope");
+const agent_protocol_types = @import("agent_protocol_types");
+const transport = @import("transport");
+const json_writer = @import("json_writer");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -33,13 +37,42 @@ const ApprovalContext = struct {
     tool_name: []const u8,
 };
 
+pub const RemoteLineReceiver = struct {
+    ctx: *anyopaque,
+    read_line_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8,
+    close_fn: ?*const fn (ctx: *anyopaque) void = null,
+
+    pub fn readLine(self: *RemoteLineReceiver, allocator: std.mem.Allocator) !?[]const u8 {
+        return self.read_line_fn(self.ctx, allocator);
+    }
+
+    pub fn close(self: *RemoteLineReceiver) void {
+        if (self.close_fn) |f| f(self.ctx);
+    }
+};
+
 pub const TuiBackendMode = enum {
     local,
     remote,
 };
 
+pub const TuiRemoteTransport = enum {
+    stdio,
+    sse,
+    websocket,
+};
+
+pub const TuiRemoteConfig = struct {
+    mode: TuiBackendMode = .local,
+    transport: TuiRemoteTransport = .stdio,
+    endpoint: []const u8 = "",
+};
+
 pub const TuiRuntimeOptions = struct {
     backend: TuiBackendMode = .local,
+    remote_config: TuiRemoteConfig = .{},
+    remote_sender: ?transport.AsyncSender = null,
+    remote_receiver: ?RemoteLineReceiver = null,
     protocol: ?agent.ProtocolClient = null,
     models: []const ai_types.Model = &.{},
     initial_model_id: ?[]const u8 = null,
@@ -58,6 +91,9 @@ pub const TuiRuntime = struct {
     selected_model_index: ?usize,
     local_agent: ?agent.Agent = null,
     remote_client: ?agent_protocol_client.AgentProtocolClient = null,
+    remote_sender: ?transport.AsyncSender = null,
+    remote_receiver: ?RemoteLineReceiver = null,
+    remote_session_id: ?agent_protocol_types.SessionId = null,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
     original_tools: []agent.AgentTool,
@@ -110,6 +146,8 @@ pub const TuiRuntime = struct {
             .allocator = allocator,
             .backend = options.backend,
             .protocol = options.protocol,
+            .remote_sender = options.remote_sender,
+            .remote_receiver = options.remote_receiver,
             .models = models,
             .selected_model_index = selected,
             .event_stream = TuiEventStream.init(allocator),
@@ -140,7 +178,22 @@ pub const TuiRuntime = struct {
 
     pub fn start(self: *TuiRuntime) !void {
         switch (self.backend) {
-            .remote => return error.NotImplemented,
+            .remote => {
+                if (self.started) return;
+                var client = agent_protocol_client.AgentProtocolClient.init(self.allocator);
+                errdefer client.deinit();
+                const sender = self.remote_sender orelse return error.NoRemoteTransportConfigured;
+                client.setSender(sender);
+                const config_json = try self.remoteConfigJson();
+                defer self.allocator.free(config_json);
+                _ = try client.sendAgentStart(config_json, null);
+                try self.pumpRemoteIncomingInto(&client);
+                const sid = client.session_id orelse return error.RemoteAgentStartFailed;
+                self.remote_session_id = sid;
+                self.remote_client = client;
+                self.started = true;
+                self.push(.agent_start);
+            },
             .local => {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
@@ -164,6 +217,16 @@ pub const TuiRuntime = struct {
             local.unsubscribeWithContext(self, onAgentEvent);
             local.deinit();
             self.local_agent = null;
+        }
+        if (self.remote_client) |*client| {
+            if (self.remote_session_id) |sid| {
+                _ = client.sendAgentStop(sid, "client disconnect") catch {};
+            }
+            if (self.remote_sender) |sender| sender.close();
+            if (self.remote_receiver) |*receiver| receiver.close();
+            client.deinit();
+            self.remote_client = null;
+            self.remote_session_id = null;
         }
         self.started = false;
     }
@@ -210,7 +273,19 @@ pub const TuiRuntime = struct {
 
     pub fn submitTurn(self: *TuiRuntime, text: []const u8) !void {
         switch (self.backend) {
-            .remote => return error.NotImplemented,
+            .remote => {
+                if (!self.started) try self.start();
+                const client = &(self.remote_client orelse return error.RuntimeNotStarted);
+                const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+                self.resetEventStreamForTurn();
+                self.cancelled.store(false, .release);
+                self.completed = false;
+                self.last_turn_stop_reason = null;
+                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), text);
+                defer self.allocator.free(message_json);
+                _ = try client.sendAgentMessage(sid, message_json, null);
+                try self.pumpRemoteIncoming();
+            },
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
@@ -243,7 +318,7 @@ pub const TuiRuntime = struct {
 
     pub fn resumeSession(self: *TuiRuntime) !void {
         switch (self.backend) {
-            .remote => return error.NotImplemented,
+            .remote => return error.RemoteResumeNotSupported,
             .local => {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
@@ -265,6 +340,12 @@ pub const TuiRuntime = struct {
     pub fn cancel(self: *TuiRuntime) void {
         self.cancelled.store(true, .release);
         if (self.local_agent) |*local| local.abort();
+        if (self.remote_client) |*client| {
+            if (self.remote_session_id) |sid| {
+                _ = client.sendAgentStop(sid, "cancelled") catch {};
+                self.pumpRemoteIncoming() catch {};
+            }
+        }
         while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
         self.pending_approval.cancelled = true;
         self.pending_approval.decision = .reject;
@@ -376,6 +457,58 @@ pub const TuiRuntime = struct {
         return OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, value));
     }
 
+    fn remoteConfigJson(self: *TuiRuntime) ![]u8 {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+        try w.beginObject();
+        if (self.currentModel()) |model| try w.writeStringField("model", model.id);
+        try w.writeBoolField("compact_output", self.compact_output);
+        try w.endObject();
+        const out = try self.allocator.dupe(u8, buffer.items);
+        buffer.deinit(self.allocator);
+        return out;
+    }
+
+    fn pumpRemoteIncomingInto(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
+        var receiver = &(self.remote_receiver orelse return error.NoRemoteTransportConfigured);
+        var read_any = false;
+        while (try receiver.readLine(self.allocator)) |line| {
+            read_any = true;
+            defer self.allocator.free(line);
+            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch |err| switch (err) {
+                error.InvalidPayloadType, error.InvalidSessionId, error.InvalidUlid, error.InvalidEnumValue => return error.ProtocolVersionMismatch,
+                else => return err,
+            };
+            defer env.deinit(self.allocator);
+            if (env.version != 1) return error.ProtocolVersionMismatch;
+            try client.processEnvelope(env);
+            try self.drainRemoteClientEvents(client);
+        }
+        if (!read_any and !self.started) return error.ConnectionRefused;
+    }
+
+    fn pumpRemoteIncoming(self: *TuiRuntime) !void {
+        const client = &(self.remote_client orelse return error.RuntimeNotStarted);
+        try self.pumpRemoteIncomingInto(client);
+    }
+
+    fn drainRemoteClientEvents(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
+        while (client.popEvent()) |owned_json| {
+            var json = owned_json;
+            defer json.deinit(self.allocator);
+            try self.handleRemoteAgentEventJson(json.slice());
+        }
+        if (self.remote_session_id) |sid| {
+            if (client.getLastErrorForSession(sid)) |msg| {
+                self.push(.{ .@"error" = .{ .message = try self.dupeOwned(msg) } });
+                self.pushTerminal(.{ .agent_end = .{ .reason = .@"error" } });
+                self.event_stream.complete(.{ .reason = .@"error" });
+                self.stream_active = false;
+            }
+        }
+    }
+
     fn messageRole(message: ai_types.Message) TuiEvent.MessageRole {
         return switch (message) {
             .user => .user,
@@ -389,6 +522,65 @@ pub const TuiRuntime = struct {
         self.handleAgentEvent(event) catch |err| {
             self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
         };
+    }
+
+    fn handleRemoteAgentEventJson(self: *TuiRuntime, json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const event_type = obj.get("type") orelse return error.InvalidRemoteEvent;
+        const type_name = event_type.string;
+
+        if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.agent_start);
+        if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
+        if (std.mem.eql(u8, type_name, "message_start")) return self.push(.{ .message_start = .{ .role = .assistant } });
+        if (std.mem.eql(u8, type_name, "message_end")) return self.push(.{ .message_end = .{ .role = .assistant } });
+        if (std.mem.eql(u8, type_name, "message_update")) {
+            const event_json = try extractObjectJson(self.allocator, json, "event");
+            defer self.allocator.free(event_json);
+            const msg = try transport.deserialize(event_json, self.allocator);
+            switch (msg) {
+                .event => |ev| {
+                    defer {
+                        var mutable = ev;
+                        ai_types.deinitAssistantMessageEvent(self.allocator, &mutable);
+                    }
+                    return try self.pushMessageUpdate(ev);
+                },
+                else => return error.InvalidRemoteEvent,
+            }
+        }
+        if (std.mem.eql(u8, type_name, "tool_execution_start")) return self.push(.{ .tool_execution_start = .{
+            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
+            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
+            .args_json = try self.dupeOwned(if (obj.get("args_json")) |v| v.string else ""),
+        } });
+        if (std.mem.eql(u8, type_name, "tool_execution_update")) return self.push(.{ .tool_execution_update = .{
+            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
+            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
+            .args_json = try self.dupeOwned(if (obj.get("args_json")) |v| v.string else ""),
+            .partial_result_json = try self.dupeOwned(obj.get("partial_result_json").?.string),
+        } });
+        if (std.mem.eql(u8, type_name, "tool_execution_end")) return self.push(.{ .tool_execution_end = .{
+            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
+            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
+            .result_json = try self.dupeOwned(obj.get("result_json").?.string),
+            .is_error = obj.get("is_error").?.bool,
+        } });
+        if (std.mem.eql(u8, type_name, "turn_end")) {
+            const reason = parseStopReason(if (obj.get("stop_reason")) |v| v.string else "stop");
+            self.last_turn_stop_reason = reason;
+            return self.pushTerminal(.{ .turn_end = .{ .stop_reason = reason } });
+        }
+        if (std.mem.eql(u8, type_name, "agent_end")) {
+            const reason: TuiEndReason = if (self.cancelled.load(.acquire)) .cancelled else if (self.last_turn_stop_reason == .@"error") .@"error" else .completed;
+            self.completed = true;
+            self.pushTerminal(.{ .agent_end = .{ .reason = reason } });
+            self.event_stream.complete(.{ .reason = reason });
+            self.stream_active = false;
+            return;
+        }
+        if (std.mem.eql(u8, type_name, "error")) return self.push(.{ .@"error" = .{ .message = try self.dupeOwned(obj.get("message").?.string) } });
     }
 
     fn handleAgentEvent(self: *TuiRuntime, event: agent.AgentEvent) !void {
@@ -448,6 +640,67 @@ pub const TuiRuntime = struct {
         }
     }
 };
+
+fn parseStopReason(value: []const u8) ai_types.StopReason {
+    return std.meta.stringToEnum(ai_types.StopReason, value) orelse .stop;
+}
+
+fn extractObjectJson(allocator: std.mem.Allocator, json: []const u8, key: []const u8) ![]u8 {
+    const needle = try std.fmt.allocPrint(allocator, "\"{s}\":", .{key});
+    defer allocator.free(needle);
+    const key_pos = std.mem.indexOf(u8, json, needle) orelse return error.InvalidRemoteEvent;
+    var idx = key_pos + needle.len;
+    while (idx < json.len and std.ascii.isWhitespace(json[idx])) : (idx += 1) {}
+    if (idx >= json.len or json[idx] != '{') return error.InvalidRemoteEvent;
+    const start = idx;
+    var depth: usize = 0;
+    var in_string = false;
+    var escaped = false;
+    while (idx < json.len) : (idx += 1) {
+        const c = json[idx];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return try allocator.dupe(u8, json[start .. idx + 1]);
+        }
+    }
+    return error.InvalidRemoteEvent;
+}
+
+fn makeRemoteMessageJson(allocator: std.mem.Allocator, model: ?ai_types.Model, text: []const u8) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var w = json_writer.JsonWriter.init(&buffer, allocator);
+    try w.beginObject();
+    if (model) |m| try w.writeStringField("model_ref", m.id);
+    try w.writeKey("messages");
+    try w.beginArray();
+    try w.beginObject();
+    try w.writeStringField("role", "user");
+    try w.writeStringField("content", text);
+    try w.endObject();
+    try w.endArray();
+    try w.writeKey("tools");
+    try w.beginArray();
+    try w.endArray();
+    try w.endObject();
+    const out = try allocator.dupe(u8, buffer.items);
+    buffer.deinit(allocator);
+    return out;
+}
 
 fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allocator: std.mem.Allocator) void {
     const approval_ctx: *ApprovalContext = @ptrCast(@alignCast(ctx.?));
@@ -1137,10 +1390,108 @@ test "failed turns emit error end reason" {
     try std.testing.expect(saw_error_end);
 }
 
-test "remote mode start returns not implemented" {
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+const RemoteMock = struct {
+    writes: std.ArrayList([]u8),
+    reads: std.ArrayList([]u8),
+
+    fn init() RemoteMock {
+        return .{ .writes = std.ArrayList([]u8).empty, .reads = std.ArrayList([]u8).empty };
+    }
+
+    fn deinit(self: *RemoteMock, allocator: std.mem.Allocator) void {
+        for (self.writes.items) |item| allocator.free(item);
+        for (self.reads.items) |item| allocator.free(item);
+        self.writes.deinit(allocator);
+        self.reads.deinit(allocator);
+    }
+
+    fn sender(self: *RemoteMock) transport.AsyncSender {
+        return .{ .context = self, .write_fn = writeFn, .flush_fn = flushFn };
+    }
+
+    fn receiver(self: *RemoteMock) RemoteLineReceiver {
+        return .{ .ctx = self, .read_line_fn = readLineFn };
+    }
+
+    fn writeFn(ctx: *anyopaque, data: []const u8) !void {
+        const self: *RemoteMock = @ptrCast(@alignCast(ctx));
+        try self.writes.append(std.testing.allocator, try std.testing.allocator.dupe(u8, data));
+    }
+
+    fn flushFn(_: *anyopaque) !void {}
+
+    fn readLineFn(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
+        const self: *RemoteMock = @ptrCast(@alignCast(ctx));
+        if (self.reads.items.len == 0) return null;
+        const line = self.reads.orderedRemove(0);
+        if (allocator.ptr == std.testing.allocator.ptr) return line;
+        defer std.testing.allocator.free(line);
+        return try allocator.dupe(u8, line);
+    }
+
+    fn queueEnvelope(self: *RemoteMock, allocator: std.mem.Allocator, env: agent_protocol_types.Envelope) !void {
+        const json = try agent_envelope.serializeEnvelope(env, allocator);
+        try self.reads.append(allocator, json);
+    }
+};
+
+test "remote mode sends agent_start envelope via mock transport" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
     defer runtime.deinit();
 
     var tui_session = runtime.createSession();
-    try std.testing.expectError(error.NotImplemented, tui_session.start());
+    try tui_session.start();
+    try std.testing.expectEqual(@as(usize, 1), mock.writes.items.len);
+
+    var env = try agent_envelope.deserializeEnvelope(mock.writes.items[0], std.testing.allocator);
+    defer env.deinit(std.testing.allocator);
+    try std.testing.expect(env.payload == .agent_start);
+}
+
+test "remote mode normalizes agent_event into TUI event" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+
+    var event_env = agent_protocol_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = 0,
+        .payload = .{ .agent_event = try std.testing.allocator.dupe(u8, "{\"type\":\"turn_start\"}") },
+    };
+    defer event_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, event_env);
+
+    try tui_session.submitTurn("hi");
+
+    var saw_turn_start = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .turn_start) saw_turn_start = true;
+    }
+    try std.testing.expect(saw_turn_start);
 }
