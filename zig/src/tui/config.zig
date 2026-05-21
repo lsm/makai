@@ -27,12 +27,14 @@ pub const ModeSettings = struct {
     caveman_mode: bool = false,
 };
 
+const borrowed_empty_theme: []u8 = &.{};
+
 pub const UiSettings = struct {
-    theme: []u8 = &.{},
+    theme: []u8 = borrowed_empty_theme,
     show_tool_panel: bool = true,
 
     pub fn deinit(self: *UiSettings, allocator: std.mem.Allocator) void {
-        if (self.theme.len > 0) allocator.free(self.theme);
+        if (self.theme.ptr != borrowed_empty_theme.ptr) allocator.free(self.theme);
         self.* = .{};
     }
 };
