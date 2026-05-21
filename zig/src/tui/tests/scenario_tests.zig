@@ -331,9 +331,17 @@ test "runtime persistence full save and resume cycle" {
     defer meta.deinit(std.testing.allocator);
 
     try store.save(meta, .{ .message_start = .{ .role = .user } });
-    var user_delta = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
-    defer user_delta.deinit(std.testing.allocator);
-    try store.save(meta, user_delta);
+    var user_end = tui_session.TuiEvent{ .message_end = .{ .role = .user, .text = try ownedText("hello") } };
+    defer user_end.deinit(std.testing.allocator);
+    try store.save(meta, user_end);
+    try store.save(meta, .{ .message_start = .{ .role = .assistant } });
+    var assistant_a = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hel") } };
+    defer assistant_a.deinit(std.testing.allocator);
+    try store.save(meta, assistant_a);
+    var assistant_b = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("lo") } };
+    defer assistant_b.deinit(std.testing.allocator);
+    try store.save(meta, assistant_b);
+    try store.save(meta, .{ .message_end = .{ .role = .assistant } });
 
     const steps = [_]mock_provider.ResponseStep{.{ .text = fixtures.expected_text }};
     var provider = mock_provider.MockProvider.init(.{ .steps = &steps });
@@ -347,14 +355,65 @@ test "runtime persistence full save and resume cycle" {
 
     var loaded = try store.resumeSession("resume-cycle", &runtime);
     defer loaded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0] == .user);
+    try std.testing.expectEqualStrings("hello", loaded.messages.items[0].user.content.text);
+    try std.testing.expect(loaded.messages.items[1] == .assistant);
+    try std.testing.expectEqualStrings("hello", loaded.messages.items[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, loaded.messages.items[1].assistant.model);
 
     var session = runtime.createSession();
     try session.submitTurn("again");
     var summary = EventSummary{};
     try drainUntilAgentEnd(&session, &summary);
     try std.testing.expect(summary.agent_end);
-    try std.testing.expectEqual(@as(usize, 2), provider.last_message_count);
+    try std.testing.expectEqual(@as(usize, 3), provider.last_message_count);
+}
+
+test "session persistence reconstructs tool call before tool result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpSessionBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    var store = try session_store.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "tool-cycle"),
+        .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
+        .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer meta.deinit(std.testing.allocator);
+
+    try store.save(meta, .{ .message_start = .{ .role = .assistant } });
+    var assistant_tool = tui_session.TuiEvent{ .message_end = .{
+        .role = .assistant,
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("demo_tool"),
+        .args_json = try ownedText("{\"x\":1}"),
+    } };
+    defer assistant_tool.deinit(std.testing.allocator);
+    try store.save(meta, assistant_tool);
+    var tool_result = tui_session.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("demo_tool"),
+        .result_json = try ownedText("{\"ok\":true}"),
+        .is_error = false,
+    } };
+    defer tool_result.deinit(std.testing.allocator);
+    try store.save(meta, tool_result);
+
+    var loaded = try store.load("tool-cycle");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0] == .assistant);
+    try std.testing.expect(loaded.messages.items[0].assistant.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("call-1", loaded.messages.items[0].assistant.content[0].tool_call.id);
+    try std.testing.expect(loaded.messages.items[1] == .tool_result);
+    try std.testing.expectEqualStrings("call-1", loaded.messages.items[1].tool_result.tool_call_id);
 }
 
 test {

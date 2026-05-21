@@ -396,6 +396,49 @@ pub const TuiRuntime = struct {
         };
     }
 
+    fn messageEndPayload(self: *TuiRuntime, message: ai_types.Message) !@TypeOf(@as(TuiEvent, undefined).message_end) {
+        var payload: @TypeOf(@as(TuiEvent, undefined).message_end) = .{ .role = messageRole(message) };
+        switch (message) {
+            .user => |m| switch (m.content) {
+                .text => |text| payload.text = try self.dupeOwned(text),
+                .parts => |parts| for (parts) |part| switch (part) {
+                    .text => |text| {
+                        payload.text = try self.dupeOwned(text.text);
+                        break;
+                    },
+                    else => {},
+                },
+            },
+            .assistant => |m| for (m.content) |block| switch (block) {
+                .text => |text| {
+                    payload.text = try self.dupeOwned(text.text);
+                    break;
+                },
+                .tool_call => |tool| {
+                    payload.tool_call_id = try self.dupeOwned(tool.id);
+                    payload.tool_name = try self.dupeOwned(tool.name);
+                    payload.args_json = try self.dupeOwned(tool.arguments_json);
+                    break;
+                },
+                else => {},
+            },
+            .tool_result => |m| {
+                payload.tool_call_id = try self.dupeOwned(m.tool_call_id);
+                payload.tool_name = try self.dupeOwned(m.tool_name);
+                payload.text = try self.dupeOwned(firstUserPartText(m.content));
+            },
+        }
+        return payload;
+    }
+
+    fn firstUserPartText(parts: []const ai_types.UserContentPart) []const u8 {
+        for (parts) |part| switch (part) {
+            .text => |text| return text.text,
+            else => {},
+        };
+        return "";
+    }
+
     fn onAgentEvent(ctx: ?*anyopaque, event: agent.AgentEvent) void {
         const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
         self.handleAgentEvent(event) catch |err| {
@@ -409,7 +452,7 @@ pub const TuiRuntime = struct {
             .turn_start => self.push(.turn_start),
             .message_start => |payload| self.push(.{ .message_start = .{ .role = messageRole(payload.message) } }),
             .message_update => |payload| try self.pushMessageUpdate(payload.event),
-            .message_end => |payload| self.push(.{ .message_end = .{ .role = messageRole(payload.message) } }),
+            .message_end => |payload| self.push(.{ .message_end = try self.messageEndPayload(payload.message) }),
             .tool_execution_start => |payload| self.push(.{ .tool_execution_start = .{
                 .tool_call_id = try self.dupeOwned(payload.tool_call_id),
                 .tool_name = try self.dupeOwned(payload.tool_name),

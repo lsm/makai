@@ -34,7 +34,13 @@ pub const TuiEvent = union(enum) {
     text_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     thinking_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     tool_call_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
-    message_end: struct { role: MessageRole },
+    message_end: struct {
+        role: MessageRole,
+        text: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        tool_call_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        tool_name: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        args_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    },
     tool_approval_requested: struct {
         tool_call_id: OwnedSlice(u8),
         tool_name: OwnedSlice(u8),
@@ -72,6 +78,12 @@ pub const TuiEvent = union(enum) {
             .text_delta => |*p| p.delta.deinit(allocator),
             .thinking_delta => |*p| p.delta.deinit(allocator),
             .tool_call_delta => |*p| p.delta.deinit(allocator),
+            .message_end => |*p| {
+                p.text.deinit(allocator);
+                p.tool_call_id.deinit(allocator);
+                p.tool_name.deinit(allocator);
+                p.args_json.deinit(allocator);
+            },
             .tool_approval_requested => |*p| {
                 p.tool_call_id.deinit(allocator);
                 p.tool_name.deinit(allocator);

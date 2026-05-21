@@ -46,6 +46,18 @@ pub const SessionMetadata = struct {
     }
 };
 
+const ReplayState = struct {
+    current_role: ?tui_session.TuiEvent.MessageRole = null,
+    assistant_text: std.ArrayList(u8) = .empty,
+    tool_call_json: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *ReplayState, allocator: std.mem.Allocator) void {
+        self.assistant_text.deinit(allocator);
+        self.tool_call_json.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const LoadedSession = struct {
     metadata: SessionMetadata,
     events: std.ArrayList(tui_session.TuiEvent) = .empty,
@@ -101,11 +113,13 @@ pub const Store = struct {
         defer self.allocator.free(data);
         var loaded = LoadedSession{ .metadata = try defaultMetadata(self.allocator, session_id) };
         errdefer loaded.deinit(self.allocator);
+        var replay = ReplayState{};
+        defer replay.deinit(self.allocator);
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (trimmed.len == 0) continue;
-            applyLine(self.allocator, &loaded, trimmed) catch continue;
+            applyLine(self.allocator, &loaded, &replay, trimmed) catch continue;
         }
         return loaded;
     }
@@ -125,11 +139,36 @@ pub const Store = struct {
         while (try iter.next(defaultIo())) |entry| {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
             const session_id = entry.name[0 .. entry.name.len - ".jsonl".len];
-            var loaded = self.load(session_id) catch continue;
-            defer loaded.deinit(self.allocator);
-            try result.append(self.allocator, try cloneMetadata(self.allocator, loaded.metadata));
+            var metadata = self.loadMetadata(session_id) catch continue;
+            errdefer metadata.deinit(self.allocator);
+            try result.append(self.allocator, metadata);
         }
         return result;
+    }
+
+    fn loadMetadata(self: Store, session_id: []const u8) !SessionMetadata {
+        const path = try sessionPath(self.allocator, self.base_dir, session_id);
+        defer self.allocator.free(path);
+        const data = try compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, 16 * 1024 * 1024);
+        defer self.allocator.free(data);
+        var meta = try defaultMetadata(self.allocator, session_id);
+        errdefer meta.deinit(self.allocator);
+        var last: []const u8 = "";
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len > 0) last = trimmed;
+        }
+        if (last.len > 0) {
+            var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, last, .{});
+            defer parsed.deinit();
+            const obj = switch (parsed.value) { .object => |o| o, else => return meta };
+            if (obj.get("metadata")) |value| switch (value) {
+                .object => |meta_obj| try updateMetadata(self.allocator, &meta, meta_obj),
+                else => {},
+            };
+        }
+        return meta;
     }
 
     pub fn resumeSession(self: Store, session_id: []const u8, runtime: *tui_runtime.TuiRuntime) !LoadedSession {
@@ -142,9 +181,17 @@ pub const Store = struct {
 };
 
 fn sessionPath(allocator: std.mem.Allocator, base_dir: []const u8, session_id: []const u8) ![]u8 {
+    try validateSessionId(session_id);
     const file_name = try std.fmt.allocPrint(allocator, "{s}.jsonl", .{session_id});
     defer allocator.free(file_name);
     return std.fs.path.join(allocator, &.{ base_dir, file_name });
+}
+
+fn validateSessionId(session_id: []const u8) !void {
+    if (session_id.len == 0) return error.InvalidSessionId;
+    if (std.mem.indexOfScalar(u8, session_id, '/') != null) return error.InvalidSessionId;
+    if (std.mem.indexOfScalar(u8, session_id, '\\') != null) return error.InvalidSessionId;
+    if (std.mem.indexOf(u8, session_id, "..") != null) return error.InvalidSessionId;
 }
 
 fn defaultMetadata(allocator: std.mem.Allocator, session_id: []const u8) !SessionMetadata {
@@ -171,7 +218,7 @@ fn cloneMetadata(allocator: std.mem.Allocator, meta: SessionMetadata) !SessionMe
     };
 }
 
-fn applyLine(allocator: std.mem.Allocator, loaded: *LoadedSession, line: []const u8) !void {
+fn applyLine(allocator: std.mem.Allocator, loaded: *LoadedSession, replay: *ReplayState, line: []const u8) !void {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
     const obj = switch (parsed.value) {
@@ -188,6 +235,7 @@ fn applyLine(allocator: std.mem.Allocator, loaded: *LoadedSession, line: []const
             var ev = event;
             ev.deinit(allocator);
         }
+        try replayEvent(allocator, &loaded.messages, replay, loaded.metadata, event);
         try loaded.events.append(allocator, event);
     }
     if (obj.get("message")) |message_value| {
@@ -197,6 +245,48 @@ fn applyLine(allocator: std.mem.Allocator, loaded: *LoadedSession, line: []const
             msg.deinit(allocator);
         }
         try loaded.messages.append(allocator, message);
+    }
+}
+
+fn replayEvent(allocator: std.mem.Allocator, messages: *std.ArrayList(ai_types.Message), replay: *ReplayState, meta: SessionMetadata, event: tui_session.TuiEvent) !void {
+    switch (event) {
+        .message_start => |payload| {
+            replay.current_role = payload.role;
+            replay.assistant_text.clearRetainingCapacity();
+            replay.tool_call_json.clearRetainingCapacity();
+        },
+        .text_delta => |payload| if (replay.current_role == .assistant) {
+            try replay.assistant_text.appendSlice(allocator, payload.delta.slice());
+        },
+        .tool_call_delta => |payload| if (replay.current_role == .assistant) {
+            try replay.tool_call_json.appendSlice(allocator, payload.delta.slice());
+        },
+        .message_end => |payload| {
+            defer {
+                replay.current_role = null;
+                replay.assistant_text.clearRetainingCapacity();
+                replay.tool_call_json.clearRetainingCapacity();
+            }
+            switch (payload.role) {
+                .user => if (payload.text.slice().len > 0) try messages.append(allocator, try userMessage(allocator, payload.text.slice())),
+                .assistant => {
+                    if (payload.tool_call_id.slice().len > 0) {
+                        try messages.append(allocator, .{ .assistant = try assistantToolCallMessage(allocator, meta, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice()) });
+                    } else if (payload.text.slice().len > 0) {
+                        try messages.append(allocator, .{ .assistant = try assistantTextMessageWithMeta(allocator, meta, payload.text.slice(), .stop) });
+                    } else if (replay.assistant_text.items.len > 0) {
+                        try messages.append(allocator, .{ .assistant = try assistantTextMessageWithMeta(allocator, meta, replay.assistant_text.items, .stop) });
+                    } else if (replay.tool_call_json.items.len > 0) {
+                        try messages.append(allocator, .{ .assistant = try assistantToolCallMessage(allocator, meta, "", "", replay.tool_call_json.items) });
+                    }
+                },
+                .tool_result => if (payload.tool_call_id.slice().len > 0) {
+                    try messages.append(allocator, .{ .tool_result = try toolResultFromFields(allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.text.slice(), false) });
+                },
+            }
+        },
+        .tool_execution_end => |payload| try messages.append(allocator, .{ .tool_result = try toolResultMessage(allocator, payload) }),
+        else => {},
     }
 }
 
@@ -223,12 +313,6 @@ fn serializeEventRecord(allocator: std.mem.Allocator, metadata: SessionMetadata,
     try writeMetadata(&w, metadata);
     try w.writeKey("event");
     try writeEvent(&w, event);
-    if (messageFromEvent(allocator, event)) |message| {
-        var msg = message;
-        defer msg.deinit(allocator);
-        try w.writeKey("message");
-        try writeMessage(&w, msg);
-    } else |_| {}
     try w.endObject();
     try buf.append(allocator, '\n');
     return buf.toOwnedSlice(allocator);
@@ -256,7 +340,7 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
         .text_delta => |p| { try w.writeStringField("type", "text_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
         .thinking_delta => |p| { try w.writeStringField("type", "thinking_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
         .tool_call_delta => |p| { try w.writeStringField("type", "tool_call_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
-        .message_end => |p| { try w.writeStringField("type", "message_end"); try w.writeStringField("role", @tagName(p.role)); },
+        .message_end => |p| { try w.writeStringField("type", "message_end"); try w.writeStringField("role", @tagName(p.role)); try w.writeStringField("text", p.text.slice()); try w.writeStringField("tool_call_id", p.tool_call_id.slice()); try w.writeStringField("tool_name", p.tool_name.slice()); try w.writeStringField("args_json", p.args_json.slice()); },
         .tool_approval_requested => |p| { try w.writeStringField("type", "tool_approval_requested"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
         .tool_execution_start => |p| { try w.writeStringField("type", "tool_execution_start"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
         .tool_execution_update => |p| { try w.writeStringField("type", "tool_execution_update"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); try w.writeStringField("partial_result_json", p.partial_result_json.slice()); },
@@ -283,7 +367,13 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
     if (std.mem.eql(u8, kind, "text_delta")) return .{ .text_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "thinking_delta")) return .{ .thinking_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_call_delta")) return .{ .tool_call_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
-    if (std.mem.eql(u8, kind, "message_end")) return .{ .message_end = .{ .role = parseRole(stringField(obj, "role") orelse "assistant") } };
+    if (std.mem.eql(u8, kind, "message_end")) return .{ .message_end = .{
+        .role = parseRole(stringField(obj, "role") orelse "assistant"),
+        .text = try owned(allocator, stringField(obj, "text") orelse ""),
+        .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""),
+        .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""),
+        .args_json = try owned(allocator, stringField(obj, "args_json") orelse ""),
+    } };
     if (std.mem.eql(u8, kind, "tool_approval_requested")) return .{ .tool_approval_requested = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_execution_start")) return .{ .tool_execution_start = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_execution_update")) return .{ .tool_execution_update = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse ""), .partial_result_json = try owned(allocator, stringField(obj, "partial_result_json") orelse "") } };
@@ -298,26 +388,47 @@ fn owned(allocator: std.mem.Allocator, value: []const u8) !OwnedSlice(u8) {
     return OwnedSlice(u8).initOwned(try allocator.dupe(u8, value));
 }
 
-fn messageFromEvent(allocator: std.mem.Allocator, event: tui_session.TuiEvent) !ai_types.Message {
-    return switch (event) {
-        .message_start => |p| switch (p.role) {
-            else => error.NoMessage,
-        },
-        .text_delta => |p| .{ .user = .{ .content = .{ .text = try allocator.dupe(u8, p.delta.slice()) }, .timestamp = compat.time.nowMillis() } },
-        .tool_execution_end => |p| .{ .tool_result = try toolResultMessage(allocator, p) },
-        else => error.NoMessage,
-    };
+fn userMessage(allocator: std.mem.Allocator, text: []const u8) !ai_types.Message {
+    return .{ .user = .{ .content = .{ .text = try allocator.dupe(u8, text) }, .timestamp = compat.time.nowMillis() } };
 }
 
 fn assistantTextMessage(allocator: std.mem.Allocator, text: []const u8, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
+    const meta = SessionMetadata{
+        .session_id = @constCast(""),
+        .model = @constCast(""),
+        .provider = @constCast(""),
+        .created_at = 0,
+        .last_active = 0,
+        .turn_count = 0,
+        .working_dir = @constCast(""),
+    };
+    return assistantTextMessageWithMeta(allocator, meta, text, stop_reason);
+}
+
+fn assistantTextMessageWithMeta(allocator: std.mem.Allocator, meta: SessionMetadata, text: []const u8, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
     const content = try allocator.alloc(ai_types.AssistantContent, 1);
     errdefer allocator.free(content);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, text) } };
+    return assistantMessage(allocator, meta, content, stop_reason);
+}
+
+fn assistantToolCallMessage(allocator: std.mem.Allocator, meta: SessionMetadata, id: []const u8, name: []const u8, args_json: []const u8) !ai_types.AssistantMessage {
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .tool_call = .{
+        .id = try allocator.dupe(u8, id),
+        .name = try allocator.dupe(u8, name),
+        .arguments_json = try allocator.dupe(u8, args_json),
+    } };
+    return assistantMessage(allocator, meta, content, .tool_use);
+}
+
+fn assistantMessage(allocator: std.mem.Allocator, meta: SessionMetadata, content: []const ai_types.AssistantContent, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
     const api = try allocator.dupe(u8, "");
     errdefer allocator.free(api);
-    const provider = try allocator.dupe(u8, "");
+    const provider = try allocator.dupe(u8, meta.provider);
     errdefer allocator.free(provider);
-    const model = try allocator.dupe(u8, "");
+    const model = try allocator.dupe(u8, meta.model);
     errdefer allocator.free(model);
     return .{
         .content = content,
@@ -332,15 +443,19 @@ fn assistantTextMessage(allocator: std.mem.Allocator, text: []const u8, stop_rea
 }
 
 fn toolResultMessage(allocator: std.mem.Allocator, p: anytype) !ai_types.ToolResultMessage {
+    return toolResultFromFields(allocator, p.tool_call_id.slice(), p.tool_name.slice(), p.result_json.slice(), p.is_error);
+}
+
+fn toolResultFromFields(allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, result: []const u8, is_error: bool) !ai_types.ToolResultMessage {
     const parts = try allocator.alloc(ai_types.UserContentPart, 1);
     errdefer allocator.free(parts);
-    parts[0] = .{ .text = .{ .text = try allocator.dupe(u8, p.result_json.slice()) } };
+    parts[0] = .{ .text = .{ .text = try allocator.dupe(u8, result) } };
     return .{
-        .tool_call_id = try allocator.dupe(u8, p.tool_call_id.slice()),
-        .tool_name = try allocator.dupe(u8, p.tool_name.slice()),
+        .tool_call_id = try allocator.dupe(u8, tool_call_id),
+        .tool_name = try allocator.dupe(u8, tool_name),
         .content = parts,
-        .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.result_json.slice())),
-        .is_error = p.is_error,
+        .details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, result)),
+        .is_error = is_error,
         .timestamp = compat.time.nowMillis(),
     };
 }
@@ -475,6 +590,13 @@ test "corrupted JSONL line is skipped" {
     try std.testing.expectEqual(@as(usize, 2), loaded.events.items.len);
     try std.testing.expect(loaded.events.items[0] == .turn_start);
     try std.testing.expect(loaded.events.items[1] == .agent_end);
+}
+
+test "invalid session id is rejected" {
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId("../escape"));
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId("foo/bar"));
+    try std.testing.expectError(error.InvalidSessionId, validateSessionId("foo\\bar"));
+    try validateSessionId("session-123");
 }
 
 test "session metadata updates from last valid line" {
