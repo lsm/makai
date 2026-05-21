@@ -28,7 +28,6 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
         if (i > 0) try writer.writeByte('\n');
         try writer.print("{s} ", .{label(entry.kind)});
         try writeClipped(writer, entry.text.items, options.width -| label(entry.kind).len -| 1);
-        if (entry.kind == .tool and std.mem.indexOf(u8, entry.text.items, "[truncated") != null) try writer.writeAll(" (show full)");
     }
 
     return out.toOwnedSlice();

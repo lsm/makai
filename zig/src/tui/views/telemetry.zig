@@ -28,7 +28,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writeSegment(writer, "tools", telemetry.tool_definitions);
 
     if (findLatestTruncatedTool(state)) |tool| {
-        try writer.print("\nTool output truncated {d}->{d} bytes", .{ tool.returned_total_bytes, tool.raw_total_bytes });
+        try writer.print("\nTool output truncated {d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
         if (tool.artifact_refs.len > 0) try writer.print(" • artifact {s}", .{tool.artifact_refs});
     }
 

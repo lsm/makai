@@ -417,7 +417,7 @@ pub const AppState = struct {
             var out: std.Io.Writer.Allocating = .init(self.allocator);
             defer out.deinit();
             const writer = &out.writer;
-            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.name, returned_total_bytes, raw_total_bytes });
+            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.name, raw_total_bytes, returned_total_bytes });
             if (artifact_refs.len > 0) try writer.print(": {s}", .{artifact_refs});
             try writer.writeByte(']');
             const indicator = try out.toOwnedSlice();
