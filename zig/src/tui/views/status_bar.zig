@@ -14,7 +14,10 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const stream = if (state.status.streaming) "streaming" else "idle";
     try writer.print(" {s}/{s} • session:{s} • turns:{d} • {s}", .{ provider, model, session, state.status.turn_count, stream });
     if (state.status.context_limit > 0) {
-        try writer.print(" • ctx:{d}/{d}", .{ state.status.context_used, state.status.context_limit });
+        const pct = (state.status.context_used * 100) / state.status.context_limit;
+        try writer.print(" • ctx:{d}% {d}/{d}", .{ pct, state.status.context_used, state.status.context_limit });
+    } else if (state.status.context_used > 0) {
+        try writer.print(" • ctx:{d}tok", .{state.status.context_used});
     }
     if (state.status.last_error.len > 0) {
         try writer.print(" • error:{s}", .{state.status.last_error});

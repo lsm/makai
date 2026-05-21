@@ -483,7 +483,36 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
         .tool_approval_requested => |p| { try w.writeStringField("type", "tool_approval_requested"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
         .tool_execution_start => |p| { try w.writeStringField("type", "tool_execution_start"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
         .tool_execution_update => |p| { try w.writeStringField("type", "tool_execution_update"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); try w.writeStringField("partial_result_json", p.partial_result_json.slice()); },
-        .tool_execution_end => |p| { try w.writeStringField("type", "tool_execution_end"); try w.writeStringField("tool_call_id", p.tool_call_id.slice()); try w.writeStringField("tool_name", p.tool_name.slice()); try w.writeStringField("result_json", p.result_json.slice()); try w.writeBoolField("is_error", p.is_error); },
+        .tool_execution_end => |p| {
+            try w.writeStringField("type", "tool_execution_end");
+            try w.writeStringField("tool_call_id", p.tool_call_id.slice());
+            try w.writeStringField("tool_name", p.tool_name.slice());
+            try w.writeStringField("result_json", p.result_json.slice());
+            try w.writeBoolField("is_error", p.is_error);
+            try w.writeIntField("raw_total_bytes", p.raw_total_bytes);
+            try w.writeIntField("returned_total_bytes", p.returned_total_bytes);
+            try w.writeIntField("estimated_returned_tokens", p.estimated_returned_tokens);
+            try w.writeIntField("artifact_count", p.artifact_count);
+            try w.writeStringField("artifact_refs", p.artifact_refs.slice());
+        },
+        .context_usage => |p| {
+            try w.writeStringField("type", "context_usage");
+            try w.writeIntField("system_prompt_bytes", p.system_prompt_bytes);
+            try w.writeIntField("message_bytes", p.message_bytes);
+            try w.writeIntField("tool_definition_bytes", p.tool_definition_bytes);
+            try w.writeIntField("total_bytes", p.total_bytes);
+            try w.writeIntField("estimated_tokens", p.estimated_tokens);
+            try w.writeIntField("message_count", p.message_count);
+            try w.writeIntField("tool_count", p.tool_count);
+        },
+        .prompt_segment_usage => |p| {
+            try w.writeStringField("type", "prompt_segment_usage");
+            try w.writeStringField("segment", @tagName(p.segment));
+            try w.writeStringField("cache_role", @tagName(p.cache_role));
+            try w.writeIntField("bytes", p.bytes);
+            try w.writeIntField("estimated_tokens", p.estimated_tokens);
+            try w.writeIntField("item_count", p.item_count);
+        },
         .turn_end => |p| { try w.writeStringField("type", "turn_end"); try w.writeStringField("stop_reason", @tagName(p.stop_reason)); },
         .agent_end => |p| { try w.writeStringField("type", "agent_end"); try w.writeStringField("reason", @tagName(p.reason)); },
         .@"error" => |p| { try w.writeStringField("type", "error"); try w.writeStringField("message", p.message.slice()); },
@@ -522,7 +551,33 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
     if (std.mem.eql(u8, kind, "tool_approval_requested")) return .{ .tool_approval_requested = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_execution_start")) return .{ .tool_execution_start = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_execution_update")) return .{ .tool_execution_update = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse ""), .partial_result_json = try owned(allocator, stringField(obj, "partial_result_json") orelse "") } };
-    if (std.mem.eql(u8, kind, "tool_execution_end")) return .{ .tool_execution_end = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .result_json = try owned(allocator, stringField(obj, "result_json") orelse ""), .is_error = boolField(obj, "is_error", false) } };
+    if (std.mem.eql(u8, kind, "tool_execution_end")) return .{ .tool_execution_end = .{
+        .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""),
+        .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""),
+        .result_json = try owned(allocator, stringField(obj, "result_json") orelse ""),
+        .is_error = boolField(obj, "is_error", false),
+        .raw_total_bytes = uint64Field(obj, "raw_total_bytes") orelse 0,
+        .returned_total_bytes = uint64Field(obj, "returned_total_bytes") orelse 0,
+        .estimated_returned_tokens = uint64Field(obj, "estimated_returned_tokens") orelse 0,
+        .artifact_count = uint32Field(obj, "artifact_count") orelse 0,
+        .artifact_refs = try owned(allocator, stringField(obj, "artifact_refs") orelse ""),
+    } };
+    if (std.mem.eql(u8, kind, "context_usage")) return .{ .context_usage = .{
+        .system_prompt_bytes = uint64Field(obj, "system_prompt_bytes") orelse 0,
+        .message_bytes = uint64Field(obj, "message_bytes") orelse 0,
+        .tool_definition_bytes = uint64Field(obj, "tool_definition_bytes") orelse 0,
+        .total_bytes = uint64Field(obj, "total_bytes") orelse 0,
+        .estimated_tokens = uint64Field(obj, "estimated_tokens") orelse 0,
+        .message_count = uint32Field(obj, "message_count") orelse 0,
+        .tool_count = uint32Field(obj, "tool_count") orelse 0,
+    } };
+    if (std.mem.eql(u8, kind, "prompt_segment_usage")) return .{ .prompt_segment_usage = .{
+        .segment = parsePromptSegmentKind(stringField(obj, "segment") orelse "message_history"),
+        .cache_role = parsePromptSegmentCacheRole(stringField(obj, "cache_role") orelse "dynamic"),
+        .bytes = uint64Field(obj, "bytes") orelse 0,
+        .estimated_tokens = uint64Field(obj, "estimated_tokens") orelse 0,
+        .item_count = uint32Field(obj, "item_count") orelse 0,
+    } };
     if (std.mem.eql(u8, kind, "turn_end")) return .{ .turn_end = .{ .stop_reason = parseStopReason(stringField(obj, "stop_reason") orelse "stop") } };
     if (std.mem.eql(u8, kind, "agent_end")) return .{ .agent_end = .{ .reason = parseEndReason(stringField(obj, "reason") orelse "completed") } };
     if (std.mem.eql(u8, kind, "error")) return .{ .@"error" = .{ .message = try owned(allocator, stringField(obj, "message") orelse "") } };
@@ -810,6 +865,16 @@ fn uintField(obj: std.json.ObjectMap, key: []const u8) ?usize {
     return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
 }
 
+fn uint64Field(obj: std.json.ObjectMap, key: []const u8) ?u64 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
+}
+
+fn uint32Field(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
+}
+
 fn parseRole(value: []const u8) tui_session.TuiEvent.MessageRole {
     if (std.mem.eql(u8, value, "user")) return .user;
     if (std.mem.eql(u8, value, "tool_result")) return .tool_result;
@@ -823,6 +888,17 @@ fn parseStopReason(value: []const u8) ai_types.StopReason {
     if (std.mem.eql(u8, value, "error")) return .@"error";
     if (std.mem.eql(u8, value, "aborted")) return .aborted;
     return .stop;
+}
+
+fn parsePromptSegmentKind(value: []const u8) tui_session.TuiEvent.PromptSegmentKind {
+    if (std.mem.eql(u8, value, "system_prompt")) return .system_prompt;
+    if (std.mem.eql(u8, value, "tool_definitions")) return .tool_definitions;
+    return .message_history;
+}
+
+fn parsePromptSegmentCacheRole(value: []const u8) tui_session.TuiEvent.PromptSegmentCacheRole {
+    if (std.mem.eql(u8, value, "stable")) return .stable;
+    return .dynamic;
 }
 
 fn parseEndReason(value: []const u8) tui_session.TuiEndReason {
