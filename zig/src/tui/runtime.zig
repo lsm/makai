@@ -6,7 +6,10 @@ const agent = @import("agent");
 const agent_protocol_client = @import("agent_protocol_client");
 const agent_envelope = @import("agent_envelope");
 const agent_protocol_types = @import("agent_protocol_types");
+const agent_protocol_server = @import("agent_protocol_server");
+const agent_protocol_runtime = @import("agent_protocol_runtime");
 const transport = @import("transport");
+const in_process = @import("transports/in_process");
 const json_writer = @import("json_writer");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
@@ -37,13 +40,32 @@ const ApprovalContext = struct {
     tool_name: []const u8,
 };
 
+pub const RemoteReadResult = union(enum) {
+    line: []const u8,
+    pending,
+    disconnected,
+};
+
 pub const RemoteLineReceiver = struct {
     ctx: *anyopaque,
     read_line_fn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8,
+    read_result_fn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!RemoteReadResult = null,
     close_fn: ?*const fn (ctx: *anyopaque) void = null,
 
     pub fn readLine(self: *RemoteLineReceiver, allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.read_result_fn) |f| {
+            return switch (try f(self.ctx, allocator)) {
+                .line => |line| line,
+                .pending, .disconnected => null,
+            };
+        }
         return self.read_line_fn(self.ctx, allocator);
+    }
+
+    pub fn read(self: *RemoteLineReceiver, allocator: std.mem.Allocator) !RemoteReadResult {
+        if (self.read_result_fn) |f| return f(self.ctx, allocator);
+        if (try self.read_line_fn(self.ctx, allocator)) |line| return .{ .line = line };
+        return .pending;
     }
 
     pub fn close(self: *RemoteLineReceiver) void {
@@ -94,6 +116,8 @@ pub const TuiRuntime = struct {
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
+    remote_error_emitted: bool = false,
+    remote_reconnect_attempted: bool = false,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
     original_tools: []agent.AgentTool,
@@ -187,12 +211,12 @@ pub const TuiRuntime = struct {
                 const config_json = try self.remoteConfigJson();
                 defer self.allocator.free(config_json);
                 _ = try client.sendAgentStart(config_json, null);
-                try self.pumpRemoteIncomingInto(&client);
-                const sid = client.session_id orelse return error.RemoteAgentStartFailed;
-                self.remote_session_id = sid;
                 self.remote_client = client;
                 self.started = true;
-                self.push(.agent_start);
+                self.remote_error_emitted = false;
+                self.remote_reconnect_attempted = false;
+                try self.pumpRemoteIncoming();
+                self.remote_session_id = self.remote_client.?.session_id;
             },
             .local => {
                 if (self.started) return;
@@ -227,6 +251,8 @@ pub const TuiRuntime = struct {
             client.deinit();
             self.remote_client = null;
             self.remote_session_id = null;
+            self.remote_error_emitted = false;
+            self.remote_reconnect_attempted = false;
         }
         self.started = false;
     }
@@ -275,16 +301,21 @@ pub const TuiRuntime = struct {
         switch (self.backend) {
             .remote => {
                 if (!self.started) try self.start();
+                try self.ensureRemoteSession();
                 const client = &(self.remote_client orelse return error.RuntimeNotStarted);
                 const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
                 self.resetEventStreamForTurn();
                 self.cancelled.store(false, .release);
                 self.completed = false;
+                self.remote_error_emitted = false;
+                self.remote_reconnect_attempted = false;
                 self.last_turn_stop_reason = null;
                 const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), text);
                 defer self.allocator.free(message_json);
                 _ = try client.sendAgentMessage(sid, message_json, null);
-                try self.pumpRemoteIncoming();
+                self.pumpRemoteIncoming() catch |err| {
+                    self.push(.{ .@"error" = .{ .message = try self.dupeOwned(@errorName(err)) } });
+                };
             },
             .local => {
                 if (!self.started) try self.start();
@@ -353,6 +384,11 @@ pub const TuiRuntime = struct {
     }
 
     pub fn streamEvents(self: *TuiRuntime) *TuiEventStream {
+        if (self.backend == .remote and self.started and !self.event_stream.isDone()) {
+            self.pumpRemoteIncoming() catch |err| {
+                self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
+            };
+        }
         return &self.event_stream;
     }
 
@@ -470,27 +506,54 @@ pub const TuiRuntime = struct {
         return out;
     }
 
-    fn pumpRemoteIncomingInto(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
+    fn pumpRemoteIncoming(self: *TuiRuntime) !void {
         var receiver = &(self.remote_receiver orelse return error.NoRemoteTransportConfigured);
-        var read_any = false;
-        while (try receiver.readLine(self.allocator)) |line| {
-            read_any = true;
-            defer self.allocator.free(line);
-            var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch |err| switch (err) {
-                error.InvalidPayloadType, error.InvalidSessionId, error.InvalidUlid, error.InvalidEnumValue => return error.ProtocolVersionMismatch,
-                else => return err,
-            };
-            defer env.deinit(self.allocator);
-            if (env.version != 1) return error.ProtocolVersionMismatch;
-            try client.processEnvelope(env);
-            try self.drainRemoteClientEvents(client);
+        const client = &(self.remote_client orelse return error.RuntimeNotStarted);
+        while (true) {
+            switch (try receiver.read(self.allocator)) {
+                .line => |line| {
+                    defer self.allocator.free(line);
+                    var env = agent_envelope.deserializeEnvelope(line, self.allocator) catch |err| switch (err) {
+                        error.InvalidPayloadType, error.InvalidSessionId, error.InvalidUlid, error.InvalidEnumValue => return error.ProtocolVersionMismatch,
+                        else => return err,
+                    };
+                    defer env.deinit(self.allocator);
+                    if (env.version != 1) return error.ProtocolVersionMismatch;
+                    try client.processEnvelope(env);
+                    if (self.remote_session_id == null) self.remote_session_id = client.session_id;
+                    try self.drainRemoteClientEvents(client);
+                },
+                .pending => return,
+                .disconnected => {
+                    try self.handleRemoteDisconnect();
+                    return;
+                },
+            }
         }
-        if (!read_any and !self.started) return error.ConnectionRefused;
     }
 
-    fn pumpRemoteIncoming(self: *TuiRuntime) !void {
-        const client = &(self.remote_client orelse return error.RuntimeNotStarted);
-        try self.pumpRemoteIncomingInto(client);
+    fn ensureRemoteSession(self: *TuiRuntime) !void {
+        if (self.remote_session_id != null) return;
+        try self.pumpRemoteIncoming();
+        if (self.remote_session_id != null) return;
+        return error.RemoteAgentStartFailed;
+    }
+
+    fn handleRemoteDisconnect(self: *TuiRuntime) !void {
+        if (!self.started) return error.ConnectionRefused;
+        if (!self.remote_reconnect_attempted) {
+            self.remote_reconnect_attempted = true;
+            var client = &(self.remote_client orelse return error.RuntimeNotStarted);
+            const config_json = try self.remoteConfigJson();
+            defer self.allocator.free(config_json);
+            _ = try client.sendAgentStart(config_json, null);
+            return;
+        }
+        self.push(.{ .@"error" = .{ .message = try self.dupeOwned("remote connection disconnected") } });
+        self.pushTerminal(.{ .agent_end = .{ .reason = .@"error" } });
+        self.event_stream.complete(.{ .reason = .@"error" });
+        self.stream_active = false;
+        self.remote_session_id = null;
     }
 
     fn drainRemoteClientEvents(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
@@ -500,11 +563,16 @@ pub const TuiRuntime = struct {
             try self.handleRemoteAgentEventJson(json.slice());
         }
         if (self.remote_session_id) |sid| {
-            if (client.getLastErrorForSession(sid)) |msg| {
-                self.push(.{ .@"error" = .{ .message = try self.dupeOwned(msg) } });
-                self.pushTerminal(.{ .agent_end = .{ .reason = .@"error" } });
-                self.event_stream.complete(.{ .reason = .@"error" });
-                self.stream_active = false;
+            if (!self.remote_error_emitted) {
+                if (client.getLastErrorForSession(sid)) |msg| {
+                    self.remote_error_emitted = true;
+                    self.push(.{ .@"error" = .{ .message = try self.dupeOwned(msg) } });
+                    self.pushTerminal(.{ .agent_end = .{ .reason = .@"error" } });
+                    self.event_stream.complete(.{ .reason = .@"error" });
+                    self.stream_active = false;
+                    client.removeSessionState(sid);
+                    self.remote_session_id = null;
+                }
             }
         }
     }
@@ -527,18 +595,17 @@ pub const TuiRuntime = struct {
     fn handleRemoteAgentEventJson(self: *TuiRuntime, json: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json, .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidRemoteEvent;
         const obj = parsed.value.object;
-        const event_type = obj.get("type") orelse return error.InvalidRemoteEvent;
-        const type_name = event_type.string;
+        const type_name = getJsonString(obj, "type") orelse return error.InvalidRemoteEvent;
 
         if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.agent_start);
         if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
-        if (std.mem.eql(u8, type_name, "message_start")) return self.push(.{ .message_start = .{ .role = .assistant } });
-        if (std.mem.eql(u8, type_name, "message_end")) return self.push(.{ .message_end = .{ .role = .assistant } });
+        if (std.mem.eql(u8, type_name, "message_start")) return self.push(.{ .message_start = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+        if (std.mem.eql(u8, type_name, "message_end")) return self.push(.{ .message_end = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
         if (std.mem.eql(u8, type_name, "message_update")) {
-            const event_json = try extractObjectJson(self.allocator, json, "event");
-            defer self.allocator.free(event_json);
-            const msg = try transport.deserialize(event_json, self.allocator);
+            const event_value = obj.get("event") orelse return error.InvalidRemoteEvent;
+            const msg = try deserializeRemoteMessageValue(self.allocator, event_value);
             switch (msg) {
                 .event => |ev| {
                     defer {
@@ -551,24 +618,24 @@ pub const TuiRuntime = struct {
             }
         }
         if (std.mem.eql(u8, type_name, "tool_execution_start")) return self.push(.{ .tool_execution_start = .{
-            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
-            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
-            .args_json = try self.dupeOwned(if (obj.get("args_json")) |v| v.string else ""),
+            .tool_call_id = try self.dupeOwned(getJsonString(obj, "tool_call_id") orelse return error.InvalidRemoteEvent),
+            .tool_name = try self.dupeOwned(getJsonString(obj, "tool_name") orelse return error.InvalidRemoteEvent),
+            .args_json = try self.dupeOwned(getJsonString(obj, "args_json") orelse ""),
         } });
         if (std.mem.eql(u8, type_name, "tool_execution_update")) return self.push(.{ .tool_execution_update = .{
-            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
-            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
-            .args_json = try self.dupeOwned(if (obj.get("args_json")) |v| v.string else ""),
-            .partial_result_json = try self.dupeOwned(obj.get("partial_result_json").?.string),
+            .tool_call_id = try self.dupeOwned(getJsonString(obj, "tool_call_id") orelse return error.InvalidRemoteEvent),
+            .tool_name = try self.dupeOwned(getJsonString(obj, "tool_name") orelse return error.InvalidRemoteEvent),
+            .args_json = try self.dupeOwned(getJsonString(obj, "args_json") orelse ""),
+            .partial_result_json = try self.dupeOwned(getJsonString(obj, "partial_result_json") orelse return error.InvalidRemoteEvent),
         } });
         if (std.mem.eql(u8, type_name, "tool_execution_end")) return self.push(.{ .tool_execution_end = .{
-            .tool_call_id = try self.dupeOwned(obj.get("tool_call_id").?.string),
-            .tool_name = try self.dupeOwned(obj.get("tool_name").?.string),
-            .result_json = try self.dupeOwned(obj.get("result_json").?.string),
-            .is_error = obj.get("is_error").?.bool,
+            .tool_call_id = try self.dupeOwned(getJsonString(obj, "tool_call_id") orelse return error.InvalidRemoteEvent),
+            .tool_name = try self.dupeOwned(getJsonString(obj, "tool_name") orelse return error.InvalidRemoteEvent),
+            .result_json = try self.dupeOwned(getJsonString(obj, "result_json") orelse return error.InvalidRemoteEvent),
+            .is_error = getJsonBool(obj, "is_error") orelse return error.InvalidRemoteEvent,
         } });
         if (std.mem.eql(u8, type_name, "turn_end")) {
-            const reason = parseStopReason(if (obj.get("stop_reason")) |v| v.string else "stop");
+            const reason = parseStopReason(getJsonString(obj, "stop_reason") orelse "stop");
             self.last_turn_stop_reason = reason;
             return self.pushTerminal(.{ .turn_end = .{ .stop_reason = reason } });
         }
@@ -580,7 +647,7 @@ pub const TuiRuntime = struct {
             self.stream_active = false;
             return;
         }
-        if (std.mem.eql(u8, type_name, "error")) return self.push(.{ .@"error" = .{ .message = try self.dupeOwned(obj.get("message").?.string) } });
+        if (std.mem.eql(u8, type_name, "error")) return self.push(.{ .@"error" = .{ .message = try self.dupeOwned(getJsonString(obj, "message") orelse return error.InvalidRemoteEvent) } });
     }
 
     fn handleAgentEvent(self: *TuiRuntime, event: agent.AgentEvent) !void {
@@ -645,39 +712,28 @@ fn parseStopReason(value: []const u8) ai_types.StopReason {
     return std.meta.stringToEnum(ai_types.StopReason, value) orelse .stop;
 }
 
-fn extractObjectJson(allocator: std.mem.Allocator, json: []const u8, key: []const u8) ![]u8 {
-    const needle = try std.fmt.allocPrint(allocator, "\"{s}\":", .{key});
-    defer allocator.free(needle);
-    const key_pos = std.mem.indexOf(u8, json, needle) orelse return error.InvalidRemoteEvent;
-    var idx = key_pos + needle.len;
-    while (idx < json.len and std.ascii.isWhitespace(json[idx])) : (idx += 1) {}
-    if (idx >= json.len or json[idx] != '{') return error.InvalidRemoteEvent;
-    const start = idx;
-    var depth: usize = 0;
-    var in_string = false;
-    var escaped = false;
-    while (idx < json.len) : (idx += 1) {
-        const c = json[idx];
-        if (in_string) {
-            if (escaped) {
-                escaped = false;
-            } else if (c == '\\') {
-                escaped = true;
-            } else if (c == '"') {
-                in_string = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_string = true;
-        } else if (c == '{') {
-            depth += 1;
-        } else if (c == '}') {
-            depth -= 1;
-            if (depth == 0) return try allocator.dupe(u8, json[start .. idx + 1]);
-        }
-    }
-    return error.InvalidRemoteEvent;
+fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    return if (value == .string) value.string else null;
+}
+
+fn getJsonBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return if (value == .bool) value.bool else null;
+}
+
+fn parseRemoteMessageRole(value: ?[]const u8) TuiEvent.MessageRole {
+    const role = value orelse return .assistant;
+    if (std.mem.eql(u8, role, "user")) return .user;
+    if (std.mem.eql(u8, role, "tool_result")) return .tool_result;
+    return .assistant;
+}
+
+fn deserializeRemoteMessageValue(allocator: std.mem.Allocator, value: std.json.Value) !transport.MessageOrControl {
+    if (value != .object) return error.InvalidRemoteEvent;
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(json);
+    return transport.deserialize(json, allocator) catch return error.InvalidRemoteEvent;
 }
 
 fn makeRemoteMessageJson(allocator: std.mem.Allocator, model: ?ai_types.Model, text: []const u8) ![]u8 {
@@ -685,16 +741,17 @@ fn makeRemoteMessageJson(allocator: std.mem.Allocator, model: ?ai_types.Model, t
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
     try w.beginObject();
-    if (model) |m| try w.writeStringField("model_ref", m.id);
+    if (model) |m| {
+        const model_ref = try std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ m.provider, m.api, m.id });
+        defer allocator.free(model_ref);
+        try w.writeStringField("model_ref", model_ref);
+    }
     try w.writeKey("messages");
     try w.beginArray();
     try w.beginObject();
     try w.writeStringField("role", "user");
     try w.writeStringField("content", text);
     try w.endObject();
-    try w.endArray();
-    try w.writeKey("tools");
-    try w.beginArray();
     try w.endArray();
     try w.endObject();
     const out = try allocator.dupe(u8, buffer.items);
@@ -1393,6 +1450,7 @@ test "failed turns emit error end reason" {
 const RemoteMock = struct {
     writes: std.ArrayList([]u8),
     reads: std.ArrayList([]u8),
+    disconnected: bool = false,
 
     fn init() RemoteMock {
         return .{ .writes = std.ArrayList([]u8).empty, .reads = std.ArrayList([]u8).empty };
@@ -1410,7 +1468,7 @@ const RemoteMock = struct {
     }
 
     fn receiver(self: *RemoteMock) RemoteLineReceiver {
-        return .{ .ctx = self, .read_line_fn = readLineFn };
+        return .{ .ctx = self, .read_line_fn = readLineFn, .read_result_fn = readResultFn };
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
@@ -1421,12 +1479,20 @@ const RemoteMock = struct {
     fn flushFn(_: *anyopaque) !void {}
 
     fn readLineFn(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
+        return switch (try readResultFn(ctx, allocator)) {
+            .line => |line| line,
+            .pending, .disconnected => null,
+        };
+    }
+
+    fn readResultFn(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
         const self: *RemoteMock = @ptrCast(@alignCast(ctx));
-        if (self.reads.items.len == 0) return null;
+        if (self.disconnected) return .disconnected;
+        if (self.reads.items.len == 0) return .pending;
         const line = self.reads.orderedRemove(0);
-        if (allocator.ptr == std.testing.allocator.ptr) return line;
+        if (allocator.ptr == std.testing.allocator.ptr) return .{ .line = line };
         defer std.testing.allocator.free(line);
-        return try allocator.dupe(u8, line);
+        return .{ .line = try allocator.dupe(u8, line) };
     }
 
     fn queueEnvelope(self: *RemoteMock, allocator: std.mem.Allocator, env: agent_protocol_types.Envelope) !void {
@@ -1494,4 +1560,197 @@ test "remote mode normalizes agent_event into TUI event" {
         if (ev == .turn_start) saw_turn_start = true;
     }
     try std.testing.expect(saw_turn_start);
+}
+
+test "remote mode serializes canonical model_ref" {
+    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, "hi");
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_ref\":\"test-provider/test-api@model-a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") == null);
+}
+
+test "remote start tolerates empty initial read" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expect(runtime.started);
+    try std.testing.expect(runtime.remote_session_id == null);
+}
+
+test "remote stream_events keeps pumping pending events" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    runtime.remote_session_id = sid;
+    try tui_session.submitTurn("hi");
+
+    var event_env = agent_protocol_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = 0,
+        .payload = .{ .agent_event = try std.testing.allocator.dupe(u8, "{\"type\":\"turn_start\"}") },
+    };
+    defer event_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, event_env);
+
+    const ev = tui_session.popEvent() orelse return error.NoRemoteEvent;
+    var mutable = ev;
+    defer mutable.deinit(std.testing.allocator);
+    try std.testing.expect(mutable == .turn_start);
+}
+
+test "remote error emits terminal event once" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    runtime.remote_session_id = sid;
+
+    var err_env = agent_protocol_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = 0,
+        .payload = .{ .agent_error = .{ .code = .internal_error, .message = try std.testing.allocator.dupe(u8, "boom") } },
+    };
+    defer err_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, err_env);
+
+    _ = tui_session.streamEvents();
+    _ = tui_session.streamEvents();
+
+    var terminal_count: usize = 0;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end) terminal_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), terminal_count);
+}
+
+test "remote event parser rejects invalid field types" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try std.testing.expectError(error.InvalidRemoteEvent, runtime.handleRemoteAgentEventJson("{\"type\":1}"));
+    try std.testing.expectError(error.InvalidRemoteEvent, runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"is_error\":\"false\"}"));
+    try std.testing.expectError(error.InvalidRemoteEvent, runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_start\",\"tool_name\":\"demo\"}"));
+}
+
+test "remote message update extracts parsed event object" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"message_update\",\"note\":\"contains \\\"event\\\": inside string\",\"event\":{\"type\":\"text_delta\",\"content_index\":0,\"delta\":\"hi\"}} ");
+    const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable = ev;
+    defer mutable.deinit(std.testing.allocator);
+    try std.testing.expect(mutable == .text_delta);
+    try std.testing.expectEqualStrings("hi", mutable.text_delta.delta.slice());
+}
+
+test "remote message role is parsed when supplied" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"message_start\",\"role\":\"user\"}");
+    const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    try std.testing.expect(ev == .message_start);
+    try std.testing.expectEqual(TuiEvent.MessageRole.user, ev.message_start.role);
+}
+
+test "remote disconnect attempts reconnect then emits terminal error" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const initial_writes = mock.writes.items.len;
+
+    mock.disconnected = true;
+    _ = tui_session.streamEvents();
+    try std.testing.expect(runtime.remote_reconnect_attempted);
+    try std.testing.expect(mock.writes.items.len > initial_writes);
+
+    _ = tui_session.streamEvents();
+    var saw_error_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end and ev.agent_end.reason == .@"error") saw_error_end = true;
+    }
+    try std.testing.expect(saw_error_end);
+}
+
+test "remote runtime integrates with in-process agent protocol server" {
+    var server = agent_protocol_server.AgentProtocolServer.init(std.testing.allocator);
+    defer server.deinit();
+    var pipe = in_process.SerializedPipe.init(std.testing.allocator);
+    defer pipe.deinit();
+    var protocol_runtime = agent_protocol_runtime.AgentProtocolRuntime{
+        .server = &server,
+        .pipe = &pipe,
+        .allocator = std.testing.allocator,
+    };
+
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .backend = .remote,
+        .remote_sender = pipe.clientSender(),
+        .remote_receiver = .{ .ctx = &pipe, .read_line_fn = remotePipeReadLine },
+        .models = &[_]ai_types.Model{test_model_a},
+    });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try protocol_runtime.pumpClientMessages();
+    _ = try protocol_runtime.pumpServerOutbox();
+    _ = tui_session.streamEvents();
+    try std.testing.expect(runtime.remote_session_id != null);
+
+    try tui_session.submitTurn("hi");
+    try protocol_runtime.pumpClientMessages();
+    const sid = runtime.remote_session_id.?;
+    try server.publishAgentEvent(sid, "{\"type\":\"turn_start\"}");
+    _ = try protocol_runtime.pumpServerOutbox();
+    _ = tui_session.streamEvents();
+
+    const ev = tui_session.popEvent() orelse return error.NoRemoteEvent;
+    try std.testing.expect(ev == .turn_start);
+}
+
+fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
+    const pipe: *in_process.SerializedPipe = @ptrCast(@alignCast(ctx));
+    var recv = pipe.clientReceiver();
+    return recv.readLine(allocator);
 }
