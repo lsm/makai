@@ -951,14 +951,8 @@ fn remoteApprovalRequiredExecute(
     _ = cancel_token;
     _ = on_update_ctx;
     _ = on_update;
-    const content = try allocator.alloc(ai_types.UserContentPart, 1);
-    errdefer allocator.free(content);
-    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "Tool execution rejected by user") } };
-    errdefer content[0].deinit(allocator);
-    return .{
-        .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
-        .details_json = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"rejected\":true}")),
-    };
+    _ = allocator;
+    return error.RemoteToolApprovalRequired;
 }
 
 fn parseToolSchemaJson(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
@@ -2684,10 +2678,7 @@ test "prepareAgentRun preserves remote tool approval requirement" {
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), prepared.tools.len);
-    const result = try prepared.tools[0].execute("call-1", "{}", null, null, null, allocator);
-    var mutable = result;
-    defer mutable.deinit(allocator);
-    try std.testing.expectEqualStrings("Tool execution rejected by user", result.content.slice()[0].text.text);
+    try std.testing.expectError(error.RemoteToolApprovalRequired, prepared.tools[0].execute("call-1", "{}", null, null, null, allocator));
 }
 
 test "prepareAgentRun parses SDK-style request options from message json" {

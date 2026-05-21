@@ -347,8 +347,9 @@ pub const TuiRuntime = struct {
                 self.completed = false;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
+                client.clearSessionTerminalState(sid);
                 self.last_turn_stop_reason = null;
-                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), self.remote_messages.items, self.wrappedRemoteTools());
+                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), self.remote_messages.items, self.remoteSerializableTools());
                 defer self.allocator.free(message_json);
                 _ = try client.sendAgentMessage(sid, message_json, null);
                 message_sent = true;
@@ -569,7 +570,10 @@ pub const TuiRuntime = struct {
                     try client.processEnvelope(env);
                     if (self.remote_session_id == null) {
                         self.remote_session_id = client.session_id;
-                        if (self.remote_session_id != null) self.remote_pending_session_id = null;
+                        if (self.remote_session_id != null) {
+                            self.remote_pending_session_id = null;
+                            self.remote_reconnect_attempted = false;
+                        }
                     }
                     try self.drainRemoteClientEvents(client);
                 },
@@ -615,8 +619,10 @@ pub const TuiRuntime = struct {
     fn handleRemoteDisconnect(self: *TuiRuntime) !void {
         if (!self.started) return error.ConnectionRefused;
         if (!self.remote_reconnect_attempted) {
+            const was_stream_active = self.stream_active and !self.event_stream.isDone();
             self.remote_reconnect_attempted = true;
             self.remote_session_id = null;
+            if (was_stream_active) try self.completeRemoteWithError("remote connection disconnected");
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
@@ -805,9 +811,8 @@ pub const TuiRuntime = struct {
         } });
     }
 
-    fn wrappedRemoteTools(self: *TuiRuntime) []const agent.AgentTool {
-        self.rebuildWrappedTools();
-        return self.wrapped_tools;
+    fn remoteSerializableTools(self: *TuiRuntime) []const agent.AgentTool {
+        return self.original_tools;
     }
 
     fn clearRemoteMessages(self: *TuiRuntime) void {
@@ -2209,22 +2214,22 @@ test "remote tool execution end records tool result history" {
 }
 
 test "remote submit preserves approval marker in serialized tools" {
-    var approval_ctx = ApprovalCtx{ .decision = .approve };
+    var original_ctx = OriginalApprovalCtx{ .decision = .approve };
     const tools = [_]agent.AgentTool{.{
         .label = "Shell",
         .name = "shell_execute",
         .description = "Run shell",
         .parameters_schema_json = "{}",
         .execute = demoTool,
+        .approval_ctx = &original_ctx,
+        .approval_fn = originalApprovalCallback,
     }};
     var runtime = try TuiRuntime.init(std.testing.allocator, .{
         .backend = .remote,
         .tools = &tools,
-        .tool_approval_ctx = &approval_ctx,
-        .tool_approval_callback = approvalCallback,
     });
     defer runtime.deinit();
-    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.wrappedRemoteTools());
+    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.remoteSerializableTools());
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"requires_approval\":true") != null);
 }
