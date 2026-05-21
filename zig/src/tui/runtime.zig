@@ -154,7 +154,6 @@ pub const TuiRuntime = struct {
         errdefer runtime.deinit();
         if (options.mcp_config_json) |config_json| {
             const bridge = try allocator.create(local_tools.mcp_bridge.McpBridge);
-            errdefer allocator.destroy(bridge);
             bridge.* = local_tools.mcp_bridge.McpBridge.init(allocator);
             bridge.bind();
             runtime.mcp_bridge = bridge;
