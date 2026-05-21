@@ -49,3 +49,16 @@ test "preview renders title and content" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Diff: patch.diff") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+hello") != null);
 }
+
+test "preview renders hashline diff anchors" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setPreview(.diff, "src/main.zig", "hashline edit preview\nrange: 2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n- 2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|old\n+ 2|new");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 120, .height = 6 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Diff: src/main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|new") != null);
+}
