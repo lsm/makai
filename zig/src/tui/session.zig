@@ -115,6 +115,7 @@ pub const TuiSessionOps = struct {
     submit_turn: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
+    decide_tool_approval: *const fn (ctx: ?*anyopaque, tool_call_id: []const u8, decision: ToolApprovalDecision) anyerror!void = undefined,
     stream_events: *const fn (ctx: ?*anyopaque) *TuiEventStream = undefined,
 };
 
@@ -144,6 +145,10 @@ pub const TuiSession = struct {
 
     pub fn currentModel(self: *TuiSession) ?ai_types.Model {
         return self.ops.current_model(self.ctx);
+    }
+
+    pub fn decideToolApproval(self: *TuiSession, tool_call_id: []const u8, decision: ToolApprovalDecision) !void {
+        try self.ops.decide_tool_approval(self.ctx, tool_call_id, decision);
     }
 
     pub fn streamEvents(self: *TuiSession) *TuiEventStream {

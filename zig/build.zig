@@ -885,6 +885,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "zigzag", .module = zigzag_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "register_builtins", .module = register_builtins_mod },
+            .{ .name = "agent", .module = agent_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },

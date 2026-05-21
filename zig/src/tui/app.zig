@@ -1,6 +1,10 @@
 const std = @import("std");
 const compat = @import("compat");
 const zz = @import("zigzag");
+const ai_types = @import("ai_types");
+const api_registry = @import("api_registry");
+const register_builtins = @import("register_builtins");
+const agent = @import("agent");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const transcript_view = @import("tui_view_transcript");
@@ -11,17 +15,74 @@ const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
 
+pub const ApprovalWaiter = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    tool_call_id: []u8 = &.{},
+    decision: ?tui_runtime.ToolApprovalDecision = null,
+
+    pub fn deinit(self: *ApprovalWaiter) void {
+        if (self.tool_call_id.len > 0) self.allocator.free(self.tool_call_id);
+        self.* = undefined;
+    }
+};
+
+pub const ProductionRuntime = struct {
+    allocator: std.mem.Allocator,
+    registry: api_registry.ApiRegistry,
+    bridge: agent.InProcessProviderProtocolBridge,
+    models: []ai_types.Model,
+
+    pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
+        var registry = api_registry.ApiRegistry.init(allocator);
+        errdefer registry.deinit();
+        try register_builtins.registerBuiltInApiProviders(&registry);
+        var runtime = ProductionRuntime{
+            .allocator = allocator,
+            .registry = registry,
+            .bridge = undefined,
+            .models = try allocator.alloc(ai_types.Model, 1),
+        };
+        runtime.bridge = agent.InProcessProviderProtocolBridge.init(&runtime.registry);
+        runtime.models[0] = defaultModel();
+        return runtime;
+    }
+
+    pub fn options(self: *ProductionRuntime) tui_runtime.TuiRuntimeOptions {
+        return .{
+            .protocol = (&self.bridge).protocolClient(),
+            .models = self.models,
+            .run_async = true,
+            .compact_output = true,
+        };
+    }
+
+    pub fn deinit(self: *ProductionRuntime) void {
+        self.allocator.free(self.models);
+        self.registry.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     state: tui_state.AppState,
     runtime: ?tui_runtime.TuiRuntime = null,
     session: ?tui_runtime.TuiSession = null,
+    approval_waiter: ?*ApprovalWaiter = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
+        var runtime_options = options;
+        const approval_waiter = try allocator.create(ApprovalWaiter);
+        errdefer allocator.destroy(approval_waiter);
+        approval_waiter.* = .{ .allocator = allocator };
+        runtime_options.tool_approval_ctx = approval_waiter;
+        runtime_options.tool_approval_callback = approvalCallback;
         var app = App{
             .allocator = allocator,
             .state = tui_state.AppState.init(allocator),
-            .runtime = try tui_runtime.TuiRuntime.init(allocator, options),
+            .runtime = try tui_runtime.TuiRuntime.init(allocator, runtime_options),
+            .approval_waiter = approval_waiter,
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
@@ -35,6 +96,10 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.runtime) |*runtime| runtime.deinit();
+        if (self.approval_waiter) |waiter| {
+            waiter.deinit();
+            self.allocator.destroy(waiter);
+        }
         self.state.deinit();
         self.* = undefined;
     }
@@ -73,7 +138,54 @@ pub const App = struct {
             };
         }
     }
+
+    pub fn recordError(self: *App, message: []const u8) !void {
+        try self.state.status.setError(self.allocator, message);
+        try self.state.appendTranscript(.@"error", message);
+    }
+
+    pub fn decideApproval(self: *App, approved: bool, always: bool) !void {
+        const id = self.state.approval.tool_call_id;
+        const decision: tui_runtime.ToolApprovalDecision = if (approved) .approve else .reject;
+        if (self.approval_waiter) |waiter| {
+            while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer waiter.mutex.unlock();
+            if (waiter.tool_call_id.len > 0 and (id.len == 0 or std.mem.eql(u8, waiter.tool_call_id, id))) {
+                waiter.decision = decision;
+            }
+        }
+        if (self.session) |*session| {
+            if (id.len > 0) try session.decideToolApproval(id, decision);
+        }
+        self.state.setApprovalDecision(approved, always);
+    }
 };
+
+fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) tui_runtime.ToolApprovalDecision {
+    const waiter: *ApprovalWaiter = @ptrCast(@alignCast(ctx.?));
+    while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
+    if (waiter.tool_call_id.len > 0) waiter.allocator.free(waiter.tool_call_id);
+    waiter.tool_call_id = waiter.allocator.dupe(u8, request.tool_call_id) catch {
+        waiter.mutex.unlock();
+        return .approve;
+    };
+    waiter.decision = null;
+    waiter.mutex.unlock();
+    while (true) {
+        while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
+        const decision = waiter.decision;
+        waiter.mutex.unlock();
+        if (decision) |value| {
+            while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
+            if (waiter.tool_call_id.len > 0) waiter.allocator.free(waiter.tool_call_id);
+            waiter.tool_call_id = &.{};
+            waiter.decision = null;
+            waiter.mutex.unlock();
+            return value;
+        }
+        compat.time.sleepNs(1 * std.time.ns_per_ms);
+    }
+}
 
 const TuiModel = struct {
     app: ?App = null,
@@ -121,18 +233,22 @@ const TuiModel = struct {
                 if (app.state.mode == .approval) {
                     switch (key.key) {
                         .char => |c| switch (c) {
-                            'a' => app.state.setApprovalDecision(true, false),
-                            'A' => app.state.setApprovalDecision(true, true),
-                            'd' => app.state.setApprovalDecision(false, false),
+                            'a' => app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {},
+                            'A' => app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {},
+                            'd' => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
                             else => {},
                         },
-                        .escape => app.state.setApprovalDecision(false, false),
+                        .escape => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
                         else => {},
                     }
                     return .none;
                 }
                 switch (key.key) {
                     .enter => {
+                        if (key.modifiers.shift) {
+                            app.state.composer.buffer.append(app.allocator, '\n') catch |err| app.recordError(@errorName(err)) catch {};
+                            return .none;
+                        }
                         const text = app.state.composer.text();
                         if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/quit")) return .quit;
                         app.submit(text) catch |err| {
@@ -146,9 +262,7 @@ const TuiModel = struct {
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
                     },
-                    .backspace => {
-                        if (app.state.composer.buffer.items.len > 0) _ = app.state.composer.buffer.pop();
-                    },
+                    .backspace => deleteLastCodepoint(app),
                     .char => |c| appendChar(app, c) catch {},
                     .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
                     .up, .page_up => app.state.transcript_scroll += 1,
@@ -189,6 +303,14 @@ const TuiModel = struct {
         try app.state.composer.buffer.appendSlice(app.allocator, buf[0..len]);
     }
 
+    fn deleteLastCodepoint(app: *App) void {
+        const text = app.state.composer.buffer.items;
+        if (text.len == 0) return;
+        var idx = text.len - 1;
+        while (idx > 0 and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
+        app.state.composer.buffer.shrinkRetainingCapacity(idx);
+    }
+
     fn countLines(text: []const u8) usize {
         if (text.len == 0) return 0;
         var count: usize = 1;
@@ -199,12 +321,30 @@ const TuiModel = struct {
     }
 };
 
+fn defaultModel() ai_types.Model {
+    return .{
+        .id = "claude-sonnet-4-5",
+        .name = "Claude Sonnet 4.5",
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .base_url = "https://api.anthropic.com/v1/messages",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 3.0, .output = 15.0, .cache_read = 0.30, .cache_write = 3.75 },
+        .context_window = 200_000,
+        .max_tokens = 8192,
+    };
+}
+
 pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     var environ_map = try compat.createEnvMap(allocator);
     defer environ_map.deinit();
 
+    var production = try ProductionRuntime.init(allocator);
+    defer production.deinit();
+
     var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
-    program.model = .{ .options = .{} };
+    program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();
 }
