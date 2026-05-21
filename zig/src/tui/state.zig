@@ -405,7 +405,7 @@ pub const AppState = struct {
             var line_no = start_line;
             var lines = std.mem.splitScalar(u8, replacement, '\n');
             while (lines.next()) |line| {
-                if (line.len == 0 and line_no > start_line) break;
+                if (line.len == 0 and line.ptr == replacement.ptr + replacement.len) break;
                 const row = try std.fmt.allocPrint(self.allocator, "+ {d}|{s}\n", .{ line_no, line });
                 defer self.allocator.free(row);
                 try out.appendSlice(self.allocator, row);
@@ -569,9 +569,20 @@ test "AppState approval flow transitions pending to approved and rejected" {
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "hashline edit preview") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 2|new line") != null);
 
+    var blank_line_event = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-hash-blank"),
+        .tool_name = try ownedText("hashline_edit"),
+        .args_json = try ownedText("{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":2,\"start_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replacement\":\"line1\\n\\nline3\"}"),
+    } };
+    defer blank_line_event.deinit(std.testing.allocator);
+    try state.applyEvent(blank_line_event);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 3|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 4|line3") != null);
+
     try std.testing.expectEqual(AppMode.approval, state.mode);
     try std.testing.expectEqual(ApprovalStatus.pending, state.approval.status);
     try std.testing.expectEqualStrings("hashline_edit", state.approval.tool_name);
+    try std.testing.expectEqualStrings("call-hash-blank", state.approval.tool_call_id);
 
     state.setApprovalDecision(true, true);
     try std.testing.expectEqual(AppMode.normal, state.mode);

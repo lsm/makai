@@ -2,6 +2,7 @@ const std = @import("std");
 const ai_types = @import("ai_types");
 const agent = @import("agent");
 const common = @import("tools/common");
+const tool_types = @import("protocol_tool_types");
 
 pub const schema_read =
     \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"byte_limit":{"type":"integer","minimum":0}},"required":["workspace_root","path"],"additionalProperties":false}
@@ -14,8 +15,9 @@ pub const schema_edit =
 pub const read_tool = agent.AgentTool{ .label = "Hashline Read", .name = "hashline_read", .description = "Read a workspace file line range with stable SHA-256 per-line anchors for large-file edits.", .short_description = "Read line range with SHA-256 anchors.", .parameters_schema_json = schema_read, .execute = readExecute };
 pub const edit_tool = agent.AgentTool{ .label = "Hashline Edit", .name = "hashline_edit", .description = "Preview or apply hash-anchored structured edits. Edits reject stale line anchors before writing.", .short_description = "Edit line range with anchor checks.", .parameters_schema_json = schema_edit, .execute = editExecute };
 
-const Operation = enum { replace_range, insert_before, insert_after, delete_range };
+const Operation = tool_types.HashlineEditOperation;
 const max_read_bytes: usize = common.max_file_bytes;
+const max_preview_bytes: usize = common.default_file_limit;
 
 const Line = struct {
     no: usize,
@@ -109,7 +111,7 @@ pub fn editExecute(tool_call_id: []const u8, args_json: []const u8, cancel_token
     var replacement_count: usize = 0;
     const edited = try applyOperation(allocator, original, operation, first, last, replacement, &replacement_count);
     defer allocator.free(edited);
-    const preview = try renderPreview(allocator, path, operation_name, original[first.start..last.end], first, last, replacement, start_hash, end_hash);
+    const preview = try renderPreview(allocator, path, operation, operation_name, original[first.start..last.end], first, last, replacement, start_hash, end_hash);
     errdefer allocator.free(preview);
 
     if (!preview_only) try common.writeWorkspaceFile(allocator, workspace_root, path, edited);
@@ -197,39 +199,56 @@ fn applyOperation(allocator: std.mem.Allocator, input: []const u8, operation: Op
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, input[0..start]);
+    if (operation == .insert_after and inserted.len > 0 and start > 0 and input[start - 1] != '\n') try out.append(allocator, '\n');
     try out.appendSlice(allocator, inserted);
     if (inserted.len > 0 and inserted[inserted.len - 1] != '\n' and end < input.len) try out.append(allocator, '\n');
     try out.appendSlice(allocator, input[end..]);
     return out.toOwnedSlice(allocator);
 }
 
-fn renderPreview(allocator: std.mem.Allocator, path: []const u8, operation: []const u8, old_range: []const u8, first: Line, last: Line, replacement: []const u8, start_hash: []const u8, end_hash: []const u8) ![]u8 {
+fn renderPreview(allocator: std.mem.Allocator, path: []const u8, operation: Operation, operation_name: []const u8, old_range: []const u8, first: Line, last: Line, replacement: []const u8, start_hash: []const u8, end_hash: []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    const header = try std.fmt.allocPrint(allocator, "hashline edit {s}\noperation: {s}\nrange: {d}:{s}..{d}:{s}\n", .{ path, operation, first.no, start_hash, last.no, end_hash });
+    const header = try std.fmt.allocPrint(allocator, "hashline edit {s}\noperation: {s}\nrange: {d}:{s}..{d}:{s}\n", .{ path, operation_name, first.no, start_hash, last.no, end_hash });
     defer allocator.free(header);
-    try out.appendSlice(allocator, header);
-    var line_no = first.no;
-    var old_iter = LineIterator.init(old_range);
-    while (old_iter.next()) |line| {
-        const old_hash = sha256Hex(line.text);
-        const row = try std.fmt.allocPrint(allocator, "- {d}:{s}|{s}\n", .{ line_no, &old_hash, line.text });
+    try appendPreview(&out, allocator, header);
+    if (operation == .replace_range or operation == .delete_range) {
+        var line_no = first.no;
+        var old_iter = LineIterator.init(old_range);
+        while (old_iter.next()) |line| {
+            const old_hash = sha256Hex(line.text);
+            const row = try std.fmt.allocPrint(allocator, "- {d}:{s}|{s}\n", .{ line_no, &old_hash, line.text });
+            defer allocator.free(row);
+            try appendPreview(&out, allocator, row);
+            line_no += 1;
+        }
+    } else {
+        const anchor_hash = sha256Hex(first.text);
+        const row = try std.fmt.allocPrint(allocator, "  anchor {d}:{s}|{s}\n", .{ first.no, &anchor_hash, first.text });
         defer allocator.free(row);
-        try out.appendSlice(allocator, row);
-        line_no += 1;
+        try appendPreview(&out, allocator, row);
     }
     var repl_iter = LineIterator.init(replacement);
-    var repl_line: usize = first.no;
+    var repl_line: usize = if (operation == .insert_after) last.no + 1 else first.no;
     while (repl_iter.next()) |line| {
         const row = try std.fmt.allocPrint(allocator, "+ {d}|{s}\n", .{ repl_line, line.text });
         defer allocator.free(row);
-        try out.appendSlice(allocator, row);
+        try appendPreview(&out, allocator, row);
         repl_line += 1;
     }
-    if (replacement.len > 0 and std.mem.indexOfScalar(u8, replacement, '\n') == null) {
-        if (repl_line == first.no) {}
-    }
     return out.toOwnedSlice(allocator);
+}
+
+fn appendPreview(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    if (out.items.len >= max_preview_bytes) return;
+    const remaining = max_preview_bytes - out.items.len;
+    if (text.len <= remaining) {
+        try out.appendSlice(allocator, text);
+        return;
+    }
+    if (remaining > 0) try out.appendSlice(allocator, text[0..remaining]);
+    const marker = "\n... preview truncated ...\n";
+    if (out.items.len + marker.len <= max_preview_bytes) try out.appendSlice(allocator, marker);
 }
 
 fn tmpRoot(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
@@ -310,6 +329,46 @@ test "hashline edit preview only leaves file unchanged" {
     const data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("one\ntwo\nthree\n", data);
+}
+
+test "hashline insert previews do not show deletions and insert after eof separates lines" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "a.txt", .data = "lastline" });
+    const start_hash = sha256Hex("lastline");
+    const preview_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"insert_after\",\"start_line\":1,\"start_hash\":\"{s}\",\"replacement\":\"next\",\"preview_only\":true}}", .{ root, &start_hash });
+    defer std.testing.allocator.free(preview_args);
+    var preview = try editExecute("call", preview_args, null, null, null, std.testing.allocator);
+    defer preview.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, preview.content.slice()[0].text.text, "- 1:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, preview.content.slice()[0].text.text, "anchor 1:") != null);
+
+    const apply_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"insert_after\",\"start_line\":1,\"start_hash\":\"{s}\",\"replacement\":\"next\"}}", .{ root, &start_hash });
+    defer std.testing.allocator.free(apply_args);
+    var applied = try editExecute("call", apply_args, null, null, null, std.testing.allocator);
+    defer applied.deinit(std.testing.allocator);
+    const data = try tmp.dir.readFileAlloc(common.defaultIo(), "a.txt", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("lastline\nnext", data);
+}
+
+test "hashline preview caps large replacements" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+    try tmp.dir.writeFile(common.defaultIo(), .{ .sub_path = "a.txt", .data = "one\n" });
+    const start_hash = sha256Hex("one");
+    const replacement = try std.testing.allocator.alloc(u8, max_preview_bytes + 4096);
+    defer std.testing.allocator.free(replacement);
+    @memset(replacement, 'x');
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"workspace_root\":\"{s}\",\"path\":\"a.txt\",\"operation\":\"replace_range\",\"start_line\":1,\"start_hash\":\"{s}\",\"replacement\":\"{s}\",\"preview_only\":true}}", .{ root, &start_hash, replacement });
+    defer std.testing.allocator.free(args);
+    var result = try editExecute("call", args, null, null, null, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.content.slice()[0].text.text.len <= max_preview_bytes);
 }
 
 test "hashline read then edit integration" {
