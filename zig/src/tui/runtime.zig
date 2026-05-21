@@ -82,7 +82,7 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
-        const models = try allocator.dupe(ai_types.Model, options.models);
+        var models = try allocator.dupe(ai_types.Model, options.models);
         errdefer allocator.free(models);
 
         var tool_registry = local_tools.ToolRegistry.init();
@@ -106,13 +106,13 @@ pub const TuiRuntime = struct {
 
         for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
 
-        const original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
+        var original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
         errdefer allocator.free(original_tools);
 
-        const wrapped_tools = try allocator.alloc(agent.AgentTool, original_tools.len);
+        var wrapped_tools = try allocator.alloc(agent.AgentTool, original_tools.len);
         errdefer allocator.free(wrapped_tools);
 
-        const approval_contexts = try allocator.alloc(ApprovalContext, original_tools.len);
+        var approval_contexts = try allocator.alloc(ApprovalContext, original_tools.len);
         errdefer allocator.free(approval_contexts);
 
         var selected: ?usize = null;
@@ -128,7 +128,7 @@ pub const TuiRuntime = struct {
             }
         }
 
-        const runtime = TuiRuntime{
+        var runtime = TuiRuntime{
             .allocator = allocator,
             .backend = options.backend,
             .protocol = options.protocol,
@@ -136,7 +136,7 @@ pub const TuiRuntime = struct {
             .selected_model_index = selected,
             .event_stream = TuiEventStream.init(allocator),
             .tool_registry = tool_registry,
-            .mcp_bridge = mcp_bridge,
+            .mcp_bridge = null,
             .original_tools = original_tools,
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
@@ -146,6 +146,28 @@ pub const TuiRuntime = struct {
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
+        original_tools = &.{};
+        wrapped_tools = &.{};
+        models = &.{};
+        tool_registry = local_tools.ToolRegistry.init();
+        approval_contexts = &.{};
+        errdefer runtime.deinit();
+        if (options.mcp_config_json) |config_json| {
+            const bridge = try allocator.create(local_tools.mcp_bridge.McpBridge);
+            errdefer allocator.destroy(bridge);
+            bridge.* = local_tools.mcp_bridge.McpBridge.init(allocator);
+            bridge.bind();
+            runtime.mcp_bridge = bridge;
+            try bridge.loadConfigJson(config_json);
+            try bridge.discover();
+            try runtime.tool_registry.registerMcpBridge(allocator, bridge);
+            allocator.free(runtime.original_tools);
+            runtime.original_tools = try allocator.dupe(agent.AgentTool, runtime.tool_registry.list());
+            allocator.free(runtime.wrapped_tools);
+            runtime.wrapped_tools = try allocator.alloc(agent.AgentTool, runtime.original_tools.len);
+            allocator.free(runtime.approval_contexts);
+            runtime.approval_contexts = try allocator.alloc(ApprovalContext, runtime.original_tools.len);
+        }
         return runtime;
     }
 
@@ -1152,6 +1174,26 @@ test "runtime wrapper preserves context-aware tool execution" {
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expect(saw_tool_end);
 }
+
+test "MCP bridge exec context address remains stable in TUI runtime" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const script = "python3 -u -c 'import json,sys\n" ++
+        "for line in sys.stdin:\n" ++
+        " msg=json.loads(line); method=msg.get(\"method\")\n" ++
+        " if method==\"initialize\": print(json.dumps({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"}}}), flush=True)\n" ++
+        " elif method==\"tools/list\": print(json.dumps({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}), flush=True)'";
+    const script_json = try std.json.Stringify.valueAlloc(std.testing.allocator, script, .{});
+    defer std.testing.allocator.free(script_json);
+    const config_json = try std.fmt.allocPrint(std.testing.allocator, "[{{\"name\":\"mock\",\"command\":\"/bin/sh\",\"args\":[\"-c\",{s}]}}]", .{script_json});
+    defer std.testing.allocator.free(config_json);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .mcp_config_json = config_json });
+    defer runtime.deinit();
+    const bridge = runtime.mcp_bridge orelse return error.MissingBridge;
+    for (bridge.tools.items) |record| {
+        try std.testing.expect(record.exec_ctx.bridge.* == bridge);
+    }
+}
+
 
 test "tool approval approve and reject paths emit tool events" {
     const tools = [_]agent.AgentTool{.{
