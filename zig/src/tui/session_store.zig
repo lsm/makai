@@ -4,7 +4,8 @@ const ai_types = @import("ai_types");
 const tui_session = @import("tui_session");
 const tui_runtime = @import("tui_runtime");
 const agent = @import("agent");
-const json_writer = @import("json/writer");
+const json_writer = @import("json_writer");
+const builtin = @import("builtin");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 fn tmpBase(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
@@ -22,17 +23,75 @@ fn defaultIo() std.Io {
 }
 
 fn appendFile(path: []const u8, data: []const u8) !void {
-    var file = try compat.fs.getCwd().createFile(defaultIo(), path, .{ .truncate = false, .read = true, .permissions = compat.fs.default_file_mode });
-    defer file.close(defaultIo());
-    const stat = try file.stat(defaultIo());
-    try file.writePositionalAll(defaultIo(), data, stat.size);
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+        var file = try compat.fs.getCwd().createFile(defaultIo(), path, .{ .truncate = false, .read = true, .lock = .exclusive, .permissions = compat.fs.default_file_mode });
+        defer file.close(defaultIo());
+        const stat = try file.stat(defaultIo());
+        try file.writePositionalAll(defaultIo(), data, stat.size);
+        return;
+    }
+
+    const flags = std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, flags, 0o600);
+    defer _ = std.posix.system.close(fd);
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = std.c.write(fd, data[written..].ptr, data.len - written);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => {
+                const n: usize = @intCast(rc);
+                if (n == 0) return error.WriteFailed;
+                written += n;
+            },
+            .INTR => continue,
+            .AGAIN => continue,
+            .FBIG => return error.FileTooBig,
+            .NOSPC => return error.NoSpaceLeft,
+            .DQUOT => return error.DiskQuota,
+            .IO => return error.InputOutput,
+            .BADF => return error.NotOpenForWriting,
+            .FAULT => return error.BadAddress,
+            .INVAL => return error.InvalidArgument,
+            else => return error.Unexpected,
+        }
+    }
 }
 
-fn readFileAllocUnlimited(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+const load_max_bytes = 64 * 1024 * 1024;
+const metadata_max_bytes = 1024 * 1024;
+const max_jsonl_line_bytes = 8 * 1024 * 1024;
+
+fn readJsonlRecords(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize, ctx: anytype, comptime onLine: fn (@TypeOf(ctx), []const u8) anyerror!void) !void {
     var file = try compat.fs.getCwd().openFile(defaultIo(), path, .{});
     defer file.close(defaultIo());
+    var file_buffer: [16 * 1024]u8 = undefined;
+    var reader = file.reader(defaultIo(), &file_buffer);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var total: usize = 0;
+    while (true) {
+        out.clearRetainingCapacity();
+        _ = reader.interface.streamDelimiterEnding(&out.writer, '\n') catch |err| switch (err) {
+            error.ReadFailed => return reader.err.?,
+            error.WriteFailed => return error.OutOfMemory,
+        };
+        const line = std.mem.trim(u8, out.written(), " \t\r");
+        total += line.len;
+        if (total > max_bytes) return error.StreamTooLong;
+        if (line.len > max_jsonl_line_bytes) return error.StreamTooLong;
+        if (line.len > 0) try onLine(ctx, line);
+        if (reader.interface.buffered().len == 0) break;
+        _ = reader.interface.takeByte() catch break;
+    }
+}
+
+fn readLastJsonlLines(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    var file = try compat.fs.getCwd().openFile(defaultIo(), path, .{});
+    defer file.close(defaultIo());
+    const stat = try file.stat(defaultIo());
+    if (stat.size > max_bytes) return error.StreamTooLong;
     var reader = file.reader(defaultIo(), &.{});
-    return reader.interface.allocRemaining(allocator, .unlimited) catch |err| switch (err) {
+    return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
         else => return err,
     };
@@ -119,21 +178,12 @@ pub const Store = struct {
     pub fn load(self: Store, session_id: []const u8) !LoadedSession {
         const path = try sessionPath(self.allocator, self.base_dir, session_id);
         defer self.allocator.free(path);
-        const data = try readFileAllocUnlimited(self.allocator, path);
-        defer self.allocator.free(data);
         var loaded = LoadedSession{ .metadata = try defaultMetadata(self.allocator, session_id) };
         errdefer loaded.deinit(self.allocator);
         var replay = ReplayState{};
         defer replay.deinit(self.allocator);
-        var it = std.mem.splitScalar(u8, data, '\n');
-        while (it.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0) continue;
-            applyLine(self.allocator, &loaded, &replay, trimmed) catch |err| switch (err) {
-                error.InvalidRecord, error.InvalidEvent, error.SyntaxError, error.UnexpectedToken, error.InvalidNumber, error.DuplicateField, error.UnknownField, error.MissingField, error.LengthMismatch => continue,
-                else => return err,
-            };
-        }
+        var ctx = LoadLineContext{ .allocator = self.allocator, .loaded = &loaded, .replay = &replay };
+        try readJsonlRecords(self.allocator, path, load_max_bytes, &ctx, loadLine);
         return loaded;
     }
 
@@ -162,19 +212,27 @@ pub const Store = struct {
     fn loadMetadata(self: Store, session_id: []const u8) !SessionMetadata {
         const path = try sessionPath(self.allocator, self.base_dir, session_id);
         defer self.allocator.free(path);
-        const data = try readFileAllocUnlimited(self.allocator, path);
+        const data = try readLastJsonlLines(self.allocator, path, metadata_max_bytes);
         defer self.allocator.free(data);
         var meta = try defaultMetadata(self.allocator, session_id);
         errdefer meta.deinit(self.allocator);
-        var it = std.mem.splitScalar(u8, data, '\n');
-        while (it.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (trimmed.len == 0) continue;
-            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, trimmed, .{}) catch continue;
+
+        var end = data.len;
+        while (end > 0) {
+            while (end > 0 and (data[end - 1] == '\n' or data[end - 1] == '\r' or data[end - 1] == ' ' or data[end - 1] == '\t')) end -= 1;
+            if (end == 0) break;
+            const start = if (std.mem.lastIndexOfScalar(u8, data[0..end], '\n')) |idx| idx + 1 else 0;
+            const line = std.mem.trim(u8, data[start..end], " \t\r");
+            end = if (start == 0) 0 else start - 1;
+            if (line.len == 0) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer parsed.deinit();
             const obj = switch (parsed.value) { .object => |o| o, else => continue };
             if (obj.get("metadata")) |value| switch (value) {
-                .object => |meta_obj| try updateMetadata(self.allocator, &meta, meta_obj),
+                .object => |meta_obj| {
+                    try updateMetadata(self.allocator, &meta, meta_obj);
+                    break;
+                },
                 else => {},
             };
         }
@@ -185,6 +243,7 @@ pub const Store = struct {
         var loaded = try self.load(session_id);
         errdefer loaded.deinit(self.allocator);
         try runtime.start();
+        if (loaded.metadata.model.len > 0) try runtime.switchModel(loaded.metadata.model);
         try runtime.replaceMessages(loaded.messages.items);
         return loaded;
     }
@@ -225,6 +284,19 @@ fn cloneMetadata(allocator: std.mem.Allocator, meta: SessionMetadata) !SessionMe
         .last_active = meta.last_active,
         .turn_count = meta.turn_count,
         .working_dir = try allocator.dupe(u8, meta.working_dir),
+    };
+}
+
+const LoadLineContext = struct {
+    allocator: std.mem.Allocator,
+    loaded: *LoadedSession,
+    replay: *ReplayState,
+};
+
+fn loadLine(ctx: *LoadLineContext, line: []const u8) !void {
+    applyLine(ctx.allocator, ctx.loaded, ctx.replay, line) catch |err| switch (err) {
+        error.InvalidRecord, error.InvalidEvent, error.SyntaxError, error.UnexpectedToken, error.InvalidNumber, error.DuplicateField, error.UnknownField, error.MissingField, error.LengthMismatch => {},
+        else => return err,
     };
 }
 
@@ -287,9 +359,9 @@ fn replayEvent(allocator: std.mem.Allocator, messages: *std.ArrayList(ai_types.M
                 },
                 .assistant => {
                     if (payload.content_json.slice().len > 0) {
-                        try messages.append(allocator, .{ .assistant = try parseAssistantMessageFromContentJson(allocator, meta, payload.content_json.slice(), .stop) });
+                        try messages.append(allocator, .{ .assistant = try parseAssistantMessageFromContentJson(allocator, meta, payload.content_json.slice(), payload.stop_reason) });
                     } else if (payload.tool_calls_json.slice().len > 0) {
-                        try messages.append(allocator, .{ .assistant = try parseAssistantMessageFromContentJson(allocator, meta, payload.tool_calls_json.slice(), .tool_use) });
+                        try messages.append(allocator, .{ .assistant = try parseAssistantMessageFromContentJson(allocator, meta, payload.tool_calls_json.slice(), payload.stop_reason) });
                     } else if (payload.tool_call_id.slice().len > 0) {
                         try messages.append(allocator, .{ .assistant = try assistantToolCallMessage(allocator, meta, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice()) });
                     } else if (payload.text.slice().len > 0) {
@@ -371,6 +443,7 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
             try w.writeStringField("tool_calls_json", p.tool_calls_json.slice());
             try w.writeStringField("details_json", p.details_json.slice());
             try w.writeStringField("artifacts_json", p.artifacts_json.slice());
+            try w.writeStringField("stop_reason", @tagName(p.stop_reason));
             try w.writeBoolField("is_error", p.is_error);
         },
         .tool_approval_requested => |p| { try w.writeStringField("type", "tool_approval_requested"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
@@ -409,6 +482,7 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
         .tool_calls_json = try owned(allocator, stringField(obj, "tool_calls_json") orelse ""),
         .details_json = try owned(allocator, stringField(obj, "details_json") orelse ""),
         .artifacts_json = try owned(allocator, stringField(obj, "artifacts_json") orelse ""),
+        .stop_reason = parseStopReason(stringField(obj, "stop_reason") orelse "stop"),
         .is_error = boolField(obj, "is_error", false),
     } };
     if (std.mem.eql(u8, kind, "tool_approval_requested")) return .{ .tool_approval_requested = .{ .tool_call_id = try owned(allocator, stringField(obj, "tool_call_id") orelse ""), .tool_name = try owned(allocator, stringField(obj, "tool_name") orelse ""), .args_json = try owned(allocator, stringField(obj, "args_json") orelse "") } };
@@ -450,7 +524,7 @@ fn parseUserParts(allocator: std.mem.Allocator, json: []const u8) ![]const ai_ty
     const content = try parseUserContent(allocator, json);
     return switch (content) {
         .parts => |parts| parts,
-        .text => unreachable,
+        .text => error.InvalidMessage,
     };
 }
 
@@ -484,7 +558,7 @@ fn parseAssistantMessageFromContentJson(allocator: std.mem.Allocator, meta: Sess
         if (content[i] == .tool_call) has_tool_call = true;
         initialized += 1;
     }
-    const stop_reason: ai_types.StopReason = if (has_tool_call) .tool_use else fallback_stop_reason;
+    const stop_reason: ai_types.StopReason = if (fallback_stop_reason == .stop and has_tool_call) .tool_use else fallback_stop_reason;
     return assistantMessage(allocator, meta, content, stop_reason);
 }
 
@@ -859,7 +933,7 @@ test "message_end replay preserves mixed assistant text and tool calls" {
     var meta = try testMeta("assistant-mixed");
     defer meta.deinit(std.testing.allocator);
 
-    var event = tui_session.TuiEvent{ .message_end = .{ .role = .assistant, .text = try owned(std.testing.allocator, "I will call tools"), .content_json = try contentJson(assistant_mixed_json) } };
+    var event = tui_session.TuiEvent{ .message_end = .{ .role = .assistant, .text = try owned(std.testing.allocator, "I will call tools"), .content_json = try contentJson(assistant_mixed_json), .stop_reason = .length } };
     defer event.deinit(std.testing.allocator);
     try store.save(meta, event);
 
@@ -871,6 +945,7 @@ test "message_end replay preserves mixed assistant text and tool calls" {
     try std.testing.expect(assistant.content[0] == .text);
     try std.testing.expect(assistant.content[1] == .tool_call);
     try std.testing.expectEqualStrings("call-1", assistant.content[1].tool_call.id);
+    try std.testing.expectEqual(ai_types.StopReason.length, assistant.stop_reason);
 }
 
 

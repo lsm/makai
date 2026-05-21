@@ -5,6 +5,7 @@ const tui_session = @import("tui_session");
 const session_store = @import("tui_session_store");
 const mock_provider = @import("tui_tests_mock_provider");
 const fixtures = @import("tui_tests_fixtures");
+const ai_types = @import("ai_types");
 
 const TuiRuntime = tui_runtime.TuiRuntime;
 const TuiSession = tui_runtime.TuiSession;
@@ -310,6 +311,19 @@ fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
 
+const alternate_model = ai_types.Model{
+    .id = "alternate-tui-model",
+    .name = "Alternate TUI Model",
+    .api = "tui-fixture-api",
+    .provider = "tui-fixture-provider",
+    .base_url = "https://example.invalid",
+    .reasoning = false,
+    .input = &.{"text"},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 8192,
+    .max_tokens = 1024,
+};
+
 test "runtime persistence full save and resume cycle" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -345,10 +359,11 @@ test "runtime persistence full save and resume cycle" {
 
     const steps = [_]mock_provider.ResponseStep{.{ .text = fixtures.expected_text }};
     var provider = mock_provider.MockProvider.init(.{ .steps = &steps });
-    const models = [_]@TypeOf(mock_provider.test_model){mock_provider.test_model};
+    const models = [_]ai_types.Model{ alternate_model, mock_provider.test_model };
     var runtime = try TuiRuntime.init(std.testing.allocator, .{
         .protocol = provider.protocolClient(),
         .models = &models,
+        .initial_model_id = alternate_model.id,
         .run_async = false,
     });
     defer runtime.deinit();
@@ -361,6 +376,7 @@ test "runtime persistence full save and resume cycle" {
     try std.testing.expect(loaded.messages.items[1] == .assistant);
     try std.testing.expectEqualStrings("hello", loaded.messages.items[1].assistant.content[0].text.text);
     try std.testing.expectEqualStrings(mock_provider.test_model.id, loaded.messages.items[1].assistant.model);
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, runtime.currentModel().?.id);
 
     var session = runtime.createSession();
     try session.submitTurn("again");

@@ -122,11 +122,6 @@ pub const JsonWriter = struct {
                     // Other control characters
                     try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
                 },
-                0x80...0xFF => {
-                    // Non-ASCII bytes - escape as \uXXXX to ensure valid JSON
-                    // This handles potentially invalid UTF-8 sequences
-                    try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
-                },
                 else => try self.buffer.append(self.allocator, c),
             }
             i += 1;
@@ -206,6 +201,19 @@ test "control characters escape as unicode sequences" {
     const expected = "{\"control\":\"A\\u0001B\"}";
 
     try std.testing.expectEqualStrings(expected, result);
+}
+
+test "utf8 string bytes are preserved" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    var writer = JsonWriter.init(&buffer, allocator);
+    try writer.beginObject();
+    try writer.writeStringField("text", "café 🚀");
+    try writer.endObject();
+
+    try std.testing.expectEqualStrings("{\"text\":\"café 🚀\"}", getResult(&writer));
 }
 
 test "nested objects and arrays" {

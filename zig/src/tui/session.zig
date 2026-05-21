@@ -44,6 +44,7 @@ pub const TuiEvent = union(enum) {
         tool_calls_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         artifacts_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        stop_reason: ai_types.StopReason = .stop,
         is_error: bool = false,
     },
     tool_approval_requested: struct {

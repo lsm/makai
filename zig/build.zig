@@ -867,6 +867,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
             .{ .name = "json/writer", .module = json_writer_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
@@ -882,6 +883,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "json/writer", .module = json_writer_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
@@ -966,6 +968,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tui_session_store", .module = tui_session_store_mod },

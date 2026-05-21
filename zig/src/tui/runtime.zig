@@ -6,7 +6,7 @@ const agent = @import("agent");
 const agent_protocol_client = @import("agent_protocol_client");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
-const json_writer = @import("json/writer");
+const json_writer = @import("json_writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const TuiSession = session.TuiSession;
@@ -414,6 +414,7 @@ pub const TuiRuntime = struct {
                 defer self.allocator.free(tool_calls_json);
                 payload.content_json = try self.dupeOwned(content_json);
                 payload.tool_calls_json = try self.dupeOwned(tool_calls_json);
+                payload.stop_reason = m.stop_reason;
             },
             .tool_result => |m| {
                 payload.tool_call_id = try self.dupeOwned(m.tool_call_id);
