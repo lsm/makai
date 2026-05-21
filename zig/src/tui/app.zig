@@ -11,6 +11,7 @@ const transcript_view = @import("tui_view_transcript");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
 const tool_panel_view = @import("tui_view_tool_panel");
+const telemetry_view = @import("tui_view_telemetry");
 const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
@@ -86,7 +87,10 @@ pub const App = struct {
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
-        if (app.runtime.?.currentModel()) |model| try app.state.status.setModel(allocator, model.id, model.provider);
+        if (app.runtime.?.currentModel()) |model| {
+            try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
+            app.state.telemetry.context_window = model.context_window;
+        }
         return app;
     }
 
@@ -285,16 +289,17 @@ const TuiModel = struct {
         const composer = composer_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
         const tools = tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_height }) catch "";
+        const telemetry = telemetry_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = height / 2 }) catch "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(extra) + 4;
+        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 5;
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}\n{s}\n{s}", .{ transcript, tools, extra, composer, status }) catch "";
+        return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}", .{ transcript, tools, telemetry, extra, composer, status }) catch "";
     }
 
     fn appendChar(app: *App, c: u21) !void {

@@ -874,6 +874,7 @@ pub fn build(b: *std.Build) void {
     const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
+    const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
@@ -895,6 +896,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_composer", .module = tui_view_composer_mod },
             .{ .name = "tui_view_status_bar", .module = tui_view_status_bar_mod },
             .{ .name = "tui_view_tool_panel", .module = tui_view_tool_panel_mod },
+            .{ .name = "tui_view_telemetry", .module = tui_view_telemetry_mod },
             .{ .name = "tui_view_approval", .module = tui_view_approval_mod },
             .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
             .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
@@ -1286,6 +1288,7 @@ pub fn build(b: *std.Build) void {
     const tui_view_composer_test = b.addTest(.{ .root_module = tui_view_composer_mod });
     const tui_view_status_bar_test = b.addTest(.{ .root_module = tui_view_status_bar_mod });
     const tui_view_tool_panel_test = b.addTest(.{ .root_module = tui_view_tool_panel_mod });
+    const tui_view_telemetry_test = b.addTest(.{ .root_module = tui_view_telemetry_mod });
     const tui_view_approval_test = b.addTest(.{ .root_module = tui_view_approval_mod });
     const tui_view_preview_test = b.addTest(.{ .root_module = tui_view_preview_mod });
     const tui_view_session_picker_test = b.addTest(.{ .root_module = tui_view_session_picker_mod });
@@ -1485,6 +1488,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
@@ -1637,6 +1641,7 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
