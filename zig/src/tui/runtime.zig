@@ -241,6 +241,18 @@ pub const TuiRuntime = struct {
         }
     }
 
+    pub fn replaceMessages(self: *TuiRuntime, messages: []const ai_types.Message) !void {
+        switch (self.backend) {
+            .remote => return error.NotImplemented,
+            .local => {
+                if (!self.started) try self.start();
+                const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.run_async) local.waitForIdle();
+                try local.replaceMessages(messages);
+            },
+        }
+    }
+
     pub fn resumeSession(self: *TuiRuntime) !void {
         switch (self.backend) {
             .remote => return error.NotImplemented,

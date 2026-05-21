@@ -2,6 +2,7 @@ const std = @import("std");
 const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_session = @import("tui_session");
+const session_store = @import("tui_session_store");
 const mock_provider = @import("tui_tests_mock_provider");
 const fixtures = @import("tui_tests_fixtures");
 
@@ -296,6 +297,64 @@ test "tool approval approve runs tool and reject skips executor" {
     try std.testing.expect(reject_requested);
     try std.testing.expect(reject_tool_error);
     try std.testing.expectEqual(@as(usize, 1), reject_state.calls);
+}
+
+fn tmpSessionBase(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    errdefer allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+    return base;
+}
+
+fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
+    return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
+}
+
+test "runtime persistence full save and resume cycle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpSessionBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try session_store.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "resume-cycle"),
+        .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
+        .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer meta.deinit(std.testing.allocator);
+
+    try store.save(meta, .{ .message_start = .{ .role = .user } });
+    var user_delta = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
+    defer user_delta.deinit(std.testing.allocator);
+    try store.save(meta, user_delta);
+
+    const steps = [_]mock_provider.ResponseStep{.{ .text = fixtures.expected_text }};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &steps });
+    const models = [_]@TypeOf(mock_provider.test_model){mock_provider.test_model};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var loaded = try store.resumeSession("resume-cycle", &runtime);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+
+    var session = runtime.createSession();
+    try session.submitTurn("again");
+    var summary = EventSummary{};
+    try drainUntilAgentEnd(&session, &summary);
+    try std.testing.expect(summary.agent_end);
+    try std.testing.expectEqual(@as(usize, 2), provider.last_message_count);
 }
 
 test {

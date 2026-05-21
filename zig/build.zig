@@ -834,6 +834,16 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tui_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
+        },
+    });
+
     const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
     const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
@@ -856,6 +866,21 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const tui_session_store_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/session_store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
@@ -942,6 +967,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
             .{ .name = "tui_tests_mock_transport", .module = tui_tests_mock_transport_mod },
             .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
@@ -1279,7 +1306,9 @@ pub fn build(b: *std.Build) void {
 
     const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
     const tui_session_test = b.addTest(.{ .root_module = tui_session_mod });
+    const tui_config_test = b.addTest(.{ .root_module = tui_config_mod });
     const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
+    const tui_session_store_test = b.addTest(.{ .root_module = tui_session_store_mod });
     const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
     const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
     const tui_view_transcript_test = b.addTest(.{ .root_module = tui_view_transcript_mod });
@@ -1478,7 +1507,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_config_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
@@ -1597,7 +1628,9 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_config_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
@@ -1630,7 +1663,9 @@ pub fn build(b: *std.Build) void {
 
     const test_unit_tui_step = b.step("test-unit-tui", "Run TUI runtime unit tests");
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_config_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
