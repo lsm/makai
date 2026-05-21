@@ -68,6 +68,27 @@ pub const TuiEvent = union(enum) {
         tool_name: OwnedSlice(u8),
         result_json: OwnedSlice(u8),
         is_error: bool,
+        raw_total_bytes: u64 = 0,
+        returned_total_bytes: u64 = 0,
+        estimated_returned_tokens: u64 = 0,
+        artifact_count: u32 = 0,
+        artifact_refs: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    },
+    context_usage: struct {
+        system_prompt_bytes: u64 = 0,
+        message_bytes: u64 = 0,
+        tool_definition_bytes: u64 = 0,
+        total_bytes: u64 = 0,
+        estimated_tokens: u64 = 0,
+        message_count: u32 = 0,
+        tool_count: u32 = 0,
+    },
+    prompt_segment_usage: struct {
+        segment: PromptSegmentKind,
+        cache_role: PromptSegmentCacheRole,
+        bytes: u64 = 0,
+        estimated_tokens: u64 = 0,
+        item_count: u32 = 0,
     },
     turn_end: struct { stop_reason: ai_types.StopReason },
     agent_end: struct { reason: TuiEndReason },
@@ -77,6 +98,17 @@ pub const TuiEvent = union(enum) {
         user,
         assistant,
         tool_result,
+    };
+
+    pub const PromptSegmentKind = enum {
+        system_prompt,
+        message_history,
+        tool_definitions,
+    };
+
+    pub const PromptSegmentCacheRole = enum {
+        stable,
+        dynamic,
     };
 
     pub fn deinit(self: *TuiEvent, allocator: std.mem.Allocator) void {
@@ -114,6 +146,7 @@ pub const TuiEvent = union(enum) {
                 p.tool_call_id.deinit(allocator);
                 p.tool_name.deinit(allocator);
                 p.result_json.deinit(allocator);
+                p.artifact_refs.deinit(allocator);
             },
             .@"error" => |*p| p.message.deinit(allocator),
             else => {},

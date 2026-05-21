@@ -60,6 +60,12 @@ pub const ToolEntry = struct {
     output: std.ArrayList(u8) = .empty,
     status: ToolStatus = .pending,
     expanded: bool = false,
+    raw_total_bytes: u64 = 0,
+    returned_total_bytes: u64 = 0,
+    estimated_returned_tokens: u64 = 0,
+    artifact_count: u32 = 0,
+    artifact_refs: []u8 = &.{},
+    truncated: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
@@ -75,6 +81,7 @@ pub const ToolEntry = struct {
         allocator.free(self.name);
         allocator.free(self.args_json);
         self.output.deinit(allocator);
+        if (self.artifact_refs.len > 0) allocator.free(self.artifact_refs);
         self.* = undefined;
     }
 };
@@ -104,6 +111,36 @@ pub const ApprovalState = struct {
     }
 };
 
+pub const PromptSegmentState = struct {
+    bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    item_count: u32 = 0,
+    cache_role: tui_runtime.TuiEvent.PromptSegmentCacheRole = .dynamic,
+    seen: bool = false,
+};
+
+pub const TelemetryState = struct {
+    system_prompt_bytes: u64 = 0,
+    message_bytes: u64 = 0,
+    tool_definition_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    context_window: u64 = 0,
+    message_count: u32 = 0,
+    tool_count: u32 = 0,
+    system_prompt: PromptSegmentState = .{},
+    messages: PromptSegmentState = .{},
+    tool_definitions: PromptSegmentState = .{},
+
+    pub fn segment(self: *TelemetryState, kind: tui_runtime.TuiEvent.PromptSegmentKind) *PromptSegmentState {
+        return switch (kind) {
+            .system_prompt => &self.system_prompt,
+            .message_history => &self.messages,
+            .tool_definitions => &self.tool_definitions,
+        };
+    }
+};
+
 pub const StatusState = struct {
     model: []u8 = &.{},
     provider: []u8 = &.{},
@@ -123,10 +160,15 @@ pub const StatusState = struct {
     }
 
     pub fn setModel(self: *StatusState, allocator: std.mem.Allocator, model: []const u8, provider: []const u8) !void {
+        try self.setModelWithContext(allocator, model, provider, 0);
+    }
+
+    pub fn setModelWithContext(self: *StatusState, allocator: std.mem.Allocator, model: []const u8, provider: []const u8, context_limit: usize) !void {
         if (self.model.len > 0) allocator.free(self.model);
         if (self.provider.len > 0) allocator.free(self.provider);
         self.model = try allocator.dupe(u8, model);
         self.provider = try allocator.dupe(u8, provider);
+        self.context_limit = context_limit;
     }
 
     pub fn setError(self: *StatusState, allocator: std.mem.Allocator, message: []const u8) !void {
@@ -204,6 +246,7 @@ pub const AppState = struct {
     composer: ComposerState = .{},
     approval: ApprovalState = .{},
     status: StatusState = .{},
+    telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
@@ -294,8 +337,11 @@ pub const AppState = struct {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), "", status);
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
+                try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
                 if (payload.is_error) try self.status.setError(self.allocator, payload.result_json.slice());
             },
+            .context_usage => |payload| self.applyContextUsage(payload),
+            .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
             .turn_end => self.status.streaming = false,
             .agent_end => |payload| {
                 self.status.streaming = false;
@@ -340,6 +386,50 @@ pub const AppState = struct {
     fn appendDelta(self: *AppState, kind: TranscriptKind, delta: []const u8) !void {
         try self.ensureTrailingEntry(kind);
         try self.transcript.items[self.transcript.items.len - 1].text.appendSlice(self.allocator, delta);
+    }
+
+    fn applyContextUsage(self: *AppState, payload: anytype) void {
+        self.telemetry.system_prompt_bytes = payload.system_prompt_bytes;
+        self.telemetry.message_bytes = payload.message_bytes;
+        self.telemetry.tool_definition_bytes = payload.tool_definition_bytes;
+        self.telemetry.total_bytes = payload.total_bytes;
+        self.telemetry.estimated_tokens = payload.estimated_tokens;
+        self.telemetry.message_count = payload.message_count;
+        self.telemetry.tool_count = payload.tool_count;
+        self.telemetry.context_window = self.status.context_limit;
+        self.status.context_used = @intCast(payload.estimated_tokens);
+    }
+
+    fn applyPromptSegmentUsage(self: *AppState, payload: anytype) void {
+        const segment = self.telemetry.segment(payload.segment);
+        segment.* = .{
+            .bytes = payload.bytes,
+            .estimated_tokens = payload.estimated_tokens,
+            .item_count = payload.item_count,
+            .cache_role = payload.cache_role,
+            .seen = true,
+        };
+    }
+
+    fn applyToolTelemetry(self: *AppState, tool: *ToolEntry, raw_total_bytes: u64, returned_total_bytes: u64, estimated_returned_tokens: u64, artifact_count: u32, artifact_refs: []const u8) !void {
+        tool.raw_total_bytes = raw_total_bytes;
+        tool.returned_total_bytes = returned_total_bytes;
+        tool.estimated_returned_tokens = estimated_returned_tokens;
+        tool.artifact_count = artifact_count;
+        tool.truncated = raw_total_bytes > returned_total_bytes or artifact_count > 0;
+        if (tool.artifact_refs.len > 0) self.allocator.free(tool.artifact_refs);
+        tool.artifact_refs = try self.allocator.dupe(u8, artifact_refs);
+        if (tool.truncated) {
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
+            defer out.deinit();
+            const writer = &out.writer;
+            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.name, raw_total_bytes, returned_total_bytes });
+            if (artifact_refs.len > 0) try writer.print(": {s}", .{artifact_refs});
+            try writer.writeByte(']');
+            const indicator = try out.toOwnedSlice();
+            defer self.allocator.free(indicator);
+            try self.appendTranscript(.tool, indicator);
+        }
     }
 
     fn findTool(self: *AppState, id: []const u8) ?*ToolEntry {
@@ -488,4 +578,78 @@ test "AppState appends tool execution updates" {
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
     try std.testing.expectEqual(ToolStatus.running, state.tools.items[0].status);
     try std.testing.expectEqualStrings("{\"match\":1}", state.tools.items[0].output.items);
+}
+
+test "AppState token counters update from context usage events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.context_limit = 2000;
+
+    try state.applyEvent(.{ .context_usage = .{
+        .system_prompt_bytes = 100,
+        .message_bytes = 300,
+        .tool_definition_bytes = 200,
+        .total_bytes = 600,
+        .estimated_tokens = 150,
+        .message_count = 4,
+        .tool_count = 2,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 150), state.status.context_used);
+    try std.testing.expectEqual(@as(u64, 150), state.telemetry.estimated_tokens);
+    try std.testing.expectEqual(@as(u64, 600), state.telemetry.total_bytes);
+    try std.testing.expectEqual(@as(u64, 2000), state.telemetry.context_window);
+    try std.testing.expectEqual(@as(u32, 4), state.telemetry.message_count);
+}
+
+test "AppState parses prompt segment usage events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .prompt_segment_usage = .{
+        .segment = .system_prompt,
+        .cache_role = .stable,
+        .bytes = 80,
+        .estimated_tokens = 20,
+        .item_count = 1,
+    } });
+    try state.applyEvent(.{ .prompt_segment_usage = .{
+        .segment = .message_history,
+        .cache_role = .dynamic,
+        .bytes = 240,
+        .estimated_tokens = 60,
+        .item_count = 3,
+    } });
+
+    try std.testing.expect(state.telemetry.system_prompt.seen);
+    try std.testing.expectEqual(@as(u64, 80), state.telemetry.system_prompt.bytes);
+    try std.testing.expectEqual(tui_runtime.TuiEvent.PromptSegmentCacheRole.stable, state.telemetry.system_prompt.cache_role);
+    try std.testing.expect(state.telemetry.messages.seen);
+    try std.testing.expectEqual(@as(u64, 60), state.telemetry.messages.estimated_tokens);
+    try std.testing.expectEqual(tui_runtime.TuiEvent.PromptSegmentCacheRole.dynamic, state.telemetry.messages.cache_role);
+}
+
+test "AppState detects truncated tool execution end events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-trunc"),
+        .tool_name = try ownedText("shell_command"),
+        .result_json = try ownedText("{\"summary\":true}"),
+        .is_error = false,
+        .raw_total_bytes = 4096,
+        .returned_total_bytes = 512,
+        .estimated_returned_tokens = 128,
+        .artifact_count = 1,
+        .artifact_refs = try ownedText("artifact://tool-output/1"),
+    } };
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expect(state.tools.items[0].truncated);
+    try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
+    try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "show full") != null);
 }
