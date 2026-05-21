@@ -34,14 +34,12 @@ fn appendFile(path: []const u8, data: []const u8) !void {
     const flags = std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true };
     const fd = try std.posix.openat(std.posix.AT.FDCWD, path, flags, 0o600);
     defer _ = std.posix.system.close(fd);
-    var written: usize = 0;
-    while (written < data.len) {
-        const rc = std.c.write(fd, data[written..].ptr, data.len - written);
+    while (true) {
+        const rc = std.c.write(fd, data.ptr, data.len);
         switch (std.c.errno(rc)) {
             .SUCCESS => {
-                const n: usize = @intCast(rc);
-                if (n == 0) return error.WriteFailed;
-                written += n;
+                if (@as(usize, @intCast(rc)) != data.len) return error.ShortWrite;
+                return;
             },
             .INTR => continue,
             .AGAIN => continue,
@@ -75,10 +73,11 @@ fn readJsonlRecords(allocator: std.mem.Allocator, path: []const u8, max_bytes: u
             error.ReadFailed => return reader.err.?,
             error.WriteFailed => return error.OutOfMemory,
         };
-        const line = std.mem.trim(u8, out.written(), " \t\r");
-        total += line.len;
+        const raw_line = out.written();
+        total += raw_line.len;
         if (total > max_bytes) return error.StreamTooLong;
-        if (line.len > max_jsonl_line_bytes) return error.StreamTooLong;
+        if (raw_line.len > max_jsonl_line_bytes) return error.StreamTooLong;
+        const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len > 0) try onLine(ctx, line);
         if (reader.interface.buffered().len == 0) break;
         _ = reader.interface.takeByte() catch break;
@@ -89,12 +88,13 @@ fn readLastJsonlLines(allocator: std.mem.Allocator, path: []const u8, max_bytes:
     var file = try compat.fs.getCwd().openFile(defaultIo(), path, .{});
     defer file.close(defaultIo());
     const stat = try file.stat(defaultIo());
-    if (stat.size > max_bytes) return error.StreamTooLong;
-    var reader = file.reader(defaultIo(), &.{});
-    return reader.interface.allocRemaining(allocator, .limited(max_bytes)) catch |err| switch (err) {
-        error.ReadFailed => return reader.err.?,
-        else => return err,
-    };
+    const read_len: usize = @intCast(@min(stat.size, max_bytes));
+    const offset = stat.size - read_len;
+    const data = try allocator.alloc(u8, read_len);
+    errdefer allocator.free(data);
+    const read = try file.readPositionalAll(defaultIo(), data, offset);
+    if (read == data.len) return data;
+    return allocator.realloc(data, read);
 }
 
 pub const SessionMetadata = struct {
@@ -119,8 +119,10 @@ const ReplayState = struct {
     current_role: ?tui_session.TuiEvent.MessageRole = null,
     assistant_text: std.ArrayList(u8) = .empty,
     tool_call_json: std.ArrayList(u8) = .empty,
+    last_tool_result_id: []u8 = &.{},
 
     fn deinit(self: *ReplayState, allocator: std.mem.Allocator) void {
+        if (self.last_tool_result_id.len > 0) allocator.free(self.last_tool_result_id);
         self.assistant_text.deinit(allocator);
         self.tool_call_json.deinit(allocator);
         self.* = undefined;
@@ -374,12 +376,26 @@ fn replayEvent(allocator: std.mem.Allocator, messages: *std.ArrayList(ai_types.M
                 },
                 .tool_result => if (payload.tool_call_id.slice().len > 0 and payload.content_json.slice().len > 0) {
                     try messages.append(allocator, .{ .tool_result = try parseToolResultFromPayload(allocator, payload) });
+                    try rememberToolResult(allocator, replay, payload.tool_call_id.slice());
                 },
             }
         },
-        .tool_execution_end => |payload| try messages.append(allocator, .{ .tool_result = try toolResultMessage(allocator, payload) }),
+        .tool_execution_end => |payload| {
+            if (isDuplicateToolResult(replay, payload.tool_call_id.slice())) return;
+            try messages.append(allocator, .{ .tool_result = try toolResultMessage(allocator, payload) });
+            try rememberToolResult(allocator, replay, payload.tool_call_id.slice());
+        },
         else => {},
     }
+}
+
+fn isDuplicateToolResult(replay: *ReplayState, tool_call_id: []const u8) bool {
+    return tool_call_id.len > 0 and std.mem.eql(u8, replay.last_tool_result_id, tool_call_id);
+}
+
+fn rememberToolResult(allocator: std.mem.Allocator, replay: *ReplayState, tool_call_id: []const u8) !void {
+    if (replay.last_tool_result_id.len > 0) allocator.free(replay.last_tool_result_id);
+    replay.last_tool_result_id = try allocator.dupe(u8, tool_call_id);
 }
 
 fn updateMetadata(allocator: std.mem.Allocator, meta: *SessionMetadata, obj: std.json.ObjectMap) !void {
@@ -882,6 +898,39 @@ test "session metadata updates from last valid line" {
     try std.testing.expectEqual(@as(usize, 2), list.items[0].turn_count);
 }
 
+test "metadata loads from tail of large session file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var meta = try defaultMetadata(std.testing.allocator, "large-metadata");
+    defer meta.deinit(std.testing.allocator);
+    try replaceString(std.testing.allocator, &meta.model, "tail-model");
+    try replaceString(std.testing.allocator, &meta.provider, "tail-provider");
+    meta.last_active = 99;
+    meta.turn_count = 7;
+
+    const path = try sessionPath(std.testing.allocator, base, "large-metadata");
+    defer std.testing.allocator.free(path);
+    const padding = try std.testing.allocator.alloc(u8, metadata_max_bytes + 16);
+    defer std.testing.allocator.free(padding);
+    @memset(padding, ' ');
+    try appendFile(path, padding);
+    try appendFile(path, "\n");
+    try store.save(meta, tui_session.TuiEvent.turn_start);
+
+    var list = try store.list();
+    defer {
+        for (list.items) |*item| item.deinit(std.testing.allocator);
+        list.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+    try std.testing.expectEqualStrings("tail-model", list.items[0].model);
+    try std.testing.expectEqual(@as(i64, 99), list.items[0].last_active);
+}
+
 fn contentJson(text: []const u8) !OwnedSlice(u8) {
     return owned(std.testing.allocator, text);
 }
@@ -988,4 +1037,56 @@ test "load skips malformed json but propagates replay errors" {
     try appendFile(path, "{bad json}\n");
     try appendFile(path, "{\"event\":{\"type\":\"message_end\",\"role\":\"assistant\",\"content_json\":\"{}\"}}\n");
     try std.testing.expectError(error.InvalidMessage, store.load("bad-replay"));
+}
+
+test "load counts raw JSONL line bytes against caps" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    const path = try sessionPath(std.testing.allocator, base, "raw-cap");
+    defer std.testing.allocator.free(path);
+    const padding = try std.testing.allocator.alloc(u8, max_jsonl_line_bytes + 1);
+    defer std.testing.allocator.free(padding);
+    @memset(padding, ' ');
+    try appendFile(path, padding);
+    try appendFile(path, "\n");
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    try std.testing.expectError(error.StreamTooLong, store.load("raw-cap"));
+}
+
+test "message_end and tool_execution_end do not duplicate tool result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var meta = try testMeta("tool-dedupe");
+    defer meta.deinit(std.testing.allocator);
+
+    var message_end = tui_session.TuiEvent{ .message_end = .{
+        .role = .tool_result,
+        .tool_call_id = try owned(std.testing.allocator, "call-1"),
+        .tool_name = try owned(std.testing.allocator, "demo"),
+        .content_json = try contentJson("[{\"type\":\"text\",\"text\":\"result\"}]"),
+    } };
+    defer message_end.deinit(std.testing.allocator);
+    try store.save(meta, message_end);
+
+    var tool_end = tui_session.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try owned(std.testing.allocator, "call-1"),
+        .tool_name = try owned(std.testing.allocator, "demo"),
+        .result_json = try owned(std.testing.allocator, "result"),
+        .is_error = false,
+    } };
+    defer tool_end.deinit(std.testing.allocator);
+    try store.save(meta, tool_end);
+
+    var loaded = try store.load("tool-dedupe");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0] == .tool_result);
+    try std.testing.expectEqualStrings("call-1", loaded.messages.items[0].tool_result.tool_call_id);
 }
