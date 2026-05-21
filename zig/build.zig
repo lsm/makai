@@ -870,6 +870,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_protocol_types", .module = protocol_agent_types_mod },
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "transports/stdio", .module = stdio_transport_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
