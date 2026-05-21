@@ -89,21 +89,6 @@ pub const TuiRuntime = struct {
         errdefer tool_registry.deinit(allocator);
         try tool_registry.registerDefaults(allocator);
 
-        var mcp_bridge: ?*local_tools.mcp_bridge.McpBridge = null;
-        errdefer if (mcp_bridge) |bridge| {
-            bridge.deinit();
-            allocator.destroy(bridge);
-        };
-        if (options.mcp_config_json) |config_json| {
-            const bridge = try allocator.create(local_tools.mcp_bridge.McpBridge);
-            bridge.* = local_tools.mcp_bridge.McpBridge.init(allocator);
-            bridge.bind();
-            mcp_bridge = bridge;
-            try bridge.loadConfigJson(config_json);
-            try bridge.discover();
-            try tool_registry.registerMcpBridge(allocator, bridge);
-        }
-
         for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
 
         var original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
