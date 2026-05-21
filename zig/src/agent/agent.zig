@@ -301,7 +301,7 @@ pub const Agent = struct {
         return self._follow_up_mode;
     }
 
-    /// Replace all messages with the given slice.
+    /// Replace all messages with deep-cloned copies of the given slice.
     pub fn replaceMessages(self: *Agent, messages: []const ai_types.Message) !void {
         // Clear existing messages
         for (self._state.messages.items) |*msg| {
@@ -311,7 +311,7 @@ pub const Agent = struct {
 
         // Add new messages (deep copy)
         for (messages) |msg| {
-            try self._state.messages.append(self._allocator, msg);
+            try self._state.messages.append(self._allocator, try ai_types.cloneMessage(self._allocator, msg));
         }
     }
 
