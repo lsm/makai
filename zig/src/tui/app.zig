@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const zz = @import("zigzag");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
@@ -86,9 +87,17 @@ const TuiModel = struct {
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
         self.deinit();
-        self.app = App.init(ctx.persistent_allocator, self.options) catch App.initWithoutRuntime(ctx.persistent_allocator);
+        self.app = App.init(ctx.persistent_allocator, self.options) catch |err| blk: {
+            var fallback = App.initWithoutRuntime(ctx.persistent_allocator);
+            fallback.state.status.setError(ctx.persistent_allocator, @errorName(err)) catch {};
+            fallback.state.appendTranscript(.@"error", @errorName(err)) catch {};
+            break :blk fallback;
+        };
         if (self.app) |*app| {
-            app.start() catch {};
+            app.start() catch |err| {
+                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+            };
             app.state.appendTranscript(.system, "Makai TUI") catch {};
             app.state.appendTranscript(.system, "Enter submits composer, Ctrl+C or /quit exits") catch {};
         }
@@ -126,9 +135,16 @@ const TuiModel = struct {
                     .enter => {
                         const text = app.state.composer.text();
                         if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/quit")) return .quit;
-                        app.submit(text) catch |err| if (err == error.QuitRequested) return .quit else {};
+                        app.submit(text) catch |err| {
+                            if (err == error.QuitRequested) return .quit;
+                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                        };
                         app.state.composer.clear();
-                        app.drainEvents() catch {};
+                        app.drainEvents() catch |err| {
+                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                        };
                     },
                     .backspace => {
                         if (app.state.composer.buffer.items.len > 0) _ = app.state.composer.buffer.pop();
@@ -184,7 +200,7 @@ const TuiModel = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
-    var environ_map = try std.process.getEnvMap(allocator);
+    var environ_map = try compat.createEnvMap(allocator);
     defer environ_map.deinit();
 
     var program = zz.Program(TuiModel).init(allocator, io, &environ_map);

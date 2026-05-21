@@ -435,3 +435,47 @@ test "Composer submission stores history and user transcript" {
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello makai", state.transcript.items[0].text.items);
 }
+
+test "AppState applies thinking tool call and lifecycle events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.agent_start);
+    try std.testing.expect(state.status.streaming);
+    try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[0].kind);
+
+    var thinking_event = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = try ownedText("plan") } };
+    defer thinking_event.deinit(std.testing.allocator);
+    try state.applyEvent(thinking_event);
+
+    var call_event = tui_runtime.TuiEvent{ .tool_call_delta = .{ .content_index = 1, .delta = try ownedText("{\"name\":\"shell\"}") } };
+    defer call_event.deinit(std.testing.allocator);
+    try state.applyEvent(call_event);
+
+    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("plan", state.transcript.items[1].text.items);
+    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[2].kind);
+    try std.testing.expectEqualStrings("{\"name\":\"shell\"}", state.transcript.items[2].text.items);
+
+    try state.applyEvent(tui_runtime.TuiEvent{ .agent_end = .{ .reason = .cancelled } });
+    try std.testing.expect(!state.status.streaming);
+    try std.testing.expectEqualStrings("agent cancelled", state.transcript.items[state.transcript.items.len - 1].text.items);
+}
+
+test "AppState appends tool execution updates" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var update_event = tui_runtime.TuiEvent{ .tool_execution_update = .{
+        .tool_call_id = try ownedText("call-3"),
+        .tool_name = try ownedText("search"),
+        .args_json = try ownedText("{\"query\":\"tui\"}"),
+        .partial_result_json = try ownedText("{\"match\":1}"),
+    } };
+    defer update_event.deinit(std.testing.allocator);
+    try state.applyEvent(update_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(ToolStatus.running, state.tools.items[0].status);
+    try std.testing.expectEqualStrings("{\"match\":1}", state.tools.items[0].output.items);
+}

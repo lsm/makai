@@ -16,3 +16,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writer.writeAll("[a] allow  [d] deny  [A] always allow");
     return out.toOwnedSlice();
 }
+
+test "approval renders pending request" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "{\"path\":\"README.md\"}");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Approval required") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "edit_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "always allow") != null);
+}

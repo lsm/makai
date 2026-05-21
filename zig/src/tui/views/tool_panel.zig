@@ -45,3 +45,17 @@ fn writeOneLine(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
     try writer.writeAll(line[0..@min(width, line.len)]);
     if (line.len > width or nl < text.len) try writer.writeAll("…");
 }
+
+test "tool panel renders tool status and output" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "{\"command\":\"pwd\"}", .running));
+    state.tools.items[0].expanded = true;
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "ok");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "[running] shell_command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ok") != null);
+}

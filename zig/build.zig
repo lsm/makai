@@ -883,6 +883,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "zigzag", .module = zigzag_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
@@ -1278,6 +1279,12 @@ pub fn build(b: *std.Build) void {
     const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
     const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
     const tui_view_transcript_test = b.addTest(.{ .root_module = tui_view_transcript_mod });
+    const tui_view_composer_test = b.addTest(.{ .root_module = tui_view_composer_mod });
+    const tui_view_status_bar_test = b.addTest(.{ .root_module = tui_view_status_bar_mod });
+    const tui_view_tool_panel_test = b.addTest(.{ .root_module = tui_view_tool_panel_mod });
+    const tui_view_approval_test = b.addTest(.{ .root_module = tui_view_approval_mod });
+    const tui_view_preview_test = b.addTest(.{ .root_module = tui_view_preview_mod });
+    const tui_view_session_picker_test = b.addTest(.{ .root_module = tui_view_session_picker_mod });
     const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
     const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
     const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
@@ -1358,7 +1365,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_loop", .module = agent_loop_mod },
-            .{ .name = "agent_bridge", .module = agent_provider_protocol_bridge_mod },
+            .{ .name = "agent_bridge", .module = agent_mod },
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
@@ -1379,7 +1386,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
-            .{ .name = "zigzag", .module = zigzag_mod },
+            .{ .name = "tui_app", .module = tui_app_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
@@ -1471,6 +1478,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
@@ -1617,6 +1630,12 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_common_test).step);

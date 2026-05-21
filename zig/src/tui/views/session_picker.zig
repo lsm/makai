@@ -20,3 +20,17 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     }
     return out.toOwnedSlice();
 }
+
+test "session picker renders selected session" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.addSession("s1", "First");
+    try state.addSession("s2", "Second");
+    state.session_index = 1;
+
+    const text = try render(std.testing.allocator, &state, .{ .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "First (s1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "> Second (s2)") != null);
+}

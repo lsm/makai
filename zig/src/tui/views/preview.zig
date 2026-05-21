@@ -37,3 +37,15 @@ fn kindText(kind: tui_state.PreviewKind) []const u8 {
         .artifact => "Artifact",
     };
 }
+
+test "preview renders title and content" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setPreview(.diff, "patch.diff", "+hello\n-world");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Diff: patch.diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+hello") != null);
+}

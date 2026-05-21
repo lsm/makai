@@ -21,9 +21,22 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     }
     const items = out.written();
     if (items.len > options.width) {
-        const clipped = try allocator.alloc(u8, options.width);
-        @memcpy(clipped, items[0..options.width]);
+        const clipped = try allocator.dupe(u8, items[0..options.width]);
+        out.deinit();
         return clipped;
     }
     return out.toOwnedSlice();
+}
+
+test "status bar renders model and clips width" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setModel(std.testing.allocator, "claude", "anthropic");
+    state.status.streaming = true;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 24 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqual(@as(usize, 24), text.len);
+    try std.testing.expect(std.mem.indexOf(u8, text, "anthropic") != null);
 }
