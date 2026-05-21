@@ -122,6 +122,19 @@ pub const JsonWriter = struct {
                     // Other control characters
                     try self.buffer.print(self.allocator, "\\u{x:0>4}", .{c});
                 },
+                0x80...0xFF => {
+                    const len = std.unicode.utf8ByteSequenceLength(c) catch {
+                        try self.buffer.appendSlice(self.allocator, "\\ufffd");
+                        i += 1;
+                        continue;
+                    };
+                    if (i + len <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+                        try self.buffer.appendSlice(self.allocator, s[i .. i + len]);
+                        i += len;
+                        continue;
+                    }
+                    try self.buffer.appendSlice(self.allocator, "\\ufffd");
+                },
                 else => try self.buffer.append(self.allocator, c),
             }
             i += 1;
@@ -214,6 +227,20 @@ test "utf8 string bytes are preserved" {
     try writer.endObject();
 
     try std.testing.expectEqualStrings("{\"text\":\"café 🚀\"}", getResult(&writer));
+}
+
+test "invalid utf8 bytes are replaced" {
+    const allocator = std.testing.allocator;
+    var buffer = std.ArrayList(u8).empty;
+    defer buffer.deinit(allocator);
+
+    var writer = JsonWriter.init(&buffer, allocator);
+    const invalid = [_]u8{ 'a', 0x80, 'b' };
+    try writer.beginObject();
+    try writer.writeStringField("text", &invalid);
+    try writer.endObject();
+
+    try std.testing.expectEqualStrings("{\"text\":\"a\\ufffdb\"}", getResult(&writer));
 }
 
 test "nested objects and arrays" {
