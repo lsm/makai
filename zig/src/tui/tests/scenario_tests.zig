@@ -2,8 +2,10 @@ const std = @import("std");
 const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_session = @import("tui_session");
+const session_store = @import("tui_session_store");
 const mock_provider = @import("tui_tests_mock_provider");
 const fixtures = @import("tui_tests_fixtures");
+const ai_types = @import("ai_types");
 
 const TuiRuntime = tui_runtime.TuiRuntime;
 const TuiSession = tui_runtime.TuiSession;
@@ -296,6 +298,138 @@ test "tool approval approve runs tool and reject skips executor" {
     try std.testing.expect(reject_requested);
     try std.testing.expect(reject_tool_error);
     try std.testing.expectEqual(@as(usize, 1), reject_state.calls);
+}
+
+fn tmpSessionBase(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    errdefer allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+    return base;
+}
+
+fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
+    return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
+}
+
+const alternate_model = ai_types.Model{
+    .id = "alternate-tui-model",
+    .name = "Alternate TUI Model",
+    .api = "tui-fixture-api",
+    .provider = "tui-fixture-provider",
+    .base_url = "https://example.invalid",
+    .reasoning = false,
+    .input = &.{"text"},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 8192,
+    .max_tokens = 1024,
+};
+
+test "runtime persistence full save and resume cycle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpSessionBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try session_store.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "resume-cycle"),
+        .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
+        .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer meta.deinit(std.testing.allocator);
+
+    try store.save(meta, .{ .message_start = .{ .role = .user } });
+    var user_end = tui_session.TuiEvent{ .message_end = .{ .role = .user, .text = try ownedText("hello") } };
+    defer user_end.deinit(std.testing.allocator);
+    try store.save(meta, user_end);
+    try store.save(meta, .{ .message_start = .{ .role = .assistant } });
+    var assistant_a = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hel") } };
+    defer assistant_a.deinit(std.testing.allocator);
+    try store.save(meta, assistant_a);
+    var assistant_b = tui_session.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("lo") } };
+    defer assistant_b.deinit(std.testing.allocator);
+    try store.save(meta, assistant_b);
+    try store.save(meta, .{ .message_end = .{ .role = .assistant } });
+
+    const steps = [_]mock_provider.ResponseStep{.{ .text = fixtures.expected_text }};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &steps });
+    const models = [_]ai_types.Model{ alternate_model, mock_provider.test_model };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .initial_model_id = alternate_model.id,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var loaded = try store.resumeSession("resume-cycle", &runtime);
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0] == .user);
+    try std.testing.expectEqualStrings("hello", loaded.messages.items[0].user.content.text);
+    try std.testing.expect(loaded.messages.items[1] == .assistant);
+    try std.testing.expectEqualStrings("hello", loaded.messages.items[1].assistant.content[0].text.text);
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, loaded.messages.items[1].assistant.model);
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, runtime.currentModel().?.id);
+
+    var session = runtime.createSession();
+    try session.submitTurn("again");
+    var summary = EventSummary{};
+    try drainUntilAgentEnd(&session, &summary);
+    try std.testing.expect(summary.agent_end);
+    try std.testing.expectEqual(@as(usize, 3), provider.last_message_count);
+}
+
+test "session persistence reconstructs tool call before tool result" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpSessionBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    var store = try session_store.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "tool-cycle"),
+        .model = try std.testing.allocator.dupe(u8, mock_provider.test_model.id),
+        .provider = try std.testing.allocator.dupe(u8, mock_provider.test_model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, "."),
+    };
+    defer meta.deinit(std.testing.allocator);
+
+    try store.save(meta, .{ .message_start = .{ .role = .assistant } });
+    var assistant_tool = tui_session.TuiEvent{ .message_end = .{
+        .role = .assistant,
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("demo_tool"),
+        .args_json = try ownedText("{\"x\":1}"),
+    } };
+    defer assistant_tool.deinit(std.testing.allocator);
+    try store.save(meta, assistant_tool);
+    var tool_result = tui_session.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("demo_tool"),
+        .result_json = try ownedText("{\"ok\":true}"),
+        .is_error = false,
+    } };
+    defer tool_result.deinit(std.testing.allocator);
+    try store.save(meta, tool_result);
+
+    var loaded = try store.load("tool-cycle");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), loaded.messages.items.len);
+    try std.testing.expect(loaded.messages.items[0] == .assistant);
+    try std.testing.expect(loaded.messages.items[0].assistant.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("call-1", loaded.messages.items[0].assistant.content[0].tool_call.id);
+    try std.testing.expect(loaded.messages.items[1] == .tool_result);
+    try std.testing.expectEqualStrings("call-1", loaded.messages.items[1].tool_result.tool_call_id);
 }
 
 test {
