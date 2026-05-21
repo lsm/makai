@@ -169,7 +169,7 @@ pub const ToolUpdateCallback = *const fn (
     partial_result_json: []const u8,
 ) void;
 
-/// Tool execution function signature
+/// Tool execution function signature used by local tool runtimes behind ToolProtocolServer.
 pub const ToolExecuteFn = *const fn (
     tool_call_id: []const u8,
     args_json: []const u8,
@@ -179,17 +179,7 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
-pub const ToolExecuteWithContextFn = *const fn (
-    ctx: ?*anyopaque,
-    tool_call_id: []const u8,
-    args_json: []const u8,
-    cancel_token: ?ai_types.CancelToken,
-    on_update_ctx: ?*anyopaque,
-    on_update: ?ToolUpdateCallback,
-    allocator: std.mem.Allocator,
-) anyerror!AgentToolResult;
-
-/// Tool execution via remote protocol path
+/// Single tool protocol dispatch path used by the agent loop.
 pub const ToolProtocolExecuteFn = *const fn (
     ctx: ?*anyopaque,
     tool_call_id: []const u8,
@@ -200,6 +190,27 @@ pub const ToolProtocolExecuteFn = *const fn (
     on_update: ?ToolUpdateCallback,
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
+
+fn defaultToolProtocolExecute(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult {
+    _ = ctx;
+    _ = tool_call_id;
+    _ = tool_name;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.ToolProtocolNotConfigured;
+}
 
 pub const ToolOutputMiddlewareInput = struct {
     tool_call_id: []const u8,
@@ -252,8 +263,6 @@ pub const AgentTool = struct {
     short_description: ?[]const u8 = null,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
-    execute_ctx: ?*anyopaque = null,
-    execute_with_context: ?ToolExecuteWithContextFn = null,
     approval_ctx: ?*anyopaque = null,
     approval_fn: ?ToolApprovalFn = null,
     approval_ui_ctx: ?*anyopaque = null,
@@ -380,7 +389,7 @@ pub const AgentLoopConfig = struct {
 
     // Tools (optional)
     tools: ?[]const AgentTool = null,
-    execute_tool_via_protocol_fn: ?ToolProtocolExecuteFn = null,
+    execute_tool_via_protocol_fn: ToolProtocolExecuteFn = defaultToolProtocolExecute,
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
     tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
     tool_output_middleware_ctx: ?*anyopaque = null,
@@ -676,7 +685,7 @@ test "AgentTool.toTool conversion" {
         .description = "A test tool",
         .short_description = "Test compact",
         .parameters_schema_json = "{}",
-        .execute = undefined, // Would be a real function in practice
+        .execute = undefined, // Runtime registration callback only; agent loop never calls directly.
     };
 
     const converted = try tool.toTool(std.testing.allocator);
