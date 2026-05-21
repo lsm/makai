@@ -253,7 +253,7 @@ fn handleStatus(ctx: CommandContext, command: Command) !CommandResult {
 
 fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    if (ctx.state.sessions.items.len == 0) return .{ .output = try ctx.allocator.dupe(u8, "no saved sessions") };
+    if (ctx.state.sessions.items.len == 0) return .{ .output = try ctx.allocator.dupe(u8, "no saved sessions (saved-session discovery is not wired yet)") };
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     const writer = &out.writer;
     try writer.writeAll("saved sessions:");
@@ -263,18 +263,19 @@ fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
 
 fn handleResume(ctx: CommandContext, command: Command) !CommandResult {
     if (command.arg) |id| {
-        var found = false;
-        for (ctx.state.sessions.items) |session| {
-            if (std.mem.eql(u8, session.id, id)) {
-                found = true;
-                break;
+        for (ctx.state.sessions.items) |entry| {
+            if (std.mem.eql(u8, entry.id, id)) {
+                return .{
+                    .output = try std.fmt.allocPrint(ctx.allocator, "resume by id is not wired yet: {s}", .{id}),
+                    .is_error = true,
+                };
             }
         }
-        if (!found) return error.SessionNotFound;
+        return error.SessionNotFound;
     }
     const session = ctx.session orelse return error.NoRuntimeConfigured;
     try session.resumeSession();
-    return .{ .output = try ctx.allocator.dupe(u8, "session resumed") };
+    return .{ .output = try ctx.allocator.dupe(u8, "current session resumed") };
 }
 
 fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
@@ -294,8 +295,19 @@ fn handlePermissions(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     const writer = &out.writer;
-    try writer.writeAll("permission policy:\n  reads inside workspace: allow\n  writes inside workspace: prompt\n  destructive shell: deny");
-    if (ctx.state.approval.status == .pending) try writer.print("\npending approval: {s} {s}", .{ ctx.state.approval.tool_name, ctx.state.approval.tool_call_id });
+    try writer.writeAll("tool permissions:\n");
+    if (ctx.runtime) |runtime| {
+        if (runtime.tool_approval_callback != null) {
+            try writer.writeAll("  approval callback: configured\n");
+        } else {
+            try writer.writeAll("  approval callback: none (tools auto-approve unless tool policy rejects)\n");
+        }
+        try writer.print("  registered tools: {d}\n", .{runtime.tool_registry.list().len});
+    } else {
+        try writer.writeAll("  runtime: not configured\n");
+    }
+    try writer.print("  current approval: {s}", .{@tagName(ctx.state.approval.status)});
+    if (ctx.state.approval.status == .pending) try writer.print("\n  pending tool: {s} ({s})", .{ ctx.state.approval.tool_name, ctx.state.approval.tool_call_id });
     return .{ .output = try out.toOwnedSlice() };
 }
 
@@ -380,4 +392,48 @@ test "dispatch reaches command handlers" {
             try std.testing.expect(result.output.len > 0);
         }
     }
+}
+
+test "resume by id does not resume current context" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.addSession("s1", "Saved");
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume", .arg = "s1" });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
+}
+
+test "sessions reports discovery gap when runtime has no source" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .sessions });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
+}
+
+test "permissions reports runtime approval state not hardcoded policy" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .permissions });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "runtime: not configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "reads inside workspace") == null);
+}
+
+test "runtime dependent commands dispatch to no-runtime errors" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .model, .arg = "model-a" }));
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .provider }));
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .tools }));
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .@"resume" }));
 }
