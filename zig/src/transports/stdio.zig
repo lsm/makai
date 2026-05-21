@@ -33,6 +33,15 @@ pub const StdioReceiver = struct {
     leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     allocator: std.mem.Allocator,
     cancel_token: ?*std.atomic.Value(bool) = null,
+    last_status: ReadStatus = .pending,
+
+    pub const ReadStatus = enum {
+        pending,
+        eof,
+        would_block,
+        cancelled,
+        read_error,
+    };
 
     pub fn init(allocator: std.mem.Allocator) StdioReceiver {
         return .{ .file = compat.stdio.stdin(), .allocator = allocator };
@@ -73,11 +82,21 @@ pub const StdioReceiver = struct {
 
             // Read more data
             if (self.cancel_token) |token| {
-                if (token.load(.acquire)) return null;
+                if (token.load(.acquire)) {
+                    self.last_status = .cancelled;
+                    return null;
+                }
             }
             const bytes_read = compat.stdio.read(self.file, &self.read_buf) catch |err| {
-                if (err == error.EndOfStream) return null;
-                if (err == error.WouldBlock) return null;
+                if (err == error.EndOfStream) {
+                    self.last_status = .eof;
+                    return null;
+                }
+                if (err == error.WouldBlock) {
+                    self.last_status = .would_block;
+                    return null;
+                }
+                self.last_status = .read_error;
                 return null;
             };
             if (bytes_read == 0) {
@@ -85,10 +104,13 @@ pub const StdioReceiver = struct {
                 if (self.leftover.items.len > 0) {
                     const line = try allocator.dupe(u8, self.leftover.items);
                     self.leftover.clearRetainingCapacity();
+                    self.last_status = .eof;
                     return line;
                 }
+                self.last_status = .eof;
                 return null;
             }
+            self.last_status = .pending;
 
             try self.leftover.appendSlice(self.allocator, self.read_buf[0..bytes_read]);
         }

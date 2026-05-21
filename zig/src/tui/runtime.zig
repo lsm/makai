@@ -196,16 +196,25 @@ pub const TuiRuntime = struct {
                     remote_config_sender = sender;
                     const receiver = try allocator.create(stdio_transport.AsyncStdioReceiver);
                     receiver.* = stdio_transport.AsyncStdioReceiver.init();
+                    var receiver_nonblocking = false;
+                    errdefer if (receiver_nonblocking) compat.stdio.setBlocking(receiver.file) catch {};
                     try compat.stdio.setNonBlocking(receiver.file);
+                    receiver_nonblocking = true;
                     receiver.file = compat.stdio.nonblocking(receiver.file);
                     remote_config_receiver = receiver;
                     const handle = try allocator.create(stdio_transport.AsyncStreamHandle);
                     errdefer allocator.destroy(handle);
                     handle.* = try receiver.receiveStreamWithHandle(allocator);
+                    var handle_initialized = true;
+                    errdefer if (handle_initialized) {
+                        _ = handle.deinit(5_000);
+                    };
                     const fallback_receiver = try allocator.create(stdio_transport.StdioReceiver);
                     fallback_receiver.* = stdio_transport.StdioReceiver.initWithFileAndCancelToken(receiver.file, allocator, handle.cancel_token);
                     handle.fallback_receiver = fallback_receiver;
+                    receiver_nonblocking = false;
                     remote_config_stream_handle = handle;
+                    handle_initialized = false;
                     remote_sender = sender.sender();
                     remote_receiver = .{ .ctx = handle, .read_line_fn = remoteConfigStdioReadLine, .read_result_fn = remoteConfigStdioReadResult, .close_fn = remoteConfigStdioClose };
                 },
@@ -284,7 +293,9 @@ pub const TuiRuntime = struct {
                 self.remote_reconnect_attempted = false;
                 self.pumpRemoteIncoming() catch |err| {
                     if (self.remote_sender) |remote_sender| remote_sender.close();
-                    if (self.remote_receiver) |*remote_receiver| remote_receiver.close();
+                    if (self.remote_config_stream_handle == null) {
+                        if (self.remote_receiver) |*remote_receiver| remote_receiver.close();
+                    }
                     if (self.remote_client) |*remote_client| remote_client.deinit();
                     self.remote_client = null;
                     self.remote_session_id = null;
@@ -1256,8 +1267,11 @@ fn remoteConfigStdioReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !R
     if (handle.stream.isDone()) {
         if (handle.fallback_receiver) |receiver| {
             if (try receiver.receiver().read(allocator)) |line| return .{ .line = line };
-            if (handle.isCancelled()) return .disconnected;
-            return .pending;
+            return switch (receiver.last_status) {
+                .would_block => .pending,
+                .pending => .pending,
+                .eof, .cancelled, .read_error => .disconnected,
+            };
         }
         return .disconnected;
     }
