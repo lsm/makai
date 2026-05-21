@@ -16,6 +16,11 @@ pub const ToolApprovalCallback = session.ToolApprovalCallback;
 pub const ToolApprovalDecision = session.ToolApprovalDecision;
 pub const ToolApprovalRequest = session.ToolApprovalRequest;
 
+const ApprovalDecisionState = struct {
+    tool_call_id: []u8 = &.{},
+    decision: ?ToolApprovalDecision = null,
+};
+
 const ApprovalContext = struct {
     runtime: *TuiRuntime,
     callback_ctx: ?*anyopaque,
@@ -57,6 +62,8 @@ pub const TuiRuntime = struct {
     original_tools: []agent.AgentTool,
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
+    pending_approval: ApprovalDecisionState = .{},
+    approval_mutex: std.atomic.Mutex = .unlocked,
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -121,6 +128,7 @@ pub const TuiRuntime = struct {
         self.stop();
         self.event_stream.deinit();
         if (self.remote_client) |*client| client.deinit();
+        self.clearPendingApproval();
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
@@ -169,6 +177,7 @@ pub const TuiRuntime = struct {
                 .submit_turn = sessionSubmitTurn,
                 .switch_model = sessionSwitchModel,
                 .current_model = sessionCurrentModel,
+                .decide_tool_approval = sessionDecideToolApproval,
                 .stream_events = sessionStreamEvents,
             },
         };
@@ -255,10 +264,47 @@ pub const TuiRuntime = struct {
     pub fn cancel(self: *TuiRuntime) void {
         self.cancelled.store(true, .release);
         if (self.local_agent) |*local| local.abort();
+        while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.approval_mutex.unlock();
     }
 
     pub fn streamEvents(self: *TuiRuntime) *TuiEventStream {
         return &self.event_stream;
+    }
+
+    pub fn decideToolApproval(self: *TuiRuntime, tool_call_id: []const u8, decision: ToolApprovalDecision) !void {
+        while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.approval_mutex.unlock();
+        if (self.pending_approval.tool_call_id.len > 0 and !std.mem.eql(u8, self.pending_approval.tool_call_id, tool_call_id)) return error.ToolApprovalNotPending;
+        if (self.pending_approval.tool_call_id.len == 0) {
+            self.pending_approval.tool_call_id = try self.allocator.dupe(u8, tool_call_id);
+        }
+        self.pending_approval.decision = decision;
+    }
+
+    fn clearPendingApproval(self: *TuiRuntime) void {
+        while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.approval_mutex.unlock();
+        if (self.pending_approval.tool_call_id.len > 0) self.allocator.free(self.pending_approval.tool_call_id);
+        self.pending_approval = .{};
+    }
+
+    fn waitForToolApproval(self: *TuiRuntime, request: ToolApprovalRequest) ToolApprovalDecision {
+        while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (self.pending_approval.tool_call_id.len > 0) self.allocator.free(self.pending_approval.tool_call_id);
+        self.pending_approval = .{ .tool_call_id = self.allocator.dupe(u8, request.tool_call_id) catch {
+            self.approval_mutex.unlock();
+            return .approve;
+        } };
+        self.approval_mutex.unlock();
+        while (!self.cancelled.load(.acquire)) {
+            while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+            const decision = self.pending_approval.decision;
+            self.approval_mutex.unlock();
+            if (decision) |value| return value;
+            compat.time.sleepNs(1 * std.time.ns_per_ms);
+        }
+        return .reject;
     }
 
     fn resetEventStreamForTurn(self: *TuiRuntime) void {
@@ -419,16 +465,18 @@ fn approveTool(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolA
             .reject, .reject_always => return .reject,
         }
     }
+    const approval_request = ToolApprovalRequest{
+        .tool_call_id = request.tool_call_id,
+        .tool_name = request.tool_name,
+        .args_json = request.args_json,
+    };
     if (approval_ctx.callback) |callback| {
-        return switch (callback(approval_ctx.callback_ctx, .{
-            .tool_call_id = request.tool_call_id,
-            .tool_name = request.tool_name,
-            .args_json = request.args_json,
-        })) {
+        return switch (callback(approval_ctx.callback_ctx, approval_request)) {
             .approve => .approve,
             .reject => .reject,
         };
     }
+    _ = approval_ctx.runtime;
     return .approve;
 }
 
@@ -460,6 +508,11 @@ fn sessionSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
 fn sessionCurrentModel(ctx: ?*anyopaque) ?ai_types.Model {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     return self.currentModel();
+}
+
+fn sessionDecideToolApproval(ctx: ?*anyopaque, tool_call_id: []const u8, decision: ToolApprovalDecision) anyerror!void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    try self.decideToolApproval(tool_call_id, decision);
 }
 
 fn sessionStreamEvents(ctx: ?*anyopaque) *TuiEventStream {
@@ -944,6 +997,7 @@ test "preserves original tool approval when wrapping" {
 
 test "preserves original tool approval UI when wrapping" {
     var original_ctx = OriginalApprovalUiCtx{};
+    var approval_ctx = ApprovalCtx{ .decision = .approve };
     const tools = [_]agent.AgentTool{.{
         .label = "Demo",
         .name = "demo_tool",
@@ -959,6 +1013,8 @@ test "preserves original tool approval UI when wrapping" {
         .protocol = makeProtocol(&mock),
         .models = &models,
         .tools = &tools,
+        .tool_approval_ctx = &approval_ctx,
+        .tool_approval_callback = approvalCallback,
         .run_async = false,
     });
     defer runtime.deinit();
