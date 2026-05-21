@@ -118,6 +118,7 @@ pub const TuiRuntime = struct {
     remote_client: ?agent_protocol_client.AgentProtocolClient = null,
     remote_config_sender: ?*stdio_transport.AsyncStdioSender = null,
     remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null,
+    remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null,
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
@@ -177,8 +178,13 @@ pub const TuiRuntime = struct {
         const resolved_backend = if (options.remote_config.mode == .remote) .remote else options.backend;
         var remote_config_sender: ?*stdio_transport.AsyncStdioSender = null;
         var remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null;
+        var remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null;
         var remote_sender = options.remote_sender;
         var remote_receiver = options.remote_receiver;
+        errdefer if (remote_config_stream_handle) |handle| {
+            _ = handle.deinit(5_000);
+            allocator.destroy(handle);
+        };
         errdefer if (remote_config_sender) |sender| allocator.destroy(sender);
         errdefer if (remote_config_receiver) |receiver| allocator.destroy(receiver);
         if (resolved_backend == .remote and remote_sender == null and remote_receiver == null and options.remote_config.mode == .remote) {
@@ -190,9 +196,18 @@ pub const TuiRuntime = struct {
                     remote_config_sender = sender;
                     const receiver = try allocator.create(stdio_transport.AsyncStdioReceiver);
                     receiver.* = stdio_transport.AsyncStdioReceiver.init();
+                    try compat.stdio.setNonBlocking(receiver.file);
+                    receiver.file = compat.stdio.nonblocking(receiver.file);
                     remote_config_receiver = receiver;
+                    const handle = try allocator.create(stdio_transport.AsyncStreamHandle);
+                    errdefer allocator.destroy(handle);
+                    handle.* = try receiver.receiveStreamWithHandle(allocator);
+                    const fallback_receiver = try allocator.create(stdio_transport.StdioReceiver);
+                    fallback_receiver.* = stdio_transport.StdioReceiver.initWithFileAndCancelToken(receiver.file, allocator, handle.cancel_token);
+                    handle.fallback_receiver = fallback_receiver;
+                    remote_config_stream_handle = handle;
                     remote_sender = sender.sender();
-                    remote_receiver = .{ .ctx = receiver, .read_line_fn = remoteConfigStdioReadLine, .read_result_fn = remoteConfigStdioReadResult, .close_fn = remoteConfigStdioClose };
+                    remote_receiver = .{ .ctx = handle, .read_line_fn = remoteConfigStdioReadLine, .read_result_fn = remoteConfigStdioReadResult, .close_fn = remoteConfigStdioClose };
                 },
                 .sse, .websocket => return error.UnsupportedRemoteTransport,
             }
@@ -204,6 +219,7 @@ pub const TuiRuntime = struct {
             .protocol = options.protocol,
             .remote_config_sender = remote_config_sender,
             .remote_config_receiver = remote_config_receiver,
+            .remote_config_stream_handle = remote_config_stream_handle,
             .remote_sender = remote_sender,
             .remote_receiver = remote_receiver,
             .remote_session_timeout_ms = options.remote_session_timeout_ms,
@@ -221,6 +237,7 @@ pub const TuiRuntime = struct {
         };
         remote_config_sender = null;
         remote_config_receiver = null;
+        remote_config_stream_handle = null;
         return runtime;
     }
 
@@ -230,6 +247,10 @@ pub const TuiRuntime = struct {
         self.remote_messages.deinit(self.allocator);
         self.event_stream.deinit();
         if (self.remote_client) |*client| client.deinit();
+        if (self.remote_config_stream_handle) |handle| {
+            _ = handle.deinit(5_000);
+            self.allocator.destroy(handle);
+        }
         if (self.remote_config_receiver) |receiver| self.allocator.destroy(receiver);
         if (self.remote_config_sender) |sender| self.allocator.destroy(sender);
         self.clearPendingApproval();
@@ -960,6 +981,7 @@ pub const TuiRuntime = struct {
                             var mutable = msg;
                             mutable.deinit(self.allocator);
                         }
+                        try self.recordRemoteAssistantMessage(msg);
                         return self.push(.{ .message_end = try self.messageEndPayload(.{ .assistant = msg }) });
                     },
                     else => return error.InvalidRemoteEvent,
@@ -1223,15 +1245,28 @@ fn remoteConfigStdioReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]
 }
 
 fn remoteConfigStdioReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
-    _ = ctx;
-    _ = allocator;
+    const handle: *stdio_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
+    if (handle.stream.poll()) |chunk| {
+        defer {
+            var mutable = chunk;
+            mutable.deinit(handle.allocator);
+        }
+        return .{ .line = try allocator.dupe(u8, chunk.data) };
+    }
+    if (handle.stream.isDone()) {
+        if (handle.fallback_receiver) |receiver| {
+            if (try receiver.receiver().read(allocator)) |line| return .{ .line = line };
+            if (handle.isCancelled()) return .disconnected;
+            return .pending;
+        }
+        return .disconnected;
+    }
     return .pending;
 }
 
 fn remoteConfigStdioClose(ctx: *anyopaque) void {
-    const receiver: *stdio_transport.AsyncStdioReceiver = @ptrCast(@alignCast(ctx));
-    var async_receiver = receiver.receiver();
-    async_receiver.close();
+    const handle: *stdio_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
+    handle.cancel();
 }
 
 fn parseStopReason(value: []const u8) ai_types.StopReason {
@@ -2465,9 +2500,19 @@ test "remote config initializes stdio transport hooks" {
     try std.testing.expectEqual(TuiBackendMode.remote, runtime.backend);
     try std.testing.expect(runtime.remote_config_sender != null);
     try std.testing.expect(runtime.remote_config_receiver != null);
+    try std.testing.expect(runtime.remote_config_stream_handle != null);
     try std.testing.expect(runtime.remote_sender != null);
     try std.testing.expect(runtime.remote_receiver != null);
     try std.testing.expectEqual(RemoteReadResult.pending, try runtime.remote_receiver.?.read(std.testing.allocator));
+    try runtime.remote_config_stream_handle.?.stream.push(.{ .data = try std.testing.allocator.dupe(u8, "{\"type\":\"agent_started\"}"), .owned = true });
+    const result = try runtime.remote_receiver.?.read(std.testing.allocator);
+    switch (result) {
+        .line => |line| {
+            defer std.testing.allocator.free(line);
+            try std.testing.expectEqualStrings("{\"type\":\"agent_started\"}", line);
+        },
+        else => return error.ExpectedRemoteLine,
+    }
 }
 
 test "remote config rejects unsupported endpoint" {
@@ -2782,6 +2827,21 @@ test "remote done event records assistant history for next turn" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
     try runtime.handleRemoteAgentEventJson("{\"type\":\"message_update\",\"event\":{\"type\":\"done\",\"reason\":\"stop\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}],\"api\":\"test-api\",\"provider\":\"test-provider\",\"model\":\"model-a\",\"usage\":{},\"stop_reason\":\"stop\",\"timestamp\":1}}}");
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
+    try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);
+    const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable = ev;
+    defer mutable.deinit(std.testing.allocator);
+    try std.testing.expect(mutable == .message_end);
+    try std.testing.expectEqualStrings("answer", mutable.message_end.text.slice());
+    try std.testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"answer\"}]", mutable.message_end.content_json.slice());
+}
+
+test "remote inline message_end records assistant history for next turn" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"message_end\",\"message\":{\"type\":\"result\",\"content\":[{\"type\":\"text\",\"text\":\"answer\"}],\"api\":\"test-api\",\"provider\":\"test-provider\",\"model\":\"model-a\",\"input\":0,\"output\":0,\"cache_read\":0,\"cache_write\":0,\"stop_reason\":\"stop\",\"timestamp\":1}}");
     try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
     try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
     try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);

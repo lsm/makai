@@ -32,6 +32,7 @@ pub const StdioReceiver = struct {
     /// Unprocessed data carried over from previous read
     leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
     allocator: std.mem.Allocator,
+    cancel_token: ?*std.atomic.Value(bool) = null,
 
     pub fn init(allocator: std.mem.Allocator) StdioReceiver {
         return .{ .file = compat.stdio.stdin(), .allocator = allocator };
@@ -39,6 +40,10 @@ pub const StdioReceiver = struct {
 
     pub fn initWithFile(file: compat.stdio.File, allocator: std.mem.Allocator) StdioReceiver {
         return .{ .file = file, .allocator = allocator };
+    }
+
+    pub fn initWithFileAndCancelToken(file: compat.stdio.File, allocator: std.mem.Allocator, cancel_token: *std.atomic.Value(bool)) StdioReceiver {
+        return .{ .file = file, .allocator = allocator, .cancel_token = cancel_token };
     }
 
     pub fn deinit(self: *StdioReceiver) void {
@@ -67,7 +72,14 @@ pub const StdioReceiver = struct {
             }
 
             // Read more data
-            const bytes_read = compat.stdio.read(self.file, &self.read_buf) catch return null;
+            if (self.cancel_token) |token| {
+                if (token.load(.acquire)) return null;
+            }
+            const bytes_read = compat.stdio.read(self.file, &self.read_buf) catch |err| {
+                if (err == error.EndOfStream) return null;
+                if (err == error.WouldBlock) return null;
+                return null;
+            };
             if (bytes_read == 0) {
                 // EOF - return remaining data as last line if any
                 if (self.leftover.items.len > 0) {
@@ -92,6 +104,7 @@ pub const AsyncStreamHandle = struct {
     thread: std.Thread,
     cancel_token: *std.atomic.Value(bool),
     allocator: std.mem.Allocator,
+    fallback_receiver: ?*StdioReceiver = null,
 
     const Self = @This();
 
@@ -111,6 +124,13 @@ pub const AsyncStreamHandle = struct {
         // If thread didn't exit, we still need to clean up
         // The detached alternative would leak, so we join anyway (blocking)
         // In production code you might want to detach or force-kill if available
+
+        if (self.fallback_receiver) |receiver| {
+            compat.stdio.setBlocking(receiver.file) catch {};
+            receiver.deinit();
+            self.allocator.destroy(receiver);
+            self.fallback_receiver = null;
+        }
 
         // Free the cancel token
         self.allocator.destroy(self.cancel_token);
@@ -251,6 +271,7 @@ pub const AsyncStdioReceiver = struct {
             .thread = thread,
             .cancel_token = cancel_token,
             .allocator = allocator,
+            .fallback_receiver = null,
         };
     }
 
