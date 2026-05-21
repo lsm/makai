@@ -237,6 +237,9 @@ pub const ComposerState = struct {
     }
 };
 
+const max_hashline_preview_bytes: usize = 20 * 1024;
+const hashline_preview_truncated_marker = "\n... preview truncated ...\n";
+
 pub const AppState = struct {
     allocator: std.mem.Allocator,
     mode: AppMode = .normal,
@@ -396,11 +399,11 @@ pub const AppState = struct {
         defer out.deinit(self.allocator);
         const header = try std.fmt.allocPrint(self.allocator, "hashline edit preview\noperation: {s}\nrange: {d}:{s}..{d}:{s}\n", .{ operation, start_line, start_hash, end_line, end_hash });
         defer self.allocator.free(header);
-        try out.appendSlice(self.allocator, header);
+        try appendHashlinePreview(&out, self.allocator, header);
         if (std.mem.eql(u8, operation, "delete_range")) {
             const row = try std.fmt.allocPrint(self.allocator, "- lines {d}..{d}\n", .{ start_line, end_line });
             defer self.allocator.free(row);
-            try out.appendSlice(self.allocator, row);
+            try appendHashlinePreview(&out, self.allocator, row);
         } else {
             var line_no: usize = if (std.mem.eql(u8, operation, "insert_after")) end_line + 1 else start_line;
             var lines = std.mem.splitScalar(u8, replacement, '\n');
@@ -408,8 +411,12 @@ pub const AppState = struct {
                 if (line.len == 0 and line.ptr == replacement.ptr + replacement.len) break;
                 const row = try std.fmt.allocPrint(self.allocator, "+ {d}|{s}\n", .{ line_no, line });
                 defer self.allocator.free(row);
-                try out.appendSlice(self.allocator, row);
+                try appendHashlinePreview(&out, self.allocator, row);
                 line_no += 1;
+                if (out.items.len >= max_hashline_preview_bytes) {
+                    try markHashlinePreviewTruncated(&out);
+                    break;
+                }
             }
         }
         try self.preview.set(self.allocator, .diff, path, out.items);
@@ -493,6 +500,23 @@ pub const AppState = struct {
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
+
+fn appendHashlinePreview(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    if (out.items.len >= max_hashline_preview_bytes) return;
+    const remaining = max_hashline_preview_bytes - out.items.len;
+    if (text.len <= remaining) {
+        try out.appendSlice(allocator, text);
+        return;
+    }
+    if (remaining > 0) try out.appendSlice(allocator, text[0..remaining]);
+    try markHashlinePreviewTruncated(out);
+}
+
+fn markHashlinePreviewTruncated(out: *std.ArrayList(u8)) !void {
+    if (out.items.len < hashline_preview_truncated_marker.len) return;
+    const marker_start = out.items.len - hashline_preview_truncated_marker.len;
+    @memcpy(out.items[marker_start..], hashline_preview_truncated_marker);
+}
 
 fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
@@ -589,10 +613,27 @@ test "AppState approval flow transitions pending to approved and rejected" {
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 3|") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 4|line3") != null);
 
+    var large_replacement = try std.ArrayList(u8).initCapacity(std.testing.allocator, max_hashline_preview_bytes + 4096);
+    defer large_replacement.deinit(std.testing.allocator);
+    while (large_replacement.items.len < max_hashline_preview_bytes + 4096) {
+        try large_replacement.appendSlice(std.testing.allocator, "large replacement line\n");
+    }
+    const large_args = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":2,\"start_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replacement\":{f}}}", .{std.json.fmt(large_replacement.items, .{})});
+    defer std.testing.allocator.free(large_args);
+    var large_event = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-hash-large"),
+        .tool_name = try ownedText("hashline_edit"),
+        .args_json = try ownedText(large_args),
+    } };
+    defer large_event.deinit(std.testing.allocator);
+    try state.applyEvent(large_event);
+    try std.testing.expect(state.preview.content.len <= max_hashline_preview_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "preview truncated") != null);
+
     try std.testing.expectEqual(AppMode.approval, state.mode);
     try std.testing.expectEqual(ApprovalStatus.pending, state.approval.status);
     try std.testing.expectEqualStrings("hashline_edit", state.approval.tool_name);
-    try std.testing.expectEqualStrings("call-hash-blank", state.approval.tool_call_id);
+    try std.testing.expectEqualStrings("call-hash-large", state.approval.tool_call_id);
 
     state.setApprovalDecision(true, true);
     try std.testing.expectEqual(AppMode.normal, state.mode);
