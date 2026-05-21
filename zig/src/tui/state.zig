@@ -274,6 +274,12 @@ pub const AppState = struct {
         try self.transcript.append(self.allocator, try TranscriptEntry.init(self.allocator, kind, text));
     }
 
+    pub fn clearTranscript(self: *AppState) void {
+        for (self.transcript.items) |*entry| entry.deinit(self.allocator);
+        self.transcript.clearRetainingCapacity();
+        self.transcript_scroll = 0;
+    }
+
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {
         try self.appendTranscript(.user, text);
     }
@@ -431,6 +437,10 @@ pub const AppState = struct {
             if (std.mem.eql(u8, tool.id, id)) return tool;
         }
         return null;
+    }
+
+    pub fn upsertToolForTest(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
+        return try self.upsertTool(id, name, args_json, status);
     }
 
     fn upsertTool(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
