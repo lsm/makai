@@ -19,6 +19,7 @@ pub const ToolApprovalRequest = session.ToolApprovalRequest;
 const ApprovalDecisionState = struct {
     tool_call_id: []u8 = &.{},
     decision: ?ToolApprovalDecision = null,
+    cancelled: bool = false,
 };
 
 const ApprovalContext = struct {
@@ -265,6 +266,8 @@ pub const TuiRuntime = struct {
         self.cancelled.store(true, .release);
         if (self.local_agent) |*local| local.abort();
         while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.pending_approval.cancelled = true;
+        self.pending_approval.decision = .reject;
         self.approval_mutex.unlock();
     }
 
@@ -280,6 +283,7 @@ pub const TuiRuntime = struct {
             self.pending_approval.tool_call_id = try self.allocator.dupe(u8, tool_call_id);
         }
         self.pending_approval.decision = decision;
+        self.pending_approval.cancelled = false;
     }
 
     fn clearPendingApproval(self: *TuiRuntime) void {
@@ -300,8 +304,10 @@ pub const TuiRuntime = struct {
         while (!self.cancelled.load(.acquire)) {
             while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
             const decision = self.pending_approval.decision;
+            const approval_cancelled = self.pending_approval.cancelled;
             self.approval_mutex.unlock();
             if (decision) |value| return value;
+            if (approval_cancelled) return .reject;
             compat.time.sleepNs(1 * std.time.ns_per_ms);
         }
         return .reject;
@@ -474,9 +480,10 @@ fn approveTool(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolA
         return switch (callback(approval_ctx.callback_ctx, approval_request)) {
             .approve => .approve,
             .reject => .reject,
+            .approve_always => .approve_always,
+            .reject_always => .reject_always,
         };
     }
-    _ = approval_ctx.runtime;
     return .approve;
 }
 

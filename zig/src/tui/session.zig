@@ -12,6 +12,8 @@ pub const TuiEndReason = enum {
 pub const ToolApprovalDecision = enum {
     approve,
     reject,
+    approve_always,
+    reject_always,
 };
 
 pub const ToolApprovalRequest = struct {
