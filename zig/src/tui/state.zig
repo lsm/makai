@@ -319,6 +319,7 @@ pub const AppState = struct {
             .message_end => {},
             .tool_approval_requested => |payload| {
                 try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice());
+                if (std.mem.eql(u8, payload.tool_name.slice(), "hashline_edit")) try self.setHashlinePreview(payload.args_json.slice());
                 self.mode = .approval;
                 _ = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .pending);
             },
@@ -376,6 +377,42 @@ pub const AppState = struct {
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
         try self.sessions.append(self.allocator, try SessionEntry.init(self.allocator, id, label));
+    }
+
+    fn setHashlinePreview(self: *AppState, args_json: []const u8) !void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, args_json, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        const obj = parsed.value.object;
+        const path = jsonString(obj, "path") orelse "(unknown)";
+        const operation = jsonString(obj, "operation") orelse "hashline_edit";
+        const start_line = jsonUsize(obj, "start_line") orelse 0;
+        const end_line = jsonUsize(obj, "end_line") orelse start_line;
+        const start_hash = jsonString(obj, "start_hash") orelse "";
+        const end_hash = jsonString(obj, "end_hash") orelse start_hash;
+        const replacement = jsonString(obj, "replacement") orelse "";
+
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.allocator);
+        const header = try std.fmt.allocPrint(self.allocator, "hashline edit preview\noperation: {s}\nrange: {d}:{s}..{d}:{s}\n", .{ operation, start_line, start_hash, end_line, end_hash });
+        defer self.allocator.free(header);
+        try out.appendSlice(self.allocator, header);
+        if (std.mem.eql(u8, operation, "delete_range")) {
+            const row = try std.fmt.allocPrint(self.allocator, "- lines {d}..{d}\n", .{ start_line, end_line });
+            defer self.allocator.free(row);
+            try out.appendSlice(self.allocator, row);
+        } else {
+            var line_no = start_line;
+            var lines = std.mem.splitScalar(u8, replacement, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0 and line_no > start_line) break;
+                const row = try std.fmt.allocPrint(self.allocator, "+ {d}|{s}\n", .{ line_no, line });
+                defer self.allocator.free(row);
+                try out.appendSlice(self.allocator, row);
+                line_no += 1;
+            }
+        }
+        try self.preview.set(self.allocator, .diff, path, out.items);
     }
 
     fn ensureTrailingEntry(self: *AppState, kind: TranscriptKind) !void {
@@ -457,6 +494,21 @@ pub const AppState = struct {
     }
 };
 
+fn jsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    if (value != .string) return null;
+    return value.string;
+}
+
+fn jsonUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => |i| if (i < 0) null else @intCast(i),
+        .number_string => |s| std.fmt.parseUnsigned(usize, s, 10) catch null,
+        else => null,
+    };
+}
+
 fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
@@ -507,9 +559,19 @@ test "AppState approval flow transitions pending to approved and rejected" {
     defer approval_event.deinit(std.testing.allocator);
     try state.applyEvent(approval_event);
 
+    var hashline_event = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-hash"),
+        .tool_name = try ownedText("hashline_edit"),
+        .args_json = try ownedText("{\"path\":\"src/main.zig\",\"operation\":\"replace_range\",\"start_line\":2,\"start_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replacement\":\"new line\"}"),
+    } };
+    defer hashline_event.deinit(std.testing.allocator);
+    try state.applyEvent(hashline_event);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "hashline edit preview") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 2|new line") != null);
+
     try std.testing.expectEqual(AppMode.approval, state.mode);
     try std.testing.expectEqual(ApprovalStatus.pending, state.approval.status);
-    try std.testing.expectEqualStrings("edit_file", state.approval.tool_name);
+    try std.testing.expectEqualStrings("hashline_edit", state.approval.tool_name);
 
     state.setApprovalDecision(true, true);
     try std.testing.expectEqual(AppMode.normal, state.mode);
