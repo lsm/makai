@@ -622,6 +622,22 @@ fn executeToolCalls(
                     };
                 }
 
+                if (t.execute_with_context) |exec_with_context| {
+                    break :blk exec_with_context(
+                        t.execute_ctx,
+                        tool_call.id,
+                        execution_args,
+                        config.cancel_token,
+                        &update_ctx,
+                        onToolUpdate,
+                        allocator,
+                    ) catch |err| {
+                        result = try createErrorResult(allocator, err);
+                        is_error = true;
+                        break :blk result;
+                    };
+                }
+
                 break :blk t.execute(
                     tool_call.id,
                     execution_args,
