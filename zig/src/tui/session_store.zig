@@ -872,7 +872,7 @@ fn uint64Field(obj: std.json.ObjectMap, key: []const u8) ?u64 {
 
 fn uint32Field(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
+    return switch (value) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null, else => null };
 }
 
 fn parseRole(value: []const u8) tui_session.TuiEvent.MessageRole {
@@ -905,6 +905,15 @@ fn parseEndReason(value: []const u8) tui_session.TuiEndReason {
     if (std.mem.eql(u8, value, "cancelled")) return .cancelled;
     if (std.mem.eql(u8, value, "error")) return .@"error";
     return .completed;
+}
+
+test "uint32 telemetry counters above max fall back to zero" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"type\":\"context_usage\",\"message_count\":4294967296}", .{});
+    defer parsed.deinit();
+    var event = try parseEvent(std.testing.allocator, parsed.value);
+    defer event.deinit(std.testing.allocator);
+    try std.testing.expect(event == .context_usage);
+    try std.testing.expectEqual(@as(u32, 0), event.context_usage.message_count);
 }
 
 test "save 10 events load replays in order" {

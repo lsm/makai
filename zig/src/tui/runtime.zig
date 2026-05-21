@@ -192,7 +192,7 @@ pub const TuiRuntime = struct {
                     receiver.* = stdio_transport.AsyncStdioReceiver.init();
                     remote_config_receiver = receiver;
                     remote_sender = sender.sender();
-                    remote_receiver = .{ .ctx = receiver, .read_line_fn = remoteConfigStdioReadLine, .close_fn = remoteConfigStdioClose };
+                    remote_receiver = .{ .ctx = receiver, .read_line_fn = remoteConfigStdioReadLine, .read_result_fn = remoteConfigStdioReadResult, .close_fn = remoteConfigStdioClose };
                 },
                 .sse, .websocket => return error.UnsupportedRemoteTransport,
             }
@@ -377,15 +377,16 @@ pub const TuiRuntime = struct {
                     var mutable = self.remote_messages.pop().?;
                     mutable.deinit(self.allocator);
                 };
+                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), self.remote_messages.items, self.remoteSerializableTools());
+                defer self.allocator.free(message_json);
                 self.resetEventStreamForTurn();
+                errdefer self.resetEventStreamAfterFailedSend();
                 self.cancelled.store(false, .release);
                 self.completed = false;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
                 client.clearSessionTerminalState(sid);
                 self.last_turn_stop_reason = null;
-                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), self.remote_messages.items, self.remoteSerializableTools());
-                defer self.allocator.free(message_json);
                 _ = try client.sendAgentMessage(sid, message_json, null);
                 message_sent = true;
                 self.pumpRemoteIncoming() catch |err| {
@@ -531,6 +532,13 @@ pub const TuiRuntime = struct {
             self.event_stream = TuiEventStream.init(self.allocator);
         }
         self.stream_active = true;
+    }
+
+    fn resetEventStreamAfterFailedSend(self: *TuiRuntime) void {
+        self.event_stream.deinit();
+        self.event_stream = TuiEventStream.init(self.allocator);
+        self.stream_active = false;
+        self.completed = true;
     }
 
     fn rebuildWrappedTools(self: *TuiRuntime) void {
@@ -943,7 +951,22 @@ pub const TuiRuntime = struct {
         if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.agent_start);
         if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
         if (std.mem.eql(u8, type_name, "message_start")) return self.push(.{ .message_start = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
-        if (std.mem.eql(u8, type_name, "message_end")) return self.push(.{ .message_end = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+        if (std.mem.eql(u8, type_name, "message_end")) {
+            if (obj.get("message")) |message_value| {
+                const message = try deserializeRemoteMessageValue(self.allocator, message_value);
+                switch (message) {
+                    .result => |msg| {
+                        defer {
+                            var mutable = msg;
+                            mutable.deinit(self.allocator);
+                        }
+                        return self.push(.{ .message_end = try self.messageEndPayload(.{ .assistant = msg }) });
+                    },
+                    else => return error.InvalidRemoteEvent,
+                }
+            }
+            return self.push(.{ .message_end = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+        }
         if (std.mem.eql(u8, type_name, "message_update")) {
             const event_value = obj.get("event") orelse return error.InvalidRemoteEvent;
             const msg = try deserializeRemoteMessageValue(self.allocator, event_value);
@@ -953,7 +976,10 @@ pub const TuiRuntime = struct {
                         var mutable = ev;
                         ai_types.deinitAssistantMessageEvent(self.allocator, &mutable);
                     }
-                    if (ev == .done) try self.recordRemoteAssistantMessage(ev.done.message);
+                    if (ev == .done) {
+                        try self.recordRemoteAssistantMessage(ev.done.message);
+                        return self.push(.{ .message_end = try self.messageEndPayload(.{ .assistant = ev.done.message }) });
+                    }
                     return try self.pushMessageUpdate(ev);
                 },
                 else => return error.InvalidRemoteEvent,
@@ -984,8 +1010,8 @@ pub const TuiRuntime = struct {
                 .raw_total_bytes = getJsonU64(obj, "raw_total_bytes") orelse 0,
                 .returned_total_bytes = getJsonU64(obj, "returned_total_bytes") orelse 0,
                 .estimated_returned_tokens = getJsonU64(obj, "estimated_returned_tokens") orelse 0,
-                .artifact_count = getJsonU32(obj, "artifact_count") orelse 0,
-                .artifact_refs = try self.dupeOwned(getJsonString(obj, "artifact_refs") orelse ""),
+                .artifact_count = getJsonU32(obj, "artifact_count") orelse getJsonArrayLenU32(obj, "artifacts") orelse 0,
+                .artifact_refs = try self.remoteArtifactRefs(obj),
             } });
         }
         if (std.mem.eql(u8, type_name, "context_usage")) return self.push(.{ .context_usage = .{
@@ -1135,6 +1161,26 @@ pub const TuiRuntime = struct {
         self.remote_messages.clearRetainingCapacity();
     }
 
+    fn remoteArtifactRefs(self: *TuiRuntime, obj: std.json.ObjectMap) !OwnedSlice(u8) {
+        if (getJsonString(obj, "artifact_refs")) |refs| return self.dupeOwned(refs);
+        const value = obj.get("artifacts") orelse return self.dupeOwned("");
+        if (value != .array) return self.dupeOwned("");
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        for (value.array.items, 0..) |item, i| {
+            if (item != .object) continue;
+            const artifact_id = getJsonString(item.object, "artifact_id") orelse continue;
+            if (i > 0) try writer.writeAll(", ");
+            if (getJsonString(item.object, "uri")) |uri| {
+                try writer.writeAll(uri);
+            } else {
+                try writer.writeAll(artifact_id);
+            }
+        }
+        return OwnedSlice(u8).initOwned(try out.toOwnedSlice());
+    }
+
     fn formatArtifactRefs(self: *TuiRuntime, artifacts: []const ai_types.ArtifactReference) !OwnedSlice(u8) {
         var out: std.Io.Writer.Allocating = .init(self.allocator);
         defer out.deinit();
@@ -1170,9 +1216,16 @@ pub const TuiRuntime = struct {
 };
 
 fn remoteConfigStdioReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
-    const receiver: *stdio_transport.AsyncStdioReceiver = @ptrCast(@alignCast(ctx));
-    var async_receiver = receiver.receiver();
-    return async_receiver.read(allocator);
+    return switch (try remoteConfigStdioReadResult(ctx, allocator)) {
+        .line => |line| line,
+        .pending, .disconnected => null,
+    };
+}
+
+fn remoteConfigStdioReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
+    _ = ctx;
+    _ = allocator;
+    return .pending;
 }
 
 fn remoteConfigStdioClose(ctx: *anyopaque) void {
@@ -1207,6 +1260,14 @@ fn getJsonU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
+}
+
+fn getJsonArrayLenU32(obj: std.json.ObjectMap, key: []const u8) ?u32 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .array => |array| std.math.cast(u32, array.items.len),
         else => null,
     };
 }
@@ -2406,6 +2467,7 @@ test "remote config initializes stdio transport hooks" {
     try std.testing.expect(runtime.remote_config_receiver != null);
     try std.testing.expect(runtime.remote_sender != null);
     try std.testing.expect(runtime.remote_receiver != null);
+    try std.testing.expectEqual(RemoteReadResult.pending, try runtime.remote_receiver.?.read(std.testing.allocator));
 }
 
 test "remote config rejects unsupported endpoint" {
@@ -2503,6 +2565,8 @@ test "remote submit failure rolls back appended user once" {
     runtime.remote_client.?.sender = null;
     try std.testing.expectError(error.NoSender, tui_session.submitTurn("hi"));
     try std.testing.expectEqual(@as(usize, 0), runtime.remote_messages.items.len);
+    try std.testing.expect(!runtime.stream_active);
+    try std.testing.expectError(error.NoSender, tui_session.submitTurn("retry"));
 }
 
 test "remote stream_events keeps pumping pending events" {
@@ -2721,6 +2785,12 @@ test "remote done event records assistant history for next turn" {
     try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
     try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
     try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);
+    const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable = ev;
+    defer mutable.deinit(std.testing.allocator);
+    try std.testing.expect(mutable == .message_end);
+    try std.testing.expectEqualStrings("answer", mutable.message_end.text.slice());
+    try std.testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"answer\"}]", mutable.message_end.content_json.slice());
 }
 
 test "remote tool execution end records tool result history" {
@@ -2757,7 +2827,7 @@ test "remote tool execution end records plain text result history" {
 test "remote tool execution end preserves telemetry fields" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
-    try runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"result_json\":\"[]\",\"is_error\":false,\"raw_total_bytes\":4096,\"returned_total_bytes\":128,\"estimated_returned_tokens\":32,\"artifact_count\":2,\"artifact_refs\":\"artifact://one, artifact://two\"}");
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"result_json\":\"[]\",\"is_error\":false,\"raw_total_bytes\":4096,\"returned_total_bytes\":128,\"estimated_returned_tokens\":32,\"artifact_count\":2,\"artifacts\":[{\"artifact_id\":\"a1\",\"uri\":\"artifact://one\"},{\"artifact_id\":\"a2\"}]}");
     const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
     var mutable = ev;
     defer mutable.deinit(std.testing.allocator);
@@ -2766,7 +2836,7 @@ test "remote tool execution end preserves telemetry fields" {
     try std.testing.expectEqual(@as(u64, 128), mutable.tool_execution_end.returned_total_bytes);
     try std.testing.expectEqual(@as(u64, 32), mutable.tool_execution_end.estimated_returned_tokens);
     try std.testing.expectEqual(@as(u32, 2), mutable.tool_execution_end.artifact_count);
-    try std.testing.expectEqualStrings("artifact://one, artifact://two", mutable.tool_execution_end.artifact_refs.slice());
+    try std.testing.expectEqualStrings("artifact://one, a2", mutable.tool_execution_end.artifact_refs.slice());
 }
 
 test "remote usage events map into TUI stream" {
