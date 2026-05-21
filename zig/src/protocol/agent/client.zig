@@ -68,6 +68,10 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const sid = agent_types.generateSessionId();
+        return self.sendAgentStartWithSession(sid, config_json, system_prompt);
+    }
+
+    pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(sid);
 

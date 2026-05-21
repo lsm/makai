@@ -117,6 +117,7 @@ pub const TuiRuntime = struct {
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
+    remote_pending_session_id: ?agent_protocol_types.SessionId = null,
     remote_error_emitted: bool = false,
     remote_reconnect_attempted: bool = false,
     remote_session_timeout_ms: u64 = 5_000,
@@ -215,7 +216,9 @@ pub const TuiRuntime = struct {
                 client.setSender(sender);
                 const config_json = try self.remoteConfigJson();
                 defer self.allocator.free(config_json);
-                _ = try client.sendAgentStart(config_json, null);
+                const sid = agent_protocol_types.generateSessionId();
+                _ = try client.sendAgentStartWithSession(sid, config_json, null);
+                self.remote_pending_session_id = sid;
                 self.remote_client = client;
                 client_moved = true;
                 self.started = true;
@@ -227,6 +230,7 @@ pub const TuiRuntime = struct {
                     if (self.remote_client) |*remote_client| remote_client.deinit();
                     self.remote_client = null;
                     self.remote_session_id = null;
+                    self.remote_pending_session_id = null;
                     self.started = false;
                     return err;
                 };
@@ -257,14 +261,17 @@ pub const TuiRuntime = struct {
             self.local_agent = null;
         }
         if (self.remote_client) |*client| {
-            if (self.remote_session_id) |sid| {
+            const stop_sid = self.remote_session_id orelse self.remote_pending_session_id;
+            if (stop_sid) |sid| {
                 _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                client.removeSessionState(sid);
             }
             if (self.remote_sender) |sender| sender.close();
             if (self.remote_receiver) |*receiver| receiver.close();
             client.deinit();
             self.remote_client = null;
             self.remote_session_id = null;
+            self.remote_pending_session_id = null;
             self.remote_error_emitted = false;
             self.remote_reconnect_attempted = false;
         }
@@ -387,12 +394,13 @@ pub const TuiRuntime = struct {
         self.cancelled.store(true, .release);
         if (self.local_agent) |*local| local.abort();
         if (self.remote_client) |*client| {
-            if (self.remote_session_id) |sid| {
+            if (self.remote_session_id orelse self.remote_pending_session_id) |sid| {
                 _ = client.sendAgentStop(sid, "cancelled") catch {};
                 self.pumpRemoteIncoming() catch {};
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);
                 self.remote_session_id = null;
+                self.remote_pending_session_id = null;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
             }
@@ -542,7 +550,10 @@ pub const TuiRuntime = struct {
                     defer env.deinit(self.allocator);
                     if (env.version != 1) return error.ProtocolVersionMismatch;
                     try client.processEnvelope(env);
-                    if (self.remote_session_id == null) self.remote_session_id = client.session_id;
+                    if (self.remote_session_id == null) {
+                        self.remote_session_id = client.session_id;
+                        if (self.remote_session_id != null) self.remote_pending_session_id = null;
+                    }
                     try self.drainRemoteClientEvents(client);
                 },
                 .pending => return,
@@ -592,11 +603,14 @@ pub const TuiRuntime = struct {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
-            _ = try client.sendAgentStart(config_json, null);
+            const sid = agent_protocol_types.generateSessionId();
+            _ = try client.sendAgentStartWithSession(sid, config_json, null);
+            self.remote_pending_session_id = sid;
             return;
         }
         try self.completeRemoteWithError("remote connection disconnected");
         self.remote_session_id = null;
+        self.remote_pending_session_id = null;
     }
 
     fn drainRemoteClientEvents(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
@@ -612,6 +626,7 @@ pub const TuiRuntime = struct {
                     try self.completeRemoteWithError(msg);
                     client.removeSessionState(sid);
                     self.remote_session_id = null;
+                    self.remote_pending_session_id = null;
                 }
             }
         }
@@ -1588,6 +1603,28 @@ test "remote mode sends agent_start envelope via mock transport" {
     var env = try agent_envelope.deserializeEnvelope(mock.writes.items[0], std.testing.allocator);
     defer env.deinit(std.testing.allocator);
     try std.testing.expect(env.payload == .agent_start);
+}
+
+test "remote stop sends agent_stop before agent_started arrives" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectEqual(@as(usize, 1), mock.writes.items.len);
+    try std.testing.expect(runtime.remote_session_id == null);
+    try std.testing.expect(runtime.remote_pending_session_id != null);
+    const pending_sid = runtime.remote_pending_session_id.?;
+
+    runtime.deinit();
+    try std.testing.expectEqual(@as(usize, 2), mock.writes.items.len);
+    var env = try agent_envelope.deserializeEnvelope(mock.writes.items[1], std.testing.allocator);
+    defer env.deinit(std.testing.allocator);
+    try std.testing.expect(env.payload == .agent_stop);
+    try std.testing.expectEqualSlices(u8, pending_sid[0..], env.session_id[0..]);
+    try std.testing.expect(mock.sender_closed);
+    try std.testing.expect(mock.receiver_closed);
 }
 
 test "remote mode normalizes agent_event into TUI event" {
