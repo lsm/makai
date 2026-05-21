@@ -861,6 +861,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },

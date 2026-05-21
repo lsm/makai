@@ -11,6 +11,7 @@ const agent_protocol_runtime = @import("agent_protocol_runtime");
 const transport = @import("transport");
 const in_process = @import("transports/in_process");
 const json_writer = @import("json_writer");
+const model_ref = @import("model_ref");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -134,6 +135,7 @@ pub const TuiRuntime = struct {
     completed: bool = false,
     started: bool = false,
     stream_active: bool = false,
+    remote_messages: std.ArrayList(ai_types.Message) = .empty,
     last_turn_stop_reason: ?ai_types.StopReason = null,
     compact_output: bool = false,
     run_async: bool = true,
@@ -193,6 +195,8 @@ pub const TuiRuntime = struct {
 
     pub fn deinit(self: *TuiRuntime) void {
         self.stop();
+        self.clearRemoteMessages();
+        self.remote_messages.deinit(self.allocator);
         self.event_stream.deinit();
         if (self.remote_client) |*client| client.deinit();
         self.clearPendingApproval();
@@ -323,18 +327,31 @@ pub const TuiRuntime = struct {
             .remote => {
                 if (!self.started) try self.start();
                 if (self.currentModel() == null) return error.NoModelConfigured;
+                if (self.stream_active and !self.event_stream.isDone()) return error.AgentAlreadyStreaming;
                 try self.ensureRemoteSession();
                 const client = &(self.remote_client orelse return error.RuntimeNotStarted);
                 const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+                const user_message = try makeRemoteUserMessage(self.allocator, text);
+                errdefer {
+                    var mutable = user_message;
+                    mutable.deinit(self.allocator);
+                }
+                try self.remote_messages.append(self.allocator, user_message);
+                var message_sent = false;
+                errdefer if (!message_sent) {
+                    var mutable = self.remote_messages.pop().?;
+                    mutable.deinit(self.allocator);
+                };
                 self.resetEventStreamForTurn();
                 self.cancelled.store(false, .release);
                 self.completed = false;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
                 self.last_turn_stop_reason = null;
-                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), text);
+                const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), self.remote_messages.items, self.original_tools);
                 defer self.allocator.free(message_json);
                 _ = try client.sendAgentMessage(sid, message_json, null);
+                message_sent = true;
                 self.pumpRemoteIncoming() catch |err| {
                     try self.completeRemoteWithError(@errorName(err));
                 };
@@ -624,9 +641,6 @@ pub const TuiRuntime = struct {
                 if (client.getLastErrorForSession(sid)) |msg| {
                     self.remote_error_emitted = true;
                     try self.completeRemoteWithError(msg);
-                    client.removeSessionState(sid);
-                    self.remote_session_id = null;
-                    self.remote_pending_session_id = null;
                 }
             }
         }
@@ -667,6 +681,7 @@ pub const TuiRuntime = struct {
                         var mutable = ev;
                         ai_types.deinitAssistantMessageEvent(self.allocator, &mutable);
                     }
+                    if (ev == .done) try self.recordRemoteAssistantMessage(ev.done.message);
                     return try self.pushMessageUpdate(ev);
                 },
                 else => return error.InvalidRemoteEvent,
@@ -710,7 +725,10 @@ pub const TuiRuntime = struct {
             .agent_start => self.push(.agent_start),
             .turn_start => self.push(.turn_start),
             .message_start => |payload| self.push(.{ .message_start = .{ .role = messageRole(payload.message) } }),
-            .message_update => |payload| try self.pushMessageUpdate(payload.event),
+            .message_update => |payload| {
+                if (payload.event == .done) try self.recordRemoteAssistantMessage(payload.event.done.message);
+                try self.pushMessageUpdate(payload.event);
+            },
             .message_end => |payload| self.push(.{ .message_end = .{ .role = messageRole(payload.message) } }),
             .tool_execution_start => |payload| self.push(.{ .tool_execution_start = .{
                 .tool_call_id = try self.dupeOwned(payload.tool_call_id),
@@ -742,6 +760,15 @@ pub const TuiRuntime = struct {
             },
             .context_usage, .prompt_segment_usage => {},
         }
+    }
+
+    fn recordRemoteAssistantMessage(self: *TuiRuntime, message: ai_types.AssistantMessage) !void {
+        try self.remote_messages.append(self.allocator, try ai_types.cloneMessage(self.allocator, .{ .assistant = message }));
+    }
+
+    fn clearRemoteMessages(self: *TuiRuntime) void {
+        for (self.remote_messages.items) |*message| message.deinit(self.allocator);
+        self.remote_messages.clearRetainingCapacity();
     }
 
     fn pushMessageUpdate(self: *TuiRuntime, event: ai_types.AssistantMessageEvent) !void {
@@ -791,27 +818,139 @@ fn deserializeRemoteMessageValue(allocator: std.mem.Allocator, value: std.json.V
     return transport.deserialize(json, allocator) catch return error.InvalidRemoteEvent;
 }
 
-fn makeRemoteMessageJson(allocator: std.mem.Allocator, model: ?ai_types.Model, text: []const u8) ![]u8 {
+fn makeRemoteUserMessage(allocator: std.mem.Allocator, text: []const u8) !ai_types.Message {
+    return .{ .user = .{
+        .content = .{ .text = try allocator.dupe(u8, text) },
+        .timestamp = compat.time.nowMillis(),
+    } };
+}
+
+fn makeRemoteMessageJson(allocator: std.mem.Allocator, model: ?ai_types.Model, messages: []const ai_types.Message, tools: []const agent.AgentTool) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
     try w.beginObject();
     if (model) |m| {
-        const model_ref = try std.fmt.allocPrint(allocator, "{s}/{s}@{s}", .{ m.provider, m.api, m.id });
-        defer allocator.free(model_ref);
-        try w.writeStringField("model_ref", model_ref);
+        const formatted_model_ref = try model_ref.formatModelRef(allocator, m.provider, m.api, m.id);
+        defer allocator.free(formatted_model_ref);
+        try w.writeStringField("model_ref", formatted_model_ref);
     }
     try w.writeKey("messages");
     try w.beginArray();
-    try w.beginObject();
-    try w.writeStringField("role", "user");
-    try w.writeStringField("content", text);
-    try w.endObject();
+    for (messages) |message| try writeRemoteMessage(&w, message);
+    try w.endArray();
+    try w.writeKey("tools");
+    try w.beginArray();
+    for (tools) |tool| try writeRemoteTool(&w, tool);
     try w.endArray();
     try w.endObject();
     const out = try allocator.dupe(u8, buffer.items);
     buffer.deinit(allocator);
     return out;
+}
+
+fn writeRemoteMessage(w: *json_writer.JsonWriter, message: ai_types.Message) !void {
+    try w.beginObject();
+    switch (message) {
+        .user => |user| {
+            try w.writeStringField("role", "user");
+            try w.writeKey("content");
+            try writeRemoteUserContent(w, user.content);
+            try w.writeIntField("timestamp", user.timestamp);
+        },
+        .assistant => |assistant| {
+            try w.writeStringField("role", "assistant");
+            try w.writeKey("content");
+            try writeRemoteAssistantContent(w, assistant.content);
+            try w.writeStringField("api", assistant.api);
+            try w.writeStringField("provider", assistant.provider);
+            try w.writeStringField("model", assistant.model);
+            try w.writeStringField("stop_reason", @tagName(assistant.stop_reason));
+            try w.writeIntField("timestamp", assistant.timestamp);
+        },
+        .tool_result => |tool_result| {
+            try w.writeStringField("role", "tool");
+            try w.writeStringField("tool_call_id", tool_result.tool_call_id);
+            try w.writeStringField("tool_name", tool_result.tool_name);
+            try w.writeBoolField("is_error", tool_result.is_error);
+            if (tool_result.getDetailsJson()) |details| try w.writeStringField("details_json", details);
+            try w.writeKey("content");
+            try writeRemoteUserContentParts(w, tool_result.content);
+            try w.writeIntField("timestamp", tool_result.timestamp);
+        },
+    }
+    try w.endObject();
+}
+
+fn writeRemoteUserContent(w: *json_writer.JsonWriter, content: ai_types.UserContent) !void {
+    switch (content) {
+        .text => |text| try w.writeString(text),
+        .parts => |parts| try writeRemoteUserContentParts(w, parts),
+    }
+}
+
+fn writeRemoteUserContentParts(w: *json_writer.JsonWriter, parts: []const ai_types.UserContentPart) !void {
+    try w.beginArray();
+    for (parts) |part| {
+        try w.beginObject();
+        switch (part) {
+            .text => |text| {
+                try w.writeStringField("type", "text");
+                try w.writeStringField("text", text.text);
+                if (text.text_signature) |signature| try w.writeStringField("text_signature", signature);
+            },
+            .image => |image| {
+                try w.writeStringField("type", "image");
+                try w.writeStringField("data", image.data);
+                try w.writeStringField("mime_type", image.mime_type);
+            },
+        }
+        try w.endObject();
+    }
+    try w.endArray();
+}
+
+fn writeRemoteAssistantContent(w: *json_writer.JsonWriter, content: []const ai_types.AssistantContent) !void {
+    try w.beginArray();
+    for (content) |block| {
+        try w.beginObject();
+        switch (block) {
+            .text => |text| {
+                try w.writeStringField("type", "text");
+                try w.writeStringField("text", text.text);
+                if (text.text_signature) |signature| try w.writeStringField("text_signature", signature);
+            },
+            .thinking => |thinking| {
+                try w.writeStringField("type", "thinking");
+                try w.writeStringField("thinking", thinking.thinking);
+                if (thinking.thinking_signature) |signature| try w.writeStringField("thinking_signature", signature);
+            },
+            .tool_call => |tool_call| {
+                try w.writeStringField("type", "tool_call");
+                try w.writeStringField("id", tool_call.id);
+                try w.writeStringField("name", tool_call.name);
+                try w.writeStringField("arguments_json", tool_call.arguments_json);
+                if (tool_call.thought_signature) |signature| try w.writeStringField("thought_signature", signature);
+            },
+            .image => |image| {
+                try w.writeStringField("type", "image");
+                try w.writeStringField("data", image.data);
+                try w.writeStringField("mime_type", image.mime_type);
+            },
+        }
+        try w.endObject();
+    }
+    try w.endArray();
+}
+
+fn writeRemoteTool(w: *json_writer.JsonWriter, tool: agent.AgentTool) !void {
+    try w.beginObject();
+    try w.writeStringField("name", tool.name);
+    try w.writeStringField("description", tool.description);
+    if (tool.short_description) |short| try w.writeStringField("short_description", short);
+    try w.writeStringField("label", tool.label);
+    try w.writeStringField("parameters_schema_json", tool.parameters_schema_json);
+    try w.endObject();
 }
 
 fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allocator: std.mem.Allocator) void {
@@ -1664,11 +1803,66 @@ test "remote mode normalizes agent_event into TUI event" {
     try std.testing.expect(saw_turn_start);
 }
 
-test "remote mode serializes canonical model_ref" {
-    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, "hi");
+test "remote mode serializes encoded canonical model_ref and tools" {
+    const model = ai_types.Model{
+        .id = "llama3.2:1b",
+        .name = "Llama",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const messages = [_]ai_types.Message{try makeRemoteUserMessage(std.testing.allocator, "hi")};
+    defer {
+        var mutable = messages[0];
+        mutable.deinit(std.testing.allocator);
+    }
+    const tools = [_]agent.AgentTool{.{
+        .label = "Lookup",
+        .name = "lookup",
+        .description = "Lookup tool",
+        .short_description = "Lookup",
+        .parameters_schema_json = "{\"type\":\"object\"}",
+        .execute = demoTool,
+    }};
+    const json = try makeRemoteMessageJson(std.testing.allocator, model, &messages, &tools);
     defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_ref\":\"test-provider/test-api@model-a\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"model_ref\":\"test-provider/test-api@llama3.2%3A1b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tools\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"lookup\"") != null);
+}
+
+test "remote mode serializes prior conversation messages" {
+    const assistant_content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "hello" } }};
+    const messages = [_]ai_types.Message{
+        try makeRemoteUserMessage(std.testing.allocator, "first"),
+        .{ .assistant = .{
+            .content = &assistant_content,
+            .api = "test-api",
+            .provider = "test-provider",
+            .model = "model-a",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 1,
+        } },
+        try makeRemoteUserMessage(std.testing.allocator, "second"),
+    };
+    defer {
+        var first = messages[0];
+        first.deinit(std.testing.allocator);
+        var second = messages[2];
+        second.deinit(std.testing.allocator);
+    }
+    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &messages, &.{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"content\":\"first\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"assistant\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"content\":\"second\"") != null);
 }
 
 test "remote start tolerates empty initial read" {
@@ -1876,6 +2070,47 @@ test "remote error emits terminal event once" {
         if (ev == .agent_end) terminal_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), terminal_count);
+    try std.testing.expectEqual(sid, runtime.remote_session_id.?);
+}
+
+test "remote submit rejects while previous turn active" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    const sid = agent_protocol_types.generateSessionId();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    const writes_before = mock.writes.items.len;
+    try std.testing.expectError(error.AgentAlreadyStreaming, tui_session.submitTurn("second"));
+    try std.testing.expectEqual(writes_before, mock.writes.items.len);
+}
+
+test "remote done event records assistant history for next turn" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    const content = [_]ai_types.AssistantContent{.{ .text = .{ .text = "answer" } }};
+    const message = ai_types.AssistantMessage{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "model-a",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 1,
+    };
+    try runtime.recordRemoteAssistantMessage(message);
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
+    try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);
 }
 
 test "remote event parser rejects invalid field types" {
