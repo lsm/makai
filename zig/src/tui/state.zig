@@ -402,7 +402,7 @@ pub const AppState = struct {
             defer self.allocator.free(row);
             try out.appendSlice(self.allocator, row);
         } else {
-            var line_no = start_line;
+            var line_no: usize = if (std.mem.eql(u8, operation, "insert_after")) end_line + 1 else start_line;
             var lines = std.mem.splitScalar(u8, replacement, '\n');
             while (lines.next()) |line| {
                 if (line.len == 0 and line.ptr == replacement.ptr + replacement.len) break;
@@ -568,6 +568,16 @@ test "AppState approval flow transitions pending to approved and rejected" {
     try state.applyEvent(hashline_event);
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "hashline edit preview") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 2|new line") != null);
+
+    var insert_after_event = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-hash-insert-after"),
+        .tool_name = try ownedText("hashline_edit"),
+        .args_json = try ownedText("{\"path\":\"src/main.zig\",\"operation\":\"insert_after\",\"start_line\":10,\"start_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"replacement\":\"inserted\"}"),
+    } };
+    defer insert_after_event.deinit(std.testing.allocator);
+    try state.applyEvent(insert_after_event);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 11|inserted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.preview.content, "+ 10|inserted") == null);
 
     var blank_line_event = tui_runtime.TuiEvent{ .tool_approval_requested = .{
         .tool_call_id = try ownedText("call-hash-blank"),

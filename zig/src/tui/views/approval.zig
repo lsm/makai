@@ -12,7 +12,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writer.writeAll("Approval required\n");
     try writer.print("Tool: {s}\n", .{state.approval.tool_name});
     try writer.print("Args: {s}\n", .{state.approval.args_json});
-    if (state.preview.content.len > 0) {
+    if (std.mem.eql(u8, state.approval.tool_name, "hashline_edit") and state.preview.content.len > 0) {
         try writer.writeAll("\nPreview:\n");
         var rows: usize = 4;
         var lines = std.mem.splitScalar(u8, state.preview.content, '\n');
@@ -52,4 +52,17 @@ test "approval renders hashline preview" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Preview:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hashline edit preview") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|new") != null);
+}
+
+test "approval hides stale preview for non hashline request" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.preview.set(std.testing.allocator, .diff, "src/main.zig", "hashline edit preview\n+ 2|stale");
+    try state.approval.setPending(std.testing.allocator, "call-3", "edit_file", "{\"path\":\"README.md\"}");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 120 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Preview:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "stale") == null);
 }
