@@ -66,7 +66,7 @@ pub const RemoteLineReceiver = struct {
     pub fn read(self: *RemoteLineReceiver, allocator: std.mem.Allocator) !RemoteReadResult {
         if (self.read_result_fn) |f| return f(self.ctx, allocator);
         if (try self.read_line_fn(self.ctx, allocator)) |line| return .{ .line = line };
-        return .pending;
+        return .disconnected;
     }
 
     pub fn close(self: *RemoteLineReceiver) void {
@@ -856,7 +856,7 @@ fn getJsonBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
 fn parseRemoteMessageRole(value: ?[]const u8) TuiEvent.MessageRole {
     const role = value orelse return .assistant;
     if (std.mem.eql(u8, role, "user")) return .user;
-    if (std.mem.eql(u8, role, "tool_result")) return .tool_result;
+    if (std.mem.eql(u8, role, "tool") or std.mem.eql(u8, role, "tool_result")) return .tool_result;
     return .assistant;
 }
 
@@ -1004,7 +1004,13 @@ fn writeRemoteTool(w: *json_writer.JsonWriter, tool: agent.AgentTool) !void {
 }
 
 fn parseRemoteToolResultContent(allocator: std.mem.Allocator, value: std.json.Value) ![]ai_types.UserContentPart {
-    if (value != .array) return error.InvalidRemoteEvent;
+    if (value != .array) {
+        const parts = try allocator.alloc(ai_types.UserContentPart, 1);
+        errdefer allocator.free(parts);
+        parts[0] = try parseRemoteToolResultScalar(allocator, value);
+        return parts;
+    }
+
     var parts = std.ArrayList(ai_types.UserContentPart).empty;
     errdefer {
         for (parts.items) |*part| part.deinit(allocator);
@@ -1014,6 +1020,13 @@ fn parseRemoteToolResultContent(allocator: std.mem.Allocator, value: std.json.Va
         try parts.append(allocator, try parseRemoteUserContentPart(allocator, item));
     }
     return parts.toOwnedSlice(allocator);
+}
+
+fn parseRemoteToolResultScalar(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.UserContentPart {
+    if (value == .string) return .{ .text = .{ .text = try allocator.dupe(u8, value.string) } };
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    errdefer allocator.free(json);
+    return .{ .text = .{ .text = json } };
 }
 
 fn parseRemoteUserContentPart(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.UserContentPart {
@@ -1975,6 +1988,17 @@ test "remote start tolerates empty initial read" {
     try std.testing.expect(runtime.remote_session_id == null);
 }
 
+test "legacy remote line receiver treats null read as disconnect" {
+    const LegacyReader = struct {
+        fn readLine(_: *anyopaque, _: std.mem.Allocator) !?[]const u8 {
+            return null;
+        }
+    };
+    var ctx: u8 = 0;
+    var receiver = RemoteLineReceiver{ .ctx = &ctx, .read_line_fn = LegacyReader.readLine };
+    try std.testing.expectEqual(RemoteReadResult.disconnected, try receiver.read(std.testing.allocator));
+}
+
 test "remote start validates receiver before sending" {
     var mock = RemoteMock.init();
     defer mock.deinit(std.testing.allocator);
@@ -2213,6 +2237,16 @@ test "remote tool execution end records tool result history" {
     try std.testing.expectEqualStrings("found", runtime.remote_messages.items[0].tool_result.content[0].text.text);
 }
 
+test "remote tool execution end records scalar tool result history" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"result_json\":\"\\\"skipped\\\"\",\"is_error\":true}");
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .tool_result);
+    try std.testing.expectEqualStrings("skipped", runtime.remote_messages.items[0].tool_result.content[0].text.text);
+    try std.testing.expect(runtime.remote_messages.items[0].tool_result.is_error);
+}
+
 test "remote submit preserves approval marker in serialized tools" {
     var original_ctx = OriginalApprovalCtx{ .decision = .approve };
     const tools = [_]agent.AgentTool{.{
@@ -2257,9 +2291,14 @@ test "remote message role is parsed when supplied" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
     try runtime.handleRemoteAgentEventJson("{\"type\":\"message_start\",\"role\":\"user\"}");
-    const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
-    try std.testing.expect(ev == .message_start);
-    try std.testing.expectEqual(TuiEvent.MessageRole.user, ev.message_start.role);
+    const user_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    try std.testing.expect(user_ev == .message_start);
+    try std.testing.expectEqual(TuiEvent.MessageRole.user, user_ev.message_start.role);
+
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"message_end\",\"role\":\"tool\"}");
+    const tool_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    try std.testing.expect(tool_ev == .message_end);
+    try std.testing.expectEqual(TuiEvent.MessageRole.tool_result, tool_ev.message_end.role);
 }
 
 test "remote disconnect attempts reconnect then emits terminal error" {
@@ -2359,7 +2398,7 @@ test "remote runtime integrates with in-process agent protocol server" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{
         .backend = .remote,
         .remote_sender = pipe.clientSender(),
-        .remote_receiver = .{ .ctx = &pipe, .read_line_fn = remotePipeReadLine },
+        .remote_receiver = .{ .ctx = &pipe, .read_line_fn = remotePipeReadLine, .read_result_fn = remotePipeReadResult },
         .models = &[_]ai_types.Model{test_model_a},
     });
     defer runtime.deinit();
@@ -2385,4 +2424,8 @@ fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u
     const pipe: *in_process.SerializedPipe = @ptrCast(@alignCast(ctx));
     var recv = pipe.clientReceiver();
     return recv.readLine(allocator);
+}
+
+fn remotePipeReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
+    return if (try remotePipeReadLine(ctx, allocator)) |line| .{ .line = line } else .pending;
 }

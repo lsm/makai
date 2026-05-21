@@ -935,7 +935,14 @@ fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_lo
         .short_description = short_description,
         .parameters_schema_json = parameters_schema_json,
         .execute = if (requires_approval) remoteApprovalRequiredExecute else unavailableAgentToolExecute,
+        .approval_fn = if (requires_approval) remoteApprovalRequiredDecision else null,
     };
+}
+
+fn remoteApprovalRequiredDecision(ctx: ?*anyopaque, request: agent_bridge.ToolApprovalRequest) agent_bridge.ToolApprovalDecision {
+    _ = ctx;
+    _ = request;
+    return .reject;
 }
 
 fn remoteApprovalRequiredExecute(
@@ -2678,6 +2685,12 @@ test "prepareAgentRun preserves remote tool approval requirement" {
     defer prepared.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), prepared.tools.len);
+    try std.testing.expect(prepared.tools[0].approval_fn != null);
+    try std.testing.expectEqual(agent_bridge.ToolApprovalDecision.reject, prepared.tools[0].approval_fn.?(prepared.tools[0].approval_ctx, .{
+        .tool_call_id = "call-1",
+        .tool_name = "shell_execute",
+        .args_json = "{}",
+    }));
     try std.testing.expectError(error.RemoteToolApprovalRequired, prepared.tools[0].execute("call-1", "{}", null, null, null, allocator));
 }
 
