@@ -384,6 +384,8 @@ pub const TuiRuntime = struct {
                 .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
+                .execute_ctx = tool.execute_ctx,
+                .execute_with_context = tool.execute_with_context,
                 .approval_ctx = &self.approval_contexts[i],
                 .approval_fn = approveTool,
                 .approval_ui_ctx = &self.approval_contexts[i],
@@ -821,6 +823,7 @@ const MockProtocolCtx = struct {
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
+    tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
 };
 
@@ -950,7 +953,7 @@ fn mockStream(
     }
 
     if (mock.tool_first and mock.call_count == 1) {
-        const content = [_]ai_types.AssistantContent{.{ .tool_call = .{ .id = "call-1", .name = "demo_tool", .arguments_json = "{}" } }};
+        const content = [_]ai_types.AssistantContent{.{ .tool_call = .{ .id = "call-1", .name = mock.tool_name, .arguments_json = "{}" } }};
         try stream.push(.{ .start = .{ .partial = emptyAssistantMessage(model, .tool_use) } });
         try pushDoneAndComplete(stream, allocator, model, &content, .tool_use);
         return stream;
@@ -1085,6 +1088,69 @@ fn demoTool(
     const content = try allocator.alloc(ai_types.UserContentPart, 1);
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "tool ok") } };
     return .{ .content = OwnedSlice(ai_types.UserContentPart).initOwned(content) };
+}
+
+const ContextToolCtx = struct { calls: usize = 0 };
+
+fn contextOnlyTool(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?agent.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    const state: *ContextToolCtx = @ptrCast(@alignCast(ctx.?));
+    state.calls += 1;
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "context tool ok") } };
+    return .{ .content = OwnedSlice(ai_types.UserContentPart).initOwned(content) };
+}
+
+test "runtime wrapper preserves context-aware tool execution" {
+    var context = ContextToolCtx{};
+    const tools = [_]agent.AgentTool{.{
+        .label = "Context",
+        .name = "context_tool",
+        .description = "Context tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .execute_ctx = &context,
+        .execute_with_context = contextOnlyTool,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{ .tool_first = true, .tool_name = "context_tool" };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("use context tool");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_tool_end = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .tool_execution_end => saw_tool_end = !ev.tool_execution_end.is_error,
+            .agent_end => break,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expect(saw_tool_end);
 }
 
 test "tool approval approve and reject paths emit tool events" {
