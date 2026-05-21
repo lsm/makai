@@ -850,9 +850,10 @@ pub fn build(b: *std.Build) void {
     const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
     const tools_file_mod = b.createModule(.{ .root_source_file = b.path("src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_hashline_mod = b.createModule(.{ .root_source_file = b.path("src/tools/hashline.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "protocol_tool_types", .module = protocol_tool_types_mod } } });
     const tools_search_mod = b.createModule(.{ .root_source_file = b.path("src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
-    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod } } });
+    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/hashline", .module = tools_hashline_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod } } });
 
     const tui_runtime_mod = b.createModule(.{
         .root_source_file = b.path("src/tui/runtime.zig"),
@@ -1355,6 +1356,7 @@ pub fn build(b: *std.Build) void {
     const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
     const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
     const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });
+    const tools_hashline_test = b.addTest(.{ .root_module = tools_hashline_mod });
     const tools_search_test = b.addTest(.{ .root_module = tools_search_mod });
     const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
     const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
@@ -1528,6 +1530,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_search_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
@@ -1651,6 +1654,7 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
@@ -1667,6 +1671,7 @@ pub fn build(b: *std.Build) void {
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
@@ -1715,6 +1720,7 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_file_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_search_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_registry_test).step);

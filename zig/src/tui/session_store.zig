@@ -881,15 +881,6 @@ fn parseRole(value: []const u8) tui_session.TuiEvent.MessageRole {
     return .assistant;
 }
 
-fn parseStopReason(value: []const u8) ai_types.StopReason {
-    if (std.mem.eql(u8, value, "length")) return .length;
-    if (std.mem.eql(u8, value, "tool_use")) return .tool_use;
-    if (std.mem.eql(u8, value, "content_filter")) return .content_filter;
-    if (std.mem.eql(u8, value, "error")) return .@"error";
-    if (std.mem.eql(u8, value, "aborted")) return .aborted;
-    return .stop;
-}
-
 fn parsePromptSegmentKind(value: []const u8) tui_session.TuiEvent.PromptSegmentKind {
     if (std.mem.eql(u8, value, "system_prompt")) return .system_prompt;
     if (std.mem.eql(u8, value, "tool_definitions")) return .tool_definitions;
@@ -899,6 +890,15 @@ fn parsePromptSegmentKind(value: []const u8) tui_session.TuiEvent.PromptSegmentK
 fn parsePromptSegmentCacheRole(value: []const u8) tui_session.TuiEvent.PromptSegmentCacheRole {
     if (std.mem.eql(u8, value, "stable")) return .stable;
     return .dynamic;
+}
+
+fn parseStopReason(value: []const u8) ai_types.StopReason {
+    if (std.mem.eql(u8, value, "length")) return .length;
+    if (std.mem.eql(u8, value, "tool_use")) return .tool_use;
+    if (std.mem.eql(u8, value, "content_filter")) return .content_filter;
+    if (std.mem.eql(u8, value, "error")) return .@"error";
+    if (std.mem.eql(u8, value, "aborted")) return .aborted;
+    return .stop;
 }
 
 fn parseEndReason(value: []const u8) tui_session.TuiEndReason {
