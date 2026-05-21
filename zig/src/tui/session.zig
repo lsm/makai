@@ -37,9 +37,14 @@ pub const TuiEvent = union(enum) {
     message_end: struct {
         role: MessageRole,
         text: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        content_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         tool_call_id: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         tool_name: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         args_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        tool_calls_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        artifacts_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+        is_error: bool = false,
     },
     tool_approval_requested: struct {
         tool_call_id: OwnedSlice(u8),
@@ -80,9 +85,13 @@ pub const TuiEvent = union(enum) {
             .tool_call_delta => |*p| p.delta.deinit(allocator),
             .message_end => |*p| {
                 p.text.deinit(allocator);
+                p.content_json.deinit(allocator);
                 p.tool_call_id.deinit(allocator);
                 p.tool_name.deinit(allocator);
                 p.args_json.deinit(allocator);
+                p.tool_calls_json.deinit(allocator);
+                p.details_json.deinit(allocator);
+                p.artifacts_json.deinit(allocator);
             },
             .tool_approval_requested => |*p| {
                 p.tool_call_id.deinit(allocator);

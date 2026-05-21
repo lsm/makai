@@ -866,6 +866,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });

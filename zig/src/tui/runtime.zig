@@ -6,6 +6,7 @@ const agent = @import("agent");
 const agent_protocol_client = @import("agent_protocol_client");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
+const json_writer = @import("json/writer");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const TuiSession = session.TuiSession;
@@ -399,36 +400,43 @@ pub const TuiRuntime = struct {
     fn messageEndPayload(self: *TuiRuntime, message: ai_types.Message) !@TypeOf(@as(TuiEvent, undefined).message_end) {
         var payload: @TypeOf(@as(TuiEvent, undefined).message_end) = .{ .role = messageRole(message) };
         switch (message) {
-            .user => |m| switch (m.content) {
-                .text => |text| payload.text = try self.dupeOwned(text),
-                .parts => |parts| for (parts) |part| switch (part) {
-                    .text => |text| {
-                        payload.text = try self.dupeOwned(text.text);
-                        break;
-                    },
-                    else => {},
-                },
+            .user => |m| {
+                payload.text = try self.dupeOwned(firstUserContentText(m.content));
+                const content_json = try serializeUserContent(self.allocator, m.content);
+                defer self.allocator.free(content_json);
+                payload.content_json = try self.dupeOwned(content_json);
             },
-            .assistant => |m| for (m.content) |block| switch (block) {
-                .text => |text| {
-                    payload.text = try self.dupeOwned(text.text);
-                    break;
-                },
-                .tool_call => |tool| {
-                    payload.tool_call_id = try self.dupeOwned(tool.id);
-                    payload.tool_name = try self.dupeOwned(tool.name);
-                    payload.args_json = try self.dupeOwned(tool.arguments_json);
-                    break;
-                },
-                else => {},
+            .assistant => |m| {
+                payload.text = try self.dupeOwned(assistantText(m.content));
+                const content_json = try serializeAssistantContent(self.allocator, m.content);
+                defer self.allocator.free(content_json);
+                const tool_calls_json = try serializeToolCalls(self.allocator, m.content);
+                defer self.allocator.free(tool_calls_json);
+                payload.content_json = try self.dupeOwned(content_json);
+                payload.tool_calls_json = try self.dupeOwned(tool_calls_json);
             },
             .tool_result => |m| {
                 payload.tool_call_id = try self.dupeOwned(m.tool_call_id);
                 payload.tool_name = try self.dupeOwned(m.tool_name);
                 payload.text = try self.dupeOwned(firstUserPartText(m.content));
+                const content_json = try serializeUserParts(self.allocator, m.content);
+                defer self.allocator.free(content_json);
+                const artifacts_json = try serializeArtifacts(self.allocator, m.artifacts.slice());
+                defer self.allocator.free(artifacts_json);
+                payload.content_json = try self.dupeOwned(content_json);
+                payload.details_json = try self.dupeOwned(m.details_json.slice());
+                payload.artifacts_json = try self.dupeOwned(artifacts_json);
+                payload.is_error = m.is_error;
             },
         }
         return payload;
+    }
+
+    fn firstUserContentText(content: ai_types.UserContent) []const u8 {
+        return switch (content) {
+            .text => |text| text,
+            .parts => |parts| firstUserPartText(parts),
+        };
     }
 
     fn firstUserPartText(parts: []const ai_types.UserContentPart) []const u8 {
@@ -437,6 +445,131 @@ pub const TuiRuntime = struct {
             else => {},
         };
         return "";
+    }
+
+    fn assistantText(content: []const ai_types.AssistantContent) []const u8 {
+        for (content) |block| switch (block) {
+            .text => |text| return text.text,
+            else => {},
+        };
+        return "";
+    }
+
+    fn serializeUserContent(allocator: std.mem.Allocator, content: ai_types.UserContent) ![]u8 {
+        return switch (content) {
+            .text => |text| blk: {
+                var buf: std.ArrayList(u8) = .empty;
+                errdefer buf.deinit(allocator);
+                var w = json_writer.JsonWriter.init(&buf, allocator);
+                try w.beginArray();
+                try writeUserTextPart(&w, text, null);
+                try w.endArray();
+                break :blk try buf.toOwnedSlice(allocator);
+            },
+            .parts => |parts| serializeUserParts(allocator, parts),
+        };
+    }
+
+    fn serializeUserParts(allocator: std.mem.Allocator, parts: []const ai_types.UserContentPart) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var w = json_writer.JsonWriter.init(&buf, allocator);
+        try w.beginArray();
+        for (parts) |part| switch (part) {
+            .text => |text| try writeUserTextPart(&w, text.text, text.text_signature),
+            .image => |image| try writeImagePart(&w, image),
+        };
+        try w.endArray();
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn serializeAssistantContent(allocator: std.mem.Allocator, content: []const ai_types.AssistantContent) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var w = json_writer.JsonWriter.init(&buf, allocator);
+        try w.beginArray();
+        for (content) |block| switch (block) {
+            .text => |text| try writeAssistantTextPart(&w, text),
+            .thinking => |thinking| try writeThinkingPart(&w, thinking),
+            .tool_call => |tool| try writeToolCallPart(&w, tool),
+            .image => |image| try writeImagePart(&w, image),
+        };
+        try w.endArray();
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn serializeToolCalls(allocator: std.mem.Allocator, content: []const ai_types.AssistantContent) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var w = json_writer.JsonWriter.init(&buf, allocator);
+        try w.beginArray();
+        for (content) |block| switch (block) {
+            .tool_call => |tool| try writeToolCallPart(&w, tool),
+            else => {},
+        };
+        try w.endArray();
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn serializeArtifacts(allocator: std.mem.Allocator, artifacts: []const ai_types.ArtifactReference) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var w = json_writer.JsonWriter.init(&buf, allocator);
+        try w.beginArray();
+        for (artifacts) |artifact| {
+            try w.beginObject();
+            try w.writeStringField("artifact_id", artifact.artifact_id);
+            try w.writeStringField("uri", artifact.uri.slice());
+            try w.writeStringField("mime_type", artifact.mime_type.slice());
+            if (artifact.byte_size) |size| try w.writeIntField("byte_size", size);
+            try w.writeStringField("sha256", artifact.sha256.slice());
+            try w.writeStringField("description", artifact.description.slice());
+            try w.endObject();
+        }
+        try w.endArray();
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn writeUserTextPart(w: *json_writer.JsonWriter, text: []const u8, signature: ?[]const u8) !void {
+        try w.beginObject();
+        try w.writeStringField("type", "text");
+        try w.writeStringField("text", text);
+        if (signature) |sig| try w.writeStringField("text_signature", sig);
+        try w.endObject();
+    }
+
+    fn writeAssistantTextPart(w: *json_writer.JsonWriter, text: ai_types.TextContent) !void {
+        try w.beginObject();
+        try w.writeStringField("type", "text");
+        try w.writeStringField("text", text.text);
+        if (text.text_signature) |sig| try w.writeStringField("text_signature", sig);
+        try w.endObject();
+    }
+
+    fn writeThinkingPart(w: *json_writer.JsonWriter, thinking: ai_types.ThinkingContent) !void {
+        try w.beginObject();
+        try w.writeStringField("type", "thinking");
+        try w.writeStringField("thinking", thinking.thinking);
+        if (thinking.thinking_signature) |sig| try w.writeStringField("thinking_signature", sig);
+        try w.endObject();
+    }
+
+    fn writeToolCallPart(w: *json_writer.JsonWriter, tool: ai_types.ToolCall) !void {
+        try w.beginObject();
+        try w.writeStringField("type", "tool_call");
+        try w.writeStringField("id", tool.id);
+        try w.writeStringField("name", tool.name);
+        try w.writeStringField("arguments_json", tool.arguments_json);
+        if (tool.thought_signature) |sig| try w.writeStringField("thought_signature", sig);
+        try w.endObject();
+    }
+
+    fn writeImagePart(w: *json_writer.JsonWriter, image: ai_types.ImageContent) !void {
+        try w.beginObject();
+        try w.writeStringField("type", "image");
+        try w.writeStringField("data", image.data);
+        try w.writeStringField("mime_type", image.mime_type);
+        try w.endObject();
     }
 
     fn onAgentEvent(ctx: ?*anyopaque, event: agent.AgentEvent) void {
