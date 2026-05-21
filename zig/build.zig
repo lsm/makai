@@ -898,6 +898,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tui_commands_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/commands.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_state", .module = tui_state_mod },
+        },
+    });
+
     const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
@@ -919,6 +930,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_commands", .module = tui_commands_mod },
             .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },
             .{ .name = "tui_view_composer", .module = tui_view_composer_mod },
             .{ .name = "tui_view_status_bar", .module = tui_view_status_bar_mod },
@@ -1314,6 +1326,7 @@ pub fn build(b: *std.Build) void {
     const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
     const tui_session_store_test = b.addTest(.{ .root_module = tui_session_store_mod });
     const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
+    const tui_commands_test = b.addTest(.{ .root_module = tui_commands_mod });
     const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
     const tui_view_transcript_test = b.addTest(.{ .root_module = tui_view_transcript_mod });
     const tui_view_composer_test = b.addTest(.{ .root_module = tui_view_composer_mod });
@@ -1515,6 +1528,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
@@ -1671,6 +1685,7 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
