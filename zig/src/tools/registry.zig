@@ -7,6 +7,7 @@ const search = @import("tools/search");
 const workspace = @import("tools/workspace");
 const artifact = @import("tools/artifact");
 const hashline = @import("tools/hashline");
+pub const mcp_bridge = @import("tools/mcp_bridge");
 
 pub const ToolRegistry = struct {
     tools: std.ArrayList(agent.AgentTool) = .empty,
@@ -37,6 +38,13 @@ pub const ToolRegistry = struct {
 
     pub fn registerDefaults(self: *ToolRegistry, allocator: std.mem.Allocator) !void {
         for (defaultTools()) |tool| try self.register(allocator, tool);
+    }
+
+    pub fn registerMcpBridge(self: *ToolRegistry, allocator: std.mem.Allocator, bridge: *mcp_bridge.McpBridge) !void {
+        var tools = std.ArrayList(agent.AgentTool).empty;
+        defer tools.deinit(allocator);
+        try bridge.appendAgentTools(&tools);
+        for (tools.items) |tool| try self.replaceOrRegister(allocator, tool);
     }
 
     pub fn resolve(self: *const ToolRegistry, name: []const u8) ?agent.AgentTool {

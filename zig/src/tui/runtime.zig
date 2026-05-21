@@ -7,6 +7,7 @@ const agent_protocol_client = @import("agent_protocol_client");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
 const json_writer = @import("json_writer");
+const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const TuiSession = session.TuiSession;
@@ -45,6 +46,8 @@ pub const TuiRuntimeOptions = struct {
     models: []const ai_types.Model = &.{},
     initial_model_id: ?[]const u8 = null,
     tools: []const agent.AgentTool = &.{},
+    mcp_config_json: ?[]const u8 = null,
+    permission_engine: ?*permission.PermissionEngine = null,
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
     compact_output: bool = false,
@@ -61,6 +64,7 @@ pub const TuiRuntime = struct {
     remote_client: ?agent_protocol_client.AgentProtocolClient = null,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
+    mcp_bridge: ?*local_tools.mcp_bridge.McpBridge = null,
     original_tools: []agent.AgentTool,
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
@@ -68,6 +72,7 @@ pub const TuiRuntime = struct {
     approval_mutex: std.atomic.Mutex = .unlocked,
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
+    permission_engine: ?*permission.PermissionEngine,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -83,6 +88,22 @@ pub const TuiRuntime = struct {
         var tool_registry = local_tools.ToolRegistry.init();
         errdefer tool_registry.deinit(allocator);
         try tool_registry.registerDefaults(allocator);
+
+        var mcp_bridge: ?*local_tools.mcp_bridge.McpBridge = null;
+        errdefer if (mcp_bridge) |bridge| {
+            bridge.deinit();
+            allocator.destroy(bridge);
+        };
+        if (options.mcp_config_json) |config_json| {
+            const bridge = try allocator.create(local_tools.mcp_bridge.McpBridge);
+            bridge.* = local_tools.mcp_bridge.McpBridge.init(allocator);
+            bridge.bind();
+            mcp_bridge = bridge;
+            try bridge.loadConfigJson(config_json);
+            try bridge.discover();
+            try tool_registry.registerMcpBridge(allocator, bridge);
+        }
+
         for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
 
         const original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
@@ -115,11 +136,13 @@ pub const TuiRuntime = struct {
             .selected_model_index = selected,
             .event_stream = TuiEventStream.init(allocator),
             .tool_registry = tool_registry,
+            .mcp_bridge = mcp_bridge,
             .original_tools = original_tools,
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
+            .permission_engine = options.permission_engine,
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
@@ -134,6 +157,10 @@ pub const TuiRuntime = struct {
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
+        if (self.mcp_bridge) |bridge| {
+            bridge.deinit();
+            self.allocator.destroy(bridge);
+        }
         self.tool_registry.deinit(self.allocator);
         self.allocator.free(self.models);
         self.* = undefined;
@@ -146,7 +173,7 @@ pub const TuiRuntime = struct {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
                 self.rebuildWrappedTools();
-                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output });
+                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output, .permission_engine = self.permission_engine });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
@@ -192,6 +219,10 @@ pub const TuiRuntime = struct {
     pub fn currentModel(self: *TuiRuntime) ?ai_types.Model {
         if (self.selected_model_index) |idx| return self.models[idx];
         return null;
+    }
+
+    pub fn availableTools(self: *TuiRuntime) []const agent.AgentTool {
+        return self.original_tools;
     }
 
     pub fn switchModel(self: *TuiRuntime, model_id: []const u8) !void {
