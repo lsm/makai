@@ -7,6 +7,7 @@ const register_builtins = @import("register_builtins");
 const agent = @import("agent");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
+const tui_commands = @import("tui_commands");
 const transcript_view = @import("tui_view_transcript");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
@@ -138,7 +139,7 @@ pub const App = struct {
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
-        if (std.mem.eql(u8, trimmed, "/quit")) return error.QuitRequested;
+        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
@@ -146,6 +147,46 @@ pub const App = struct {
                 try self.state.appendTranscript(.@"error", @errorName(err));
                 return;
             };
+        }
+    }
+
+    fn submitCommand(self: *App, text: []const u8) !void {
+        var parsed = tui_commands.parseOrMessage(self.allocator, text) catch |err| {
+            try self.state.status.setError(self.allocator, @errorName(err));
+            try self.state.appendTranscript(.@"error", @errorName(err));
+            return;
+        };
+        defer parsed.deinit(self.allocator);
+
+        const command = switch (parsed) {
+            .message => |message| {
+                try self.state.status.setError(self.allocator, message);
+                try self.state.appendTranscript(.@"error", message);
+                return;
+            },
+            .command => |command| command,
+        };
+
+        var result = tui_commands.dispatch(.{
+            .allocator = self.allocator,
+            .state = &self.state,
+            .runtime = if (self.runtime) |*runtime| runtime else null,
+            .session = if (self.session) |*session| session else null,
+        }, command) catch |err| {
+            try self.state.status.setError(self.allocator, @errorName(err));
+            try self.state.appendTranscript(.@"error", @errorName(err));
+            return;
+        };
+        defer result.deinit(self.allocator);
+
+        switch (result.action) {
+            .quit => return error.QuitRequested,
+            .clear_transcript => self.state.clearTranscript(),
+            .none => {},
+        }
+        if (result.output.len > 0) {
+            try self.state.appendTranscript(if (result.is_error) .@"error" else .system, result.output);
+            if (result.is_error) try self.state.status.setError(self.allocator, result.output);
         }
     }
 
@@ -266,7 +307,6 @@ const TuiModel = struct {
                             return .none;
                         }
                         const text = app.state.composer.text();
-                        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "/quit")) return .quit;
                         app.submit(text) catch |err| {
                             if (err == error.QuitRequested) return .quit;
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -371,4 +411,28 @@ test "App submit appends user transcript without runtime" {
     try app.submit("hello");
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqualStrings("hello", app.state.transcript.items[0].text.items);
+}
+
+test "App submit routes help command to system transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/help");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
+}
+
+test "App submit routes unknown command to error transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/unknown");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.@"error", app.state.transcript.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "unknown command") != null);
+}
+
+test "App submit quit command requests quit" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
 }
