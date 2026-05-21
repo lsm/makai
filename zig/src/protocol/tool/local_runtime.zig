@@ -11,6 +11,9 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 const PipeTransport = in_process.SerializedPipe;
 
 const ExecutionContext = struct {
+    // Single in-process dispatch context for synchronous LocalToolProtocol pump.
+    // Recursive LocalToolProtocol.execute calls on same thread would clobber this
+    // state; do not add nested dispatch without replacing this bridge.
     threadlocal var current: ExecutionContext = .{};
 
     cancel_token: ?ai_types.CancelToken = null,
@@ -156,74 +159,33 @@ pub const ToolProtocolServer = struct {
 };
 
 pub const ToolProtocolClient = struct {
-    pipe: *PipeTransport,
     server_id: tool_types.Ulid,
     sequence: u64 = 0,
 
-    pub fn init(pipe: *PipeTransport) ToolProtocolClient {
-        return .{ .pipe = pipe, .server_id = tool_types.generateUlid() };
+    pub fn init() ToolProtocolClient {
+        return .{ .server_id = tool_types.generateUlid() };
     }
 
-    pub fn execute(
+    pub fn nextExecuteEnvelope(
         self: *ToolProtocolClient,
         tool_call_id: []const u8,
         tool_name: []const u8,
         args_json: []const u8,
         allocator: std.mem.Allocator,
-    ) !agent_types.AgentToolResult {
-        const execution_id = tool_types.generateUlid();
+    ) !tool_types.Envelope {
         self.sequence += 1;
-        var env = tool_types.Envelope{
+        return .{
             .server_id = self.server_id,
             .message_id = tool_types.generateUlid(),
             .sequence = self.sequence,
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .tool_execute = .{
-                .execution_id = execution_id,
+                .execution_id = tool_types.generateUlid(),
                 .tool_call_id = try allocator.dupe(u8, tool_call_id),
                 .tool_name = try allocator.dupe(u8, tool_name),
                 .args_json = try allocator.dupe(u8, args_json),
             } },
         };
-        defer env.deinit(allocator);
-
-        const json = try tool_envelope.serializeEnvelope(env, allocator);
-        defer allocator.free(json);
-
-        var sender = self.pipe.clientSender();
-        try sender.write(json);
-        try sender.flush();
-
-        var recv = self.pipe.clientReceiver();
-        while (try recv.readLine(allocator)) |line| {
-            defer allocator.free(line);
-            var response = try tool_envelope.deserializeEnvelope(line, allocator);
-            defer response.deinit(allocator);
-            switch (response.payload) {
-                .tool_result => |res| return try agentToolResultFromProtocol(allocator, res),
-                .tool_error => |err| return toolErrorToError(err.code),
-                else => {},
-            }
-        }
-
-        return error.ToolProtocolNoResponse;
-    }
-
-    pub fn executeFn(
-        ctx: ?*anyopaque,
-        tool_call_id: []const u8,
-        tool_name: []const u8,
-        args_json: []const u8,
-        cancel_token: ?ai_types.CancelToken,
-        on_update_ctx: ?*anyopaque,
-        on_update: ?agent_types.ToolUpdateCallback,
-        allocator: std.mem.Allocator,
-    ) anyerror!agent_types.AgentToolResult {
-        _ = cancel_token;
-        _ = on_update_ctx;
-        _ = on_update;
-        const self: *ToolProtocolClient = @ptrCast(@alignCast(ctx.?));
-        return self.execute(tool_call_id, tool_name, args_json, allocator);
     }
 };
 
@@ -239,7 +201,7 @@ pub const LocalToolProtocol = struct {
         var server = ToolProtocolServer.init(allocator);
         errdefer server.deinit();
         try server.registerTools(tools);
-        const client = ToolProtocolClient.init(&pipe);
+        const client = ToolProtocolClient.init();
         return .{
             .allocator = allocator,
             .pipe = pipe,
@@ -280,21 +242,8 @@ pub const LocalToolProtocol = struct {
         allocator: std.mem.Allocator,
     ) !agent_types.AgentToolResult {
         if (override_fn) |exec| return exec(override_ctx, tool_call_id, tool_name, args_json, cancel_token, on_update_ctx, on_update, allocator);
-        const execution_id = tool_types.generateUlid();
-        self.client.sequence += 1;
         self.pipe.compact();
-        var env = tool_types.Envelope{
-            .server_id = self.client.server_id,
-            .message_id = tool_types.generateUlid(),
-            .sequence = self.client.sequence,
-            .timestamp = compat.time.nowMillis(),
-            .payload = .{ .tool_execute = .{
-                .execution_id = execution_id,
-                .tool_call_id = try allocator.dupe(u8, tool_call_id),
-                .tool_name = try allocator.dupe(u8, tool_name),
-                .args_json = try allocator.dupe(u8, args_json),
-            } },
-        };
+        var env = try self.client.nextExecuteEnvelope(tool_call_id, tool_name, args_json, allocator);
         defer env.deinit(allocator);
 
         const json = try tool_envelope.serializeEnvelope(env, allocator);

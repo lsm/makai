@@ -56,9 +56,6 @@ pub const ToolRegistry = struct {
         return self.tools.items;
     }
 
-    pub fn registerWithProtocolServer(self: *const ToolRegistry, server: anytype) !void {
-        try server.registerTools(self.tools.items);
-    }
 };
 
 pub fn defaultTools() []const agent.AgentTool {
