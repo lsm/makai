@@ -20,8 +20,17 @@ pub const ApprovalWaiter = struct {
     mutex: std.atomic.Mutex = .unlocked,
     tool_call_id: []u8 = &.{},
     decision: ?tui_runtime.ToolApprovalDecision = null,
+    shutting_down: bool = false,
+
+    pub fn cancel(self: *ApprovalWaiter) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.shutting_down = true;
+        self.decision = .reject;
+    }
 
     pub fn deinit(self: *ApprovalWaiter) void {
+        self.cancel();
         if (self.tool_call_id.len > 0) self.allocator.free(self.tool_call_id);
         self.* = undefined;
     }
@@ -95,6 +104,7 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.approval_waiter) |waiter| waiter.cancel();
         if (self.runtime) |*runtime| runtime.deinit();
         if (self.approval_waiter) |waiter| {
             waiter.deinit();
@@ -146,16 +156,20 @@ pub const App = struct {
 
     pub fn decideApproval(self: *App, approved: bool, always: bool) !void {
         const id = self.state.approval.tool_call_id;
-        const decision: tui_runtime.ToolApprovalDecision = if (approved) .approve else .reject;
+        const decision: tui_runtime.ToolApprovalDecision = if (approved) if (always) .approve_always else .approve else if (always) .reject_always else .reject;
+        var matched_waiter = false;
         if (self.approval_waiter) |waiter| {
             while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
             defer waiter.mutex.unlock();
             if (waiter.tool_call_id.len > 0 and (id.len == 0 or std.mem.eql(u8, waiter.tool_call_id, id))) {
                 waiter.decision = decision;
+                matched_waiter = true;
             }
         }
-        if (self.session) |*session| {
-            if (id.len > 0) try session.decideToolApproval(id, decision);
+        if (!matched_waiter) {
+            if (self.session) |*session| {
+                if (id.len > 0) try session.decideToolApproval(id, decision);
+            }
         }
         self.state.setApprovalDecision(approved, always);
     }
@@ -174,6 +188,7 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
     while (true) {
         while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
         const decision = waiter.decision;
+        const shutting_down = waiter.shutting_down;
         waiter.mutex.unlock();
         if (decision) |value| {
             while (!waiter.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -183,6 +198,7 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
             waiter.mutex.unlock();
             return value;
         }
+        if (shutting_down) return .reject;
         compat.time.sleepNs(1 * std.time.ns_per_ms);
     }
 }
