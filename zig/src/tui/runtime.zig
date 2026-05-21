@@ -657,8 +657,8 @@ pub const TuiRuntime = struct {
                 .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
-                .execute_ctx = tool.execute_ctx,
-                .execute_with_context = tool.execute_with_context,
+                .runtime_ctx = tool.runtime_ctx,
+                .runtime_execute = tool.runtime_execute,
                 .approval_ctx = &self.approval_contexts[i],
                 .approval_fn = approveTool,
                 .approval_ui_ctx = &self.approval_contexts[i],
@@ -2063,8 +2063,8 @@ test "runtime wrapper preserves context-aware tool execution" {
         .description = "Context tool",
         .parameters_schema_json = "{}",
         .execute = demoTool,
-        .execute_ctx = &context,
-        .execute_with_context = contextOnlyTool,
+        .runtime_ctx = &context,
+        .runtime_execute = contextOnlyTool,
     }};
     const models = [_]ai_types.Model{test_model_a};
     var mock = MockProtocolCtx{ .tool_first = true, .tool_name = "context_tool" };

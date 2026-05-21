@@ -179,6 +179,17 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
+/// Context-aware runtime function used only inside ToolProtocolServer.
+pub const ToolRuntimeExecuteFn = *const fn (
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult;
+
 /// Single tool protocol dispatch path used by the agent loop.
 pub const ToolProtocolExecuteFn = *const fn (
     ctx: ?*anyopaque,
@@ -263,6 +274,8 @@ pub const AgentTool = struct {
     short_description: ?[]const u8 = null,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
+    runtime_ctx: ?*anyopaque = null,
+    runtime_execute: ?ToolRuntimeExecuteFn = null,
     approval_ctx: ?*anyopaque = null,
     approval_fn: ?ToolApprovalFn = null,
     approval_ui_ctx: ?*anyopaque = null,
