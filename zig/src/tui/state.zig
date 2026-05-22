@@ -254,6 +254,8 @@ pub const AppState = struct {
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
+    active_assistant_entry: ?usize = null,
+    active_tool_result_entry: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator) AppState {
         return .{ .allocator = allocator };
@@ -312,17 +314,17 @@ pub const AppState = struct {
                 self.status.turn_count += 1;
             },
             .message_start => |payload| switch (payload.role) {
-                .assistant => try self.ensureTrailingEntry(.assistant),
-                .user => try self.ensureTrailingEntry(.user),
-                .tool_result => try self.ensureTrailingEntry(.tool),
+                .assistant => self.active_assistant_entry = try self.ensureTrailingEntry(.assistant),
+                .user => _ = try self.ensureTrailingEntry(.user),
+                .tool_result => self.active_tool_result_entry = try self.appendEmptyTranscript(.tool),
             },
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
             .thinking_delta => |payload| try self.appendDelta(.thinking, payload.delta.slice()),
             .tool_call_delta => |payload| try self.appendDelta(.tool, payload.delta.slice()),
             .message_end => |payload| switch (payload.role) {
-                .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice()),
-                .user => try self.finishTranscriptEntry(.user, payload.text.slice()),
-                .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice()),
+                .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
+                .user => try self.finishTranscriptEntry(.user, payload.text.slice(), null),
+                .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice(), &self.active_tool_result_entry),
             },
             .tool_approval_requested => |payload| {
                 try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice());
@@ -426,26 +428,54 @@ pub const AppState = struct {
         try self.preview.set(self.allocator, .diff, path, out.items);
     }
 
-    fn ensureTrailingEntry(self: *AppState, kind: TranscriptKind) !void {
-        if (self.transcript.items.len > 0 and self.transcript.items[self.transcript.items.len - 1].kind == kind) return;
+    fn ensureTrailingEntry(self: *AppState, kind: TranscriptKind) !usize {
+        if (self.transcript.items.len == 0 or self.transcript.items[self.transcript.items.len - 1].kind != kind) {
+            return try self.appendEmptyTranscript(kind);
+        }
+        return self.transcript.items.len - 1;
+    }
+
+    fn appendEmptyTranscript(self: *AppState, kind: TranscriptKind) !usize {
         try self.appendTranscript(kind, "");
+        return self.transcript.items.len - 1;
     }
 
     fn appendDelta(self: *AppState, kind: TranscriptKind, delta: []const u8) !void {
-        try self.ensureTrailingEntry(kind);
-        try self.transcript.items[self.transcript.items.len - 1].text.appendSlice(self.allocator, delta);
+        const index = try self.ensureTrailingEntry(kind);
+        switch (kind) {
+            .assistant => self.active_assistant_entry = index,
+            .tool => self.active_tool_result_entry = index,
+            else => {},
+        }
+        try self.transcript.items[index].text.appendSlice(self.allocator, delta);
     }
 
-    fn finishTranscriptEntry(self: *AppState, kind: TranscriptKind, text: []const u8) !void {
-        if (text.len == 0) return;
-        if (self.transcript.items.len > 0 and self.transcript.items[self.transcript.items.len - 1].kind == kind) {
-            const entry = &self.transcript.items[self.transcript.items.len - 1];
-            if (std.mem.eql(u8, entry.text.items, text)) return;
-            entry.text.clearRetainingCapacity();
-            try entry.text.appendSlice(self.allocator, text);
+    fn finishTranscriptEntry(self: *AppState, kind: TranscriptKind, text: []const u8, active_entry: ?*?usize) !void {
+        if (text.len == 0) {
+            if (active_entry) |entry| entry.* = null;
             return;
         }
+
+        if (active_entry) |entry| {
+            if (entry.*) |index| {
+                if (index < self.transcript.items.len and self.transcript.items[index].kind == kind) {
+                    try self.replaceEntryText(index, text);
+                    entry.* = null;
+                    return;
+                }
+            }
+            entry.* = null;
+        }
+
+        if (self.transcript.items.len > 0 and self.transcript.items[self.transcript.items.len - 1].kind == kind and std.mem.eql(u8, self.transcript.items[self.transcript.items.len - 1].text.items, text)) return;
         try self.appendTranscript(kind, text);
+    }
+
+    fn replaceEntryText(self: *AppState, index: usize, text: []const u8) !void {
+        const entry = &self.transcript.items[index];
+        if (std.mem.eql(u8, entry.text.items, text)) return;
+        entry.text.clearRetainingCapacity();
+        try entry.text.appendSlice(self.allocator, text);
     }
 
     fn applyContextUsage(self: *AppState, payload: anytype) void {
@@ -640,6 +670,67 @@ test "AppState message_end user text avoids duplicate submitted message" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello", state.transcript.items[0].text.items);
+}
+
+test "AppState message_end updates active assistant before trailing tool" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    var text_delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("partial") } };
+    defer text_delta.deinit(std.testing.allocator);
+    try state.applyEvent(text_delta);
+
+    var tool_delta = tui_runtime.TuiEvent{ .tool_call_delta = .{ .content_index = 1, .delta = try ownedText("{\"name\":\"shell\"}") } };
+    defer tool_delta.deinit(std.testing.allocator);
+    try state.applyEvent(tool_delta);
+
+    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText("final assistant") } };
+    defer assistant_end.deinit(std.testing.allocator);
+    try state.applyEvent(assistant_end);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("final assistant", state.transcript.items[0].text.items);
+    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell") != null);
+}
+
+test "AppState message_end-only assistant appends after prior assistant" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.assistant, "previous response");
+    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText("next response") } };
+    defer assistant_end.deinit(std.testing.allocator);
+    try state.applyEvent(assistant_end);
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqualStrings("previous response", state.transcript.items[0].text.items);
+    try std.testing.expectEqualStrings("next response", state.transcript.items[1].text.items);
+}
+
+test "AppState tool_result message_end updates active tool entry only" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.tool, "shell_execute");
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var tool_result_a = tui_runtime.TuiEvent{ .message_end = .{ .role = .tool_result, .text = try ownedText("first result") } };
+    defer tool_result_a.deinit(std.testing.allocator);
+    try state.applyEvent(tool_result_a);
+
+    try state.appendTranscript(.tool, "file_read");
+    try state.applyEvent(.{ .message_start = .{ .role = .tool_result } });
+    var tool_result_b = tui_runtime.TuiEvent{ .message_end = .{ .role = .tool_result, .text = try ownedText("second result") } };
+    defer tool_result_b.deinit(std.testing.allocator);
+    try state.applyEvent(tool_result_b);
+
+    try std.testing.expectEqual(@as(usize, 4), state.transcript.items.len);
+    try std.testing.expectEqualStrings("shell_execute", state.transcript.items[0].text.items);
+    try std.testing.expectEqualStrings("first result", state.transcript.items[1].text.items);
+    try std.testing.expectEqualStrings("file_read", state.transcript.items[2].text.items);
+    try std.testing.expectEqualStrings("second result", state.transcript.items[3].text.items);
 }
 
 test "AppState approval flow transitions pending to approved and rejected" {
