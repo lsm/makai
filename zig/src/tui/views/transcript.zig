@@ -57,12 +57,12 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, widt
 }
 
 fn renderEntryText(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8, width: usize) ![]const u8 {
+    if (kind == .assistant) {
+        var markdown = zz.Markdown.init();
+        markdown.width = @intCast(@min(width, std.math.maxInt(u16)));
+        return markdown.render(allocator, text);
+    }
     const styled = switch (kind) {
-        .assistant => blk: {
-            var markdown = zz.Markdown.init();
-            markdown.width = @intCast(@min(width, std.math.maxInt(u16)));
-            break :blk try markdown.render(allocator, text);
-        },
         .@"error" => try tui_theme.errorText().render(allocator, text),
         .thinking => try tui_theme.role(.thinking).render(allocator, text),
         .system => try tui_theme.muted().render(allocator, text),
@@ -159,4 +159,15 @@ test "transcript renders markdown syntax" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Heading") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "item") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") == null);
+}
+
+test "transcript keeps assistant code indentation" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```zig\n    const x = 1;\n```\n");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "    const x") != null);
 }

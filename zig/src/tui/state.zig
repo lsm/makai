@@ -248,17 +248,20 @@ pub const ComposerState = struct {
     buffer: std.ArrayList(u8) = .empty,
     history: std.ArrayList([]u8) = .empty,
     history_index: ?usize = null,
+    history_draft: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *ComposerState, allocator: std.mem.Allocator) void {
         self.buffer.deinit(allocator);
         for (self.history.items) |item| allocator.free(item);
         self.history.deinit(allocator);
+        self.history_draft.deinit(allocator);
         self.* = undefined;
     }
 
     pub fn clear(self: *ComposerState) void {
         self.buffer.clearRetainingCapacity();
         self.history_index = null;
+        self.history_draft.clearRetainingCapacity();
     }
 
     pub fn text(self: ComposerState) []const u8 {
@@ -337,10 +340,18 @@ pub const AppState = struct {
         }
         const submitted = try self.allocator.dupe(u8, raw);
         errdefer self.allocator.free(submitted);
-        try self.composer.history.append(self.allocator, try self.allocator.dupe(u8, submitted));
+        try self.recordComposerHistory(submitted);
         self.composer.clear();
         try self.appendUserMessage(submitted);
         return submitted;
+    }
+
+    pub fn recordComposerHistory(self: *AppState, text: []const u8) !void {
+        const raw = std.mem.trim(u8, text, " \t\r\n");
+        if (raw.len == 0) return;
+        try self.composer.history.append(self.allocator, try self.allocator.dupe(u8, raw));
+        self.composer.history_index = null;
+        self.composer.history_draft.clearRetainingCapacity();
     }
 
     pub fn replaceComposerBuffer(self: *AppState, text: []const u8) !void {
@@ -350,10 +361,16 @@ pub const AppState = struct {
 
     pub fn composerHistoryPrev(self: *AppState) !bool {
         if (self.composer.history.items.len == 0) return false;
-        const next_index = if (self.composer.history_index) |index|
-            index -| 1
-        else
-            self.composer.history.items.len - 1;
+        if (self.composer.history_index) |index| {
+            if (index == 0) return false;
+            const next_index = index - 1;
+            self.composer.history_index = next_index;
+            try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+            return true;
+        }
+        self.composer.history_draft.clearRetainingCapacity();
+        try self.composer.history_draft.appendSlice(self.allocator, self.composer.buffer.items);
+        const next_index = self.composer.history.items.len - 1;
         self.composer.history_index = next_index;
         try self.replaceComposerBuffer(self.composer.history.items[next_index]);
         return true;
@@ -363,7 +380,8 @@ pub const AppState = struct {
         const current = self.composer.history_index orelse return false;
         if (current + 1 >= self.composer.history.items.len) {
             self.composer.history_index = null;
-            self.composer.buffer.clearRetainingCapacity();
+            try self.replaceComposerBuffer(self.composer.history_draft.items);
+            self.composer.history_draft.clearRetainingCapacity();
             return true;
         }
         const next_index = current + 1;
@@ -1171,21 +1189,24 @@ test "Composer submission stores history and user transcript" {
     try std.testing.expectEqualStrings("hello makai", state.transcript.items[0].text.items);
 }
 
-test "Composer history navigation recalls entries and clears at end" {
+test "Composer history navigation recalls entries and restores draft" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
     try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "first"));
     try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "second"));
+    try state.composer.buffer.appendSlice(std.testing.allocator, "draft");
 
     try std.testing.expect(try state.composerHistoryPrev());
     try std.testing.expectEqualStrings("second", state.composer.text());
     try std.testing.expect(try state.composerHistoryPrev());
     try std.testing.expectEqualStrings("first", state.composer.text());
+    try std.testing.expect(!try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("first", state.composer.text());
     try std.testing.expect(try state.composerHistoryNext());
     try std.testing.expectEqualStrings("second", state.composer.text());
     try std.testing.expect(try state.composerHistoryNext());
-    try std.testing.expectEqualStrings("", state.composer.text());
+    try std.testing.expectEqualStrings("draft", state.composer.text());
 }
 
 test "AppState toggles thinking visibility" {

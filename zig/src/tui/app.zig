@@ -292,8 +292,11 @@ const TuiModel = struct {
                 if (key.modifiers.ctrl) switch (key.key) {
                     .char => |c| switch (c) {
                         'c' => return .quit,
-                        'r' => app.state.toggleThinking(),
-                        else => {},
+                        'r' => {
+                            app.state.toggleThinking();
+                            return .none;
+                        },
+                        else => return .none,
                     },
                     else => {},
                 };
@@ -317,6 +320,7 @@ const TuiModel = struct {
                             return .none;
                         }
                         const text = app.state.composer.text();
+                        app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         app.submit(text) catch |err| {
                             if (err == error.QuitRequested) return .quit;
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
