@@ -312,7 +312,7 @@ pub const AppState = struct {
             .turn_start => {
                 self.status.streaming = true;
                 self.status.turn_count += 1;
-                self.clearActiveTranscriptEntries();
+                self.cleanupActiveTranscriptEntries();
             },
             .message_start => |payload| switch (payload.role) {
                 .assistant => self.active_assistant_entry = try self.appendEmptyTranscript(.assistant),
@@ -355,11 +355,11 @@ pub const AppState = struct {
             .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
             .turn_end => {
                 self.status.streaming = false;
-                self.clearActiveTranscriptEntries();
+                self.cleanupActiveTranscriptEntries();
             },
             .agent_end => |payload| {
                 self.status.streaming = false;
-                self.clearActiveTranscriptEntries();
+                self.cleanupActiveTranscriptEntries();
                 switch (payload.reason) {
                     .completed => {},
                     .cancelled => try self.appendTranscript(.system, "agent cancelled"),
@@ -367,7 +367,7 @@ pub const AppState = struct {
                 }
             },
             .@"error" => |payload| {
-                self.clearActiveTranscriptEntries();
+                self.cleanupActiveTranscriptEntries();
                 try self.status.setError(self.allocator, payload.message.slice());
                 try self.appendTranscript(.@"error", payload.message.slice());
             },
@@ -447,13 +447,22 @@ pub const AppState = struct {
     }
 
     fn appendDelta(self: *AppState, kind: TranscriptKind, delta: []const u8) !void {
-        const index = try self.ensureTrailingEntry(kind);
-        switch (kind) {
-            .assistant => self.active_assistant_entry = index,
-            .tool => self.active_tool_result_entry = index,
-            else => {},
-        }
+        const index = switch (kind) {
+            .assistant => try self.activeOrTrailingEntry(kind, &self.active_assistant_entry),
+            .tool => try self.activeOrTrailingEntry(kind, &self.active_tool_result_entry),
+            else => try self.ensureTrailingEntry(kind),
+        };
         try self.transcript.items[index].text.appendSlice(self.allocator, delta);
+    }
+
+    fn activeOrTrailingEntry(self: *AppState, kind: TranscriptKind, active_entry: *?usize) !usize {
+        if (active_entry.*) |index| {
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == kind) return index;
+            active_entry.* = null;
+        }
+        const index = try self.ensureTrailingEntry(kind);
+        active_entry.* = index;
+        return index;
     }
 
     fn finishTranscriptEntry(self: *AppState, kind: TranscriptKind, text: []const u8, active_entry: ?*?usize) !void {
@@ -491,6 +500,20 @@ pub const AppState = struct {
     fn clearActiveTranscriptEntries(self: *AppState) void {
         self.active_assistant_entry = null;
         self.active_tool_result_entry = null;
+    }
+
+    fn cleanupActiveTranscriptEntries(self: *AppState) void {
+        self.removeEmptyActiveTranscriptEntry(&self.active_assistant_entry, .assistant);
+        self.removeEmptyActiveTranscriptEntry(&self.active_tool_result_entry, .tool);
+        self.clearActiveTranscriptEntries();
+    }
+
+    fn removeEmptyActiveTranscriptEntry(self: *AppState, active_entry: *?usize, kind: TranscriptKind) void {
+        if (active_entry.*) |index| {
+            if (index < self.transcript.items.len and self.transcript.items[index].kind == kind and self.transcript.items[index].text.items.len == 0) {
+                self.removeTranscriptEntry(index);
+            }
+        }
     }
 
     fn removeTranscriptEntry(self: *AppState, index: usize) void {
@@ -774,6 +797,48 @@ test "AppState removes empty assistant placeholder on empty message_end" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("previous response", state.transcript.items[0].text.items);
+}
+
+test "AppState removes empty assistant placeholder on aborted turn" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.assistant, "previous response");
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    try state.applyEvent(tui_runtime.TuiEvent{ .agent_end = .{ .reason = .cancelled } });
+
+    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("previous response", state.transcript.items[0].text.items);
+    try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("agent cancelled", state.transcript.items[1].text.items);
+}
+
+test "AppState finalizes active assistant after reasoning and tool deltas" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    var thinking_delta = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = try ownedText("plan") } };
+    defer thinking_delta.deinit(std.testing.allocator);
+    try state.applyEvent(thinking_delta);
+    var tool_delta = tui_runtime.TuiEvent{ .tool_call_delta = .{ .content_index = 1, .delta = try ownedText("{\"name\":\"shell\"}") } };
+    defer tool_delta.deinit(std.testing.allocator);
+    try state.applyEvent(tool_delta);
+    var text_delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 2, .delta = try ownedText("partial") } };
+    defer text_delta.deinit(std.testing.allocator);
+    try state.applyEvent(text_delta);
+    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText("final") } };
+    defer assistant_end.deinit(std.testing.allocator);
+    try state.applyEvent(assistant_end);
+
+    try std.testing.expectEqual(@as(usize, 3), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("final", state.transcript.items[0].text.items);
+    try std.testing.expectEqual(TranscriptKind.thinking, state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("plan", state.transcript.items[1].text.items);
+    try std.testing.expectEqual(TranscriptKind.tool, state.transcript.items[2].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[2].text.items, "shell") != null);
 }
 
 test "AppState keeps identical inline assistant message_end turns" {
