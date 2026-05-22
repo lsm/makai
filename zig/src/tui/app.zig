@@ -16,6 +16,7 @@ const telemetry_view = @import("tui_view_telemetry");
 const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
+const tui_render = @import("tui_render");
 
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
@@ -356,7 +357,8 @@ const TuiModel = struct {
         const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 5;
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        return std.fmt.allocPrint(ctx.allocator, "{s}\n{s}\n{s}\n{s}\n{s}\n{s}", .{ transcript, tools, telemetry, extra, composer, status }) catch "";
+        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, composer, status }) catch "";
+        return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
     fn appendChar(app: *App, c: u21) !void {
