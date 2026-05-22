@@ -926,6 +926,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
@@ -945,7 +947,7 @@ pub fn build(b: *std.Build) void {
     const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
-    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
+    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
     const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_state", .module = tui_state_mod } } });
