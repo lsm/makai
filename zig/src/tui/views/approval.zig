@@ -1,30 +1,40 @@
 const std = @import("std");
 const tui_state = @import("tui_state");
+const tui_theme = @import("tui_theme");
+const tui_text = @import("tui_text");
+const tui_render = @import("tui_render");
 
 pub const Options = struct {
     width: usize = 80,
 };
 
-pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    const writer = &out.writer;
-    if (state.approval.status != .pending) return out.toOwnedSlice();
-    try writer.writeAll("Approval required\n");
-    try writer.print("Tool: {s}\n", .{state.approval.tool_name});
-    try writer.print("Args: {s}\n", .{state.approval.args_json});
+pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
+    if (state.approval.status != .pending) return allocator.dupe(u8, "");
+    var parts = std.ArrayList([]const u8).empty;
+    defer parts.deinit(allocator);
+    defer for (parts.items) |part| allocator.free(part);
+
+    try parts.append(allocator, try tui_theme.errorText().render(allocator, "Approval required"));
+    try parts.append(allocator, try std.fmt.allocPrint(allocator, "Tool: {s}", .{state.approval.tool_name}));
+    const args = try tui_text.truncateToWidth(allocator, state.approval.args_json, options.width -| 8);
+    defer allocator.free(args);
+    try parts.append(allocator, try std.fmt.allocPrint(allocator, "Args: {s}", .{args}));
     if (std.mem.eql(u8, state.approval.tool_name, "hashline_edit") and state.preview.content.len > 0) {
-        try writer.writeAll("\nPreview:\n");
-        var rows: usize = 4;
+        try parts.append(allocator, try tui_theme.panelTitle().render(allocator, "Preview:"));
+        var rows: usize = 0;
         var lines = std.mem.splitScalar(u8, state.preview.content, '\n');
         while (lines.next()) |line| {
-            if (rows >= 12) break;
-            try writer.writeAll(line[0..@min(options.width, line.len)]);
-            try writer.writeByte('\n');
+            if (rows >= 8) break;
+            const clipped = try tui_text.truncateToWidth(allocator, line, options.width -| 4);
+            defer allocator.free(clipped);
+            try parts.append(allocator, try tui_theme.diffLine(line).render(allocator, clipped));
             rows += 1;
         }
     }
-    try writer.writeAll("[a] allow  [d] deny  [A] always allow");
-    return out.toOwnedSlice();
+    try parts.append(allocator, try tui_theme.muted().render(allocator, "(a) allow once  (A) allow always  (d) deny  Esc abort"));
+    const body = try tui_render.joinVertical(allocator, parts.items);
+    defer allocator.free(body);
+    return tui_theme.panel().borderForeground(tui_theme.palette.warning).width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 test "approval renders pending request" {
@@ -37,7 +47,7 @@ test "approval renders pending request" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "Approval required") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "edit_file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "always allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "allow always") != null);
 }
 
 test "approval renders hashline preview" {
