@@ -120,17 +120,15 @@ pub fn truncateLinesToWidth(allocator: std.mem.Allocator, text: []const u8, line
     const writer = &out.writer;
     var lines = std.mem.splitScalar(u8, text, '\n');
     var row: usize = 0;
-    while (lines.next()) |line| {
-        if (row >= max_lines) {
-            if (row > 0) try writer.writeByte('\n');
-            try writer.writeAll(ellipsis);
-            break;
-        }
+    while (row < max_lines) : (row += 1) {
+        const line = lines.next() orelse break;
         if (row > 0) try writer.writeByte('\n');
-        const clipped = try truncateLineToWidth(allocator, line, line_width);
+        const has_more_lines = row + 1 == max_lines and lines.peek() != null;
+        const width = if (has_more_lines) line_width -| 1 else line_width;
+        const clipped = try truncateLineToWidth(allocator, line, width);
         defer allocator.free(clipped);
         try writer.writeAll(clipped);
-        row += 1;
+        if (has_more_lines) try writer.writeAll(ellipsis);
     }
     return out.toOwnedSlice();
 }
@@ -265,6 +263,14 @@ test "truncateMultilineToBudget preserves newline before clipping" {
     const text = try truncateMultilineToBudget(std.testing.allocator, "alpha\nbeta gamma", 10);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOfScalar(u8, text, '\n') != null);
+}
+
+test "truncateLinesToWidth caps output to max lines" {
+    const text = try truncateLinesToWidth(std.testing.allocator, "one\ntwo\nthree\nfour", 10, 3);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqual(@as(usize, 3), lineCount(text));
+    try std.testing.expect(std.mem.indexOf(u8, text, "three") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ellipsis) != null);
 }
 
 test "truncateToWidth accepts CSI tilde terminator" {

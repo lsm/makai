@@ -28,7 +28,7 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     const content = if (text.len == 0)
         try tui_theme.composerPlaceholder().render(allocator, "Ask Makai…")
     else
-        try tui_text.truncateToWidth(allocator, text, remaining);
+        try tui_text.truncateLinesToWidth(allocator, text, remaining, 3);
     defer allocator.free(content);
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ prompt, content });
 }
@@ -47,4 +47,16 @@ test "composer renders placeholder and text" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, ">") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
+}
+
+test "composer renders multiline draft content" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.composer.buffer.appendSlice(std.testing.allocator, "first line\nsecond line");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
 }
