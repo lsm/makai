@@ -21,6 +21,10 @@ fn nonblockingFileFromHandle(handle: File.Handle) File {
     return .{ .handle = handle, .flags = .{ .nonblocking = true } };
 }
 
+fn blockingFileFromHandle(handle: File.Handle) File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+}
+
 /// Return the process stdin file handle.
 ///
 /// Zig 0.16 mapping: this borrows stdin from the Makai default I/O context while
@@ -63,6 +67,11 @@ pub fn nonblocking(file: File) File {
     return nonblockingFileFromHandle(file.handle);
 }
 
+/// Return a copy of the file handle configured for blocking reads.
+pub fn blocking(file: File) File {
+    return blockingFileFromHandle(file.handle);
+}
+
 fn setNonBlockingMode(file: File, enabled: bool) !void {
     if (@import("builtin").os.tag == .windows) return;
     var flags = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(usize, 0));
@@ -87,9 +96,21 @@ pub fn setNonBlocking(file: File) !void {
     try setNonBlockingMode(file, true);
 }
 
+/// Enable O_NONBLOCK and return a matching Zig File metadata copy.
+pub fn setNonBlockingFile(file: File) !File {
+    try setNonBlocking(file);
+    return nonblocking(file);
+}
+
 /// Disable O_NONBLOCK on POSIX file descriptors.
 pub fn setBlocking(file: File) !void {
     try setNonBlockingMode(file, false);
+}
+
+/// Disable O_NONBLOCK and return a matching Zig File metadata copy.
+pub fn setBlockingFile(file: File) !File {
+    try setBlocking(file);
+    return blocking(file);
 }
 
 /// Close a stdio/file handle.

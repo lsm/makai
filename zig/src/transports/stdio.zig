@@ -148,7 +148,7 @@ pub const AsyncStreamHandle = struct {
         // In production code you might want to detach or force-kill if available
 
         if (self.fallback_receiver) |receiver| {
-            compat.stdio.setBlocking(receiver.file) catch {};
+            receiver.file = compat.stdio.setBlockingFile(receiver.file) catch receiver.file;
             receiver.deinit();
             self.allocator.destroy(receiver);
             self.fallback_receiver = null;
@@ -338,7 +338,15 @@ pub const AsyncStdioReceiver = struct {
             }
 
             // Read more data
-            const bytes_read = compat.stdio.read(ctx.file, &ctx.read_buf) catch {
+            const bytes_read = compat.stdio.read(ctx.file, &ctx.read_buf) catch |err| {
+                if (err == error.WouldBlock) {
+                    std.Thread.yield() catch {};
+                    continue;
+                }
+                if (err == error.EndOfStream) {
+                    ctx.stream.complete({});
+                    return;
+                }
                 ctx.stream.completeWithError("Read error");
                 return;
             };

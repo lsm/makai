@@ -57,6 +57,7 @@ pub const AgentOptions = struct {
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: ?u32 = 60_000,
     compact_tool_output: bool = false,
+    permission_engine: ?*types.permission.PermissionEngine = null,
 };
 
 /// High-level Agent class that manages state, subscriptions, and message queues.
@@ -102,6 +103,7 @@ pub const Agent = struct {
     _thinking_budgets: ?ai_types.ThinkingBudgets,
     _max_retry_delay_ms: ?u32,
     _compact_tool_output: bool,
+    _permission_engine: ?*types.permission.PermissionEngine,
 
     // Async support
     _thread: ?std.Thread,
@@ -140,6 +142,7 @@ pub const Agent = struct {
             ._thinking_budgets = options.thinking_budgets,
             ._max_retry_delay_ms = options.max_retry_delay_ms,
             ._compact_tool_output = options.compact_tool_output,
+            ._permission_engine = options.permission_engine,
             ._thread = null,
             ._done_event = .is_set,
             ._mutex = .init,
@@ -279,6 +282,10 @@ pub const Agent = struct {
 
     pub fn setCompactToolOutput(self: *Agent, enabled: bool) void {
         self._compact_tool_output = enabled;
+    }
+
+    pub fn setPermissionEngine(self: *Agent, engine: ?*types.permission.PermissionEngine) void {
+        self._permission_engine = engine;
     }
 
     /// Set the steering mode.
@@ -902,6 +909,7 @@ pub const Agent = struct {
             .thinking_budgets = self._thinking_budgets,
             .max_retry_delay_ms = self._max_retry_delay_ms,
             .compact_tool_output = self._compact_tool_output,
+            .permission_engine = self._permission_engine,
             .transform_context_fn = self._transform_context_fn,
             .transform_context_ctx = self._transform_context_ctx,
             .get_steering_messages_fn = getSteeringMessages,

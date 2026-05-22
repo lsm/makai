@@ -178,6 +178,16 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
+pub const ToolExecuteWithContextFn = *const fn (
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult;
+
 /// Tool execution via remote protocol path
 pub const ToolProtocolExecuteFn = *const fn (
     ctx: ?*anyopaque,
@@ -241,6 +251,8 @@ pub const AgentTool = struct {
     short_description: ?[]const u8 = null,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
+    execute_ctx: ?*anyopaque = null,
+    execute_with_context: ?ToolExecuteWithContextFn = null,
     approval_ctx: ?*anyopaque = null,
     approval_fn: ?ToolApprovalFn = null,
     approval_ui_ctx: ?*anyopaque = null,

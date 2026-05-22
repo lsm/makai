@@ -15,6 +15,7 @@ const json_writer = @import("json_writer");
 const model_ref = @import("model_ref");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
+const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 pub const TuiSession = session.TuiSession;
@@ -102,6 +103,8 @@ pub const TuiRuntimeOptions = struct {
     models: []const ai_types.Model = &.{},
     initial_model_id: ?[]const u8 = null,
     tools: []const agent.AgentTool = &.{},
+    mcp_config_json: ?[]const u8 = null,
+    permission_engine: ?*permission.PermissionEngine = null,
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
     compact_output: bool = false,
@@ -128,6 +131,7 @@ pub const TuiRuntime = struct {
     remote_session_timeout_ms: u64 = 5_000,
     event_stream: TuiEventStream,
     tool_registry: local_tools.ToolRegistry,
+    mcp_bridge: ?*local_tools.mcp_bridge.McpBridge = null,
     original_tools: []agent.AgentTool,
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
@@ -135,6 +139,7 @@ pub const TuiRuntime = struct {
     approval_mutex: std.atomic.Mutex = .unlocked,
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
+    permission_engine: ?*permission.PermissionEngine,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -145,21 +150,22 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
-        const models = try allocator.dupe(ai_types.Model, options.models);
+        var models = try allocator.dupe(ai_types.Model, options.models);
         errdefer allocator.free(models);
 
         var tool_registry = local_tools.ToolRegistry.init();
         errdefer tool_registry.deinit(allocator);
         try tool_registry.registerDefaults(allocator);
+
         for (options.tools) |tool| try tool_registry.replaceOrRegister(allocator, tool);
 
-        const original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
+        var original_tools = try allocator.dupe(agent.AgentTool, tool_registry.list());
         errdefer allocator.free(original_tools);
 
-        const wrapped_tools = try allocator.alloc(agent.AgentTool, original_tools.len);
+        var wrapped_tools = try allocator.alloc(agent.AgentTool, original_tools.len);
         errdefer allocator.free(wrapped_tools);
 
-        const approval_contexts = try allocator.alloc(ApprovalContext, original_tools.len);
+        var approval_contexts = try allocator.alloc(ApprovalContext, original_tools.len);
         errdefer allocator.free(approval_contexts);
 
         var selected: ?usize = null;
@@ -197,10 +203,11 @@ pub const TuiRuntime = struct {
                     const receiver = try allocator.create(stdio_transport.AsyncStdioReceiver);
                     receiver.* = stdio_transport.AsyncStdioReceiver.init();
                     var receiver_nonblocking = false;
-                    errdefer if (receiver_nonblocking) compat.stdio.setBlocking(receiver.file) catch {};
-                    try compat.stdio.setNonBlocking(receiver.file);
+                    errdefer if (receiver_nonblocking) {
+                        receiver.file = compat.stdio.setBlockingFile(receiver.file) catch receiver.file;
+                    };
+                    receiver.file = try compat.stdio.setNonBlockingFile(receiver.file);
                     receiver_nonblocking = true;
-                    receiver.file = compat.stdio.nonblocking(receiver.file);
                     remote_config_receiver = receiver;
                     const handle = try allocator.create(stdio_transport.AsyncStreamHandle);
                     errdefer allocator.destroy(handle);
@@ -222,7 +229,7 @@ pub const TuiRuntime = struct {
             }
         }
 
-        const runtime = TuiRuntime{
+        var runtime = TuiRuntime{
             .allocator = allocator,
             .backend = resolved_backend,
             .protocol = options.protocol,
@@ -236,17 +243,47 @@ pub const TuiRuntime = struct {
             .selected_model_index = selected,
             .event_stream = TuiEventStream.init(allocator),
             .tool_registry = tool_registry,
+            .mcp_bridge = null,
             .original_tools = original_tools,
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
+            .permission_engine = options.permission_engine,
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
         remote_config_sender = null;
         remote_config_receiver = null;
         remote_config_stream_handle = null;
+        original_tools = &.{};
+        wrapped_tools = &.{};
+        models = &.{};
+        tool_registry = local_tools.ToolRegistry.init();
+        approval_contexts = &.{};
+        errdefer runtime.deinit();
+        if (options.mcp_config_json) |config_json| {
+            const bridge = try allocator.create(local_tools.mcp_bridge.McpBridge);
+            bridge.* = local_tools.mcp_bridge.McpBridge.init(allocator);
+            bridge.bind();
+            runtime.mcp_bridge = bridge;
+            try bridge.loadConfigJson(config_json);
+            try bridge.discover();
+            try runtime.tool_registry.registerMcpBridge(allocator, bridge);
+            const next_original_tools = try allocator.dupe(agent.AgentTool, runtime.tool_registry.list());
+            errdefer allocator.free(next_original_tools);
+            const next_wrapped_tools = try allocator.alloc(agent.AgentTool, next_original_tools.len);
+            errdefer allocator.free(next_wrapped_tools);
+            const next_approval_contexts = try allocator.alloc(ApprovalContext, next_original_tools.len);
+            errdefer allocator.free(next_approval_contexts);
+
+            allocator.free(runtime.approval_contexts);
+            allocator.free(runtime.wrapped_tools);
+            allocator.free(runtime.original_tools);
+            runtime.original_tools = next_original_tools;
+            runtime.wrapped_tools = next_wrapped_tools;
+            runtime.approval_contexts = next_approval_contexts;
+        }
         return runtime;
     }
 
@@ -266,6 +303,10 @@ pub const TuiRuntime = struct {
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
+        if (self.mcp_bridge) |bridge| {
+            bridge.deinit();
+            self.allocator.destroy(bridge);
+        }
         self.tool_registry.deinit(self.allocator);
         self.allocator.free(self.models);
         self.* = undefined;
@@ -309,7 +350,7 @@ pub const TuiRuntime = struct {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
                 self.rebuildWrappedTools();
-                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output });
+                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output, .permission_engine = self.permission_engine });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
@@ -370,6 +411,10 @@ pub const TuiRuntime = struct {
     pub fn currentModel(self: *TuiRuntime) ?ai_types.Model {
         if (self.selected_model_index) |idx| return self.models[idx];
         return null;
+    }
+
+    pub fn availableTools(self: *TuiRuntime) []const agent.AgentTool {
+        return self.original_tools;
     }
 
     pub fn switchModel(self: *TuiRuntime, model_id: []const u8) !void {
@@ -592,6 +637,8 @@ pub const TuiRuntime = struct {
                 .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
+                .execute_ctx = tool.execute_ctx,
+                .execute_with_context = tool.execute_with_context,
                 .approval_ctx = &self.approval_contexts[i],
                 .approval_fn = approveTool,
                 .approval_ui_ctx = &self.approval_contexts[i],
@@ -1660,6 +1707,7 @@ const MockProtocolCtx = struct {
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
+    tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
 };
 
@@ -1789,7 +1837,7 @@ fn mockStream(
     }
 
     if (mock.tool_first and mock.call_count == 1) {
-        const content = [_]ai_types.AssistantContent{.{ .tool_call = .{ .id = "call-1", .name = "demo_tool", .arguments_json = "{}" } }};
+        const content = [_]ai_types.AssistantContent{.{ .tool_call = .{ .id = "call-1", .name = mock.tool_name, .arguments_json = "{}" } }};
         try stream.push(.{ .start = .{ .partial = emptyAssistantMessage(model, .tool_use) } });
         try pushDoneAndComplete(stream, allocator, model, &content, .tool_use);
         return stream;
@@ -1926,6 +1974,89 @@ fn demoTool(
     content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "tool ok") } };
     return .{ .content = OwnedSlice(ai_types.UserContentPart).initOwned(content) };
 }
+
+const ContextToolCtx = struct { calls: usize = 0 };
+
+fn contextOnlyTool(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?agent.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    const state: *ContextToolCtx = @ptrCast(@alignCast(ctx.?));
+    state.calls += 1;
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "context tool ok") } };
+    return .{ .content = OwnedSlice(ai_types.UserContentPart).initOwned(content) };
+}
+
+test "runtime wrapper preserves context-aware tool execution" {
+    var context = ContextToolCtx{};
+    const tools = [_]agent.AgentTool{.{
+        .label = "Context",
+        .name = "context_tool",
+        .description = "Context tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .execute_ctx = &context,
+        .execute_with_context = contextOnlyTool,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{ .tool_first = true, .tool_name = "context_tool" };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("use context tool");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_tool_end = false;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .tool_execution_end => saw_tool_end = !ev.tool_execution_end.is_error,
+            .agent_end => break,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expect(saw_tool_end);
+}
+
+test "MCP bridge exec context address remains stable in TUI runtime" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const script = "python3 -u -c 'import json,sys\n" ++
+        "for line in sys.stdin:\n" ++
+        " msg=json.loads(line); method=msg.get(\"method\")\n" ++
+        " if method==\"initialize\": print(json.dumps({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"fake\",\"version\":\"1\"}}}), flush=True)\n" ++
+        " elif method==\"tools/list\": print(json.dumps({\"jsonrpc\":\"2.0\",\"id\":msg[\"id\"],\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo\",\"inputSchema\":{\"type\":\"object\"}}]}}), flush=True)'";
+    const script_json = try std.json.Stringify.valueAlloc(std.testing.allocator, script, .{});
+    defer std.testing.allocator.free(script_json);
+    const config_json = try std.fmt.allocPrint(std.testing.allocator, "[{{\"name\":\"mock\",\"command\":\"/bin/sh\",\"args\":[\"-c\",{s}]}}]", .{script_json});
+    defer std.testing.allocator.free(config_json);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .mcp_config_json = config_json });
+    defer runtime.deinit();
+    const bridge = runtime.mcp_bridge orelse return error.MissingBridge;
+    for (bridge.tools.items) |record| {
+        try std.testing.expect(record.exec_ctx.bridge.* == bridge);
+    }
+}
+
 
 test "tool approval approve and reject paths emit tool events" {
     const tools = [_]agent.AgentTool{.{
