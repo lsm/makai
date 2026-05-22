@@ -54,9 +54,9 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const segments = try tui_theme.statusKey().render(allocator, "Segments");
     defer allocator.free(segments);
     try writer.print("{s} ", .{segments});
-    try writeSegment(writer, allocator, "system_prompt", telemetry.system_prompt);
+    try writeSegment(writer, allocator, "sys", telemetry.system_prompt);
     try writer.writeAll(" • ");
-    try writeSegment(writer, allocator, "messages", telemetry.messages);
+    try writeSegment(writer, allocator, "msg", telemetry.messages);
     try writer.writeAll(" • ");
     try writeSegment(writer, allocator, "tools", telemetry.tool_definitions);
 
@@ -125,8 +125,8 @@ test "telemetry view renders context and segments" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "100/200 tok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "system_prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "messages") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "msg") != null);
 }
 
 test "telemetry overflow preserves segment line" {

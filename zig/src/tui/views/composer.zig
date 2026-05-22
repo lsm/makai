@@ -13,24 +13,65 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
     defer allocator.free(input);
-    const help = try tui_theme.muted().render(allocator, "Enter submit • Shift+Enter newline • Ctrl+C quit • /quit quit");
-    defer allocator.free(help);
-    const body = try tui_render.joinVertical(allocator, &.{ input, help });
+    const hint = try renderHint(allocator, state);
+    defer allocator.free(hint);
+    const body = try tui_render.joinVertical(allocator, &.{ input, hint });
     defer allocator.free(body);
     return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]u8 {
-    const text = state.composer.text();
-    const prompt = try tui_theme.composerPrompt().render(allocator, "> ");
+    const prompt = try tui_theme.composerPrompt().render(allocator, promptFor(state));
     defer allocator.free(prompt);
-    const remaining = width -| tui_text.visibleWidth(prompt);
-    const content = if (text.len == 0)
-        try tui_theme.composerPlaceholder().render(allocator, "Ask Makai…")
-    else
-        try tui_text.truncateLinesToWidth(allocator, text, remaining, 3);
+    if (state.composer.text().len == 0) {
+        var area = zz.TextArea.init(allocator);
+        defer area.deinit();
+        area.placeholder = "Ask Makai…";
+        area.placeholder_style = tui_theme.composerPlaceholder();
+        area.setSize(@intCast(@min(width, std.math.maxInt(u16))), 1);
+        const content = try tui_theme.composerPlaceholder().render(allocator, "Ask Makai…");
+        defer allocator.free(content);
+        return prefixFirstLine(allocator, prompt, content);
+    }
+    const content = try tui_text.truncateLinesToWidth(allocator, state.composer.text(), width, 4);
     defer allocator.free(content);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prompt, content });
+    return prefixFirstLine(allocator, prompt, content);
+}
+
+fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]const u8 {
+    const text = state.composer.text();
+    if (std.mem.startsWith(u8, text, "!"))
+        return tui_theme.muted().render(allocator, "shell mode • Enter runs command through agent");
+    if (std.mem.startsWith(u8, text, "@"))
+        return tui_theme.muted().render(allocator, "file picker • type path or query");
+    if (state.composer.history.items.len > 0) {
+        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Ctrl+R thinking", .{state.composer.history.items.len});
+        defer allocator.free(hint);
+        return tui_theme.muted().render(allocator, hint);
+    }
+    return tui_theme.muted().render(allocator, "Enter submit • Shift+Enter newline • Ctrl+R thinking • Ctrl+C quit");
+}
+
+fn promptFor(state: *const tui_state.AppState) []const u8 {
+    const text = state.composer.text();
+    if (std.mem.startsWith(u8, text, "!")) return "! ";
+    if (std.mem.startsWith(u8, text, "@")) return "@ ";
+    return "> ";
+}
+
+fn prefixFirstLine(allocator: std.mem.Allocator, prompt: []const u8, content: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(prompt);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    if (lines.next()) |first| try writer.writeAll(first);
+    while (lines.next()) |line| {
+        try writer.writeByte('\n');
+        try writer.writeAll("  ");
+        try writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
 }
 
 test "composer renders placeholder and text" {
@@ -59,4 +100,19 @@ test "composer renders multiline draft content" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+}
+
+test "composer renders shell and file hints" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.composer.buffer.appendSlice(std.testing.allocator, "!ls");
+    const shell = try render(std.testing.allocator, &state, .{ .width = 50 });
+    defer std.testing.allocator.free(shell);
+    try std.testing.expect(std.mem.indexOf(u8, shell, "shell mode") != null);
+
+    state.composer.buffer.clearRetainingCapacity();
+    try state.composer.buffer.appendSlice(std.testing.allocator, "@src");
+    const file = try render(std.testing.allocator, &state, .{ .width = 50 });
+    defer std.testing.allocator.free(file);
+    try std.testing.expect(std.mem.indexOf(u8, file, "file picker") != null);
 }

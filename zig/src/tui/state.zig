@@ -281,6 +281,7 @@ pub const AppState = struct {
     status: StatusState = .{},
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
+    show_thinking: bool = true,
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
@@ -342,6 +343,39 @@ pub const AppState = struct {
         return submitted;
     }
 
+    pub fn replaceComposerBuffer(self: *AppState, text: []const u8) !void {
+        self.composer.buffer.clearRetainingCapacity();
+        try self.composer.buffer.appendSlice(self.allocator, text);
+    }
+
+    pub fn composerHistoryPrev(self: *AppState) !bool {
+        if (self.composer.history.items.len == 0) return false;
+        const next_index = if (self.composer.history_index) |index|
+            index -| 1
+        else
+            self.composer.history.items.len - 1;
+        self.composer.history_index = next_index;
+        try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+        return true;
+    }
+
+    pub fn composerHistoryNext(self: *AppState) !bool {
+        const current = self.composer.history_index orelse return false;
+        if (current + 1 >= self.composer.history.items.len) {
+            self.composer.history_index = null;
+            self.composer.buffer.clearRetainingCapacity();
+            return true;
+        }
+        const next_index = current + 1;
+        self.composer.history_index = next_index;
+        try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+        return true;
+    }
+
+    pub fn toggleThinking(self: *AppState) void {
+        self.show_thinking = !self.show_thinking;
+    }
+
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
         switch (event) {
             .agent_start => {
@@ -375,7 +409,9 @@ pub const AppState = struct {
             .tool_execution_start => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
                 tool.expanded = true;
-                try self.appendTranscript(.tool, payload.tool_name.slice());
+                const summary = try toolSummary(self.allocator, payload.tool_name.slice(), payload.args_json.slice());
+                defer self.allocator.free(summary);
+                try self.appendTranscript(.tool, summary);
             },
             .tool_execution_update => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
@@ -677,6 +713,55 @@ fn jsonUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
     };
 }
 
+fn toolSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
+    const primary = primaryToolArg(allocator, args_json) catch null;
+    defer if (primary) |value| allocator.free(value);
+    if (primary) |value| {
+        const clipped = try clipSummaryArg(allocator, value);
+        defer allocator.free(clipped);
+        return std.fmt.allocPrint(allocator, "◈ {s} \"{s}\"", .{ name, clipped });
+    }
+    return std.fmt.allocPrint(allocator, "◈ {s}", .{name});
+}
+
+fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
+    if (args_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const keys = [_][]const u8{ "command", "path", "query", "pattern", "file", "operation" };
+    for (keys) |key| {
+        if (jsonString(parsed.value.object, key)) |value| {
+            if (value.len > 0) return try allocator.dupe(u8, value);
+        }
+    }
+    return null;
+}
+
+fn clipSummaryArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < value.len and width < 48) {
+        const c = value[i];
+        if (c == '\n' or c == '\r' or c == '\t') {
+            try writer.writeByte(' ');
+            width += 1;
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (i + len > value.len) break;
+        try writer.writeAll(value[i .. i + len]);
+        width += 1;
+        i += len;
+    }
+    if (i < value.len) try writer.writeAll("…");
+    return out.toOwnedSlice();
+}
+
 fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
@@ -738,6 +823,7 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ shell_command \"pwd\"") != null);
 }
 
 test "AppState finalizes transcript from message_end text" {
@@ -1083,6 +1169,31 @@ test "Composer submission stores history and user transcript" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello makai", state.transcript.items[0].text.items);
+}
+
+test "Composer history navigation recalls entries and clears at end" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "first"));
+    try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "second"));
+
+    try std.testing.expect(try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("second", state.composer.text());
+    try std.testing.expect(try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("first", state.composer.text());
+    try std.testing.expect(try state.composerHistoryNext());
+    try std.testing.expectEqualStrings("second", state.composer.text());
+    try std.testing.expect(try state.composerHistoryNext());
+    try std.testing.expectEqualStrings("", state.composer.text());
+}
+
+test "AppState toggles thinking visibility" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expect(state.show_thinking);
+    state.toggleThinking();
+    try std.testing.expect(!state.show_thinking);
 }
 
 test "AppState applies thinking tool call and lifecycle events" {

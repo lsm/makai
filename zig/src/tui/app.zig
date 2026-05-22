@@ -290,7 +290,11 @@ const TuiModel = struct {
         switch (msg) {
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
-                    .char => |c| if (c == 'c') return .quit,
+                    .char => |c| switch (c) {
+                        'c' => return .quit,
+                        'r' => app.state.toggleThinking(),
+                        else => {},
+                    },
                     else => {},
                 };
                 if (app.state.mode == .approval) {
@@ -327,8 +331,14 @@ const TuiModel = struct {
                     .backspace => deleteLastCodepoint(app),
                     .char => |c| appendChar(app, c) catch {},
                     .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
-                    .up, .page_up => app.state.transcript_scroll += 1,
-                    .down, .page_down => app.state.transcript_scroll -|= 1,
+                    .up => {
+                        if (!(app.state.composerHistoryPrev() catch false)) app.state.transcript_scroll += 1;
+                    },
+                    .down => {
+                        if (!(app.state.composerHistoryNext() catch false)) app.state.transcript_scroll -|= 1;
+                    },
+                    .page_up => app.state.transcript_scroll += 1,
+                    .page_down => app.state.transcript_scroll -|= 1,
                     .escape => app.state.mode = .normal,
                     else => {},
                 }
