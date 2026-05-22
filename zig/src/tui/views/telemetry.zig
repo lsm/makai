@@ -71,7 +71,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
 
     const items = out.written();
     if (tui_text.visibleWidth(items) > options.width * 3) {
-        const clipped = try tui_text.truncateToWidth(allocator, items, options.width * 3);
+        const clipped = try tui_text.truncateLinesToWidth(allocator, items, options.width, 3);
         out.deinit();
         return clipped;
     }
@@ -127,4 +127,20 @@ test "telemetry view renders context and segments" {
     try std.testing.expect(std.mem.indexOf(u8, text, "100/200 tok") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "system_prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "messages") != null);
+}
+
+test "telemetry overflow preserves segment line" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.telemetry.estimated_tokens = 100;
+    state.telemetry.context_window = 200;
+    state.telemetry.total_bytes = 400;
+    state.telemetry.system_prompt = .{ .bytes = 40, .estimated_tokens = 10, .item_count = 1, .cache_role = .stable, .seen = true };
+    state.telemetry.messages = .{ .bytes = 200, .estimated_tokens = 50, .item_count = 4, .cache_role = .dynamic, .seen = true };
+    state.telemetry.tool_definitions = .{ .bytes = 160, .estimated_tokens = 40, .item_count = 2, .cache_role = .stable, .seen = true };
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 12 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Segments") != null);
 }

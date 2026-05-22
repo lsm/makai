@@ -17,8 +17,12 @@ pub fn lineCount(text: []const u8) usize {
 }
 
 pub fn truncateToWidth(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
+    return truncateLineToWidth(allocator, text, max_width);
+}
+
+pub fn truncateLineToWidth(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
     if (max_width == 0) return allocator.dupe(u8, "");
-    if (visibleWidth(text) <= max_width) return allocator.dupe(u8, text);
+    if (visibleWidth(text) <= max_width and std.mem.indexOfScalar(u8, text, '\n') == null) return allocator.dupe(u8, text);
     if (max_width <= 1) return allocator.dupe(u8, ellipsis);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -28,6 +32,7 @@ pub fn truncateToWidth(allocator: std.mem.Allocator, text: []const u8, max_width
     var width: usize = 0;
     var i: usize = 0;
     var open_sgr = false;
+    var truncated = false;
 
     while (i < text.len and width < target) {
         if (text[i] == 0x1b) {
@@ -36,20 +41,97 @@ pub fn truncateToWidth(allocator: std.mem.Allocator, text: []const u8, max_width
             if (i > start and isSgrSequence(text[start..i])) open_sgr = true;
             continue;
         }
-        if (text[i] == '\n') break;
+        if (text[i] == '\n') {
+            truncated = true;
+            break;
+        }
 
         const len = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
         if (i + len > text.len) break;
         const codepoint = std.unicode.utf8Decode(text[i .. i + len]) catch text[i];
         const cw = zz.measure.charWidth(@intCast(codepoint));
-        if (width + cw > target) break;
+        if (width + cw > target) {
+            truncated = true;
+            break;
+        }
         try writer.writeAll(text[i .. i + len]);
         width += cw;
         i += len;
     }
 
-    try writer.writeAll(ellipsis);
+    if (i < text.len or truncated) try writer.writeAll(ellipsis);
     if (open_sgr) try writer.writeAll(zz.ansi.reset);
+    return out.toOwnedSlice();
+}
+
+pub fn flattenNewlines(allocator: std.mem.Allocator, text: []const u8, separator: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeAll(separator);
+        first = false;
+        try writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
+}
+
+pub fn truncateMultilineToBudget(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
+    if (max_width == 0) return allocator.dupe(u8, "");
+    if (visibleWidth(text) <= max_width) return allocator.dupe(u8, text);
+    if (max_width <= 1) return allocator.dupe(u8, ellipsis);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var remaining = max_width;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    var source_has_more = false;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        if (remaining <= 1) {
+            source_has_more = true;
+            break;
+        }
+        const line_width = visibleWidth(line);
+        const budget = @min(remaining, line_width + 1);
+        const clipped = try truncateLineToWidth(allocator, line, budget);
+        defer allocator.free(clipped);
+        try writer.writeAll(clipped);
+        const consumed = @min(remaining, visibleWidth(clipped));
+        remaining -|= consumed;
+        if (line_width > budget or remaining == 0) {
+            source_has_more = true;
+            break;
+        }
+    }
+    if (source_has_more and remaining > 0) try writer.writeAll(ellipsis);
+    return out.toOwnedSlice();
+}
+
+pub fn truncateLinesToWidth(allocator: std.mem.Allocator, text: []const u8, line_width: usize, max_lines: usize) ![]u8 {
+    if (line_width == 0 or max_lines == 0) return allocator.dupe(u8, "");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var row: usize = 0;
+    while (lines.next()) |line| {
+        if (row >= max_lines) {
+            if (row > 0) try writer.writeByte('\n');
+            try writer.writeAll(ellipsis);
+            break;
+        }
+        if (row > 0) try writer.writeByte('\n');
+        const clipped = try truncateLineToWidth(allocator, line, line_width);
+        defer allocator.free(clipped);
+        try writer.writeAll(clipped);
+        row += 1;
+    }
     return out.toOwnedSlice();
 }
 
@@ -137,7 +219,7 @@ fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !vo
             const c = text[index.*];
             try writer.writeByte(c);
             index.* += 1;
-            if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) return;
+            if (c >= 0x40 and c <= 0x7e) return;
         }
         return;
     }
@@ -171,6 +253,31 @@ test "truncateToWidth preserves ANSI and width" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(visibleWidth(text) <= 6);
     try std.testing.expect(std.mem.indexOf(u8, text, ellipsis) != null);
+}
+
+test "flattenNewlines joins rows for single-line transcript entries" {
+    const text = try flattenNewlines(std.testing.allocator, "alpha\nbeta", " / ");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("alpha / beta", text);
+}
+
+test "truncateMultilineToBudget preserves newline before clipping" {
+    const text = try truncateMultilineToBudget(std.testing.allocator, "alpha\nbeta gamma", 10);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOfScalar(u8, text, '\n') != null);
+}
+
+test "truncateToWidth accepts CSI tilde terminator" {
+    const text = try truncateToWidth(std.testing.allocator, "\x1b[1~hello", 5);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "hello") != null);
+}
+
+test "wrapTextWithAnsi accepts CSI tilde terminator" {
+    const text = try wrapTextWithAnsi(std.testing.allocator, "\x1b[1~alpha beta", 20);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "beta") != null);
 }
 
 test "wrapTextWithAnsi wraps words" {

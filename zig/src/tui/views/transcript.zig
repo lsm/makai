@@ -45,7 +45,9 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
 }
 
 fn renderEntryText(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8, width: usize) ![]const u8 {
-    const clipped = try tui_text.truncateToWidth(allocator, text, width);
+    const flattened = try tui_text.flattenNewlines(allocator, text, " / ");
+    defer allocator.free(flattened);
+    const clipped = try tui_text.truncateToWidth(allocator, flattened, width);
     errdefer allocator.free(clipped);
     if (kind == .@"error") {
         const styled = try tui_theme.errorText().render(allocator, clipped);
@@ -79,4 +81,15 @@ test "transcript renders labels" {
     try std.testing.expect(std.mem.indexOf(u8, text, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "AI:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "world") != null);
+}
+
+test "transcript flattens multiline entries into one rendered row" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "alpha\nbeta");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "alpha / beta") != null);
 }
