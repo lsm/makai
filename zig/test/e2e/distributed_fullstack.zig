@@ -16,6 +16,7 @@ const agent_bridge = @import("agent_bridge");
 const tool_types = @import("tool_types");
 const tool_envelope = @import("tool_envelope");
 const tool_runtime = @import("tool_runtime");
+const tool_local_runtime = @import("tool_local_runtime");
 const in_process = @import("transports/in_process");
 
 const InProcessProviderProtocolBridge = agent_bridge.InProcessProviderProtocolBridge;
@@ -291,10 +292,15 @@ test "distributed fullstack: agent loop via provider protocol and tool protocol"
         },
     };
 
+    var local_tools = try tool_local_runtime.LocalToolProtocol.init(allocator, &tools);
+    defer local_tools.deinit();
+
     const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &context, .{
         .model = model,
         .protocol = bridge.protocolClient(),
         .tools = &tools,
+        .execute_tool_via_protocol_fn = tool_local_runtime.LocalToolProtocol.executeFn,
+        .execute_tool_via_protocol_ctx = &local_tools,
         .max_iterations = 4,
         .transform_context_fn = filterContextForProtocol,
         // M-006: provide an explicit api_key so the binary's credential

@@ -1267,6 +1267,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tool_types", .module = protocol_tool_types_mod },
                 .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
                 .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+                .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
