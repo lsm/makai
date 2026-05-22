@@ -16,6 +16,12 @@ pub fn lineCount(text: []const u8) usize {
     return count;
 }
 
+pub fn compactNumber(allocator: std.mem.Allocator, value: u64) ![]u8 {
+    if (value >= 1_000_000) return std.fmt.allocPrint(allocator, "{d}M", .{value / 1_000_000});
+    if (value >= 1_000) return std.fmt.allocPrint(allocator, "{d}k", .{value / 1_000});
+    return std.fmt.allocPrint(allocator, "{d}", .{value});
+}
+
 pub fn truncateToWidth(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
     return truncateLineToWidth(allocator, text, max_width);
 }
@@ -240,6 +246,18 @@ fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !vo
 
 fn isSgrSequence(seq: []const u8) bool {
     return seq.len >= 3 and seq[0] == 0x1b and seq[1] == '[' and seq[seq.len - 1] == 'm';
+}
+
+test "compactNumber formats suffixes" {
+    const small = try compactNumber(std.testing.allocator, 42);
+    defer std.testing.allocator.free(small);
+    try std.testing.expectEqualStrings("42", small);
+    const thousands = try compactNumber(std.testing.allocator, 12_345);
+    defer std.testing.allocator.free(thousands);
+    try std.testing.expectEqualStrings("12k", thousands);
+    const millions = try compactNumber(std.testing.allocator, 2_000_000);
+    defer std.testing.allocator.free(millions);
+    try std.testing.expectEqualStrings("2M", millions);
 }
 
 test "visibleWidth ignores ANSI" {

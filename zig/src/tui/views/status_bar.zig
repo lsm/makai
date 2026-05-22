@@ -67,10 +67,10 @@ fn writeContext(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *co
     var gauge_arena = std.heap.ArenaAllocator.init(allocator);
     defer gauge_arena.deinit();
     const gauge_text = gauge.view(gauge_arena.allocator());
-    const used_text = try compactNumber(allocator, used);
+    const used_text = try tui_text.compactNumber(allocator, used);
     defer allocator.free(used_text);
     if (limit > 0) {
-        const limit_text = try compactNumber(allocator, limit);
+        const limit_text = try tui_text.compactNumber(allocator, limit);
         defer allocator.free(limit_text);
         try writeOwnedSegment(writer, allocator, "ctx", try std.fmt.allocPrint(allocator, "{s} {d}% {s}/{s}", .{ gauge_text, pct, used_text, limit_text }));
     } else {
@@ -82,12 +82,6 @@ fn estimatedCost(allocator: std.mem.Allocator, state: *const tui_state.AppState)
     const tokens: f64 = @floatFromInt(if (state.telemetry.estimated_tokens > 0) state.telemetry.estimated_tokens else state.status.context_used);
     const dollars = (tokens / 1_000_000.0) * 3.0;
     return std.fmt.allocPrint(allocator, "${d:.4}", .{dollars});
-}
-
-fn compactNumber(allocator: std.mem.Allocator, value: u64) ![]u8 {
-    if (value >= 1_000_000) return std.fmt.allocPrint(allocator, "{d}M", .{value / 1_000_000});
-    if (value >= 1_000) return std.fmt.allocPrint(allocator, "{d}k", .{value / 1_000});
-    return std.fmt.allocPrint(allocator, "{d}", .{value});
 }
 
 fn writeSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: []const u8, value: []const u8) !void {

@@ -1,5 +1,4 @@
 const std = @import("std");
-const zz = @import("zigzag");
 const tui_state = @import("tui_state");
 const tui_theme = @import("tui_theme");
 const tui_text = @import("tui_text");
@@ -24,11 +23,6 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     const prompt = try tui_theme.composerPrompt().render(allocator, promptFor(state));
     defer allocator.free(prompt);
     if (state.composer.text().len == 0) {
-        var area = zz.TextArea.init(allocator);
-        defer area.deinit();
-        area.placeholder = "Ask Makai…";
-        area.placeholder_style = tui_theme.composerPlaceholder();
-        area.setSize(@intCast(@min(width, std.math.maxInt(u16))), 1);
         const content = try tui_theme.composerPlaceholder().render(allocator, "Ask Makai…");
         defer allocator.free(content);
         return prefixFirstLine(allocator, prompt, content);
