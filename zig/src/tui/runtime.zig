@@ -234,8 +234,7 @@ pub const TuiRuntime = struct {
             }
         }
 
-        var tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
-        errdefer tool_protocol.deinit();
+        const tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
 
         var runtime = TuiRuntime{
             .allocator = allocator,
