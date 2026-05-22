@@ -66,23 +66,6 @@ fn writeOneLine(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
     if (line.len > width or nl < text.len) try writer.writeAll("…");
 }
 
-fn noopTool(
-    tool_call_id: []const u8,
-    args_json: []const u8,
-    cancel_token: ?@import("ai_types").CancelToken,
-    on_update_ctx: ?*anyopaque,
-    on_update: ?@import("agent").ToolUpdateCallback,
-    allocator: std.mem.Allocator,
-) anyerror!@import("agent").AgentToolResult {
-    _ = tool_call_id;
-    _ = args_json;
-    _ = cancel_token;
-    _ = on_update_ctx;
-    _ = on_update;
-    _ = allocator;
-    return error.NotImplemented;
-}
-
 test "tool panel renders registered tools when idle" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -92,7 +75,7 @@ test "tool panel renders registered tools when idle" {
         .description = "Run shell commands",
         .short_description = "Run shell commands",
         .parameters_schema_json = "{}",
-        .execute = noopTool,
+        .execute = tui_state.noopToolForTest,
     }};
     try state.setRegisteredTools(&tools);
 

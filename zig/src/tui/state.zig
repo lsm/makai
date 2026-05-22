@@ -681,7 +681,7 @@ fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
 
-fn noopTool(
+pub fn noopToolForTest(
     tool_call_id: []const u8,
     args_json: []const u8,
     cancel_token: ?ai_types.CancelToken,
@@ -940,14 +940,14 @@ test "AppState clones registered tool metadata" {
             .description = "Run command",
             .short_description = "Run shell commands",
             .parameters_schema_json = "{}",
-            .execute = noopTool,
+            .execute = noopToolForTest,
         },
         .{
             .label = "Workspace Info",
             .name = "workspace_info",
             .description = "Show workspace",
             .parameters_schema_json = "{}",
-            .execute = noopTool,
+            .execute = noopToolForTest,
         },
     };
     var state = AppState.init(std.testing.allocator);
@@ -966,7 +966,7 @@ test "AppState clones registered tool metadata" {
         .description = "Read file",
         .short_description = "Read files",
         .parameters_schema_json = "{}",
-        .execute = noopTool,
+        .execute = noopToolForTest,
     }};
     try state.setRegisteredTools(&replacement);
     try std.testing.expectEqual(@as(usize, 1), state.registered_tools.items.len);
