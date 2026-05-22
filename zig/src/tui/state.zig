@@ -770,9 +770,25 @@ fn clipSummaryArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
             i += 1;
             continue;
         }
+        if (c < 0x20 or c == 0x7f) {
+            i += 1;
+            continue;
+        }
         const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
         if (i + len > value.len) break;
-        try writer.writeAll(value[i .. i + len]);
+        if (len == 1) {
+            try writer.writeByte(c);
+        } else {
+            const codepoint = std.unicode.utf8Decode(value[i .. i + len]) catch {
+                i += 1;
+                continue;
+            };
+            if (codepoint < 0x20 or codepoint == 0x7f) {
+                i += len;
+                continue;
+            }
+            try writer.writeAll(value[i .. i + len]);
+        }
         width += 1;
         i += len;
     }
@@ -842,6 +858,23 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ shell_command \"pwd\"") != null);
+}
+
+test "AppState strips control bytes from tool summaries" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_command"),
+        .args_json = try ownedText("{\"command\":\"before\\u001b[2Jafter\\u0007\"}"),
+    } };
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.transcript.items[0].text.items, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.transcript.items[0].text.items, 0x07) == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "before[2Jafter") != null);
 }
 
 test "AppState finalizes transcript from message_end text" {

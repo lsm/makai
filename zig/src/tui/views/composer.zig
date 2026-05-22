@@ -22,12 +22,15 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
 fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]u8 {
     const prompt = try tui_theme.composerPrompt().render(allocator, promptFor(state));
     defer allocator.free(prompt);
+    const content_width = width -| tui_text.visibleWidth(promptFor(state));
     if (state.composer.text().len == 0) {
-        const content = try tui_theme.composerPlaceholder().render(allocator, "Ask Makai…");
+        const placeholder = try tui_text.truncateLineToWidth(allocator, "Ask Makai…", content_width);
+        defer allocator.free(placeholder);
+        const content = try tui_theme.composerPlaceholder().render(allocator, placeholder);
         defer allocator.free(content);
         return prefixFirstLine(allocator, prompt, content);
     }
-    const content = try tui_text.truncateLinesToWidth(allocator, state.composer.text(), width, 4);
+    const content = try tui_text.truncateLinesToWidth(allocator, state.composer.text(), content_width, 4);
     defer allocator.free(content);
     return prefixFirstLine(allocator, prompt, content);
 }
@@ -109,4 +112,18 @@ test "composer renders shell and file hints" {
     const file = try render(std.testing.allocator, &state, .{ .width = 50 });
     defer std.testing.allocator.free(file);
     try std.testing.expect(std.mem.indexOf(u8, file, "file picker") != null);
+}
+
+test "composer accounts for prompt width when truncating text" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.composer.buffer.appendSlice(std.testing.allocator, "1234567890");
+
+    const input = try renderInput(std.testing.allocator, &state, 8);
+    defer std.testing.allocator.free(input);
+
+    var lines = std.mem.splitScalar(u8, input, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 8);
+    }
 }

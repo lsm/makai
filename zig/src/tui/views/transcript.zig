@@ -14,6 +14,8 @@ pub const Options = struct {
 };
 
 pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Options) ![]const u8 {
+    if (options.height == 0) return allocator.dupe(u8, "");
+
     var visible_entries = std.ArrayList(*const TranscriptEntry).empty;
     defer visible_entries.deinit(allocator);
     for (state.transcript.items) |*entry| {
@@ -21,28 +23,23 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
         try visible_entries.append(allocator, entry);
     }
 
-    const total = visible_entries.items.len;
-    if (total == 0) {
+    if (visible_entries.items.len == 0) {
         var ready_text: []const u8 = "Makai ready. Type message, /quit exits.";
         if (state.transcript.items.len > 0 and !state.show_thinking) ready_text = "Thinking hidden. Ctrl+R shows reasoning.";
         return tui_theme.muted().render(allocator, ready_text);
     }
 
-    const visible = @min(options.height, total);
-    const max_start = total - visible;
-    const start = max_start -| state.transcript_scroll;
-
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
-    for (visible_entries.items[start..], 0..) |entry, i| {
-        if (i >= visible) break;
-        if (i > 0) try writer.writeByte('\n');
+    var all_rows: std.Io.Writer.Allocating = .init(allocator);
+    defer all_rows.deinit();
+    const all_writer = &all_rows.writer;
+    for (visible_entries.items, 0..) |entry, i| {
+        if (i > 0) try all_writer.writeByte('\n');
         const row = try renderEntry(allocator, entry, options.width);
         defer allocator.free(row);
-        try writer.writeAll(row);
+        try all_writer.writeAll(row);
     }
-    return out.toOwnedSlice();
+
+    return lineWindow(allocator, all_rows.written(), options.height, state.transcript_scroll);
 }
 
 fn renderEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
@@ -69,7 +66,7 @@ fn renderEntryText(allocator: std.mem.Allocator, kind: TranscriptKind, text: []c
         else => try allocator.dupe(u8, text),
     };
     defer allocator.free(styled);
-    return tui_text.wrapTextWithAnsi(allocator, styled, @max(width, 1));
+    return tui_text.truncateLinesToWidth(allocator, styled, @max(width, 1), std.math.maxInt(usize));
 }
 
 fn indentBody(allocator: std.mem.Allocator, styled_label: []const u8, label_width: usize, body: []const u8) ![]u8 {
@@ -88,6 +85,28 @@ fn indentBody(allocator: std.mem.Allocator, styled_label: []const u8, label_widt
         }
         first = false;
         try writer.writeAll(line);
+    }
+    return out.toOwnedSlice();
+}
+
+fn lineWindow(allocator: std.mem.Allocator, text: []const u8, height: usize, scroll: usize) ![]u8 {
+    const total = tui_text.lineCount(text);
+    if (total <= height and scroll == 0) return allocator.dupe(u8, text);
+    const visible = @min(height, total);
+    const max_start = total - visible;
+    const start_line = max_start -| scroll;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line_index: usize = 0;
+    var written: usize = 0;
+    while (lines.next()) |line| : (line_index += 1) {
+        if (line_index < start_line) continue;
+        if (written >= visible) break;
+        if (written > 0) try writer.writeByte('\n');
+        try writer.writeAll(line);
+        written += 1;
     }
     return out.toOwnedSlice();
 }
@@ -170,4 +189,29 @@ test "transcript keeps assistant code indentation" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "    const x") != null);
+}
+
+test "transcript caps rendered lines to height" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "one\ntwo\nthree\nfour");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 2 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqual(@as(usize, 2), tui_text.lineCount(text));
+    try std.testing.expect(std.mem.indexOf(u8, text, "three") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "four") != null);
+}
+
+test "transcript preserves non-assistant whitespace" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.tool, "  alpha   beta\n    gamma");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "  alpha   beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "    gamma") != null);
 }
