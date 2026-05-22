@@ -462,7 +462,14 @@ pub const AppState = struct {
 
     fn finishTranscriptEntryWithOptions(self: *AppState, kind: TranscriptKind, text: []const u8, active_entry: ?*?usize, dedupe_trailing: bool) !void {
         if (text.len == 0) {
-            if (active_entry) |entry| entry.* = null;
+            if (active_entry) |entry| {
+                if (entry.*) |index| {
+                    if (index < self.transcript.items.len and self.transcript.items[index].kind == kind and self.transcript.items[index].text.items.len == 0) {
+                        self.removeTranscriptEntry(index);
+                    }
+                }
+                entry.* = null;
+            }
             return;
         }
 
@@ -484,6 +491,20 @@ pub const AppState = struct {
     fn clearActiveTranscriptEntries(self: *AppState) void {
         self.active_assistant_entry = null;
         self.active_tool_result_entry = null;
+    }
+
+    fn removeTranscriptEntry(self: *AppState, index: usize) void {
+        var entry = self.transcript.orderedRemove(index);
+        entry.deinit(self.allocator);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
+    }
+
+    fn adjustActiveTranscriptEntryAfterRemove(self: *AppState, active_entry: *?usize, removed_index: usize) void {
+        _ = self;
+        if (active_entry.*) |index| {
+            active_entry.* = if (index == removed_index) null else if (index > removed_index) index - 1 else index;
+        }
     }
 
     fn replaceEntryText(self: *AppState, index: usize, text: []const u8) !void {
@@ -738,6 +759,21 @@ test "AppState message_start opens fresh assistant row after prior assistant" {
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
     try std.testing.expectEqualStrings("previous response", state.transcript.items[0].text.items);
     try std.testing.expectEqualStrings("next response", state.transcript.items[1].text.items);
+}
+
+test "AppState removes empty assistant placeholder on empty message_end" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.assistant, "previous response");
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+    var assistant_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .assistant, .text = try ownedText("") } };
+    defer assistant_end.deinit(std.testing.allocator);
+    try state.applyEvent(assistant_end);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.assistant, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("previous response", state.transcript.items[0].text.items);
 }
 
 test "AppState keeps identical inline assistant message_end turns" {
