@@ -3,6 +3,7 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const agent = @import("agent");
+const agent_types = @import("agent_types");
 const agent_protocol_client = @import("agent_protocol_client");
 const agent_envelope = @import("agent_envelope");
 const agent_protocol_types = @import("agent_protocol_types");
@@ -15,6 +16,7 @@ const json_writer = @import("json_writer");
 const model_ref = @import("model_ref");
 const session = @import("tui_session");
 const local_tools = @import("tools/registry");
+const tool_local_runtime = @import("tool_local_runtime");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
@@ -135,6 +137,9 @@ pub const TuiRuntime = struct {
     original_tools: []agent.AgentTool,
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
+    tool_protocol: tool_local_runtime.LocalToolProtocol,
+    tool_protocol_override_fn: ?agent_types.ToolProtocolExecuteFn = null,
+    tool_protocol_override_ctx: ?*anyopaque = null,
     pending_approval: ApprovalDecisionState = .{},
     approval_mutex: std.atomic.Mutex = .unlocked,
     tool_approval_ctx: ?*anyopaque,
@@ -229,6 +234,8 @@ pub const TuiRuntime = struct {
             }
         }
 
+        const tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
+
         var runtime = TuiRuntime{
             .allocator = allocator,
             .backend = resolved_backend,
@@ -247,6 +254,7 @@ pub const TuiRuntime = struct {
             .original_tools = original_tools,
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
+            .tool_protocol = tool_protocol,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
@@ -300,6 +308,7 @@ pub const TuiRuntime = struct {
         if (self.remote_config_receiver) |receiver| self.allocator.destroy(receiver);
         if (self.remote_config_sender) |sender| self.allocator.destroy(sender);
         self.clearPendingApproval();
+        self.tool_protocol.deinit();
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
@@ -350,10 +359,18 @@ pub const TuiRuntime = struct {
                 if (self.started) return;
                 const protocol = self.protocol orelse return error.NoProtocolConfigured;
                 self.rebuildWrappedTools();
-                self.local_agent = agent.Agent.init(self.allocator, .{ .protocol = protocol, .compact_tool_output = self.compact_output, .permission_engine = self.permission_engine });
+                self.local_agent = agent.Agent.init(self.allocator, .{
+                    .protocol = protocol,
+                    .compact_tool_output = self.compact_output,
+                    .permission_engine = self.permission_engine,
+                    .execute_tool_via_protocol_fn = executeTuiToolProtocol,
+                    .execute_tool_via_protocol_ctx = self,
+                });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
+                self.tool_protocol.server.tools.clearRetainingCapacity();
+                try self.tool_protocol.server.registerTools(self.wrapped_tools);
                 self.local_agent.?.setTools(self.wrapped_tools);
                 self.started = true;
             },
@@ -639,8 +656,8 @@ pub const TuiRuntime = struct {
                 .short_description = tool.short_description,
                 .parameters_schema_json = tool.parameters_schema_json,
                 .execute = tool.execute,
-                .execute_ctx = tool.execute_ctx,
-                .execute_with_context = tool.execute_with_context,
+                .runtime_ctx = tool.runtime_ctx,
+                .runtime_execute = tool.runtime_execute,
                 .approval_ctx = &self.approval_contexts[i],
                 .approval_fn = approveTool,
                 .approval_ui_ctx = &self.approval_contexts[i],
@@ -1626,6 +1643,30 @@ fn notifyToolApproval(ctx: ?*anyopaque, request: agent.ToolApprovalRequest, allo
     } });
 }
 
+fn executeTuiToolProtocol(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?agent.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!agent.AgentToolResult {
+    const runtime: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return runtime.tool_protocol.executeWithOverride(
+        tool_call_id,
+        tool_name,
+        args_json,
+        cancel_token,
+        on_update_ctx,
+        on_update,
+        runtime.tool_protocol_override_ctx,
+        runtime.tool_protocol_override_fn,
+        allocator,
+    );
+}
+
 fn approveTool(ctx: ?*anyopaque, request: agent.ToolApprovalRequest) agent.ToolApprovalDecision {
     const approval_ctx: *ApprovalContext = @ptrCast(@alignCast(ctx.?));
     if (approval_ctx.original_callback) |callback| {
@@ -2021,8 +2062,8 @@ test "runtime wrapper preserves context-aware tool execution" {
         .description = "Context tool",
         .parameters_schema_json = "{}",
         .execute = demoTool,
-        .execute_ctx = &context,
-        .execute_with_context = contextOnlyTool,
+        .runtime_ctx = &context,
+        .runtime_execute = contextOnlyTool,
     }};
     const models = [_]ai_types.Model{test_model_a};
     var mock = MockProtocolCtx{ .tool_first = true, .tool_name = "context_tool" };

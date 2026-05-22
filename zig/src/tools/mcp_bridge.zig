@@ -57,8 +57,8 @@ pub const McpToolDefinition = struct {
             .short_description = short_description,
             .parameters_schema_json = schema,
             .execute = unavailableExecute,
-            .execute_ctx = ctx,
-            .execute_with_context = executeWithContext,
+            .runtime_ctx = ctx,
+            .runtime_execute = executeWithContext,
             .approval_ctx = if (self.is_destructive) ctx else null,
             .approval_fn = null,
         };
@@ -345,7 +345,7 @@ pub const McpBridge = struct {
             const ctx_mcp_name = try self.allocator.dupe(u8, mcp_name);
             errdefer self.allocator.free(ctx_mcp_name);
             exec_ctx.* = .{ .bridge = &self.self_ref, .server_index = server_index, .mcp_name = ctx_mcp_name };
-            tool.execute_ctx = exec_ctx;
+            tool.runtime_ctx = exec_ctx;
             try self.tools.append(self.allocator, .{
                 .server_index = server_index,
                 .mcp_name = try self.allocator.dupe(u8, mcp_name),
@@ -589,7 +589,7 @@ test "MCP invocation forwards text result" {
     errdefer deinitAgentToolFields(std.testing.allocator, &tool);
     const exec_ctx = try std.testing.allocator.create(McpToolExecContext);
     exec_ctx.* = .{ .bridge = &bridge.self_ref, .server_index = 0, .mcp_name = try std.testing.allocator.dupe(u8, "echo") };
-    tool.execute_ctx = exec_ctx;
+    tool.runtime_ctx = exec_ctx;
     try bridge.tools.append(std.testing.allocator, .{
         .server_index = 0,
         .mcp_name = try std.testing.allocator.dupe(u8, "echo"),
@@ -598,7 +598,7 @@ test "MCP invocation forwards text result" {
         .is_destructive = false,
     });
 
-    var result = try tool.execute_with_context.?(tool.execute_ctx, "call_1", "{}", null, null, null, std.testing.allocator);
+    var result = try tool.runtime_execute.?(tool.runtime_ctx, "call_1", "{}", null, null, null, std.testing.allocator);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hello from mcp", result.content.slice()[0].text.text);
 }
@@ -661,7 +661,7 @@ test "MCP JSON-RPC and result errors fail execution" {
     );
     defer rpc_error.deinit();
     bridge.servers.items[0].mock_response = rpc_error.value;
-    try std.testing.expectError(error.McpToolError, tool.execute_with_context.?(tool.execute_ctx, "call_1", "{}", null, null, null, std.testing.allocator));
+    try std.testing.expectError(error.McpToolError, tool.runtime_execute.?(tool.runtime_ctx, "call_1", "{}", null, null, null, std.testing.allocator));
 
     var result_error = try std.json.parseFromSlice(
         std.json.Value,
@@ -671,7 +671,7 @@ test "MCP JSON-RPC and result errors fail execution" {
     );
     defer result_error.deinit();
     bridge.servers.items[0].mock_response = result_error.value;
-    try std.testing.expectError(error.McpToolError, tool.execute_with_context.?(tool.execute_ctx, "call_2", "{}", null, null, null, std.testing.allocator));
+    try std.testing.expectError(error.McpToolError, tool.runtime_execute.?(tool.runtime_ctx, "call_2", "{}", null, null, null, std.testing.allocator));
 }
 
 fn makeTestTool(bridge: *McpBridge, name: []const u8) !agent.AgentTool {
@@ -869,7 +869,7 @@ test "MCP execution honors cancellation while waiting" {
     const tool = try makeTestTool(&bridge, "echo");
     var cancelled = std.atomic.Value(bool).init(true);
     const token = ai_types.CancelToken{ .cancelled = &cancelled };
-    try std.testing.expectError(error.Cancelled, tool.execute_with_context.?(tool.execute_ctx, "call_1", "{}", token, null, null, std.testing.allocator));
+    try std.testing.expectError(error.Cancelled, tool.runtime_execute.?(tool.runtime_ctx, "call_1", "{}", token, null, null, std.testing.allocator));
 }
 
 
@@ -930,7 +930,7 @@ test "MCP tools/call arguments are compacted to one JSON-RPC line" {
     defer response.deinit();
     bridge.servers.items[0].mock_response = response.value;
     const tool = try makeTestTool(&bridge, "echo");
-    var result = try tool.execute_with_context.?(tool.execute_ctx, "call_1", "{\n  \"value\": 1\n}", null, null, null, std.testing.allocator);
+    var result = try tool.runtime_execute.?(tool.runtime_ctx, "call_1", "{\n  \"value\": 1\n}", null, null, null, std.testing.allocator);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("ok", result.content.slice()[0].text.text);
 }

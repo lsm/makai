@@ -635,52 +635,19 @@ fn executeToolCalls(
                 .args_json = execution_args,
             };
 
-            result = blk: {
-                if (config.execute_tool_via_protocol_fn) |exec_remote| {
-                    break :blk exec_remote(
-                        config.execute_tool_via_protocol_ctx,
-                        tool_call.id,
-                        tool_call.name,
-                        execution_args,
-                        config.cancel_token,
-                        &update_ctx,
-                        onToolUpdate,
-                        allocator,
-                    ) catch |err| {
-                        result = try createErrorResult(allocator, err);
-                        is_error = true;
-                        break :blk result;
-                    };
-                }
-
-                if (t.execute_with_context) |exec_with_context| {
-                    break :blk exec_with_context(
-                        t.execute_ctx,
-                        tool_call.id,
-                        execution_args,
-                        config.cancel_token,
-                        &update_ctx,
-                        onToolUpdate,
-                        allocator,
-                    ) catch |err| {
-                        result = try createErrorResult(allocator, err);
-                        is_error = true;
-                        break :blk result;
-                    };
-                }
-
-                break :blk t.execute(
-                    tool_call.id,
-                    execution_args,
-                    config.cancel_token,
-                    &update_ctx,
-                    onToolUpdate,
-                    allocator,
-                ) catch |err| {
-                    result = try createErrorResult(allocator, err);
-                    is_error = true;
-                    break :blk result;
-                };
+            result = config.execute_tool_via_protocol_fn(
+                config.execute_tool_via_protocol_ctx,
+                tool_call.id,
+                tool_call.name,
+                execution_args,
+                config.cancel_token,
+                &update_ctx,
+                onToolUpdate,
+                allocator,
+            ) catch |err| blk: {
+                result = try createErrorResult(allocator, err);
+                is_error = true;
+                break :blk result;
             };
         } else {
             result = try createErrorResult(allocator, error.ToolNotFound);

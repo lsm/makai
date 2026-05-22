@@ -302,6 +302,24 @@ pub const SerializedPipe = struct {
         self.* = undefined;
     }
 
+    pub fn compact(self: *SerializedPipe) void {
+        compactBuffer(&self.to_client, &self.to_client_read_pos);
+        compactBuffer(&self.to_server, &self.to_server_read_pos);
+    }
+
+    fn compactBuffer(buffer: *std.ArrayList(u8), read_pos: *usize) void {
+        if (read_pos.* == 0) return;
+        if (read_pos.* >= buffer.items.len) {
+            buffer.clearRetainingCapacity();
+            read_pos.* = 0;
+            return;
+        }
+        const remaining = buffer.items[read_pos.*..];
+        std.mem.copyForwards(u8, buffer.items[0..remaining.len], remaining);
+        buffer.shrinkRetainingCapacity(remaining.len);
+        read_pos.* = 0;
+    }
+
     /// Server writes to this to send to client
     pub fn serverSender(self: *SerializedPipe) transport_mod.AsyncSender {
         return .{

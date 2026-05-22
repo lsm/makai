@@ -774,6 +774,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const protocol_tool_local_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("src/protocol/tool/local_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "tool_types", .module = protocol_tool_types_mod },
+            .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
+            .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
     const agent_loop_mod = b.createModule(.{
         .root_source_file = b.path("src/agent/agent_loop.zig"),
         .target = target,
@@ -803,6 +820,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol_server", .module = protocol_server_mod },
             .{ .name = "protocol_client", .module = protocol_client_mod },
             .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+            .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
         },
     });
@@ -866,6 +884,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent", .module = agent_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "permission", .module = permission_mod },
             .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
             .{ .name = "agent_protocol_server", .module = protocol_agent_server_mod },
@@ -879,6 +898,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
+            .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
             .{ .name = "json/writer", .module = json_writer_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
@@ -1247,6 +1267,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tool_types", .module = protocol_tool_types_mod },
                 .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
                 .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+                .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
@@ -1326,6 +1347,7 @@ pub fn build(b: *std.Build) void {
     const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
     const protocol_tool_envelope_test = b.addTest(.{ .root_module = protocol_tool_envelope_mod });
     const protocol_tool_runtime_test = b.addTest(.{ .root_module = protocol_tool_runtime_mod });
+    const protocol_tool_local_runtime_test = b.addTest(.{ .root_module = protocol_tool_local_runtime_mod });
 
     // Agent tests
     const permission_test = b.addTest(.{ .root_module = permission_mod });
@@ -1575,6 +1597,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tool_local_runtime_test).step);
     test_step.dependOn(&auth_cli_test_run.step);
     test_step.dependOn(&makai_cli_test_run.step);
 
@@ -1621,6 +1644,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_local_runtime_test).step);
 
     const test_unit_providers_step = b.step("test-unit-providers", "Run provider unit tests");
     test_unit_providers_step.dependOn(&b.addRunArtifact(api_registry_test).step);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat");
 const ai_types = @import("ai_types");
+const tool_local_runtime = @import("tool_local_runtime");
 const event_stream_mod = @import("event_stream");
 const types = @import("agent_types");
 const agent_loop = @import("agent_loop");
@@ -52,6 +53,8 @@ pub const AgentOptions = struct {
 
     // Provider options
     session_id: ?[]const u8 = null,
+    execute_tool_via_protocol_fn: ?types.ToolProtocolExecuteFn = null,
+    execute_tool_via_protocol_ctx: ?*anyopaque = null,
     get_api_key_fn: ?GetApiKeyFn = null,
     get_api_key_ctx: ?*anyopaque = null,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
@@ -98,6 +101,9 @@ pub const Agent = struct {
     _transform_context_fn: ?TransformContextFn,
     _transform_context_ctx: ?*anyopaque,
     _session_id: ?[]const u8,
+    _execute_tool_via_protocol_fn: ?types.ToolProtocolExecuteFn,
+    _execute_tool_via_protocol_ctx: ?*anyopaque,
+    _local_tool_protocol: ?*tool_local_runtime.LocalToolProtocol,
     _get_api_key_fn: ?GetApiKeyFn,
     _get_api_key_ctx: ?*anyopaque,
     _thinking_budgets: ?ai_types.ThinkingBudgets,
@@ -137,6 +143,9 @@ pub const Agent = struct {
             ._transform_context_fn = options.transform_context_fn,
             ._transform_context_ctx = options.transform_context_ctx,
             ._session_id = options.session_id,
+            ._execute_tool_via_protocol_fn = options.execute_tool_via_protocol_fn,
+            ._execute_tool_via_protocol_ctx = options.execute_tool_via_protocol_ctx,
+            ._local_tool_protocol = null,
             ._get_api_key_fn = options.get_api_key_fn,
             ._get_api_key_ctx = options.get_api_key_ctx,
             ._thinking_budgets = options.thinking_budgets,
@@ -155,6 +164,12 @@ pub const Agent = struct {
         // Wait for any running thread to complete
         if (self._thread != null) {
             self.waitForIdle();
+        }
+
+        if (self._local_tool_protocol) |local| {
+            local.deinit();
+            self._allocator.destroy(local);
+            self._local_tool_protocol = null;
         }
 
         // Clear queues
@@ -895,11 +910,25 @@ pub const Agent = struct {
             try context.appendMessage(try self.cloneMessage(msg));
         }
 
+        if (self._execute_tool_via_protocol_fn == null) {
+            if (self._local_tool_protocol == null) {
+                const local = try self._allocator.create(tool_local_runtime.LocalToolProtocol);
+                errdefer self._allocator.destroy(local);
+                local.* = try tool_local_runtime.LocalToolProtocol.init(self._allocator, self._state.tools);
+                self._local_tool_protocol = local;
+            } else {
+                self._local_tool_protocol.?.server.tools.clearRetainingCapacity();
+                try self._local_tool_protocol.?.server.registerTools(self._state.tools);
+            }
+        }
+
         // Build config. Agent remains auth-agnostic; provider layer owns credentials.
         const config = agent_loop.AgentLoopConfig{
             .model = model,
             .protocol = self._protocol,
             .tools = self._state.tools,
+            .execute_tool_via_protocol_fn = self._execute_tool_via_protocol_fn orelse tool_local_runtime.LocalToolProtocol.executeFn,
+            .execute_tool_via_protocol_ctx = self._execute_tool_via_protocol_ctx orelse self._local_tool_protocol,
             .temperature = null,
             .max_tokens = null,
             .api_key = null,
