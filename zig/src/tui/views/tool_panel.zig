@@ -9,9 +9,22 @@ pub const Options = struct {
 pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     const writer = &out.writer;
-    try writer.writeAll("Tools");
+    try writer.print("Tools ({d} registered)", .{state.registered_tools.items.len});
     if (state.tools.items.len == 0) {
-        try writer.writeAll("\n  none");
+        if (state.registered_tools.items.len == 0) {
+            try writer.writeAll("\n  none");
+            return out.toOwnedSlice();
+        }
+        var rows: usize = 1;
+        for (state.registered_tools.items) |tool| {
+            if (rows >= options.height) break;
+            try writer.print("\n  {s}", .{tool.name});
+            if (tool.short_description.len > 0) {
+                try writer.writeAll(" - ");
+                try writeOneLine(writer, tool.short_description, options.width -| tool.name.len -| 5);
+            }
+            rows += 1;
+        }
         return out.toOwnedSlice();
     }
 
@@ -51,6 +64,44 @@ fn writeOneLine(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
     const line = text[0..nl];
     try writer.writeAll(line[0..@min(width, line.len)]);
     if (line.len > width or nl < text.len) try writer.writeAll("…");
+}
+
+fn noopTool(
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?@import("ai_types").CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?@import("agent").ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!@import("agent").AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.NotImplemented;
+}
+
+test "tool panel renders registered tools when idle" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    const tools = [_]@import("agent").AgentTool{.{
+        .label = "Shell Execute",
+        .name = "shell_execute",
+        .description = "Run shell commands",
+        .short_description = "Run shell commands",
+        .parameters_schema_json = "{}",
+        .execute = noopTool,
+    }};
+    try state.setRegisteredTools(&tools);
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Tools (1 registered)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "shell_execute - Run shell commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "none") == null);
 }
 
 test "tool panel renders tool status and output" {

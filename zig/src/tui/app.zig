@@ -97,6 +97,7 @@ pub const App = struct {
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
+        try app.state.setRegisteredTools(app.runtime.?.availableTools());
         if (app.runtime.?.currentModel()) |model| {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
             app.state.telemetry.context_window = model.context_window;
@@ -408,6 +409,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();
+}
+
+test "App init seeds registered tools from runtime" {
+    var production = try ProductionRuntime.init(std.testing.allocator);
+    defer production.deinit();
+    var app = try App.init(std.testing.allocator, production.options());
+    defer app.deinit();
+
+    try std.testing.expect(app.state.registered_tools.items.len >= 12);
+    try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
+    try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
 }
 
 test "App submit appends user transcript without runtime" {

@@ -1,4 +1,6 @@
 const std = @import("std");
+const agent = @import("agent");
+const ai_types = @import("ai_types");
 const tui_runtime = @import("tui_runtime");
 
 pub const AppMode = enum {
@@ -49,6 +51,33 @@ pub const TranscriptEntry = struct {
 
     pub fn deinit(self: *TranscriptEntry, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const RegisteredToolEntry = struct {
+    name: []u8,
+    label: []u8,
+    short_description: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, tool: agent.AgentTool) !RegisteredToolEntry {
+        const name = try allocator.dupe(u8, tool.name);
+        errdefer allocator.free(name);
+        const label = try allocator.dupe(u8, tool.label);
+        errdefer allocator.free(label);
+        const short_description = try allocator.dupe(u8, tool.short_description orelse "");
+        errdefer allocator.free(short_description);
+        return .{
+            .name = name,
+            .label = label,
+            .short_description = short_description,
+        };
+    }
+
+    pub fn deinit(self: *RegisteredToolEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        allocator.free(self.label);
+        allocator.free(self.short_description);
         self.* = undefined;
     }
 };
@@ -244,6 +273,7 @@ pub const AppState = struct {
     allocator: std.mem.Allocator,
     mode: AppMode = .normal,
     transcript: std.ArrayList(TranscriptEntry) = .empty,
+    registered_tools: std.ArrayList(RegisteredToolEntry) = .empty,
     tools: std.ArrayList(ToolEntry) = .empty,
     sessions: std.ArrayList(SessionEntry) = .empty,
     composer: ComposerState = .{},
@@ -264,6 +294,8 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
+        for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
+        self.registered_tools.deinit(self.allocator);
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.deinit(self.allocator);
         for (self.sessions.items) |*session| session.deinit(self.allocator);
@@ -277,6 +309,13 @@ pub const AppState = struct {
 
     pub fn appendTranscript(self: *AppState, kind: TranscriptKind, text: []const u8) !void {
         try self.transcript.append(self.allocator, try TranscriptEntry.init(self.allocator, kind, text));
+    }
+
+    pub fn setRegisteredTools(self: *AppState, tools: []const agent.AgentTool) !void {
+        for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
+        self.registered_tools.clearRetainingCapacity();
+        try self.registered_tools.ensureTotalCapacity(self.allocator, tools.len);
+        for (tools) |tool| self.registered_tools.appendAssumeCapacity(try RegisteredToolEntry.init(self.allocator, tool));
     }
 
     pub fn clearTranscript(self: *AppState) void {
@@ -642,6 +681,23 @@ fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
 
+fn noopTool(
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?agent.ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!agent.AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.NotImplemented;
+}
+
 test "AppState applies transcript and tool events" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -874,6 +930,47 @@ test "AppState clears stale active assistant before next inline message_end" {
     try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
     try std.testing.expectEqualStrings("interrupted", state.transcript.items[0].text.items);
     try std.testing.expectEqualStrings("next response", state.transcript.items[1].text.items);
+}
+
+test "AppState clones registered tool metadata" {
+    const tools = [_]agent.AgentTool{
+        .{
+            .label = "Shell Execute",
+            .name = "shell_execute",
+            .description = "Run command",
+            .short_description = "Run shell commands",
+            .parameters_schema_json = "{}",
+            .execute = noopTool,
+        },
+        .{
+            .label = "Workspace Info",
+            .name = "workspace_info",
+            .description = "Show workspace",
+            .parameters_schema_json = "{}",
+            .execute = noopTool,
+        },
+    };
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.setRegisteredTools(&tools);
+    try std.testing.expectEqual(@as(usize, 2), state.registered_tools.items.len);
+    try std.testing.expectEqualStrings("shell_execute", state.registered_tools.items[0].name);
+    try std.testing.expectEqualStrings("Shell Execute", state.registered_tools.items[0].label);
+    try std.testing.expectEqualStrings("Run shell commands", state.registered_tools.items[0].short_description);
+    try std.testing.expectEqualStrings("", state.registered_tools.items[1].short_description);
+
+    const replacement = [_]agent.AgentTool{.{
+        .label = "File Read",
+        .name = "file_read",
+        .description = "Read file",
+        .short_description = "Read files",
+        .parameters_schema_json = "{}",
+        .execute = noopTool,
+    }};
+    try state.setRegisteredTools(&replacement);
+    try std.testing.expectEqual(@as(usize, 1), state.registered_tools.items.len);
+    try std.testing.expectEqualStrings("file_read", state.registered_tools.items[0].name);
 }
 
 test "AppState tool_result message_end updates active tool entry only" {
