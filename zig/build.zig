@@ -785,6 +785,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "permission", .module = permission_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
         },
     });
 
@@ -867,6 +868,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "permission", .module = permission_mod },
             .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
+            .{ .name = "agent_protocol_server", .module = protocol_agent_server_mod },
+            .{ .name = "agent_protocol_runtime", .module = protocol_agent_runtime_mod },
+            .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
+            .{ .name = "agent_protocol_types", .module = protocol_agent_types_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "transports/stdio", .module = stdio_transport_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
             .{ .name = "tools/registry", .module = tools_registry_mod },
             .{ .name = "json/writer", .module = json_writer_mod },

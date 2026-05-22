@@ -927,14 +927,39 @@ fn parseAgentTool(allocator: std.mem.Allocator, value: std.json.Value) !agent_lo
     const parameters_schema_json = try parseToolSchemaJson(allocator, tool_obj);
     errdefer allocator.free(parameters_schema_json);
 
+    const requires_approval = getBoolField(tool_obj, "requires_approval") orelse getBoolField(outer_obj, "requires_approval") orelse false;
     return .{
         .label = label,
         .name = name,
         .description = description,
         .short_description = short_description,
         .parameters_schema_json = parameters_schema_json,
-        .execute = unavailableAgentToolExecute,
+        .execute = if (requires_approval) remoteApprovalRequiredExecute else unavailableAgentToolExecute,
+        .approval_fn = if (requires_approval) remoteApprovalRequiredDecision else null,
     };
+}
+
+fn remoteApprovalRequiredDecision(ctx: ?*anyopaque, request: agent_bridge.ToolApprovalRequest) agent_bridge.ToolApprovalDecision {
+    _ = ctx;
+    _ = request;
+    return .reject;
+}
+
+fn remoteApprovalRequiredExecute(
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?*const fn (?*anyopaque, []const u8, []const u8, []const u8) void,
+    allocator: std.mem.Allocator,
+) anyerror!agent_loop.AgentToolResult {
+    _ = tool_call_id;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.RemoteToolApprovalRequired;
 }
 
 fn parseToolSchemaJson(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
@@ -1478,6 +1503,7 @@ fn serializeAgentLoopEvent(
             try w.writeStringField("tool_call_id", payload.tool_call_id);
             try w.writeStringField("tool_name", payload.tool_name);
             try w.writeStringField("result_json", payload.result_json);
+            if (payload.content_json.len > 0) try w.writeStringField("content_json", payload.content_json);
             try w.writeBoolField("is_error", payload.is_error);
             try w.writeIntField("args_bytes", payload.args_bytes);
             try w.writeIntField("raw_result_bytes", payload.raw_result_bytes);
@@ -1549,6 +1575,11 @@ fn writeUsageField(w: *json_writer.JsonWriter, usage: ai_types.Usage) !void {
 fn getStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
     return if (value == .string) value.string else null;
+}
+
+fn getBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    return if (value == .bool) value.bool else null;
 }
 
 fn parseTimestamp(obj: std.json.ObjectMap) i64 {
@@ -2634,6 +2665,34 @@ test "prepareAgentRun preserves requested tools" {
     try std.testing.expectEqualStrings("read_file", prepared.tools[0].name);
     try std.testing.expectEqualStrings("Read a file", prepared.tools[0].description);
     try std.testing.expect(std.mem.find(u8, prepared.tools[0].parameters_schema_json, "\"path\"") != null);
+}
+
+test "prepareAgentRun preserves remote tool approval requirement" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var pending = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"tools":[{"name":"shell_execute","description":"Run shell","parameters_schema_json":"{}","requires_approval":true}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer pending.deinit(allocator);
+
+    var prepared = try prepareAgentRun(allocator, pending);
+    defer prepared.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), prepared.tools.len);
+    try std.testing.expect(prepared.tools[0].approval_fn != null);
+    try std.testing.expectEqual(agent_bridge.ToolApprovalDecision.reject, prepared.tools[0].approval_fn.?(prepared.tools[0].approval_ctx, .{
+        .tool_call_id = "call-1",
+        .tool_name = "shell_execute",
+        .args_json = "{}",
+    }));
+    try std.testing.expectError(error.RemoteToolApprovalRequired, prepared.tools[0].execute("call-1", "{}", null, null, null, allocator));
 }
 
 test "prepareAgentRun parses SDK-style request options from message json" {

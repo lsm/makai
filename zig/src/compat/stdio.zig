@@ -17,6 +17,14 @@ fn fileFromPipeHandle(handle: File.Handle) File {
     return .{ .handle = handle, .flags = .{ .nonblocking = false } };
 }
 
+fn nonblockingFileFromHandle(handle: File.Handle) File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = true } };
+}
+
+fn blockingFileFromHandle(handle: File.Handle) File {
+    return .{ .handle = handle, .flags = .{ .nonblocking = false } };
+}
+
 /// Return the process stdin file handle.
 ///
 /// Zig 0.16 mapping: this borrows stdin from the Makai default I/O context while
@@ -52,6 +60,57 @@ pub fn writeLine(file: File, data: []const u8) !void {
 /// Read bytes from a stdio/file handle into one buffer.
 pub fn read(file: File, buffer: []u8) !usize {
     return file.readStreaming(defaultIo(), &.{buffer});
+}
+
+/// Return a copy of the file handle configured for non-blocking reads.
+pub fn nonblocking(file: File) File {
+    return nonblockingFileFromHandle(file.handle);
+}
+
+/// Return a copy of the file handle configured for blocking reads.
+pub fn blocking(file: File) File {
+    return blockingFileFromHandle(file.handle);
+}
+
+fn setNonBlockingMode(file: File, enabled: bool) !void {
+    if (@import("builtin").os.tag == .windows) return;
+    var flags = std.posix.system.fcntl(file.handle, std.posix.F.GETFL, @as(usize, 0));
+    switch (std.posix.errno(flags)) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+    const nonblocking_flag: @TypeOf(flags) = 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
+    if (enabled) {
+        flags |= nonblocking_flag;
+    } else {
+        flags &= std.math.maxInt(@TypeOf(flags)) ^ nonblocking_flag;
+    }
+    switch (std.posix.errno(std.posix.system.fcntl(file.handle, std.posix.F.SETFL, flags))) {
+        .SUCCESS => {},
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
+/// Enable O_NONBLOCK on POSIX file descriptors.
+pub fn setNonBlocking(file: File) !void {
+    try setNonBlockingMode(file, true);
+}
+
+/// Enable O_NONBLOCK and return a matching Zig File metadata copy.
+pub fn setNonBlockingFile(file: File) !File {
+    try setNonBlocking(file);
+    return nonblocking(file);
+}
+
+/// Disable O_NONBLOCK on POSIX file descriptors.
+pub fn setBlocking(file: File) !void {
+    try setNonBlockingMode(file, false);
+}
+
+/// Disable O_NONBLOCK and return a matching Zig File metadata copy.
+pub fn setBlockingFile(file: File) !File {
+    try setBlocking(file);
+    return blocking(file);
 }
 
 /// Close a stdio/file handle.

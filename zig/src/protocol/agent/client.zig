@@ -68,6 +68,10 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const sid = agent_types.generateSessionId();
+        return self.sendAgentStartWithSession(sid, config_json, system_prompt);
+    }
+
+    pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(sid);
 
@@ -155,7 +159,7 @@ pub const AgentProtocolClient = struct {
         try self.session_complete_flags.put(session_id, true);
     }
 
-    fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
+    pub fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
             err.deinit(self.allocator);

@@ -102,6 +102,7 @@ pub const ToolExecutionEndPayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     result_json: []const u8,
+    content_json: []const u8 = "",
     is_error: bool,
     args_bytes: u64 = 0,
     raw_result_bytes: u64 = 0,
