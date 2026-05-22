@@ -248,17 +248,20 @@ pub const ComposerState = struct {
     buffer: std.ArrayList(u8) = .empty,
     history: std.ArrayList([]u8) = .empty,
     history_index: ?usize = null,
+    history_draft: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *ComposerState, allocator: std.mem.Allocator) void {
         self.buffer.deinit(allocator);
         for (self.history.items) |item| allocator.free(item);
         self.history.deinit(allocator);
+        self.history_draft.deinit(allocator);
         self.* = undefined;
     }
 
     pub fn clear(self: *ComposerState) void {
         self.buffer.clearRetainingCapacity();
         self.history_index = null;
+        self.history_draft.clearRetainingCapacity();
     }
 
     pub fn text(self: ComposerState) []const u8 {
@@ -281,6 +284,7 @@ pub const AppState = struct {
     status: StatusState = .{},
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
+    show_thinking: bool = true,
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
@@ -336,10 +340,58 @@ pub const AppState = struct {
         }
         const submitted = try self.allocator.dupe(u8, raw);
         errdefer self.allocator.free(submitted);
-        try self.composer.history.append(self.allocator, try self.allocator.dupe(u8, submitted));
+        try self.recordComposerHistory(submitted);
         self.composer.clear();
         try self.appendUserMessage(submitted);
         return submitted;
+    }
+
+    pub fn recordComposerHistory(self: *AppState, text: []const u8) !void {
+        const raw = std.mem.trim(u8, text, " \t\r\n");
+        if (raw.len == 0) return;
+        try self.composer.history.append(self.allocator, try self.allocator.dupe(u8, raw));
+        self.composer.history_index = null;
+        self.composer.history_draft.clearRetainingCapacity();
+    }
+
+    pub fn replaceComposerBuffer(self: *AppState, text: []const u8) !void {
+        self.composer.buffer.clearRetainingCapacity();
+        try self.composer.buffer.appendSlice(self.allocator, text);
+    }
+
+    pub fn composerHistoryPrev(self: *AppState) !bool {
+        if (self.composer.history.items.len == 0) return false;
+        if (self.composer.history_index) |index| {
+            if (index == 0) return false;
+            const next_index = index - 1;
+            self.composer.history_index = next_index;
+            try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+            return true;
+        }
+        self.composer.history_draft.clearRetainingCapacity();
+        try self.composer.history_draft.appendSlice(self.allocator, self.composer.buffer.items);
+        const next_index = self.composer.history.items.len - 1;
+        self.composer.history_index = next_index;
+        try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+        return true;
+    }
+
+    pub fn composerHistoryNext(self: *AppState) !bool {
+        const current = self.composer.history_index orelse return false;
+        if (current + 1 >= self.composer.history.items.len) {
+            self.composer.history_index = null;
+            try self.replaceComposerBuffer(self.composer.history_draft.items);
+            self.composer.history_draft.clearRetainingCapacity();
+            return true;
+        }
+        const next_index = current + 1;
+        self.composer.history_index = next_index;
+        try self.replaceComposerBuffer(self.composer.history.items[next_index]);
+        return true;
+    }
+
+    pub fn toggleThinking(self: *AppState) void {
+        self.show_thinking = !self.show_thinking;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
@@ -375,7 +427,9 @@ pub const AppState = struct {
             .tool_execution_start => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
                 tool.expanded = true;
-                try self.appendTranscript(.tool, payload.tool_name.slice());
+                const summary = try toolSummary(self.allocator, payload.tool_name.slice(), payload.args_json.slice());
+                defer self.allocator.free(summary);
+                try self.appendTranscript(.tool, summary);
             },
             .tool_execution_update => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
@@ -677,6 +731,71 @@ fn jsonUsize(obj: std.json.ObjectMap, key: []const u8) ?usize {
     };
 }
 
+fn toolSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []const u8) ![]u8 {
+    const primary = primaryToolArg(allocator, args_json) catch null;
+    defer if (primary) |value| allocator.free(value);
+    if (primary) |value| {
+        const clipped = try clipSummaryArg(allocator, value);
+        defer allocator.free(clipped);
+        return std.fmt.allocPrint(allocator, "◈ {s} \"{s}\"", .{ name, clipped });
+    }
+    return std.fmt.allocPrint(allocator, "◈ {s}", .{name});
+}
+
+fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
+    if (args_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const keys = [_][]const u8{ "command", "path", "query", "pattern", "file", "operation" };
+    for (keys) |key| {
+        if (jsonString(parsed.value.object, key)) |value| {
+            if (value.len > 0) return try allocator.dupe(u8, value);
+        }
+    }
+    return null;
+}
+
+fn clipSummaryArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < value.len and width < 48) {
+        const c = value[i];
+        if (c == '\n' or c == '\r' or c == '\t') {
+            try writer.writeByte(' ');
+            width += 1;
+            i += 1;
+            continue;
+        }
+        if (c < 0x20 or c == 0x7f) {
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (i + len > value.len) break;
+        if (len == 1) {
+            try writer.writeByte(c);
+        } else {
+            const codepoint = std.unicode.utf8Decode(value[i .. i + len]) catch {
+                i += 1;
+                continue;
+            };
+            if (codepoint < 0x20 or codepoint == 0x7f) {
+                i += len;
+                continue;
+            }
+            try writer.writeAll(value[i .. i + len]);
+        }
+        width += 1;
+        i += len;
+    }
+    if (i < value.len) try writer.writeAll("…");
+    return out.toOwnedSlice();
+}
+
 fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
@@ -738,6 +857,24 @@ test "AppState applies transcript and tool events" {
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ shell_command \"pwd\"") != null);
+}
+
+test "AppState strips control bytes from tool summaries" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_command"),
+        .args_json = try ownedText("{\"command\":\"before\\u001b[2Jafter\\u0007\"}"),
+    } };
+    defer start_event.deinit(std.testing.allocator);
+    try state.applyEvent(start_event);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.transcript.items[0].text.items, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.transcript.items[0].text.items, 0x07) == null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[0].text.items, "before[2Jafter") != null);
 }
 
 test "AppState finalizes transcript from message_end text" {
@@ -1083,6 +1220,34 @@ test "Composer submission stores history and user transcript" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello makai", state.transcript.items[0].text.items);
+}
+
+test "Composer history navigation recalls entries and restores draft" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "first"));
+    try state.composer.history.append(std.testing.allocator, try std.testing.allocator.dupe(u8, "second"));
+    try state.composer.buffer.appendSlice(std.testing.allocator, "draft");
+
+    try std.testing.expect(try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("second", state.composer.text());
+    try std.testing.expect(try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("first", state.composer.text());
+    try std.testing.expect(!try state.composerHistoryPrev());
+    try std.testing.expectEqualStrings("first", state.composer.text());
+    try std.testing.expect(try state.composerHistoryNext());
+    try std.testing.expectEqualStrings("second", state.composer.text());
+    try std.testing.expect(try state.composerHistoryNext());
+    try std.testing.expectEqualStrings("draft", state.composer.text());
+}
+
+test "AppState toggles thinking visibility" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expect(state.show_thinking);
+    state.toggleThinking();
+    try std.testing.expect(!state.show_thinking);
 }
 
 test "AppState applies thinking tool call and lifecycle events" {

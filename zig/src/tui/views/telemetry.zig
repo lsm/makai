@@ -37,16 +37,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     defer gauge_arena.deinit();
     const gauge_text = gauge.view(gauge_arena.allocator());
     try writer.writeAll(gauge_text);
-    const used_text = try compactNumber(allocator, telemetry.estimated_tokens);
+    const used_text = try tui_text.compactNumber(allocator, telemetry.estimated_tokens);
     defer allocator.free(used_text);
     if (limit > 0) {
-        const limit_text = try compactNumber(allocator, limit);
+        const limit_text = try tui_text.compactNumber(allocator, limit);
         defer allocator.free(limit_text);
         try writer.print(" {s}/{s} tok", .{ used_text, limit_text });
     } else {
         try writer.print(" {s} tok", .{used_text});
     }
-    const bytes_text = try compactNumber(allocator, telemetry.total_bytes);
+    const bytes_text = try tui_text.compactNumber(allocator, telemetry.total_bytes);
     defer allocator.free(bytes_text);
     try writer.print(" ({s} bytes)", .{bytes_text});
 
@@ -54,16 +54,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const segments = try tui_theme.statusKey().render(allocator, "Segments");
     defer allocator.free(segments);
     try writer.print("{s} ", .{segments});
-    try writeSegment(writer, allocator, "system_prompt", telemetry.system_prompt);
+    try writeSegment(writer, allocator, "sys", telemetry.system_prompt);
     try writer.writeAll(" • ");
-    try writeSegment(writer, allocator, "messages", telemetry.messages);
+    try writeSegment(writer, allocator, "msg", telemetry.messages);
     try writer.writeAll(" • ");
     try writeSegment(writer, allocator, "tools", telemetry.tool_definitions);
 
     if (findLatestTruncatedTool(state)) |tool| {
-        const raw_text = try compactNumber(allocator, tool.raw_total_bytes);
+        const raw_text = try tui_text.compactNumber(allocator, tool.raw_total_bytes);
         defer allocator.free(raw_text);
-        const returned_text = try compactNumber(allocator, tool.returned_total_bytes);
+        const returned_text = try tui_text.compactNumber(allocator, tool.returned_total_bytes);
         defer allocator.free(returned_text);
         try writer.print("\nTool output truncated {s}->{s} bytes", .{ raw_text, returned_text });
         if (tool.artifact_refs.len > 0) try writer.print(" • artifact {s}", .{tool.artifact_refs});
@@ -78,12 +78,6 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     return out.toOwnedSlice();
 }
 
-fn compactNumber(allocator: std.mem.Allocator, value: u64) ![]u8 {
-    if (value >= 1_000_000) return std.fmt.allocPrint(allocator, "{d}M", .{value / 1_000_000});
-    if (value >= 1_000) return std.fmt.allocPrint(allocator, "{d}k", .{value / 1_000});
-    return std.fmt.allocPrint(allocator, "{d}", .{value});
-}
-
 fn writeSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, name: []const u8, segment: tui_state.PromptSegmentState) !void {
     const styled_name = try tui_theme.statusKey().render(allocator, name);
     defer allocator.free(styled_name);
@@ -95,9 +89,9 @@ fn writeSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, name: []co
         .stable => "stable/cacheable",
         .dynamic => "dynamic",
     };
-    const bytes = try compactNumber(allocator, segment.bytes);
+    const bytes = try tui_text.compactNumber(allocator, segment.bytes);
     defer allocator.free(bytes);
-    const tokens = try compactNumber(allocator, segment.estimated_tokens);
+    const tokens = try tui_text.compactNumber(allocator, segment.estimated_tokens);
     defer allocator.free(tokens);
     try writer.print("{s}:{s}b/{s}t {s}", .{ styled_name, bytes, tokens, role });
 }
@@ -125,8 +119,8 @@ test "telemetry view renders context and segments" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "100/200 tok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "system_prompt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "messages") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "sys") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "msg") != null);
 }
 
 test "telemetry overflow preserves segment line" {
