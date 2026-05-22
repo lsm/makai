@@ -4,6 +4,7 @@ const ai_types = @import("ai_types");
 const event_stream_module = @import("event_stream");
 const types = @import("agent_types");
 const permission = @import("permission");
+const json_writer = @import("json_writer");
 const owned_slice_mod = @import("owned_slice");
 
 // Re-export types needed by callers
@@ -372,6 +373,33 @@ fn skipToolCall(
     };
 }
 
+fn serializeToolResultContent(allocator: std.mem.Allocator, content: []const ai_types.UserContentPart) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    var w = json_writer.JsonWriter.init(&buf, allocator);
+    try w.beginArray();
+    for (content) |part| {
+        try w.beginObject();
+        switch (part) {
+            .text => |text| {
+                try w.writeStringField("type", "text");
+                try w.writeStringField("text", text.text);
+                if (text.text_signature) |sig| try w.writeStringField("text_signature", sig);
+            },
+            .image => |image| {
+                try w.writeStringField("type", "image");
+                try w.writeStringField("data", image.data);
+                try w.writeStringField("mime_type", image.mime_type);
+            },
+        }
+        try w.endObject();
+    }
+    try w.endArray();
+    const out = try allocator.dupe(u8, buf.items);
+    buf.deinit(allocator);
+    return out;
+}
+
 fn finalizeToolExecution(
     allocator: std.mem.Allocator,
     config: AgentLoopConfig,
@@ -398,12 +426,15 @@ fn finalizeToolExecution(
 
     const returned_usage = measureToolResult(result.*);
     const result_json = result.getDetailsJson() orelse "null";
+    const content_json = try serializeToolResultContent(allocator, result.content.slice());
+    defer allocator.free(content_json);
     const args_bytes: u64 = @intCast(args_json.len);
 
     try event_stream.push(.{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .result_json = result_json,
+        .content_json = content_json,
         .is_error = is_error,
         .args_bytes = args_bytes,
         .raw_result_bytes = raw_usage.result_bytes,

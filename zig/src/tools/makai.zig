@@ -1503,6 +1503,7 @@ fn serializeAgentLoopEvent(
             try w.writeStringField("tool_call_id", payload.tool_call_id);
             try w.writeStringField("tool_name", payload.tool_name);
             try w.writeStringField("result_json", payload.result_json);
+            if (payload.content_json.len > 0) try w.writeStringField("content_json", payload.content_json);
             try w.writeBoolField("is_error", payload.is_error);
             try w.writeIntField("args_bytes", payload.args_bytes);
             try w.writeIntField("raw_result_bytes", payload.raw_result_bytes);

@@ -785,6 +785,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "permission", .module = permission_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
         },
     });
 

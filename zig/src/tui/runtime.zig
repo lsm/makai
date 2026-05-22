@@ -377,7 +377,9 @@ pub const TuiRuntime = struct {
                 client.removeSessionState(sid);
             }
             if (self.remote_sender) |sender| sender.close();
-            if (self.remote_receiver) |*receiver| receiver.close();
+            if (self.remote_config_stream_handle == null) {
+                if (self.remote_receiver) |*receiver| receiver.close();
+            }
             client.deinit();
             self.remote_client = null;
             self.remote_session_id = null;
@@ -819,10 +821,12 @@ pub const TuiRuntime = struct {
             defer json.deinit(self.allocator);
             try self.handleRemoteAgentEventJson(json.slice());
         }
-        if (self.remote_session_id) |sid| {
+        const sid = self.remote_session_id orelse self.remote_pending_session_id;
+        if (sid) |session_id| {
             if (!self.remote_error_emitted) {
-                if (client.getLastErrorForSession(sid)) |msg| {
+                if (client.getLastErrorForSession(session_id)) |msg| {
                     self.remote_error_emitted = true;
+                    self.remote_pending_session_id = null;
                     try self.completeRemoteWithError(msg);
                 }
             }
@@ -1080,8 +1084,9 @@ pub const TuiRuntime = struct {
             const tool_call_id = getJsonString(obj, "tool_call_id") orelse return error.InvalidRemoteEvent;
             const tool_name = getJsonString(obj, "tool_name") orelse return error.InvalidRemoteEvent;
             const result_json = getJsonString(obj, "result_json") orelse return error.InvalidRemoteEvent;
+            const content_json = getJsonString(obj, "content_json") orelse result_json;
             const is_error = getJsonBool(obj, "is_error") orelse return error.InvalidRemoteEvent;
-            try self.recordRemoteToolResultJson(tool_call_id, tool_name, result_json, getJsonString(obj, "details_json"), is_error);
+            try self.recordRemoteToolResultJson(tool_call_id, tool_name, content_json, getJsonString(obj, "details_json") orelse result_json, is_error);
             return self.push(.{ .tool_execution_end = .{
                 .tool_call_id = try self.dupeOwned(tool_call_id),
                 .tool_name = try self.dupeOwned(tool_name),
@@ -1531,7 +1536,7 @@ fn writeRemoteTool(w: *json_writer.JsonWriter, tool: agent.AgentTool) !void {
     if (tool.short_description) |short| try w.writeStringField("short_description", short);
     try w.writeStringField("label", tool.label);
     try w.writeStringField("parameters_schema_json", tool.parameters_schema_json);
-    try w.writeBoolField("requires_approval", tool.approval_fn != null or tool.approval_ui_fn != null);
+    try w.writeBoolField("requires_approval", tool.approval_fn != null);
     try w.endObject();
 }
 
@@ -1562,9 +1567,19 @@ fn parseRemoteToolResultContent(allocator: std.mem.Allocator, value: std.json.Va
         parts.deinit(allocator);
     }
     for (value.array.items) |item| {
-        try parts.append(allocator, try parseRemoteUserContentPart(allocator, item));
+        const part = parseRemoteUserContentPart(allocator, item) catch |err| switch (err) {
+            error.InvalidRemoteEvent => return parseRemoteToolResultJsonText(allocator, value),
+            else => return err,
+        };
+        try parts.append(allocator, part);
     }
     return parts.toOwnedSlice(allocator);
+}
+
+fn parseRemoteToolResultJsonText(allocator: std.mem.Allocator, value: std.json.Value) ![]ai_types.UserContentPart {
+    const json = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(json);
+    return parseRemoteToolResultText(allocator, json);
 }
 
 fn parseRemoteToolResultScalar(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.UserContentPart {
@@ -2660,6 +2675,16 @@ test "remote config initializes stdio transport hooks" {
     }
 }
 
+test "remote config stdio stop keeps handle reusable" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .stdio } });
+    defer runtime.deinit();
+    runtime.remote_client = agent_protocol_client.AgentProtocolClient.init(std.testing.allocator);
+    runtime.started = true;
+    runtime.stop();
+    try std.testing.expect(runtime.remote_config_stream_handle != null);
+    try std.testing.expect(!runtime.remote_config_stream_handle.?.isCancelled());
+}
+
 test "remote config rejects unsupported endpoint" {
     try std.testing.expectError(error.UnsupportedRemoteEndpoint, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .stdio, .endpoint = "remote" } }));
 }
@@ -2715,6 +2740,34 @@ test "remote submit uses configurable startup timeout" {
     const writes_after_first_timeout = mock.writes.items.len;
     try std.testing.expectError(error.RemoteAgentStartFailed, tui_session.submitTurn("retry"));
     try std.testing.expect(mock.writes.items.len > writes_after_first_timeout);
+}
+
+test "remote startup error for pending session emits terminal error" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    var err_env = agent_protocol_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_error = .{ .code = .internal_error, .message = try std.testing.allocator.dupe(u8, "startup failed") } },
+    };
+    defer err_env.deinit(std.testing.allocator);
+    try mock.queueEnvelope(std.testing.allocator, err_env);
+    try std.testing.expectError(error.RemoteAgentStartFailed, tui_session.submitTurn("hi"));
+    try std.testing.expect(runtime.event_stream.isDone());
+    var saw_error = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .@"error" and std.mem.eql(u8, ev.@"error".message.slice(), "startup failed")) saw_error = true;
+    }
+    try std.testing.expect(saw_error);
 }
 
 test "remote submit rejects missing model before send" {
@@ -3009,6 +3062,25 @@ test "remote tool execution end records tool result history" {
     try std.testing.expectEqualStrings("found", runtime.remote_messages.items[0].tool_result.content[0].text.text);
 }
 
+test "remote tool execution end records content_json over details result" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"result_json\":\"{\\\"ok\\\":true}\",\"content_json\":\"[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"actual output\\\"}]\",\"is_error\":false}");
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .tool_result);
+    try std.testing.expectEqualStrings("actual output", runtime.remote_messages.items[0].tool_result.content[0].text.text);
+    try std.testing.expectEqualStrings("{\"ok\":true}", runtime.remote_messages.items[0].tool_result.details_json.slice());
+}
+
+test "remote tool execution end accepts arbitrary JSON array history" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"tool_execution_end\",\"tool_call_id\":\"call-1\",\"tool_name\":\"lookup\",\"result_json\":\"[{\\\"id\\\":1,\\\"name\\\":\\\"a\\\"}]\",\"is_error\":false}");
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
+    try std.testing.expect(runtime.remote_messages.items[0] == .tool_result);
+    try std.testing.expectEqualStrings("[{\"id\":1,\"name\":\"a\"}]", runtime.remote_messages.items[0].tool_result.content[0].text.text);
+}
+
 test "remote tool execution end records scalar tool result history" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
@@ -3077,6 +3149,27 @@ test "remote submit preserves approval marker in serialized tools" {
     const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.remoteSerializableTools());
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"requires_approval\":true") != null);
+}
+
+test "remote submit ignores approval UI marker in serialized tools" {
+    var original_ctx = OriginalApprovalUiCtx{};
+    const tools = [_]agent.AgentTool{.{
+        .label = "Notify",
+        .name = "notify_only",
+        .description = "Notify only",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .approval_ui_ctx = &original_ctx,
+        .approval_ui_fn = originalApprovalUiCallback,
+    }};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .backend = .remote,
+        .tools = &tools,
+    });
+    defer runtime.deinit();
+    const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.remoteSerializableTools());
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"requires_approval\":false") != null);
 }
 
 test "remote event parser rejects invalid field types" {
