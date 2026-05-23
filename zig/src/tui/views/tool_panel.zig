@@ -130,11 +130,13 @@ fn takeDisplayWidth(line: []const u8, max_width: usize) DisplayTake {
         if (i + len > line.len) break;
         const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch line[i];
         const cw = @import("zigzag").measure.charWidth(@intCast(codepoint));
-        if (width + cw > max_width) break;
+        if (width + cw > max_width) {
+            if (i == 0) i += len;
+            break;
+        }
         width += cw;
         i += len;
     }
-    if (i == 0) i = @min(line.len, 1);
     return .{ .bytes = i, .width = width };
 }
 
@@ -149,6 +151,18 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
             const c = text[index.*];
             index.* += 1;
             if (c >= 0x40 and c <= 0x7e) return;
+        }
+        return;
+    }
+    if (second == ']') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
         }
     }
 }
@@ -263,4 +277,18 @@ test "tool panel keeps diff styling across wrapped segments and errors win" {
     try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|abcdefgh") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ijklmnopqr") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+ cmd failed") != null);
+}
+
+test "tool panel wrapper skips OSC and keeps wide UTF-8 intact" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "{}", .done));
+    state.tools.items[0].expanded = true;
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "\x1b]8;;https://example.com\x07link\x1b]8;;\x07\n界abc");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 40, .height = 6 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b]8;;https://example.com\x07link\x1b]8;;\x07") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "界") != null);
 }
