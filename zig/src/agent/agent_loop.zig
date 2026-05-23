@@ -593,6 +593,14 @@ fn executeToolCalls(
                 .args_json = execution_args,
             };
             if (config.permission_engine) |engine| {
+                const policy_decision = engine.evaluate(tool_call.name, validated_args);
+                if (policy_decision == .deny) {
+                    result = try rejectedToolResult(allocator);
+                    is_error = true;
+                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                    continue;
+                }
+
                 const legacy_decision = runLegacyApproval(t, approval_request, allocator);
                 if (legacy_decision == .reject or legacy_decision == .reject_always) {
                     result = try rejectedToolResult(allocator);
@@ -604,18 +612,11 @@ fn executeToolCalls(
                     const call = permission.parseToolCall(allocator, tool_call.name, validated_args) catch null;
                     if (call) |parsed_call| {
                         defer permission.deinitParsedToolCall(allocator, parsed_call);
-                        try engine.persistDecision(parsed_call, .allow);
+                        if (permission.canPersistDecision(parsed_call)) try engine.persistDecision(parsed_call, .allow);
                     }
                 }
 
-                const policy_decision = engine.evaluate(tool_call.name, validated_args);
-                if (policy_decision == .deny) {
-                    result = try rejectedToolResult(allocator);
-                    is_error = true;
-                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
-                    continue;
-                }
-                if (policy_decision == .prompt and engine.approval_callback != null) {
+                if (policy_decision == .prompt and engine.approval_callback != null and legacy_decision != .approve_always) {
                     const decision = try engine.approve(tool_call.name, validated_args);
                     if (decision == .reject or decision == .reject_always) {
                         result = try rejectedToolResult(allocator);
@@ -1740,7 +1741,7 @@ test "executeToolCalls persists legacy approve always with permission engine" {
     };
 
     var approval = ApprovalRecorder{ .decision = .approve_always };
-    const tools = [_]AgentTool{.{
+    const scoped_tools = [_]AgentTool{.{
         .label = "Edit",
         .name = "file_edit",
         .description = "Edit file",
@@ -1749,13 +1750,13 @@ test "executeToolCalls persists legacy approve always with permission engine" {
         .approval_ctx = &approval,
         .approval_fn = recordingApproval,
     }};
-    const assistant_content = [_]ai_types.AssistantContent{.{ .tool_call = .{
+    const scoped_content = [_]ai_types.AssistantContent{.{ .tool_call = .{
         .id = "call_edit",
         .name = "file_edit",
         .arguments_json = "{\"path\":\"src/main.zig\"}",
     } }};
-    const assistant_message = ai_types.AssistantMessage{
-        .content = &assistant_content,
+    const scoped_message = ai_types.AssistantMessage{
+        .content = &scoped_content,
         .api = "test-api",
         .provider = "test-provider",
         .model = "test-model",
@@ -1771,9 +1772,116 @@ test "executeToolCalls persists legacy approve always with permission engine" {
     var agent_events = AgentEventStream.init(allocator);
     defer agent_events.deinit();
 
-    var tool_result = try executeToolCalls(
+    var scoped_result = try executeToolCalls(
         allocator,
-        assistant_message,
+        scoped_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &scoped_tools,
+            .permission_engine = &engine,
+        },
+        &agent_events,
+    );
+    defer scoped_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), approval.calls);
+    try std.testing.expectEqual(@as(usize, 1), engine.persisted.items.len);
+    try std.testing.expectEqualStrings("/workspace/src/main.zig", engine.persisted.items[0].path.?);
+    try std.testing.expectEqual(permission.PermissionDecision.allow, engine.evaluate("file_edit", "{\"path\":\"/workspace/src/main.zig\"}"));
+
+    approval.calls = 0;
+    const unscoped_tools = [_]AgentTool{.{
+        .label = "Remote",
+        .name = "remote_tool",
+        .description = "Remote tool",
+        .parameters_schema_json = "{}",
+        .execute = mockLargeOutputTool,
+        .approval_ctx = &approval,
+        .approval_fn = recordingApproval,
+    }};
+    const unscoped_content = [_]ai_types.AssistantContent{.{ .tool_call = .{
+        .id = "call_remote",
+        .name = "remote_tool",
+        .arguments_json = "{\"q\":\"x\"}",
+    } }};
+    const unscoped_message = ai_types.AssistantMessage{
+        .content = &unscoped_content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    var unscoped_result = try executeToolCalls(
+        allocator,
+        unscoped_message,
+        .{
+            .model = model,
+            .protocol = .{ .stream_fn = undefined },
+            .tools = &unscoped_tools,
+            .permission_engine = &engine,
+        },
+        &agent_events,
+    );
+    defer unscoped_result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), approval.calls);
+    try std.testing.expectEqual(@as(usize, 1), engine.persisted.items.len);
+}
+
+test "executeToolCalls denies policy before legacy approval can persist always" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "test-model",
+        .name = "Test",
+        .api = "test-api",
+        .provider = "test-provider",
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+
+    var approval = ApprovalRecorder{ .decision = .approve_always };
+    const tools = [_]AgentTool{.{
+        .label = "Edit",
+        .name = "file_edit",
+        .description = "Edit file",
+        .parameters_schema_json = "{}",
+        .execute = mockLargeOutputTool,
+        .approval_ctx = &approval,
+        .approval_fn = recordingApproval,
+    }};
+    const content = [_]ai_types.AssistantContent{.{ .tool_call = .{
+        .id = "call_outside",
+        .name = "file_edit",
+        .arguments_json = "{\"path\":\"/tmp/outside.zig\"}",
+    } }};
+    const message = ai_types.AssistantMessage{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    var engine = try permission.PermissionEngine.init(allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-agent-loop-deny-before-approve-always.json",
+    });
+    defer engine.deinit();
+    var agent_events = AgentEventStream.init(allocator);
+    defer agent_events.deinit();
+
+    var result = try executeToolCalls(
+        allocator,
+        message,
         .{
             .model = model,
             .protocol = .{ .stream_fn = undefined },
@@ -1782,12 +1890,11 @@ test "executeToolCalls persists legacy approve always with permission engine" {
         },
         &agent_events,
     );
-    defer tool_result.deinit(allocator);
+    defer result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), approval.calls);
-    try std.testing.expectEqual(@as(usize, 1), engine.persisted.items.len);
-    try std.testing.expectEqualStrings("/workspace/src/main.zig", engine.persisted.items[0].path.?);
-    try std.testing.expectEqual(permission.PermissionDecision.allow, engine.evaluate("file_edit", "{\"path\":\"/workspace/src/main.zig\"}"));
+    try std.testing.expectEqual(@as(usize, 0), approval.calls);
+    try std.testing.expectEqual(@as(usize, 0), engine.persisted.items.len);
+    try std.testing.expect(result.tool_results[0].is_error);
 }
 
 test "executeToolCalls applies output middleware and reports byte telemetry" {

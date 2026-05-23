@@ -423,7 +423,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn canPersistDecision(call: ToolCall) bool {
+pub fn canPersistDecision(call: ToolCall) bool {
     return switch (call.operation) {
         .read, .write => call.path != null,
         .shell => call.command != null,
