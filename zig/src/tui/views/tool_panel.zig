@@ -59,18 +59,12 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
             if (tool.estimated_returned_tokens > 0) try writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
             try writer.writeByte(')');
         }
-        if (tool.truncated) try writer.writeAll(" truncated/show full");
-        if (tool.artifact_refs.len > 0) try writer.print(" artifact:{s}", .{tool.artifact_refs});
+        if (tool.truncated) try writer.writeAll(" truncated · show full");
+        if (tool.artifact_refs.len > 0) try writer.print(" · artifact:{s}", .{tool.artifact_refs});
+        if (tool.expanded) try writer.writeAll(" · expanded");
         rows += 1;
         if (tool.expanded and rows < options.height) {
-            try writer.writeByte('\n');
-            try writer.writeAll("    ");
-            const one = try oneLine(allocator, if (tool.output.items.len > 0) tool.output.items else tool.args_json, options.width -| 6);
-            defer allocator.free(one);
-            const styled = try tui_theme.muted().render(allocator, one);
-            defer allocator.free(styled);
-            try writer.writeAll(styled);
-            rows += 1;
+            rows = try renderExpandedOutput(allocator, writer, tool, options.width, options.height, rows);
         }
     }
     const body = try out.toOwnedSlice();
@@ -87,16 +81,41 @@ fn statusText(status: tui_state.ToolStatus) []const u8 {
     };
 }
 
-fn oneLine(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
-    const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    const line = text[0..nl];
-    const clipped = try tui_text.truncateToWidth(allocator, line, width);
-    if (nl < text.len and tui_text.visibleWidth(clipped) < width) {
-        const with_ellipsis = try std.fmt.allocPrint(allocator, "{s}…", .{clipped});
-        allocator.free(clipped);
-        return with_ellipsis;
+fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, tool: tui_state.ToolEntry, width: usize, height: usize, rows: usize) !usize {
+    const source = if (tool.output.items.len > 0) tool.output.items else tool.args_json;
+    if (source.len == 0) return rows;
+    const available_lines = height - rows;
+    if (available_lines == 0) return rows;
+    const content_width = width -| 8;
+    if (content_width == 0) return rows;
+
+    const wrapped = try tui_text.wrapTextWithAnsi(allocator, source, content_width);
+    defer allocator.free(wrapped);
+    const clipped = try tui_text.truncateLinesToWidth(allocator, wrapped, content_width, available_lines);
+    defer allocator.free(clipped);
+
+    var next_rows = rows;
+    var lines = std.mem.splitScalar(u8, clipped, '\n');
+    while (lines.next()) |line| {
+        if (next_rows >= height) break;
+        try writer.writeByte('\n');
+        try writer.writeAll("    │ ");
+        const styled = try styleOutputLine(allocator, tool.status, line);
+        defer allocator.free(styled);
+        try writer.writeAll(styled);
+        next_rows += 1;
     }
-    return clipped;
+    return next_rows;
+}
+
+fn styleOutputLine(allocator: std.mem.Allocator, status: tui_state.ToolStatus, line: []const u8) ![]const u8 {
+    if (isDiffLike(line)) return tui_theme.diffLine(line).render(allocator, line);
+    if (status == .@"error") return tui_theme.errorText().render(allocator, line);
+    return tui_theme.muted().render(allocator, line);
+}
+
+fn isDiffLike(line: []const u8) bool {
+    return std.mem.startsWith(u8, line, "+") or std.mem.startsWith(u8, line, "-") or std.mem.startsWith(u8, line, "  anchor");
 }
 
 test "tool panel renders registered tools when idle" {
@@ -121,17 +140,38 @@ test "tool panel renders registered tools when idle" {
     try std.testing.expect(std.mem.indexOf(u8, text, "none") == null);
 }
 
-test "tool panel renders tool status and output" {
+test "tool panel renders tool status and multiline output" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "{\"command\":\"pwd\"}", .running));
     state.tools.items[0].expanded = true;
-    try state.tools.items[0].output.appendSlice(std.testing.allocator, "ok");
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "first line\nsecond line");
 
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "running") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "shell_command") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "expanded") != null);
+}
+
+test "tool panel renders diff and error output" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "hashline_edit", "{}", .done));
+    state.tools.items[0].expanded = true;
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "- 2:hash|old\n+ 2|new");
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "shell_command", "{}", .@"error"));
+    state.tools.items[1].expanded = true;
+    try state.tools.items[1].output.appendSlice(std.testing.allocator, "boom");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "- 2:hash|old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "error") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "boom") != null);
 }
