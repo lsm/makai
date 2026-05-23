@@ -691,6 +691,24 @@ test "persisted always allow decision reloads and auto-approves" {
     }
 }
 
+test "approve always persists scoped path decision" {
+    const persistence_path = "zig-cache/test-permissions-approve-always-scope.json";
+    compat.fs.getCwd().deleteFile(std.testing.io, persistence_path) catch {};
+
+    approval_recorder = .{ .decision = .approve_always };
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = persistence_path,
+        .approval_callback = approvalCallback,
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(ApprovalDecision.approve_always, try engine.approve("file:write", "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expectEqual(@as(usize, 1), engine.persisted.items.len);
+    try std.testing.expectEqualStrings("/workspace/src/main.zig", engine.persisted.items[0].path.?);
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:write", "{\"path\":\"/workspace/src/main.zig\"}"));
+}
+
 test "persisted path scope matches normalized equivalent paths" {
     var engine = try PermissionEngine.init(std.testing.allocator, .{
         .workspace_root = "/workspace",

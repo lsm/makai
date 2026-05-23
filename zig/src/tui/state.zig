@@ -120,22 +120,27 @@ pub const ApprovalState = struct {
     tool_call_id: []u8 = &.{},
     tool_name: []u8 = &.{},
     args_json: []u8 = &.{},
+    scope_hint: []u8 = &.{},
     always: bool = false,
 
     pub fn deinit(self: *ApprovalState, allocator: std.mem.Allocator) void {
         if (self.tool_call_id.len > 0) allocator.free(self.tool_call_id);
         if (self.tool_name.len > 0) allocator.free(self.tool_name);
         if (self.args_json.len > 0) allocator.free(self.args_json);
+        if (self.scope_hint.len > 0) allocator.free(self.scope_hint);
         self.* = .{};
     }
 
     pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, args_json: []const u8) !void {
         self.deinit(allocator);
+        const scope_hint = try approvalScopeHint(allocator, tool_name, args_json);
+        errdefer allocator.free(scope_hint);
         self.* = .{
             .status = .pending,
             .tool_call_id = try allocator.dupe(u8, tool_call_id),
             .tool_name = try allocator.dupe(u8, tool_name),
             .args_json = try allocator.dupe(u8, args_json),
+            .scope_hint = scope_hint,
         };
     }
 };
@@ -698,6 +703,27 @@ pub const AppState = struct {
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
+
+fn approvalScopeHint(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+    defer parsed.deinit();
+    if (parsed.value != .object) return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+    const obj = parsed.value.object;
+    if (firstJsonString(obj, &.{ "path", "file_path", "target_path", "cwd" })) |path| {
+        return std.fmt.allocPrint(allocator, "{s} path {s}", .{ tool_name, path });
+    }
+    if (firstJsonString(obj, &.{ "command", "cmd", "script" })) |command| {
+        return std.fmt.allocPrint(allocator, "{s} command {s}", .{ tool_name, command });
+    }
+    return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+}
+
+fn firstJsonString(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (jsonString(obj, key)) |value| return value;
+    }
+    return null;
+}
 
 fn appendHashlinePreview(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     if (out.items.len >= max_hashline_preview_bytes) return;

@@ -19,6 +19,11 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const args = try tui_text.truncateToWidth(allocator, state.approval.args_json, options.width -| 8);
     defer allocator.free(args);
     try parts.append(allocator, try std.fmt.allocPrint(allocator, "Args: {s}", .{args}));
+    if (state.approval.scope_hint.len > 0) {
+        const scope = try tui_text.truncateToWidth(allocator, state.approval.scope_hint, options.width -| 16);
+        defer allocator.free(scope);
+        try parts.append(allocator, try std.fmt.allocPrint(allocator, "Always scope: {s}", .{scope}));
+    }
     if (std.mem.eql(u8, state.approval.tool_name, "hashline_edit") and state.preview.content.len > 0) {
         try parts.append(allocator, try tui_theme.panelTitle().render(allocator, "Preview:"));
         var rows: usize = 0;
@@ -31,7 +36,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
             rows += 1;
         }
     }
-    try parts.append(allocator, try tui_theme.muted().render(allocator, "(a) allow once  (A) allow always  (d) deny  Esc abort"));
+    try parts.append(allocator, try tui_theme.muted().render(allocator, "(y) allow once  (a) allow always  (n) deny  Esc abort"));
     const body = try tui_render.joinVertical(allocator, parts.items);
     defer allocator.free(body);
     return tui_theme.panel().borderForeground(tui_theme.palette.warning).width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
@@ -47,7 +52,21 @@ test "approval renders pending request" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "Approval required") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "edit_file") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "allow always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(y) allow once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(a) allow always") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(n) deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Always scope: edit_file path README.md") != null);
+}
+
+test "approval renders command scope hint" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.approval.setPending(std.testing.allocator, "call-shell", "shell_execute", "{\"command\":\"zig build test\"}");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Always scope: shell_execute command zig build test") != null);
 }
 
 test "approval renders hashline preview" {
