@@ -69,6 +69,19 @@ test "approval renders command scope hint" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Always scope: shell_execute command zig build test") != null);
 }
 
+test "approval scope hint strips terminal controls" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.approval.setPending(std.testing.allocator, "call-escape", "edit_file", "{\"path\":\"src/\\u001b[2Jsecret.zig\"}");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, state.approval.scope_hint, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[2J") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "secret.zig") != null);
+}
+
 test "approval renders hashline preview" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();

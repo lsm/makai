@@ -705,17 +705,62 @@ pub const AppState = struct {
 };
 
 fn approvalScopeHint(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+    const safe_tool_name = try sanitizeTerminalText(allocator, tool_name);
+    defer allocator.free(safe_tool_name);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
     defer parsed.deinit();
-    if (parsed.value != .object) return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+    if (parsed.value != .object) return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
     const obj = parsed.value.object;
     if (firstJsonString(obj, &.{ "path", "file_path", "target_path", "cwd" })) |path| {
-        return std.fmt.allocPrint(allocator, "{s} path {s}", .{ tool_name, path });
+        const safe_path = try sanitizeTerminalText(allocator, path);
+        defer allocator.free(safe_path);
+        return std.fmt.allocPrint(allocator, "{s} path {s}", .{ safe_tool_name, safe_path });
     }
     if (firstJsonString(obj, &.{ "command", "cmd", "script" })) |command| {
-        return std.fmt.allocPrint(allocator, "{s} command {s}", .{ tool_name, command });
+        const safe_command = try sanitizeTerminalText(allocator, command);
+        defer allocator.free(safe_command);
+        return std.fmt.allocPrint(allocator, "{s} command {s}", .{ safe_tool_name, safe_command });
     }
-    return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{tool_name});
+    return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
+}
+
+fn sanitizeTerminalText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        switch (c) {
+            '\n', '\r', '\t' => {
+                try writer.writeByte(' ');
+                i += 1;
+                continue;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const codepoint = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (codepoint < 0x20 or codepoint == 0x7f) {
+            i += len;
+            continue;
+        }
+        try writer.writeAll(text[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice();
 }
 
 fn firstJsonString(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
