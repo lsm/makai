@@ -78,3 +78,16 @@ test "preview renders hashline diff anchors" {
     try std.testing.expect(std.mem.indexOf(u8, text, "2:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|new") != null);
 }
+
+test "preview preserves adjacent diff pair text with styling" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.setPreview(.diff, "patch.diff", "- value = old\n+ value = new");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "- value = old") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+ value = new") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") != null);
+}
