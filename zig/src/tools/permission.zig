@@ -129,6 +129,26 @@ pub const PermissionEngine = struct {
         return engine;
     }
 
+    /// Initialize engine without loading persisted file.
+    /// Use when on-disk permissions are corrupt or unreadable.
+    pub fn initEmpty(allocator: std.mem.Allocator, options: PermissionEngineOptions) !Self {
+        const workspace_root = try allocator.dupe(u8, options.workspace_root);
+        errdefer allocator.free(workspace_root);
+
+        const persistence_path = if (options.persistence_path) |path|
+            try allocator.dupe(u8, path)
+        else
+            try defaultPersistencePath(allocator);
+        errdefer allocator.free(persistence_path);
+
+        return Self{
+            .allocator = allocator,
+            .workspace_root = workspace_root,
+            .persistence_path = persistence_path,
+            .approval_callback = options.approval_callback,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         for (self.persisted.items) |*decision| decision.deinit(self.allocator);
         self.persisted.deinit(self.allocator);
@@ -319,7 +339,7 @@ pub const PermissionEngine = struct {
     }
 };
 
-fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) !ToolCall {
+pub fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) !ToolCall {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
 
@@ -356,7 +376,7 @@ fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
     };
 }
 
-fn deinitParsedToolCall(allocator: std.mem.Allocator, call: ToolCall) void {
+pub fn deinitParsedToolCall(allocator: std.mem.Allocator, call: ToolCall) void {
     if (call.path) |path| allocator.free(@constCast(path));
     if (call.command) |command| allocator.free(@constCast(command));
 }
@@ -423,7 +443,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, a.?, b.?);
 }
 
-fn canPersistDecision(call: ToolCall) bool {
+pub fn canPersistDecision(call: ToolCall) bool {
     return switch (call.operation) {
         .read, .write => call.path != null,
         .shell => call.command != null,
@@ -689,6 +709,24 @@ test "persisted always allow decision reloads and auto-approves" {
         try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"path\":\"/workspace/file.txt\"}"));
         try std.testing.expectEqual(@as(usize, 0), approval_recorder.calls);
     }
+}
+
+test "approve always persists scoped path decision" {
+    const persistence_path = "zig-cache/test-permissions-approve-always-scope.json";
+    compat.fs.getCwd().deleteFile(std.testing.io, persistence_path) catch {};
+
+    approval_recorder = .{ .decision = .approve_always };
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = persistence_path,
+        .approval_callback = approvalCallback,
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(ApprovalDecision.approve_always, try engine.approve("file:write", "{\"path\":\"src/main.zig\"}"));
+    try std.testing.expectEqual(@as(usize, 1), engine.persisted.items.len);
+    try std.testing.expectEqualStrings("/workspace/src/main.zig", engine.persisted.items[0].path.?);
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:write", "{\"path\":\"/workspace/src/main.zig\"}"));
 }
 
 test "persisted path scope matches normalized equivalent paths" {

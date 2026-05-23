@@ -120,22 +120,27 @@ pub const ApprovalState = struct {
     tool_call_id: []u8 = &.{},
     tool_name: []u8 = &.{},
     args_json: []u8 = &.{},
+    scope_hint: []u8 = &.{},
     always: bool = false,
 
     pub fn deinit(self: *ApprovalState, allocator: std.mem.Allocator) void {
         if (self.tool_call_id.len > 0) allocator.free(self.tool_call_id);
         if (self.tool_name.len > 0) allocator.free(self.tool_name);
         if (self.args_json.len > 0) allocator.free(self.args_json);
+        if (self.scope_hint.len > 0) allocator.free(self.scope_hint);
         self.* = .{};
     }
 
     pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, args_json: []const u8) !void {
         self.deinit(allocator);
+        const scope_hint = try approvalScopeHint(allocator, tool_name, args_json);
+        errdefer allocator.free(scope_hint);
         self.* = .{
             .status = .pending,
             .tool_call_id = try allocator.dupe(u8, tool_call_id),
             .tool_name = try allocator.dupe(u8, tool_name),
             .args_json = try allocator.dupe(u8, args_json),
+            .scope_hint = scope_hint,
         };
     }
 };
@@ -699,6 +704,72 @@ pub const AppState = struct {
     }
 };
 
+fn approvalScopeHint(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
+    const safe_tool_name = try sanitizeTerminalText(allocator, tool_name);
+    defer allocator.free(safe_tool_name);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
+    defer parsed.deinit();
+    if (parsed.value != .object) return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
+    const obj = parsed.value.object;
+    if (firstJsonString(obj, &.{ "path", "file_path", "target_path", "cwd" })) |path| {
+        const safe_path = try sanitizeTerminalText(allocator, path);
+        defer allocator.free(safe_path);
+        return std.fmt.allocPrint(allocator, "{s} path {s}", .{ safe_tool_name, safe_path });
+    }
+    if (firstJsonString(obj, &.{ "command", "cmd", "script" })) |command| {
+        const safe_command = try sanitizeTerminalText(allocator, command);
+        defer allocator.free(safe_command);
+        return std.fmt.allocPrint(allocator, "{s} command {s}", .{ safe_tool_name, safe_command });
+    }
+    return std.fmt.allocPrint(allocator, "{s} (one tool call)", .{safe_tool_name});
+}
+
+fn sanitizeTerminalText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        switch (c) {
+            '\n', '\r', '\t' => {
+                try writer.writeByte(' ');
+                i += 1;
+                continue;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const codepoint = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f)) {
+            i += len;
+            continue;
+        }
+        try writer.writeAll(text[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice();
+}
+
+fn firstJsonString(obj: std.json.ObjectMap, keys: []const []const u8) ?[]const u8 {
+    for (keys) |key| {
+        if (jsonString(obj, key)) |value| return value;
+    }
+    return null;
+}
+
 fn appendHashlinePreview(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
     if (out.items.len >= max_hashline_preview_bytes) return;
     const remaining = max_hashline_preview_bytes - out.items.len;
@@ -783,7 +854,7 @@ fn clipSummaryArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
                 i += 1;
                 continue;
             };
-            if (codepoint < 0x20 or codepoint == 0x7f) {
+            if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f)) {
                 i += len;
                 continue;
             }

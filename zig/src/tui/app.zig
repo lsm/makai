@@ -17,6 +17,7 @@ const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
 const tui_render = @import("tui_render");
+const permission = @import("permission");
 
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
@@ -43,16 +44,26 @@ pub const ProductionRuntime = struct {
     allocator: std.mem.Allocator,
     registry: api_registry.ApiRegistry,
     bridge: agent.InProcessProviderProtocolBridge,
+    permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
         errdefer registry.deinit();
         try register_builtins.registerBuiltInApiProviders(&registry);
+
+        const workspace_root = try std.process.currentPathAlloc(defaultIo(), allocator);
+        defer allocator.free(workspace_root);
+        var permission_engine = permission.PermissionEngine.init(allocator, .{ .workspace_root = workspace_root }) catch
+            permission.PermissionEngine.initEmpty(allocator, .{ .workspace_root = workspace_root }) catch
+            @panic("OOM initializing permission engine");
+        errdefer permission_engine.deinit();
+
         var runtime = ProductionRuntime{
             .allocator = allocator,
             .registry = registry,
             .bridge = undefined,
+            .permission_engine = permission_engine,
             .models = try allocator.alloc(ai_types.Model, 1),
         };
         runtime.bridge = agent.InProcessProviderProtocolBridge.init(&runtime.registry);
@@ -64,6 +75,7 @@ pub const ProductionRuntime = struct {
         return .{
             .protocol = (&self.bridge).protocolClient(),
             .models = self.models,
+            .permission_engine = &self.permission_engine,
             .run_async = true,
             .compact_output = true,
         };
@@ -71,6 +83,7 @@ pub const ProductionRuntime = struct {
 
     pub fn deinit(self: *ProductionRuntime) void {
         self.allocator.free(self.models);
+        self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;
     }
@@ -303,9 +316,9 @@ const TuiModel = struct {
                 if (app.state.mode == .approval) {
                     switch (key.key) {
                         .char => |c| switch (c) {
-                            'a' => app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {},
-                            'A' => app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {},
-                            'd' => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
+                            'y' => app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {},
+                            'a' => app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {},
+                            'n' => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
                             else => {},
                         },
                         .escape => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
@@ -399,6 +412,13 @@ const TuiModel = struct {
     }
 };
 
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
 fn defaultModel() ai_types.Model {
     return .{
         .id = "claude-sonnet-4-5",
@@ -436,6 +456,31 @@ test "App init seeds registered tools from runtime" {
     try std.testing.expect(app.state.registered_tools.items.len >= 12);
     try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
     try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
+    try std.testing.expect(app.runtime.?.permission_engine.?.workspace_root.len > 0);
+}
+
+test "App approval decisions map to requested choices" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    app.state.mode = .approval;
+
+    try app.decideApproval(true, false);
+    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
+    try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
+    try std.testing.expect(!app.state.approval.always);
+
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    app.state.mode = .approval;
+    try app.decideApproval(true, true);
+    try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
+    try std.testing.expect(app.state.approval.always);
+
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    app.state.mode = .approval;
+    try app.decideApproval(false, false);
+    try std.testing.expectEqual(tui_state.ApprovalStatus.rejected, app.state.approval.status);
+    try std.testing.expect(!app.state.approval.always);
 }
 
 test "App submit appends user transcript without runtime" {
