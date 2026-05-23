@@ -129,6 +129,26 @@ pub const PermissionEngine = struct {
         return engine;
     }
 
+    /// Initialize engine without loading persisted file.
+    /// Use when on-disk permissions are corrupt or unreadable.
+    pub fn initEmpty(allocator: std.mem.Allocator, options: PermissionEngineOptions) !Self {
+        const workspace_root = try allocator.dupe(u8, options.workspace_root);
+        errdefer allocator.free(workspace_root);
+
+        const persistence_path = if (options.persistence_path) |path|
+            try allocator.dupe(u8, path)
+        else
+            try defaultPersistencePath(allocator);
+        errdefer allocator.free(persistence_path);
+
+        return Self{
+            .allocator = allocator,
+            .workspace_root = workspace_root,
+            .persistence_path = persistence_path,
+            .approval_callback = options.approval_callback,
+        };
+    }
+
     pub fn deinit(self: *Self) void {
         for (self.persisted.items) |*decision| decision.deinit(self.allocator);
         self.persisted.deinit(self.allocator);

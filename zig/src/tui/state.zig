@@ -753,7 +753,7 @@ fn sanitizeTerminalText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
             i += 1;
             continue;
         };
-        if (codepoint < 0x20 or codepoint == 0x7f) {
+        if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f)) {
             i += len;
             continue;
         }
@@ -854,7 +854,7 @@ fn clipSummaryArg(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
                 i += 1;
                 continue;
             };
-            if (codepoint < 0x20 or codepoint == 0x7f) {
+            if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f)) {
                 i += len;
                 continue;
             }

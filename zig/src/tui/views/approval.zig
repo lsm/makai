@@ -82,6 +82,20 @@ test "approval scope hint strips terminal controls" {
     try std.testing.expect(std.mem.indexOf(u8, text, "secret.zig") != null);
 }
 
+test "approval scope hint strips C1 control characters" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    // U+009B (CSI) encodes as C2 9B in UTF-8
+    try state.approval.setPending(std.testing.allocator, "call-c1", "edit_file", "{\"path\":\"src/\xC2\x9Bclear.zig\"}");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100 });
+    defer std.testing.allocator.free(text);
+
+    // C2 9B (U+009B CSI) should be stripped from scope hint
+    try std.testing.expect(std.mem.indexOf(u8, state.approval.scope_hint, "\xC2\x9B") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "clear.zig") != null);
+}
+
 test "approval renders hashline preview" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();

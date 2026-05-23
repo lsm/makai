@@ -600,29 +600,32 @@ fn executeToolCalls(
                     try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                     continue;
                 }
-
-                const legacy_decision = runLegacyApproval(t, approval_request, allocator);
-                if (legacy_decision == .reject or legacy_decision == .reject_always) {
-                    result = try rejectedToolResult(allocator);
-                    is_error = true;
-                    try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
-                    continue;
-                }
-                if (legacy_decision == .approve_always) {
-                    const call = permission.parseToolCall(allocator, tool_call.name, validated_args) catch null;
-                    if (call) |parsed_call| {
-                        defer permission.deinitParsedToolCall(allocator, parsed_call);
-                        if (permission.canPersistDecision(parsed_call)) try engine.persistDecision(parsed_call, .allow);
-                    }
-                }
-
-                if (policy_decision == .prompt and engine.approval_callback != null and legacy_decision != .approve_always) {
-                    const decision = try engine.approve(tool_call.name, validated_args);
-                    if (decision == .reject or decision == .reject_always) {
+                // Skip legacy prompt when a persisted policy already allows the call
+                if (policy_decision != .allow) {
+                    const legacy_decision = runLegacyApproval(t, approval_request, allocator);
+                    if (legacy_decision == .reject or legacy_decision == .reject_always) {
                         result = try rejectedToolResult(allocator);
                         is_error = true;
                         try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
                         continue;
+                    }
+                    if (legacy_decision == .approve_always) {
+                        const call = permission.parseToolCall(allocator, tool_call.name, validated_args) catch null;
+                        if (call) |parsed_call| {
+                            defer permission.deinitParsedToolCall(allocator, parsed_call);
+                            // Best-effort persistence — I/O failure must not reject the approved tool
+                            if (permission.canPersistDecision(parsed_call)) engine.persistDecision(parsed_call, .allow) catch {};
+                        }
+                    }
+
+                    if (policy_decision == .prompt and engine.approval_callback != null and legacy_decision != .approve_always) {
+                        const decision = try engine.approve(tool_call.name, validated_args);
+                        if (decision == .reject or decision == .reject_always) {
+                            result = try rejectedToolResult(allocator);
+                            is_error = true;
+                            try finalizeToolExecution(allocator, config, event_stream, &results, tool_call, execution_args, &result, is_error);
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -1658,7 +1661,7 @@ test "executeToolCalls uses protocol executor when configured" {
     try std.testing.expect(saw_update);
 }
 
-test "executeToolCalls runs legacy approval even when permission engine allows" {
+test "executeToolCalls skips legacy approval when policy already allows" {
     const allocator = std.testing.allocator;
 
     const model = ai_types.Model{
@@ -1698,9 +1701,8 @@ test "executeToolCalls runs legacy approval even when permission engine allows" 
         .stop_reason = .tool_use,
         .timestamp = 0,
     };
-    var engine = try permission.PermissionEngine.init(allocator, .{
+    var engine = try permission.PermissionEngine.initEmpty(allocator, .{
         .workspace_root = "/workspace",
-        .persistence_path = "zig-cache/test-agent-loop-permission-legacy.json",
     });
     defer engine.deinit();
     var agent_events = AgentEventStream.init(allocator);
@@ -1719,9 +1721,10 @@ test "executeToolCalls runs legacy approval even when permission engine allows" 
     );
     defer tool_result.deinit(allocator);
 
-    try std.testing.expectEqual(@as(usize, 1), approval.calls);
+    // file_read of workspace-internal path is auto-allowed by policy (.read + inside workspace).
+    // Legacy approval callback should NOT fire.
+    try std.testing.expectEqual(@as(usize, 0), approval.calls);
     try std.testing.expectEqual(@as(usize, 1), tool_result.tool_results.len);
-    try std.testing.expect(tool_result.tool_results[0].is_error);
 }
 
 test "executeToolCalls persists legacy approve always with permission engine" {
@@ -1764,9 +1767,8 @@ test "executeToolCalls persists legacy approve always with permission engine" {
         .stop_reason = .tool_use,
         .timestamp = 0,
     };
-    var engine = try permission.PermissionEngine.init(allocator, .{
+    var engine = try permission.PermissionEngine.initEmpty(allocator, .{
         .workspace_root = "/workspace",
-        .persistence_path = "zig-cache/test-agent-loop-approve-always.json",
     });
     defer engine.deinit();
     var agent_events = AgentEventStream.init(allocator);
@@ -1871,9 +1873,8 @@ test "executeToolCalls denies policy before legacy approval can persist always" 
         .stop_reason = .tool_use,
         .timestamp = 0,
     };
-    var engine = try permission.PermissionEngine.init(allocator, .{
+    var engine = try permission.PermissionEngine.initEmpty(allocator, .{
         .workspace_root = "/workspace",
-        .persistence_path = "zig-cache/test-agent-loop-deny-before-approve-always.json",
     });
     defer engine.deinit();
     var agent_events = AgentEventStream.init(allocator);

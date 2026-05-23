@@ -54,7 +54,9 @@ pub const ProductionRuntime = struct {
 
         const workspace_root = try std.process.currentPathAlloc(defaultIo(), allocator);
         defer allocator.free(workspace_root);
-        var permission_engine = try permission.PermissionEngine.init(allocator, .{ .workspace_root = workspace_root });
+        var permission_engine = permission.PermissionEngine.init(allocator, .{ .workspace_root = workspace_root }) catch
+            permission.PermissionEngine.initEmpty(allocator, .{ .workspace_root = workspace_root }) catch
+            @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
         var runtime = ProductionRuntime{
