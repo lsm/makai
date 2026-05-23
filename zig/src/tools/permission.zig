@@ -319,7 +319,7 @@ pub const PermissionEngine = struct {
     }
 };
 
-fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) !ToolCall {
+pub fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) !ToolCall {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
 
@@ -356,7 +356,7 @@ fn parseToolCall(allocator: std.mem.Allocator, tool_name: []const u8, args_json:
     };
 }
 
-fn deinitParsedToolCall(allocator: std.mem.Allocator, call: ToolCall) void {
+pub fn deinitParsedToolCall(allocator: std.mem.Allocator, call: ToolCall) void {
     if (call.path) |path| allocator.free(@constCast(path));
     if (call.command) |command| allocator.free(@constCast(command));
 }
