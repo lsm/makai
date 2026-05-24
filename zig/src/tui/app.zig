@@ -840,10 +840,10 @@ const TuiModel = struct {
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
-            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
+            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 5;
+        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 6;
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
         const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, composer, status }) catch "";

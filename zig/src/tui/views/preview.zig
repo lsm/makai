@@ -17,7 +17,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         try writer.writeAll(empty);
         const body = try out.toOwnedSlice();
         defer allocator.free(body);
-        return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+        return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
     }
     const title = try std.fmt.allocPrint(allocator, "{s}: {s}", .{ kindText(state.preview.kind), state.preview.title });
     defer allocator.free(title);
@@ -43,7 +43,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     }
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
-    return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 fn kindText(kind: tui_state.PreviewKind) []const u8 {

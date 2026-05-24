@@ -13,11 +13,11 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
     defer allocator.free(input);
-    const hint = try renderHint(allocator, state, options.streaming_shortcuts_supported);
+    const hint = try renderHint(allocator, state, options.streaming_shortcuts_supported, inner_width);
     defer allocator.free(hint);
     const body = try tui_render.joinVertical(allocator, &.{ input, hint });
     defer allocator.free(body);
-    return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]u8 {
@@ -36,7 +36,7 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     return prefixFirstLine(allocator, prompt, content);
 }
 
-fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool) ![]const u8 {
+fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool, max_width: usize) ![]const u8 {
     const text = state.composer.text();
     if (state.status.streaming and streaming_shortcuts_supported) {
         const queued = state.queue.total();
@@ -45,18 +45,30 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, st
         else
             try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
         defer allocator.free(hint);
-        return tui_theme.muted().render(allocator, hint);
+        const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
+        defer allocator.free(truncated);
+        return tui_theme.muted().render(allocator, truncated);
     }
-    if (std.mem.startsWith(u8, text, "!"))
-        return tui_theme.muted().render(allocator, "shell mode • Enter runs command through agent");
-    if (std.mem.startsWith(u8, text, "@"))
-        return tui_theme.muted().render(allocator, "file picker • type path or query");
+    if (std.mem.startsWith(u8, text, "!")) {
+        const truncated = try tui_text.truncateToWidth(allocator, "shell mode • Enter runs command through agent", max_width);
+        defer allocator.free(truncated);
+        return tui_theme.muted().render(allocator, truncated);
+    }
+    if (std.mem.startsWith(u8, text, "@")) {
+        const truncated = try tui_text.truncateToWidth(allocator, "file picker • type path or query", max_width);
+        defer allocator.free(truncated);
+        return tui_theme.muted().render(allocator, truncated);
+    }
     if (state.composer.history.items.len > 0) {
         const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Ctrl+R thinking", .{state.composer.history.items.len});
         defer allocator.free(hint);
-        return tui_theme.muted().render(allocator, hint);
+        const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
+        defer allocator.free(truncated);
+        return tui_theme.muted().render(allocator, truncated);
     }
-    return tui_theme.muted().render(allocator, "Enter submit • Shift+Enter newline • Ctrl+R thinking • Ctrl+C quit");
+    const truncated = try tui_text.truncateToWidth(allocator, "Enter submit • Shift+Enter newline • Ctrl+R thinking • Ctrl+C quit", max_width);
+    defer allocator.free(truncated);
+    return tui_theme.muted().render(allocator, truncated);
 }
 
 fn promptFor(state: *const tui_state.AppState) []const u8 {

@@ -70,7 +70,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     }
 
     const items = out.written();
-    if (tui_text.visibleWidth(items) > options.width * 3) {
+    if (tui_text.visibleWidth(items) > options.width) {
         const clipped = try tui_text.truncateLinesToWidth(allocator, items, options.width, 3);
         out.deinit();
         return clipped;

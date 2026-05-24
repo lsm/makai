@@ -4,6 +4,7 @@ const tui_theme = @import("tui_theme");
 const tui_text = @import("tui_text");
 
 pub const Options = struct {
+    width: usize = 80,
     height: usize = 12,
     offset: usize = 0,
 };
@@ -21,7 +22,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         try writer.writeAll(none);
         const body = try out.toOwnedSlice();
         defer allocator.free(body);
-        return tui_theme.panel().render(allocator, body);
+        return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
     }
     const end = @min(state.sessions.items.len, options.offset + options.height);
     for (state.sessions.items[options.offset..end], options.offset..) |session, i| {
@@ -35,7 +36,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     }
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
-    return tui_theme.panel().render(allocator, body);
+    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 test "session picker renders selected session" {
