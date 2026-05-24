@@ -414,12 +414,16 @@ pub const App = struct {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
+            const tips = if (self.supportsStreamingShortcuts())
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands"
+            else
+                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
                 \\cwd: {s}
-                \\tips: Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands
-            , .{ provider, model, cwd });
+                \\tips: {s}
+            , .{ provider, model, cwd, tips });
             defer self.allocator.free(welcome);
             try self.state.appendTranscript(.system, welcome);
             return;
@@ -1067,6 +1071,9 @@ test "App submit routes unknown command to error transcript" {
 test "App welcome uses session count" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
     try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
     app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
 
@@ -1080,6 +1087,22 @@ test "App welcome uses session count" {
     try app.appendWelcome();
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") == null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
+}
+
+test "App welcome hides streaming shortcut tips for remote runtime" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+    try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
+
+    try app.appendWelcome();
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter while streaming") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter submit") != null);
 }
 
 const MockAppSession = struct {
