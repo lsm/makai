@@ -41,17 +41,13 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
 
     const all_text = all_rows.written();
     const total_lines = tui_text.lineCount(all_text);
-    // Reserve one line for scroll indicator when scrolled; use full height otherwise.
-    const view_height = if (state.transcript_scroll > 0 and total_lines > options.height)
-        options.height -| 1
-    else
-        options.height;
+    // Reserve one line for scroll indicator when scrolled and enough space exists; use full height otherwise.
+    const show_indicator = state.transcript_scroll > 0 and total_lines > options.height and options.height >= 2;
+    const view_height = if (show_indicator) options.height - 1 else options.height;
     const windowed = try lineWindow(allocator, all_text, view_height, state.transcript_scroll);
     defer allocator.free(windowed);
 
-    if (state.transcript_scroll == 0 or total_lines <= options.height) {
-        return allocator.dupe(u8, windowed);
-    }
+    if (!show_indicator) return allocator.dupe(u8, windowed);
 
     // Prepend a scroll indicator line: "↑ SCROLL N%"
     const pct = scrollPercent(total_lines, view_height, state.transcript_scroll);
@@ -281,5 +277,18 @@ test "transcript hides scroll indicator when at bottom" {
     const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
     defer std.testing.allocator.free(text);
 
+    try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
+}
+
+test "transcript keeps one-line viewport within height when scrolled" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "one\ntwo\nthree");
+    state.transcript_scroll = 1;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 1 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(text));
     try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
 }

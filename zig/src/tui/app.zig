@@ -157,9 +157,9 @@ pub const App = struct {
     /// Load sessions from the store into state.sessions.
     pub fn loadSessions(self: *App) !void {
         const store = self.store orelse return;
+        var metas = try store.list();
         for (self.state.sessions.items) |*s| s.deinit(self.allocator);
         self.state.sessions.clearRetainingCapacity();
-        var metas = store.list() catch return;
         defer {
             for (metas.items) |*meta| meta.deinit(self.allocator);
             metas.deinit(self.allocator);
@@ -211,10 +211,10 @@ pub const App = struct {
         switch (event) {
             .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             .text_delta => |payload| {
-                if (payload.delta.slice().len > max_session_event_payload_bytes) return;
+                if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
             .tool_call_delta => |payload| {
-                if (payload.delta.slice().len > max_session_event_payload_bytes) return;
+                if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
             .message_end => |payload| {
                 if (messageEndPayloadSize(payload) > max_session_event_payload_bytes) return;
@@ -229,21 +229,29 @@ pub const App = struct {
     }
 
     fn messageEndPayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).message_end)) usize {
-        return payload.text.slice().len +
-            payload.content_json.slice().len +
-            payload.tool_call_id.slice().len +
-            payload.tool_name.slice().len +
-            payload.args_json.slice().len +
-            payload.tool_calls_json.slice().len +
-            payload.details_json.slice().len +
-            payload.artifacts_json.slice().len;
+        return jsonStringBudget(payload.text.slice()) +
+            jsonStringBudget(payload.content_json.slice()) +
+            jsonStringBudget(payload.tool_call_id.slice()) +
+            jsonStringBudget(payload.tool_name.slice()) +
+            jsonStringBudget(payload.args_json.slice()) +
+            jsonStringBudget(payload.tool_calls_json.slice()) +
+            jsonStringBudget(payload.details_json.slice()) +
+            jsonStringBudget(payload.artifacts_json.slice());
     }
 
     fn toolExecutionEndPayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).tool_execution_end)) usize {
-        return payload.result_json.slice().len +
-            payload.tool_call_id.slice().len +
-            payload.tool_name.slice().len +
-            payload.artifact_refs.slice().len;
+        return jsonStringBudget(payload.result_json.slice()) +
+            jsonStringBudget(payload.tool_call_id.slice()) +
+            jsonStringBudget(payload.tool_name.slice()) +
+            jsonStringBudget(payload.artifact_refs.slice());
+    }
+
+    fn jsonStringBudget(value: []const u8) usize {
+        return value.len * 6;
+    }
+
+    test "json string budget accounts for worst-case escaping" {
+        try std.testing.expectEqual(@as(usize, 24), jsonStringBudget("\\\\\\\\"));
     }
 
     fn currentSessionMetadata(self: *App) session_store.SessionMetadata {
@@ -320,7 +328,11 @@ pub const App = struct {
             .command => |command| command,
         };
 
-        if (command.kind == .sessions) self.loadSessions() catch {};
+        if (command.kind == .sessions) self.loadSessions() catch |err| {
+            try self.state.status.setError(self.allocator, @errorName(err));
+            try self.state.appendTranscript(.@"error", @errorName(err));
+            return;
+        };
 
         var result = tui_commands.dispatch(.{
             .allocator = self.allocator,
@@ -339,7 +351,7 @@ pub const App = struct {
             .clear_transcript => self.state.clearTranscript(),
             .open_session_picker => {
                 // Refresh sessions list from store then open the picker.
-                self.loadSessions() catch {};
+                try self.loadSessions();
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
                 self.state.mode = .session_picker;
