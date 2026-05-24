@@ -972,6 +972,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
             .{ .name = "tui_render", .module = tui_render_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
             .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },
             .{ .name = "tui_view_composer", .module = tui_view_composer_mod },
             .{ .name = "tui_view_status_bar", .module = tui_view_status_bar_mod },

@@ -144,10 +144,7 @@ pub const Store = struct {
     }
 
     pub fn initDefault(allocator: std.mem.Allocator) !Store {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.HomeNotFound,
-            else => return err,
-        };
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch return error.HomeNotFound;
         defer allocator.free(home);
         const base = try std.fs.path.join(allocator, &.{ home, ".makai", "sessions" });
         defer allocator.free(base);

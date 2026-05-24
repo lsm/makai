@@ -8,6 +8,7 @@ const agent = @import("agent");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
+const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
@@ -52,7 +53,7 @@ pub const ProductionRuntime = struct {
         errdefer registry.deinit();
         try register_builtins.registerBuiltInApiProviders(&registry);
 
-        const workspace_root = try std.process.currentPathAlloc(defaultIo(), allocator);
+        const workspace_root = try currentPathOwned(allocator);
         defer allocator.free(workspace_root);
         var permission_engine = permission.PermissionEngine.init(allocator, .{ .workspace_root = workspace_root }) catch
             permission.PermissionEngine.initEmpty(allocator, .{ .workspace_root = workspace_root }) catch
@@ -95,6 +96,10 @@ pub const App = struct {
     runtime: ?tui_runtime.TuiRuntime = null,
     session: ?tui_runtime.TuiSession = null,
     approval_waiter: ?*ApprovalWaiter = null,
+    store: ?session_store.Store = null,
+    session_id: []u8 = &.{},
+    session_created_at: i64 = 0,
+    working_dir: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
         var runtime_options = options;
@@ -116,6 +121,14 @@ pub const App = struct {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
             app.state.telemetry.context_window = model.context_window;
         }
+        // Initialize session store and generate a session ID.
+        app.store = session_store.Store.initDefault(allocator) catch null;
+        app.session_id = generateSessionId(allocator) catch try allocator.dupe(u8, "default");
+        app.session_created_at = compat.time.nowMillis();
+        app.working_dir = currentPathOwned(allocator) catch try allocator.dupe(u8, "");
+        try app.state.status.setSessionId(allocator, app.session_id);
+        // Pre-populate sessions list.
+        try app.loadSessions();
         return app;
     }
 
@@ -130,8 +143,78 @@ pub const App = struct {
             waiter.deinit();
             self.allocator.destroy(waiter);
         }
+        if (self.store) |*store| store.deinit();
+        if (self.session_id.len > 0) self.allocator.free(self.session_id);
+        if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
         self.state.deinit();
         self.* = undefined;
+    }
+
+    /// Load sessions from the store into state.sessions.
+    pub fn loadSessions(self: *App) !void {
+        const store = self.store orelse return;
+        for (self.state.sessions.items) |*s| s.deinit(self.allocator);
+        self.state.sessions.clearRetainingCapacity();
+        var metas = store.list() catch return;
+        defer {
+            for (metas.items) |*meta| meta.deinit(self.allocator);
+            metas.deinit(self.allocator);
+        }
+        std.mem.sort(session_store.SessionMetadata, metas.items, {}, newerSessionFirst);
+        for (metas.items) |meta| {
+            const label = try formatSessionLabel(self.allocator, meta);
+            defer self.allocator.free(label);
+            try self.state.addSession(meta.session_id, label);
+        }
+    }
+
+    /// Resume the session currently selected in the session picker.
+    pub fn resumeSelectedSession(self: *App) !void {
+        const store = self.store orelse return error.NoStoreConfigured;
+        const runtime = if (self.runtime) |*r| r else return error.NoRuntimeConfigured;
+        const sessions = self.state.sessions.items;
+        if (sessions.len == 0) return;
+        const idx = self.state.session_index;
+        if (idx >= sessions.len) return;
+        const id = sessions[idx].id;
+        var loaded = try store.resumeSession(id, runtime);
+        defer loaded.deinit(self.allocator);
+        self.state.clearTranscript();
+        if (self.session_id.len > 0) self.allocator.free(self.session_id);
+        self.session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
+        self.session_created_at = loaded.metadata.created_at;
+        try self.state.status.setSessionId(self.allocator, self.session_id);
+        try self.state.status.setModelWithContext(self.allocator, loaded.metadata.model, loaded.metadata.provider, self.state.status.context_limit);
+        self.state.status.turn_count = loaded.metadata.turn_count;
+        // Replay events into transcript.
+        for (loaded.events.items) |*event| {
+            try self.state.applyEvent(event.*);
+        }
+        self.state.mode = .normal;
+    }
+
+    /// Save one event to the session store (best-effort: ignores errors).
+    fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
+        const store = self.store orelse return;
+        // Only save events that are needed for session replay.
+        switch (event) {
+            .message_start, .message_end, .tool_execution_start, .tool_execution_end, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            else => return,
+        }
+        const meta = self.currentSessionMetadata();
+        store.save(meta, event) catch {};
+    }
+
+    fn currentSessionMetadata(self: *App) session_store.SessionMetadata {
+        return .{
+            .session_id = self.session_id,
+            .model = self.state.status.model,
+            .provider = self.state.status.provider,
+            .created_at = self.session_created_at,
+            .last_active = compat.time.nowMillis(),
+            .turn_count = self.state.status.turn_count,
+            .working_dir = self.working_dir,
+        };
     }
 
     pub fn start(self: *App) !void {
@@ -151,6 +234,7 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
+            self.saveEvent(ev);
             try self.state.applyEvent(ev);
         }
     }
@@ -160,6 +244,8 @@ pub const App = struct {
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         try self.state.appendUserMessage(trimmed);
+        self.saveEvent(.{ .message_start = .{ .role = .user } });
+        self.saveEvent(.{ .message_end = .{ .role = .user, .text = .initBorrowed(trimmed) } });
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
                 try self.state.status.setError(self.allocator, @errorName(err));
@@ -201,6 +287,12 @@ pub const App = struct {
         switch (result.action) {
             .quit => return error.QuitRequested,
             .clear_transcript => self.state.clearTranscript(),
+            .open_session_picker => {
+                // Refresh sessions list from store then open the picker.
+                self.loadSessions() catch {};
+                self.state.session_index = 0;
+                self.state.mode = .session_picker;
+            },
             .none => {},
         }
         if (result.output.len > 0) {
@@ -263,14 +355,85 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
     }
 }
 
+/// Module-level state for the external editor launch (T11).
+/// Stores the temp file path so the stateless `perform` fn can access it.
+var editor_tmp_path: [512]u8 = undefined;
+var editor_tmp_path_len: usize = 0;
+var editor_tmp_allocator: ?std.mem.Allocator = null;
+
+/// T11: Write composer buffer to a temp file and return a batch command that
+/// exits alt screen, runs the editor, and returns an editor_done message.
+fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiModel.Msg) {
+    if (@import("builtin").is_test) return null; // skip in tests
+    if (@import("builtin").os.tag == .windows) return null;
+
+    const content = app.state.composer.buffer.items;
+    const tmp_path = std.fmt.allocPrint(allocator, "/tmp/makai_edit_{d}.txt", .{compat.time.nowMillis()}) catch return null;
+    defer allocator.free(tmp_path);
+
+    // Write current buffer to temp file.
+    var file = std.Io.Dir.createFileAbsolute(defaultIo(), tmp_path, .{}) catch return null;
+    file.writeStreamingAll(defaultIo(), content) catch {
+        file.close(defaultIo());
+        return null;
+    };
+    file.close(defaultIo());
+
+    // Store path in module-level state for the perform fn.
+    if (tmp_path.len >= editor_tmp_path.len) return null;
+    @memcpy(editor_tmp_path[0..tmp_path.len], tmp_path);
+    editor_tmp_path_len = tmp_path.len;
+    editor_tmp_allocator = allocator;
+
+    return zz.Cmd(TuiModel.Msg){ .sequence = &.{
+        .exit_alt_screen,
+        .show_cursor,
+        .{ .perform = runEditorPerform },
+    } };
+}
+
+/// Stateless perform fn: spawns $EDITOR on the temp file and reads result back.
+fn runEditorPerform() ?TuiModel.Msg {
+    if (editor_tmp_path_len == 0) return null;
+    const path = editor_tmp_path[0..editor_tmp_path_len];
+    const allocator = editor_tmp_allocator orelse return null;
+
+    // Resolve $EDITOR or fall back to vi.
+    const editor_owned = compat.getEnvVarOwned(allocator, "EDITOR") catch
+        (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return null);
+    defer allocator.free(editor_owned);
+    const editor = editor_owned;
+
+    // Spawn editor and wait.
+    var child = std.process.spawn(defaultIo(), .{
+        .argv = &[_][]const u8{ editor, path },
+        .stdin = .inherit,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch return null;
+    defer if (child.id != null) child.kill(defaultIo());
+    _ = child.wait(defaultIo()) catch return null;
+
+    // Read file back.
+    const content = std.Io.Dir.readFileAlloc(.cwd(), defaultIo(), path, allocator, .limited(10 * 1024 * 1024)) catch return null;
+    // Clean up temp file (best-effort).
+    std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
+    editor_tmp_path_len = 0;
+
+    return TuiModel.Msg{ .editor_done = content };
+}
+
 const TuiModel = struct {
     app: ?App = null,
     options: tui_runtime.TuiRuntimeOptions = .{},
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
+        mouse: zz.MouseEvent,
         tick: struct { timestamp: u64, delta: u64 },
         quit: void,
+        /// Content read back from the external editor (owned by allocator stored in editor_tmp_allocator).
+        editor_done: []u8,
     };
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -289,7 +452,10 @@ const TuiModel = struct {
             app.state.appendTranscript(.system, "Makai TUI") catch {};
             app.state.appendTranscript(.system, "Enter submits composer, Ctrl+C or /quit exits") catch {};
         }
-        return .{ .every = 50 * std.time.ns_per_ms };
+        return .{ .batch = &.{
+            .{ .every = 50 * std.time.ns_per_ms },
+            .enable_mouse,
+        } };
     }
 
     pub fn deinit(self: *TuiModel) void {
@@ -298,13 +464,27 @@ const TuiModel = struct {
     }
 
     pub fn update(self: *TuiModel, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
-        _ = ctx;
         const app = &(self.app orelse return .none);
         switch (msg) {
+            .editor_done => |content| {
+                // Content was read back from the external editor. Load into composer.
+                defer if (editor_tmp_allocator) |alloc| alloc.free(content);
+                app.state.replaceComposerBuffer(content) catch {};
+                // Re-enter alt screen and hide cursor after editor exit.
+                return .{ .sequence = &.{
+                    .enter_alt_screen,
+                    .hide_cursor,
+                } };
+            },
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
                     .char => |c| switch (c) {
                         'c' => return .quit,
+                        'g' => {
+                            // T11: Open external editor with current composer buffer.
+                            if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
+                            return .none;
+                        },
                         'r' => {
                             app.state.toggleThinking();
                             return .none;
@@ -322,6 +502,34 @@ const TuiModel = struct {
                             else => {},
                         },
                         .escape => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
+                        else => {},
+                    }
+                    return .none;
+                }
+                // Session picker navigation (T10).
+                if (app.state.mode == .session_picker) {
+                    switch (key.key) {
+                        .up => {
+                            if (app.state.session_index > 0) app.state.session_index -= 1;
+                        },
+                        .down => {
+                            const n = app.state.sessions.items.len;
+                            if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
+                        },
+                        .char => |c| switch (c) {
+                            'k' => {
+                                if (app.state.session_index > 0) app.state.session_index -= 1;
+                            },
+                            'j' => {
+                                const n = app.state.sessions.items.len;
+                                if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
+                            },
+                            else => {},
+                        },
+                        .enter => {
+                            app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
+                        },
+                        .escape => app.state.mode = .normal,
                         else => {},
                     }
                     return .none;
@@ -354,11 +562,19 @@ const TuiModel = struct {
                     .down => {
                         if (!(app.state.composerHistoryNext() catch false)) app.state.transcript_scroll -|= 1;
                     },
-                    .page_up => app.state.transcript_scroll += 1,
-                    .page_down => app.state.transcript_scroll -|= 1,
+                    // PageUp/PageDown scroll by 5 lines for faster navigation.
+                    .page_up => app.state.transcript_scroll += 5,
+                    .page_down => app.state.transcript_scroll -|= 5,
                     .escape => app.state.mode = .normal,
                     else => {},
                 }
+            },
+            .mouse => |mouse| {
+                if (mouse.event_type == .press) switch (mouse.button) {
+                    .wheel_up => app.state.transcript_scroll += 3,
+                    .wheel_down => app.state.transcript_scroll -|= 3,
+                    else => {},
+                };
             },
             .tick => app.drainEvents() catch {},
             .quit => return .quit,
@@ -417,6 +633,66 @@ fn defaultIo() std.Io {
         std.testing.io
     else
         std.Io.Threaded.global_single_threaded.io();
+}
+
+fn currentPathOwned(allocator: std.mem.Allocator) ![]u8 {
+    const path_z = try std.process.currentPathAlloc(defaultIo(), allocator);
+    defer allocator.free(path_z);
+    return allocator.dupe(u8, path_z);
+}
+
+fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store.SessionMetadata) bool {
+    if (a.last_active == b.last_active) return std.mem.lessThan(u8, a.session_id, b.session_id);
+    return a.last_active > b.last_active;
+}
+
+/// Generate a timestamp-based session ID, e.g. "20260523-150405-123".
+fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
+    const millis = compat.time.nowMillis();
+    const secs: i64 = @divFloor(millis, 1000);
+    const ms: i64 = @mod(millis, 1000);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(secs, 0))) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch.getDaySeconds();
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            ms,
+        },
+    );
+}
+
+/// Format a session label from metadata: "model provider YYYY-MM-DD HH:MM".
+fn formatSessionLabel(allocator: std.mem.Allocator, meta: session_store.SessionMetadata) ![]u8 {
+    const ts = meta.last_active;
+    const secs: i64 = @divFloor(ts, 1000);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(secs, 0))) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch.getDaySeconds();
+    return std.fmt.allocPrint(
+        allocator,
+        "{s} {s} {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}",
+        .{
+            if (meta.model.len > 0) meta.model else "unknown",
+            if (meta.provider.len > 0) meta.provider else "",
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+        },
+    );
 }
 
 fn defaultModel() ai_types.Model {

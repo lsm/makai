@@ -39,7 +39,42 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
         try all_writer.writeAll(row);
     }
 
-    return lineWindow(allocator, all_rows.written(), options.height, state.transcript_scroll);
+    const all_text = all_rows.written();
+    const total_lines = tui_text.lineCount(all_text);
+    // Reserve one line for scroll indicator when scrolled; use full height otherwise.
+    const view_height = if (state.transcript_scroll > 0 and total_lines > options.height)
+        options.height -| 1
+    else
+        options.height;
+    const windowed = try lineWindow(allocator, all_text, view_height, state.transcript_scroll);
+    defer allocator.free(windowed);
+
+    if (state.transcript_scroll == 0 or total_lines <= options.height) {
+        return allocator.dupe(u8, windowed);
+    }
+
+    // Prepend a scroll indicator line: "↑ SCROLL N%"
+    const pct = scrollPercent(total_lines, view_height, state.transcript_scroll);
+    const raw_indicator = try std.fmt.allocPrint(allocator, "\u{2191} SCROLL {d}%", .{pct});
+    defer allocator.free(raw_indicator);
+    const indicator = try tui_theme.muted().render(allocator, raw_indicator);
+    defer allocator.free(indicator);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.writeAll(indicator);
+    try writer.writeByte('\n');
+    try writer.writeAll(windowed);
+    return out.toOwnedSlice();
+}
+
+/// Return scroll percentage: 100 = at top, 0 = at bottom.
+fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
+    if (total_lines <= view_height) return 0;
+    const max_scroll = total_lines - view_height;
+    const clamped = @min(scroll, max_scroll);
+    return clamped * 100 / max_scroll;
 }
 
 fn renderEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
@@ -214,4 +249,37 @@ test "transcript preserves non-assistant whitespace" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "  alpha   beta") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "    gamma") != null);
+}
+
+test "transcript shows scroll indicator when scrolled up" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    // Add more lines than fit in the viewport
+    for (0..20) |i| {
+        const msg = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
+        defer std.testing.allocator.free(msg);
+        try state.appendTranscript(.assistant, msg);
+    }
+    state.transcript_scroll = 5; // scrolled up
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") != null);
+}
+
+test "transcript hides scroll indicator when at bottom" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    for (0..10) |i| {
+        const msg = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
+        defer std.testing.allocator.free(msg);
+        try state.appendTranscript(.assistant, msg);
+    }
+    state.transcript_scroll = 0; // at bottom
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
 }

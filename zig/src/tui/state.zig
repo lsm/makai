@@ -209,6 +209,11 @@ pub const StatusState = struct {
         if (self.last_error.len > 0) allocator.free(self.last_error);
         self.last_error = try allocator.dupe(u8, message);
     }
+
+    pub fn setSessionId(self: *StatusState, allocator: std.mem.Allocator, session_id: []const u8) !void {
+        if (self.session_id.len > 0) allocator.free(self.session_id);
+        self.session_id = try allocator.dupe(u8, session_id);
+    }
 };
 
 pub const PreviewState = struct {
