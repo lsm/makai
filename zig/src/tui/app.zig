@@ -826,7 +826,10 @@ const TuiModel = struct {
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
-        const composer = composer_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
+        const composer = composer_view.render(ctx.allocator, &app.state, .{
+            .width = width,
+            .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
+        }) catch "";
         const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
         const tools = tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_height }) catch "";
         const telemetry = telemetry_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
