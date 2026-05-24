@@ -177,7 +177,6 @@ pub const App = struct {
         const idx = self.state.session_index;
         if (idx >= sessions.len) return;
         const id = sessions[idx].id;
-        self.discardPendingEvents();
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
         self.discardPendingEvents();
@@ -438,17 +437,53 @@ fn cleanupExternalEditorTempPath(path: []const u8) void {
     if (std.fs.path.dirname(path)) |dir| std.Io.Dir.deleteDirAbsolute(defaultIo(), dir) catch {};
 }
 
+fn appendEditorArg(parts: *std.ArrayList([]u8), allocator: std.mem.Allocator, buffer: *std.ArrayList(u8)) !void {
+    if (buffer.items.len == 0) return;
+    try parts.append(allocator, try allocator.dupe(u8, buffer.items));
+    buffer.clearRetainingCapacity();
+}
+
 fn buildEditorArgv(allocator: std.mem.Allocator, editor: []const u8, path: []const u8) ![]const []const u8 {
     var parts: std.ArrayList([]u8) = .empty;
     errdefer {
         for (parts.items) |part| allocator.free(part);
         parts.deinit(allocator);
     }
+    var current: std.ArrayList(u8) = .empty;
+    defer current.deinit(allocator);
 
-    var it = std.mem.tokenizeScalar(u8, editor, ' ');
-    while (it.next()) |part| {
-        try parts.append(allocator, try allocator.dupe(u8, part));
+    var quote: ?u8 = null;
+    var escape = false;
+    for (editor) |c| {
+        if (escape) {
+            try current.append(allocator, c);
+            escape = false;
+            continue;
+        }
+        if (c == '\\') {
+            escape = true;
+            continue;
+        }
+        if (quote) |q| {
+            if (c == q) {
+                quote = null;
+            } else {
+                try current.append(allocator, c);
+            }
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            continue;
+        }
+        if (std.ascii.isWhitespace(c)) {
+            try appendEditorArg(&parts, allocator, &current);
+            continue;
+        }
+        try current.append(allocator, c);
     }
+    if (escape) try current.append(allocator, '\\');
+    try appendEditorArg(&parts, allocator, &current);
     if (parts.items.len == 0) try parts.append(allocator, try allocator.dupe(u8, "vi"));
     try parts.append(allocator, try allocator.dupe(u8, path));
     return parts.toOwnedSlice(allocator);
