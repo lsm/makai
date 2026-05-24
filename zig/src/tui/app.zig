@@ -757,9 +757,15 @@ const TuiModel = struct {
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         if (app.state.status.streaming) {
                             if (key.modifiers.alt) {
-                                app.queueFollowUp(text) catch |err| app.recordError(@errorName(err)) catch {};
+                                app.queueFollowUp(text) catch |err| {
+                                    if (err == error.QuitRequested) return .quit;
+                                    app.recordError(@errorName(err)) catch {};
+                                };
                             } else {
-                                app.steer(text) catch |err| app.recordError(@errorName(err)) catch {};
+                                app.steer(text) catch |err| {
+                                    if (err == error.QuitRequested) return .quit;
+                                    app.recordError(@errorName(err)) catch {};
+                                };
                             }
                         } else {
                             app.submit(text) catch |err| {
@@ -1062,10 +1068,139 @@ test "App welcome uses session count" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
 }
 
+const MockAppSession = struct {
+    steer_count: usize = 0,
+    queued_follow_up_count: usize = 0,
+    queued_counts: tui_runtime.QueuedCounts = .{},
+
+    fn session(self: *MockAppSession) tui_runtime.TuiSession {
+        return .{
+            .ctx = self,
+            .ops = .{
+                .start = start,
+                .resume_session = resumeSession,
+                .cancel = cancel,
+                .submit_turn = submitTurn,
+                .steer = steer,
+                .queue_follow_up = queueFollowUp,
+                .queued_counts = queuedCounts,
+                .switch_model = switchModel,
+                .current_model = currentModel,
+                .decide_tool_approval = decideToolApproval,
+                .stream_events = streamEvents,
+            },
+        };
+    }
+
+    fn ptr(ctx: ?*anyopaque) *MockAppSession {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn start(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn resumeSession(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn cancel(ctx: ?*anyopaque) void {
+        _ = ctx;
+    }
+
+    fn submitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        _ = ctx;
+        _ = text;
+    }
+
+    fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = ptr(ctx);
+        self.steer_count += 1;
+        try std.testing.expectEqualStrings("steer me", text);
+    }
+
+    fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = ptr(ctx);
+        self.queued_follow_up_count += 1;
+        try std.testing.expectEqualStrings("follow later", text);
+    }
+
+    fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
+        return ptr(ctx).queued_counts;
+    }
+
+    fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
+        _ = ctx;
+        _ = model_id;
+    }
+
+    fn currentModel(ctx: ?*anyopaque) ?ai_types.Model {
+        _ = ctx;
+        return null;
+    }
+
+    fn decideToolApproval(ctx: ?*anyopaque, tool_call_id: []const u8, decision: tui_runtime.ToolApprovalDecision) anyerror!void {
+        _ = ctx;
+        _ = tool_call_id;
+        _ = decision;
+    }
+
+    fn streamEvents(ctx: ?*anyopaque) *tui_runtime.TuiEventStream {
+        _ = ctx;
+        unreachable;
+    }
+};
+
 test "App submit quit command requests quit" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
+}
+
+test "App steer and queue follow-up handle fallback empty and session paths" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.steer("  steer fallback  ");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer fallback", app.state.transcript.items[0].text.items);
+
+    try app.queueFollowUp("\tfollow fallback\n");
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("follow fallback", app.state.transcript.items[1].text.items);
+
+    try app.steer("   ");
+    try app.queueFollowUp("\n\t");
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+
+    app.state.clearTranscript();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 1, .follow_up = 2 } };
+    app.session = mock.session();
+
+    try app.steer(" steer me ");
+    try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer me", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
+
+    mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
+    try app.queueFollowUp(" follow later ");
+    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("follow later", app.state.transcript.items[1].text.items);
+    try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
+}
+
+test "TuiModel exits quit command while streaming" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/quit");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
 }
 
 test "session picker navigation pages through hidden rows" {

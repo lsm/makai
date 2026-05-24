@@ -175,14 +175,7 @@ pub const TelemetryState = struct {
     }
 };
 
-pub const QueueState = struct {
-    steering_count: usize = 0,
-    follow_up_count: usize = 0,
-
-    pub fn total(self: QueueState) usize {
-        return self.steering_count + self.follow_up_count;
-    }
-};
+pub const QueueState = tui_runtime.QueuedCounts;
 
 pub const StatusState = struct {
     model: []u8 = &.{},
@@ -437,8 +430,7 @@ pub const AppState = struct {
     }
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
-        self.queue.steering_count = counts.steering;
-        self.queue.follow_up_count = counts.follow_up;
+        self.queue = counts;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {

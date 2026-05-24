@@ -553,8 +553,7 @@ pub const TuiRuntime = struct {
             .remote => return .{},
             .local => {
                 const local = &(self.local_agent orelse return .{});
-                const counts = local.queuedCounts();
-                return .{ .steering = counts.steering, .follow_up = counts.follow_up };
+                return local.queuedCounts();
             },
         }
     }

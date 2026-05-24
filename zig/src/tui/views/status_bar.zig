@@ -121,8 +121,8 @@ test "status bar renders model and clips width" {
 test "status bar renders queue count when queued" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    state.queue.steering_count = 1;
-    state.queue.follow_up_count = 2;
+    state.queue.steering = 1;
+    state.queue.follow_up = 2;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 160 });
     defer std.testing.allocator.free(text);

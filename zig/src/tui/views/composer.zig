@@ -112,7 +112,7 @@ test "composer renders queued hint while streaming" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     state.status.streaming = true;
-    state.queue.follow_up_count = 2;
+    state.queue.follow_up = 2;
 
     const text = try render(std.testing.allocator, &state, .{ .width = 80 });
     defer std.testing.allocator.free(text);

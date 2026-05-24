@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent = @import("agent");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -165,14 +166,7 @@ pub const TuiSessionResult = struct {
 
 pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 
-pub const QueuedCounts = struct {
-    steering: usize = 0,
-    follow_up: usize = 0,
-
-    pub fn total(self: QueuedCounts) usize {
-        return self.steering + self.follow_up;
-    }
-};
+pub const QueuedCounts = agent.Agent.QueuedCounts;
 
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
