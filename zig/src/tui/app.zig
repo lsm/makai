@@ -371,9 +371,8 @@ fn approvalCallback(ctx: ?*anyopaque, request: tui_runtime.ToolApprovalRequest) 
 }
 
 /// Module-level state for the external editor launch (T11).
-/// Stores the temp file path so the stateless `perform` fn can access it.
-var editor_tmp_path: [512]u8 = undefined;
-var editor_tmp_path_len: usize = 0;
+/// Stores the owned temp file path so the stateless `perform` fn can access it.
+var editor_tmp_path: []u8 = &.{};
 var editor_tmp_allocator: ?std.mem.Allocator = null;
 
 const editor_tmp_dir_prefix = "makai-editor-";
@@ -387,12 +386,17 @@ fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiMode
 
     const content = app.state.composer.buffer.items;
     const tmp_path = createExternalEditorTempFile(allocator, content) catch return null;
-    defer allocator.free(tmp_path);
+    errdefer {
+        cleanupExternalEditorTempPath(tmp_path);
+        allocator.free(tmp_path);
+    }
 
-    // Store path in module-level state for the perform fn.
-    if (tmp_path.len >= editor_tmp_path.len) return null;
-    @memcpy(editor_tmp_path[0..tmp_path.len], tmp_path);
-    editor_tmp_path_len = tmp_path.len;
+    // Store owned path in module-level state for the perform fn.
+    if (editor_tmp_path.len > 0) {
+        cleanupExternalEditorTempPath(editor_tmp_path);
+        allocator.free(editor_tmp_path);
+    }
+    editor_tmp_path = tmp_path;
     editor_tmp_allocator = allocator;
 
     return zz.Cmd(TuiModel.Msg){ .sequence = &.{
@@ -497,12 +501,14 @@ fn freeEditorArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
 
 /// Stateless perform fn: spawns $EDITOR on the temp file and reads result back.
 fn runEditorPerform() ?TuiModel.Msg {
-    if (editor_tmp_path_len == 0) return TuiModel.Msg{ .editor_failed = {} };
-    const path = editor_tmp_path[0..editor_tmp_path_len];
+    if (editor_tmp_path.len == 0) return TuiModel.Msg{ .editor_failed = {} };
     const allocator = editor_tmp_allocator orelse return TuiModel.Msg{ .editor_failed = {} };
+    const path = editor_tmp_path;
     defer {
         cleanupExternalEditorTempPath(path);
-        editor_tmp_path_len = 0;
+        allocator.free(path);
+        editor_tmp_path = &.{};
+        editor_tmp_allocator = null;
     }
 
     // Resolve $EDITOR or fall back to vi.
@@ -760,7 +766,7 @@ fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store
     return a.last_active > b.last_active;
 }
 
-/// Generate a timestamp-based session ID, e.g. "20260523-150405-123".
+/// Generate a collision-resistant session ID, e.g. "20260523-150405-123-a1b2c3d4e5f60708".
 fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
     const millis = compat.time.nowMillis();
     const secs: i64 = @divFloor(millis, 1000);
@@ -770,9 +776,13 @@ fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
     const year_day = day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     const day_secs = epoch.getDaySeconds();
+    var random_bytes: [8]u8 = undefined;
+    compat.random.fillSecureBytes(&random_bytes);
+    var random_hex: [16]u8 = undefined;
+    encodeHexLower(&random_hex, &random_bytes);
     return std.fmt.allocPrint(
         allocator,
-        "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}",
+        "{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}-{s}",
         .{
             year_day.year,
             month_day.month.numeric(),
@@ -781,6 +791,7 @@ fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
             ms,
+            random_hex,
         },
     );
 }
