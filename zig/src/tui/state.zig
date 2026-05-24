@@ -209,6 +209,12 @@ pub const StatusState = struct {
         if (self.last_error.len > 0) allocator.free(self.last_error);
         self.last_error = try allocator.dupe(u8, message);
     }
+
+    pub fn setSessionId(self: *StatusState, allocator: std.mem.Allocator, session_id: []const u8) !void {
+        const new_session_id = try allocator.dupe(u8, session_id);
+        if (self.session_id.len > 0) allocator.free(self.session_id);
+        self.session_id = new_session_id;
+    }
 };
 
 pub const PreviewState = struct {
@@ -293,6 +299,7 @@ pub const AppState = struct {
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
+    session_scroll: usize = 0,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
 
@@ -331,6 +338,26 @@ pub const AppState = struct {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
+        self.clearActiveTranscriptEntries();
+    }
+
+    pub fn clearTools(self: *AppState) void {
+        for (self.tools.items) |*tool| tool.deinit(self.allocator);
+        self.tools.clearRetainingCapacity();
+        self.tool_scroll = 0;
+    }
+
+    pub fn resetReplayState(self: *AppState) void {
+        self.clearTranscript();
+        self.clearTools();
+        self.telemetry = .{};
+        self.status.context_used = 0;
+        self.status.turn_count = 0;
+        self.status.streaming = false;
+        if (self.status.last_error.len > 0) {
+            self.allocator.free(self.status.last_error);
+            self.status.last_error = &.{};
+        }
     }
 
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {

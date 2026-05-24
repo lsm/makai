@@ -33,6 +33,7 @@ pub const CommandAction = enum {
     none,
     quit,
     clear_transcript,
+    open_session_picker,
 };
 
 pub const CommandResult = struct {
@@ -238,27 +239,25 @@ fn handleProvider(ctx: CommandContext, command: Command) !CommandResult {
 fn handleStatus(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     const status = ctx.state.status;
-    return .{ .output = try std.fmt.allocPrint(ctx.allocator,
-        "session: {s}\nmodel: {s}\nprovider: {s}\nturns: {d}\ncontext: {d}/{d}\nstreaming: {s}",
-        .{
-            if (status.session_id.len > 0) status.session_id else "(current)",
-            if (status.model.len > 0) status.model else "none",
-            if (status.provider.len > 0) status.provider else "none",
-            status.turn_count,
-            status.context_used,
-            status.context_limit,
-            if (status.streaming) "yes" else "no",
-        }) };
+    return .{ .output = try std.fmt.allocPrint(ctx.allocator, "session: {s}\nmodel: {s}\nprovider: {s}\nturns: {d}\ncontext: {d}/{d}\nstreaming: {s}", .{
+        if (status.session_id.len > 0) status.session_id else "(current)",
+        if (status.model.len > 0) status.model else "none",
+        if (status.provider.len > 0) status.provider else "none",
+        status.turn_count,
+        status.context_used,
+        status.context_limit,
+        if (status.streaming) "yes" else "no",
+    }) };
 }
 
 fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    if (ctx.state.sessions.items.len == 0) return .{ .output = try ctx.allocator.dupe(u8, "no saved sessions (saved-session discovery is not wired yet)") };
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    try writer.writeAll("saved sessions:");
-    for (ctx.state.sessions.items) |session| try writer.print("\n  {s}  {s}", .{ session.id, session.label });
-    return .{ .output = try out.toOwnedSlice() };
+    // Sessions are loaded by App.loadSessions() before dispatch.
+    // Return the open_session_picker action so App can switch mode.
+    if (ctx.state.sessions.items.len == 0) {
+        return .{ .output = try ctx.allocator.dupe(u8, "no saved sessions") };
+    }
+    return .{ .action = .open_session_picker };
 }
 
 fn handleResume(ctx: CommandContext, command: Command) !CommandResult {
@@ -388,6 +387,8 @@ test "dispatch reaches command handlers" {
             try std.testing.expectEqual(CommandAction.quit, result.action);
         } else if (kind == .clear) {
             try std.testing.expectEqual(CommandAction.clear_transcript, result.action);
+        } else if (kind == .sessions) {
+            try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
         } else {
             try std.testing.expect(result.output.len > 0);
         }
@@ -406,14 +407,25 @@ test "resume by id does not resume current context" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
 }
 
-test "sessions reports discovery gap when runtime has no source" {
+test "sessions opens picker when sessions exist" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.addSession("s1", "Saved");
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .sessions });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
+}
+
+test "sessions reports empty store" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
 
     var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .sessions });
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "no saved sessions") != null);
 }
 
 test "permissions reports runtime approval state not hardcoded policy" {

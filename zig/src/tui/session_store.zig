@@ -144,8 +144,8 @@ pub const Store = struct {
     }
 
     pub fn initDefault(allocator: std.mem.Allocator) !Store {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.HomeNotFound,
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+            error.EnvironmentVariableMissing => return error.HomeNotFound,
             else => return err,
         };
         defer allocator.free(home);
