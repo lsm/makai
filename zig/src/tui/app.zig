@@ -179,17 +179,22 @@ pub const App = struct {
         const id = sessions[idx].id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
-        self.state.clearTranscript();
+        self.state.resetReplayState();
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
         self.session_created_at = loaded.metadata.created_at;
         try self.state.status.setSessionId(self.allocator, self.session_id);
-        try self.state.status.setModelWithContext(self.allocator, loaded.metadata.model, loaded.metadata.provider, self.state.status.context_limit);
-        self.state.status.turn_count = loaded.metadata.turn_count;
-        // Replay events into transcript.
+        if (runtime.currentModel()) |model| {
+            try self.state.status.setModelWithContext(self.allocator, model.id, model.provider, model.context_window);
+            self.state.telemetry.context_window = model.context_window;
+        } else {
+            try self.state.status.setModelWithContext(self.allocator, loaded.metadata.model, loaded.metadata.provider, 0);
+        }
+        // Replay events into transcript and status counters.
         for (loaded.events.items) |*event| {
             try self.state.applyEvent(event.*);
         }
+        self.state.status.streaming = false;
         self.state.mode = .normal;
     }
 
@@ -198,7 +203,7 @@ pub const App = struct {
         const store = self.store orelse return;
         // Only save events that are needed for session replay.
         switch (event) {
-            .message_start, .message_end, .tool_execution_start, .tool_execution_end, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .message_start, .message_end, .tool_execution_start, .tool_execution_end, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             else => return,
         }
         const meta = self.currentSessionMetadata();
@@ -244,8 +249,6 @@ pub const App = struct {
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         try self.state.appendUserMessage(trimmed);
-        self.saveEvent(.{ .message_start = .{ .role = .user } });
-        self.saveEvent(.{ .message_end = .{ .role = .user, .text = .initBorrowed(trimmed) } });
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
                 try self.state.status.setError(self.allocator, @errorName(err));
@@ -271,6 +274,8 @@ pub const App = struct {
             },
             .command => |command| command,
         };
+
+        if (command.kind == .sessions) self.loadSessions() catch {};
 
         var result = tui_commands.dispatch(.{
             .allocator = self.allocator,
@@ -394,13 +399,17 @@ fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiMode
 
 /// Stateless perform fn: spawns $EDITOR on the temp file and reads result back.
 fn runEditorPerform() ?TuiModel.Msg {
-    if (editor_tmp_path_len == 0) return null;
+    if (editor_tmp_path_len == 0) return TuiModel.Msg{ .editor_failed = {} };
     const path = editor_tmp_path[0..editor_tmp_path_len];
-    const allocator = editor_tmp_allocator orelse return null;
+    const allocator = editor_tmp_allocator orelse return TuiModel.Msg{ .editor_failed = {} };
+    defer {
+        std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
+        editor_tmp_path_len = 0;
+    }
 
     // Resolve $EDITOR or fall back to vi.
     const editor_owned = compat.getEnvVarOwned(allocator, "EDITOR") catch
-        (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return null);
+        (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return TuiModel.Msg{ .editor_failed = {} });
     defer allocator.free(editor_owned);
     const editor = editor_owned;
 
@@ -410,15 +419,12 @@ fn runEditorPerform() ?TuiModel.Msg {
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
-    }) catch return null;
+    }) catch return TuiModel.Msg{ .editor_failed = {} };
     defer if (child.id != null) child.kill(defaultIo());
-    _ = child.wait(defaultIo()) catch return null;
+    _ = child.wait(defaultIo()) catch return TuiModel.Msg{ .editor_failed = {} };
 
     // Read file back.
-    const content = std.Io.Dir.readFileAlloc(.cwd(), defaultIo(), path, allocator, .limited(10 * 1024 * 1024)) catch return null;
-    // Clean up temp file (best-effort).
-    std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
-    editor_tmp_path_len = 0;
+    const content = std.Io.Dir.readFileAlloc(.cwd(), defaultIo(), path, allocator, .limited(10 * 1024 * 1024)) catch return TuiModel.Msg{ .editor_failed = {} };
 
     return TuiModel.Msg{ .editor_done = content };
 }
@@ -434,6 +440,8 @@ const TuiModel = struct {
         quit: void,
         /// Content read back from the external editor (owned by allocator stored in editor_tmp_allocator).
         editor_done: []u8,
+        /// External editor failed after leaving alt screen; restore terminal state.
+        editor_failed: void,
     };
 
     pub fn init(self: *TuiModel, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -471,6 +479,13 @@ const TuiModel = struct {
                 defer if (editor_tmp_allocator) |alloc| alloc.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
                 // Re-enter alt screen and hide cursor after editor exit.
+                return .{ .sequence = &.{
+                    .enter_alt_screen,
+                    .hide_cursor,
+                } };
+            },
+            .editor_failed => {
+                app.recordError("external editor failed") catch {};
                 return .{ .sequence = &.{
                     .enter_alt_screen,
                     .hide_cursor,

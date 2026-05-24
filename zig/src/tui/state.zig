@@ -336,6 +336,22 @@ pub const AppState = struct {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
+        self.clearActiveTranscriptEntries();
+    }
+
+    pub fn clearTools(self: *AppState) void {
+        for (self.tools.items) |*tool| tool.deinit(self.allocator);
+        self.tools.clearRetainingCapacity();
+        self.tool_scroll = 0;
+    }
+
+    pub fn resetReplayState(self: *AppState) void {
+        self.clearTranscript();
+        self.clearTools();
+        self.telemetry = .{};
+        self.status.context_used = 0;
+        self.status.turn_count = 0;
+        self.status.streaming = false;
     }
 
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {
