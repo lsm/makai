@@ -211,8 +211,9 @@ pub const StatusState = struct {
     }
 
     pub fn setSessionId(self: *StatusState, allocator: std.mem.Allocator, session_id: []const u8) !void {
+        const new_session_id = try allocator.dupe(u8, session_id);
         if (self.session_id.len > 0) allocator.free(self.session_id);
-        self.session_id = try allocator.dupe(u8, session_id);
+        self.session_id = new_session_id;
     }
 };
 
@@ -298,6 +299,7 @@ pub const AppState = struct {
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
+    session_scroll: usize = 0,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
 

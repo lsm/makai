@@ -21,6 +21,7 @@ const tui_render = @import("tui_render");
 const permission = @import("permission");
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
+const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
 
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
@@ -207,14 +208,41 @@ pub const App = struct {
         const store = self.store orelse return;
         // Only save events that are needed for session replay.
         switch (event) {
-            .message_start, .message_end, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .text_delta => |payload| {
+                if (payload.delta.slice().len > max_session_event_payload_bytes) return;
+            },
+            .tool_call_delta => |payload| {
+                if (payload.delta.slice().len > max_session_event_payload_bytes) return;
+            },
+            .message_end => |payload| {
+                if (messageEndPayloadSize(payload) > max_session_event_payload_bytes) return;
+            },
             .tool_execution_end => |payload| {
-                if (payload.result_json.slice().len + payload.tool_call_id.slice().len + payload.tool_name.slice().len + payload.artifact_refs.slice().len > max_session_event_jsonl_bytes / 2) return;
+                if (toolExecutionEndPayloadSize(payload) > max_session_event_payload_bytes) return;
             },
             else => return,
         }
         const meta = self.currentSessionMetadata();
         store.save(meta, event) catch {};
+    }
+
+    fn messageEndPayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).message_end)) usize {
+        return payload.text.slice().len +
+            payload.content_json.slice().len +
+            payload.tool_call_id.slice().len +
+            payload.tool_name.slice().len +
+            payload.args_json.slice().len +
+            payload.tool_calls_json.slice().len +
+            payload.details_json.slice().len +
+            payload.artifacts_json.slice().len;
+    }
+
+    fn toolExecutionEndPayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).tool_execution_end)) usize {
+        return payload.result_json.slice().len +
+            payload.tool_call_id.slice().len +
+            payload.tool_name.slice().len +
+            payload.artifact_refs.slice().len;
     }
 
     fn currentSessionMetadata(self: *App) session_store.SessionMetadata {
@@ -312,6 +340,7 @@ pub const App = struct {
                 // Refresh sessions list from store then open the picker.
                 self.loadSessions() catch {};
                 self.state.session_index = 0;
+                self.state.session_scroll = 0;
                 self.state.mode = .session_picker;
             },
             .none => {},
@@ -635,21 +664,11 @@ const TuiModel = struct {
                 // Session picker navigation (T10).
                 if (app.state.mode == .session_picker) {
                     switch (key.key) {
-                        .up => {
-                            if (app.state.session_index > 0) app.state.session_index -= 1;
-                        },
-                        .down => {
-                            const n = visibleSessionCount(app);
-                            if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
-                        },
+                        .up => moveSessionSelection(app, -1),
+                        .down => moveSessionSelection(app, 1),
                         .char => |c| switch (c) {
-                            'k' => {
-                                if (app.state.session_index > 0) app.state.session_index -= 1;
-                            },
-                            'j' => {
-                                const n = visibleSessionCount(app);
-                                if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
-                            },
+                            'k' => moveSessionSelection(app, -1),
+                            'j' => moveSessionSelection(app, 1),
                             else => {},
                         },
                         .enter => {
@@ -721,7 +740,7 @@ const TuiModel = struct {
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
-            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = sessionPickerHeight(app) }) catch "",
+            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
             .normal => "",
         };
         const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 5;
@@ -754,8 +773,32 @@ const TuiModel = struct {
         return count;
     }
 
+    fn moveSessionSelection(app: *App, delta: isize) void {
+        const n = app.state.sessions.items.len;
+        if (n == 0) {
+            app.state.session_index = 0;
+            app.state.session_scroll = 0;
+            return;
+        }
+        if (delta < 0) {
+            app.state.session_index -|= @as(usize, @intCast(-delta));
+        } else {
+            app.state.session_index = @min(n - 1, app.state.session_index + @as(usize, @intCast(delta)));
+        }
+        ensureSessionSelectionVisible(app);
+    }
+
+    fn ensureSessionSelectionVisible(app: *App) void {
+        const height = sessionPickerHeight(app);
+        if (app.state.session_index < app.state.session_scroll) {
+            app.state.session_scroll = app.state.session_index;
+        } else if (height > 0 and app.state.session_index >= app.state.session_scroll + height) {
+            app.state.session_scroll = app.state.session_index + 1 - height;
+        }
+    }
+
     fn visibleSessionCount(app: *const App) usize {
-        return @min(app.state.sessions.items.len, sessionPickerHeight(app));
+        return @min(app.state.sessions.items.len -| app.state.session_scroll, sessionPickerHeight(app));
     }
 
     fn sessionPickerHeight(app: *const App) usize {
@@ -931,7 +974,7 @@ test "App submit quit command requests quit" {
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
 }
 
-test "session picker navigation is capped to visible rows" {
+test "session picker navigation pages through hidden rows" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     app.last_view_height = 8;
@@ -941,5 +984,12 @@ test "session picker navigation is capped to visible rows" {
     try app.state.addSession("s4", "Four");
     try app.state.addSession("s5", "Five");
 
+    try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
+    TuiModel.moveSessionSelection(&app, 1);
+    TuiModel.moveSessionSelection(&app, 1);
+    TuiModel.moveSessionSelection(&app, 1);
+    TuiModel.moveSessionSelection(&app, 1);
+    try std.testing.expectEqual(@as(usize, 4), app.state.session_index);
+    try std.testing.expectEqual(@as(usize, 1), app.state.session_scroll);
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
 }
