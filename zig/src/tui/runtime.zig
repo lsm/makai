@@ -418,6 +418,7 @@ pub const TuiRuntime = struct {
                 .submit_turn = sessionSubmitTurn,
                 .steer = sessionSteer,
                 .queue_follow_up = sessionQueueFollowUp,
+                .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
                 .switch_model = sessionSwitchModel,
                 .current_model = sessionCurrentModel,
@@ -548,6 +549,16 @@ pub const TuiRuntime = struct {
         }
     }
 
+    pub fn clearQueuedMessages(self: *TuiRuntime) void {
+        switch (self.backend) {
+            .remote => {},
+            .local => {
+                const local = &(self.local_agent orelse return);
+                local.clearAllQueues();
+            },
+        }
+    }
+
     pub fn queuedCounts(self: *TuiRuntime) QueuedCounts {
         switch (self.backend) {
             .remote => return .{},
@@ -565,6 +576,7 @@ pub const TuiRuntime = struct {
                 if (!self.started) try self.start();
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 if (self.run_async) local.waitForIdle();
+                local.clearAllQueues();
                 try local.replaceMessages(messages);
             },
         }
@@ -1760,6 +1772,11 @@ fn sessionQueueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
     try self.queueFollowUp(text);
 }
 
+fn sessionClearQueuedMessages(ctx: ?*anyopaque) void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    self.clearQueuedMessages();
+}
+
 fn sessionQueuedCounts(ctx: ?*anyopaque) QueuedCounts {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     return self.queuedCounts();
@@ -2287,6 +2304,23 @@ test "remote queue operations report unsupported" {
     var tui_session = runtime.createSession();
     try std.testing.expectError(error.RemoteSteeringUnsupported, tui_session.steer("hi"));
     try std.testing.expectError(error.RemoteQueueUnsupported, tui_session.queueFollowUp("hi"));
+}
+
+test "runtime clears queued messages before replacing messages" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.steer("steer now");
+    try tui_session.queueFollowUp("later");
+    try std.testing.expectEqual(@as(usize, 2), tui_session.queuedCounts().total());
+
+    try runtime.replaceMessages(&.{});
+
+    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
 }
 
 test "event stream resets between turns" {

@@ -202,6 +202,8 @@ pub const App = struct {
         for (loaded.events.items) |*event| {
             try self.state.applyEvent(event.*);
         }
+        if (self.session) |*session| session.clearQueuedMessages();
+        self.refreshQueuedCounts();
         self.state.status.streaming = false;
         self.state.mode = .normal;
     }
@@ -753,6 +755,10 @@ const TuiModel = struct {
                             app.state.composer.buffer.append(app.allocator, '\n') catch |err| app.recordError(@errorName(err)) catch {};
                             return .none;
                         }
+                        app.drainEvents() catch |err| {
+                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                        };
                         const text = app.state.composer.text();
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         if (app.state.status.streaming) {
@@ -1071,7 +1077,11 @@ test "App welcome uses session count" {
 const MockAppSession = struct {
     steer_count: usize = 0,
     queued_follow_up_count: usize = 0,
+    submit_count: usize = 0,
+    clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
+    events: tui_runtime.TuiEventStream = undefined,
+    events_initialized: bool = false,
 
     fn session(self: *MockAppSession) tui_runtime.TuiSession {
         return .{
@@ -1083,6 +1093,7 @@ const MockAppSession = struct {
                 .submit_turn = submitTurn,
                 .steer = steer,
                 .queue_follow_up = queueFollowUp,
+                .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
                 .switch_model = switchModel,
                 .current_model = currentModel,
@@ -1109,8 +1120,9 @@ const MockAppSession = struct {
     }
 
     fn submitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
-        _ = ctx;
-        _ = text;
+        const self = ptr(ctx);
+        self.submit_count += 1;
+        try std.testing.expectEqualStrings("new turn", text);
     }
 
     fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
@@ -1123,6 +1135,12 @@ const MockAppSession = struct {
         const self = ptr(ctx);
         self.queued_follow_up_count += 1;
         try std.testing.expectEqualStrings("follow later", text);
+    }
+
+    fn clearQueuedMessages(ctx: ?*anyopaque) void {
+        const self = ptr(ctx);
+        self.clear_count += 1;
+        self.queued_counts = .{};
     }
 
     fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
@@ -1145,9 +1163,20 @@ const MockAppSession = struct {
         _ = decision;
     }
 
+    fn eventStream(self: *MockAppSession) *tui_runtime.TuiEventStream {
+        if (!self.events_initialized) {
+            self.events = tui_runtime.TuiEventStream.init(std.testing.allocator);
+            self.events_initialized = true;
+        }
+        return &self.events;
+    }
+
     fn streamEvents(ctx: ?*anyopaque) *tui_runtime.TuiEventStream {
-        _ = ctx;
-        unreachable;
+        return ptr(ctx).eventStream();
+    }
+
+    fn deinit(self: *MockAppSession) void {
+        if (self.events_initialized) self.events.deinit();
     }
 };
 
@@ -1201,6 +1230,24 @@ test "TuiModel exits quit command while streaming" {
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
+}
+
+test "TuiModel drains events before routing Enter while streaming" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try mock.eventStream().push(.{ .turn_end = .{ .stop_reason = .stop } });
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expect(!model.app.?.state.status.streaming);
 }
 
 test "session picker navigation pages through hidden rows" {

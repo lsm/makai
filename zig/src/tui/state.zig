@@ -354,6 +354,7 @@ pub const AppState = struct {
         self.clearTranscript();
         self.clearTools();
         self.telemetry = .{};
+        self.queue = .{};
         self.status.context_used = 0;
         self.status.turn_count = 0;
         self.status.streaming = false;
@@ -1353,6 +1354,16 @@ test "AppState toggles thinking visibility" {
     try std.testing.expect(state.show_thinking);
     state.toggleThinking();
     try std.testing.expect(!state.show_thinking);
+}
+
+test "AppState reset replay clears stale queue counts" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.queue = .{ .steering = 1, .follow_up = 2 };
+
+    state.resetReplayState();
+
+    try std.testing.expectEqual(@as(usize, 0), state.queue.total());
 }
 
 test "AppState applies thinking tool call and lifecycle events" {

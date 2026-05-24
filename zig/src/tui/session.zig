@@ -175,6 +175,7 @@ pub const TuiSessionOps = struct {
     submit_turn: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     queue_follow_up: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
+    clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
@@ -208,6 +209,10 @@ pub const TuiSession = struct {
 
     pub fn queueFollowUp(self: *TuiSession, text: []const u8) !void {
         try self.ops.queue_follow_up(self.ctx, text);
+    }
+
+    pub fn clearQueuedMessages(self: *TuiSession) void {
+        self.ops.clear_queued_messages(self.ctx);
     }
 
     pub fn queuedCounts(self: *TuiSession) QueuedCounts {
