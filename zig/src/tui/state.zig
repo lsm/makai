@@ -352,6 +352,10 @@ pub const AppState = struct {
         self.status.context_used = 0;
         self.status.turn_count = 0;
         self.status.streaming = false;
+        if (self.status.last_error.len > 0) {
+            self.allocator.free(self.status.last_error);
+            self.status.last_error = &.{};
+        }
     }
 
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {

@@ -177,8 +177,10 @@ pub const App = struct {
         const idx = self.state.session_index;
         if (idx >= sessions.len) return;
         const id = sessions[idx].id;
+        self.discardPendingEvents();
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
+        self.discardPendingEvents();
         self.state.resetReplayState();
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
@@ -241,6 +243,14 @@ pub const App = struct {
             defer ev.deinit(self.allocator);
             self.saveEvent(ev);
             try self.state.applyEvent(ev);
+        }
+    }
+
+    fn discardPendingEvents(self: *App) void {
+        var session = &(self.session orelse return);
+        while (session.popEvent()) |event| {
+            var ev = event;
+            ev.deinit(self.allocator);
         }
     }
 
@@ -366,6 +376,9 @@ var editor_tmp_path: [512]u8 = undefined;
 var editor_tmp_path_len: usize = 0;
 var editor_tmp_allocator: ?std.mem.Allocator = null;
 
+const editor_tmp_dir_prefix = "makai-editor-";
+const editor_tmp_file_name = "composer.txt";
+
 /// T11: Write composer buffer to a temp file and return a batch command that
 /// exits alt screen, runs the editor, and returns an editor_done message.
 fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiModel.Msg) {
@@ -373,16 +386,8 @@ fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiMode
     if (@import("builtin").os.tag == .windows) return null;
 
     const content = app.state.composer.buffer.items;
-    const tmp_path = std.fmt.allocPrint(allocator, "/tmp/makai_edit_{d}.txt", .{compat.time.nowMillis()}) catch return null;
+    const tmp_path = createExternalEditorTempFile(allocator, content) catch return null;
     defer allocator.free(tmp_path);
-
-    // Write current buffer to temp file.
-    var file = std.Io.Dir.createFileAbsolute(defaultIo(), tmp_path, .{}) catch return null;
-    file.writeStreamingAll(defaultIo(), content) catch {
-        file.close(defaultIo());
-        return null;
-    };
-    file.close(defaultIo());
 
     // Store path in module-level state for the perform fn.
     if (tmp_path.len >= editor_tmp_path.len) return null;
@@ -397,13 +402,71 @@ fn launchExternalEditor(app: *App, allocator: std.mem.Allocator) ?zz.Cmd(TuiMode
     } };
 }
 
+fn encodeHexLower(out: []u8, bytes: []const u8) void {
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, i| {
+        out[i * 2] = alphabet[byte >> 4];
+        out[i * 2 + 1] = alphabet[byte & 0x0f];
+    }
+}
+
+fn createExternalEditorTempFile(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var random_bytes: [16]u8 = undefined;
+    compat.random.fillSecureBytes(&random_bytes);
+    var random_hex: [32]u8 = undefined;
+    encodeHexLower(&random_hex, &random_bytes);
+
+    const tmp_dir = compat.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
+    defer allocator.free(tmp_dir);
+    const dir_path = try std.fs.path.join(allocator, &.{ tmp_dir, editor_tmp_dir_prefix ++ random_hex });
+    errdefer allocator.free(dir_path);
+    try std.Io.Dir.createDirAbsolute(defaultIo(), dir_path, @enumFromInt(0o700));
+    errdefer std.Io.Dir.deleteDirAbsolute(defaultIo(), dir_path) catch {};
+
+    const file_path = try std.fs.path.join(allocator, &.{ dir_path, editor_tmp_file_name });
+    errdefer allocator.free(file_path);
+    allocator.free(dir_path);
+
+    var file = try std.Io.Dir.createFileAbsolute(defaultIo(), file_path, .{ .exclusive = true, .truncate = false, .permissions = @enumFromInt(0o600) });
+    errdefer std.Io.Dir.deleteFileAbsolute(defaultIo(), file_path) catch {};
+    defer file.close(defaultIo());
+    try file.writeStreamingAll(defaultIo(), content);
+    return file_path;
+}
+
+fn cleanupExternalEditorTempPath(path: []const u8) void {
+    std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.deleteDirAbsolute(defaultIo(), dir) catch {};
+}
+
+fn buildEditorArgv(allocator: std.mem.Allocator, editor: []const u8, path: []const u8) ![]const []const u8 {
+    var parts: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (parts.items) |part| allocator.free(part);
+        parts.deinit(allocator);
+    }
+
+    var it = std.mem.tokenizeScalar(u8, editor, ' ');
+    while (it.next()) |part| {
+        try parts.append(allocator, try allocator.dupe(u8, part));
+    }
+    if (parts.items.len == 0) try parts.append(allocator, try allocator.dupe(u8, "vi"));
+    try parts.append(allocator, try allocator.dupe(u8, path));
+    return parts.toOwnedSlice(allocator);
+}
+
+fn freeEditorArgv(allocator: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| allocator.free(arg);
+    allocator.free(argv);
+}
+
 /// Stateless perform fn: spawns $EDITOR on the temp file and reads result back.
 fn runEditorPerform() ?TuiModel.Msg {
     if (editor_tmp_path_len == 0) return TuiModel.Msg{ .editor_failed = {} };
     const path = editor_tmp_path[0..editor_tmp_path_len];
     const allocator = editor_tmp_allocator orelse return TuiModel.Msg{ .editor_failed = {} };
     defer {
-        std.Io.Dir.deleteFileAbsolute(defaultIo(), path) catch {};
+        cleanupExternalEditorTempPath(path);
         editor_tmp_path_len = 0;
     }
 
@@ -411,11 +474,12 @@ fn runEditorPerform() ?TuiModel.Msg {
     const editor_owned = compat.getEnvVarOwned(allocator, "EDITOR") catch
         (compat.getEnvVarOwned(allocator, "VISUAL") catch allocator.dupe(u8, "vi") catch return TuiModel.Msg{ .editor_failed = {} });
     defer allocator.free(editor_owned);
-    const editor = editor_owned;
+    const argv = buildEditorArgv(allocator, editor_owned, path) catch return TuiModel.Msg{ .editor_failed = {} };
+    defer freeEditorArgv(allocator, argv);
 
     // Spawn editor and wait.
     var child = std.process.spawn(defaultIo(), .{
-        .argv = &[_][]const u8{ editor, path },
+        .argv = argv,
         .stdin = .inherit,
         .stdout = .inherit,
         .stderr = .inherit,
