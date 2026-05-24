@@ -131,8 +131,9 @@ pub const App = struct {
         app.session_created_at = compat.time.nowMillis();
         app.working_dir = currentPathOwned(allocator) catch try allocator.dupe(u8, "");
         try app.state.status.setSessionId(allocator, app.session_id);
-        // Pre-populate sessions list.
-        try app.loadSessions();
+        // Pre-populate sessions list on a best-effort basis. Startup should not
+        // lose the interactive runtime just because saved-session discovery fails.
+        app.loadSessions() catch |err| try app.recordError(@errorName(err));
         return app;
     }
 
@@ -176,6 +177,7 @@ pub const App = struct {
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
         const runtime = if (self.runtime) |*r| r else return error.NoRuntimeConfigured;
+        if (runtime.backend == .remote) return error.SessionResumeUnsupportedForRemoteRuntime;
         const sessions = self.state.sessions.items;
         if (sessions.len == 0) return;
         const idx = self.state.session_index;
@@ -1005,4 +1007,22 @@ test "session picker navigation pages through hidden rows" {
     try std.testing.expectEqual(@as(usize, 4), app.state.session_index);
     try std.testing.expectEqual(@as(usize, 1), app.state.session_scroll);
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
+}
+
+fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !tui_runtime.TuiRuntime {
+    return tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote });
+}
+
+test "resume selected session rejects remote runtime before store replay" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+
+    try std.testing.expectError(error.NoStoreConfigured, app.resumeSelectedSession());
+
+    app.store = try session_store.Store.init(std.testing.allocator, ".");
+
+    try std.testing.expectError(error.SessionResumeUnsupportedForRemoteRuntime, app.resumeSelectedSession());
 }
