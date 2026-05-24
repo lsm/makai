@@ -24,6 +24,7 @@ pub const TuiSession = session.TuiSession;
 pub const TuiEvent = session.TuiEvent;
 pub const TuiEventStream = session.TuiEventStream;
 pub const TuiEndReason = session.TuiEndReason;
+pub const QueuedCounts = session.QueuedCounts;
 pub const ToolApprovalCallback = session.ToolApprovalCallback;
 pub const ToolApprovalDecision = session.ToolApprovalDecision;
 pub const ToolApprovalRequest = session.ToolApprovalRequest;
@@ -415,6 +416,9 @@ pub const TuiRuntime = struct {
                 .resume_session = sessionResume,
                 .cancel = sessionCancel,
                 .submit_turn = sessionSubmitTurn,
+                .steer = sessionSteer,
+                .queue_follow_up = sessionQueueFollowUp,
+                .queued_counts = sessionQueuedCounts,
                 .switch_model = sessionSwitchModel,
                 .current_model = sessionCurrentModel,
                 .decide_tool_approval = sessionDecideToolApproval,
@@ -449,6 +453,14 @@ pub const TuiRuntime = struct {
             }
         }
         return error.ModelNotFound;
+    }
+
+    fn makeUserMessage(self: *TuiRuntime, text: []const u8) !ai_types.Message {
+        const owned_text = try self.allocator.dupe(u8, text);
+        return .{ .user = .{
+            .content = .{ .text = owned_text },
+            .timestamp = compat.time.nowMillis(),
+        } };
     }
 
     pub fn submitTurn(self: *TuiRuntime, text: []const u8) !void {
@@ -499,22 +511,50 @@ pub const TuiRuntime = struct {
                 self.completed = false;
                 self.last_turn_stop_reason = null;
                 if (self.run_async) {
-                    const owned_text = try self.allocator.dupe(u8, text);
-                    errdefer self.allocator.free(owned_text);
-                    const msg = ai_types.Message{ .user = .{
-                        .content = .{ .text = owned_text },
-                        .timestamp = compat.time.nowMillis(),
-                    } };
+                    var msg = try self.makeUserMessage(text);
+                    defer msg.deinit(self.allocator);
                     try local.promptAsync(msg);
-                    self.allocator.free(owned_text);
                 } else {
-                    const owned_text = try self.allocator.dupe(u8, text);
-                    const msg = ai_types.Message{ .user = .{
-                        .content = .{ .text = owned_text },
-                        .timestamp = compat.time.nowMillis(),
-                    } };
+                    const msg = try self.makeUserMessage(text);
                     try local.prompt(msg);
                 }
+            },
+        }
+    }
+
+    pub fn steer(self: *TuiRuntime, text: []const u8) !void {
+        switch (self.backend) {
+            .remote => return error.RemoteSteeringUnsupported,
+            .local => {
+                if (!self.started) return error.RuntimeNotStarted;
+                const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                var msg = try self.makeUserMessage(text);
+                errdefer msg.deinit(self.allocator);
+                try local.steer(msg);
+            },
+        }
+    }
+
+    pub fn queueFollowUp(self: *TuiRuntime, text: []const u8) !void {
+        switch (self.backend) {
+            .remote => return error.RemoteQueueUnsupported,
+            .local => {
+                if (!self.started) return error.RuntimeNotStarted;
+                const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                var msg = try self.makeUserMessage(text);
+                errdefer msg.deinit(self.allocator);
+                try local.followUp(msg);
+            },
+        }
+    }
+
+    pub fn queuedCounts(self: *TuiRuntime) QueuedCounts {
+        switch (self.backend) {
+            .remote => return .{},
+            .local => {
+                const local = &(self.local_agent orelse return .{});
+                const counts = local.queuedCounts();
+                return .{ .steering = counts.steering, .follow_up = counts.follow_up };
             },
         }
     }
@@ -1711,6 +1751,21 @@ fn sessionSubmitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
     try self.submitTurn(text);
 }
 
+fn sessionSteer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    try self.steer(text);
+}
+
+fn sessionQueueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    try self.queueFollowUp(text);
+}
+
+fn sessionQueuedCounts(ctx: ?*anyopaque) QueuedCounts {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.queuedCounts();
+}
+
 fn sessionSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     try self.switchModel(model_id);
@@ -1763,6 +1818,7 @@ const MockProtocolCtx = struct {
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
+    wait_after_tool_first: bool = false,
     tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
 };
@@ -1893,6 +1949,12 @@ fn mockStream(
     }
 
     if (mock.tool_first and mock.call_count == 1) {
+        if (mock.wait_after_tool_first) {
+            var waits: usize = 0;
+            while (waits < 50) : (waits += 1) {
+                std.testing.io.sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+            }
+        }
         const content = [_]ai_types.AssistantContent{.{ .tool_call = .{ .id = "call-1", .name = mock.tool_name, .arguments_json = "{}" } }};
         try stream.push(.{ .start = .{ .partial = emptyAssistantMessage(model, .tool_use) } });
         try pushDoneAndComplete(stream, allocator, model, &content, .tool_use);
@@ -2184,6 +2246,48 @@ test "tool approval approve and reject paths emit tool events" {
     }
     try std.testing.expectEqual(@as(usize, 1), reject_ctx.calls);
     try std.testing.expect(reject_saw_error_tool);
+}
+
+test "runtime queues steering and follow-up messages" {
+    var mock = MockProtocolCtx{ .tool_first = true, .wait_after_tool_first = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.steer("steer now");
+    try tui_session.queueFollowUp("later");
+    const queued = tui_session.queuedCounts();
+    try std.testing.expectEqual(@as(usize, 1), queued.steering);
+    try std.testing.expectEqual(@as(usize, 1), queued.follow_up);
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var user_messages: usize = 0;
+    while (tui_session.waitEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user) user_messages += 1;
+            },
+            .agent_end => break,
+            else => {},
+        }
+    }
+    try std.testing.expect(user_messages >= 2);
+    try std.testing.expectEqual(@as(usize, 3), mock.call_count);
+    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
+}
+
+test "remote queue operations report unsupported" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try std.testing.expectError(error.RemoteSteeringUnsupported, tui_session.steer("hi"));
+    try std.testing.expectError(error.RemoteQueueUnsupported, tui_session.queueFollowUp("hi"));
 }
 
 test "event stream resets between turns" {

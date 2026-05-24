@@ -175,6 +175,15 @@ pub const TelemetryState = struct {
     }
 };
 
+pub const QueueState = struct {
+    steering_count: usize = 0,
+    follow_up_count: usize = 0,
+
+    pub fn total(self: QueueState) usize {
+        return self.steering_count + self.follow_up_count;
+    }
+};
+
 pub const StatusState = struct {
     model: []u8 = &.{},
     provider: []u8 = &.{},
@@ -293,6 +302,7 @@ pub const AppState = struct {
     composer: ComposerState = .{},
     approval: ApprovalState = .{},
     status: StatusState = .{},
+    queue: QueueState = .{},
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     show_thinking: bool = true,
@@ -424,6 +434,11 @@ pub const AppState = struct {
 
     pub fn toggleThinking(self: *AppState) void {
         self.show_thinking = !self.show_thinking;
+    }
+
+    pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
+        self.queue.steering_count = counts.steering;
+        self.queue.follow_up_count = counts.follow_up;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {

@@ -288,6 +288,11 @@ pub const App = struct {
             self.saveEvent(ev);
             try self.state.applyEvent(ev);
         }
+        self.refreshQueuedCounts();
+    }
+
+    fn refreshQueuedCounts(self: *App) void {
+        if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
     }
 
     fn discardPendingEvents(self: *App) void {
@@ -311,6 +316,33 @@ pub const App = struct {
                 return;
             };
         }
+        self.refreshQueuedCounts();
+    }
+
+    pub fn steer(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        if (self.session) |*session| {
+            try session.steer(trimmed);
+            try self.state.appendUserMessage(trimmed);
+            self.refreshQueuedCounts();
+            return;
+        }
+        try self.state.appendUserMessage(trimmed);
+    }
+
+    pub fn queueFollowUp(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        if (self.session) |*session| {
+            try session.queueFollowUp(trimmed);
+            try self.state.appendUserMessage(trimmed);
+            self.refreshQueuedCounts();
+            return;
+        }
+        try self.state.appendUserMessage(trimmed);
     }
 
     fn submitCommand(self: *App, text: []const u8) !void {
@@ -369,6 +401,28 @@ pub const App = struct {
     pub fn recordError(self: *App, message: []const u8) !void {
         try self.state.status.setError(self.allocator, message);
         try self.state.appendTranscript(.@"error", message);
+    }
+
+    pub fn appendWelcome(self: *App) !void {
+        if (self.state.sessions.items.len == 0) {
+            const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
+            const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
+            const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
+            const welcome = try std.fmt.allocPrint(self.allocator,
+                \\Makai TUI
+                \\model: {s}/{s}
+                \\cwd: {s}
+                \\tips: Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands
+            , .{ provider, model, cwd });
+            defer self.allocator.free(welcome);
+            try self.state.appendTranscript(.system, welcome);
+            return;
+        }
+        const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
+        const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
+        const welcome = try std.fmt.allocPrint(self.allocator, "Makai TUI • {s}/{s} • /sessions resumes saved work", .{ provider, model });
+        defer self.allocator.free(welcome);
+        try self.state.appendTranscript(.system, welcome);
     }
 
     pub fn decideApproval(self: *App, approved: bool, always: bool) !void {
@@ -612,8 +666,7 @@ const TuiModel = struct {
                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
             };
-            app.state.appendTranscript(.system, "Makai TUI") catch {};
-            app.state.appendTranscript(.system, "Enter submits composer, Ctrl+C or /quit exits") catch {};
+            app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
         }
         return .{ .batch = &.{
             .{ .every = 50 * std.time.ns_per_ms },
@@ -702,11 +755,19 @@ const TuiModel = struct {
                         }
                         const text = app.state.composer.text();
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
-                        app.submit(text) catch |err| {
-                            if (err == error.QuitRequested) return .quit;
-                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
-                        };
+                        if (app.state.status.streaming) {
+                            if (key.modifiers.alt) {
+                                app.queueFollowUp(text) catch |err| app.recordError(@errorName(err)) catch {};
+                            } else {
+                                app.steer(text) catch |err| app.recordError(@errorName(err)) catch {};
+                            }
+                        } else {
+                            app.submit(text) catch |err| {
+                                if (err == error.QuitRequested) return .quit;
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        }
                         app.state.composer.clear();
                         app.drainEvents() catch |err| {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -981,6 +1042,24 @@ test "App submit routes unknown command to error transcript" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.@"error", app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "unknown command") != null);
+}
+
+test "App welcome uses session count" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
+
+    try app.appendWelcome();
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
+
+    app.state.clearTranscript();
+    try app.state.addSession("s1", "saved");
+    try app.appendWelcome();
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
 }
 
 test "App submit quit command requests quit" {

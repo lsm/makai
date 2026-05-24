@@ -29,6 +29,10 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writeOwnedSegment(writer, allocator, "cost", try estimatedCost(allocator, state));
     try writer.writeAll(" • ");
     try writeStyledValue(writer, allocator, "state", stream, if (state.status.streaming) tui_theme.successText() else tui_theme.muted());
+    if (state.queue.total() > 0) {
+        try writer.writeAll(" • ");
+        try writeOwnedSegment(writer, allocator, "queue", try std.fmt.allocPrint(allocator, "{d}", .{state.queue.total()}));
+    }
     try writer.writeAll(" • ");
     try writeSegment(writer, allocator, "perm", perm);
     try writer.writeAll(" • ");
@@ -112,6 +116,19 @@ test "status bar renders model and clips width" {
 
     try std.testing.expect(tui_text.visibleWidth(text) <= 24);
     try std.testing.expect(std.mem.indexOf(u8, text, "anthropic") != null);
+}
+
+test "status bar renders queue count when queued" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.queue.steering_count = 1;
+    state.queue.follow_up_count = 2;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "queue") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "3") != null);
 }
 
 test "status bar renders context gauge cost and permission" {

@@ -37,6 +37,15 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
 
 fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]const u8 {
     const text = state.composer.text();
+    if (state.status.streaming) {
+        const queued = state.queue.total();
+        const hint = if (queued > 0)
+            try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
+        else
+            try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
+        defer allocator.free(hint);
+        return tui_theme.muted().render(allocator, hint);
+    }
     if (std.mem.startsWith(u8, text, "!"))
         return tui_theme.muted().render(allocator, "shell mode • Enter runs command through agent");
     if (std.mem.startsWith(u8, text, "@"))
@@ -97,6 +106,18 @@ test "composer renders multiline draft content" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+}
+
+test "composer renders queued hint while streaming" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    state.queue.follow_up_count = 2;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80 });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
 }
 
 test "composer renders shell and file hints" {
