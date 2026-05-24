@@ -183,10 +183,11 @@ pub const App = struct {
         const id = sessions[idx].id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
+        const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
         self.discardPendingEvents();
         self.state.resetReplayState();
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
-        self.session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
+        self.session_id = new_session_id;
         self.session_created_at = loaded.metadata.created_at;
         try self.state.status.setSessionId(self.allocator, self.session_id);
         if (runtime.currentModel()) |model| {
