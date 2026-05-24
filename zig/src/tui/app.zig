@@ -298,6 +298,11 @@ pub const App = struct {
         if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
     }
 
+    fn supportsStreamingShortcuts(self: *const App) bool {
+        const runtime = self.runtime orelse return self.session != null;
+        return runtime.backend == .local;
+    }
+
     fn discardPendingEvents(self: *App) void {
         var session = &(self.session orelse return);
         while (session.popEvent()) |event| {
@@ -328,7 +333,6 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.steer(trimmed);
-            try self.state.appendUserMessage(trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -341,7 +345,6 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
-            try self.state.appendUserMessage(trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -763,7 +766,7 @@ const TuiModel = struct {
                         if (app.state.mode == .approval) return .none;
                         const text = app.state.composer.text();
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
-                        if (app.state.status.streaming) {
+                        if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
@@ -1210,16 +1213,14 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
 
     try app.steer(" steer me ");
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
-    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
-    try std.testing.expectEqualStrings("steer me", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
 
     mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
     try app.queueFollowUp(" follow later ");
     try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
-    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
-    try std.testing.expectEqualStrings("follow later", app.state.transcript.items[1].text.items);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
 }
@@ -1250,6 +1251,26 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expect(!model.app.?.state.status.streaming);
+}
+
+test "TuiModel remote streaming Enter falls back to submit and preserves composer" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    runtime = undefined;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
 }
 
 test "TuiModel stops Enter routing when drained event enters approval mode" {
