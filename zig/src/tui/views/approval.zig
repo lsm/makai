@@ -16,11 +16,11 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
 
     try parts.append(allocator, try tui_theme.errorText().render(allocator, "Approval required"));
     try parts.append(allocator, try std.fmt.allocPrint(allocator, "Tool: {s}", .{state.approval.tool_name}));
-    const args = try tui_text.truncateToWidth(allocator, state.approval.args_json, options.width -| 8);
+    const args = try tui_text.truncateToWidth(allocator, state.approval.args_json, options.width -| 10);
     defer allocator.free(args);
     try parts.append(allocator, try std.fmt.allocPrint(allocator, "Args: {s}", .{args}));
     if (state.approval.scope_hint.len > 0) {
-        const scope = try tui_text.truncateToWidth(allocator, state.approval.scope_hint, options.width -| 16);
+        const scope = try tui_text.truncateToWidth(allocator, state.approval.scope_hint, options.width -| 18);
         defer allocator.free(scope);
         try parts.append(allocator, try std.fmt.allocPrint(allocator, "Always scope: {s}", .{scope}));
     }
@@ -39,7 +39,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try parts.append(allocator, try tui_theme.muted().render(allocator, "(y) allow once  (a) allow always  (n) deny  Esc abort"));
     const body = try tui_render.joinVertical(allocator, parts.items);
     defer allocator.free(body);
-    return tui_theme.panel().borderForeground(tui_theme.palette.warning).width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+    return tui_theme.panel().borderForeground(tui_theme.palette.warning).width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 test "approval renders pending request" {

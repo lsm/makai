@@ -241,6 +241,29 @@ fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !vo
         }
         return;
     }
+    // SCS: ESC ( ) * + — followed by one more byte
+    if (second >= '(' and second <= '+') {
+        if (index.* < text.len) {
+            try writer.writeByte(text[index.*]);
+            index.* += 1;
+        }
+        return;
+    }
+    // DCS: ESC P — followed by string until ST (ESC \) or BEL
+    if (second == 'P') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            try writer.writeByte(c);
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                try writer.writeByte(text[index.*]);
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
     _ = start;
 }
 

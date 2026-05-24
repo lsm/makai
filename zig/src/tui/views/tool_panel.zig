@@ -24,7 +24,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
             try writer.writeAll(none);
             const body = try out.toOwnedSlice();
             defer allocator.free(body);
-            return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+            return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
         }
         var rows: usize = 1;
         for (state.registered_tools.items) |tool| {
@@ -33,7 +33,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
             try writer.print("  {s}", .{tool.name});
             if (tool.short_description.len > 0) {
                 try writer.writeAll(" ");
-                const desc = try tui_text.truncateToWidth(allocator, tool.short_description, options.width -| tool.name.len -| 6);
+                const desc = try tui_text.truncateToWidth(allocator, tool.short_description, options.width -| tool.name.len -| 7);
                 defer allocator.free(desc);
                 const styled_desc = try tui_theme.muted().render(allocator, desc);
                 defer allocator.free(styled_desc);
@@ -43,7 +43,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         }
         const body = try out.toOwnedSlice();
         defer allocator.free(body);
-        return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+        return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
     }
 
     var rows: usize = 1;
@@ -54,22 +54,33 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         const status = try tui_theme.toolStatus(tool.status).render(allocator, statusText(tool.status));
         defer allocator.free(status);
         try writer.print("[{s}] {s}", .{ status, tool.name });
+        var meta_out: std.Io.Writer.Allocating = .init(allocator);
+        defer meta_out.deinit();
+        const meta_writer = &meta_out.writer;
         if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
-            try writer.print(" ({d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
-            if (tool.estimated_returned_tokens > 0) try writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
-            try writer.writeByte(')');
+            try meta_writer.print(" ({d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
+            if (tool.estimated_returned_tokens > 0) try meta_writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
+            try meta_writer.writeByte(')');
         }
-        if (tool.truncated) try writer.writeAll(" truncated · show full");
-        if (tool.artifact_refs.len > 0) try writer.print(" · artifact:{s}", .{tool.artifact_refs});
-        if (tool.expanded) try writer.writeAll(" · expanded");
+        if (tool.truncated) try meta_writer.writeAll(" truncated · show full");
+        if (tool.artifact_refs.len > 0) try meta_writer.print(" · artifact:{s}", .{tool.artifact_refs});
+        if (tool.expanded) try meta_writer.writeAll(" · expanded");
+        const prefix_visible = 5 + tui_text.visibleWidth(status) + tool.name.len;
+        const remaining = (options.width -| 4) -| prefix_visible;
+        const meta_str = meta_out.written();
+        if (meta_str.len > 0 and remaining > 0) {
+            const meta_truncated = try tui_text.truncateToWidth(allocator, meta_str, remaining);
+            defer allocator.free(meta_truncated);
+            try writer.writeAll(meta_truncated);
+        }
         rows += 1;
         if (tool.expanded and rows < options.height) {
-            rows = try renderExpandedOutput(allocator, writer, tool, options.width, options.height, rows);
+            rows = try renderExpandedOutput(allocator, writer, tool, options.width -| 4, options.height, rows);
         }
     }
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
-    return tui_theme.panel().width(@intCast(@min(options.width, std.math.maxInt(u16)))).render(allocator, body);
+    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
 }
 
 fn statusText(status: tui_state.ToolStatus) []const u8 {
@@ -86,7 +97,7 @@ fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, to
     if (source.len == 0) return rows;
     const available_lines = height - rows;
     if (available_lines == 0) return rows;
-    const content_width = width -| 8;
+    const content_width = width -| 6;
     if (content_width == 0) return rows;
 
     var next_rows = rows;
@@ -149,6 +160,37 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
             const c = text[index.*];
             index.* += 1;
             if (c >= 0x40 and c <= 0x7e) return;
+        }
+        return;
+    }
+    // OSC: ESC ] — followed by string until BEL or ST (ESC \)
+    if (second == ']') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
+    // SCS: ESC ( ) * + — followed by one more byte
+    if (second >= '(' and second <= '+') {
+        if (index.* < text.len) index.* += 1;
+        return;
+    }
+    // DCS: ESC P — followed by string until ST (ESC \) or BEL
+    if (second == 'P') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
         }
     }
 }
@@ -260,7 +302,8 @@ test "tool panel keeps diff styling across wrapped segments and errors win" {
     const text = try render(std.testing.allocator, &state, .{ .width = 20, .height = 8 });
     defer std.testing.allocator.free(text);
 
-    try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|abcdefgh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "ijklmnopqr") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "+ cmd failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+ 2|abcdef") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ghijklmnop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "+ cmd fail") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ed") != null);
 }
