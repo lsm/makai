@@ -983,6 +983,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
             .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
             .{ .name = "permission", .module = permission_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

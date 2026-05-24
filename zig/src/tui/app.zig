@@ -19,6 +19,7 @@ const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
@@ -759,6 +760,7 @@ const TuiModel = struct {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
+                        if (app.state.mode == .approval) return .none;
                         const text = app.state.composer.text();
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         if (app.state.status.streaming) {
@@ -1248,6 +1250,29 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expect(!model.app.?.state.status.streaming);
+}
+
+test "TuiModel stops Enter routing when drained event enters approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try mock.eventStream().push(.{ .tool_approval_requested = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-approval")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "edit_file")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"path\":\"README.md\"}")),
+    } });
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "should wait");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
 }
 
 test "session picker navigation pages through hidden rows" {
