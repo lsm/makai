@@ -163,6 +163,19 @@ fn skipAnsiSequence(text: []const u8, index: *usize) void {
         }
         return;
     }
+    // OSC: ESC ] — followed by string until BEL or ST (ESC \)
+    if (second == ']') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
     // SCS: ESC ( ) * + — followed by one more byte
     if (second >= '(' and second <= '+') {
         if (index.* < text.len) index.* += 1;
