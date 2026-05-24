@@ -249,7 +249,8 @@ pub const App = struct {
         var session = &(self.session orelse return);
         while (session.popEvent()) |event| {
             var ev = event;
-            ev.deinit(self.allocator);
+            defer ev.deinit(self.allocator);
+            self.saveEvent(ev);
         }
     }
 
