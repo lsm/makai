@@ -20,6 +20,8 @@ const session_picker_view = @import("tui_view_session_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 
+const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
+
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -100,6 +102,7 @@ pub const App = struct {
     session_id: []u8 = &.{},
     session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
+    last_view_height: usize = 8,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
         var runtime_options = options;
@@ -204,7 +207,10 @@ pub const App = struct {
         const store = self.store orelse return;
         // Only save events that are needed for session replay.
         switch (event) {
-            .message_start, .message_end, .tool_execution_start, .tool_execution_end, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .message_start, .message_end, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
+            .tool_execution_end => |payload| {
+                if (payload.result_json.slice().len + payload.tool_call_id.slice().len + payload.tool_name.slice().len + payload.artifact_refs.slice().len > max_session_event_jsonl_bytes / 2) return;
+            },
             else => return,
         }
         const meta = self.currentSessionMetadata();
@@ -543,7 +549,7 @@ const TuiModel = struct {
         mouse: zz.MouseEvent,
         tick: struct { timestamp: u64, delta: u64 },
         quit: void,
-        /// Content read back from the external editor (owned by allocator stored in editor_tmp_allocator).
+        /// Content read back from the external editor (owned by persistent allocator).
         editor_done: []u8,
         /// External editor failed after leaving alt screen; restore terminal state.
         editor_failed: void,
@@ -581,7 +587,7 @@ const TuiModel = struct {
         switch (msg) {
             .editor_done => |content| {
                 // Content was read back from the external editor. Load into composer.
-                defer if (editor_tmp_allocator) |alloc| alloc.free(content);
+                defer ctx.persistent_allocator.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
                 // Re-enter alt screen and hide cursor after editor exit.
                 return .{ .sequence = &.{
@@ -633,7 +639,7 @@ const TuiModel = struct {
                             if (app.state.session_index > 0) app.state.session_index -= 1;
                         },
                         .down => {
-                            const n = app.state.sessions.items.len;
+                            const n = visibleSessionCount(app);
                             if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
                         },
                         .char => |c| switch (c) {
@@ -641,7 +647,7 @@ const TuiModel = struct {
                                 if (app.state.session_index > 0) app.state.session_index -= 1;
                             },
                             'j' => {
-                                const n = app.state.sessions.items.len;
+                                const n = visibleSessionCount(app);
                                 if (n > 0 and app.state.session_index < n - 1) app.state.session_index += 1;
                             },
                             else => {},
@@ -706,6 +712,7 @@ const TuiModel = struct {
         const app = &(self.app orelse return "Makai TUI failed to initialize");
         const width: usize = @max(ctx.width, 20);
         const height: usize = @max(ctx.height, 8);
+        app.last_view_height = height;
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
@@ -714,7 +721,7 @@ const TuiModel = struct {
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
-            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = height / 2 }) catch "",
+            .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .height = sessionPickerHeight(app) }) catch "",
             .normal => "",
         };
         const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + countLines(extra) + 5;
@@ -745,6 +752,14 @@ const TuiModel = struct {
             if (c == '\n') count += 1;
         }
         return count;
+    }
+
+    fn visibleSessionCount(app: *const App) usize {
+        return @min(app.state.sessions.items.len, sessionPickerHeight(app));
+    }
+
+    fn sessionPickerHeight(app: *const App) usize {
+        return @max(app.last_view_height, 8) / 2;
     }
 };
 
@@ -914,4 +929,17 @@ test "App submit quit command requests quit" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
+}
+
+test "session picker navigation is capped to visible rows" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.last_view_height = 8;
+    try app.state.addSession("s1", "One");
+    try app.state.addSession("s2", "Two");
+    try app.state.addSession("s3", "Three");
+    try app.state.addSession("s4", "Four");
+    try app.state.addSession("s5", "Five");
+
+    try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
 }
