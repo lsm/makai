@@ -419,13 +419,12 @@ fn createExternalEditorTempFile(allocator: std.mem.Allocator, content: []const u
     const tmp_dir = compat.getEnvVarOwned(allocator, "TMPDIR") catch try allocator.dupe(u8, "/tmp");
     defer allocator.free(tmp_dir);
     const dir_path = try std.fs.path.join(allocator, &.{ tmp_dir, editor_tmp_dir_prefix ++ random_hex });
-    errdefer allocator.free(dir_path);
+    defer allocator.free(dir_path);
     try std.Io.Dir.createDirAbsolute(defaultIo(), dir_path, @enumFromInt(0o700));
     errdefer std.Io.Dir.deleteDirAbsolute(defaultIo(), dir_path) catch {};
 
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, editor_tmp_file_name });
     errdefer allocator.free(file_path);
-    allocator.free(dir_path);
 
     var file = try std.Io.Dir.createFileAbsolute(defaultIo(), file_path, .{ .exclusive = true, .truncate = false, .permissions = @enumFromInt(0o600) });
     errdefer std.Io.Dir.deleteFileAbsolute(defaultIo(), file_path) catch {};
