@@ -6,13 +6,14 @@ const tui_render = @import("tui_render");
 
 pub const Options = struct {
     width: usize = 80,
+    streaming_shortcuts_supported: bool = true,
 };
 
 pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
     defer allocator.free(input);
-    const hint = try renderHint(allocator, state);
+    const hint = try renderHint(allocator, state, options.streaming_shortcuts_supported);
     defer allocator.free(hint);
     const body = try tui_render.joinVertical(allocator, &.{ input, hint });
     defer allocator.free(body);
@@ -35,8 +36,17 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     return prefixFirstLine(allocator, prompt, content);
 }
 
-fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]const u8 {
+fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool) ![]const u8 {
     const text = state.composer.text();
+    if (state.status.streaming and streaming_shortcuts_supported) {
+        const queued = state.queue.total();
+        const hint = if (queued > 0)
+            try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
+        else
+            try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
+        defer allocator.free(hint);
+        return tui_theme.muted().render(allocator, hint);
+    }
     if (std.mem.startsWith(u8, text, "!"))
         return tui_theme.muted().render(allocator, "shell mode • Enter runs command through agent");
     if (std.mem.startsWith(u8, text, "@"))
@@ -97,6 +107,31 @@ test "composer renders multiline draft content" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+}
+
+test "composer renders queued hint while streaming shortcuts are supported" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    state.queue.follow_up = 2;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80 });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
+}
+
+test "composer hides streaming shortcut hint when unsupported" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    state.queue.follow_up = 2;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .streaming_shortcuts_supported = false });
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter submit") != null);
 }
 
 test "composer renders shell and file hints" {

@@ -19,6 +19,7 @@ const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
+const OwnedSlice = @import("owned_slice").OwnedSlice;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
@@ -202,6 +203,8 @@ pub const App = struct {
         for (loaded.events.items) |*event| {
             try self.state.applyEvent(event.*);
         }
+        if (self.session) |*session| session.clearQueuedMessages();
+        self.refreshQueuedCounts();
         self.state.status.streaming = false;
         self.state.mode = .normal;
     }
@@ -288,6 +291,16 @@ pub const App = struct {
             self.saveEvent(ev);
             try self.state.applyEvent(ev);
         }
+        self.refreshQueuedCounts();
+    }
+
+    fn refreshQueuedCounts(self: *App) void {
+        if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
+    }
+
+    fn supportsStreamingShortcuts(self: *const App) bool {
+        const runtime = self.runtime orelse return self.session != null;
+        return runtime.backend == .local;
     }
 
     fn discardPendingEvents(self: *App) void {
@@ -311,6 +324,31 @@ pub const App = struct {
                 return;
             };
         }
+        self.refreshQueuedCounts();
+    }
+
+    pub fn steer(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        if (self.session) |*session| {
+            try session.steer(trimmed);
+            self.refreshQueuedCounts();
+            return;
+        }
+        try self.state.appendUserMessage(trimmed);
+    }
+
+    pub fn queueFollowUp(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        if (self.session) |*session| {
+            try session.queueFollowUp(trimmed);
+            self.refreshQueuedCounts();
+            return;
+        }
+        try self.state.appendUserMessage(trimmed);
     }
 
     fn submitCommand(self: *App, text: []const u8) !void {
@@ -369,6 +407,32 @@ pub const App = struct {
     pub fn recordError(self: *App, message: []const u8) !void {
         try self.state.status.setError(self.allocator, message);
         try self.state.appendTranscript(.@"error", message);
+    }
+
+    pub fn appendWelcome(self: *App) !void {
+        if (self.state.sessions.items.len == 0) {
+            const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
+            const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
+            const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
+            const tips = if (self.supportsStreamingShortcuts())
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands"
+            else
+                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands";
+            const welcome = try std.fmt.allocPrint(self.allocator,
+                \\Makai TUI
+                \\model: {s}/{s}
+                \\cwd: {s}
+                \\tips: {s}
+            , .{ provider, model, cwd, tips });
+            defer self.allocator.free(welcome);
+            try self.state.appendTranscript(.system, welcome);
+            return;
+        }
+        const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
+        const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
+        const welcome = try std.fmt.allocPrint(self.allocator, "Makai TUI • {s}/{s} • /sessions resumes saved work", .{ provider, model });
+        defer self.allocator.free(welcome);
+        try self.state.appendTranscript(.system, welcome);
     }
 
     pub fn decideApproval(self: *App, approved: bool, always: bool) !void {
@@ -612,8 +676,7 @@ const TuiModel = struct {
                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
             };
-            app.state.appendTranscript(.system, "Makai TUI") catch {};
-            app.state.appendTranscript(.system, "Enter submits composer, Ctrl+C or /quit exits") catch {};
+            app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
         }
         return .{ .batch = &.{
             .{ .every = 50 * std.time.ns_per_ms },
@@ -700,13 +763,32 @@ const TuiModel = struct {
                             app.state.composer.buffer.append(app.allocator, '\n') catch |err| app.recordError(@errorName(err)) catch {};
                             return .none;
                         }
-                        const text = app.state.composer.text();
-                        app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
-                        app.submit(text) catch |err| {
-                            if (err == error.QuitRequested) return .quit;
+                        app.drainEvents() catch |err| {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
+                        if (app.state.mode == .approval) return .none;
+                        const text = app.state.composer.text();
+                        app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
+                        if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
+                            if (key.modifiers.alt) {
+                                app.queueFollowUp(text) catch |err| {
+                                    if (err == error.QuitRequested) return .quit;
+                                    app.recordError(@errorName(err)) catch {};
+                                };
+                            } else {
+                                app.steer(text) catch |err| {
+                                    if (err == error.QuitRequested) return .quit;
+                                    app.recordError(@errorName(err)) catch {};
+                                };
+                            }
+                        } else {
+                            app.submit(text) catch |err| {
+                                if (err == error.QuitRequested) return .quit;
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        }
                         app.state.composer.clear();
                         app.drainEvents() catch |err| {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -748,7 +830,10 @@ const TuiModel = struct {
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
-        const composer = composer_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
+        const composer = composer_view.render(ctx.allocator, &app.state, .{
+            .width = width,
+            .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
+        }) catch "";
         const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
         const tools = tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_height }) catch "";
         const telemetry = telemetry_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
@@ -983,10 +1068,258 @@ test "App submit routes unknown command to error transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "unknown command") != null);
 }
 
+test "App welcome uses session count" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
+
+    try app.appendWelcome();
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
+
+    app.state.clearTranscript();
+    try app.state.addSession("s1", "saved");
+    try app.appendWelcome();
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
+}
+
+test "App welcome hides streaming shortcut tips for remote runtime" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+    try app.state.status.setModel(std.testing.allocator, "model-a", "provider-a");
+    app.working_dir = try std.testing.allocator.dupe(u8, "/tmp/work");
+
+    try app.appendWelcome();
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter while streaming") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter submit") != null);
+}
+
+const MockAppSession = struct {
+    steer_count: usize = 0,
+    queued_follow_up_count: usize = 0,
+    submit_count: usize = 0,
+    clear_count: usize = 0,
+    queued_counts: tui_runtime.QueuedCounts = .{},
+    events: tui_runtime.TuiEventStream = undefined,
+    events_initialized: bool = false,
+
+    fn session(self: *MockAppSession) tui_runtime.TuiSession {
+        return .{
+            .ctx = self,
+            .ops = .{
+                .start = start,
+                .resume_session = resumeSession,
+                .cancel = cancel,
+                .submit_turn = submitTurn,
+                .steer = steer,
+                .queue_follow_up = queueFollowUp,
+                .clear_queued_messages = clearQueuedMessages,
+                .queued_counts = queuedCounts,
+                .switch_model = switchModel,
+                .current_model = currentModel,
+                .decide_tool_approval = decideToolApproval,
+                .stream_events = streamEvents,
+            },
+        };
+    }
+
+    fn ptr(ctx: ?*anyopaque) *MockAppSession {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn start(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn resumeSession(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn cancel(ctx: ?*anyopaque) void {
+        _ = ctx;
+    }
+
+    fn submitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = ptr(ctx);
+        self.submit_count += 1;
+        try std.testing.expectEqualStrings("new turn", text);
+    }
+
+    fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = ptr(ctx);
+        self.steer_count += 1;
+        try std.testing.expectEqualStrings("steer me", text);
+    }
+
+    fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        const self = ptr(ctx);
+        self.queued_follow_up_count += 1;
+        try std.testing.expectEqualStrings("follow later", text);
+    }
+
+    fn clearQueuedMessages(ctx: ?*anyopaque) void {
+        const self = ptr(ctx);
+        self.clear_count += 1;
+        self.queued_counts = .{};
+    }
+
+    fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
+        return ptr(ctx).queued_counts;
+    }
+
+    fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
+        _ = ctx;
+        _ = model_id;
+    }
+
+    fn currentModel(ctx: ?*anyopaque) ?ai_types.Model {
+        _ = ctx;
+        return null;
+    }
+
+    fn decideToolApproval(ctx: ?*anyopaque, tool_call_id: []const u8, decision: tui_runtime.ToolApprovalDecision) anyerror!void {
+        _ = ctx;
+        _ = tool_call_id;
+        _ = decision;
+    }
+
+    fn eventStream(self: *MockAppSession) *tui_runtime.TuiEventStream {
+        if (!self.events_initialized) {
+            self.events = tui_runtime.TuiEventStream.init(std.testing.allocator);
+            self.events_initialized = true;
+        }
+        return &self.events;
+    }
+
+    fn streamEvents(ctx: ?*anyopaque) *tui_runtime.TuiEventStream {
+        return ptr(ctx).eventStream();
+    }
+
+    fn deinit(self: *MockAppSession) void {
+        if (self.events_initialized) self.events.deinit();
+    }
+};
+
 test "App submit quit command requests quit" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
+}
+
+test "App steer and queue follow-up handle fallback empty and session paths" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.steer("  steer fallback  ");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("steer fallback", app.state.transcript.items[0].text.items);
+
+    try app.queueFollowUp("\tfollow fallback\n");
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("follow fallback", app.state.transcript.items[1].text.items);
+
+    try app.steer("   ");
+    try app.queueFollowUp("\n\t");
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+
+    app.state.clearTranscript();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 1, .follow_up = 2 } };
+    app.session = mock.session();
+
+    try app.steer(" steer me ");
+    try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
+
+    mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
+    try app.queueFollowUp(" follow later ");
+    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
+}
+
+test "TuiModel exits quit command while streaming" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/quit");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
+}
+
+test "TuiModel drains events before routing Enter while streaming" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try mock.eventStream().push(.{ .turn_end = .{ .stop_reason = .stop } });
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expect(!model.app.?.state.status.streaming);
+}
+
+test "TuiModel remote streaming Enter falls back to submit and preserves composer" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    runtime = undefined;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "new turn");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+}
+
+test "TuiModel stops Enter routing when drained event enters approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try mock.eventStream().push(.{ .tool_approval_requested = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-approval")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "edit_file")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"path\":\"README.md\"}")),
+    } });
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "should wait");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
 }
 
 test "session picker navigation pages through hidden rows" {

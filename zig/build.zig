@@ -847,6 +847,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "agent", .module = agent_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
@@ -982,6 +983,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
             .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
             .{ .name = "permission", .module = permission_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 

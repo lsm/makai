@@ -1,4 +1,5 @@
 const std = @import("std");
+const agent = @import("agent");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -165,11 +166,17 @@ pub const TuiSessionResult = struct {
 
 pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 
+pub const QueuedCounts = agent.Agent.QueuedCounts;
+
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     resume_session: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     cancel: *const fn (ctx: ?*anyopaque) void = undefined,
     submit_turn: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
+    steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
+    queue_follow_up: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
+    clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
+    queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
     decide_tool_approval: *const fn (ctx: ?*anyopaque, tool_call_id: []const u8, decision: ToolApprovalDecision) anyerror!void = undefined,
@@ -194,6 +201,22 @@ pub const TuiSession = struct {
 
     pub fn submitTurn(self: *TuiSession, text: []const u8) !void {
         try self.ops.submit_turn(self.ctx, text);
+    }
+
+    pub fn steer(self: *TuiSession, text: []const u8) !void {
+        try self.ops.steer(self.ctx, text);
+    }
+
+    pub fn queueFollowUp(self: *TuiSession, text: []const u8) !void {
+        try self.ops.queue_follow_up(self.ctx, text);
+    }
+
+    pub fn clearQueuedMessages(self: *TuiSession) void {
+        self.ops.clear_queued_messages(self.ctx);
+    }
+
+    pub fn queuedCounts(self: *TuiSession) QueuedCounts {
+        return self.ops.queued_counts(self.ctx);
     }
 
     pub fn switchModel(self: *TuiSession, model_id: []const u8) !void {

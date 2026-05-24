@@ -246,9 +246,28 @@ pub const Agent = struct {
         return self._state.is_streaming;
     }
 
+    pub const QueuedCounts = struct {
+        steering: usize = 0,
+        follow_up: usize = 0,
+
+        pub fn total(self: QueuedCounts) usize {
+            return self.steering + self.follow_up;
+        }
+    };
+
     /// Check if there are queued messages.
     pub fn hasQueuedMessages(self: Agent) bool {
         return self._steering_queue.items.len > 0 or self._follow_up_queue.items.len > 0;
+    }
+
+    /// Return queued steering and follow-up counts.
+    pub fn queuedCounts(self: *Agent) QueuedCounts {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+        return .{
+            .steering = self._steering_queue.items.len,
+            .follow_up = self._follow_up_queue.items.len,
+        };
     }
 
     /// Validate continueFromContext without mutating queues.
