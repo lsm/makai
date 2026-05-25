@@ -969,6 +969,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "register_builtins", .module = register_builtins_mod },
             .{ .name = "agent", .module = agent_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
