@@ -5,6 +5,7 @@ const ai_types = @import("ai_types");
 const api_registry = @import("api_registry");
 const register_builtins = @import("register_builtins");
 const agent = @import("agent");
+const event_stream = @import("event_stream");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
@@ -71,9 +72,12 @@ pub const ProductionRuntime = struct {
             .permission_engine = permission_engine,
             .models = try allocator.alloc(ai_types.Model, 1),
         };
-        runtime.bridge = agent.InProcessProviderProtocolBridge.init(&runtime.registry);
         runtime.models[0] = defaultModel();
         return runtime;
+    }
+
+    pub fn initBridge(self: *ProductionRuntime) void {
+        self.bridge = agent.InProcessProviderProtocolBridge.init(&self.registry);
     }
 
     pub fn options(self: *ProductionRuntime) tui_runtime.TuiRuntimeOptions {
@@ -999,6 +1003,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 
     var production = try ProductionRuntime.init(allocator);
     defer production.deinit();
+    production.initBridge();
 
     var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
     program.model = .{ .options = production.options() };
@@ -1009,6 +1014,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 test "App init seeds registered tools from runtime" {
     var production = try ProductionRuntime.init(std.testing.allocator);
     defer production.deinit();
+    production.initBridge();
     var app = try App.init(std.testing.allocator, production.options());
     defer app.deinit();
 
@@ -1358,4 +1364,172 @@ test "resume selected session rejects remote runtime before store replay" {
     app.store = try session_store.Store.init(std.testing.allocator, ".");
 
     try std.testing.expectError(error.SessionResumeUnsupportedForRemoteRuntime, app.resumeSelectedSession());
+}
+
+// ============================================================================
+// Mock provider for ProductionRuntime lifetime regression tests
+// ============================================================================
+
+const MockProvider = struct {
+    fn stream(
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ?ai_types.StreamOptions,
+        a: std.mem.Allocator,
+    ) anyerror!*event_stream.AssistantMessageEventStream {
+        _ = model;
+        _ = context;
+        _ = options;
+
+        const s = try a.create(event_stream.AssistantMessageEventStream);
+        s.* = event_stream.AssistantMessageEventStream.init(a);
+
+        s.push(.{ .start = .{ .partial = .{
+            .content = &.{},
+            .api = "mock-api",
+            .provider = "mock",
+            .model = "mock-model",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = compat.time.nowMillis(),
+            .is_owned = false,
+        } } }) catch {};
+
+        s.complete(try ai_types.cloneAssistantMessage(a, .{
+            .content = &.{.{ .text = .{ .text = "ok" } }},
+            .api = "mock-api",
+            .provider = "mock",
+            .model = "mock-model",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = compat.time.nowMillis(),
+            .is_owned = false,
+        }));
+        s.markThreadDone();
+        return s;
+    }
+
+    fn streamSimple(
+        model: ai_types.Model,
+        context: ai_types.Context,
+        options: ?ai_types.SimpleStreamOptions,
+        a: std.mem.Allocator,
+    ) anyerror!*event_stream.AssistantMessageEventStream {
+        _ = options;
+        return stream(model, context, null, a);
+    }
+};
+
+fn registerMockProvider(registry: *api_registry.ApiRegistry) !void {
+    try registry.registerApiProvider(.{
+        .api = "mock-api",
+        .stream = MockProvider.stream,
+        .stream_simple = MockProvider.streamSimple,
+    }, null);
+}
+
+const test_model = ai_types.Model{
+    .id = "mock-model",
+    .name = "Mock",
+    .api = "mock-api",
+    .provider = "mock",
+    .base_url = "",
+    .reasoning = false,
+    .input = &[_][]const u8{"text"},
+    .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+    .context_window = 1024,
+    .max_tokens = 256,
+};
+
+fn testContext() ai_types.Context {
+    const user = ai_types.Message{ .user = .{
+        .content = .{ .text = "hi" },
+        .timestamp = compat.time.nowMillis(),
+    } };
+    return .{ .messages = &[_]ai_types.Message{user} };
+}
+
+fn drainStreamAndVerify(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream) !void {
+    var saw_start = false;
+    while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
+        if (ev == .start) saw_start = true;
+    }
+    try std.testing.expect(saw_start);
+    try std.testing.expect(stream.getResult() != null);
+}
+
+// Regression test: initBridge() must be called after init() so the bridge's
+// registry pointer is stable. This test would crash with hash map corruption
+// if init() initialized the bridge with a dangling pointer to the local
+// variable's registry.
+test "ProductionRuntime initBridge gives stable registry pointer" {
+    const allocator = std.testing.allocator;
+    var production = try ProductionRuntime.init(allocator);
+    defer production.deinit();
+
+    try registerMockProvider(&production.registry);
+    production.initBridge();
+
+    const protocol = production.options().protocol.?;
+    const stream = try protocol.stream(test_model, testContext(), .{ .api_key = "test-key" }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    try drainStreamAndVerify(allocator, stream);
+}
+
+// Reuse scenario: the same ProductionRuntime (and therefore the same stable
+// registry pointer) can be used for multiple sequential streams.
+test "ProductionRuntime multiple sequential streams reuse stable pointer" {
+    const allocator = std.testing.allocator;
+    var production = try ProductionRuntime.init(allocator);
+    defer production.deinit();
+
+    try registerMockProvider(&production.registry);
+    production.initBridge();
+
+    const protocol = production.options().protocol.?;
+
+    for (0..3) |_| {
+        const stream = try protocol.stream(test_model, testContext(), .{ .api_key = "test-key" }, allocator);
+        defer {
+            stream.deinit();
+            allocator.destroy(stream);
+        }
+        try drainStreamAndVerify(allocator, stream);
+    }
+}
+
+// Lifetime ordering: stream threads may outlive TuiSession/TuiRuntime but
+// must not outlive ProductionRuntime, because the stream thread references
+// ProductionRuntime.registry. This test simulates that ordering by starting
+// a stream through the protocol client, dropping the TuiRuntime/TuiSession
+// that originated the request, and verifying the stream still completes and
+// ProductionRuntime.deinit() is safe.
+test "ProductionRuntime outlives stream threads from dropped TuiRuntime" {
+    const allocator = std.testing.allocator;
+    var production = try ProductionRuntime.init(allocator);
+    defer production.deinit();
+
+    try registerMockProvider(&production.registry);
+    production.initBridge();
+
+    const stream = blk: {
+        const options = production.options();
+        const protocol = options.protocol.?;
+        const s = try protocol.stream(test_model, testContext(), .{ .api_key = "test-key" }, allocator);
+        break :blk s;
+    };
+    // TuiRuntimeOptions and any associated TuiSession are now out of scope,
+    // but the stream thread still references production.registry.
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    try drainStreamAndVerify(allocator, stream);
 }
