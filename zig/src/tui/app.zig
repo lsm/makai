@@ -850,7 +850,7 @@ const TuiModel = struct {
         const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, composer, status }) catch "";
+        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, status, composer }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
