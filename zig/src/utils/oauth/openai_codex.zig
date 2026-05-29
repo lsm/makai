@@ -1,13 +1,20 @@
+//! OpenAI Codex OAuth (Authorization Code flow with PKCE, manual paste UX).
+//!
+//! Mirrors the callback shape of `oauth/anthropic.zig` so the TUI login bridge
+//! can drive all providers uniformly: the flow shows an authorization URL via
+//! `onAuth`, blocks on `onPrompt` for the pasted redirect URL/code, then
+//! exchanges the code for tokens.
+
 const std = @import("std");
 const compat = @import("compat");
 const http = compat.http;
 const pkce_mod = @import("oauth/pkce");
 
-const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const redirect_uri = "https://console.anthropic.com/oauth/code/callback";
-const scopes = "org:create_api_key%20user:profile%20user:inference";
-const auth_url_base = "https://claude.ai/oauth/authorize";
-const token_url = "https://console.anthropic.com/v1/oauth/token";
+const client_id = "app_EMoamEEZ73f0CkXaXp7hrann";
+const redirect_uri = "http://localhost:1455/auth/callback";
+const scopes = "openid%20profile%20email%20offline_access";
+const auth_url_base = "https://auth.openai.com/oauth/authorize";
+const token_url = "https://auth.openai.com/oauth/token";
 
 pub const Credentials = struct {
     refresh: []const u8,
@@ -32,44 +39,35 @@ pub const Prompt = struct {
 
 fn buildAuthUrl(allocator: std.mem.Allocator, challenge: []const u8, state: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator,
-        "{s}?code=true&client_id={s}&redirect_uri={s}&scope={s}&response_type=code&code_challenge={s}&code_challenge_method=S256&state={s}",
+        "{s}?client_id={s}&redirect_uri={s}&response_type=code&scope={s}&code_challenge={s}&code_challenge_method=S256&state={s}&audience=https://api.openai.com/v1",
         .{ auth_url_base, client_id, redirect_uri, scopes, challenge, state },
     );
 }
 
-/// Anthropic OAuth login (manual code flow with PKCE)
+/// OpenAI Codex OAuth login (manual code flow with PKCE).
 pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
-    // 1. Generate PKCE
     const pkce = try pkce_mod.generate(allocator);
     defer pkce.deinit(allocator);
 
-    // 2. Build authorization URL
     const auth_url = try buildAuthUrl(allocator, pkce.challenge, pkce.verifier);
     defer allocator.free(auth_url);
 
-    // 3. Show URL to user
     callbacks.onAuth(.{
         .url = auth_url,
-        .instructions = "Paste the code from the URL after '#code=' below:",
+        .instructions = "Authorize, then paste the full redirect URL (or just the code) below:",
     });
 
-    // 4. Get manual code input
     const manual_input = callbacks.onPrompt(.{ .message = "Enter code:" });
     defer allocator.free(manual_input);
 
-    // Parse "code#state" format
     const parsed_auth = try parseAuthFromManualInput(allocator, manual_input);
     defer allocator.free(parsed_auth.code);
     defer allocator.free(parsed_auth.state);
 
-    // 5. Exchange code for tokens.
-    // Some UX paths provide only the code, so fall back to our original state value.
-    const state_for_exchange = if (parsed_auth.state.len > 0) parsed_auth.state else pkce.verifier;
-    const token_response = try exchangeCode(parsed_auth.code, state_for_exchange, pkce.verifier, allocator);
+    const token_response = try exchangeCode(parsed_auth.code, pkce.verifier, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
 
-    // 6. Return credentials with 5-minute buffer
     const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
@@ -79,17 +77,16 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     };
 }
 
-/// Refresh Anthropic OAuth token
+/// Refresh OpenAI Codex OAuth token.
 pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Credentials {
-    // Build JSON request body
     const body = try std.json.Stringify.valueAlloc(allocator, .{
         .grant_type = "refresh_token",
         .client_id = client_id,
         .refresh_token = credentials.refresh,
+        .scope = "openid profile email offline_access",
     }, .{});
     defer allocator.free(body);
 
-    // Make HTTP request (simplified - real implementation would use http.zig)
     const token_response = try exchangeTokens(body, allocator);
     defer allocator.free(token_response.refresh_token);
     defer allocator.free(token_response.access_token);
@@ -103,92 +100,54 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     };
 }
 
-/// Get API key from credentials (access token IS the API key)
+/// Get API key from credentials (access token IS the API key).
 pub fn getApiKey(credentials: Credentials, allocator: std.mem.Allocator) ![]const u8 {
     return try allocator.dupe(u8, credentials.access);
 }
 
-/// Parsed code and state from manual input
 const ParsedAuth = struct {
     code: []const u8,
     state: []const u8,
 };
 
-/// Parse code and state from manual input (format: "code#state" or just "code")
+/// Parse code and state from manual input (a redirect URL, "code#state", or
+/// just "code").
 fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
+    const trimmed = std.mem.trim(u8, input, " \t\r\n");
+
     // An empty paste means the user dismissed the prompt: treat it as a
     // cancellation rather than attempting a doomed exchange with a blank code.
-    if (std.mem.trim(u8, input, " \t\r\n").len == 0) return error.OAuthCancelled;
+    if (trimmed.len == 0) return error.OAuthCancelled;
 
-    // Try to find #code= in URL
-    if (std.mem.find(u8, input, "#code=")) |idx| {
+    if (std.mem.find(u8, trimmed, "?code=") orelse std.mem.find(u8, trimmed, "&code=")) |idx| {
         const code_start = idx + 6;
-        var code_end = input.len;
-        var state: []const u8 = "";
-
-        // Look for & or # after code
-        if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
+        var code_end = trimmed.len;
+        if (std.mem.findAny(u8, trimmed[code_start..], "#&")) |end| {
             code_end = code_start + end;
         }
+        const code = try allocator.dupe(u8, trimmed[code_start..code_end]);
+        errdefer allocator.free(code);
 
-        const code = try allocator.dupe(u8, input[code_start..code_end]);
-
-        // Look for state parameter
-        if (std.mem.find(u8, input, "&state=")) |state_idx| {
-            const state_start = state_idx + 7;
-            var state_end = input.len;
-            if (std.mem.find(u8, input[state_start..], "&")) |end| {
-                state_end = state_start + end;
-            }
-            state = try allocator.dupe(u8, input[state_start..state_end]);
-        } else if (std.mem.find(u8, input, "#state=")) |state_idx| {
-            const state_start = state_idx + 7;
-            var state_end = input.len;
-            if (std.mem.find(u8, input[state_start..], "&")) |end| {
-                state_end = state_start + end;
-            }
-            state = try allocator.dupe(u8, input[state_start..state_end]);
-        }
-
-        return .{ .code = code, .state = state };
-    }
-
-    // Try to find ?code= in URL
-    if (std.mem.find(u8, input, "?code=")) |idx| {
-        const code_start = idx + 6;
-        var code_end = input.len;
         var state: []const u8 = "";
-
-        // Look for & or # after code
-        if (std.mem.findAny(u8, input[code_start..], "#&")) |end| {
-            code_end = code_start + end;
-        }
-
-        const code = try allocator.dupe(u8, input[code_start..code_end]);
-
-        // Look for state parameter
-        if (std.mem.find(u8, input, "&state=")) |state_idx| {
-            const state_start = state_idx + 7;
-            var state_end = input.len;
-            if (std.mem.find(u8, input[state_start..], "&")) |end| {
+        if (std.mem.find(u8, trimmed, "state=")) |state_idx| {
+            const state_start = state_idx + 6;
+            var state_end = trimmed.len;
+            if (std.mem.findAny(u8, trimmed[state_start..], "#&")) |end| {
                 state_end = state_start + end;
             }
-            state = try allocator.dupe(u8, input[state_start..state_end]);
+            state = trimmed[state_start..state_end];
         }
-
-        return .{ .code = code, .state = state };
+        return .{ .code = code, .state = try allocator.dupe(u8, state) };
     }
 
-    // Assume raw "code#state" format
-    if (std.mem.find(u8, input, "#")) |hash_idx| {
-        const code = try allocator.dupe(u8, input[0..hash_idx]);
-        const state = try allocator.dupe(u8, input[hash_idx + 1 ..]);
-        return .{ .code = code, .state = state };
+    if (std.mem.find(u8, trimmed, "#")) |hash_idx| {
+        const code = try allocator.dupe(u8, trimmed[0..hash_idx]);
+        errdefer allocator.free(code);
+        return .{ .code = code, .state = try allocator.dupe(u8, trimmed[hash_idx + 1 ..]) };
     }
 
-    // Just code, no state
     return .{
-        .code = try allocator.dupe(u8, input),
+        .code = try allocator.dupe(u8, trimmed),
         .state = try allocator.dupe(u8, ""),
     };
 }
@@ -219,19 +178,16 @@ fn getObjectI64Field(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
 
 fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
-        std.debug.print("Failed to parse token response JSON: {s}\n", .{response_body});
+        std.debug.print("Failed to parse Codex token response JSON: {s}\n", .{response_body});
         return error.ParseError;
     };
     defer parsed.deinit();
 
-    if (parsed.value != .object) {
-        std.debug.print("Token response is not an object: {s}\n", .{response_body});
-        return error.ParseError;
-    }
+    if (parsed.value != .object) return error.ParseError;
 
     const obj = &parsed.value.object;
     if (getObjectStringField(obj, "error")) |err| {
-        std.debug.print("OAuth error: {s}", .{err});
+        std.debug.print("Codex OAuth error: {s}", .{err});
         if (getObjectStringField(obj, "error_description")) |desc| {
             std.debug.print(" - {s}", .{desc});
         }
@@ -239,24 +195,14 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
         return error.OAuthFailed;
     }
 
-    const access_token = getObjectStringField(obj, "access_token") orelse
-        getObjectStringField(obj, "accessToken") orelse {
-        std.debug.print("Token response missing access_token: {s}\n", .{response_body});
+    const access_token = getObjectStringField(obj, "access_token") orelse {
+        std.debug.print("Codex token response missing access_token: {s}\n", .{response_body});
         return error.ParseError;
     };
-    const refresh_token = getObjectStringField(obj, "refresh_token") orelse
-        getObjectStringField(obj, "refreshToken") orelse access_token;
+    const refresh_token = getObjectStringField(obj, "refresh_token") orelse access_token;
 
-    var expires_in = getObjectI64Field(obj, "expires_in") orelse
-        getObjectI64Field(obj, "expiresIn") orelse 3600;
-    if (expires_in <= 0) {
-        if (getObjectI64Field(obj, "expires_at")) |expires_at| {
-            const now_seconds = compat.time.nowSeconds();
-            if (expires_at > now_seconds) expires_in = expires_at - now_seconds else expires_in = 3600;
-        } else {
-            expires_in = 3600;
-        }
-    }
+    var expires_in = getObjectI64Field(obj, "expires_in") orelse 3600;
+    if (expires_in <= 0) expires_in = 3600;
 
     return .{
         .access_token = try allocator.dupe(u8, access_token),
@@ -265,14 +211,11 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
     };
 }
 
-/// Exchange authorization code for tokens
-fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
-    // Build JSON body
+fn exchangeCode(code: []const u8, verifier: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     const body = try std.json.Stringify.valueAlloc(allocator, .{
         .grant_type = "authorization_code",
         .client_id = client_id,
         .code = code,
-        .state = state,
         .redirect_uri = redirect_uri,
         .code_verifier = verifier,
     }, .{});
@@ -281,12 +224,10 @@ fn exchangeCode(code: []const u8, state: []const u8, verifier: []const u8, alloc
     return try exchangeTokens(body, allocator);
 }
 
-/// Exchange tokens with Anthropic API
 fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     var client = http.HttpClient.init(allocator);
     defer client.deinit();
 
-    // Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY)
     var environ_map = compat.createEnvMap(allocator) catch null;
     defer if (environ_map) |*map| map.deinit();
     if (environ_map) |*map| {
@@ -309,7 +250,6 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     });
     defer request.deinit();
 
-    // Avoid compressed response bodies for stable token JSON parsing.
     request.headers.accept_encoding = .omit;
 
     try http.sendRequest(&request, body);
@@ -322,7 +262,7 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
         const reader = http.responseReader(&response, &buffer);
         const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
         defer allocator.free(error_body);
-        std.debug.print("Token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
+        std.debug.print("Codex token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
         return error.OAuthFailed;
     }
 
@@ -334,8 +274,18 @@ fn exchangeTokens(body: []const u8, allocator: std.mem.Allocator) !TokenResponse
     return try parseTokenResponse(response_body, allocator);
 }
 
-test "parseAuthFromManualInput - hash fragment with state" {
-    const input = "https://console.anthropic.com/oauth/code/callback#code=abc123&state=xyz";
+test "buildAuthUrl includes client_id and PKCE challenge" {
+    const url = try buildAuthUrl(std.testing.allocator, "challenge-value", "state-value");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.find(u8, url, "client_id=app_") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge=challenge-value") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=state-value") != null);
+}
+
+test "parseAuthFromManualInput - redirect url with code and state" {
+    const input = "http://localhost:1455/auth/callback?code=abc123&state=xyz";
     const auth = try parseAuthFromManualInput(std.testing.allocator, input);
     defer std.testing.allocator.free(auth.code);
     defer std.testing.allocator.free(auth.state);
@@ -344,34 +294,23 @@ test "parseAuthFromManualInput - hash fragment with state" {
     try std.testing.expectEqualStrings("xyz", auth.state);
 }
 
-test "parseAuthFromManualInput - query parameter with state" {
-    const input = "https://console.anthropic.com/oauth/code/callback?code=def456&state=xyz";
-    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
-    defer std.testing.allocator.free(auth.code);
-    defer std.testing.allocator.free(auth.state);
-
-    try std.testing.expectEqualStrings("def456", auth.code);
-    try std.testing.expectEqualStrings("xyz", auth.state);
-}
-
-test "parseAuthFromManualInput - raw code#state format" {
-    const input = "ghi789#mystate";
-    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
-    defer std.testing.allocator.free(auth.code);
-    defer std.testing.allocator.free(auth.state);
-
-    try std.testing.expectEqualStrings("ghi789", auth.code);
-    try std.testing.expectEqualStrings("mystate", auth.state);
-}
-
 test "parseAuthFromManualInput - raw code only" {
-    const input = "ghi789";
+    const input = "just-a-code";
     const auth = try parseAuthFromManualInput(std.testing.allocator, input);
     defer std.testing.allocator.free(auth.code);
     defer std.testing.allocator.free(auth.state);
 
-    try std.testing.expectEqualStrings("ghi789", auth.code);
+    try std.testing.expectEqualStrings("just-a-code", auth.code);
     try std.testing.expectEqualStrings("", auth.state);
+}
+
+test "parseAuthFromManualInput - trims surrounding whitespace" {
+    const input = "  code123\n";
+    const auth = try parseAuthFromManualInput(std.testing.allocator, input);
+    defer std.testing.allocator.free(auth.code);
+    defer std.testing.allocator.free(auth.state);
+
+    try std.testing.expectEqualStrings("code123", auth.code);
 }
 
 test "getApiKey - returns access token" {
@@ -387,42 +326,35 @@ test "getApiKey - returns access token" {
     try std.testing.expectEqualStrings("access_token", api_key);
 }
 
-test "parseTokenResponse handles missing refresh and expires" {
+test "parseTokenResponse extracts tokens" {
     const payload =
-        \\{"access_token":"a-token"}
+        \\{"access_token":"acc","refresh_token":"ref","expires_in":1800}
     ;
     const response = try parseTokenResponse(payload, std.testing.allocator);
     defer std.testing.allocator.free(response.access_token);
     defer std.testing.allocator.free(response.refresh_token);
 
-    try std.testing.expectEqualStrings("a-token", response.access_token);
-    try std.testing.expectEqualStrings("a-token", response.refresh_token);
-    try std.testing.expect(response.expires_in > 0);
-}
-
-test "buildAuthUrl includes code=true" {
-    const url = try buildAuthUrl(std.testing.allocator, "challenge-value", "state-value");
-    defer std.testing.allocator.free(url);
-
-    try std.testing.expect(std.mem.find(u8, url, "code=true") != null);
-}
-
-test "parseTokenResponse handles camelCase token fields" {
-    const payload =
-        \\{"accessToken":"camel-access","refreshToken":"camel-refresh","expiresIn":1800}
-    ;
-    const response = try parseTokenResponse(payload, std.testing.allocator);
-    defer std.testing.allocator.free(response.access_token);
-    defer std.testing.allocator.free(response.refresh_token);
-
-    try std.testing.expectEqualStrings("camel-access", response.access_token);
-    try std.testing.expectEqualStrings("camel-refresh", response.refresh_token);
+    try std.testing.expectEqualStrings("acc", response.access_token);
+    try std.testing.expectEqualStrings("ref", response.refresh_token);
     try std.testing.expectEqual(@as(i64, 1800), response.expires_in);
+}
+
+test "parseTokenResponse falls back to access_token when refresh missing" {
+    const payload =
+        \\{"access_token":"acc"}
+    ;
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer std.testing.allocator.free(response.access_token);
+    defer std.testing.allocator.free(response.refresh_token);
+
+    try std.testing.expectEqualStrings("acc", response.access_token);
+    try std.testing.expectEqualStrings("acc", response.refresh_token);
+    try std.testing.expect(response.expires_in > 0);
 }
 
 test "parseTokenResponse maps oauth error payload to OAuthFailed" {
     const payload =
-        \\{"error":"invalid_grant","error_description":"Invalid 'code' in request."}
+        \\{"error":"invalid_grant","error_description":"bad code"}
     ;
     try std.testing.expectError(error.OAuthFailed, parseTokenResponse(payload, std.testing.allocator));
 }

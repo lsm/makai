@@ -2,12 +2,16 @@ const std = @import("std");
 const agent = @import("agent");
 const ai_types = @import("ai_types");
 const tui_runtime = @import("tui_runtime");
+const compat = @import("compat");
 
 pub const AppMode = enum {
     normal,
     approval,
     preview,
     session_picker,
+    model_picker,
+    login_picker,
+    login_input,
 };
 
 pub const TranscriptKind = enum {
@@ -42,9 +46,12 @@ pub const PreviewKind = enum {
 pub const TranscriptEntry = struct {
     kind: TranscriptKind,
     text: std.ArrayList(u8) = .empty,
+    /// Wall-clock time (epoch ms) the entry was created, for chat-style
+    /// timestamps in the transcript header.
+    timestamp_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8) !TranscriptEntry {
-        var entry = TranscriptEntry{ .kind = kind };
+        var entry = TranscriptEntry{ .kind = kind, .timestamp_ms = compat.time.nowMillis() };
         try entry.text.appendSlice(allocator, text);
         return entry;
     }
@@ -299,10 +306,16 @@ pub const AppState = struct {
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     show_thinking: bool = true,
+    /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
+    /// spinner frames and other time-based effects from this so animation stays
+    /// in lockstep with the render loop without each view tracking its own clock.
+    anim_tick: u64 = 0,
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
     session_scroll: usize = 0,
+    menu_index: usize = 0,
+    menu_scroll: usize = 0,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
 
@@ -342,6 +355,40 @@ pub const AppState = struct {
         self.transcript.clearRetainingCapacity();
         self.transcript_scroll = 0;
         self.clearActiveTranscriptEntries();
+    }
+
+    /// Borrowed text of the most recent assistant reply, or null if none exists.
+    /// Valid until the transcript is next mutated.
+    pub fn lastAssistantText(self: *const AppState) ?[]const u8 {
+        var i = self.transcript.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.transcript.items[i].kind == .assistant) {
+                return self.transcript.items[i].text.items;
+            }
+        }
+        return null;
+    }
+
+    /// Render the whole transcript as plain text with role prefixes. Caller owns
+    /// the returned slice.
+    pub fn transcriptToText(self: *const AppState, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        for (self.transcript.items, 0..) |entry, idx| {
+            if (idx > 0) try buf.append(allocator, '\n');
+            const prefix: []const u8 = switch (entry.kind) {
+                .user => "> ",
+                .assistant => "",
+                .thinking => "[thinking] ",
+                .tool => "[tool] ",
+                .system => "[system] ",
+                .@"error" => "[error] ",
+            };
+            try buf.appendSlice(allocator, prefix);
+            try buf.appendSlice(allocator, entry.text.items);
+        }
+        return buf.toOwnedSlice(allocator);
     }
 
     pub fn clearTools(self: *AppState) void {
@@ -1482,4 +1529,32 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "show full") != null);
+}
+
+test "lastAssistantText returns the most recent assistant reply" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(state.lastAssistantText() == null);
+
+    try state.appendTranscript(.user, "hello");
+    try state.appendTranscript(.assistant, "first reply");
+    try state.appendTranscript(.user, "again");
+    try state.appendTranscript(.assistant, "second reply");
+    try state.appendTranscript(.system, "noise");
+
+    try std.testing.expectEqualStrings("second reply", state.lastAssistantText().?);
+}
+
+test "transcriptToText renders role-prefixed plain text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.user, "ping");
+    try state.appendTranscript(.assistant, "pong");
+    try state.appendTranscript(.@"error", "boom");
+
+    const text = try state.transcriptToText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("> ping\npong\n[error] boom", text);
 }

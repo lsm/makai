@@ -75,7 +75,7 @@ fn promptFor(state: *const tui_state.AppState) []const u8 {
     const text = state.composer.text();
     if (std.mem.startsWith(u8, text, "!")) return "! ";
     if (std.mem.startsWith(u8, text, "@")) return "@ ";
-    return "> ";
+    return tui_theme.glyph.prompt ++ " ";
 }
 
 fn prefixFirstLine(allocator: std.mem.Allocator, prompt: []const u8, content: []const u8) ![]u8 {
@@ -105,7 +105,7 @@ test "composer renders placeholder and text" {
     try state.composer.buffer.appendSlice(std.testing.allocator, "hello world");
     const text = try render(std.testing.allocator, &state, .{ .width = 30 });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, ">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
 }
 
