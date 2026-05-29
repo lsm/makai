@@ -22,6 +22,7 @@ const json_writer = @import("json_writer");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
 const tui_app = @import("tui_app");
+const tui_model_catalog = @import("tui_model_catalog");
 
 pub const VERSION = "0.0.1";
 
@@ -818,6 +819,11 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     var parsed = model_ref.parseModelRef(allocator, ref) catch return error.InvalidModelRef;
     errdefer parsed.deinit(allocator);
 
+    if (try modelFromProductionCatalog(allocator, parsed)) |model| {
+        parsed.deinit(allocator);
+        return model;
+    }
+
     const name = try allocator.dupe(u8, parsed.model_id);
     errdefer allocator.free(name);
 
@@ -844,6 +850,26 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     parsed.api = &.{};
     parsed.model_id = &.{};
     return model;
+}
+
+fn modelFromProductionCatalog(
+    allocator: std.mem.Allocator,
+    parsed: model_ref.ParsedModelRef,
+) !?ai_types.Model {
+    const models = tui_model_catalog.loadProductionModels(allocator) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer tui_model_catalog.deinitModels(allocator, models);
+
+    for (models) |model| {
+        if (!std.mem.eql(u8, model.provider, parsed.provider_id)) continue;
+        if (!std.mem.eql(u8, model.api, parsed.api)) continue;
+        if (!std.mem.eql(u8, model.id, parsed.model_id)) continue;
+        return try ai_types.cloneModel(allocator, model);
+    }
+
+    return null;
 }
 
 fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
