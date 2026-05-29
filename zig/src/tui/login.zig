@@ -173,9 +173,10 @@ pub const LoginSession = struct {
     }
 
     /// Block until the main thread supplies input, then hand ownership of the
-    /// allocated slice to the caller (the OAuth flow frees it). Empty input
-    /// returns a non-owned empty literal, which the flows treat as "skip".
-    fn waitForInput(self: *LoginSession, message: []const u8) []const u8 {
+    /// allocated slice to the caller when non-empty input is required. Optional
+    /// prompts keep empty input as a non-owned literal so provider flows that
+    /// interpret empty as "use default" do not try to free it.
+    fn waitForInput(self: *LoginSession, message: []const u8, allow_empty: bool) []const u8 {
         self.lock();
         if (self.prompt_message.len > 0) self.allocator.free(self.prompt_message);
         self.prompt_message = self.allocator.dupe(u8, message) catch &.{};
@@ -193,13 +194,19 @@ pub const LoginSession = struct {
                 self.input_ready = false;
                 self.mutex.unlock();
                 if (value.len == 0) {
-                    self.allocator.free(value);
-                    return "";
+                    if (allow_empty) {
+                        self.allocator.free(value);
+                        return "";
+                    }
+                    return value;
                 }
                 return value;
             }
             self.mutex.unlock();
-            if (shutting) return "";
+            if (shutting) {
+                if (allow_empty) return "";
+                return self.allocator.alloc(u8, 0) catch @panic("OOM");
+            }
             compat.time.sleepNs(5 * std.time.ns_per_ms);
         }
     }
@@ -246,7 +253,7 @@ fn anthropicOnAuth(info: anthropic.AuthInfo) void {
 }
 fn anthropicOnPrompt(prompt: anthropic.Prompt) []const u8 {
     const s = g_active orelse return "";
-    return s.waitForInput(prompt.message);
+    return s.waitForInput(prompt.message, prompt.allow_empty);
 }
 
 fn githubOnAuth(info: github.AuthInfo) void {
@@ -254,7 +261,7 @@ fn githubOnAuth(info: github.AuthInfo) void {
 }
 fn githubOnPrompt(prompt: github.Prompt) []const u8 {
     const s = g_active orelse return "";
-    return s.waitForInput(prompt.message);
+    return s.waitForInput(prompt.message, prompt.allow_empty);
 }
 
 fn codexOnAuth(info: codex.AuthInfo) void {
@@ -262,7 +269,7 @@ fn codexOnAuth(info: codex.AuthInfo) void {
 }
 fn codexOnPrompt(prompt: codex.Prompt) []const u8 {
     const s = g_active orelse return "";
-    return s.waitForInput(prompt.message);
+    return s.waitForInput(prompt.message, prompt.allow_empty);
 }
 
 // --- worker entry points ---
@@ -333,7 +340,7 @@ test "LoginSession start rejects a second concurrent login" {
 test "LoginSession bridges prompt input through the worker" {
     const Helper = struct {
         fn worker(session: *LoginSession) void {
-            const input = session.waitForInput("Enter code:");
+            const input = session.waitForInput("Enter code:", false);
             defer if (input.len > 0) session.allocator.free(input);
             session.finishSuccess("refresh-tok", input, 1234, null);
         }

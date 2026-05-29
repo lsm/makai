@@ -38,6 +38,7 @@ pub const CommandAction = enum {
     open_session_picker,
     open_model_picker,
     open_login_picker,
+    start_login_provider,
     copy_last,
     copy_all,
 };
@@ -45,10 +46,12 @@ pub const CommandAction = enum {
 pub const CommandResult = struct {
     action: CommandAction = .none,
     output: []u8 = &.{},
+    login_provider: []u8 = &.{},
     is_error: bool = false,
 
     pub fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
         if (self.output.len > 0) allocator.free(self.output);
+        if (self.login_provider.len > 0) allocator.free(self.login_provider);
         self.* = undefined;
     }
 };
@@ -73,7 +76,7 @@ pub const CommandInfo = struct {
 pub const commands = [_]CommandInfo{
     .{ .name = "help", .kind = .help, .usage = "/help", .description = "List available commands", .handler = handleHelp },
     .{ .name = "model", .kind = .model, .usage = "/model [name]", .description = "Open model picker or switch active model", .handler = handleModel },
-    .{ .name = "login", .kind = .login, .usage = "/login", .description = "Sign in to a provider", .handler = handleLogin },
+    .{ .name = "login", .kind = .login, .usage = "/login [provider]", .description = "Sign in to a provider", .handler = handleLogin },
     .{ .name = "provider", .kind = .provider, .usage = "/provider [name]", .description = "Show or switch active provider", .handler = handleProvider },
     .{ .name = "status", .kind = .status, .usage = "/status", .description = "Show session status", .handler = handleStatus },
     .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
@@ -201,8 +204,12 @@ fn handleModel(ctx: CommandContext, command: Command) !CommandResult {
 }
 
 fn handleLogin(ctx: CommandContext, command: Command) !CommandResult {
-    _ = ctx;
-    _ = command;
+    if (command.arg) |provider| {
+        return .{
+            .action = .start_login_provider,
+            .login_provider = try ctx.allocator.dupe(u8, provider),
+        };
+    }
     return .{ .action = .open_login_picker };
 }
 
@@ -407,6 +414,17 @@ test "dispatch reaches command handlers" {
             try std.testing.expect(result.output.len > 0);
         }
     }
+}
+
+test "login command can target a provider directly" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .login, .arg = "openai-codex" });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(CommandAction.start_login_provider, result.action);
+    try std.testing.expectEqualStrings("openai-codex", result.login_provider);
 }
 
 test "resume by id does not resume current context" {

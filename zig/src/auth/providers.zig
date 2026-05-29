@@ -8,6 +8,7 @@ pub const ProviderDefinition = struct {
 pub const AUTH_PROVIDER_DEFINITIONS = [_]ProviderDefinition{
     .{ .id = "anthropic", .name = "Anthropic" },
     .{ .id = "github-copilot", .name = "GitHub Copilot" },
+    .{ .id = "openai-codex", .name = "OpenAI Codex" },
     .{ .id = "test-fixture", .name = "Test Fixture (CI)" },
 };
 
@@ -23,4 +24,9 @@ pub fn findProvider(provider_id: []const u8) ?ProviderDefinition {
 test "findProvider returns configured provider by id" {
     const provider = findProvider("anthropic") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("Anthropic", provider.name);
+}
+
+test "findProvider returns OpenAI Codex provider" {
+    const provider = findProvider("openai-codex") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("OpenAI Codex", provider.name);
 }
