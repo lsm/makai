@@ -9,15 +9,16 @@ const event_stream = @import("event_stream");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
+const tui_login = @import("tui_login");
+const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
-const tool_panel_view = @import("tui_view_tool_panel");
-const telemetry_view = @import("tui_view_telemetry");
 const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
+const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -101,14 +102,23 @@ pub const ProductionRuntime = struct {
 pub const App = struct {
     allocator: std.mem.Allocator,
     state: tui_state.AppState,
-    runtime: ?tui_runtime.TuiRuntime = null,
+    runtime: ?*tui_runtime.TuiRuntime = null,
     session: ?tui_runtime.TuiSession = null,
     approval_waiter: ?*ApprovalWaiter = null,
+    login: ?*tui_login.LoginSession = null,
     store: ?session_store.Store = null,
     session_id: []u8 = &.{},
     session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
+    /// Text staged for the system clipboard, flushed to the terminal via OSC 52
+    /// on the next `update` (where a mutable `Context` is available). Owned.
+    ///
+    /// The TUI never enables terminal mouse reporting, so the terminal keeps
+    /// ownership of the mouse and native click-drag selection + copy works out
+    /// of the box (like other agent CLIs). `Ctrl+Y` / `/copy` provide an
+    /// explicit OSC 52 copy path for when dragging isn't convenient.
+    pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
         var runtime_options = options;
@@ -117,10 +127,19 @@ pub const App = struct {
         approval_waiter.* = .{ .allocator = allocator };
         runtime_options.tool_approval_ctx = approval_waiter;
         runtime_options.tool_approval_callback = approvalCallback;
+        // The runtime is heap-allocated so its address is stable: the session
+        // created below stores a pointer back to it, and `App` is returned by
+        // value (moved into its caller). An inline runtime would leave that
+        // pointer dangling after the move.
+        const runtime_ptr = try allocator.create(tui_runtime.TuiRuntime);
+        runtime_ptr.* = tui_runtime.TuiRuntime.init(allocator, runtime_options) catch |err| {
+            allocator.destroy(runtime_ptr);
+            return err;
+        };
         var app = App{
             .allocator = allocator,
             .state = tui_state.AppState.init(allocator),
-            .runtime = try tui_runtime.TuiRuntime.init(allocator, runtime_options),
+            .runtime = runtime_ptr,
             .approval_waiter = approval_waiter,
         };
         errdefer app.deinit();
@@ -147,13 +166,21 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.login) |session| {
+            session.deinit();
+            self.login = null;
+        }
         if (self.approval_waiter) |waiter| waiter.cancel();
-        if (self.runtime) |*runtime| runtime.deinit();
+        if (self.runtime) |runtime| {
+            runtime.deinit();
+            self.allocator.destroy(runtime);
+        }
         if (self.approval_waiter) |waiter| {
             waiter.deinit();
             self.allocator.destroy(waiter);
         }
         if (self.store) |*store| store.deinit();
+        if (self.pending_clipboard) |c| self.allocator.free(c);
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
         self.state.deinit();
@@ -181,7 +208,7 @@ pub const App = struct {
     /// Resume the session currently selected in the session picker.
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        const runtime = if (self.runtime) |*r| r else return error.NoRuntimeConfigured;
+        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         if (runtime.backend == .remote) return error.SessionResumeUnsupportedForRemoteRuntime;
         const sessions = self.state.sessions.items;
         if (sessions.len == 0) return;
@@ -211,6 +238,225 @@ pub const App = struct {
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
         self.state.mode = .normal;
+    }
+
+    /// Providers that expose an OAuth login, in picker order.
+    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex" };
+
+    fn loginProviderEnum(idx: usize) tui_login.Provider {
+        return switch (idx) {
+            0 => .anthropic,
+            1 => .github_copilot,
+            2 => .openai_codex,
+            else => .anthropic,
+        };
+    }
+
+    /// Open the model picker, pre-selecting the currently active model.
+    fn openModelPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        const runtime = self.runtime orelse return self.enterMenu(.model_picker);
+        const current = runtime.currentModel();
+        if (current) |active| {
+            for (runtime.availableModels(), 0..) |model, i| {
+                if (std.mem.eql(u8, model.id, active.id)) {
+                    self.state.menu_index = i;
+                    break;
+                }
+            }
+        }
+        self.enterMenu(.model_picker);
+    }
+
+    fn enterMenu(self: *App, mode: tui_state.AppMode) void {
+        self.state.mode = mode;
+        self.ensureMenuSelectionVisible();
+    }
+
+    fn menuItemCount(self: *const App) usize {
+        return switch (self.state.mode) {
+            .model_picker => if (self.runtime) |runtime| runtime.availableModels().len else 0,
+            .login_picker => login_providers.len,
+            else => 0,
+        };
+    }
+
+    /// Apply the model highlighted in the model picker, then return to normal.
+    fn applySelectedModel(self: *App) !void {
+        const runtime = self.runtime orelse return error.NoRuntimeConfigured;
+        const models = runtime.availableModels();
+        if (models.len == 0 or self.state.menu_index >= models.len) {
+            self.state.mode = .normal;
+            return;
+        }
+        const model = models[self.state.menu_index];
+        if (self.session) |*session| {
+            try session.switchModel(model.id);
+        } else {
+            try runtime.switchModel(model.id);
+        }
+        if (runtime.currentModel()) |m| {
+            try self.state.status.setModelWithContext(self.allocator, m.id, m.provider, m.context_window);
+            self.state.telemetry.context_window = m.context_window;
+        }
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "model switched to {s} ({s})", .{ model.id, model.provider });
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    /// Start the OAuth worker for the highlighted provider. The flow then drives
+    /// forward via `pollLogin()` on each tick.
+    fn applySelectedLogin(self: *App) !void {
+        const idx = @min(self.state.menu_index, login_providers.len - 1);
+        const provider = login_providers[idx];
+        self.state.mode = .normal;
+        if (self.login != null) {
+            try self.state.appendTranscript(.system, "a login is already in progress");
+            return;
+        }
+        self.login = tui_login.LoginSession.start(self.allocator, loginProviderEnum(idx)) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator, "could not start login for {s}: {s}", .{ provider, @errorName(err) });
+            defer self.allocator.free(msg);
+            try self.state.appendTranscript(.@"error", msg);
+            return;
+        };
+        const msg = try std.fmt.allocPrint(self.allocator, "starting login for {s}…", .{provider});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    /// Drive the active login session forward. Called each tick; surfaces the
+    /// authorization URL, switches to an input prompt when the worker blocks on
+    /// pasted input, and persists credentials when the flow completes.
+    fn pollLogin(self: *App) !void {
+        const session = self.login orelse return;
+        switch (session.poll()) {
+            .none => {},
+            .show_auth => |auth| {
+                const msg = if (auth.instructions) |ins|
+                    try std.fmt.allocPrint(self.allocator, "open this URL to authorize:\n{s}\n{s}", .{ auth.url, ins })
+                else
+                    try std.fmt.allocPrint(self.allocator, "open this URL to authorize:\n{s}", .{auth.url});
+                defer self.allocator.free(msg);
+                try self.state.appendTranscript(.system, msg);
+            },
+            .request_input => |req| {
+                const msg = try std.fmt.allocPrint(self.allocator, "{s} (type your answer and press Enter)", .{req.message});
+                defer self.allocator.free(msg);
+                try self.state.appendTranscript(.system, msg);
+                self.state.mode = .login_input;
+            },
+            .done => |creds| {
+                const provider_id = session.provider_id;
+                const save_err = self.saveLoginCredentials(provider_id, creds);
+                creds.deinit(self.allocator);
+                self.finishLogin();
+                if (save_err) |_| {
+                    const msg = try std.fmt.allocPrint(self.allocator, "logged in to {s}", .{provider_id});
+                    defer self.allocator.free(msg);
+                    try self.state.appendTranscript(.system, msg);
+                } else |err| {
+                    const msg = try std.fmt.allocPrint(self.allocator, "login succeeded but saving credentials failed: {s}", .{@errorName(err)});
+                    defer self.allocator.free(msg);
+                    try self.state.appendTranscript(.@"error", msg);
+                }
+            },
+            .failed => |name| {
+                const msg = try std.fmt.allocPrint(self.allocator, "login failed: {s}", .{name});
+                defer self.allocator.free(msg);
+                self.finishLogin();
+                try self.state.appendTranscript(.@"error", msg);
+            },
+        }
+    }
+
+    /// Tear down the active login session and leave any input mode.
+    fn finishLogin(self: *App) void {
+        if (self.login) |session| {
+            session.deinit();
+            self.login = null;
+        }
+        if (self.state.mode == .login_input) self.state.mode = .normal;
+    }
+
+    /// Persist freshly obtained OAuth credentials into `~/.makai/auth.json`,
+    /// replacing any existing entry for the provider. Does not take ownership of
+    /// `creds`.
+    fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
+        var storage = try oauth_storage.AuthStorage.loadFromFile(self.allocator);
+        defer storage.deinit();
+
+        const key = try self.allocator.dupe(u8, provider_id);
+        var owned = false;
+        errdefer if (!owned) self.allocator.free(key);
+        const refresh = try self.allocator.dupe(u8, creds.refresh);
+        errdefer if (!owned) self.allocator.free(refresh);
+        const access = try self.allocator.dupe(u8, creds.access);
+        errdefer if (!owned) self.allocator.free(access);
+        const pd: ?[]const u8 = if (creds.provider_data) |d| try self.allocator.dupe(u8, d) else null;
+        errdefer if (!owned) {
+            if (pd) |d| self.allocator.free(d);
+        };
+
+        if (storage.providers.fetchRemove(provider_id)) |removed| {
+            self.allocator.free(removed.key);
+            removed.value.deinit(self.allocator);
+        }
+
+        try storage.providers.put(key, .{ .oauth = .{
+            .refresh = refresh,
+            .access = access,
+            .expires = creds.expires,
+            .provider_data = pd,
+        } });
+        owned = true;
+        try storage.persist();
+    }
+
+    /// Hand pasted input to the worker the login flow is blocked on.
+    fn submitLoginInput(self: *App, text: []const u8) void {
+        const session = self.login orelse {
+            self.state.mode = .normal;
+            return;
+        };
+        session.provideInput(text) catch |err| {
+            self.recordError(@errorName(err)) catch {};
+            return;
+        };
+        self.state.mode = .normal;
+    }
+
+    /// Abort an in-progress login.
+    fn cancelLogin(self: *App) void {
+        self.finishLogin();
+        self.state.appendTranscript(.system, "login cancelled") catch {};
+        self.state.mode = .normal;
+    }
+
+    fn moveMenuSelection(self: *App, delta: isize) void {
+        const n = self.menuItemCount();
+        if (n == 0) {
+            self.state.menu_index = 0;
+            self.state.menu_scroll = 0;
+            return;
+        }
+        if (delta < 0) {
+            self.state.menu_index -|= @as(usize, @intCast(-delta));
+        } else {
+            self.state.menu_index = @min(n - 1, self.state.menu_index + @as(usize, @intCast(delta)));
+        }
+        self.ensureMenuSelectionVisible();
+    }
+
+    fn ensureMenuSelectionVisible(self: *App) void {
+        const height = @max(self.last_view_height, 8) / 2;
+        if (self.state.menu_index < self.state.menu_scroll) {
+            self.state.menu_scroll = self.state.menu_index;
+        } else if (height > 0 and self.state.menu_index >= self.state.menu_scroll + height) {
+            self.state.menu_scroll = self.state.menu_index + 1 - height;
+        }
     }
 
     /// Save one event to the session store (best-effort: ignores errors).
@@ -381,7 +627,7 @@ pub const App = struct {
         var result = tui_commands.dispatch(.{
             .allocator = self.allocator,
             .state = &self.state,
-            .runtime = if (self.runtime) |*runtime| runtime else null,
+            .runtime = if (self.runtime) |runtime| runtime else null,
             .session = if (self.session) |*session| session else null,
         }, command) catch |err| {
             try self.state.status.setError(self.allocator, @errorName(err));
@@ -400,6 +646,14 @@ pub const App = struct {
                 self.state.session_scroll = 0;
                 self.state.mode = .session_picker;
             },
+            .open_model_picker => self.openModelPicker(),
+            .open_login_picker => {
+                self.state.menu_index = 0;
+                self.state.menu_scroll = 0;
+                self.state.mode = .login_picker;
+            },
+            .copy_last => self.copyLastAssistant(),
+            .copy_all => self.copyTranscript(),
             .none => {},
         }
         if (result.output.len > 0) {
@@ -413,15 +667,56 @@ pub const App = struct {
         try self.state.appendTranscript(.@"error", message);
     }
 
+    /// Stage text for the system clipboard. The bytes are copied; the actual
+    /// OSC 52 write happens in `update` via `flushClipboard`.
+    fn stageClipboard(self: *App, text: []const u8) void {
+        const dup = self.allocator.dupe(u8, text) catch return;
+        if (self.pending_clipboard) |old| self.allocator.free(old);
+        self.pending_clipboard = dup;
+    }
+
+    /// Write any staged clipboard text to the terminal's clipboard (OSC 52).
+    fn flushClipboard(self: *App, ctx: *zz.Context) void {
+        const text = self.pending_clipboard orelse return;
+        self.pending_clipboard = null;
+        defer self.allocator.free(text);
+        _ = ctx.setClipboard(text) catch {};
+    }
+
+    /// Copy the most recent assistant reply to the system clipboard.
+    fn copyLastAssistant(self: *App) void {
+        const text = self.state.lastAssistantText() orelse {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        };
+        self.stageClipboard(text);
+        self.state.appendTranscript(.system, "copied last reply to clipboard") catch {};
+    }
+
+    /// Copy the full transcript to the system clipboard.
+    fn copyTranscript(self: *App) void {
+        const text = self.state.transcriptToText(self.allocator) catch {
+            self.recordError("copy failed") catch {};
+            return;
+        };
+        defer self.allocator.free(text);
+        if (text.len == 0) {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        }
+        self.stageClipboard(text);
+        self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
+    }
+
     pub fn appendWelcome(self: *App) !void {
         if (self.state.sessions.items.len == 0) {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
             const tips = if (self.supportsStreamingShortcuts())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands"
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands";
+                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -652,7 +947,7 @@ fn runEditorPerform() ?TuiModel.Msg {
     return TuiModel.Msg{ .editor_done = content };
 }
 
-const TuiModel = struct {
+pub const TuiModel = struct {
     app: ?App = null,
     options: tui_runtime.TuiRuntimeOptions = .{},
 
@@ -682,10 +977,9 @@ const TuiModel = struct {
             };
             app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
         }
-        return .{ .batch = &.{
-            .{ .every = 50 * std.time.ns_per_ms },
-            .enable_mouse,
-        } };
+        // Intentionally do NOT enable mouse reporting: leaving the mouse with the
+        // terminal means native click-drag selection and copy work out of the box.
+        return .{ .every = 50 * std.time.ns_per_ms };
     }
 
     pub fn deinit(self: *TuiModel) void {
@@ -726,6 +1020,11 @@ const TuiModel = struct {
                             app.state.toggleThinking();
                             return .none;
                         },
+                        'y' => {
+                            app.copyLastAssistant();
+                            app.flushClipboard(ctx);
+                            return .none;
+                        },
                         else => return .none,
                     },
                     else => {},
@@ -755,6 +1054,44 @@ const TuiModel = struct {
                         },
                         .enter => {
                             app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
+                        },
+                        .escape => app.state.mode = .normal,
+                        else => {},
+                    }
+                    return .none;
+                }
+                // Pasted-input prompt during an OAuth login flow.
+                if (app.state.mode == .login_input) {
+                    switch (key.key) {
+                        .enter => {
+                            const text = app.state.composer.text();
+                            app.submitLoginInput(text);
+                            app.state.composer.clear();
+                        },
+                        .escape => app.cancelLogin(),
+                        .backspace => deleteLastCodepoint(app),
+                        .char => |c| appendChar(app, c) catch {},
+                        .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
+                        else => {},
+                    }
+                    return .none;
+                }
+                // Model / login menu navigation.
+                if (app.state.mode == .model_picker or app.state.mode == .login_picker) {
+                    switch (key.key) {
+                        .up => app.moveMenuSelection(-1),
+                        .down => app.moveMenuSelection(1),
+                        .char => |c| switch (c) {
+                            'k' => app.moveMenuSelection(-1),
+                            'j' => app.moveMenuSelection(1),
+                            else => {},
+                        },
+                        .enter => {
+                            if (app.state.mode == .model_picker) {
+                                app.applySelectedModel() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else {
+                                app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {};
+                            }
                         },
                         .escape => app.state.mode = .normal,
                         else => {},
@@ -815,16 +1152,20 @@ const TuiModel = struct {
                     else => {},
                 }
             },
-            .mouse => |mouse| {
-                if (mouse.event_type == .press) switch (mouse.button) {
-                    .wheel_up => app.state.transcript_scroll += 3,
-                    .wheel_down => app.state.transcript_scroll -|= 3,
-                    else => {},
-                };
+            .mouse => {
+                // Mouse reporting is never enabled (the terminal keeps the mouse
+                // for native selection), so mouse events are not expected here.
             },
-            .tick => app.drainEvents() catch {},
+            .tick => {
+                app.state.anim_tick +%= 1;
+                app.drainEvents() catch {};
+                app.pollLogin() catch {};
+            },
             .quit => return .quit,
         }
+        // A command (e.g. `/copy`) may have staged clipboard text; flush it now
+        // that a mutable Context is in hand.
+        app.flushClipboard(ctx);
         return .none;
     }
 
@@ -833,24 +1174,52 @@ const TuiModel = struct {
         const width: usize = @max(ctx.width, 20);
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
+        // A single one-line status bar sits below the composer; the transcript
+        // fills the rest of the screen. The tool panel and verbose telemetry
+        // panel were removed — their context/token data already lives in the
+        // status line, and tool details are available via `/tools`.
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
             .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
         }) catch "";
-        const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
-        const tools = tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_height }) catch "";
-        const telemetry = telemetry_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
+            .model_picker => blk: {
+                const models = if (app.runtime) |runtime| runtime.availableModels() else &[_]ai_types.Model{};
+                const items = ctx.allocator.alloc(menu_picker_view.Item, models.len) catch break :blk "";
+                for (models, 0..) |model, i| items[i] = .{ .label = model.id, .detail = model.provider };
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Select model",
+                    .items = items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                    .empty_message = "  no models available",
+                }) catch "";
+            },
+            .login_picker => blk: {
+                var items: [App.login_providers.len]menu_picker_view.Item = undefined;
+                for (App.login_providers, 0..) |provider, i| items[i] = .{ .label = provider };
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Login provider",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .login_input => "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + @max(countLines(extra), 1);
+        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, status, composer }) catch "";
+        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
@@ -1063,6 +1432,30 @@ test "App submit routes help command to system transcript" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
+}
+
+test "multi-line /help output renders all lines into transcript view" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/help");
+
+    const rendered = try transcript_view.render(std.testing.allocator, &app.state, .{ .width = 100, .height = 30 });
+    defer std.testing.allocator.free(rendered);
+
+    // Every command name must appear in the rendered transcript — the previous
+    // bug (inline_style theme stripped newlines) collapsed the whole help
+    // listing to a single truncated line.
+    const expect = [_][]const u8{
+        "/help",  "/model",       "/provider", "/status",
+        "/tools", "/permissions", "/compact",  "/clear",
+        "/diff",  "/quit",
+    };
+    for (expect) |needle| {
+        if (std.mem.indexOf(u8, rendered, needle) == null) {
+            std.debug.print("missing {s} in rendered output:\n{s}\n", .{ needle, rendered });
+            return error.TestExpectedHelpLine;
+        }
+    }
 }
 
 test "App submit routes unknown command to error transcript" {
@@ -1348,8 +1741,13 @@ test "session picker navigation pages through hidden rows" {
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
 }
 
-fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !tui_runtime.TuiRuntime {
-    return tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote });
+fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
+    const runtime = try allocator.create(tui_runtime.TuiRuntime);
+    runtime.* = tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote }) catch |err| {
+        allocator.destroy(runtime);
+        return err;
+    };
+    return runtime;
 }
 
 test "resume selected session rejects remote runtime before store replay" {

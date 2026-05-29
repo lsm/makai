@@ -6,6 +6,7 @@ const tui_state = @import("tui_state");
 pub const CommandKind = enum {
     help,
     model,
+    login,
     provider,
     status,
     sessions,
@@ -14,6 +15,7 @@ pub const CommandKind = enum {
     permissions,
     compact,
     clear,
+    copy,
     diff,
     quit,
 };
@@ -34,6 +36,10 @@ pub const CommandAction = enum {
     quit,
     clear_transcript,
     open_session_picker,
+    open_model_picker,
+    open_login_picker,
+    copy_last,
+    copy_all,
 };
 
 pub const CommandResult = struct {
@@ -66,7 +72,8 @@ pub const CommandInfo = struct {
 
 pub const commands = [_]CommandInfo{
     .{ .name = "help", .kind = .help, .usage = "/help", .description = "List available commands", .handler = handleHelp },
-    .{ .name = "model", .kind = .model, .usage = "/model [name]", .description = "Show or switch active model", .handler = handleModel },
+    .{ .name = "model", .kind = .model, .usage = "/model [name]", .description = "Open model picker or switch active model", .handler = handleModel },
+    .{ .name = "login", .kind = .login, .usage = "/login", .description = "Sign in to a provider", .handler = handleLogin },
     .{ .name = "provider", .kind = .provider, .usage = "/provider [name]", .description = "Show or switch active provider", .handler = handleProvider },
     .{ .name = "status", .kind = .status, .usage = "/status", .description = "Show session status", .handler = handleStatus },
     .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
@@ -75,6 +82,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "permissions", .kind = .permissions, .usage = "/permissions", .description = "Show tool permission policies", .handler = handlePermissions },
     .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
+    .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
 };
@@ -188,19 +196,14 @@ fn handleModel(ctx: CommandContext, command: Command) !CommandResult {
         if (model) |m| try ctx.state.status.setModel(ctx.allocator, m.id, m.provider);
         return .{ .output = try std.fmt.allocPrint(ctx.allocator, "model switched to {s}", .{model_id}) };
     }
+    // No argument: open the interactive picker instead of dumping a list.
+    return .{ .action = .open_model_picker };
+}
 
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    if (currentModel(ctx)) |model| {
-        try writer.print("current model: {s} ({s})\n", .{ model.id, model.provider });
-    } else {
-        try writer.writeAll("current model: none\n");
-    }
-    if (ctx.runtime) |runtime| {
-        try writer.writeAll("available models:");
-        for (runtime.availableModels()) |model| try writer.print("\n  {s} ({s})", .{ model.id, model.provider });
-    }
-    return .{ .output = try out.toOwnedSlice() };
+fn handleLogin(ctx: CommandContext, command: Command) !CommandResult {
+    _ = ctx;
+    _ = command;
+    return .{ .action = .open_login_picker };
 }
 
 fn handleProvider(ctx: CommandContext, command: Command) !CommandResult {
@@ -318,6 +321,17 @@ fn handleCompact(ctx: CommandContext, command: Command) !CommandResult {
 fn handleClear(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     return .{ .action = .clear_transcript, .output = try ctx.allocator.dupe(u8, "transcript cleared") };
+}
+
+fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
+    _ = ctx;
+    // The app stages the clipboard write and reports status itself, so no output.
+    if (command.arg) |arg| {
+        if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t"), "all")) {
+            return .{ .action = .copy_all };
+        }
+    }
+    return .{ .action = .copy_last };
 }
 
 fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
@@ -448,4 +462,20 @@ test "runtime dependent commands dispatch to no-runtime errors" {
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .provider }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .tools }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .@"resume" }));
+}
+
+test "copy command selects last reply or whole transcript" {
+    try std.testing.expectEqual(CommandKind.copy, (try parse("/copy")).kind);
+
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
+
+    var last = try dispatch(ctx, .{ .kind = .copy });
+    defer last.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.copy_last, last.action);
+
+    var all = try dispatch(ctx, .{ .kind = .copy, .arg = "all" });
+    defer all.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.copy_all, all.action);
 }
