@@ -10,6 +10,7 @@ const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
+const tui_model_catalog = @import("tui_model_catalog");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -66,14 +67,24 @@ pub const ProductionRuntime = struct {
             @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
-        var runtime = ProductionRuntime{
+        const catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
+        errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
+
+        const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
+        errdefer allocator.free(models);
+        models[0] = defaultModel();
+        for (catalog_models, 0..) |model, idx| {
+            models[idx + 1] = model;
+        }
+        allocator.free(catalog_models);
+
+        const runtime = ProductionRuntime{
             .allocator = allocator,
             .registry = registry,
             .bridge = undefined,
             .permission_engine = permission_engine,
-            .models = try allocator.alloc(ai_types.Model, 1),
+            .models = models,
         };
-        runtime.models[0] = defaultModel();
         return runtime;
     }
 
@@ -92,6 +103,7 @@ pub const ProductionRuntime = struct {
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
+        for (self.models) |*model| model.deinit(self.allocator);
         self.allocator.free(self.models);
         self.permission_engine.deinit();
         self.registry.deinit();
