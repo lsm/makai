@@ -125,11 +125,8 @@ pub const App = struct {
     last_view_height: usize = 8,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
-    ///
-    /// The TUI never enables terminal mouse reporting, so the terminal keeps
-    /// ownership of the mouse and native click-drag selection + copy works out
-    /// of the box (like other agent CLIs). `Ctrl+Y` / `/copy` provide an
-    /// explicit OSC 52 copy path for when dragging isn't convenient.
+    /// `Ctrl+Y` / `/copy` provide an explicit copy path because mouse reporting
+    /// is enabled for wheel scrolling while the TUI is active.
     pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
@@ -1015,8 +1012,6 @@ pub const TuiModel = struct {
             };
             app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
         }
-        // Intentionally do NOT enable mouse reporting: leaving the mouse with the
-        // terminal means native click-drag selection and copy work out of the box.
         return .{ .every = 50 * std.time.ns_per_ms };
     }
 
@@ -1190,9 +1185,12 @@ pub const TuiModel = struct {
                     else => {},
                 }
             },
-            .mouse => {
-                // Mouse reporting is never enabled (the terminal keeps the mouse
-                // for native selection), so mouse events are not expected here.
+            .mouse => |mouse| {
+                switch (mouse.button) {
+                    .wheel_up => app.state.transcript_scroll += 3,
+                    .wheel_down => app.state.transcript_scroll -|= 3,
+                    else => {},
+                }
             },
             .tick => {
                 app.state.anim_tick +%= 1;
@@ -1412,7 +1410,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     defer production.deinit();
     production.initBridge();
 
-    var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
+    var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, .{ .mouse = true });
     program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();

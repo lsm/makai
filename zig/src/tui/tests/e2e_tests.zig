@@ -105,6 +105,10 @@ const Driver = struct {
         _ = self.model.update(.{ .key = .{ .key = key } }, &self.ctx);
     }
 
+    fn sendMouse(self: *Driver, mouse: zz.MouseEvent) void {
+        _ = self.model.update(.{ .mouse = mouse }, &self.ctx);
+    }
+
     fn typeText(self: *Driver, text: []const u8) void {
         const view = std.unicode.Utf8View.init(text) catch return;
         var it = view.iterator();
@@ -331,7 +335,7 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     try std.testing.expect(d.frameContains("starting login for anthropic"));
 }
 
-test "e2e: TUI never enables mouse reporting so native selection works" {
+test "e2e: mouse wheel scrolls the transcript" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
     var d = try Driver.init(std.testing.allocator, .{
@@ -341,10 +345,11 @@ test "e2e: TUI never enables mouse reporting so native selection works" {
     }, .{});
     defer d.deinit();
 
-    // The startup command must be the plain tick timer, NOT a batch that turns
-    // on mouse capture. Grabbing the mouse (e.g. `\x1b[?1003h`) is exactly what
-    // breaks the terminal's native click-drag selection + copy, so the init Cmd
-    // staying `.every` is the regression guard for that behavior.
+    try std.testing.expectEqual(@as(usize, 0), d.app().state.transcript_scroll);
+    d.sendMouse(.{ .x = 10, .y = 10, .button = .wheel_up, .event_type = .press });
+    try std.testing.expectEqual(@as(usize, 3), d.app().state.transcript_scroll);
+    d.sendMouse(.{ .x = 10, .y = 10, .button = .wheel_down, .event_type = .press });
+    try std.testing.expectEqual(@as(usize, 0), d.app().state.transcript_scroll);
     try std.testing.expectEqual(
         @as(std.meta.Tag(zz.Cmd(TuiModel.Msg)), .every),
         std.meta.activeTag(d.init_cmd),
