@@ -13,6 +13,9 @@ const StringBuilder = @import("string_builder").StringBuilder;
 const oauth_storage = @import("oauth/storage");
 const codex_oauth = @import("oauth/openai_codex");
 
+const openai_codex_responses_api = "openai-codex-responses";
+const default_codex_instructions = "You are a helpful coding assistant.";
+
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
     switch (msg) {
@@ -68,6 +71,10 @@ fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringH
         else => {},
     }
     return false;
+}
+
+fn isOpenAICodexResponsesModel(model: ai_types.Model) bool {
+    return std.mem.eql(u8, model.api, openai_codex_responses_api);
 }
 
 /// Free a StringHashMap's keys
@@ -139,6 +146,19 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.beginObject();
     try w.writeStringField("model", model.id);
 
+    const is_codex_model = isOpenAICodexResponsesModel(model);
+    const explicit_system_prompt = context.getSystemPrompt();
+    if (is_codex_model) {
+        const instructions = explicit_system_prompt orelse default_codex_instructions;
+        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, instructions);
+        defer {
+            if (sanitized.ptr != instructions.ptr) {
+                allocator.free(@constCast(sanitized));
+            }
+        }
+        try w.writeStringField("instructions", sanitized);
+    }
+
     // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
@@ -159,7 +179,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     try w.writeBoolField("stream", true);
-    try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
+    if (!is_codex_model) {
+        try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
+    }
 
     // Add reasoning parameters for reasoning models (o1, o3, etc.)
     if (model.reasoning) {
@@ -184,7 +206,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    if (std.mem.find(u8, model.base_url, "openai.com") != null) {
+    if (std.mem.find(u8, model.base_url, "openai.com") != null or is_codex_model) {
         try w.writeBoolField("store", false);
     }
 
@@ -221,19 +243,21 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    if (context.getSystemPrompt()) |sp| {
-        try w.beginObject();
-        const system_role: []const u8 = if (model.reasoning) "developer" else "system";
-        try w.writeStringField("role", system_role);
-        // Sanitize system prompt to remove unpaired surrogates
-        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
-        defer {
-            if (sanitized.ptr != sp.ptr) {
-                allocator.free(@constCast(sanitized));
+    if (!is_codex_model) {
+        if (explicit_system_prompt) |sp| {
+            try w.beginObject();
+            const system_role: []const u8 = if (model.reasoning) "developer" else "system";
+            try w.writeStringField("role", system_role);
+            // Sanitize system prompt to remove unpaired surrogates
+            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
+            defer {
+                if (sanitized.ptr != sp.ptr) {
+                    allocator.free(@constCast(sanitized));
+                }
             }
+            try w.writeStringField("content", sanitized);
+            try w.endObject();
         }
-        try w.writeStringField("content", sanitized);
-        try w.endObject();
     }
 
     // GPT-5 "juice" workaround: when reasoning is disabled for GPT-5 models,
@@ -368,7 +392,7 @@ fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix
 }
 
 fn responsesPathForModel(model: ai_types.Model) []const u8 {
-    if (std.mem.eql(u8, model.api, "openai-codex-responses")) return "/responses";
+    if (isOpenAICodexResponsesModel(model)) return "/responses";
     return "/v1/responses";
 }
 
@@ -1597,6 +1621,54 @@ test "OpenAI Codex responses use Codex backend path" {
         .max_tokens = 16384,
     };
     try std.testing.expectEqualStrings("/responses", responsesPathForModel(model));
+}
+
+test "OpenAI Codex request body includes default instructions" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{ .messages = &.{} };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"You are a helpful coding assistant.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"store\":false") != null);
+    try std.testing.expect(std.mem.find(u8, body, "max_output_tokens") == null);
+}
+
+test "OpenAI Codex request body uses system prompt as instructions" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("Use the project style."),
+        .messages = &.{},
+    };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Use the project style.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") == null);
 }
 
 /// Helper to parse JSON and return ParsedEvent for tests
