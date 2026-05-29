@@ -768,11 +768,28 @@ fn streamAssistantResponse(
     while (provider_stream.wait()) |provider_event| {
         switch (provider_event) {
             .start => |s| {
+                var owned_start_event = provider_event;
+                errdefer if (provider_stream.owns_events) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &owned_start_event);
+                };
+
                 // Create a Message wrapper for the assistant message
-                const msg: ai_types.Message = .{ .assistant = s.partial };
+                const msg: ai_types.Message = .{ .assistant = .{
+                    .content = &.{},
+                    .api = config.model.api,
+                    .provider = config.model.provider,
+                    .model = config.model.id,
+                    .usage = s.partial.usage,
+                    .stop_reason = s.partial.stop_reason,
+                    .timestamp = s.partial.timestamp,
+                    .is_owned = false,
+                } };
                 try event_stream.push(.{ .message_start = .{
                     .message = msg,
                 } });
+                if (provider_stream.owns_events) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &owned_start_event);
+                }
                 message_started = true;
             },
             .text_start => |evt| {
