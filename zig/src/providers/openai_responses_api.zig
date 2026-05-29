@@ -169,7 +169,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "function");
                 try w.writeStringField("name", tool.name);
                 try w.writeStringField("description", tool.description);
-                try w.writeBoolField("strict", true);
+                try w.writeBoolField("strict", false);
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
                 try w.endObject();
@@ -1669,6 +1669,36 @@ test "OpenAI Codex request body uses system prompt as instructions" {
 
     try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Use the project style.\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") == null);
+}
+
+test "OpenAI Responses request body sends local tools without strict schema mode" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const tools = [_]ai_types.Tool{.{
+        .name = "file_read",
+        .description = "Read a file",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"workspace_root\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"workspace_root\",\"path\"],\"additionalProperties\":false}",
+    }};
+    const context: ai_types.Context = .{
+        .messages = &.{},
+        .tools = &tools,
+    };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"file_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\":false") != null);
 }
 
 /// Helper to parse JSON and return ParsedEvent for tests
