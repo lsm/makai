@@ -605,9 +605,13 @@ const StdioProtocolLoop = struct {
             }
 
             while (run.stream.poll()) |event| {
+                var owned_event = event;
+                errdefer deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
+
                 const event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
                 defer self.allocator.free(event_json);
                 self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
+                deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
                 forwarded += 1;
             }
 
@@ -742,6 +746,16 @@ const StdioProtocolLoop = struct {
         return drained;
     }
 };
+
+fn deinitSerializedStdioAgentEvent(allocator: std.mem.Allocator, event: *agent_loop.AgentEvent) void {
+    switch (event.*) {
+        .message_update => |*payload| {
+            var provider_event = payload.event;
+            ai_types.deinitAssistantMessageEvent(allocator, &provider_event);
+        },
+        else => {},
+    }
+}
 
 fn prepareAgentRun(
     allocator: std.mem.Allocator,
