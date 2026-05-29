@@ -252,6 +252,15 @@ pub const App = struct {
         };
     }
 
+    fn loginProviderIndex(provider_id: []const u8) ?usize {
+        for (login_providers, 0..) |provider, idx| {
+            if (std.mem.eql(u8, provider_id, provider)) return idx;
+        }
+        if (std.mem.eql(u8, provider_id, "codex") or std.mem.eql(u8, provider_id, "openai")) return 2;
+        if (std.mem.eql(u8, provider_id, "github")) return 1;
+        return null;
+    }
+
     /// Open the model picker, pre-selecting the currently active model.
     fn openModelPicker(self: *App) void {
         self.state.menu_scroll = 0;
@@ -306,10 +315,9 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
-    /// Start the OAuth worker for the highlighted provider. The flow then drives
-    /// forward via `pollLogin()` on each tick.
-    fn applySelectedLogin(self: *App) !void {
-        const idx = @min(self.state.menu_index, login_providers.len - 1);
+    /// Start the OAuth worker for a provider index. The flow then drives forward
+    /// via `pollLogin()` on each tick.
+    fn startLoginProviderIndex(self: *App, idx: usize) !void {
         const provider = login_providers[idx];
         self.state.mode = .normal;
         if (self.login != null) {
@@ -325,6 +333,23 @@ pub const App = struct {
         const msg = try std.fmt.allocPrint(self.allocator, "starting login for {s}…", .{provider});
         defer self.allocator.free(msg);
         try self.state.appendTranscript(.system, msg);
+    }
+
+    fn startLoginProviderName(self: *App, provider_id: []const u8) !void {
+        const idx = loginProviderIndex(provider_id) orelse {
+            const msg = try std.fmt.allocPrint(self.allocator, "unknown login provider: {s}", .{provider_id});
+            defer self.allocator.free(msg);
+            try self.state.status.setError(self.allocator, msg);
+            try self.state.appendTranscript(.@"error", msg);
+            return;
+        };
+        try self.startLoginProviderIndex(idx);
+    }
+
+    /// Start the OAuth worker for the highlighted provider.
+    fn applySelectedLogin(self: *App) !void {
+        const idx = @min(self.state.menu_index, login_providers.len - 1);
+        try self.startLoginProviderIndex(idx);
     }
 
     /// Drive the active login session forward. Called each tick; surfaces the
@@ -385,7 +410,7 @@ pub const App = struct {
     /// replacing any existing entry for the provider. Does not take ownership of
     /// `creds`.
     fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
-        var storage = try oauth_storage.AuthStorage.loadFromFile(self.allocator);
+        var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
         defer storage.deinit();
 
         const key = try self.allocator.dupe(u8, provider_id);
@@ -652,6 +677,7 @@ pub const App = struct {
                 self.state.menu_scroll = 0;
                 self.state.mode = .login_picker;
             },
+            .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
             .none => {},
@@ -1432,6 +1458,17 @@ test "App submit routes help command to system transcript" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
+}
+
+test "App submit starts direct OpenAI Codex login command" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.submit("/login openai-codex");
+
+    try std.testing.expect(app.login != null);
+    try std.testing.expectEqualStrings("openai-codex", app.login.?.provider_id);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for openai-codex") != null);
 }
 
 test "multi-line /help output renders all lines into transcript view" {

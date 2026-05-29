@@ -10,6 +10,8 @@ const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
+const oauth_storage = @import("oauth/storage");
+const codex_oauth = @import("oauth/openai_codex");
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -1505,17 +1507,53 @@ pub fn registerOpenAIResponsesApiProvider(registry: *api_registry.ApiRegistry) !
     }, null);
 }
 
+fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !oauth_storage.Credentials {
+    const refreshed = try codex_oauth.refreshToken(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+    return .{
+        .refresh = refreshed.refresh,
+        .access = refreshed.access,
+        .expires = refreshed.expires,
+    };
+}
+
+fn getOpenAICodexApiKey(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) ![]const u8 {
+    return try codex_oauth.getApiKey(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+}
+
 pub fn registerOpenAICodexResponsesApiProvider(registry: *api_registry.ApiRegistry) !void {
     try registry.registerApiProvider(.{
         .api = "openai-codex-responses",
         .stream = streamOpenAIResponses,
         .stream_simple = streamSimpleOpenAIResponses,
+        .auth_provider_id = "openai-codex",
+        .auth_refresh_fn = refreshOpenAICodexCredentials,
+        .auth_get_api_key_fn = getOpenAICodexApiKey,
     }, null);
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "OpenAI Codex provider registers OAuth hooks" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registerOpenAICodexResponsesApiProvider(&registry);
+
+    const provider = registry.getApiProvider("openai-codex-responses") orelse return error.TestExpectedCodexProvider;
+    try std.testing.expectEqualStrings("openai-codex", provider.auth_provider_id.?);
+    try std.testing.expect(provider.auth_refresh_fn != null);
+    try std.testing.expect(provider.auth_get_api_key_fn != null);
+}
 
 /// Helper to parse JSON and return ParsedEvent for tests
 fn parseEventForTest(data: []const u8, allocator: std.mem.Allocator) ?struct { parsed: std.json.Parsed(std.json.Value), event: ParsedEvent } {

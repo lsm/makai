@@ -255,7 +255,7 @@ pub const ProtocolServer = struct {
 
     fn defaultLoadAuthStorage(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
         _ = ctx;
-        return oauth_storage.AuthStorage.loadFromFile(allocator);
+        return oauth_storage.AuthStorage.loadDefault(allocator);
     }
 
     pub const Options = struct {

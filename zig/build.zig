@@ -106,6 +106,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compat", .module = compat_mod },
         },
     });
+    if (target.result.os.tag == .macos) {
+        oauth_storage_mod.linkFramework("Security", .{});
+        oauth_storage_mod.linkFramework("CoreFoundation", .{});
+    }
 
     const refresh_lock_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
@@ -310,6 +314,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
         },
     });
 
@@ -708,6 +714,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "compat", .module = compat_mod },
