@@ -5,6 +5,9 @@ const ai_types = @import("ai_types");
 const json_writer = @import("json_writer");
 const transport = @import("transport");
 
+const OpenAICompatMaxTokensField = @TypeOf((ai_types.OpenAICompatOptions{}).max_tokens_field);
+const OpenAICompatThinkingFormat = @TypeOf((ai_types.OpenAICompatOptions{}).thinking_format);
+
 /// Serialize envelope to JSON
 pub fn serializeEnvelope(
     envelope: protocol_types.Envelope,
@@ -100,13 +103,7 @@ fn serializePayload(
         .stream_request => |req| {
             // Nest model fields inside a "model" object per PROTOCOL.md
             try w.writeKey("model");
-            try w.beginObject();
-            try w.writeStringField("id", req.model.id);
-            try w.writeStringField("name", req.model.name);
-            try w.writeStringField("api", req.model.api);
-            try w.writeStringField("provider", req.model.provider);
-            try w.writeStringField("base_url", req.model.base_url);
-            try w.endObject();
+            try serializeModel(w, req.model);
             try w.writeBoolField("include_partial", req.include_partial);
 
             // Serialize context
@@ -122,13 +119,7 @@ fn serializePayload(
         .complete_request => |req| {
             // Nest model fields inside a "model" object per PROTOCOL.md
             try w.writeKey("model");
-            try w.beginObject();
-            try w.writeStringField("id", req.model.id);
-            try w.writeStringField("name", req.model.name);
-            try w.writeStringField("api", req.model.api);
-            try w.writeStringField("provider", req.model.provider);
-            try w.writeStringField("base_url", req.model.base_url);
-            try w.endObject();
+            try serializeModel(w, req.model);
 
             // Serialize context
             try w.writeKey("context");
@@ -206,6 +197,104 @@ fn serializePayload(
         },
     }
 
+    try w.endObject();
+}
+
+fn serializeModel(
+    w: *json_writer.JsonWriter,
+    model: ai_types.Model,
+) !void {
+    try w.beginObject();
+    try w.writeStringField("id", model.id);
+    try w.writeStringField("name", model.name);
+    try w.writeStringField("api", model.api);
+    try w.writeStringField("provider", model.provider);
+    try w.writeStringField("base_url", model.base_url);
+    try w.writeBoolField("reasoning", model.reasoning);
+
+    try w.writeKey("input");
+    try w.beginArray();
+    for (model.input) |input| {
+        try w.writeString(input);
+    }
+    try w.endArray();
+
+    try w.writeKey("cost");
+    try w.beginObject();
+    try w.writeKey("input");
+    try writeFloat64(w, model.cost.input);
+    try w.writeKey("output");
+    try writeFloat64(w, model.cost.output);
+    try w.writeKey("cache_read");
+    try writeFloat64(w, model.cost.cache_read);
+    try w.writeKey("cache_write");
+    try writeFloat64(w, model.cost.cache_write);
+    try w.endObject();
+
+    try w.writeIntField("context_window", model.context_window);
+    try w.writeIntField("max_tokens", model.max_tokens);
+
+    if (model.headers) |headers| {
+        try serializeHeaderPairs(w, headers);
+    }
+
+    if (model.compat) |compat_options| {
+        try serializeOpenAICompatOptions(w, compat_options);
+    }
+
+    try w.endObject();
+}
+
+fn writeFloat64(w: *json_writer.JsonWriter, value: f64) !void {
+    if (w.needs_comma) {
+        try w.buffer.append(w.allocator, ',');
+    }
+    try w.buffer.print(w.allocator, "{d}", .{value});
+    w.needs_comma = true;
+}
+
+fn serializeHeaderPairs(
+    w: *json_writer.JsonWriter,
+    headers: []const ai_types.HeaderPair,
+) !void {
+    try w.writeKey("headers");
+    try w.beginArray();
+    for (headers) |header| {
+        try w.beginObject();
+        try w.writeStringField("name", header.name);
+        try w.writeStringField("value", header.value);
+        try w.endObject();
+    }
+    try w.endArray();
+}
+
+fn serializeOptionalBoolField(
+    w: *json_writer.JsonWriter,
+    field: []const u8,
+    value: ?bool,
+) !void {
+    if (value) |unwrapped| {
+        try w.writeBoolField(field, unwrapped);
+    }
+}
+
+fn serializeOpenAICompatOptions(
+    w: *json_writer.JsonWriter,
+    compat_options: ai_types.OpenAICompatOptions,
+) !void {
+    try w.writeKey("compat");
+    try w.beginObject();
+    try serializeOptionalBoolField(w, "supports_store", compat_options.supports_store);
+    try serializeOptionalBoolField(w, "supports_developer_role", compat_options.supports_developer_role);
+    try serializeOptionalBoolField(w, "supports_reasoning_effort", compat_options.supports_reasoning_effort);
+    try serializeOptionalBoolField(w, "supports_usage_in_streaming", compat_options.supports_usage_in_streaming);
+    try w.writeStringField("max_tokens_field", @tagName(compat_options.max_tokens_field));
+    try serializeOptionalBoolField(w, "requires_tool_result_name", compat_options.requires_tool_result_name);
+    try serializeOptionalBoolField(w, "requires_assistant_after_tool_result", compat_options.requires_assistant_after_tool_result);
+    try serializeOptionalBoolField(w, "requires_thinking_as_text", compat_options.requires_thinking_as_text);
+    try serializeOptionalBoolField(w, "requires_mistral_tool_ids", compat_options.requires_mistral_tool_ids);
+    try w.writeStringField("thinking_format", @tagName(compat_options.thinking_format));
+    try serializeOptionalBoolField(w, "supports_strict_mode", compat_options.supports_strict_mode);
     try w.endObject();
 }
 
@@ -430,15 +519,7 @@ fn serializeStreamOptions(
 
     // Serialize headers if present
     if (opts.headers) |headers| {
-        try w.writeKey("headers");
-        try w.beginArray();
-        for (headers) |header| {
-            try w.beginObject();
-            try w.writeStringField("name", header.name);
-            try w.writeStringField("value", header.value);
-            try w.endObject();
-        }
-        try w.endArray();
+        try serializeHeaderPairs(w, headers);
     }
 
     // Retry config
@@ -722,6 +803,180 @@ fn isEventType(type_str: []const u8) bool {
     return false;
 }
 
+fn deserializeModel(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) !ai_types.Model {
+    const id = try dupeValidatedString(allocator, obj, "id", MAX_MODEL_FIELD_LENGTH);
+    errdefer allocator.free(id);
+    const name = try dupeValidatedString(allocator, obj, "name", MAX_MODEL_FIELD_LENGTH);
+    errdefer allocator.free(name);
+    const api = try dupeValidatedString(allocator, obj, "api", MAX_IDENTIFIER_LENGTH);
+    errdefer allocator.free(api);
+    const provider = try dupeValidatedString(allocator, obj, "provider", MAX_IDENTIFIER_LENGTH);
+    errdefer allocator.free(provider);
+    const base_url = try dupeValidatedString(allocator, obj, "base_url", MAX_MODEL_FIELD_LENGTH);
+    errdefer allocator.free(base_url);
+
+    const input = try deserializeInputModalities(obj, allocator);
+    errdefer freeInputModalities(allocator, input);
+
+    const headers = if (obj.get("headers")) |headers_val|
+        try deserializeHeaderPairs(headers_val.array, allocator)
+    else
+        null;
+    errdefer if (headers) |pairs| freeHeaderPairs(allocator, pairs);
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = if (obj.get("reasoning")) |value| value.bool else false,
+        .input = input,
+        .cost = if (obj.get("cost")) |value| try deserializeCost(value.object) else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = try optionalU32(obj, "context_window", 0),
+        .max_tokens = try optionalU32(obj, "max_tokens", 0),
+        .headers = headers,
+        .compat = if (obj.get("compat")) |value| try deserializeOpenAICompatOptions(value.object) else null,
+        .is_owned = true,
+    };
+}
+
+fn dupeValidatedString(
+    allocator: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    field: []const u8,
+    max_len: usize,
+) ![]u8 {
+    const value = obj.get(field).?.string;
+    try validateLength(value, max_len);
+    return try allocator.dupe(u8, value);
+}
+
+fn deserializeInputModalities(
+    obj: std.json.ObjectMap,
+    allocator: std.mem.Allocator,
+) ![]const []const u8 {
+    const input_val = obj.get("input") orelse return try allocator.alloc([]const u8, 0);
+    const input_arr = input_val.array;
+    const input = try allocator.alloc([]const u8, input_arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (input[0..initialized]) |item| allocator.free(item);
+        allocator.free(input);
+    }
+
+    for (input_arr.items, 0..) |item, idx| {
+        try validateLength(item.string, MAX_IDENTIFIER_LENGTH);
+        input[idx] = try allocator.dupe(u8, item.string);
+        initialized += 1;
+    }
+
+    return input;
+}
+
+fn freeInputModalities(allocator: std.mem.Allocator, input: []const []const u8) void {
+    for (input) |item| allocator.free(item);
+    allocator.free(input);
+}
+
+fn deserializeHeaderPairs(
+    array: std.json.Array,
+    allocator: std.mem.Allocator,
+) ![]ai_types.HeaderPair {
+    const headers = try allocator.alloc(ai_types.HeaderPair, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (headers[0..initialized]) |*header| header.deinit(allocator);
+        allocator.free(headers);
+    }
+
+    for (array.items, 0..) |item, idx| {
+        const header_obj = item.object;
+        const name_value = header_obj.get("name").?.string;
+        try validateLength(name_value, MAX_HEADER_NAME_LENGTH);
+        const name = try allocator.dupe(u8, name_value);
+        errdefer allocator.free(name);
+
+        const header_value = header_obj.get("value").?.string;
+        try validateLength(header_value, MAX_HEADER_VALUE_LENGTH);
+        const value = try allocator.dupe(u8, header_value);
+        errdefer allocator.free(value);
+
+        headers[idx] = .{ .name = name, .value = value };
+        initialized += 1;
+    }
+
+    return headers;
+}
+
+fn freeHeaderPairs(allocator: std.mem.Allocator, headers: []const ai_types.HeaderPair) void {
+    const mutable_headers: []ai_types.HeaderPair = @constCast(headers);
+    for (mutable_headers) |*header| header.deinit(allocator);
+    allocator.free(headers);
+}
+
+fn deserializeCost(obj: std.json.ObjectMap) !ai_types.Cost {
+    return .{
+        .input = try optionalF64(obj, "input", 0),
+        .output = try optionalF64(obj, "output", 0),
+        .cache_read = try optionalF64(obj, "cache_read", 0),
+        .cache_write = try optionalF64(obj, "cache_write", 0),
+    };
+}
+
+fn optionalU32(obj: std.json.ObjectMap, field: []const u8, default: u32) !u32 {
+    const value = obj.get(field) orelse return default;
+    if (value.integer < 0) return error.InvalidUserContent;
+    return @intCast(value.integer);
+}
+
+fn optionalF64(obj: std.json.ObjectMap, field: []const u8, default: f64) !f64 {
+    const value = obj.get(field) orelse return default;
+    return switch (value) {
+        .integer => |number| @floatFromInt(number),
+        .float => |number| number,
+        .number_string => |number| try std.fmt.parseFloat(f64, number),
+        else => error.InvalidUserContent,
+    };
+}
+
+fn optionalBool(obj: std.json.ObjectMap, field: []const u8) ?bool {
+    const value = obj.get(field) orelse return null;
+    return value.bool;
+}
+
+fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompatOptions {
+    return .{
+        .supports_store = optionalBool(obj, "supports_store"),
+        .supports_developer_role = optionalBool(obj, "supports_developer_role"),
+        .supports_reasoning_effort = optionalBool(obj, "supports_reasoning_effort"),
+        .supports_usage_in_streaming = optionalBool(obj, "supports_usage_in_streaming"),
+        .max_tokens_field = if (obj.get("max_tokens_field")) |value| try parseMaxTokensField(value.string) else .max_completion_tokens,
+        .requires_tool_result_name = optionalBool(obj, "requires_tool_result_name"),
+        .requires_assistant_after_tool_result = optionalBool(obj, "requires_assistant_after_tool_result"),
+        .requires_thinking_as_text = optionalBool(obj, "requires_thinking_as_text"),
+        .requires_mistral_tool_ids = optionalBool(obj, "requires_mistral_tool_ids"),
+        .thinking_format = if (obj.get("thinking_format")) |value| try parseThinkingFormat(value.string) else .openai,
+        .supports_strict_mode = optionalBool(obj, "supports_strict_mode"),
+    };
+}
+
+fn parseMaxTokensField(str: []const u8) error{InvalidEnumValue}!OpenAICompatMaxTokensField {
+    if (std.mem.eql(u8, str, "max_completion_tokens")) return .max_completion_tokens;
+    if (std.mem.eql(u8, str, "max_tokens")) return .max_tokens;
+    return error.InvalidEnumValue;
+}
+
+fn parseThinkingFormat(str: []const u8) error{InvalidEnumValue}!OpenAICompatThinkingFormat {
+    if (std.mem.eql(u8, str, "openai")) return .openai;
+    if (std.mem.eql(u8, str, "zai")) return .zai;
+    if (std.mem.eql(u8, str, "qwen")) return .qwen;
+    return error.InvalidEnumValue;
+}
+
 /// Deserialize stream request
 fn deserializeStreamRequest(
     obj: std.json.ObjectMap,
@@ -729,47 +984,20 @@ fn deserializeStreamRequest(
 ) !protocol_types.StreamRequest {
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
-
-    // Validate and allocate each field separately with errdefer to avoid leaks on OOM
-    const id_str = model_obj.get("id").?.string;
-    try validateLength(id_str, MAX_MODEL_FIELD_LENGTH);
-    const id = try allocator.dupe(u8, id_str);
-    errdefer allocator.free(id);
-    const name_str = model_obj.get("name").?.string;
-    try validateLength(name_str, MAX_MODEL_FIELD_LENGTH);
-    const name = try allocator.dupe(u8, name_str);
-    errdefer allocator.free(name);
-    const api_str = model_obj.get("api").?.string;
-    try validateLength(api_str, MAX_IDENTIFIER_LENGTH);
-    const api = try allocator.dupe(u8, api_str);
-    errdefer allocator.free(api);
-    const provider_str = model_obj.get("provider").?.string;
-    try validateLength(provider_str, MAX_IDENTIFIER_LENGTH);
-    const provider = try allocator.dupe(u8, provider_str);
-    errdefer allocator.free(provider);
-    const base_url_str = model_obj.get("base_url").?.string;
-    try validateLength(base_url_str, MAX_MODEL_FIELD_LENGTH);
-    const base_url = try allocator.dupe(u8, base_url_str);
-    errdefer allocator.free(base_url);
-
-    const model = ai_types.Model{
-        .id = id,
-        .name = name,
-        .api = api,
-        .provider = provider,
-        .base_url = base_url,
-        .reasoning = false,
-        .input = &.{},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 0,
-        .max_tokens = 0,
-        .is_owned = true, // Mark as owned since we duped the strings
-    };
+    const model = try deserializeModel(model_obj, allocator);
+    errdefer {
+        var mutable_model = model;
+        mutable_model.deinit(allocator);
+    }
 
     const context = if (obj.get("context")) |ctx_val|
         try deserializeContext(ctx_val.object, allocator)
     else
         ai_types.Context{ .messages = &.{} };
+    errdefer {
+        var mutable_context = context;
+        mutable_context.deinit(allocator);
+    }
 
     const include_partial = if (obj.get("include_partial")) |ip|
         ip.bool
@@ -780,6 +1008,10 @@ fn deserializeStreamRequest(
         try deserializeStreamOptions(opts_val.object, allocator)
     else
         null;
+    errdefer if (options) |opts| {
+        var mutable_opts = opts;
+        mutable_opts.deinit(allocator);
+    };
 
     return .{
         .model = model,
@@ -796,52 +1028,29 @@ fn deserializeCompleteRequest(
 ) !protocol_types.CompleteRequest {
     // Parse nested model object per PROTOCOL.md
     const model_obj = obj.get("model").?.object;
-
-    // Validate and allocate each field separately with errdefer to avoid leaks on OOM
-    const id_str = model_obj.get("id").?.string;
-    try validateLength(id_str, MAX_MODEL_FIELD_LENGTH);
-    const id = try allocator.dupe(u8, id_str);
-    errdefer allocator.free(id);
-    const name_str = model_obj.get("name").?.string;
-    try validateLength(name_str, MAX_MODEL_FIELD_LENGTH);
-    const name = try allocator.dupe(u8, name_str);
-    errdefer allocator.free(name);
-    const api_str = model_obj.get("api").?.string;
-    try validateLength(api_str, MAX_IDENTIFIER_LENGTH);
-    const api = try allocator.dupe(u8, api_str);
-    errdefer allocator.free(api);
-    const provider_str = model_obj.get("provider").?.string;
-    try validateLength(provider_str, MAX_IDENTIFIER_LENGTH);
-    const provider = try allocator.dupe(u8, provider_str);
-    errdefer allocator.free(provider);
-    const base_url_str = model_obj.get("base_url").?.string;
-    try validateLength(base_url_str, MAX_MODEL_FIELD_LENGTH);
-    const base_url = try allocator.dupe(u8, base_url_str);
-    errdefer allocator.free(base_url);
-
-    const model = ai_types.Model{
-        .id = id,
-        .name = name,
-        .api = api,
-        .provider = provider,
-        .base_url = base_url,
-        .reasoning = false,
-        .input = &.{},
-        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
-        .context_window = 0,
-        .max_tokens = 0,
-        .is_owned = true, // Mark as owned since we duped the strings
-    };
+    const model = try deserializeModel(model_obj, allocator);
+    errdefer {
+        var mutable_model = model;
+        mutable_model.deinit(allocator);
+    }
 
     const context = if (obj.get("context")) |ctx_val|
         try deserializeContext(ctx_val.object, allocator)
     else
         ai_types.Context{ .messages = &.{} };
+    errdefer {
+        var mutable_context = context;
+        mutable_context.deinit(allocator);
+    }
 
     const options = if (obj.get("options")) |opts_val|
         try deserializeStreamOptions(opts_val.object, allocator)
     else
         null;
+    errdefer if (options) |opts| {
+        var mutable_opts = opts;
+        mutable_opts.deinit(allocator);
+    };
 
     return .{
         .model = model,
@@ -1393,6 +1602,7 @@ fn deserializeStreamOptions(
     allocator: std.mem.Allocator,
 ) !ai_types.StreamOptions {
     var opts: ai_types.StreamOptions = .{};
+    errdefer opts.deinit(allocator);
 
     if (obj.get("api_key")) |key| {
         opts.api_key = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, key.string));
@@ -1464,6 +1674,11 @@ fn deserializeStreamOptions(
     }
     if (obj.get("ping_interval_ms")) |interval| {
         opts.ping_interval_ms = @intCast(interval.integer);
+    }
+    if (obj.get("headers")) |headers_val| {
+        const headers = try deserializeHeaderPairs(headers_val.array, allocator);
+        opts.headers = headers;
+        opts.owned_headers = ai_types.OwnedSlice(ai_types.HeaderPair).initOwned(headers);
     }
 
     return opts;
@@ -1615,6 +1830,12 @@ pub const MAX_IDENTIFIER_LENGTH: usize = 256;
 /// These come from client-side model_ref parsing and carry similar size constraints.
 pub const MAX_MODEL_FIELD_LENGTH: usize = 512;
 
+/// Maximum allowed length for provider request header names.
+pub const MAX_HEADER_NAME_LENGTH: usize = 256;
+
+/// Maximum allowed length for provider request header values.
+pub const MAX_HEADER_VALUE_LENGTH: usize = 8192;
+
 /// Validate that a string slice does not exceed the given maximum length.
 /// Returns an error if the input is too long.
 fn validateLength(slice: []const u8, max_len: usize) EnvelopeError!void {
@@ -1714,6 +1935,81 @@ test "serializeEnvelope with stream_request payload" {
     try std.testing.expect(std.mem.find(u8, json, "\"include_partial\":true") != null);
 
     envelope.deinit(allocator);
+}
+
+test "stream_request round trips model metadata" {
+    const allocator = std.testing.allocator;
+
+    const input = [_][]const u8{ "text", "image" };
+    const headers = [_]ai_types.HeaderPair{
+        .{ .name = "version", .value = "0.135.0" },
+        .{ .name = "ChatGPT-Account-ID", .value = "account-123" },
+    };
+    const model = ai_types.Model{
+        .id = "gpt-5.4-mini",
+        .name = "GPT-5.4 Mini",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &input,
+        .cost = .{ .input = 1.25, .output = 2.5, .cache_read = 0.125, .cache_write = 0.25 },
+        .context_window = 272_000,
+        .max_tokens = 16_384,
+        .headers = &headers,
+        .compat = .{
+            .supports_store = false,
+            .max_tokens_field = .max_tokens,
+            .thinking_format = .zai,
+        },
+    };
+
+    const context = ai_types.Context{ .messages = &.{} };
+    const options = ai_types.StreamOptions{ .headers = &headers };
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 1708234567890,
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = context,
+            .options = options,
+            .include_partial = true,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+    envelope.deinit(allocator);
+
+    var decoded = try deserializeEnvelope(json, allocator);
+    defer decoded.deinit(allocator);
+
+    try std.testing.expect(decoded.payload == .stream_request);
+    const decoded_model = decoded.payload.stream_request.model;
+    try std.testing.expectEqualStrings("gpt-5.4-mini", decoded_model.id);
+    try std.testing.expectEqualStrings("GPT-5.4 Mini", decoded_model.name);
+    try std.testing.expectEqualStrings("openai-codex-responses", decoded_model.api);
+    try std.testing.expectEqualStrings("openai-codex", decoded_model.provider);
+    try std.testing.expectEqualStrings("https://chatgpt.com/backend-api/codex", decoded_model.base_url);
+    try std.testing.expect(decoded_model.reasoning);
+    try std.testing.expectEqual(@as(usize, 2), decoded_model.input.len);
+    try std.testing.expectEqualStrings("text", decoded_model.input[0]);
+    try std.testing.expectEqualStrings("image", decoded_model.input[1]);
+    try std.testing.expectEqual(@as(u32, 272_000), decoded_model.context_window);
+    try std.testing.expectEqual(@as(u32, 16_384), decoded_model.max_tokens);
+    try std.testing.expect(decoded_model.headers != null);
+    try std.testing.expectEqual(@as(usize, 2), decoded_model.headers.?.len);
+    try std.testing.expectEqualStrings("version", decoded_model.headers.?[0].name);
+    try std.testing.expectEqualStrings("0.135.0", decoded_model.headers.?[0].value);
+    try std.testing.expect(decoded_model.compat != null);
+    try std.testing.expectEqual(@as(?bool, false), decoded_model.compat.?.supports_store);
+    try std.testing.expectEqual(@as(@TypeOf(decoded_model.compat.?.max_tokens_field), .max_tokens), decoded_model.compat.?.max_tokens_field);
+    try std.testing.expectEqual(@as(@TypeOf(decoded_model.compat.?.thinking_format), .zai), decoded_model.compat.?.thinking_format);
+    try std.testing.expect(decoded.payload.stream_request.options != null);
+    try std.testing.expect(decoded.payload.stream_request.options.?.headers != null);
+    try std.testing.expectEqualStrings("ChatGPT-Account-ID", decoded.payload.stream_request.options.?.headers.?[1].name);
 }
 
 test "deserializeEnvelope parses valid JSON" {
