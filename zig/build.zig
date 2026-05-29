@@ -1565,6 +1565,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
             .{ .name = "tui_app", .module = tui_app_mod },
+            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
