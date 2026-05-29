@@ -367,6 +367,11 @@ fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix
     return out;
 }
 
+fn responsesPathForModel(model: ai_types.Model) []const u8 {
+    if (std.mem.eql(u8, model.api, "openai-codex-responses")) return "/responses";
+    return "/v1/responses";
+}
+
 fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     var sb = StringBuilder{};
     sb.count("Bearer ");
@@ -659,7 +664,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = compat.http.HttpClient.init(allocator);
     defer client.deinit();
 
-    const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/responses") catch {
+    const url = buildUrlWithSuffix(allocator, model.base_url, responsesPathForModel(model)) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom url");
@@ -701,6 +706,18 @@ fn runThread(ctx: *ThreadCtx) void {
         stream.completeWithError("oom headers");
         return;
     };
+    if (model.headers) |model_headers| {
+        for (model_headers) |header| {
+            headers.append(allocator, .{ .name = header.name, .value = header.value }) catch {
+                allocator.free(auth);
+                allocator.free(url);
+                ctx.deinit();
+                stream.markThreadDone();
+                stream.completeWithError("oom headers");
+                return;
+            };
+        }
+    }
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1513,10 +1530,21 @@ fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocat
         .access = credentials.access,
         .expires = credentials.expires,
     }, allocator);
+    errdefer {
+        allocator.free(refreshed.refresh);
+        allocator.free(refreshed.access);
+    }
+    const provider_data = if (credentials.provider_data) |data|
+        try allocator.dupe(u8, data)
+    else
+        null;
+    errdefer if (provider_data) |data| allocator.free(data);
+
     return .{
         .refresh = refreshed.refresh,
         .access = refreshed.access,
         .expires = refreshed.expires,
+        .provider_data = provider_data,
     };
 }
 
@@ -1553,6 +1581,22 @@ test "OpenAI Codex provider registers OAuth hooks" {
     try std.testing.expectEqualStrings("openai-codex", provider.auth_provider_id.?);
     try std.testing.expect(provider.auth_refresh_fn != null);
     try std.testing.expect(provider.auth_get_api_key_fn != null);
+}
+
+test "OpenAI Codex responses use Codex backend path" {
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try std.testing.expectEqualStrings("/responses", responsesPathForModel(model));
 }
 
 /// Helper to parse JSON and return ParsedEvent for tests

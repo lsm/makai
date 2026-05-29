@@ -616,7 +616,11 @@ pub const AuthStorage = struct {
     pub fn loadDefault(allocator: std.mem.Allocator) !AuthStorage {
         if (shouldUseKeychain()) {
             switch (try loadFromKeychain(allocator)) {
-                .found => |storage| return storage,
+                .found => |storage| {
+                    var loaded = storage;
+                    try maybeImportCodexCliCredentials(&loaded);
+                    return loaded;
+                },
                 .not_found => {
                     var storage = try loadFromFileWithSaveFn(allocator, keychain_save_fn);
                     try maybeImportCodexCliCredentials(&storage);
