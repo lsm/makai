@@ -255,14 +255,19 @@ fn validateToolArguments(
 /// Create an error result for failed tool execution
 fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResult {
     const error_name = @errorName(err);
-    _ = error_name; // We could include this in the error message
     const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    errdefer allocator.free(content);
+    const text = try std.fmt.allocPrint(allocator, "Tool execution failed: {s}", .{error_name});
+    errdefer allocator.free(text);
     content[0] = .{ .text = .{
-        .text = try allocator.dupe(u8, "Tool execution failed"),
+        .text = text,
     } };
+    const details = try std.json.Stringify.valueAlloc(allocator, .{ .ok = false, .err = error_name }, .{});
+    errdefer allocator.free(details);
     return .{
         .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
-        .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
+        .details_json = ai_types.OwnedSlice(u8).initOwned(details),
+        .is_error = true,
     };
 }
 
@@ -274,6 +279,7 @@ fn rejectedToolResult(allocator: std.mem.Allocator) !AgentToolResult {
     return .{
         .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
         .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"rejected\":true}")),
+        .is_error = true,
     };
 }
 
@@ -513,10 +519,21 @@ test "compact output support requires root schema property" {
     try std.testing.expect(try supportsCompactToolOutput(std.testing.allocator, root));
 }
 
+test "compact output injection preserves explicit caller choice" {
+    const explicit_false = try withCompactToolOutput(std.testing.allocator, "{\"command\":\"ls -al\",\"compact_output\":false}");
+    defer std.testing.allocator.free(explicit_false);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -al\",\"compact_output\":false}", explicit_false);
+
+    const missing = try withCompactToolOutput(std.testing.allocator, "{\"command\":\"ls -al\"}");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"compact_output\":true") != null);
+}
+
 fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return try allocator.dupe(u8, args_json);
+    if (parsed.value.object.contains("compact_output")) return try allocator.dupe(u8, args_json);
     try parsed.value.object.put(allocator, "compact_output", .{ .bool = true });
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
@@ -660,6 +677,7 @@ fn executeToolCalls(
                 is_error = true;
                 break :blk result;
             };
+            is_error = result.is_error;
         } else {
             result = try createErrorResult(allocator, error.ToolNotFound);
             is_error = true;

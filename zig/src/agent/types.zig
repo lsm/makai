@@ -148,6 +148,7 @@ pub const AgentToolResult = struct {
     content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
+    is_error: bool = false,
 
     pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
         const details = self.details_json.slice();

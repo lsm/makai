@@ -1071,7 +1071,6 @@ fn executeStdioToolViaAgentProtocol(
         if (executor.bridge.popResult(allocator, executor.session_id, tool_call_id)) |result| {
             var owned_result = result;
             defer owned_result.deinit(allocator);
-            if (owned_result.is_error) return error.RemoteToolExecutionFailed;
             const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
             errdefer deinitUserContentParts(allocator, content);
             const details_json = try allocator.dupe(u8, owned_result.details_json);
@@ -1079,6 +1078,7 @@ fn executeStdioToolViaAgentProtocol(
             return .{
                 .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
                 .details_json = ai_types.OwnedSlice(u8).initOwned(details_json),
+                .is_error = owned_result.is_error,
             };
         }
         compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
