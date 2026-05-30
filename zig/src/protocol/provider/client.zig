@@ -251,11 +251,19 @@ pub const ProtocolClient = struct {
         return false;
     }
 
+    fn hasReconstructedToolCall(recon: *const partial_reconstructor.PartialReconstructor) bool {
+        var iter = recon.content_blocks.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == .tool_call) return true;
+        }
+        return false;
+    }
+
     fn cloneOrReconstructResult(self: *Self, stream_id: protocol_types.Ulid, result: ai_types.AssistantMessage) !ai_types.AssistantMessage {
-        if (result.stop_reason == .tool_use and !hasToolCallContent(result)) {
+        if (!hasToolCallContent(result)) {
             if (self.reconstructors.getPtr(stream_id)) |recon| {
-                if (recon.content_blocks.count() > 0) {
-                    const rebuilt = recon.buildMessage(result.stop_reason, result.timestamp) catch null;
+                if (hasReconstructedToolCall(recon)) {
+                    const rebuilt = recon.buildMessage(.tool_use, result.timestamp) catch null;
                     if (rebuilt) |msg| {
                         if (hasToolCallContent(msg)) return msg;
                         var cleanup = msg;
@@ -1714,7 +1722,7 @@ test "processEnvelope reconstructs streamed tool calls when terminal result omit
             .provider = result_provider,
             .model = result_model,
             .usage = .{},
-            .stop_reason = .tool_use,
+            .stop_reason = .stop,
             .timestamp = 20,
             .is_owned = true,
         } },
@@ -1728,6 +1736,7 @@ test "processEnvelope reconstructs streamed tool calls when terminal result omit
     try client.processEnvelope(env_result);
 
     const got = (try client.waitResultFor(sid, 1000)).?;
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, got.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), got.content.len);
     try std.testing.expect(got.content[0] == .tool_call);
     try std.testing.expectEqualStrings("call_shell", got.content[0].tool_call.id);

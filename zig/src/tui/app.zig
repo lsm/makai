@@ -125,8 +125,11 @@ pub const App = struct {
     last_view_height: usize = 8,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
-    /// `Ctrl+Y` / `/copy` provide an explicit copy path because mouse reporting
-    /// is enabled for wheel scrolling while the TUI is active.
+    ///
+    /// The TUI does not enable terminal mouse reporting, so the terminal keeps
+    /// ownership of the mouse and native click-drag selection + copy works out
+    /// of the box (like other agent CLIs). `Ctrl+Y` / `/copy` provide an
+    /// explicit OSC 52 copy path for when dragging isn't convenient.
     pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
@@ -1185,12 +1188,9 @@ pub const TuiModel = struct {
                     else => {},
                 }
             },
-            .mouse => |mouse| {
-                switch (mouse.button) {
-                    .wheel_up => app.state.transcript_scroll += 3,
-                    .wheel_down => app.state.transcript_scroll -|= 3,
-                    else => {},
-                }
+            .mouse => {
+                // Mouse reporting is intentionally not enabled; if a terminal
+                // sends a mouse event anyway, leave app state unchanged.
             },
             .tick => {
                 app.state.anim_tick +%= 1;
@@ -1410,7 +1410,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     defer production.deinit();
     production.initBridge();
 
-    var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, .{ .mouse = true });
+    var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
     program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();

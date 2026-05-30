@@ -313,3 +313,132 @@ test "InProcessProviderProtocolBridge smoke test" {
 
     try std.testing.expect(saw_start);
 }
+
+test "InProcessProviderProtocolBridge preserves streamed tool call terminal result" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    const Mock = struct {
+        fn partial(model: ai_types.Model) ai_types.AssistantMessage {
+            return .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            };
+        }
+
+        fn stream(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.StreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = context;
+            _ = options;
+
+            const s = try a.create(event_stream.AssistantMessageEventStream);
+            s.* = event_stream.AssistantMessageEventStream.init(a);
+            const p = partial(model);
+
+            s.push(.{ .start = .{ .partial = p } }) catch {};
+            s.push(.{ .toolcall_start = .{
+                .content_index = 0,
+                .id = "call_shell",
+                .name = "shell_execute",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_delta = .{
+                .content_index = 0,
+                .delta = "{\"command\":\"ls -al\"}",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_end = .{
+                .content_index = 0,
+                .tool_call = .{ .id = "call_shell", .name = "shell_execute", .arguments_json = "{\"command\":\"ls -al\"}" },
+                .partial = p,
+            } }) catch {};
+
+            // Match OpenAI Responses behavior: terminal result can omit streamed
+            // function-call content and report a generic stop reason.
+            s.complete(try ai_types.cloneAssistantMessage(a, .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            }));
+            s.markThreadDone();
+            return s;
+        }
+
+        fn streamSimple(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.SimpleStreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = options;
+            return stream(model, context, null, a);
+        }
+    };
+
+    try registry.registerApiProvider(.{
+        .api = "mock-tool-api",
+        .stream = Mock.stream,
+        .stream_simple = Mock.streamSimple,
+    }, null);
+
+    var bridge = InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+    const model = ai_types.Model{
+        .id = "mock-tool-model",
+        .name = "Mock Tool",
+        .api = "mock-tool-api",
+        .provider = "mock",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const user = ai_types.Message{ .user = .{
+        .content = .{ .text = "run ls -al" },
+        .timestamp = compat.time.nowMillis(),
+    } };
+    const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
+
+    const stream = try protocol.stream(model, ctx, .{ .api_key = "test-key" }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var saw_tool_end = false;
+    while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
+        if (ev == .toolcall_end) saw_tool_end = true;
+    }
+
+    const result = stream.getResult().?;
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expect(result.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("shell_execute", result.content[0].tool_call.name);
+
+    var owned_result = result;
+    owned_result.deinit(allocator);
+    stream.result = null;
+    try std.testing.expect(saw_tool_end);
+}
