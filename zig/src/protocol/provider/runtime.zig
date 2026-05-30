@@ -32,6 +32,11 @@ pub const ProviderProtocolRuntime = struct {
 
             // Forward all pending stream events first.
             while (active_stream.event_stream.poll()) |event| {
+                var event_cleanup = event;
+                defer if (active_stream.event_stream.owns_events) {
+                    protocol_types.deinitEvent(self.allocator, &event_cleanup);
+                };
+
                 const seq = self.server.getNextSequence(stream_id);
                 const env = protocol_types.Envelope{
                     .stream_id = stream_id,

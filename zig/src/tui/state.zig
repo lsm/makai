@@ -301,6 +301,7 @@ pub const AppState = struct {
     sessions: std.ArrayList(SessionEntry) = .empty,
     composer: ComposerState = .{},
     approval: ApprovalState = .{},
+    permission_mode: tui_runtime.PermissionMode = .ask,
     status: StatusState = .{},
     queue: QueueState = .{},
     telemetry: TelemetryState = .{},

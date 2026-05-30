@@ -34,8 +34,10 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writeSep(writer, allocator);
     if (state.mode == .approval) {
         try writeStyledValue(writer, allocator, "perm", "pending", tui_theme.warningText());
+    } else if (state.permission_mode == .bypass) {
+        try writeStyledValue(writer, allocator, "perm", "bypass", tui_theme.warningText());
     } else {
-        try writeSegment(writer, allocator, "perm", "ask");
+        try writeSegment(writer, allocator, "perm", @tagName(state.permission_mode));
     }
     try writeSep(writer, allocator);
     try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
@@ -181,4 +183,16 @@ test "status bar renders context gauge cost and permission" {
     // value still renders (e.g. "$0.0300").
     try std.testing.expect(std.mem.indexOf(u8, text, "$") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
+}
+
+test "status bar renders bypass permission mode" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.permission_mode = .bypass;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bypass") != null);
 }

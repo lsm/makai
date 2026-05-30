@@ -435,6 +435,16 @@ fn buildCompoundId(allocator: std.mem.Allocator, call_id: []const u8, item_id: [
     return out;
 }
 
+fn pushOwnedEvent(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream, event: ai_types.AssistantMessageEvent) !void {
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, event);
+    errdefer {
+        var cleanup = owned;
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
+    }
+
+    try stream.push(owned);
+}
+
 /// Event parsed from a response SSE event
 const ParsedEvent = struct {
     event_type: EventType,
@@ -611,17 +621,129 @@ fn parseResponseEventFromValue(json_value: std.json.Value) ?ParsedEvent {
     return null;
 }
 
-/// Parse a response event from raw SSE data bytes
-/// Allocates temporary memory for JSON parsing which is freed before returning.
-/// Note: The returned ParsedEvent contains slices that are invalid after this function returns!
-/// For tests, use parseResponseEventFromValue with a long-lived JSON value instead.
+fn cloneOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |s| return try allocator.dupe(u8, s);
+    return null;
+}
+
+fn cloneOutputItem(allocator: std.mem.Allocator, item: ParsedEvent.OutputItem) !ParsedEvent.OutputItem {
+    const item_type = try allocator.dupe(u8, item.item_type);
+    errdefer allocator.free(item_type);
+
+    const id = try cloneOptionalString(allocator, item.id);
+    errdefer if (id) |s| allocator.free(s);
+
+    const call_id = try cloneOptionalString(allocator, item.call_id);
+    errdefer if (call_id) |s| allocator.free(s);
+
+    const name = try cloneOptionalString(allocator, item.name);
+    errdefer if (name) |s| allocator.free(s);
+
+    const arguments = try cloneOptionalString(allocator, item.arguments);
+    errdefer if (arguments) |s| allocator.free(s);
+
+    return .{
+        .item_type = item_type,
+        .id = id,
+        .call_id = call_id,
+        .name = name,
+        .arguments = arguments,
+    };
+}
+
+fn deinitOutputItem(allocator: std.mem.Allocator, item: ParsedEvent.OutputItem) void {
+    allocator.free(item.item_type);
+    if (item.id) |s| allocator.free(s);
+    if (item.call_id) |s| allocator.free(s);
+    if (item.name) |s| allocator.free(s);
+    if (item.arguments) |s| allocator.free(s);
+}
+
+fn cloneParsedEvent(allocator: std.mem.Allocator, event: ParsedEvent) !ParsedEvent {
+    return switch (event.event_type) {
+        .text_delta => |delta| .{
+            .event_type = .{ .text_delta = try allocator.dupe(u8, delta) },
+            .output_index = event.output_index,
+        },
+        .output_item_added => |item| .{
+            .event_type = .{ .output_item_added = try cloneOutputItem(allocator, item) },
+            .output_index = event.output_index,
+        },
+        .function_call_args_delta => |args| blk: {
+            const item_id = try allocator.dupe(u8, args.item_id);
+            errdefer allocator.free(item_id);
+            const delta = try allocator.dupe(u8, args.delta);
+            errdefer allocator.free(delta);
+            break :blk .{
+                .event_type = .{ .function_call_args_delta = .{ .item_id = item_id, .delta = delta } },
+                .output_index = event.output_index,
+            };
+        },
+        .function_call_args_done => |args| blk: {
+            const item_id = try allocator.dupe(u8, args.item_id);
+            errdefer allocator.free(item_id);
+            const arguments = try allocator.dupe(u8, args.arguments);
+            errdefer allocator.free(arguments);
+            break :blk .{
+                .event_type = .{ .function_call_args_done = .{ .item_id = item_id, .arguments = arguments } },
+                .output_index = event.output_index,
+            };
+        },
+        .reasoning_delta => |delta| .{
+            .event_type = .{ .reasoning_delta = try allocator.dupe(u8, delta) },
+            .output_index = event.output_index,
+        },
+        .reasoning_done => .{
+            .event_type = .reasoning_done,
+            .output_index = event.output_index,
+        },
+        .output_item_done => |item| .{
+            .event_type = .{ .output_item_done = try cloneOutputItem(allocator, item) },
+            .output_index = event.output_index,
+        },
+        .completed => |info| .{
+            .event_type = .{ .completed = .{
+                .status = try cloneOptionalString(allocator, info.status),
+                .usage = info.usage,
+            } },
+            .output_index = event.output_index,
+        },
+    };
+}
+
+fn deinitParsedEvent(allocator: std.mem.Allocator, event: *ParsedEvent) void {
+    switch (event.event_type) {
+        .text_delta => |delta| allocator.free(delta),
+        .output_item_added => |item| deinitOutputItem(allocator, item),
+        .function_call_args_delta => |args| {
+            allocator.free(args.item_id);
+            allocator.free(args.delta);
+        },
+        .function_call_args_done => |args| {
+            allocator.free(args.item_id);
+            allocator.free(args.arguments);
+        },
+        .reasoning_delta => |delta| allocator.free(delta),
+        .reasoning_done => {},
+        .output_item_done => |item| deinitOutputItem(allocator, item),
+        .completed => |info| {
+            if (info.status) |status| allocator.free(status);
+        },
+    }
+    event.* = undefined;
+}
+
+/// Parse a response event from raw SSE data bytes.
+/// Returned string slices are owned by the caller and must be freed with
+/// deinitParsedEvent.
 fn parseResponseEventToStruct(data: []const u8, allocator: std.mem.Allocator) ?ParsedEvent {
     if (std.mem.eql(u8, data, "[DONE]")) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
     defer parsed.deinit();
 
-    return parseResponseEventFromValue(parsed.value);
+    const borrowed = parseResponseEventFromValue(parsed.value) orelse return null;
+    return cloneParsedEvent(allocator, borrowed) catch null;
 }
 
 /// Tracking state for in-progress tool calls
@@ -986,7 +1108,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     // Emit start event
-    _ = stream.push(.{
+    _ = pushOwnedEvent(allocator, stream, .{
         .start = .{
             .partial = .{
                 .content = &.{},
@@ -1042,7 +1164,8 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            const parsed = parseResponseEventToStruct(ev.data, allocator) orelse continue;
+            var parsed = parseResponseEventToStruct(ev.data, allocator) orelse continue;
+            defer deinitParsedEvent(allocator, &parsed);
 
             switch (parsed.event_type) {
                 .text_delta => |delta| {
@@ -1052,7 +1175,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         text_started = true;
 
                         // Emit text_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .text_start = .{
                                 .content_index = text_content_index.?,
                                 .partial = .{
@@ -1072,7 +1195,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Emit text_delta event
                     if (text_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .text_delta = .{
                                 .content_index = idx,
                                 .delta = delta,
@@ -1160,7 +1283,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         };
 
                         // Emit toolcall_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .toolcall_start = .{
                                 .content_index = content_index,
                                 .id = compound_id,
@@ -1184,7 +1307,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         tool_call_tracker_instance.appendDelta(content_index, args.delta) catch {};
 
                         // Emit toolcall_delta event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .toolcall_delta = .{
                                 .content_index = content_index,
                                 .delta = args.delta,
@@ -1212,7 +1335,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         thinking_started = true;
 
                         // Emit thinking_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_start = .{
                                 .content_index = thinking_content_index.?,
                                 .partial = .{
@@ -1232,7 +1355,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Emit thinking_delta event
                     if (thinking_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_delta = .{
                                 .content_index = idx,
                                 .delta = delta,
@@ -1252,7 +1375,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .reasoning_done => {
                     // Emit thinking_end event
                     if (thinking_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_end = .{
                                 .content_index = idx,
                                 .content = thinking.items,
@@ -1275,8 +1398,15 @@ fn runThread(ctx: *ThreadCtx) void {
                         if (item_id_to_content_index.get(item_id)) |content_index| {
                             // Complete the tool call
                             if (tool_call_tracker_instance.completeCall(content_index, allocator)) |tc| {
+                                defer {
+                                    allocator.free(tc.id);
+                                    allocator.free(tc.name);
+                                    if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
+                                    if (tc.thought_signature) |sig| allocator.free(sig);
+                                }
+
                                 // Emit toolcall_end event
-                                _ = stream.push(.{
+                                _ = pushOwnedEvent(allocator, stream, .{
                                     .toolcall_end = .{
                                         .content_index = content_index,
                                         .tool_call = tc,
@@ -1486,6 +1616,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
     s.wait_for_thread_on_deinit = true;
 
     const ctx = try allocator.create(ThreadCtx);
@@ -1928,6 +2059,102 @@ test "parseResponseEventToStruct returns null for invalid JSON" {
     const allocator = std.testing.allocator;
     const result = parseResponseEventToStruct("not valid json", allocator);
     try std.testing.expect(result == null);
+}
+
+test "parseResponseEventToStruct owns function call output item strings" {
+    const allocator = std.testing.allocator;
+    const data = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"shell_execute\",\"arguments\":\"\"}}";
+
+    var event = parseResponseEventToStruct(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitParsedEvent(allocator, &event);
+
+    const clobber = try allocator.alloc(u8, 4096);
+    defer allocator.free(clobber);
+    @memset(clobber, 'x');
+
+    switch (event.event_type) {
+        .output_item_added => |item| {
+            try std.testing.expectEqualStrings("function_call", item.item_type);
+            try std.testing.expectEqualStrings("fc_123", item.id.?);
+            try std.testing.expectEqualStrings("call_abc", item.call_id.?);
+            try std.testing.expectEqualStrings("shell_execute", item.name.?);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "OpenAI Responses stream events own cloned function call strings" {
+    const allocator = std.testing.allocator;
+
+    var stream = event_stream.AssistantMessageEventStream.init(allocator);
+    stream.owns_events = true;
+    defer stream.deinit();
+
+    const added_data = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"shell_execute\",\"arguments\":\"\"}}";
+    var added = parseResponseEventToStruct(added_data, allocator) orelse return error.TestExpectedAdded;
+    const added_item = added.event_type.output_item_added;
+    const compound_id = try buildCompoundId(allocator, added_item.call_id.?, added_item.id.?);
+    defer allocator.free(compound_id);
+
+    try pushOwnedEvent(allocator, &stream, .{ .toolcall_start = .{
+        .content_index = 0,
+        .id = compound_id,
+        .name = added_item.name.?,
+        .partial = .{
+            .content = &.{},
+            .api = "openai-codex-responses",
+            .provider = "openai-codex",
+            .model = "gpt-test",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 1,
+            .is_owned = false,
+        },
+    } });
+    deinitParsedEvent(allocator, &added);
+
+    const start_event = stream.poll() orelse return error.TestExpectedStartEvent;
+    switch (start_event) {
+        .toolcall_start => |start| {
+            try std.testing.expectEqualStrings("call_abc|fc_123", start.id);
+            try std.testing.expectEqualStrings("shell_execute", start.name);
+        },
+        else => return error.TestExpectedStartEvent,
+    }
+    var mutable_start = start_event;
+    ai_types.deinitAssistantMessageEvent(allocator, &mutable_start);
+
+    const delta_data = "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_123\",\"delta\":\"{\\\"command\\\":\\\"ls -al\\\"}\"}";
+    var delta = parseResponseEventToStruct(delta_data, allocator) orelse return error.TestExpectedDelta;
+    const args = delta.event_type.function_call_args_delta;
+    try pushOwnedEvent(allocator, &stream, .{ .toolcall_delta = .{
+        .content_index = 0,
+        .delta = args.delta,
+        .partial = .{
+            .content = &.{},
+            .api = "openai-codex-responses",
+            .provider = "openai-codex",
+            .model = "gpt-test",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 2,
+            .is_owned = false,
+        },
+    } });
+    deinitParsedEvent(allocator, &delta);
+
+    const delta_event = stream.poll() orelse return error.TestExpectedDeltaEvent;
+    switch (delta_event) {
+        .toolcall_delta => |tool_delta| {
+            try std.testing.expectEqualStrings("{\"command\":\"ls -al\"}", tool_delta.delta);
+        },
+        else => return error.TestExpectedDeltaEvent,
+    }
+    var mutable_delta = delta_event;
+    ai_types.deinitAssistantMessageEvent(allocator, &mutable_delta);
 }
 
 test "parseResponseEventFromValue returns null for unknown event type" {

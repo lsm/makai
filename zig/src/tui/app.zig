@@ -156,6 +156,7 @@ pub const App = struct {
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
+        app.state.permission_mode = app.runtime.?.permissionMode();
         try app.state.setRegisteredTools(app.runtime.?.availableTools());
         if (app.runtime.?.currentModel()) |model| {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);

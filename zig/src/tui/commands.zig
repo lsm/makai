@@ -82,7 +82,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
     .{ .name = "resume", .kind = .@"resume", .usage = "/resume [id]", .description = "Resume saved session", .handler = handleResume },
     .{ .name = "tools", .kind = .tools, .usage = "/tools", .description = "List registered tools", .handler = handleTools },
-    .{ .name = "permissions", .kind = .permissions, .usage = "/permissions", .description = "Show tool permission policies", .handler = handlePermissions },
+    .{ .name = "permissions", .kind = .permissions, .usage = "/permissions [ask|bypass]", .description = "Show or set tool permission mode", .handler = handlePermissions },
     .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
     .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
@@ -301,11 +301,25 @@ fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
 }
 
 fn handlePermissions(ctx: CommandContext, command: Command) !CommandResult {
-    _ = command;
+    if (command.arg) |arg| {
+        const mode = parsePermissionMode(arg) orelse {
+            return .{
+                .output = try std.fmt.allocPrint(ctx.allocator, "unknown permission mode: {s}", .{arg}),
+                .is_error = true,
+            };
+        };
+        const runtime = ctx.runtime orelse return error.NoRuntimeConfigured;
+        try runtime.setPermissionMode(mode);
+        ctx.state.permission_mode = mode;
+        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "permission mode set to {s}", .{@tagName(mode)}) };
+    }
+
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     const writer = &out.writer;
     try writer.writeAll("tool permissions:\n");
     if (ctx.runtime) |runtime| {
+        ctx.state.permission_mode = runtime.permissionMode();
+        try writer.print("  mode: {s}\n", .{@tagName(runtime.permissionMode())});
         if (runtime.tool_approval_callback != null) {
             try writer.writeAll("  approval callback: configured\n");
         } else {
@@ -318,6 +332,12 @@ fn handlePermissions(ctx: CommandContext, command: Command) !CommandResult {
     try writer.print("  current approval: {s}", .{@tagName(ctx.state.approval.status)});
     if (ctx.state.approval.status == .pending) try writer.print("\n  pending tool: {s} ({s})", .{ ctx.state.approval.tool_name, ctx.state.approval.tool_call_id });
     return .{ .output = try out.toOwnedSlice() };
+}
+
+fn parsePermissionMode(value: []const u8) ?tui_runtime.PermissionMode {
+    if (std.mem.eql(u8, value, "ask")) return .ask;
+    if (std.mem.eql(u8, value, "bypass")) return .bypass;
+    return null;
 }
 
 fn handleCompact(ctx: CommandContext, command: Command) !CommandResult {
@@ -469,6 +489,24 @@ test "permissions reports runtime approval state not hardcoded policy" {
 
     try std.testing.expect(std.mem.indexOf(u8, result.output, "runtime: not configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "reads inside workspace") == null);
+}
+
+test "permissions command switches runtime mode" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    var bypass = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .permissions, .arg = "bypass" });
+    defer bypass.deinit(std.testing.allocator);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, state.permission_mode);
+    try std.testing.expect(std.mem.indexOf(u8, bypass.output, "permission mode set to bypass") != null);
+
+    var ask = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .permissions, .arg = "ask" });
+    defer ask.deinit(std.testing.allocator);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, state.permission_mode);
 }
 
 test "runtime dependent commands dispatch to no-runtime errors" {

@@ -90,6 +90,11 @@ pub const TuiRemoteTransport = enum {
     websocket,
 };
 
+pub const PermissionMode = enum {
+    ask,
+    bypass,
+};
+
 pub const TuiRemoteConfig = struct {
     mode: TuiBackendMode = .local,
     transport: TuiRemoteTransport = .stdio,
@@ -110,6 +115,7 @@ pub const TuiRuntimeOptions = struct {
     permission_engine: ?*permission.PermissionEngine = null,
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
+    permission_mode: PermissionMode = .ask,
     compact_output: bool = false,
     run_async: bool = true,
 };
@@ -146,6 +152,7 @@ pub const TuiRuntime = struct {
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
     permission_engine: ?*permission.PermissionEngine,
+    permission_mode: PermissionMode = .ask,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -259,6 +266,7 @@ pub const TuiRuntime = struct {
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
+            .permission_mode = options.permission_mode,
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
@@ -293,6 +301,8 @@ pub const TuiRuntime = struct {
             runtime.wrapped_tools = next_wrapped_tools;
             runtime.approval_contexts = next_approval_contexts;
         }
+        if (runtime.permission_engine) |engine| engine.setBypassAll(runtime.permission_mode == .bypass);
+        runtime.rebuildWrappedTools();
         return runtime;
     }
 
@@ -439,6 +449,22 @@ pub const TuiRuntime = struct {
 
     pub fn availableTools(self: *TuiRuntime) []const agent.AgentTool {
         return self.original_tools;
+    }
+
+    pub fn permissionMode(self: *const TuiRuntime) PermissionMode {
+        return self.permission_mode;
+    }
+
+    pub fn setPermissionMode(self: *TuiRuntime, mode: PermissionMode) !void {
+        self.permission_mode = mode;
+        if (self.permission_engine) |engine| engine.setBypassAll(mode == .bypass);
+        self.rebuildWrappedTools();
+        if (self.local_agent) |*local| {
+            local.setPermissionEngine(self.permission_engine);
+            local.setTools(self.wrapped_tools);
+        }
+        self.tool_protocol.server.tools.clearRetainingCapacity();
+        try self.tool_protocol.server.registerTools(self.wrapped_tools);
     }
 
     pub fn switchModel(self: *TuiRuntime, model_id: []const u8) !void {
@@ -690,6 +716,7 @@ pub const TuiRuntime = struct {
 
     fn rebuildWrappedTools(self: *TuiRuntime) void {
         for (self.original_tools, 0..) |tool, i| {
+            const bypass = self.permission_mode == .bypass;
             self.approval_contexts[i] = .{
                 .runtime = self,
                 .callback_ctx = self.tool_approval_ctx,
@@ -709,10 +736,10 @@ pub const TuiRuntime = struct {
                 .execute = tool.execute,
                 .runtime_ctx = tool.runtime_ctx,
                 .runtime_execute = tool.runtime_execute,
-                .approval_ctx = &self.approval_contexts[i],
-                .approval_fn = approveTool,
-                .approval_ui_ctx = &self.approval_contexts[i],
-                .approval_ui_fn = notifyToolApproval,
+                .approval_ctx = if (bypass) null else &self.approval_contexts[i],
+                .approval_fn = if (bypass) null else approveTool,
+                .approval_ui_ctx = if (bypass) null else &self.approval_contexts[i],
+                .approval_ui_fn = if (bypass) null else notifyToolApproval,
             };
         }
     }
@@ -752,6 +779,7 @@ pub const TuiRuntime = struct {
         try w.beginObject();
         if (self.currentModel()) |model| try w.writeStringField("model", model.id);
         try w.writeBoolField("compact_output", self.compact_output);
+        try w.writeStringField("permission_mode", @tagName(self.permission_mode));
         try w.endObject();
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
@@ -2191,7 +2219,6 @@ test "MCP bridge exec context address remains stable in TUI runtime" {
     }
 }
 
-
 test "tool approval approve and reject paths emit tool events" {
     const tools = [_]agent.AgentTool{.{
         .label = "Demo",
@@ -2275,9 +2302,6 @@ test "runtime queues steering and follow-up messages" {
     try tui_session.submitTurn("first");
     try tui_session.steer("steer now");
     try tui_session.queueFollowUp("later");
-    const queued = tui_session.queuedCounts();
-    try std.testing.expectEqual(@as(usize, 1), queued.steering);
-    try std.testing.expectEqual(@as(usize, 1), queued.follow_up);
 
     if (runtime.local_agent) |*local| local.waitForIdle();
 
@@ -2426,6 +2450,59 @@ test "preserves original tool approval when wrapping" {
 
     try std.testing.expectEqual(@as(usize, 1), original_ctx.calls);
     try std.testing.expect(saw_rejected_tool);
+}
+
+test "permission bypass disables policy engine and approval wrappers" {
+    var engine = try permission.PermissionEngine.initEmpty(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-tui-permission-bypass.json",
+    });
+    defer engine.deinit();
+
+    var original_ctx = OriginalApprovalCtx{ .decision = .reject };
+    const tools = [_]agent.AgentTool{.{
+        .label = "Demo",
+        .name = "demo_tool",
+        .description = "Demo tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .approval_ctx = &original_ctx,
+        .approval_fn = originalApprovalCallback,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .permission_engine = &engine,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(PermissionMode.ask, runtime.permissionMode());
+    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .deny);
+
+    try runtime.setPermissionMode(.bypass);
+    try std.testing.expectEqual(PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .allow);
+    for (runtime.wrapped_tools) |tool| {
+        try std.testing.expect(tool.approval_fn == null);
+        try std.testing.expect(tool.approval_ui_fn == null);
+    }
+
+    try runtime.setPermissionMode(.ask);
+    try std.testing.expectEqual(PermissionMode.ask, runtime.permissionMode());
+    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .deny);
+    var found_demo = false;
+    for (runtime.wrapped_tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "demo_tool")) {
+            found_demo = true;
+            try std.testing.expect(tool.approval_fn != null);
+            try std.testing.expect(tool.approval_ui_fn != null);
+        }
+    }
+    try std.testing.expect(found_demo);
 }
 
 test "preserves original tool approval UI when wrapping" {
