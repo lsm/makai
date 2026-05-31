@@ -116,6 +116,7 @@ pub const TuiRuntimeOptions = struct {
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
     permission_mode: PermissionMode = .bypass,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     compact_output: bool = false,
     run_async: bool = true,
 };
@@ -153,6 +154,7 @@ pub const TuiRuntime = struct {
     tool_approval_callback: ?ToolApprovalCallback,
     permission_engine: ?*permission.PermissionEngine,
     permission_mode: PermissionMode = .bypass,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -267,6 +269,7 @@ pub const TuiRuntime = struct {
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
             .permission_mode = options.permission_mode,
+            .thinking_level = options.thinking_level,
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
@@ -380,6 +383,7 @@ pub const TuiRuntime = struct {
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
+                self.local_agent.?.setThinkingLevel(self.thinking_level);
                 self.tool_protocol.server.tools.clearRetainingCapacity();
                 try self.tool_protocol.server.registerTools(self.wrapped_tools);
                 self.local_agent.?.setTools(self.wrapped_tools);
@@ -453,6 +457,15 @@ pub const TuiRuntime = struct {
 
     pub fn permissionMode(self: *const TuiRuntime) PermissionMode {
         return self.permission_mode;
+    }
+
+    pub fn thinkingLevel(self: *const TuiRuntime) ai_types.ThinkingLevel {
+        return self.thinking_level;
+    }
+
+    pub fn setThinkingLevel(self: *TuiRuntime, level: ai_types.ThinkingLevel) void {
+        self.thinking_level = level;
+        if (self.local_agent) |*local| local.setThinkingLevel(level);
     }
 
     pub fn setPermissionMode(self: *TuiRuntime, mode: PermissionMode) !void {
@@ -780,6 +793,7 @@ pub const TuiRuntime = struct {
         if (self.currentModel()) |model| try w.writeStringField("model", model.id);
         try w.writeBoolField("compact_output", self.compact_output);
         try w.writeStringField("permission_mode", @tagName(self.permission_mode));
+        try w.writeStringField("thinking_level", @tagName(self.thinking_level));
         try w.endObject();
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
@@ -1859,6 +1873,7 @@ const test_model_b = ai_types.Model{
 const MockProtocolCtx = struct {
     call_count: usize = 0,
     last_model_id: []const u8 = "",
+    last_thinking_level: ai_types.ThinkingLevel = .off,
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
@@ -1958,6 +1973,7 @@ fn mockStream(
     const mock: *MockProtocolCtx = @ptrCast(@alignCast(ctx.?));
     mock.call_count += 1;
     mock.last_model_id = model.id;
+    mock.last_thinking_level = options.thinking_level;
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -2583,6 +2599,28 @@ test "initial model id selects matching model" {
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "thinking level affects next local turn" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    runtime.setThinkingLevel(.high);
+    try tui_session.submitTurn("hi");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_turn_start = false;
+    var saw_message_start = false;
+    var saw_text_delta = false;
+    var saw_message_end = false;
+    var saw_turn_end = false;
+    collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, mock.last_thinking_level);
 }
 
 test "model switch is rejected while async turn is running" {

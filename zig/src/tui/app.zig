@@ -187,6 +187,7 @@ pub const App = struct {
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
         app.state.permission_mode = app.runtime.?.permissionMode();
+        app.state.thinking_level = app.runtime.?.thinkingLevel();
         try app.state.setRegisteredTools(app.runtime.?.availableTools());
         if (app.runtime.?.currentModel()) |model| {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
@@ -802,15 +803,20 @@ pub const App = struct {
         self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
     }
 
+    fn cycleThinkingLevel(self: *App) void {
+        const level = self.state.cycleThinkingLevel();
+        if (self.runtime) |runtime| runtime.setThinkingLevel(level);
+    }
+
     pub fn appendWelcome(self: *App) !void {
         if (self.state.sessions.items.len == 0) {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
             const tips = if (self.supportsStreamingShortcuts())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • Ctrl+Y copy reply • /help commands"
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • Ctrl+Y copy reply • /help commands";
+                "Enter submit • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1108,10 +1114,6 @@ pub const TuiModel = struct {
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
                         },
-                        'r' => {
-                            app.state.toggleThinking();
-                            return .none;
-                        },
                         'y' => {
                             app.copyLastAssistant();
                             app.flushClipboard(ctx);
@@ -1121,6 +1123,10 @@ pub const TuiModel = struct {
                     },
                     else => {},
                 };
+                if (key.key == .tab and key.modifiers.eql(.{ .shift = true })) {
+                    app.cycleThinkingLevel();
+                    return .none;
+                }
                 if (app.state.mode == .approval) {
                     switch (key.key) {
                         .char => |c| switch (c) {
@@ -1801,6 +1807,16 @@ test "TuiModel Shift Enter inserts newline without submitting" {
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqualStrings("first\n", model.app.?.state.composer.text());
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
+}
+
+test "TuiModel Shift Tab cycles thinking level" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, model.app.?.state.thinking_level);
+    const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, model.app.?.state.thinking_level);
 }
 
 test "TuiModel drains events before routing Enter while streaming" {

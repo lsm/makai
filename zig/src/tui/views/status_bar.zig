@@ -40,6 +40,8 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         try writeSegment(writer, allocator, "perm", @tagName(state.permission_mode));
     }
     try writeSep(writer, allocator);
+    try writeSegment(writer, allocator, "think", @tagName(state.thinking_level));
+    try writeSep(writer, allocator);
     try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
     if (state.status.last_error.len > 0) {
         try writeSep(writer, allocator);
@@ -183,6 +185,8 @@ test "status bar renders context gauge cost and permission" {
     // value still renders (e.g. "$0.0300").
     try std.testing.expect(std.mem.indexOf(u8, text, "$") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "minimal") != null);
 }
 
 test "status bar renders bypass permission mode" {

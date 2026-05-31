@@ -975,6 +975,7 @@ pub const Agent = struct {
             .max_tokens = null,
             .api_key = null,
             .cancel_token = self._cancel_token,
+            .thinking_level = self._state.thinking_level,
             .max_iterations = null,
             .session_id = self._session_id,
             .thinking_budgets = self._thinking_budgets,

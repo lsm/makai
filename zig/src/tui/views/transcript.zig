@@ -25,7 +25,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
 
     if (visible_entries.items.len == 0) {
         var ready_text: []const u8 = "Makai ready. Type message, /quit exits.";
-        if (state.transcript.items.len > 0 and !state.show_thinking) ready_text = "Thinking hidden. Ctrl+R shows reasoning.";
+        if (state.transcript.items.len > 0 and !state.show_thinking) ready_text = "Thinking hidden.";
         const ready_line = try tui_theme.muted().render(allocator, ready_text);
         defer allocator.free(ready_line);
         return padTopToHeight(allocator, ready_line, options.height);
@@ -382,6 +382,19 @@ test "transcript hides thinking when toggled off" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "secret plan") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "visible answer") != null);
+}
+
+test "transcript empty visible state does not advertise removed Ctrl R shortcut" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.thinking, "secret plan");
+    state.show_thinking = false;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Thinking hidden.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ctrl+R") == null);
 }
 
 test "transcript renders markdown syntax" {

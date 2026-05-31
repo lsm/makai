@@ -307,6 +307,7 @@ pub const AppState = struct {
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     show_thinking: bool = true,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
     /// spinner frames and other time-based effects from this so animation stays
     /// in lockstep with the render loop without each view tracking its own clock.
@@ -476,6 +477,17 @@ pub const AppState = struct {
 
     pub fn toggleThinking(self: *AppState) void {
         self.show_thinking = !self.show_thinking;
+    }
+
+    pub fn cycleThinkingLevel(self: *AppState) ai_types.ThinkingLevel {
+        self.thinking_level = switch (self.thinking_level) {
+            .minimal => .low,
+            .low => .medium,
+            .medium => .high,
+            .high => .off,
+            .off, .xhigh => .minimal,
+        };
+        return self.thinking_level;
     }
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
@@ -1402,6 +1414,17 @@ test "AppState toggles thinking visibility" {
     try std.testing.expect(state.show_thinking);
     state.toggleThinking();
     try std.testing.expect(!state.show_thinking);
+}
+
+test "AppState cycles thinking levels for TUI shortcut" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.medium, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.off, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, state.cycleThinkingLevel());
 }
 
 test "AppState reset replay clears stale queue counts" {

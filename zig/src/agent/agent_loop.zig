@@ -806,6 +806,7 @@ fn streamAssistantResponse(
         .api_key = config.api_key,
         .session_id = config.session_id,
         .cancel_token = config.cancel_token,
+        .thinking_level = config.thinking_level,
         .thinking_budgets = config.thinking_budgets,
         .max_retry_delay_ms = config.max_retry_delay_ms orelse 60_000,
         .temperature = config.temperature,

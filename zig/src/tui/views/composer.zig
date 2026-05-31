@@ -72,13 +72,13 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, st
         return tui_theme.muted().render(allocator, truncated);
     }
     if (state.composer.history.items.len > 0) {
-        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Ctrl+R thinking", .{state.composer.history.items.len});
+        const hint = try std.fmt.allocPrint(allocator, "↑/↓ history • {d} saved • Shift+Enter newline • Shift+Tab thinking level", .{state.composer.history.items.len});
         defer allocator.free(hint);
         const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
         defer allocator.free(truncated);
         return tui_theme.muted().render(allocator, truncated);
     }
-    const truncated = try tui_text.truncateToWidth(allocator, "Enter submit • Shift+Enter newline • Ctrl+R thinking • Ctrl+C quit", max_width);
+    const truncated = try tui_text.truncateToWidth(allocator, "Enter submit • Shift+Enter newline • Shift+Tab thinking level • Ctrl+C quit", max_width);
     defer allocator.free(truncated);
     return tui_theme.muted().render(allocator, truncated);
 }
@@ -109,9 +109,11 @@ test "composer renders placeholder and text" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
 
-    const placeholder = try render(std.testing.allocator, &state, .{ .width = 30 });
+    const placeholder = try render(std.testing.allocator, &state, .{ .width = 80 });
     defer std.testing.allocator.free(placeholder);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Ask Makai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Shift+Tab") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, "Ctrl+R") == null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, input_cursor) != null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "╭") != null);
 

@@ -319,6 +319,7 @@ pub const ProtocolOptions = struct {
     api_key: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: u32 = 60_000,
     temperature: ?f32 = null,
@@ -431,6 +432,7 @@ pub const AgentLoopConfig = struct {
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
 
     // Agent-specific options
     max_iterations: ?u32 = null, // Max tool use iterations
@@ -870,6 +872,7 @@ test "ProtocolOptions defaults" {
     try std.testing.expect(opts.api_key == null);
     try std.testing.expect(opts.session_id == null);
     try std.testing.expect(opts.cancel_token == null);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, opts.thinking_level);
     try std.testing.expect(opts.thinking_budgets == null);
     try std.testing.expectEqual(@as(u32, 60_000), opts.max_retry_delay_ms);
     try std.testing.expect(opts.temperature == null);
