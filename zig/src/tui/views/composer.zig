@@ -9,6 +9,8 @@ pub const Options = struct {
     streaming_shortcuts_supported: bool = true,
 };
 
+const input_cursor = "|";
+
 pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
@@ -24,16 +26,26 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     const prompt = try tui_theme.composerPrompt().render(allocator, promptFor(state));
     defer allocator.free(prompt);
     const content_width = width -| tui_text.visibleWidth(promptFor(state));
+    if (content_width == 0) return prefixFirstLine(allocator, prompt, "");
+    const draft_width = content_width -| tui_text.visibleWidth(input_cursor);
     if (state.composer.text().len == 0) {
-        const placeholder = try tui_text.truncateLineToWidth(allocator, "Ask Makai…", content_width);
+        const placeholder = try tui_text.truncateLineToWidth(allocator, "Ask Makai…", draft_width);
         defer allocator.free(placeholder);
-        const content = try tui_theme.composerPlaceholder().render(allocator, placeholder);
+        const placeholder_with_cursor = try appendCursor(allocator, placeholder);
+        defer allocator.free(placeholder_with_cursor);
+        const content = try tui_theme.composerPlaceholder().render(allocator, placeholder_with_cursor);
         defer allocator.free(content);
         return prefixFirstLine(allocator, prompt, content);
     }
-    const content = try tui_text.truncateLinesToWidth(allocator, state.composer.text(), content_width, 4);
+    const draft = try tui_text.truncateLinesToWidth(allocator, state.composer.text(), draft_width, 4);
+    defer allocator.free(draft);
+    const content = try appendCursor(allocator, draft);
     defer allocator.free(content);
     return prefixFirstLine(allocator, prompt, content);
+}
+
+fn appendCursor(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ text, input_cursor });
 }
 
 fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool, max_width: usize) ![]const u8 {
@@ -100,6 +112,7 @@ test "composer renders placeholder and text" {
     const placeholder = try render(std.testing.allocator, &state, .{ .width = 30 });
     defer std.testing.allocator.free(placeholder);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "Ask Makai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, placeholder, input_cursor) != null);
     try std.testing.expect(std.mem.indexOf(u8, placeholder, "╭") != null);
 
     try state.composer.buffer.appendSlice(std.testing.allocator, "hello world");
@@ -107,6 +120,7 @@ test "composer renders placeholder and text" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, tui_theme.glyph.prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "hello world" ++ input_cursor) != null);
 }
 
 test "composer renders multiline draft content" {

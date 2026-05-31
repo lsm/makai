@@ -18,6 +18,7 @@ const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_session = @import("tui_session");
 const session_store = @import("tui_session_store");
+const tui_config = @import("tui_config");
 const mock_provider = @import("tui_tests_mock_provider");
 const fixtures = @import("tui_tests_fixtures");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -304,6 +305,64 @@ test "e2e: /model opens the picker and selecting switches the active model" {
 
     try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
     try std.testing.expectEqualStrings("second-model", d.app().state.status.model);
+
+    var store = try tui_config.Store.initDefault(std.testing.allocator);
+    defer store.deinit();
+    var cfg = try store.load();
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("second-model", cfg.model);
+    try std.testing.expectEqualStrings("second-provider", cfg.provider);
+}
+
+test "e2e: /model and /provider commands persist the active model" {
+    const models = [_]ai_types.Model{
+        mock_provider.test_model,
+        .{
+            .id = "second-model",
+            .name = "Second Model",
+            .api = "tui-fixture-api",
+            .provider = "second-provider",
+            .base_url = "https://example.invalid",
+            .reasoning = false,
+            .input = &.{"text"},
+            .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+            .context_window = 4096,
+            .max_tokens = 512,
+        },
+    };
+    var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
+    var d = try Driver.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    }, .{});
+    defer d.deinit();
+
+    d.typeText("/model second-model");
+    d.pressEnter();
+    try std.testing.expectEqualStrings("second-model", d.app().state.status.model);
+
+    {
+        var store = try tui_config.Store.initDefault(std.testing.allocator);
+        defer store.deinit();
+        var cfg = try store.load();
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("second-model", cfg.model);
+        try std.testing.expectEqualStrings("second-provider", cfg.provider);
+    }
+
+    d.typeText("/provider " ++ mock_provider.test_model.provider);
+    d.pressEnter();
+    try std.testing.expectEqualStrings(mock_provider.test_model.id, d.app().state.status.model);
+
+    {
+        var store = try tui_config.Store.initDefault(std.testing.allocator);
+        defer store.deinit();
+        var cfg = try store.load();
+        defer cfg.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(mock_provider.test_model.id, cfg.model);
+        try std.testing.expectEqualStrings(mock_provider.test_model.provider, cfg.provider);
+    }
 }
 
 test "e2e: /login opens the provider picker and selecting starts the flow" {

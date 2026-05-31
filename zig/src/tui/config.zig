@@ -76,8 +76,8 @@ pub const Store = struct {
     }
 
     pub fn initDefault(allocator: std.mem.Allocator) !Store {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.HomeNotFound,
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+            error.EnvironmentVariableMissing => return error.HomeNotFound,
             else => return err,
         };
         defer allocator.free(home);
@@ -106,6 +106,17 @@ pub const Store = struct {
         };
         defer self.allocator.free(data);
         return parseConfig(self.allocator, data);
+    }
+
+    pub fn loadIfExists(self: Store) !?Config {
+        const path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "config.json" });
+        defer self.allocator.free(path);
+        const data = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.allocator.free(data);
+        return try parseConfig(self.allocator, data);
     }
 
     pub fn save(self: Store, cfg: Config) !void {
@@ -282,4 +293,21 @@ test "missing config creates defaults" {
     const data = try compat.fs.readFileAlloc(std.testing.allocator, compat.fs.getCwd(), path, 1024);
     defer std.testing.allocator.free(data);
     try std.testing.expect(std.mem.indexOf(u8, data, "claude-sonnet-4-5") != null);
+}
+
+test "loadIfExists returns null without creating defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    const missing = try store.loadIfExists();
+    try std.testing.expect(missing == null);
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.FileNotFound, compat.fs.readFileAlloc(std.testing.allocator, compat.fs.getCwd(), path, 1024));
 }

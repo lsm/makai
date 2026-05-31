@@ -11,6 +11,7 @@ const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
 const tui_model_catalog = @import("tui_model_catalog");
+const tui_config = @import("tui_config");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -54,6 +55,7 @@ pub const ProductionRuntime = struct {
     bridge: agent.InProcessProviderProtocolBridge,
     permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
+    initial_model_id: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -67,7 +69,7 @@ pub const ProductionRuntime = struct {
             @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
-        const catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
+        var catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
         errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
 
         const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
@@ -77,6 +79,14 @@ pub const ProductionRuntime = struct {
             models[idx + 1] = model;
         }
         allocator.free(catalog_models);
+        catalog_models = &.{};
+        errdefer for (models) |*model| model.deinit(allocator);
+
+        var initial_model_id = loadSavedModelId(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        errdefer if (initial_model_id) |id| allocator.free(id);
 
         const runtime = ProductionRuntime{
             .allocator = allocator,
@@ -84,7 +94,9 @@ pub const ProductionRuntime = struct {
             .bridge = undefined,
             .permission_engine = permission_engine,
             .models = models,
+            .initial_model_id = initial_model_id,
         };
+        initial_model_id = null;
         return runtime;
     }
 
@@ -96,6 +108,7 @@ pub const ProductionRuntime = struct {
         return .{
             .protocol = (&self.bridge).protocolClient(),
             .models = self.models,
+            .initial_model_id = self.initial_model_id,
             .permission_engine = &self.permission_engine,
             .run_async = true,
             .compact_output = true,
@@ -105,11 +118,28 @@ pub const ProductionRuntime = struct {
     pub fn deinit(self: *ProductionRuntime) void {
         for (self.models) |*model| model.deinit(self.allocator);
         self.allocator.free(self.models);
+        if (self.initial_model_id) |id| self.allocator.free(id);
         self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;
     }
 };
+
+fn loadSavedModelId(allocator: std.mem.Allocator) !?[]u8 {
+    var store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
+        error.HomeNotFound => return null,
+        else => return err,
+    };
+    defer store.deinit();
+    return try loadSavedModelIdFromStore(allocator, store);
+}
+
+fn loadSavedModelIdFromStore(allocator: std.mem.Allocator, store: tui_config.Store) !?[]u8 {
+    var cfg = (try store.loadIfExists()) orelse return null;
+    defer cfg.deinit(allocator);
+    if (cfg.model.len == 0) return null;
+    return try allocator.dupe(u8, cfg.model);
+}
 
 pub const App = struct {
     allocator: std.mem.Allocator,
@@ -322,6 +352,7 @@ pub const App = struct {
             try self.state.status.setModelWithContext(self.allocator, m.id, m.provider, m.context_window);
             self.state.telemetry.context_window = m.context_window;
         }
+        self.persistCurrentModel();
         self.state.mode = .normal;
         const msg = try std.fmt.allocPrint(self.allocator, "model switched to {s} ({s})", .{ model.id, model.provider });
         defer self.allocator.free(msg);
@@ -695,6 +726,7 @@ pub const App = struct {
             .copy_all => self.copyTranscript(),
             .none => {},
         }
+        if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
         if (result.output.len > 0) {
             try self.state.appendTranscript(if (result.is_error) .@"error" else .system, result.output);
             if (result.is_error) try self.state.status.setError(self.allocator, result.output);
@@ -704,6 +736,29 @@ pub const App = struct {
     pub fn recordError(self: *App, message: []const u8) !void {
         try self.state.status.setError(self.allocator, message);
         try self.state.appendTranscript(.@"error", message);
+    }
+
+    fn persistCurrentModel(self: *App) void {
+        const runtime = self.runtime orelse return;
+        const model = runtime.currentModel() orelse return;
+        self.persistSelectedModel(model) catch |err| self.recordError(@errorName(err)) catch {};
+    }
+
+    fn persistSelectedModel(self: *App, model: ai_types.Model) !void {
+        var store = try tui_config.Store.initDefault(self.allocator);
+        defer store.deinit();
+        var cfg = try store.load();
+        defer cfg.deinit(self.allocator);
+
+        try replaceOwnedString(self.allocator, &cfg.model, model.id);
+        try replaceOwnedString(self.allocator, &cfg.provider, model.provider);
+        try store.save(cfg);
+    }
+
+    fn replaceOwnedString(allocator: std.mem.Allocator, field: *[]u8, value: []const u8) !void {
+        const next = try allocator.dupe(u8, value);
+        allocator.free(field.*);
+        field.* = next;
     }
 
     /// Stage text for the system clipboard. The bytes are copied; the actual
@@ -1428,6 +1483,27 @@ test "App init seeds registered tools from runtime" {
     try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
     try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
     try std.testing.expect(app.runtime.?.permission_engine.?.workspace_root.len > 0);
+}
+
+test "saved model id loads from config store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer std.testing.allocator.free(base);
+
+    var store = try tui_config.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    std.testing.allocator.free(cfg.model);
+    cfg.model = try std.testing.allocator.dupe(u8, "persisted-model");
+    std.testing.allocator.free(cfg.provider);
+    cfg.provider = try std.testing.allocator.dupe(u8, "persisted-provider");
+    try store.save(cfg);
+
+    const model_id = (try loadSavedModelIdFromStore(std.testing.allocator, store)).?;
+    defer std.testing.allocator.free(model_id);
+    try std.testing.expectEqualStrings("persisted-model", model_id);
 }
 
 test "App approval decisions map to requested choices" {

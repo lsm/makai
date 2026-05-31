@@ -2571,6 +2571,20 @@ test "model switch affects next turn" {
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
 }
 
+test "initial model id selects matching model" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{ test_model_a, test_model_b };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .initial_model_id = "model-b",
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
 test "model switch is rejected while async turn is running" {
     var mock = MockProtocolCtx{ .wait_for_cancel = true };
     const models = [_]ai_types.Model{ test_model_a, test_model_b };
