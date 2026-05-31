@@ -497,6 +497,9 @@ test "permissions command switches runtime mode" {
     var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
     defer runtime.deinit();
 
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, state.permission_mode);
+
     var bypass = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .permissions, .arg = "bypass" });
     defer bypass.deinit(std.testing.allocator);
     try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, runtime.permissionMode());

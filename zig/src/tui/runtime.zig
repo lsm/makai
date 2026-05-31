@@ -115,7 +115,7 @@ pub const TuiRuntimeOptions = struct {
     permission_engine: ?*permission.PermissionEngine = null,
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
-    permission_mode: PermissionMode = .ask,
+    permission_mode: PermissionMode = .bypass,
     compact_output: bool = false,
     run_async: bool = true,
 };
@@ -152,7 +152,7 @@ pub const TuiRuntime = struct {
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
     permission_engine: ?*permission.PermissionEngine,
-    permission_mode: PermissionMode = .ask,
+    permission_mode: PermissionMode = .bypass,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -2237,6 +2237,7 @@ test "tool approval approve and reject paths emit tool events" {
         .tools = &tools,
         .tool_approval_ctx = &approve_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer approve_runtime.deinit();
@@ -2269,6 +2270,7 @@ test "tool approval approve and reject paths emit tool events" {
         .tools = &tools,
         .tool_approval_ctx = &reject_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer reject_runtime.deinit();
@@ -2428,6 +2430,7 @@ test "preserves original tool approval when wrapping" {
         .protocol = makeProtocol(&mock),
         .models = &models,
         .tools = &tools,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer runtime.deinit();
@@ -2480,10 +2483,6 @@ test "permission bypass disables policy engine and approval wrappers" {
     });
     defer runtime.deinit();
 
-    try std.testing.expectEqual(PermissionMode.ask, runtime.permissionMode());
-    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .deny);
-
-    try runtime.setPermissionMode(.bypass);
     try std.testing.expectEqual(PermissionMode.bypass, runtime.permissionMode());
     try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .allow);
     for (runtime.wrapped_tools) |tool| {
@@ -2525,6 +2524,7 @@ test "preserves original tool approval UI when wrapping" {
         .tools = &tools,
         .tool_approval_ctx = &approval_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer runtime.deinit();
@@ -3399,6 +3399,7 @@ test "remote submit preserves approval marker in serialized tools" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{
         .backend = .remote,
         .tools = &tools,
+        .permission_mode = .ask,
     });
     defer runtime.deinit();
     const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.remoteSerializableTools());

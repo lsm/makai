@@ -245,6 +245,7 @@ test "e2e: tool approval prompt appears and approving runs the tool to completio
         .protocol = provider.protocolClient(),
         .models = &models,
         .tools = &tools,
+        .permission_mode = .ask,
         .run_async = true,
     }, .{});
     defer d.deinit();
