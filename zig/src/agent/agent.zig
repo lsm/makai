@@ -680,8 +680,14 @@ pub const Agent = struct {
     /// Deep copy messages for thread ownership
     fn copyMessagesForThread(self: *Agent, messages: []const ai_types.Message) ![]ai_types.Message {
         const owned = try self._allocator.alloc(ai_types.Message, messages.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |*msg| msg.deinit(self._allocator);
+            self._allocator.free(owned);
+        }
         for (messages, 0..) |msg, i| {
             owned[i] = try self.cloneMessage(msg);
+            initialized += 1;
         }
         return owned;
     }
@@ -698,13 +704,27 @@ pub const Agent = struct {
         };
     }
 
+    fn setStreamMessage(self: *Agent, msg: ai_types.Message) !void {
+        var cloned = try self.cloneMessage(msg);
+        errdefer cloned.deinit(self._allocator);
+
+        self._state.clearStreamMessage();
+        self._state.stream_message = cloned;
+    }
+
     fn cloneUserContent(self: *Agent, content: ai_types.UserContent) !ai_types.UserContent {
         return switch (content) {
             .text => |t| .{ .text = try self._allocator.dupe(u8, t) },
             .parts => |parts| blk: {
                 var cloned_parts = try self._allocator.alloc(ai_types.UserContentPart, parts.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (cloned_parts[0..initialized]) |*part| part.deinit(self._allocator);
+                    self._allocator.free(cloned_parts);
+                }
                 for (parts, 0..) |p, i| {
                     cloned_parts[i] = try self.cloneUserContentPart(p);
+                    initialized += 1;
                 }
                 break :blk .{ .parts = cloned_parts };
             },
@@ -874,7 +894,7 @@ pub const Agent = struct {
         self.clearMessages();
         self.clearAllQueues();
         self._state.is_streaming = false;
-        self._state.stream_message = null;
+        self._state.clearStreamMessage();
         self._state.pending_tool_calls.clearRetainingCapacity();
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
@@ -907,8 +927,9 @@ pub const Agent = struct {
         errdefer {
             self._state.is_streaming = false;
             self._cancel_token = null;
+            self._state.clearStreamMessage();
         }
-        self._state.stream_message = null;
+        self._state.clearStreamMessage();
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
 
@@ -926,7 +947,9 @@ pub const Agent = struct {
         // its messages and frees them on deinit, while AgentState also owns its
         // history, so context must receive independent clones.
         for (self._state.messages.items) |msg| {
-            try context.appendMessage(try self.cloneMessage(msg));
+            var cloned = try self.cloneMessage(msg);
+            errdefer cloned.deinit(self._allocator);
+            try context.appendMessage(cloned);
         }
 
         if (self._execute_tool_via_protocol_fn == null) {
@@ -987,19 +1010,24 @@ pub const Agent = struct {
 
         // Process events
         while (stream.wait()) |event| {
+            var owned_event = event;
+            defer owned_event.deinit(self._allocator);
+
             // Update internal state based on events
-            switch (event) {
+            switch (owned_event) {
                 .message_start => |e| {
-                    self._state.stream_message = e.message;
+                    try self.setStreamMessage(e.message);
                 },
                 .message_update => |e| {
-                    self._state.stream_message = .{ .assistant = e.message };
+                    try self.setStreamMessage(.{ .assistant = e.message });
                 },
                 .message_end => |e| {
                     // Add an owned copy to Agent state; event payloads may be borrowed
                     // from loop context/provider buffers and are freed elsewhere.
-                    try self._state.messages.append(self._allocator, try self.cloneMessage(e.message));
-                    self._state.stream_message = null;
+                    var cloned_message = try self.cloneMessage(e.message);
+                    errdefer cloned_message.deinit(self._allocator);
+                    try self._state.messages.append(self._allocator, cloned_message);
+                    self._state.clearStreamMessage();
                 },
                 .tool_execution_start => |e| {
                     try self._state.pending_tool_calls.put(e.tool_call_id, {});
@@ -1015,13 +1043,13 @@ pub const Agent = struct {
                 },
                 .agent_end => {
                     self._state.is_streaming = false;
-                    self._state.stream_message = null;
+                    self._state.clearStreamMessage();
                 },
                 else => {},
             }
 
             // Emit to listeners
-            self.emit(event);
+            self.emit(owned_event);
         }
 
         // Transfer ownership if any prompts were actually consumed (appended to

@@ -409,14 +409,30 @@ pub const ProtocolClient = struct {
                 // This is necessary because the envelope's deinit will free
                 // the original event's strings
                 const owned_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, evt);
+                var owned_evt_transferred = false;
+                errdefer {
+                    if (!owned_evt_transferred) {
+                        var cleanup = owned_evt;
+                        ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
+                    }
+                }
 
                 // Push to global event stream for polling
                 try self.event_stream.push(owned_evt);
+                owned_evt_transferred = true;
 
                 // Push to per-stream event stream
                 const stream_es = try self.ensureStreamEventStream(env.stream_id);
                 const per_stream_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, owned_evt);
+                var per_stream_evt_transferred = false;
+                errdefer {
+                    if (!per_stream_evt_transferred) {
+                        var cleanup = per_stream_evt;
+                        ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
+                    }
+                }
                 try stream_es.push(per_stream_evt);
+                per_stream_evt_transferred = true;
 
                 // Process through legacy reconstructor for compatibility
                 try self.reconstructor.processEvent(owned_evt);
@@ -1840,7 +1856,7 @@ test "receiveLoopWithRetry processes envelopes with retry on transient errors" {
         }
     };
 
-    const items = [_][]const u8{ env_json };
+    const items = [_][]const u8{env_json};
     var mock = MockReceiver{
         .items = &items,
         .remaining_failures = 2,

@@ -749,13 +749,7 @@ const StdioProtocolLoop = struct {
 };
 
 fn deinitSerializedStdioAgentEvent(allocator: std.mem.Allocator, event: *agent_loop.AgentEvent) void {
-    switch (event.*) {
-        .message_update => |*payload| {
-            var provider_event = payload.event;
-            ai_types.deinitAssistantMessageEvent(allocator, &provider_event);
-        },
-        else => {},
-    }
+    event.deinit(allocator);
 }
 
 fn prepareAgentRun(
