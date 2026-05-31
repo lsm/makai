@@ -1466,10 +1466,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     defer production.deinit();
     production.initBridge();
 
-    var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
+    var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, tuiProgramOptions());
     program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();
+}
+
+fn tuiProgramOptions() zz.Options {
+    return .{ .kitty_keyboard = true };
 }
 
 test "App init seeds registered tools from runtime" {
@@ -1483,6 +1487,10 @@ test "App init seeds registered tools from runtime" {
     try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
     try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
     try std.testing.expect(app.runtime.?.permission_engine.?.workspace_root.len > 0);
+}
+
+test "TUI program enables enhanced keyboard protocol" {
+    try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
 
 test "saved model id loads from config store" {
@@ -1782,6 +1790,17 @@ test "TuiModel exits quit command while streaming" {
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
+}
+
+test "TuiModel Shift Enter inserts newline without submitting" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "first");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .shift = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqualStrings("first\n", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
 }
 
 test "TuiModel drains events before routing Enter while streaming" {
