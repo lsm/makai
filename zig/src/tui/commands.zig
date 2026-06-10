@@ -85,7 +85,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "provider", .kind = .provider, .usage = "/provider [name]", .description = "Show or switch active provider", .handler = handleProvider },
     .{ .name = "status", .kind = .status, .usage = "/status", .description = "Show session status", .handler = handleStatus },
     .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
-    .{ .name = "resume", .kind = .@"resume", .usage = "/resume [id]", .description = "Resume saved session", .handler = handleResume },
+    .{ .name = "resume", .kind = .@"resume", .usage = "/resume", .description = "Open saved sessions", .handler = handleResume },
     .{ .name = "tools", .kind = .tools, .usage = "/tools", .description = "List registered tools", .handler = handleTools },
     .{ .name = "permissions", .kind = .permissions, .usage = "/permissions [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
     .{ .name = "perm", .kind = .permissions, .usage = "/perm [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
@@ -279,20 +279,7 @@ fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
 }
 
 fn handleResume(ctx: CommandContext, command: Command) !CommandResult {
-    if (command.arg) |id| {
-        for (ctx.state.sessions.items) |entry| {
-            if (std.mem.eql(u8, entry.id, id)) {
-                return .{
-                    .output = try std.fmt.allocPrint(ctx.allocator, "resume by id is not wired yet: {s}", .{id}),
-                    .is_error = true,
-                };
-            }
-        }
-        return error.SessionNotFound;
-    }
-    const session = ctx.session orelse return error.NoRuntimeConfigured;
-    try session.resumeSession();
-    return .{ .output = try ctx.allocator.dupe(u8, "current session resumed") };
+    return try handleSessions(ctx, command);
 }
 
 fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
@@ -384,7 +371,13 @@ fn parseThinkingLevel(value: []const u8) ?ai_types.ThinkingLevel {
 
 fn handleCompact(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    return .{ .output = try ctx.allocator.dupe(u8, "compact not yet implemented") };
+    const session = ctx.session orelse return error.NoRuntimeConfigured;
+    const result = try session.compactMessages();
+    const output = if (result.before == result.after)
+        try std.fmt.allocPrint(ctx.allocator, "conversation context already compact ({d} messages)", .{result.before})
+    else
+        try std.fmt.allocPrint(ctx.allocator, "conversation context compacted: {d} -> {d} messages", .{ result.before, result.after });
+    return .{ .output = output };
 }
 
 fn handleClear(ctx: CommandContext, command: Command) !CommandResult {
@@ -462,7 +455,7 @@ test "dispatch reaches command handlers" {
     _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .compact, .clear, .diff, .quit };
+    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .diff, .quit };
     for (kinds) |kind| {
         var result = try dispatch(ctx, .{ .kind = kind });
         defer result.deinit(std.testing.allocator);
@@ -495,16 +488,49 @@ test "login command can target a provider directly" {
     try std.testing.expectEqualStrings("openai-codex", result.login_provider);
 }
 
-test "resume by id does not resume current context" {
+test "resume is an alias for sessions" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.addSession("s1", "Saved");
 
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume", .arg = "s1" });
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume" });
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
+    try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
+}
+
+const CompactCommandSession = struct {
+    before: usize = 12,
+    after: usize = 9,
+    compact_count: usize = 0,
+
+    fn session(self: *CompactCommandSession) tui_runtime.TuiSession {
+        return .{
+            .ctx = self,
+            .ops = .{
+                .compact_messages = compactMessages,
+            },
+        };
+    }
+
+    fn compactMessages(ctx: ?*anyopaque) anyerror!tui_runtime.CompactMessagesResult {
+        const self: *CompactCommandSession = @ptrCast(@alignCast(ctx.?));
+        self.compact_count += 1;
+        return .{ .before = self.before, .after = self.after };
+    }
+};
+
+test "compact command compacts session history" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    var compact = CompactCommandSession{};
+    var session = compact.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .compact });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), compact.compact_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "12 -> 9") != null);
 }
 
 test "sessions opens picker when sessions exist" {
@@ -610,7 +636,7 @@ test "runtime dependent commands dispatch to no-runtime errors" {
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .model, .arg = "model-a" }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .provider }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .tools }));
-    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .@"resume" }));
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .compact }));
 }
 
 test "copy command selects last reply or whole transcript" {

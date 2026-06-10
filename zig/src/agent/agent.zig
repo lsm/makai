@@ -356,6 +356,11 @@ pub const Agent = struct {
         }
     }
 
+    /// Compact older conversation history into a bounded summary message.
+    pub fn compactMessages(self: *Agent) !ai_types.CompactMessagesResult {
+        return try ai_types.compactMessageHistory(self._allocator, &self._state.messages);
+    }
+
     /// Append a message to the conversation.
     pub fn appendMessage(self: *Agent, message: ai_types.Message) !void {
         try self._state.messages.append(self._allocator, message);

@@ -814,7 +814,7 @@ pub const App = struct {
             .command => |command| command,
         };
 
-        if (command.kind == .sessions) self.loadSessions() catch |err| {
+        if (command.kind == .sessions or command.kind == .@"resume") self.loadSessions() catch |err| {
             try self.state.status.setError(self.allocator, @errorName(err));
             try self.state.appendTranscript(.@"error", @errorName(err));
             return;

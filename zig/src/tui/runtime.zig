@@ -25,6 +25,7 @@ pub const TuiEvent = session.TuiEvent;
 pub const TuiEventStream = session.TuiEventStream;
 pub const TuiEndReason = session.TuiEndReason;
 pub const QueuedCounts = session.QueuedCounts;
+pub const CompactMessagesResult = session.CompactMessagesResult;
 pub const ToolApprovalCallback = session.ToolApprovalCallback;
 pub const ToolApprovalDecision = session.ToolApprovalDecision;
 pub const ToolApprovalRequest = session.ToolApprovalRequest;
@@ -469,6 +470,7 @@ pub const TuiRuntime = struct {
             .ops = .{
                 .start = sessionStart,
                 .resume_session = sessionResume,
+                .compact_messages = sessionCompactMessages,
                 .cancel = sessionCancel,
                 .submit_turn = sessionSubmitTurn,
                 .steer = sessionSteer,
@@ -692,6 +694,22 @@ pub const TuiRuntime = struct {
                 if (self.run_async) local.waitForIdle();
                 local.clearAllQueues();
                 try local.replaceMessages(messages);
+            },
+        }
+    }
+
+    pub fn compactMessages(self: *TuiRuntime) !CompactMessagesResult {
+        switch (self.backend) {
+            .remote => {
+                if (self.stream_active and !self.event_stream.isDone()) return error.AgentAlreadyStreaming;
+                return try ai_types.compactMessageHistory(self.allocator, &self.remote_messages);
+            },
+            .local => {
+                if (!self.started) try self.start();
+                const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.run_async) local.waitForIdle();
+                local.clearAllQueues();
+                return try local.compactMessages();
             },
         }
     }
@@ -1944,6 +1962,11 @@ fn sessionStart(ctx: ?*anyopaque) anyerror!void {
 fn sessionResume(ctx: ?*anyopaque) anyerror!void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     try self.resumeSession();
+}
+
+fn sessionCompactMessages(ctx: ?*anyopaque) anyerror!CompactMessagesResult {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return try self.compactMessages();
 }
 
 fn sessionCancel(ctx: ?*anyopaque) void {

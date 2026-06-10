@@ -171,10 +171,12 @@ pub const TuiSessionResult = struct {
 pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 
 pub const QueuedCounts = agent.Agent.QueuedCounts;
+pub const CompactMessagesResult = ai_types.CompactMessagesResult;
 
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     resume_session: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
+    compact_messages: *const fn (ctx: ?*anyopaque) anyerror!CompactMessagesResult = undefined,
     cancel: *const fn (ctx: ?*anyopaque) void = undefined,
     submit_turn: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
@@ -197,6 +199,10 @@ pub const TuiSession = struct {
 
     pub fn resumeSession(self: *TuiSession) !void {
         try self.ops.resume_session(self.ctx);
+    }
+
+    pub fn compactMessages(self: *TuiSession) !CompactMessagesResult {
+        return try self.ops.compact_messages(self.ctx);
     }
 
     pub fn cancel(self: *TuiSession) void {
