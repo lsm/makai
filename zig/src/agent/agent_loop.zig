@@ -561,8 +561,18 @@ fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![
     defer parsed.deinit();
     if (parsed.value != .object) return try allocator.dupe(u8, args_json);
     if (parsed.value.object.contains("compact_output")) return try allocator.dupe(u8, args_json);
-    try parsed.value.object.put(allocator, "compact_output", .{ .bool = true });
+    // Dynamic JSON values parsed by `parseFromSlice` own object-map storage
+    // through the parser arena. Grow the map with that same arena allocator;
+    // using the caller allocator can free arena-owned buckets and panic.
+    try parsed.value.object.put(parsed.arena.allocator(), "compact_output", .{ .bool = true });
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+test "compact output injection grows parsed object with parser arena" {
+    const args = "{\"workspace_root\":\"/workspace\",\"command\":\"ls -al\",\"timeout_ms\":10000,\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8}";
+    const injected = try withCompactToolOutput(std.testing.allocator, args);
+    defer std.testing.allocator.free(injected);
+    try std.testing.expect(std.mem.indexOf(u8, injected, "\"compact_output\":true") != null);
 }
 
 fn pushProviderMessageUpdate(

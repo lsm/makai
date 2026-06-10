@@ -18,6 +18,7 @@ const DisplayEntry = struct {
     kind: TranscriptKind,
     text: []const u8,
     timestamp_ms: i64,
+    tool_name: []const u8 = "",
 };
 
 pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Options) ![]const u8 {
@@ -109,6 +110,7 @@ fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayE
         .kind = entry.kind,
         .text = entry.text.items,
         .timestamp_ms = entry.timestamp_ms,
+        .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
     });
 }
 
@@ -154,6 +156,7 @@ fn appendDebugToolState(
             .kind = .tool,
             .text = out.written(),
             .timestamp_ms = 0,
+            .tool_name = tool.name,
         });
     }
 }
@@ -294,7 +297,7 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     const arena = arena_state.allocator();
 
     const align_right = entry.kind == .user;
-    const header = try renderHeader(arena, entry.kind, entry.timestamp_ms, align_right, width);
+    const header = try renderHeader(arena, entry.kind, entry.tool_name, entry.timestamp_ms, align_right, width);
 
     const body: []const u8 = switch (entry.kind) {
         .user => blk: {
@@ -311,7 +314,7 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
             const open = try openSgr(arena, assistant_fg, assistant_bg);
             break :blk try renderBubble(arena, md, open, false, width);
         },
-        else => try renderCard(arena, entry.kind, entry.text, width),
+        else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, width),
     };
 
     // Compose header + body, then hand a single owned copy back to the caller.
@@ -328,9 +331,10 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
 
 /// "❯ You · 14:32" — role glyph + name in the role color, dim timestamp.
 /// Right-aligned for the user so it sits above their right-side bubble.
-fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
+fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
     const raw_label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(kind), roleName(kind) });
-    const styled_label = try tui_theme.role(kind).render(allocator, raw_label);
+    const role_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolRole(tool_name) else tui_theme.role(kind);
+    const styled_label = try role_style.render(allocator, raw_label);
     const clock = try formatClock(allocator, ts_ms);
 
     var time_raw: []const u8 = "";
@@ -396,12 +400,13 @@ fn renderBubble(allocator: std.mem.Allocator, content: []const u8, open: []const
 /// Render system/tool/thinking/error entries as a rounded card framed in the
 /// role color. Body lines are truncated (not word-wrapped) so command output
 /// and tool args keep their original whitespace and indentation.
-fn renderCard(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8, width: usize) ![]const u8 {
+fn renderCard(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, text: []const u8, width: usize) ![]const u8 {
     const content_width = @max(width -| 4, 8); // 2 border + 2 padding
     const truncated = try tui_text.truncateLinesToWidth(allocator, text, content_width, std.math.maxInt(usize));
-    const styled = try styleEachLine(allocator, tui_theme.bodyStyle(kind), truncated);
+    const body_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolBody(tool_name) else tui_theme.bodyStyle(kind);
+    const styled = try styleEachLine(allocator, body_style, truncated);
     const card = tui_theme.panel()
-        .borderForeground(roleColor(kind))
+        .borderForeground(roleColor(kind, tool_name))
         .width(@intCast(@min(content_width, std.math.maxInt(u16))));
     return card.render(allocator, styled);
 }
@@ -455,15 +460,32 @@ fn roleName(kind: TranscriptKind) []const u8 {
     };
 }
 
-fn roleColor(kind: TranscriptKind) zz.Color {
+fn roleColor(kind: TranscriptKind, tool_name: []const u8) zz.Color {
     return switch (kind) {
         .user => tui_theme.palette.user,
         .assistant => tui_theme.palette.assistant,
         .thinking => tui_theme.palette.thinking,
-        .tool => tui_theme.palette.tool,
+        .tool => if (tool_name.len > 0) tui_theme.toolColorForName(tool_name) else tui_theme.palette.tool,
         .system => tui_theme.palette.panel_border,
         .@"error" => tui_theme.palette.danger,
     };
+}
+
+fn inferredToolName(text: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, text, "◈ ")) return firstToolNameToken(text["◈ ".len..]);
+    if (std.mem.startsWith(u8, text, "tool state: ")) return firstToolNameToken(text["tool state: ".len..]);
+    return firstToolNameToken(text);
+}
+
+fn firstToolNameToken(text: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < text.len and std.ascii.isWhitespace(text[start])) start += 1;
+    var end = start;
+    while (end < text.len) : (end += 1) {
+        const c = text[end];
+        if (std.ascii.isWhitespace(c) or c == '"' or c == '[' or c == '{' or c == '(') break;
+    }
+    return text[start..end];
 }
 
 fn lineWindow(allocator: std.mem.Allocator, text: []const u8, height: usize, scroll: usize) ![]u8 {
@@ -498,6 +520,13 @@ fn renderedLineContaining(text: []const u8, needle: []const u8) ?[]const u8 {
         if (std.mem.indexOf(u8, line, needle) != null) return line;
     }
     return null;
+}
+
+fn colorFg(allocator: std.mem.Allocator, color: zz.Color) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try color.writeFg(&out.writer);
+    return out.toOwnedSlice();
 }
 
 test "transcript renders labels" {
@@ -618,6 +647,25 @@ test "transcript everything mode includes low value system and full tool state" 
     try std.testing.expect(std.mem.indexOf(u8, text, "tool state: shell_execute") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "full output line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "context usage") != null);
+}
+
+test "transcript colors tool cards by inferred operation" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.tool, "◈ shell_execute \"ls\"");
+    try state.appendTranscript(.tool, "◈ file_read \"src/main.zig\"");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 20 });
+    defer std.testing.allocator.free(text);
+
+    const shell_open = try colorFg(std.testing.allocator, tui_theme.toolColorForName("shell_execute"));
+    defer std.testing.allocator.free(shell_open);
+    const read_open = try colorFg(std.testing.allocator, tui_theme.toolColorForName("file_read"));
+    defer std.testing.allocator.free(read_open);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, shell_open) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, read_open) != null);
+    try std.testing.expect(!std.mem.eql(u8, shell_open, read_open));
 }
 
 test "transcript renders markdown syntax" {

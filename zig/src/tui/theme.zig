@@ -13,6 +13,13 @@ pub const palette = struct {
     pub const assistant = zz.Color.brightCyan;
     pub const thinking = zz.Color.brightMagenta;
     pub const tool = zz.Color.brightYellow;
+    pub const tool_shell = zz.Color.brightCyan;
+    pub const tool_read = zz.Color.brightGreen;
+    pub const tool_write = zz.Color.brightMagenta;
+    pub const tool_search = zz.Color.fromRgb(122, 162, 247);
+    pub const tool_workspace = zz.Color.brightBlue;
+    pub const tool_sync = zz.Color.fromRgb(255, 160, 80);
+    pub const tool_auth = zz.Color.fromRgb(187, 154, 247);
     pub const system = zz.Color.gray(18);
     pub const danger = zz.Color.brightRed;
     pub const success = zz.Color.brightGreen;
@@ -21,6 +28,17 @@ pub const palette = struct {
     pub const accent = zz.Color.fromRgb(122, 162, 247);
     pub const surface = zz.Color.fromRgb(22, 22, 30);
     pub const surface_alt = zz.Color.fromRgb(31, 31, 42);
+};
+
+pub const ToolVisualKind = enum {
+    shell,
+    read,
+    write,
+    search,
+    workspace,
+    sync,
+    auth,
+    other,
 };
 
 /// Single-width Unicode glyphs chosen for broad terminal/font support (no
@@ -115,6 +133,51 @@ pub fn bodyStyle(kind: tui_state.TranscriptKind) zz.Style {
     };
 }
 
+pub fn toolKindForName(name: []const u8) ToolVisualKind {
+    if (toolNameMatches(name, &.{ "workspace", "git" })) return .workspace;
+    if (toolNameMatches(name, &.{ "sync", "pull", "push", "fetch", "download", "upload" })) return .sync;
+    if (toolNameMatches(name, &.{ "auth", "login", "oauth", "token" })) return .auth;
+    if (toolNameMatches(name, &.{ "shell", "bash", "exec", "execute", "command", "run" })) return .shell;
+    if (toolNameMatches(name, &.{ "write", "edit", "patch", "delete", "insert", "replace", "hashline_edit" })) return .write;
+    if (toolNameMatches(name, &.{ "read", "stat", "cat", "hashline_read", "view" })) return .read;
+    if (toolNameMatches(name, &.{ "search", "grep", "find", "rg", "list" })) return .search;
+    return .other;
+}
+
+pub fn toolColorForName(name: []const u8) zz.Color {
+    return switch (toolKindForName(name)) {
+        .shell => palette.tool_shell,
+        .read => palette.tool_read,
+        .write => palette.tool_write,
+        .search => palette.tool_search,
+        .workspace => palette.tool_workspace,
+        .sync => palette.tool_sync,
+        .auth => palette.tool_auth,
+        .other => palette.tool,
+    };
+}
+
+pub fn toolRole(name: []const u8) zz.Style {
+    return (zz.Style{}).fg(toolColorForName(name)).bold(true).inline_style(true);
+}
+
+pub fn toolBody(name: []const u8) zz.Style {
+    return (zz.Style{}).fg(toolColorForName(name)).inline_style(true);
+}
+
+fn toolNameMatches(name: []const u8, tokens: []const []const u8) bool {
+    for (tokens) |token| {
+        if (std.mem.eql(u8, name, token)) return true;
+    }
+    var parts = std.mem.tokenizeAny(u8, name, "_-:./ ");
+    while (parts.next()) |part| {
+        for (tokens) |token| {
+            if (std.mem.eql(u8, part, token)) return true;
+        }
+    }
+    return false;
+}
+
 pub fn toolStatus(status: tui_state.ToolStatus) zz.Style {
     return switch (status) {
         .pending => (zz.Style{}).fg(palette.warning).bold(true).inline_style(true),
@@ -181,4 +244,13 @@ test "theme exposes role and panel styles" {
     const panel_text = try panel().render(std.testing.allocator, "body");
     defer std.testing.allocator.free(panel_text);
     try std.testing.expect(std.mem.indexOf(u8, panel_text, "body") != null);
+}
+
+test "theme classifies tool colors by operation" {
+    try std.testing.expectEqual(ToolVisualKind.shell, toolKindForName("shell_execute"));
+    try std.testing.expectEqual(ToolVisualKind.read, toolKindForName("file_read"));
+    try std.testing.expectEqual(ToolVisualKind.write, toolKindForName("hashline_edit"));
+    try std.testing.expectEqual(ToolVisualKind.search, toolKindForName("search_text"));
+    try std.testing.expectEqual(ToolVisualKind.workspace, toolKindForName("workspace_git_status"));
+    try std.testing.expectEqual(ToolVisualKind.auth, toolKindForName("openai_login"));
 }

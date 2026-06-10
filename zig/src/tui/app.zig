@@ -1674,7 +1674,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true, .mouse = true };
+    return .{ .kitty_keyboard = true, .mouse = false };
 }
 
 pub fn tuiProgramOptionsForTest() zz.Options {
@@ -1699,8 +1699,8 @@ test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
 
-test "TUI program enables mouse reporting for wheel transcript scroll" {
-    try std.testing.expect(tuiProgramOptions().mouse);
+test "TUI program leaves plain mouse selection to the terminal" {
+    try std.testing.expect(!tuiProgramOptions().mouse);
 }
 
 test "saved model id loads from config store" {
