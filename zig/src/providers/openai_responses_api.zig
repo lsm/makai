@@ -1688,15 +1688,13 @@ fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocat
         .refresh = credentials.refresh,
         .access = credentials.access,
         .expires = credentials.expires,
+        .provider_data = credentials.provider_data,
     }, allocator);
     errdefer {
         allocator.free(refreshed.refresh);
         allocator.free(refreshed.access);
     }
-    const provider_data = if (credentials.provider_data) |data|
-        try allocator.dupe(u8, data)
-    else
-        null;
+    const provider_data = refreshed.provider_data;
     errdefer if (provider_data) |data| allocator.free(data);
 
     return .{

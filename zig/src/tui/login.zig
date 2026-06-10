@@ -303,8 +303,9 @@ fn runCodex(self: *LoginSession) void {
     defer {
         self.allocator.free(creds.refresh);
         self.allocator.free(creds.access);
+        if (creds.provider_data) |pd| self.allocator.free(pd);
     }
-    self.finishSuccess(creds.refresh, creds.access, creds.expires, null);
+    self.finishSuccess(creds.refresh, creds.access, creds.expires, creds.provider_data);
 }
 
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {

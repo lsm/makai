@@ -21,6 +21,7 @@ pub const Credentials = struct {
     refresh: []const u8,
     access: []const u8,
     expires: i64,
+    provider_data: ?[]const u8 = null,
 };
 
 pub const Callbacks = struct {
@@ -197,11 +198,7 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
 
     const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
-    return .{
-        .refresh = try allocator.dupe(u8, refresh_token),
-        .access = try allocator.dupe(u8, token_response.access_token),
-        .expires = expires,
-    };
+    return try buildCredentials(allocator, refresh_token, token_response.access_token, expires, token_response.provider_data);
 }
 
 /// Refresh OpenAI Codex OAuth token.
@@ -275,21 +272,42 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
 const TokenResponse = struct {
     access_token: []const u8,
     refresh_token: ?[]const u8,
+    provider_data: ?[]const u8 = null,
     expires_in: i64,
 };
 
 fn deinitTokenResponse(allocator: std.mem.Allocator, response: TokenResponse) void {
     allocator.free(response.access_token);
     if (response.refresh_token) |refresh| allocator.free(refresh);
+    if (response.provider_data) |data| allocator.free(data);
+}
+
+fn buildCredentials(
+    allocator: std.mem.Allocator,
+    refresh_token: []const u8,
+    access_token: []const u8,
+    expires: i64,
+    provider_data: ?[]const u8,
+) !Credentials {
+    const refresh = try allocator.dupe(u8, refresh_token);
+    errdefer allocator.free(refresh);
+    const access = try allocator.dupe(u8, access_token);
+    errdefer allocator.free(access);
+    const data = if (provider_data) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (data) |value| allocator.free(value);
+
+    return .{
+        .refresh = refresh,
+        .access = access,
+        .expires = expires,
+        .provider_data = data,
+    };
 }
 
 fn credentialsFromRefreshResponse(credentials: Credentials, token_response: TokenResponse, expires: i64, allocator: std.mem.Allocator) !Credentials {
     const refresh_token = token_response.refresh_token orelse credentials.refresh;
-    return .{
-        .refresh = try allocator.dupe(u8, refresh_token),
-        .access = try allocator.dupe(u8, token_response.access_token),
-        .expires = expires,
-    };
+    const provider_data = token_response.provider_data orelse credentials.provider_data;
+    return try buildCredentials(allocator, refresh_token, token_response.access_token, expires, provider_data);
 }
 
 fn getObjectStringField(obj: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -310,9 +328,68 @@ fn getObjectI64Field(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
     return null;
 }
 
+fn getObjectAccountId(obj: *const std.json.ObjectMap) ?[]const u8 {
+    const account_id = getObjectStringField(obj, "account_id") orelse return null;
+    if (account_id.len == 0) return null;
+    return account_id;
+}
+
+fn getJsonAccountId(value: std.json.Value) ?[]const u8 {
+    return switch (value) {
+        .object => |obj| {
+            if (getObjectAccountId(&obj)) |account_id| return account_id;
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                if (getJsonAccountId(entry.value_ptr.*)) |account_id| return account_id;
+            }
+            return null;
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (getJsonAccountId(item)) |account_id| return account_id;
+            }
+            return null;
+        },
+        else => null,
+    };
+}
+
+fn accountIdFromJwt(allocator: std.mem.Allocator, token: []const u8) !?[]u8 {
+    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return null;
+    const payload_start = first_dot + 1;
+    const second_rel = std.mem.indexOfScalar(u8, token[payload_start..], '.') orelse return null;
+    const payload = token[payload_start .. payload_start + second_rel];
+
+    const decoded_len = std.base64.url_safe_no_pad.Decoder.calcSizeForSlice(payload) catch return null;
+    const decoded = try allocator.alloc(u8, decoded_len);
+    defer allocator.free(decoded);
+    std.base64.url_safe_no_pad.Decoder.decode(decoded, payload) catch return null;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return null;
+    defer parsed.deinit();
+    const account_id = getJsonAccountId(parsed.value) orelse return null;
+    return try allocator.dupe(u8, account_id);
+}
+
+fn buildProviderData(allocator: std.mem.Allocator, account_id: []const u8) ![]u8 {
+    return try std.json.Stringify.valueAlloc(allocator, .{ .source = "openai-codex", .account_id = account_id }, .{});
+}
+
+fn providerDataFromTokenObject(allocator: std.mem.Allocator, obj: *const std.json.ObjectMap) !?[]u8 {
+    if (getObjectAccountId(obj)) |account_id| return try buildProviderData(allocator, account_id);
+
+    if (getObjectStringField(obj, "id_token")) |id_token| {
+        const account_id = (try accountIdFromJwt(allocator, id_token)) orelse return null;
+        defer allocator.free(account_id);
+        return try buildProviderData(allocator, account_id);
+    }
+
+    return null;
+}
+
 fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !TokenResponse {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, response_body, .{}) catch {
-        std.debug.print("Failed to parse Codex token response JSON: {s}\n", .{response_body});
+        std.debug.print("Failed to parse Codex token response JSON; response body redacted ({d} bytes)\n", .{response_body.len});
         return error.ParseError;
     };
     defer parsed.deinit();
@@ -330,7 +407,7 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
     }
 
     const access_token = getObjectStringField(obj, "access_token") orelse {
-        std.debug.print("Codex token response missing access_token: {s}\n", .{response_body});
+        std.debug.print("Codex token response missing access_token; response body redacted ({d} bytes)\n", .{response_body.len});
         return error.ParseError;
     };
     const refresh_token = if (getObjectStringField(obj, "refresh_token")) |refresh|
@@ -338,6 +415,8 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
     else
         null;
     errdefer if (refresh_token) |refresh| allocator.free(refresh);
+    const provider_data = try providerDataFromTokenObject(allocator, obj);
+    errdefer if (provider_data) |data| allocator.free(data);
 
     var expires_in = getObjectI64Field(obj, "expires_in") orelse 3600;
     if (expires_in <= 0) expires_in = 3600;
@@ -345,6 +424,7 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
     return .{
         .access_token = try allocator.dupe(u8, access_token),
         .refresh_token = refresh_token,
+        .provider_data = provider_data,
         .expires_in = expires_in,
     };
 }
@@ -400,7 +480,7 @@ fn exchangeTokens(body: []const u8, content_type: []const u8, allocator: std.mem
         const reader = http.responseReader(&response, &buffer);
         const error_body = try http.allocRemainingResponse(allocator, reader, 8192);
         defer allocator.free(error_body);
-        std.debug.print("Codex token exchange error {d}: {s}\n", .{ @intFromEnum(response.head.status), error_body });
+        std.debug.print("Codex token exchange error {d}; response body redacted ({d} bytes)\n", .{ @intFromEnum(response.head.status), error_body.len });
         return error.OAuthFailed;
     }
 
@@ -497,6 +577,32 @@ test "parseTokenResponse extracts tokens" {
     try std.testing.expectEqual(@as(i64, 1800), response.expires_in);
 }
 
+test "parseTokenResponse extracts account metadata from account_id" {
+    const payload =
+        \\{"access_token":"acc","refresh_token":"ref","account_id":"account-123"}
+    ;
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer deinitTokenResponse(std.testing.allocator, response);
+
+    try std.testing.expect(response.provider_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.provider_data.?, "\"source\":\"openai-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.provider_data.?, "\"account_id\":\"account-123\"") != null);
+}
+
+test "parseTokenResponse extracts account metadata from id_token" {
+    const id_token = "e30.eyJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiYWNjb3VudF9pZCI6ImFjY3QtbmVzdGVkIn19.sig";
+    const payload = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"access_token":"acc","refresh_token":"ref","id_token":"{s}"}}
+    , .{id_token});
+    defer std.testing.allocator.free(payload);
+
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer deinitTokenResponse(std.testing.allocator, response);
+
+    try std.testing.expect(response.provider_data != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.provider_data.?, "\"account_id\":\"acct-nested\"") != null);
+}
+
 test "parseTokenResponse preserves missing refresh token as null" {
     const payload =
         \\{"access_token":"acc"}
@@ -514,6 +620,7 @@ test "refresh response without rotated refresh token preserves existing refresh 
         .refresh = "old-refresh",
         .access = "old-access",
         .expires = 1,
+        .provider_data = "{\"account_id\":\"old-account\"}",
     };
     const response = TokenResponse{
         .access_token = "new-access",
@@ -523,10 +630,12 @@ test "refresh response without rotated refresh token preserves existing refresh 
     const refreshed = try credentialsFromRefreshResponse(credentials, response, 1234, std.testing.allocator);
     defer std.testing.allocator.free(refreshed.refresh);
     defer std.testing.allocator.free(refreshed.access);
+    defer if (refreshed.provider_data) |data| std.testing.allocator.free(data);
 
     try std.testing.expectEqualStrings("old-refresh", refreshed.refresh);
     try std.testing.expectEqualStrings("new-access", refreshed.access);
     try std.testing.expectEqual(@as(i64, 1234), refreshed.expires);
+    try std.testing.expectEqualStrings("{\"account_id\":\"old-account\"}", refreshed.provider_data.?);
 }
 
 test "parseTokenResponse maps oauth error payload to OAuthFailed" {

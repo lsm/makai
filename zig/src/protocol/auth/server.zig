@@ -643,6 +643,7 @@ pub const AuthProtocolServer = struct {
             .refresh = credentials.refresh,
             .access = credentials.access,
             .expires = credentials.expires,
+            .provider_data = credentials.provider_data,
         };
     }
 
@@ -916,7 +917,7 @@ fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Cred
             .provider_data = credentials.provider_data,
         },
     });
-    try storage.saveToFile();
+    try storage.persist();
 }
 
 test "AuthProtocolServer type is available" {
