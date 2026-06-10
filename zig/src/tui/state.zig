@@ -684,8 +684,10 @@ pub const AppState = struct {
                     .completed => {},
                     .cancelled => try self.appendTranscript(.system, "agent cancelled"),
                     .@"error" => {
-                        try self.status.setError(self.allocator, "agent error");
-                        try self.appendTranscript(.@"error", "agent error");
+                        if (self.status.last_error.len == 0) {
+                            try self.status.setError(self.allocator, "agent ended with error, but no error details were provided");
+                            try self.appendTranscript(.@"error", self.status.last_error);
+                        }
                     },
                 }
             },
@@ -1676,8 +1678,22 @@ test "AppState clears stale active assistant before next inline message_end" {
     try std.testing.expectEqual(@as(usize, 3), state.transcript.items.len);
     try std.testing.expectEqualStrings("interrupted", state.transcript.items[0].text.items);
     try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
-    try std.testing.expectEqualStrings("agent error", state.transcript.items[1].text.items);
+    try std.testing.expectEqualStrings("agent ended with error, but no error details were provided", state.transcript.items[1].text.items);
     try std.testing.expectEqualStrings("next response", state.transcript.items[2].text.items);
+}
+
+test "AppState does not append generic agent error after detailed error event" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var error_event = tui_runtime.TuiEvent{ .@"error" = .{ .message = try ownedText("provider failed: bad request") } };
+    defer error_event.deinit(std.testing.allocator);
+    try state.applyEvent(error_event);
+    try state.applyEvent(.{ .agent_end = .{ .reason = .@"error" } });
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("provider failed: bad request", state.transcript.items[0].text.items);
 }
 
 test "AppState clones registered tool metadata" {

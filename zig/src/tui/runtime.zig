@@ -1314,6 +1314,11 @@ pub const TuiRuntime = struct {
             } }),
             .turn_end => |payload| {
                 self.last_turn_stop_reason = payload.message.stop_reason;
+                if (payload.message.stop_reason == .@"error") {
+                    if (payload.message.getErrorMessage()) |message| {
+                        self.push(.{ .@"error" = .{ .message = try self.dupeOwned(message) } });
+                    }
+                }
                 self.pushTerminal(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
             },
             .agent_end => {
@@ -1964,6 +1969,7 @@ const MockProtocolCtx = struct {
     wait_after_tool_first: bool = false,
     tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
+    provider_error_message: []const u8 = "",
 };
 
 fn makeAssistantMessage(allocator: std.mem.Allocator, model: ai_types.Model, content: []const ai_types.AssistantContent, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
@@ -2066,6 +2072,16 @@ fn mockStream(
 
     if (mock.force_error) {
         stream.completeWithError("forced provider error");
+        return stream;
+    }
+
+    if (mock.provider_error_message.len > 0) {
+        var event_message = emptyAssistantMessage(model, .@"error");
+        event_message.error_message = OwnedSlice(u8).initBorrowed(mock.provider_error_message);
+        var result_message = emptyAssistantMessage(model, .@"error");
+        result_message.error_message = OwnedSlice(u8).initBorrowed(mock.provider_error_message);
+        try stream.push(.{ .@"error" = .{ .reason = .@"error", .err = event_message } });
+        stream.complete(result_message);
         return stream;
     }
 
@@ -2189,6 +2205,28 @@ test "local runtime includes startup cwd as default workspace root in provider p
     if (runtime.local_agent) |*local| local.waitForIdle();
 
     try std.testing.expect(mock.saw_workspace_prompt);
+}
+
+test "local runtime surfaces provider error message details" {
+    var mock = MockProtocolCtx{ .provider_error_message = "provider rejected request: missing workspace_root" };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectError(error.AgentLoopFailed, tui_session.submitTurn("hi"));
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_detail = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .@"error" and std.mem.eql(u8, ev.@"error".message.slice(), "provider rejected request: missing workspace_root")) {
+            saw_detail = true;
+        }
+    }
+    try std.testing.expect(saw_detail);
 }
 
 test "runtime cancel emits cancelled agent_end" {
