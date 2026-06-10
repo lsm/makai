@@ -187,7 +187,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     if (model.reasoning) {
         try w.writeKey("reasoning");
         try w.beginObject();
-        try w.writeStringField("effort", normalizedOpenAIReasoningEffort(options));
+        if (normalizedOpenAIReasoningEffort(options)) |effort| {
+            try w.writeStringField("effort", effort);
+        }
         if (options.getReasoningSummary()) |summary| {
             try w.writeStringField("summary", summary);
         } else {
@@ -369,10 +371,10 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     return buf.toOwnedSlice(allocator);
 }
 
-fn normalizedOpenAIReasoningEffort(options: ai_types.StreamOptions) []const u8 {
-    if (!options.reasoning_enabled) return "none";
+fn normalizedOpenAIReasoningEffort(options: ai_types.StreamOptions) ?[]const u8 {
+    if (!options.reasoning_enabled) return null;
     const effort = options.getReasoningEffort() orelse return "medium";
-    if (std.mem.eql(u8, effort, "off")) return "none";
+    if (std.mem.eql(u8, effort, "off")) return null;
     if (std.mem.eql(u8, effort, "minimal")) return "low";
     return effort;
 }
@@ -2252,7 +2254,7 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
 
     try std.testing.expect(std.mem.find(u8, body, "# Juice: 0 !important") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"medium\"") == null);
 }
 
@@ -2283,6 +2285,36 @@ test "buildRequestBody normalizes minimal reasoning effort for OpenAI" {
 
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"low\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"minimal\"") == null);
+}
+
+test "buildRequestBody omits unsupported none reasoning effort" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed("off"),
+        .reasoning_enabled = true,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\"") == null);
 }
 
 test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {

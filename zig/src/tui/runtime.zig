@@ -608,7 +608,9 @@ pub const TuiRuntime = struct {
                 self.remote_reconnect_attempted = false;
                 client.clearSessionTerminalState(sid);
                 self.last_turn_stop_reason = null;
-                _ = try client.sendAgentMessage(sid, message_json, null);
+                const options_json = try self.remoteMessageOptionsJson();
+                defer self.allocator.free(options_json);
+                _ = try client.sendAgentMessage(sid, message_json, options_json);
                 message_sent = true;
                 self.pumpRemoteIncoming() catch |err| {
                     try self.completeRemoteWithError(@errorName(err));
@@ -868,6 +870,18 @@ pub const TuiRuntime = struct {
         try w.writeStringField("permission_mode", @tagName(self.permission_mode));
         try w.writeStringField("thinking_level", @tagName(self.thinking_level));
         if (self.workspace_root.len > 0) try w.writeStringField("workspace_root", self.workspace_root);
+        try w.endObject();
+        const out = try self.allocator.dupe(u8, buffer.items);
+        buffer.deinit(self.allocator);
+        return out;
+    }
+
+    fn remoteMessageOptionsJson(self: *TuiRuntime) ![]u8 {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+        try w.beginObject();
+        try w.writeStringField("thinking_level", @tagName(self.thinking_level));
         try w.endObject();
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
@@ -3255,6 +3269,32 @@ test "remote submit waits through pending startup polls" {
     try tui_session.submitTurn("hi");
     try std.testing.expectEqualSlices(u8, sid[0..], runtime.remote_session_id.?[0..]);
     try std.testing.expect(mock.writes.items.len >= 2);
+}
+
+test "remote submit sends current thinking level in message options" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+
+    runtime.setThinkingLevel(.high);
+    try tui_session.submitTurn("hi");
+    try std.testing.expect(mock.writes.items.len >= 2);
+
+    var env = try agent_envelope.deserializeEnvelope(mock.writes.items[1], std.testing.allocator);
+    defer env.deinit(std.testing.allocator);
+    try std.testing.expect(env.payload == .agent_message);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_message.options_json.slice(), "\"thinking_level\":\"high\"") != null);
 }
 
 test "remote submit uses configurable startup timeout" {

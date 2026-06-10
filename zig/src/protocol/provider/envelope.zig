@@ -822,7 +822,7 @@ fn deserializeModel(
     errdefer freeInputModalities(allocator, input);
 
     const headers = if (obj.get("headers")) |headers_val|
-        try deserializeHeaderPairs(headers_val.array, allocator)
+        try deserializeHeaderPairsValue(headers_val, allocator)
     else
         null;
     errdefer if (headers) |pairs| freeHeaderPairs(allocator, pairs);
@@ -894,13 +894,18 @@ fn deserializeHeaderPairs(
     }
 
     for (array.items, 0..) |item, idx| {
+        if (item != .object) return error.InvalidUserContent;
         const header_obj = item.object;
-        const name_value = header_obj.get("name").?.string;
+        const name_field = header_obj.get("name") orelse return error.InvalidUserContent;
+        if (name_field != .string) return error.InvalidUserContent;
+        const name_value = name_field.string;
         try validateLength(name_value, MAX_HEADER_NAME_LENGTH);
         const name = try allocator.dupe(u8, name_value);
         errdefer allocator.free(name);
 
-        const header_value = header_obj.get("value").?.string;
+        const value_field = header_obj.get("value") orelse return error.InvalidUserContent;
+        if (value_field != .string) return error.InvalidUserContent;
+        const header_value = value_field.string;
         try validateLength(header_value, MAX_HEADER_VALUE_LENGTH);
         const value = try allocator.dupe(u8, header_value);
         errdefer allocator.free(value);
@@ -910,6 +915,14 @@ fn deserializeHeaderPairs(
     }
 
     return headers;
+}
+
+fn deserializeHeaderPairsValue(
+    value: std.json.Value,
+    allocator: std.mem.Allocator,
+) ![]ai_types.HeaderPair {
+    if (value != .array) return error.InvalidUserContent;
+    return try deserializeHeaderPairs(value.array, allocator);
 }
 
 fn freeHeaderPairs(allocator: std.mem.Allocator, headers: []const ai_types.HeaderPair) void {
@@ -1692,7 +1705,7 @@ fn deserializeStreamOptions(
         opts.ping_interval_ms = try valueAsU64(interval);
     }
     if (obj.get("headers")) |headers_val| {
-        const headers = try deserializeHeaderPairs(headers_val.array, allocator);
+        const headers = try deserializeHeaderPairsValue(headers_val, allocator);
         opts.headers = headers;
         opts.owned_headers = ai_types.OwnedSlice(ai_types.HeaderPair).initOwned(headers);
     }
@@ -2064,6 +2077,49 @@ test "stream_request rejects oversized model integer fields" {
     defer allocator.free(oversized);
 
     try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(oversized, allocator));
+}
+
+test "stream_request rejects malformed model headers" {
+    const allocator = std.testing.allocator;
+    const headers = [_]ai_types.HeaderPair{.{ .name = "version", .value = "0.135.0" }};
+    const model = ai_types.Model{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+        .headers = &headers,
+    };
+    const context = ai_types.Context{ .messages = &.{} };
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 1708234567890,
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = context,
+            .options = null,
+            .include_partial = true,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+    envelope.deinit(allocator);
+
+    const malformed_object = try std.mem.replaceOwned(u8, allocator, json, "\"headers\":[{\"name\":\"version\",\"value\":\"0.135.0\"}]", "\"headers\":{}");
+    defer allocator.free(malformed_object);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(malformed_object, allocator));
+
+    const missing_value = try std.mem.replaceOwned(u8, allocator, json, "\"headers\":[{\"name\":\"version\",\"value\":\"0.135.0\"}]", "\"headers\":[{\"name\":\"version\"}]");
+    defer allocator.free(missing_value);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(missing_value, allocator));
 }
 
 test "deserializeEnvelope parses valid JSON" {
