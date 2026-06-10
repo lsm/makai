@@ -42,13 +42,9 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     try writeSep(writer, allocator);
     try writeSegment(writer, allocator, "think", @tagName(state.thinking_level));
     try writeSep(writer, allocator);
+    try writeSegment(writer, allocator, "view", @tagName(state.transcript_mode));
+    try writeSep(writer, allocator);
     try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
-    if (state.status.last_error.len > 0) {
-        try writeSep(writer, allocator);
-        const err = try tui_theme.errorText().render(allocator, state.status.last_error);
-        defer allocator.free(err);
-        try writer.writeAll(err);
-    }
 
     const items = out.written();
     if (tui_text.visibleWidth(items) > options.width) {
@@ -186,7 +182,9 @@ test "status bar renders context gauge cost and permission" {
     try std.testing.expect(std.mem.indexOf(u8, text, "$") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "minimal") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "low") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "view") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "balanced") != null);
 }
 
 test "status bar renders bypass permission mode" {
@@ -199,4 +197,18 @@ test "status bar renders bypass permission mode" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bypass") != null);
+}
+
+test "status bar does not render last error" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setError(std.testing.allocator, "agent error");
+    state.status.turn_count = 7;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "turns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agent error") == null);
 }

@@ -56,6 +56,7 @@ const AgentRunOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
+    thinking_level: ai_types.ThinkingLevel = .low,
     api_key: ?[]u8 = null,
 
     fn deinit(self: *AgentRunOptions, allocator: std.mem.Allocator) void {
@@ -560,6 +561,7 @@ const StdioProtocolLoop = struct {
             .temperature = prepared.options.temperature,
             .max_tokens = prepared.options.max_tokens,
             .max_iterations = prepared.options.max_iterations,
+            .thinking_level = prepared.options.thinking_level,
             .session_id = session_id_text,
             .api_key = prepared.options.api_key,
             .cancel_token = .{ .cancelled = cancel_flag },
@@ -798,7 +800,7 @@ fn prepareAgentRun(
     const system_prompt = try allocator.dupe(u8, system_prompt_builder.items);
     errdefer allocator.free(system_prompt);
 
-    const options = try parseAgentRunOptions(allocator, message_obj, pending.options_json);
+    const options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
 
     return .{
         .model = model,
@@ -866,7 +868,7 @@ fn modelFromProductionCatalog(
     return null;
 }
 
-fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
+fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, config_obj: ?std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
     const message_options = if (message_obj.get("options")) |value|
         if (value == .object) value.object else null
     else
@@ -884,6 +886,7 @@ fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.Obje
         .temperature = optionF32(envelope_options, message_options, "temperature"),
         .max_tokens = optionU32(envelope_options, message_options, "max_tokens"),
         .max_iterations = optionU32(envelope_options, message_options, "max_iterations"),
+        .thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level") orelse .low,
         .api_key = if (optionString(envelope_options, message_options, "api_key")) |key| try allocator.dupe(u8, key) else null,
     };
 }
@@ -908,6 +911,25 @@ fn optionU32(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: [
 
 fn optionString(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (optionValue(primary, fallback, key)) |value| if (value == .string) value.string else null else null;
+}
+
+fn optionThinkingLevel(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, config: ?std.json.ObjectMap, key: []const u8) ?ai_types.ThinkingLevel {
+    if (optionString(primary, fallback, key)) |value| {
+        if (std.meta.stringToEnum(ai_types.ThinkingLevel, value)) |level| return normalizeStdioThinkingLevel(level);
+    }
+    if (config) |obj| {
+        if (getStringField(obj, key)) |value| {
+            if (std.meta.stringToEnum(ai_types.ThinkingLevel, value)) |level| return normalizeStdioThinkingLevel(level);
+        }
+    }
+    return null;
+}
+
+fn normalizeStdioThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLevel {
+    return switch (level) {
+        .minimal => .low,
+        else => level,
+    };
 }
 
 fn parseAgentTools(
@@ -2750,6 +2772,71 @@ test "prepareAgentRun parses SDK-style request options from message json" {
     try std.testing.expectEqual(@as(?f32, 0.25), prepared.options.temperature);
     try std.testing.expectEqual(@as(?u32, 64), prepared.options.max_tokens);
     try std.testing.expectEqual(@as(?u32, 7), prepared.options.max_iterations);
+}
+
+test "prepareAgentRun reads thinking level from stdio config and allows message override" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var from_config = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"high\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_config.deinit(allocator);
+
+    var prepared_config = try prepareAgentRun(allocator, from_config);
+    defer prepared_config.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, prepared_config.options.thinking_level);
+
+    var from_message = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"options":{"thinking_level":"off"}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"high\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_message.deinit(allocator);
+
+    var prepared_message = try prepareAgentRun(allocator, from_message);
+    defer prepared_message.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.off, prepared_message.options.thinking_level);
+
+    var from_legacy_minimal = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"minimal\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_legacy_minimal.deinit(allocator);
+
+    var prepared_minimal = try prepareAgentRun(allocator, from_legacy_minimal);
+    defer prepared_minimal.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, prepared_minimal.options.thinking_level);
+
+    var from_xhigh = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"options":{"thinking_level":"xhigh"}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_xhigh.deinit(allocator);
+
+    var prepared_xhigh = try prepareAgentRun(allocator, from_xhigh);
+    defer prepared_xhigh.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.xhigh, prepared_xhigh.options.thinking_level);
 }
 
 test "parseToolResultHistoryMessage preserves structured tool_result content" {

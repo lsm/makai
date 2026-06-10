@@ -116,10 +116,17 @@ pub const TuiRuntimeOptions = struct {
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
     permission_mode: PermissionMode = .bypass,
-    thinking_level: ai_types.ThinkingLevel = .minimal,
+    thinking_level: ai_types.ThinkingLevel = .low,
     compact_output: bool = false,
     run_async: bool = true,
 };
+
+fn normalizeTuiThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLevel {
+    return switch (level) {
+        .minimal => .low,
+        else => level,
+    };
+}
 
 pub const TuiRuntime = struct {
     allocator: std.mem.Allocator,
@@ -154,7 +161,7 @@ pub const TuiRuntime = struct {
     tool_approval_callback: ?ToolApprovalCallback,
     permission_engine: ?*permission.PermissionEngine,
     permission_mode: PermissionMode = .bypass,
-    thinking_level: ai_types.ThinkingLevel = .minimal,
+    thinking_level: ai_types.ThinkingLevel = .low,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -269,7 +276,7 @@ pub const TuiRuntime = struct {
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
             .permission_mode = options.permission_mode,
-            .thinking_level = options.thinking_level,
+            .thinking_level = normalizeTuiThinkingLevel(options.thinking_level),
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
@@ -464,8 +471,9 @@ pub const TuiRuntime = struct {
     }
 
     pub fn setThinkingLevel(self: *TuiRuntime, level: ai_types.ThinkingLevel) void {
-        self.thinking_level = level;
-        if (self.local_agent) |*local| local.setThinkingLevel(level);
+        const normalized = normalizeTuiThinkingLevel(level);
+        self.thinking_level = normalized;
+        if (self.local_agent) |*local| local.setThinkingLevel(normalized);
     }
 
     pub fn setPermissionMode(self: *TuiRuntime, mode: PermissionMode) !void {
@@ -1163,6 +1171,7 @@ pub const TuiRuntime = struct {
         }
         if (std.mem.eql(u8, type_name, "message_update")) {
             const event_value = obj.get("event") orelse return error.InvalidRemoteEvent;
+            self.push(.{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(try jsonValueToOwnedString(self.allocator, event_value)) } });
             const msg = try deserializeRemoteMessageValue(self.allocator, event_value);
             switch (msg) {
                 .event => |ev| {
@@ -1247,6 +1256,7 @@ pub const TuiRuntime = struct {
             .turn_start => self.push(.turn_start),
             .message_start => |payload| self.push(.{ .message_start = .{ .role = messageRole(payload.message) } }),
             .message_update => |payload| {
+                try self.pushProviderEvent(payload.event);
                 if (self.backend == .remote and payload.event == .done) try self.recordRemoteAssistantMessage(payload.event.done.message);
                 try self.pushMessageUpdate(payload.event);
             },
@@ -1408,6 +1418,11 @@ pub const TuiRuntime = struct {
             else => {},
         }
     }
+
+    fn pushProviderEvent(self: *TuiRuntime, event: ai_types.AssistantMessageEvent) !void {
+        const event_json = try transport.serializeEvent(event, self.allocator);
+        self.push(.{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(event_json) } });
+    }
 };
 
 fn remoteConfigStdioReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
@@ -1447,6 +1462,45 @@ fn remoteConfigStdioClose(ctx: *anyopaque) void {
 
 fn parseStopReason(value: []const u8) ai_types.StopReason {
     return std.meta.stringToEnum(ai_types.StopReason, value) orelse .stop;
+}
+
+fn jsonValueToOwnedString(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var writer = json_writer.JsonWriter.init(&buffer, allocator);
+    try writeJsonValue(&writer, value, allocator);
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn writeJsonValue(writer: *json_writer.JsonWriter, value: std.json.Value, allocator: std.mem.Allocator) !void {
+    switch (value) {
+        .null => try writer.writeNull(),
+        .bool => |b| try writer.writeBool(b),
+        .integer => |i| try writer.writeInt(i),
+        .float => |f| {
+            try writer.buffer.print(allocator, "{d}", .{f});
+            writer.needs_comma = true;
+        },
+        .number_string => |s| {
+            try writer.buffer.appendSlice(allocator, s);
+            writer.needs_comma = true;
+        },
+        .string => |s| try writer.writeString(s),
+        .array => |arr| {
+            try writer.beginArray();
+            for (arr.items) |item| try writeJsonValue(writer, item, allocator);
+            try writer.endArray();
+        },
+        .object => |obj| {
+            try writer.beginObject();
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                try writer.writeKey(entry.key_ptr.*);
+                try writeJsonValue(writer, entry.value_ptr.*, allocator);
+            }
+            try writer.endObject();
+        },
+    }
 }
 
 fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -2623,6 +2677,15 @@ test "thinking level affects next local turn" {
     try std.testing.expectEqual(ai_types.ThinkingLevel.high, mock.last_thinking_level);
 }
 
+test "TUI runtime normalizes hidden minimal thinking level" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .thinking_level = .minimal });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, runtime.thinkingLevel());
+    runtime.setThinkingLevel(.minimal);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, runtime.thinkingLevel());
+}
+
 test "model switch is rejected while async turn is running" {
     var mock = MockProtocolCtx{ .wait_for_cancel = true };
     const models = [_]ai_types.Model{ test_model_a, test_model_b };
@@ -3335,6 +3398,11 @@ test "remote done event records assistant history for next turn" {
     try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
     try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
     try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);
+    const provider_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable_provider = provider_ev;
+    defer mutable_provider.deinit(std.testing.allocator);
+    try std.testing.expect(mutable_provider == .provider_event);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_provider.provider_event.event_json.slice(), "\"type\":\"done\"") != null);
     const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
     var mutable = ev;
     defer mutable.deinit(std.testing.allocator);
@@ -3492,6 +3560,11 @@ test "remote message update extracts parsed event object" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
     try runtime.handleRemoteAgentEventJson("{\"type\":\"message_update\",\"note\":\"contains \\\"event\\\": inside string\",\"event\":{\"type\":\"text_delta\",\"content_index\":0,\"delta\":\"hi\"}} ");
+    const provider_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable_provider = provider_ev;
+    defer mutable_provider.deinit(std.testing.allocator);
+    try std.testing.expect(mutable_provider == .provider_event);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_provider.provider_event.event_json.slice(), "\"type\":\"text_delta\"") != null);
     const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
     var mutable = ev;
     defer mutable.deinit(std.testing.allocator);

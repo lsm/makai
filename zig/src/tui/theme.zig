@@ -155,6 +155,10 @@ pub fn composerPlaceholder() zz.Style {
     return muted();
 }
 
+pub fn composerCursor() zz.Style {
+    return (zz.Style{}).fg(palette.surface).bg(palette.text).bold(true).inline_style(true);
+}
+
 pub fn statusSegment() zz.Style {
     return (zz.Style{}).fg(palette.text).inline_style(true);
 }

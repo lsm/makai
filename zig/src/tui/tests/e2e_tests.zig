@@ -391,7 +391,7 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     try std.testing.expect(d.frameContains("starting login for anthropic"));
 }
 
-test "e2e: TUI never enables mouse reporting so native selection works" {
+test "e2e: TUI enables mouse reporting for wheel transcript scroll" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
     var d = try Driver.init(std.testing.allocator, .{
@@ -401,13 +401,17 @@ test "e2e: TUI never enables mouse reporting so native selection works" {
     }, .{});
     defer d.deinit();
 
-    // The startup command must be the plain tick timer, NOT a batch that turns
-    // on mouse capture. Grabbing the mouse (e.g. `\x1b[?1003h`) can leave the
-    // user's shell receiving raw mouse sequences if the TUI aborts.
     try std.testing.expectEqual(
         @as(std.meta.Tag(zz.Cmd(TuiModel.Msg)), .every),
         std.meta.activeTag(d.init_cmd),
     );
+
+    try std.testing.expect(tui_app.tuiProgramOptionsForTest().mouse);
+    d.app().state.transcript_scroll = 0;
+    _ = d.model.update(.{ .mouse = .{ .x = 0, .y = 0, .button = .wheel_up, .event_type = .press } }, &d.ctx);
+    try std.testing.expectEqual(@as(usize, 3), d.app().state.transcript_scroll);
+    _ = d.model.update(.{ .mouse = .{ .x = 0, .y = 0, .button = .wheel_down, .event_type = .press } }, &d.ctx);
+    try std.testing.expectEqual(@as(usize, 0), d.app().state.transcript_scroll);
 }
 
 test "e2e: /copy reports when there is a reply to copy" {

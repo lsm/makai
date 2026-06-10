@@ -156,10 +156,8 @@ pub const App = struct {
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
-    /// The TUI does not enable terminal mouse reporting, so the terminal keeps
-    /// ownership of the mouse and native click-drag selection + copy works out
-    /// of the box (like other agent CLIs). `Ctrl+Y` / `/copy` provide an
-    /// explicit OSC 52 copy path for when dragging isn't convenient.
+    /// `Ctrl+Y` / `/copy` provide an explicit OSC 52 copy path for when
+    /// dragging selection isn't convenient.
     pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
@@ -287,6 +285,12 @@ pub const App = struct {
     /// Providers that expose an OAuth login, in picker order.
     const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex" };
 
+    const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
+
+    const view_modes = [_]tui_state.TranscriptVisibilityMode{ .everything, .verbose, .balanced, .chat };
+
+    const thinking_levels = [_]ai_types.ThinkingLevel{ .off, .low, .medium, .high, .xhigh };
+
     fn loginProviderEnum(idx: usize) tui_login.Provider {
         return switch (idx) {
             0 => .anthropic,
@@ -322,6 +326,44 @@ pub const App = struct {
         self.enterMenu(.model_picker);
     }
 
+    fn openPermissionPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        if (self.runtime) |runtime| self.state.permission_mode = runtime.permissionMode();
+        for (permission_modes, 0..) |mode, i| {
+            if (mode == self.state.permission_mode) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.permission_picker);
+    }
+
+    fn openViewPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        for (view_modes, 0..) |mode, i| {
+            if (mode == self.state.transcript_mode) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.view_picker);
+    }
+
+    fn openThinkingPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        if (self.runtime) |runtime| self.state.thinking_level = runtime.thinkingLevel();
+        for (thinking_levels, 0..) |level, i| {
+            if (level == self.state.thinking_level) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.thinking_picker);
+    }
+
     fn enterMenu(self: *App, mode: tui_state.AppMode) void {
         self.state.mode = mode;
         self.ensureMenuSelectionVisible();
@@ -331,6 +373,9 @@ pub const App = struct {
         return switch (self.state.mode) {
             .model_picker => if (self.runtime) |runtime| runtime.availableModels().len else 0,
             .login_picker => login_providers.len,
+            .permission_picker => permission_modes.len,
+            .view_picker => view_modes.len,
+            .thinking_picker => thinking_levels.len,
             else => 0,
         };
     }
@@ -395,6 +440,39 @@ pub const App = struct {
     fn applySelectedLogin(self: *App) !void {
         const idx = @min(self.state.menu_index, login_providers.len - 1);
         try self.startLoginProviderIndex(idx);
+    }
+
+    fn applySelectedPermission(self: *App) !void {
+        const idx = @min(self.state.menu_index, permission_modes.len - 1);
+        const mode = permission_modes[idx];
+        const runtime = self.runtime orelse return error.NoRuntimeConfigured;
+        try runtime.setPermissionMode(mode);
+        self.state.permission_mode = mode;
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "permission mode set to {s}", .{@tagName(mode)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn applySelectedView(self: *App) !void {
+        const idx = @min(self.state.menu_index, view_modes.len - 1);
+        const mode = view_modes[idx];
+        self.state.setTranscriptMode(mode);
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "view mode set to {s}", .{@tagName(mode)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn applySelectedThinking(self: *App) !void {
+        const idx = @min(self.state.menu_index, thinking_levels.len - 1);
+        const level = thinking_levels[idx];
+        if (self.runtime) |runtime| runtime.setThinkingLevel(level);
+        self.state.thinking_level = level;
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "thinking level set to {s}", .{@tagName(level)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
     }
 
     /// Drive the active login session forward. Called each tick; surfaces the
@@ -532,14 +610,27 @@ pub const App = struct {
     /// Save one event to the session store (best-effort: ignores errors).
     fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
         const store = self.store orelse return;
-        // Only save events that are needed for session replay.
+        // Save replay-critical and debug-visible events while still rejecting
+        // oversized payloads that would make the JSONL session unwieldy.
         switch (event) {
             .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             .text_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
+            .thinking_delta => |payload| {
+                if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
+            },
             .tool_call_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
+            },
+            .provider_event => |payload| {
+                if (jsonStringBudget(payload.event_json.slice()) > max_session_event_payload_bytes) return;
+            },
+            .tool_approval_requested => |payload| {
+                if (toolRequestPayloadSize(payload) > max_session_event_payload_bytes) return;
+            },
+            .tool_execution_update => |payload| {
+                if (toolUpdatePayloadSize(payload) > max_session_event_payload_bytes) return;
             },
             .message_end => |payload| {
                 if (messageEndPayloadSize(payload) > max_session_event_payload_bytes) return;
@@ -547,7 +638,9 @@ pub const App = struct {
             .tool_execution_end => |payload| {
                 if (toolExecutionEndPayloadSize(payload) > max_session_event_payload_bytes) return;
             },
-            else => return,
+            .@"error" => |payload| {
+                if (jsonStringBudget(payload.message.slice()) > max_session_event_payload_bytes) return;
+            },
         }
         const meta = self.currentSessionMetadata();
         store.save(meta, event) catch {};
@@ -569,6 +662,17 @@ pub const App = struct {
             jsonStringBudget(payload.tool_call_id.slice()) +
             jsonStringBudget(payload.tool_name.slice()) +
             jsonStringBudget(payload.artifact_refs.slice());
+    }
+
+    fn toolRequestPayloadSize(payload: anytype) usize {
+        return jsonStringBudget(payload.tool_call_id.slice()) +
+            jsonStringBudget(payload.tool_name.slice()) +
+            jsonStringBudget(payload.args_json.slice());
+    }
+
+    fn toolUpdatePayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).tool_execution_update)) usize {
+        return toolRequestPayloadSize(payload) +
+            jsonStringBudget(payload.partial_result_json.slice());
     }
 
     fn jsonStringBudget(value: []const u8) usize {
@@ -722,6 +826,9 @@ pub const App = struct {
                 self.state.menu_scroll = 0;
                 self.state.mode = .login_picker;
             },
+            .open_permission_picker => self.openPermissionPicker(),
+            .open_view_picker => self.openViewPicker(),
+            .open_thinking_picker => self.openThinkingPicker(),
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
@@ -1167,15 +1274,19 @@ pub const TuiModel = struct {
                             app.state.composer.clear();
                         },
                         .escape => app.cancelLogin(),
-                        .backspace => deleteLastCodepoint(app),
+                        .backspace => _ = app.state.composer.deleteBeforeCursor(),
                         .char => |c| appendChar(app, c) catch {},
-                        .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
+                        .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
+                        .left => _ = app.state.composer.moveCursorPrev(),
+                        .right => _ = app.state.composer.moveCursorNext(),
+                        .home => app.state.composer.moveCursorHome(),
+                        .end => app.state.composer.moveCursorEnd(),
                         else => {},
                     }
                     return .none;
                 }
-                // Model / login menu navigation.
-                if (app.state.mode == .model_picker or app.state.mode == .login_picker) {
+                // Single-column selector menu navigation.
+                if (isMenuMode(app.state.mode)) {
                     switch (key.key) {
                         .up => app.moveMenuSelection(-1),
                         .down => app.moveMenuSelection(1),
@@ -1187,8 +1298,14 @@ pub const TuiModel = struct {
                         .enter => {
                             if (app.state.mode == .model_picker) {
                                 app.applySelectedModel() catch |err| app.recordError(@errorName(err)) catch {};
-                            } else {
+                            } else if (app.state.mode == .login_picker) {
                                 app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .permission_picker) {
+                                app.applySelectedPermission() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .view_picker) {
+                                app.applySelectedView() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .thinking_picker) {
+                                app.applySelectedThinking() catch |err| app.recordError(@errorName(err)) catch {};
                             }
                         },
                         .escape => app.state.mode = .normal,
@@ -1199,7 +1316,7 @@ pub const TuiModel = struct {
                 switch (key.key) {
                     .enter => {
                         if (key.modifiers.shift) {
-                            app.state.composer.buffer.append(app.allocator, '\n') catch |err| app.recordError(@errorName(err)) catch {};
+                            app.state.composer.insertSlice(app.allocator, "\n") catch |err| app.recordError(@errorName(err)) catch {};
                             return .none;
                         }
                         app.drainEvents() catch |err| {
@@ -1234,9 +1351,13 @@ pub const TuiModel = struct {
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
                     },
-                    .backspace => deleteLastCodepoint(app),
+                    .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
-                    .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
+                    .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
+                    .left => _ = app.state.composer.moveCursorPrev(),
+                    .right => _ = app.state.composer.moveCursorNext(),
+                    .home => app.state.composer.moveCursorHome(),
+                    .end => app.state.composer.moveCursorEnd(),
                     .up => {
                         if (!(app.state.composerHistoryPrev() catch false)) app.state.transcript_scroll += 1;
                     },
@@ -1250,10 +1371,7 @@ pub const TuiModel = struct {
                     else => {},
                 }
             },
-            .mouse => {
-                // Mouse reporting is intentionally not enabled; if a terminal
-                // sends a mouse event anyway, leave app state unchanged.
-            },
+            .mouse => |mouse| handleMouse(app, mouse),
             .tick => {
                 app.state.anim_tick +%= 1;
                 app.drainEvents() catch {};
@@ -1311,6 +1429,48 @@ pub const TuiModel = struct {
                     .offset = app.state.menu_scroll,
                 }) catch "";
             },
+            .permission_picker => blk: {
+                var items: [App.permission_modes.len]menu_picker_view.Item = undefined;
+                for (App.permission_modes, 0..) |mode, i| {
+                    items[i] = .{ .label = @tagName(mode), .detail = permissionModeDetail(mode) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Tool permissions",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .view_picker => blk: {
+                var items: [App.view_modes.len]menu_picker_view.Item = undefined;
+                for (App.view_modes, 0..) |mode, i| {
+                    items[i] = .{ .label = @tagName(mode), .detail = viewModeDetail(mode) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Transcript view",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .thinking_picker => blk: {
+                var items: [App.thinking_levels.len]menu_picker_view.Item = undefined;
+                for (App.thinking_levels, 0..) |level, i| {
+                    items[i] = .{ .label = @tagName(level), .detail = thinkingLevelDetail(level) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Thinking level",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
             .login_input => "",
             .normal => "",
         };
@@ -1324,15 +1484,49 @@ pub const TuiModel = struct {
     fn appendChar(app: *App, c: u21) !void {
         var buf: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(c, &buf);
-        try app.state.composer.buffer.appendSlice(app.allocator, buf[0..len]);
+        try app.state.composer.insertSlice(app.allocator, buf[0..len]);
     }
 
-    fn deleteLastCodepoint(app: *App) void {
-        const text = app.state.composer.buffer.items;
-        if (text.len == 0) return;
-        var idx = text.len - 1;
-        while (idx > 0 and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
-        app.state.composer.buffer.shrinkRetainingCapacity(idx);
+    fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
+        if (mouse.event_type != .press) return;
+        switch (mouse.button) {
+            .wheel_up => app.state.transcript_scroll += 3,
+            .wheel_down => app.state.transcript_scroll -|= 3,
+            else => {},
+        }
+    }
+
+    fn isMenuMode(mode: tui_state.AppMode) bool {
+        return switch (mode) {
+            .model_picker, .login_picker, .permission_picker, .view_picker, .thinking_picker => true,
+            else => false,
+        };
+    }
+
+    fn permissionModeDetail(mode: tui_runtime.PermissionMode) []const u8 {
+        return switch (mode) {
+            .bypass => "run tools without prompts",
+            .ask => "ask before tool execution",
+        };
+    }
+
+    fn viewModeDetail(mode: tui_state.TranscriptVisibilityMode) []const u8 {
+        return switch (mode) {
+            .everything => "full protocol log",
+            .verbose => "more internals",
+            .balanced => "balanced details",
+            .chat => "mostly messages",
+        };
+    }
+
+    fn thinkingLevelDetail(level: ai_types.ThinkingLevel) []const u8 {
+        return switch (level) {
+            .off => "disabled",
+            .minimal, .low => "light reasoning",
+            .medium => "balanced reasoning",
+            .high => "deeper reasoning",
+            .xhigh => "maximum reasoning",
+        };
     }
 
     fn countLines(text: []const u8) usize {
@@ -1479,7 +1673,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true };
+    return .{ .kitty_keyboard = true, .mouse = true };
+}
+
+pub fn tuiProgramOptionsForTest() zz.Options {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    return tuiProgramOptions();
 }
 
 test "App init seeds registered tools from runtime" {
@@ -1497,6 +1696,10 @@ test "App init seeds registered tools from runtime" {
 
 test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
+}
+
+test "TUI program enables mouse reporting for wheel transcript scroll" {
+    try std.testing.expect(tuiProgramOptions().mouse);
 }
 
 test "saved model id loads from config store" {
@@ -1518,6 +1721,58 @@ test "saved model id loads from config store" {
     const model_id = (try loadSavedModelIdFromStore(std.testing.allocator, store)).?;
     defer std.testing.allocator.free(model_id);
     try std.testing.expectEqualStrings("persisted-model", model_id);
+}
+
+test "App saveEvent keeps debug-visible event types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    defer std.testing.allocator.free(base);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    app.session_id = try std.testing.allocator.dupe(u8, "save-debug-events");
+    app.session_created_at = 1;
+
+    var thinking = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "plan")) } };
+    defer thinking.deinit(std.testing.allocator);
+    app.saveEvent(thinking);
+
+    var approval = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"command\":\"pwd\"}")),
+    } };
+    defer approval.deinit(std.testing.allocator);
+    app.saveEvent(approval);
+
+    var update = tui_runtime.TuiEvent{ .tool_execution_update = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"command\":\"pwd\"}")),
+        .partial_result_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"stdout\":\"/tmp\"}")),
+    } };
+    defer update.deinit(std.testing.allocator);
+    app.saveEvent(update);
+
+    var provider = tui_runtime.TuiEvent{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"type\":\"done\"}")) } };
+    defer provider.deinit(std.testing.allocator);
+    app.saveEvent(provider);
+
+    var err = tui_runtime.TuiEvent{ .@"error" = .{ .message = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "boom")) } };
+    defer err.deinit(std.testing.allocator);
+    app.saveEvent(err);
+
+    var loaded = try app.store.?.load("save-debug-events");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), loaded.events.items.len);
+    try std.testing.expect(loaded.events.items[0] == .thinking_delta);
+    try std.testing.expect(loaded.events.items[1] == .tool_approval_requested);
+    try std.testing.expect(loaded.events.items[2] == .tool_execution_update);
+    try std.testing.expect(loaded.events.items[3] == .provider_event);
+    try std.testing.expectEqualStrings("{\"type\":\"done\"}", loaded.events.items[3].provider_event.event_json.slice());
+    try std.testing.expect(loaded.events.items[4] == .@"error");
 }
 
 test "App approval decisions map to requested choices" {
@@ -1585,8 +1840,8 @@ test "multi-line /help output renders all lines into transcript view" {
     // listing to a single truncated line.
     const expect = [_][]const u8{
         "/help",  "/model",       "/provider", "/status",
-        "/tools", "/permissions", "/compact",  "/clear",
-        "/diff",  "/quit",
+        "/tools", "/permissions", "/view",     "/compact",
+        "/clear", "/diff",        "/quit",
     };
     for (expect) |needle| {
         if (std.mem.indexOf(u8, rendered, needle) == null) {
@@ -1792,7 +2047,7 @@ test "TuiModel exits quit command while streaming" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/quit");
+    try model.app.?.state.replaceComposerBuffer("/quit");
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
@@ -1801,7 +2056,7 @@ test "TuiModel exits quit command while streaming" {
 test "TuiModel Shift Enter inserts newline without submitting" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "first");
+    try model.app.?.state.replaceComposerBuffer("first");
 
     const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .shift = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
@@ -1813,10 +2068,40 @@ test "TuiModel Shift Tab cycles thinking level" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
 
-    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, model.app.?.state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, model.app.?.state.thinking_level);
     const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(ai_types.ThinkingLevel.low, model.app.?.state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
+}
+
+test "setting pickers apply selected values" {
+    const runtime_ptr = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    runtime_ptr.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime_ptr;
+
+    app.openViewPicker();
+    try std.testing.expectEqual(tui_state.AppMode.view_picker, app.state.mode);
+    app.state.menu_index = 0;
+    try app.applySelectedView();
+    try std.testing.expectEqual(tui_state.TranscriptVisibilityMode.everything, app.state.transcript_mode);
+    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
+
+    app.openThinkingPicker();
+    try std.testing.expectEqual(tui_state.AppMode.thinking_picker, app.state.mode);
+    app.state.menu_index = 3;
+    try app.applySelectedThinking();
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, app.state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, runtime_ptr.thinkingLevel());
+
+    app.openPermissionPicker();
+    try std.testing.expectEqual(tui_state.AppMode.permission_picker, app.state.mode);
+    app.state.menu_index = 1;
+    try app.applySelectedPermission();
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, app.state.permission_mode);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, runtime_ptr.permissionMode());
 }
 
 test "TuiModel drains events before routing Enter while streaming" {
@@ -1878,6 +2163,20 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
+}
+
+test "TuiModel moves composer cursor and edits in place" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'a' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'b' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'c' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .left } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'X' } } }, undefined);
+    try std.testing.expectEqualStrings("abXc", model.app.?.state.composer.text());
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    try std.testing.expectEqualStrings("abc", model.app.?.state.composer.text());
 }
 
 test "session picker navigation pages through hidden rows" {

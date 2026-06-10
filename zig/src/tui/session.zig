@@ -35,6 +35,9 @@ pub const TuiEvent = union(enum) {
     text_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     thinking_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     tool_call_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
+    provider_event: struct {
+        event_json: OwnedSlice(u8),
+    },
     message_end: struct {
         role: MessageRole,
         text: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -117,6 +120,7 @@ pub const TuiEvent = union(enum) {
             .text_delta => |*p| p.delta.deinit(allocator),
             .thinking_delta => |*p| p.delta.deinit(allocator),
             .tool_call_delta => |*p| p.delta.deinit(allocator),
+            .provider_event => |*p| p.event_json.deinit(allocator),
             .message_end => |*p| {
                 p.text.deinit(allocator);
                 p.content_json.deinit(allocator);

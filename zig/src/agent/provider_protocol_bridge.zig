@@ -108,8 +108,8 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
 
 fn reasoningEffort(level: ai_types.ThinkingLevel) []const u8 {
     return switch (level) {
-        .off => "",
-        .minimal => "minimal",
+        .off => "none",
+        .minimal => "low",
         .low => "low",
         .medium => "medium",
         .high => "high",
@@ -387,7 +387,10 @@ test "provider protocol bridge maps thinking level to stream options" {
     try std.testing.expect(!off.thinking_enabled);
     try std.testing.expect(!off.reasoning_enabled);
     try std.testing.expect(off.getThinkingEffort() == null);
-    try std.testing.expect(off.getReasoningEffort() == null);
+    try std.testing.expectEqualStrings("none", off.getReasoningEffort().?);
+
+    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, null, null);
+    try std.testing.expectEqualStrings("low", minimal.getReasoningEffort().?);
 }
 
 test "InProcessProviderProtocolBridge preserves streamed tool call terminal result" {
