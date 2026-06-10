@@ -110,6 +110,7 @@ pub const ProductionRuntime = struct {
             .models = self.models,
             .initial_model_id = self.initial_model_id,
             .permission_engine = &self.permission_engine,
+            .workspace_root = self.permission_engine.workspace_root,
             .run_async = true,
             .compact_output = true,
         };

@@ -113,6 +113,7 @@ pub const TuiRuntimeOptions = struct {
     tools: []const agent.AgentTool = &.{},
     mcp_config_json: ?[]const u8 = null,
     permission_engine: ?*permission.PermissionEngine = null,
+    workspace_root: []const u8 = "",
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
     permission_mode: PermissionMode = .bypass,
@@ -153,6 +154,7 @@ pub const TuiRuntime = struct {
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
     tool_protocol: tool_local_runtime.LocalToolProtocol,
+    workspace_root: []u8,
     tool_protocol_override_fn: ?agent_types.ToolProtocolExecuteFn = null,
     tool_protocol_override_ctx: ?*anyopaque = null,
     pending_approval: ApprovalDecisionState = .{},
@@ -251,7 +253,11 @@ pub const TuiRuntime = struct {
             }
         }
 
-        const tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
+        var tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
+        errdefer tool_protocol.deinit();
+
+        var workspace_root = try allocator.dupe(u8, options.workspace_root);
+        errdefer allocator.free(workspace_root);
 
         var runtime = TuiRuntime{
             .allocator = allocator,
@@ -272,6 +278,7 @@ pub const TuiRuntime = struct {
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
             .tool_protocol = tool_protocol,
+            .workspace_root = workspace_root,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
@@ -286,6 +293,8 @@ pub const TuiRuntime = struct {
         original_tools = &.{};
         wrapped_tools = &.{};
         models = &.{};
+        tool_protocol = undefined;
+        workspace_root = &.{};
         tool_registry = local_tools.ToolRegistry.init();
         approval_contexts = &.{};
         errdefer runtime.deinit();
@@ -330,6 +339,7 @@ pub const TuiRuntime = struct {
         if (self.remote_config_sender) |sender| self.allocator.destroy(sender);
         self.clearPendingApproval();
         self.tool_protocol.deinit();
+        self.allocator.free(self.workspace_root);
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
@@ -354,8 +364,10 @@ pub const TuiRuntime = struct {
                 client.setSender(sender);
                 const config_json = try self.remoteConfigJson();
                 defer self.allocator.free(config_json);
+                const system_prompt = try self.workspaceSystemPrompt();
+                defer self.allocator.free(system_prompt);
                 const sid = agent_protocol_types.generateSessionId();
-                _ = try client.sendAgentStartWithSession(sid, config_json, null);
+                _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
                 self.remote_pending_session_id = sid;
                 self.remote_client = client;
                 client_moved = true;
@@ -389,6 +401,9 @@ pub const TuiRuntime = struct {
                 });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
+                const system_prompt = try self.workspaceSystemPrompt();
+                defer self.allocator.free(system_prompt);
+                try self.local_agent.?.setSystemPrompt(system_prompt);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
                 self.local_agent.?.setThinkingLevel(self.thinking_level);
                 self.tool_protocol.server.tools.clearRetainingCapacity();
@@ -802,6 +817,7 @@ pub const TuiRuntime = struct {
         try w.writeBoolField("compact_output", self.compact_output);
         try w.writeStringField("permission_mode", @tagName(self.permission_mode));
         try w.writeStringField("thinking_level", @tagName(self.thinking_level));
+        if (self.workspace_root.len > 0) try w.writeStringField("workspace_root", self.workspace_root);
         try w.endObject();
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
@@ -874,8 +890,10 @@ pub const TuiRuntime = struct {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
+            const system_prompt = try self.workspaceSystemPrompt();
+            defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, null);
+            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
         }
         const timeout_ns = self.remote_session_timeout_ms * std.time.ns_per_ms;
@@ -904,6 +922,15 @@ pub const TuiRuntime = struct {
         self.stream_active = false;
     }
 
+    fn workspaceSystemPrompt(self: *TuiRuntime) ![]u8 {
+        if (self.workspace_root.len == 0) return self.allocator.dupe(u8, "");
+        return std.fmt.allocPrint(self.allocator,
+            \\Current working directory: {s}
+            \\Default workspace root: {s}
+            \\Use this absolute path as the `workspace_root` argument for shell, file, search, edit, and workspace tools unless the user explicitly asks for a different path.
+        , .{ self.workspace_root, self.workspace_root });
+    }
+
     fn completeRemoteCancelled(self: *TuiRuntime) void {
         if (self.event_stream.isDone()) return;
         self.completed = true;
@@ -923,8 +950,10 @@ pub const TuiRuntime = struct {
             if (was_stream_active) try self.completeRemoteWithError("remote connection disconnected");
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
+            const system_prompt = try self.workspaceSystemPrompt();
+            defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, null);
+            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
             return;
         }
@@ -1928,6 +1957,7 @@ const MockProtocolCtx = struct {
     call_count: usize = 0,
     last_model_id: []const u8 = "",
     last_thinking_level: ai_types.ThinkingLevel = .off,
+    saw_workspace_prompt: bool = false,
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
@@ -2023,11 +2053,13 @@ fn mockStream(
     options: agent.ProtocolOptions,
     allocator: std.mem.Allocator,
 ) anyerror!*event_stream.AssistantMessageEventStream {
-    _ = context;
     const mock: *MockProtocolCtx = @ptrCast(@alignCast(ctx.?));
     mock.call_count += 1;
     mock.last_model_id = model.id;
     mock.last_thinking_level = options.thinking_level;
+    const system_prompt = context.system_prompt.slice();
+    mock.saw_workspace_prompt = std.mem.indexOf(u8, system_prompt, "Default workspace root: /tmp/makai-workspace") != null and
+        std.mem.indexOf(u8, system_prompt, "`workspace_root`") != null;
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -2138,6 +2170,25 @@ test "runtime submit turn emits normalized events" {
     try std.testing.expect(saw_message_end);
     try std.testing.expect(saw_turn_end);
     try std.testing.expectEqual(@as(usize, 0), runtime.remote_messages.items.len);
+}
+
+test "local runtime includes startup cwd as default workspace root in provider prompt" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .workspace_root = "/tmp/makai-workspace",
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("pwd");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expect(mock.saw_workspace_prompt);
 }
 
 test "runtime cancel emits cancelled agent_end" {
@@ -2846,7 +2897,12 @@ test "remote mode sends agent_start envelope via mock transport" {
         .payload = .{ .agent_started = .{ .session_id = sid } },
     });
 
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .backend = .remote,
+        .remote_sender = mock.sender(),
+        .remote_receiver = mock.receiver(),
+        .workspace_root = "/tmp/makai-workspace",
+    });
     defer runtime.deinit();
 
     var tui_session = runtime.createSession();
@@ -2856,6 +2912,9 @@ test "remote mode sends agent_start envelope via mock transport" {
     var env = try agent_envelope.deserializeEnvelope(mock.writes.items[0], std.testing.allocator);
     defer env.deinit(std.testing.allocator);
     try std.testing.expect(env.payload == .agent_start);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.config_json, "\"workspace_root\":\"/tmp/makai-workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.system_prompt.slice(), "Default workspace root: /tmp/makai-workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.system_prompt.slice(), "`workspace_root`") != null);
 }
 
 test "remote stop sends agent_stop before agent_started arrives" {
