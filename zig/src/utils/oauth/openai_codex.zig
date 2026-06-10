@@ -191,13 +191,14 @@ pub fn login(callbacks: Callbacks, allocator: std.mem.Allocator) !Credentials {
     }
 
     const token_response = try exchangeCode(parsed_auth.code, pkce.verifier, allocator);
-    defer allocator.free(token_response.refresh_token);
-    defer allocator.free(token_response.access_token);
+    defer deinitTokenResponse(allocator, token_response);
+
+    const refresh_token = token_response.refresh_token orelse return error.ParseError;
 
     const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
 
     return .{
-        .refresh = try allocator.dupe(u8, token_response.refresh_token),
+        .refresh = try allocator.dupe(u8, refresh_token),
         .access = try allocator.dupe(u8, token_response.access_token),
         .expires = expires,
     };
@@ -213,16 +214,10 @@ pub fn refreshToken(credentials: Credentials, allocator: std.mem.Allocator) !Cre
     defer allocator.free(body);
 
     const token_response = try exchangeTokens(body, "application/json", allocator);
-    defer allocator.free(token_response.refresh_token);
-    defer allocator.free(token_response.access_token);
+    defer deinitTokenResponse(allocator, token_response);
 
     const expires = compat.time.nowMillis() + (token_response.expires_in * 1000) - (5 * 60 * 1000);
-
-    return .{
-        .refresh = try allocator.dupe(u8, token_response.refresh_token),
-        .access = try allocator.dupe(u8, token_response.access_token),
-        .expires = expires,
-    };
+    return try credentialsFromRefreshResponse(credentials, token_response, expires, allocator);
 }
 
 /// Get API key from credentials (access token IS the API key).
@@ -279,9 +274,23 @@ fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !Pa
 
 const TokenResponse = struct {
     access_token: []const u8,
-    refresh_token: []const u8,
+    refresh_token: ?[]const u8,
     expires_in: i64,
 };
+
+fn deinitTokenResponse(allocator: std.mem.Allocator, response: TokenResponse) void {
+    allocator.free(response.access_token);
+    if (response.refresh_token) |refresh| allocator.free(refresh);
+}
+
+fn credentialsFromRefreshResponse(credentials: Credentials, token_response: TokenResponse, expires: i64, allocator: std.mem.Allocator) !Credentials {
+    const refresh_token = token_response.refresh_token orelse credentials.refresh;
+    return .{
+        .refresh = try allocator.dupe(u8, refresh_token),
+        .access = try allocator.dupe(u8, token_response.access_token),
+        .expires = expires,
+    };
+}
 
 fn getObjectStringField(obj: *const std.json.ObjectMap, key: []const u8) ?[]const u8 {
     if (obj.get(key)) |value| {
@@ -324,14 +333,18 @@ fn parseTokenResponse(response_body: []const u8, allocator: std.mem.Allocator) !
         std.debug.print("Codex token response missing access_token: {s}\n", .{response_body});
         return error.ParseError;
     };
-    const refresh_token = getObjectStringField(obj, "refresh_token") orelse access_token;
+    const refresh_token = if (getObjectStringField(obj, "refresh_token")) |refresh|
+        try allocator.dupe(u8, refresh)
+    else
+        null;
+    errdefer if (refresh_token) |refresh| allocator.free(refresh);
 
     var expires_in = getObjectI64Field(obj, "expires_in") orelse 3600;
     if (expires_in <= 0) expires_in = 3600;
 
     return .{
         .access_token = try allocator.dupe(u8, access_token),
-        .refresh_token = try allocator.dupe(u8, refresh_token),
+        .refresh_token = refresh_token,
         .expires_in = expires_in,
     };
 }
@@ -477,25 +490,43 @@ test "parseTokenResponse extracts tokens" {
         \\{"access_token":"acc","refresh_token":"ref","expires_in":1800}
     ;
     const response = try parseTokenResponse(payload, std.testing.allocator);
-    defer std.testing.allocator.free(response.access_token);
-    defer std.testing.allocator.free(response.refresh_token);
+    defer deinitTokenResponse(std.testing.allocator, response);
 
     try std.testing.expectEqualStrings("acc", response.access_token);
-    try std.testing.expectEqualStrings("ref", response.refresh_token);
+    try std.testing.expectEqualStrings("ref", response.refresh_token.?);
     try std.testing.expectEqual(@as(i64, 1800), response.expires_in);
 }
 
-test "parseTokenResponse falls back to access_token when refresh missing" {
+test "parseTokenResponse preserves missing refresh token as null" {
     const payload =
         \\{"access_token":"acc"}
     ;
     const response = try parseTokenResponse(payload, std.testing.allocator);
-    defer std.testing.allocator.free(response.access_token);
-    defer std.testing.allocator.free(response.refresh_token);
+    defer deinitTokenResponse(std.testing.allocator, response);
 
     try std.testing.expectEqualStrings("acc", response.access_token);
-    try std.testing.expectEqualStrings("acc", response.refresh_token);
+    try std.testing.expect(response.refresh_token == null);
     try std.testing.expect(response.expires_in > 0);
+}
+
+test "refresh response without rotated refresh token preserves existing refresh token" {
+    const credentials = Credentials{
+        .refresh = "old-refresh",
+        .access = "old-access",
+        .expires = 1,
+    };
+    const response = TokenResponse{
+        .access_token = "new-access",
+        .refresh_token = null,
+        .expires_in = 3600,
+    };
+    const refreshed = try credentialsFromRefreshResponse(credentials, response, 1234, std.testing.allocator);
+    defer std.testing.allocator.free(refreshed.refresh);
+    defer std.testing.allocator.free(refreshed.access);
+
+    try std.testing.expectEqualStrings("old-refresh", refreshed.refresh);
+    try std.testing.expectEqualStrings("new-access", refreshed.access);
+    try std.testing.expectEqual(@as(i64, 1234), refreshed.expires);
 }
 
 test "parseTokenResponse maps oauth error payload to OAuthFailed" {

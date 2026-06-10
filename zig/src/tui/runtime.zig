@@ -129,6 +129,25 @@ fn normalizeTuiThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLev
     };
 }
 
+fn cloneModels(allocator: std.mem.Allocator, models: []const ai_types.Model) ![]ai_types.Model {
+    const cloned = try allocator.alloc(ai_types.Model, models.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*model| model.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (models, 0..) |model, idx| {
+        cloned[idx] = try ai_types.cloneModel(allocator, model);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void {
+    for (models) |*model| model.deinit(allocator);
+    allocator.free(models);
+}
+
 pub const TuiRuntime = struct {
     allocator: std.mem.Allocator,
     backend: TuiBackendMode,
@@ -174,8 +193,8 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
-        var models = try allocator.dupe(ai_types.Model, options.models);
-        errdefer allocator.free(models);
+        var models = try cloneModels(allocator, options.models);
+        errdefer deinitModels(allocator, models);
 
         var tool_registry = local_tools.ToolRegistry.init();
         errdefer tool_registry.deinit(allocator);
@@ -348,7 +367,7 @@ pub const TuiRuntime = struct {
             self.allocator.destroy(bridge);
         }
         self.tool_registry.deinit(self.allocator);
-        self.allocator.free(self.models);
+        deinitModels(self.allocator, self.models);
         self.* = undefined;
     }
 
@@ -466,6 +485,37 @@ pub const TuiRuntime = struct {
 
     pub fn availableModels(self: *TuiRuntime) []const ai_types.Model {
         return self.models;
+    }
+
+    pub fn replaceModels(self: *TuiRuntime, next_models: []const ai_types.Model, preferred_model_id: ?[]const u8) !void {
+        var owned_next = try cloneModels(self.allocator, next_models);
+        errdefer deinitModels(self.allocator, owned_next);
+
+        const active_model_id = if (preferred_model_id) |id|
+            id
+        else if (self.selected_model_index) |idx|
+            self.models[idx].id
+        else
+            null;
+
+        var next_selected: ?usize = if (owned_next.len > 0) 0 else null;
+        if (active_model_id) |id| {
+            for (owned_next, 0..) |model, idx| {
+                if (std.mem.eql(u8, model.id, id)) {
+                    next_selected = idx;
+                    break;
+                }
+            }
+        }
+
+        deinitModels(self.allocator, self.models);
+        self.models = owned_next;
+        owned_next = &.{};
+        self.selected_model_index = next_selected;
+
+        if (self.local_agent) |*local| {
+            if (next_selected) |idx| local.setModel(self.models[idx]);
+        }
     }
 
     pub fn currentModel(self: *TuiRuntime) ?ai_types.Model {
@@ -2741,6 +2791,18 @@ test "initial model id selects matching model" {
     });
     defer runtime.deinit();
 
+    try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "replaceModels preserves selected model when still available" {
+    const initial = [_]ai_types.Model{ test_model_a, test_model_b };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &initial, .initial_model_id = "model-b" });
+    defer runtime.deinit();
+
+    const replacement = [_]ai_types.Model{test_model_b};
+    try runtime.replaceModels(&replacement, null);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.availableModels().len);
     try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
 }
 

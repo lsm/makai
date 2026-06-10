@@ -929,8 +929,24 @@ fn deserializeCost(obj: std.json.ObjectMap) !ai_types.Cost {
 
 fn optionalU32(obj: std.json.ObjectMap, field: []const u8, default: u32) !u32 {
     const value = obj.get(field) orelse return default;
-    if (value.integer < 0) return error.InvalidUserContent;
-    return @intCast(value.integer);
+    return try valueAsU32(value);
+}
+
+fn valueAsU32(value: std.json.Value) !u32 {
+    const parsed = try valueAsU64(value);
+    if (parsed > std.math.maxInt(u32)) return error.InvalidUserContent;
+    return @intCast(parsed);
+}
+
+fn valueAsU64(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |number| blk: {
+            if (number < 0) return error.InvalidUserContent;
+            break :blk @intCast(number);
+        },
+        .number_string => |number| std.fmt.parseUnsigned(u64, number, 10) catch error.InvalidUserContent,
+        else => error.InvalidUserContent,
+    };
 }
 
 fn optionalF64(obj: std.json.ObjectMap, field: []const u8, default: f64) !f64 {
@@ -1132,7 +1148,7 @@ fn deserializeModelsResponse(
     allocator: std.mem.Allocator,
 ) !protocol_types.ModelsResponse {
     const fetched_at_ms = obj.get("fetched_at_ms").?.integer;
-    const cache_max_age_ms: u64 = @intCast(obj.get("cache_max_age_ms").?.integer);
+    const cache_max_age_ms = try valueAsU64(obj.get("cache_max_age_ms").?);
     const models_array = obj.get("models").?.array;
 
     const models = try allocator.alloc(protocol_types.ModelDescriptor, models_array.items.len);
@@ -1237,8 +1253,8 @@ fn deserializeModelDescriptor(
         .lifecycle = try parseModelLifecycle(obj.get("lifecycle").?.string),
         .capabilities = protocol_types.OwnedSlice(protocol_types.ModelCapability).initOwned(capabilities),
         .source = try parseModelSource(obj.get("source").?.string),
-        .context_window = if (obj.get("context_window")) |value| @intCast(value.integer) else null,
-        .max_output_tokens = if (obj.get("max_output_tokens")) |value| @intCast(value.integer) else null,
+        .context_window = if (obj.get("context_window")) |value| try valueAsU32(value) else null,
+        .max_output_tokens = if (obj.get("max_output_tokens")) |value| try valueAsU32(value) else null,
         .reasoning_default = if (obj.get("reasoning_default")) |value| try parseReasoningLevel(value.string) else null,
         .metadata = metadata,
     };
@@ -1615,7 +1631,7 @@ fn deserializeStreamOptions(
         };
     }
     if (obj.get("max_tokens")) |max| {
-        opts.max_tokens = @intCast(max.integer);
+        opts.max_tokens = try valueAsU32(max);
     }
     if (obj.get("cache_retention")) |ret| {
         opts.cache_retention = parseCacheRetention(ret.string);
@@ -1627,7 +1643,7 @@ fn deserializeStreamOptions(
         opts.thinking_enabled = te.bool;
     }
     if (obj.get("thinking_budget_tokens")) |tbt| {
-        opts.thinking_budget_tokens = @intCast(tbt.integer);
+        opts.thinking_budget_tokens = try valueAsU32(tbt);
     }
     if (obj.get("thinking_effort")) |effort| {
         opts.thinking_effort = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, effort.string));
@@ -1670,10 +1686,10 @@ fn deserializeStreamOptions(
         }
     }
     if (obj.get("http_timeout_ms")) |timeout| {
-        opts.http_timeout_ms = @intCast(timeout.integer);
+        opts.http_timeout_ms = try valueAsU64(timeout);
     }
     if (obj.get("ping_interval_ms")) |interval| {
-        opts.ping_interval_ms = @intCast(interval.integer);
+        opts.ping_interval_ms = try valueAsU64(interval);
     }
     if (obj.get("headers")) |headers_val| {
         const headers = try deserializeHeaderPairs(headers_val.array, allocator);
@@ -2010,6 +2026,44 @@ test "stream_request round trips model metadata" {
     try std.testing.expect(decoded.payload.stream_request.options != null);
     try std.testing.expect(decoded.payload.stream_request.options.?.headers != null);
     try std.testing.expectEqualStrings("ChatGPT-Account-ID", decoded.payload.stream_request.options.?.headers.?[1].name);
+}
+
+test "stream_request rejects oversized model integer fields" {
+    const allocator = std.testing.allocator;
+    const model = ai_types.Model{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+    };
+    const context = ai_types.Context{ .messages = &.{} };
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 1708234567890,
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = context,
+            .options = null,
+            .include_partial = true,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+    envelope.deinit(allocator);
+
+    const oversized = try std.mem.replaceOwned(u8, allocator, json, "\"context_window\":1", "\"context_window\":4294967296");
+    defer allocator.free(oversized);
+
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(oversized, allocator));
 }
 
 test "deserializeEnvelope parses valid JSON" {

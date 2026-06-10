@@ -49,6 +49,22 @@ pub const ApprovalWaiter = struct {
     }
 };
 
+fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    var catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
+    errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
+
+    const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
+    errdefer allocator.free(models);
+    models[0] = defaultModel();
+    for (catalog_models, 0..) |model, idx| {
+        models[idx + 1] = model;
+    }
+    allocator.free(catalog_models);
+    catalog_models = &.{};
+    errdefer for (models) |*model| model.deinit(allocator);
+    return models;
+}
+
 pub const ProductionRuntime = struct {
     allocator: std.mem.Allocator,
     registry: api_registry.ApiRegistry,
@@ -69,18 +85,8 @@ pub const ProductionRuntime = struct {
             @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
-        var catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
-        errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
-
-        const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
-        errdefer allocator.free(models);
-        models[0] = defaultModel();
-        for (catalog_models, 0..) |model, idx| {
-            models[idx + 1] = model;
-        }
-        allocator.free(catalog_models);
-        catalog_models = &.{};
-        errdefer for (models) |*model| model.deinit(allocator);
+        const models = try loadRuntimeModels(allocator);
+        errdefer tui_model_catalog.deinitModels(allocator, models);
 
         var initial_model_id = loadSavedModelId(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -117,8 +123,7 @@ pub const ProductionRuntime = struct {
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
-        for (self.models) |*model| model.deinit(self.allocator);
-        self.allocator.free(self.models);
+        tui_model_catalog.deinitModels(self.allocator, self.models);
         if (self.initial_model_id) |id| self.allocator.free(id);
         self.permission_engine.deinit();
         self.registry.deinit();
@@ -503,9 +508,17 @@ pub const App = struct {
                 creds.deinit(self.allocator);
                 self.finishLogin();
                 if (save_err) |_| {
+                    const refresh_err = self.refreshModelsAfterLogin();
                     const msg = try std.fmt.allocPrint(self.allocator, "logged in to {s}", .{provider_id});
                     defer self.allocator.free(msg);
                     try self.state.appendTranscript(.system, msg);
+                    if (refresh_err) |_| {
+                        try self.state.appendTranscript(.system, "model catalog refreshed");
+                    } else |err| {
+                        const refresh_msg = try std.fmt.allocPrint(self.allocator, "login succeeded but refreshing models failed: {s}", .{@errorName(err)});
+                        defer self.allocator.free(refresh_msg);
+                        try self.state.appendTranscript(.@"error", refresh_msg);
+                    }
                 } else |err| {
                     const msg = try std.fmt.allocPrint(self.allocator, "login succeeded but saving credentials failed: {s}", .{@errorName(err)});
                     defer self.allocator.free(msg);
@@ -562,6 +575,14 @@ pub const App = struct {
         } });
         owned = true;
         try storage.persist();
+    }
+
+    fn refreshModelsAfterLogin(self: *App) !void {
+        const runtime = self.runtime orelse return;
+        const current_id = if (runtime.currentModel()) |model| model.id else null;
+        const models = try loadRuntimeModels(self.allocator);
+        defer tui_model_catalog.deinitModels(self.allocator, models);
+        try runtime.replaceModels(models, current_id);
     }
 
     /// Hand pasted input to the worker the login flow is blocked on.
@@ -1693,6 +1714,32 @@ test "App init seeds registered tools from runtime" {
     try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
     try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
     try std.testing.expect(app.runtime.?.permission_engine.?.workspace_root.len > 0);
+}
+
+test "App refreshes runtime models after login" {
+    const extra_model = ai_types.Model{
+        .id = "temporary-extra-model",
+        .name = "Temporary Extra",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{ extra_model, defaultModel() }, .initial_model_id = "temporary-extra-model" });
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.availableModels().len);
+    try app.refreshModelsAfterLogin();
+    try std.testing.expectEqual(@as(usize, 1), runtime.availableModels().len);
+    try std.testing.expectEqualStrings(defaultModel().id, runtime.currentModel().?.id);
 }
 
 test "TUI program enables enhanced keyboard protocol" {
