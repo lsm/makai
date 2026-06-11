@@ -833,13 +833,19 @@ fn deserializeModel(
         .api = api,
         .provider = provider,
         .base_url = base_url,
-        .reasoning = if (obj.get("reasoning")) |value| value.bool else false,
+        .reasoning = if (obj.get("reasoning")) |value| try valueAsBool(value) else false,
         .input = input,
-        .cost = if (obj.get("cost")) |value| try deserializeCost(value.object) else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .cost = if (obj.get("cost")) |value| blk: {
+            if (value != .object) return error.InvalidUserContent;
+            break :blk try deserializeCost(value.object);
+        } else .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = try optionalU32(obj, "context_window", 0),
         .max_tokens = try optionalU32(obj, "max_tokens", 0),
         .headers = headers,
-        .compat = if (obj.get("compat")) |value| try deserializeOpenAICompatOptions(value.object) else null,
+        .compat = if (obj.get("compat")) |value| blk: {
+            if (value != .object) return error.InvalidUserContent;
+            break :blk try deserializeOpenAICompatOptions(value.object);
+        } else null,
         .is_owned = true,
     };
 }
@@ -860,6 +866,7 @@ fn deserializeInputModalities(
     allocator: std.mem.Allocator,
 ) ![]const []const u8 {
     const input_val = obj.get("input") orelse return try allocator.alloc([]const u8, 0);
+    if (input_val != .array) return error.InvalidUserContent;
     const input_arr = input_val.array;
     const input = try allocator.alloc([]const u8, input_arr.items.len);
     var initialized: usize = 0;
@@ -869,6 +876,7 @@ fn deserializeInputModalities(
     }
 
     for (input_arr.items, 0..) |item, idx| {
+        if (item != .string) return error.InvalidUserContent;
         try validateLength(item.string, MAX_IDENTIFIER_LENGTH);
         input[idx] = try allocator.dupe(u8, item.string);
         initialized += 1;
@@ -962,6 +970,13 @@ fn valueAsU64(value: std.json.Value) !u64 {
     };
 }
 
+fn valueAsBool(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |b| b,
+        else => error.InvalidUserContent,
+    };
+}
+
 fn optionalF64(obj: std.json.ObjectMap, field: []const u8, default: f64) !f64 {
     const value = obj.get(field) orelse return default;
     return switch (value) {
@@ -972,24 +987,30 @@ fn optionalF64(obj: std.json.ObjectMap, field: []const u8, default: f64) !f64 {
     };
 }
 
-fn optionalBool(obj: std.json.ObjectMap, field: []const u8) ?bool {
+fn optionalBool(obj: std.json.ObjectMap, field: []const u8) !?bool {
     const value = obj.get(field) orelse return null;
-    return value.bool;
+    return try valueAsBool(value);
 }
 
 fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompatOptions {
     return .{
-        .supports_store = optionalBool(obj, "supports_store"),
-        .supports_developer_role = optionalBool(obj, "supports_developer_role"),
-        .supports_reasoning_effort = optionalBool(obj, "supports_reasoning_effort"),
-        .supports_usage_in_streaming = optionalBool(obj, "supports_usage_in_streaming"),
-        .max_tokens_field = if (obj.get("max_tokens_field")) |value| try parseMaxTokensField(value.string) else .max_completion_tokens,
-        .requires_tool_result_name = optionalBool(obj, "requires_tool_result_name"),
-        .requires_assistant_after_tool_result = optionalBool(obj, "requires_assistant_after_tool_result"),
-        .requires_thinking_as_text = optionalBool(obj, "requires_thinking_as_text"),
-        .requires_mistral_tool_ids = optionalBool(obj, "requires_mistral_tool_ids"),
-        .thinking_format = if (obj.get("thinking_format")) |value| try parseThinkingFormat(value.string) else .openai,
-        .supports_strict_mode = optionalBool(obj, "supports_strict_mode"),
+        .supports_store = try optionalBool(obj, "supports_store"),
+        .supports_developer_role = try optionalBool(obj, "supports_developer_role"),
+        .supports_reasoning_effort = try optionalBool(obj, "supports_reasoning_effort"),
+        .supports_usage_in_streaming = try optionalBool(obj, "supports_usage_in_streaming"),
+        .max_tokens_field = if (obj.get("max_tokens_field")) |value| blk: {
+            if (value != .string) return error.InvalidUserContent;
+            break :blk try parseMaxTokensField(value.string);
+        } else .max_completion_tokens,
+        .requires_tool_result_name = try optionalBool(obj, "requires_tool_result_name"),
+        .requires_assistant_after_tool_result = try optionalBool(obj, "requires_assistant_after_tool_result"),
+        .requires_thinking_as_text = try optionalBool(obj, "requires_thinking_as_text"),
+        .requires_mistral_tool_ids = try optionalBool(obj, "requires_mistral_tool_ids"),
+        .thinking_format = if (obj.get("thinking_format")) |value| blk: {
+            if (value != .string) return error.InvalidUserContent;
+            break :blk try parseThinkingFormat(value.string);
+        } else .openai,
+        .supports_strict_mode = try optionalBool(obj, "supports_strict_mode"),
     };
 }
 
@@ -2120,6 +2141,56 @@ test "stream_request rejects malformed model headers" {
     const missing_value = try std.mem.replaceOwned(u8, allocator, json, "\"headers\":[{\"name\":\"version\",\"value\":\"0.135.0\"}]", "\"headers\":[{\"name\":\"version\"}]");
     defer allocator.free(missing_value);
     try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(missing_value, allocator));
+}
+
+test "stream_request rejects malformed model input and compat metadata" {
+    const allocator = std.testing.allocator;
+    const model = ai_types.Model{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1,
+        .max_tokens = 1,
+        .compat = .{ .supports_store = false },
+    };
+    const context = ai_types.Context{ .messages = &.{} };
+    var envelope = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 1708234567890,
+        .payload = .{ .stream_request = .{
+            .model = model,
+            .context = context,
+            .options = null,
+            .include_partial = true,
+        } },
+    };
+
+    const json = try serializeEnvelope(envelope, allocator);
+    defer allocator.free(json);
+    envelope.deinit(allocator);
+
+    const input_object = try std.mem.replaceOwned(u8, allocator, json, "\"input\":[\"text\"]", "\"input\":{}");
+    defer allocator.free(input_object);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(input_object, allocator));
+
+    const input_non_string = try std.mem.replaceOwned(u8, allocator, json, "\"input\":[\"text\"]", "\"input\":[{}]");
+    defer allocator.free(input_non_string);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(input_non_string, allocator));
+
+    const compat_string_bool = try std.mem.replaceOwned(u8, allocator, json, "\"supports_store\":false", "\"supports_store\":\"false\"");
+    defer allocator.free(compat_string_bool);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(compat_string_bool, allocator));
+
+    const compat_object = try std.mem.replaceOwned(u8, allocator, json, "\"compat\":{", "\"compat\":\"bad\",\"compat_extra\":{");
+    defer allocator.free(compat_object);
+    try std.testing.expectError(error.InvalidUserContent, deserializeEnvelope(compat_object, allocator));
 }
 
 test "deserializeEnvelope parses valid JSON" {

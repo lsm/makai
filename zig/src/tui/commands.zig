@@ -227,9 +227,9 @@ fn handleProvider(ctx: CommandContext, command: Command) !CommandResult {
         for (runtime.availableModels()) |model| {
             if (std.mem.eql(u8, model.provider, provider)) {
                 if (ctx.session) |session| {
-                    try session.switchModel(model.id);
+                    try session.switchModelExact(model);
                 } else {
-                    try runtime.switchModel(model.id);
+                    try runtime.switchModelExact(model);
                 }
                 try ctx.state.status.setModel(ctx.allocator, model.id, model.provider);
                 return .{ .output = try std.fmt.allocPrint(ctx.allocator, "provider switched to {s} via model {s}", .{ provider, model.id }) };

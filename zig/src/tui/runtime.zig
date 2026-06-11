@@ -478,6 +478,7 @@ pub const TuiRuntime = struct {
                 .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
                 .switch_model = sessionSwitchModel,
+                .switch_model_exact = sessionSwitchModelExact,
                 .current_model = sessionCurrentModel,
                 .decide_tool_approval = sessionDecideToolApproval,
                 .stream_events = sessionStreamEvents,
@@ -562,6 +563,24 @@ pub const TuiRuntime = struct {
 
         for (self.models, 0..) |model, i| {
             if (std.mem.eql(u8, model.id, model_id)) {
+                self.selected_model_index = i;
+                if (self.local_agent) |*local| local.setModel(model);
+                return;
+            }
+        }
+        return error.ModelNotFound;
+    }
+
+    pub fn switchModelExact(self: *TuiRuntime, selected: ai_types.Model) !void {
+        if (self.local_agent) |*local| {
+            if (!local.isIdle()) return error.AgentAlreadyStreaming;
+        }
+
+        for (self.models, 0..) |model, i| {
+            if (std.mem.eql(u8, model.id, selected.id) and
+                std.mem.eql(u8, model.provider, selected.provider) and
+                std.mem.eql(u8, model.api, selected.api))
+            {
                 self.selected_model_index = i;
                 if (self.local_agent) |*local| local.setModel(model);
                 return;
@@ -2004,6 +2023,11 @@ fn sessionSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
     try self.switchModel(model_id);
 }
 
+fn sessionSwitchModelExact(ctx: ?*anyopaque, model: ai_types.Model) anyerror!void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    try self.switchModelExact(model);
+}
+
 fn sessionCurrentModel(ctx: ?*anyopaque) ?ai_types.Model {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     return self.currentModel();
@@ -2815,6 +2839,41 @@ test "model switch affects next turn" {
     collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
 
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
+}
+
+test "exact model switch distinguishes duplicate ids" {
+    const first = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Completions",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const second = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Responses",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const models = [_]ai_types.Model{ first, second };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &models });
+    defer runtime.deinit();
+
+    try runtime.switchModelExact(second);
+
+    try std.testing.expectEqualStrings("gpt-4o", runtime.currentModel().?.id);
+    try std.testing.expectEqualStrings("openai-responses", runtime.currentModel().?.api);
 }
 
 test "initial model id selects matching model" {

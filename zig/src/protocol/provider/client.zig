@@ -265,7 +265,11 @@ pub const ProtocolClient = struct {
                 if (hasReconstructedToolCall(recon)) {
                     const rebuilt = recon.buildMessage(.tool_use, result.timestamp) catch null;
                     if (rebuilt) |msg| {
-                        if (hasToolCallContent(msg)) return msg;
+                        if (hasToolCallContent(msg)) {
+                            var with_usage = msg;
+                            with_usage.usage = result.usage;
+                            return with_usage;
+                        }
                         var cleanup = msg;
                         cleanup.deinit(self.allocator);
                     }
@@ -1737,7 +1741,7 @@ test "processEnvelope reconstructs streamed tool calls when terminal result omit
             .api = result_api,
             .provider = result_provider,
             .model = result_model,
-            .usage = .{},
+            .usage = .{ .input = 11, .output = 7, .cost = .{ .input = 0.011, .output = 0.014, .total = 0.025 } },
             .stop_reason = .stop,
             .timestamp = 20,
             .is_owned = true,
@@ -1758,6 +1762,9 @@ test "processEnvelope reconstructs streamed tool calls when terminal result omit
     try std.testing.expectEqualStrings("call_shell", got.content[0].tool_call.id);
     try std.testing.expectEqualStrings("shell_execute", got.content[0].tool_call.name);
     try std.testing.expectEqualStrings("{\"command\":\"ls -al\"}", got.content[0].tool_call.arguments_json);
+    try std.testing.expectEqual(@as(u64, 11), got.usage.input);
+    try std.testing.expectEqual(@as(u64, 7), got.usage.output);
+    try std.testing.expectEqual(@as(f64, 0.025), got.usage.cost.total);
 }
 
 test "sendStreamRequest without sender returns error" {

@@ -396,9 +396,9 @@ pub const App = struct {
         }
         const model = models[self.state.menu_index];
         if (self.session) |*session| {
-            try session.switchModel(model.id);
+            try session.switchModelExact(model);
         } else {
-            try runtime.switchModel(model.id);
+            try runtime.switchModelExact(model);
         }
         if (runtime.currentModel()) |m| {
             try self.state.status.setModelWithContext(self.allocator, m.id, m.provider, m.context_window);
@@ -1967,6 +1967,7 @@ const MockAppSession = struct {
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
                 .switch_model = switchModel,
+                .switch_model_exact = switchModelExact,
                 .current_model = currentModel,
                 .decide_tool_approval = decideToolApproval,
                 .stream_events = streamEvents,
@@ -2021,6 +2022,11 @@ const MockAppSession = struct {
     fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
         _ = ctx;
         _ = model_id;
+    }
+
+    fn switchModelExact(ctx: ?*anyopaque, model: ai_types.Model) anyerror!void {
+        _ = ctx;
+        _ = model;
     }
 
     fn currentModel(ctx: ?*anyopaque) ?ai_types.Model {

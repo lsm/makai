@@ -184,6 +184,7 @@ pub const TuiSessionOps = struct {
     clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
+    switch_model_exact: *const fn (ctx: ?*anyopaque, model: ai_types.Model) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
     decide_tool_approval: *const fn (ctx: ?*anyopaque, tool_call_id: []const u8, decision: ToolApprovalDecision) anyerror!void = undefined,
     stream_events: *const fn (ctx: ?*anyopaque) *TuiEventStream = undefined,
@@ -231,6 +232,10 @@ pub const TuiSession = struct {
 
     pub fn switchModel(self: *TuiSession, model_id: []const u8) !void {
         try self.ops.switch_model(self.ctx, model_id);
+    }
+
+    pub fn switchModelExact(self: *TuiSession, model: ai_types.Model) !void {
+        try self.ops.switch_model_exact(self.ctx, model);
     }
 
     pub fn currentModel(self: *TuiSession) ?ai_types.Model {
