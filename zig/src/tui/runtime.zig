@@ -111,6 +111,7 @@ pub const TuiRuntimeOptions = struct {
     protocol: ?agent.ProtocolClient = null,
     models: []const ai_types.Model = &.{},
     initial_model_id: ?[]const u8 = null,
+    initial_model: ?InitialModelRef = null,
     tools: []const agent.AgentTool = &.{},
     mcp_config_json: ?[]const u8 = null,
     permission_engine: ?*permission.PermissionEngine = null,
@@ -121,6 +122,12 @@ pub const TuiRuntimeOptions = struct {
     thinking_level: ai_types.ThinkingLevel = .low,
     compact_output: bool = false,
     run_async: bool = true,
+};
+
+pub const InitialModelRef = struct {
+    id: []const u8,
+    provider: []const u8 = "",
+    api: []const u8 = "",
 };
 
 fn normalizeTuiThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLevel {
@@ -215,7 +222,14 @@ pub const TuiRuntime = struct {
         var selected: ?usize = null;
         if (models.len > 0) {
             selected = 0;
-            if (options.initial_model_id) |id| {
+            if (options.initial_model) |initial| {
+                for (models, 0..) |model, i| {
+                    if (modelMatchesInitial(model, initial)) {
+                        selected = i;
+                        break;
+                    }
+                }
+            } else if (options.initial_model_id) |id| {
                 for (models, 0..) |model, i| {
                     if (std.mem.eql(u8, model.id, id)) {
                         selected = i;
@@ -343,6 +357,13 @@ pub const TuiRuntime = struct {
         if (runtime.permission_engine) |engine| engine.setBypassAll(runtime.permission_mode == .bypass);
         runtime.rebuildWrappedTools();
         return runtime;
+    }
+
+    fn modelMatchesInitial(model: ai_types.Model, initial: InitialModelRef) bool {
+        if (!std.mem.eql(u8, model.id, initial.id)) return false;
+        if (initial.provider.len > 0 and !std.mem.eql(u8, model.provider, initial.provider)) return false;
+        if (initial.api.len > 0 and !std.mem.eql(u8, model.api, initial.api)) return false;
+        return true;
     }
 
     pub fn deinit(self: *TuiRuntime) void {
@@ -490,21 +511,23 @@ pub const TuiRuntime = struct {
         return self.models;
     }
 
-    pub fn replaceModels(self: *TuiRuntime, next_models: []const ai_types.Model, preferred_model_id: ?[]const u8) !void {
+    pub fn replaceModels(self: *TuiRuntime, next_models: []const ai_types.Model, preferred_model: ?ai_types.Model) !void {
+        if (self.local_agent) |*local| {
+            if (!local.isIdle()) return error.AgentAlreadyStreaming;
+        }
+
         var owned_next = try cloneModels(self.allocator, next_models);
         errdefer deinitModels(self.allocator, owned_next);
 
-        const active_model_id = if (preferred_model_id) |id|
-            id
-        else if (self.selected_model_index) |idx|
-            self.models[idx].id
-        else
-            null;
+        const active_model = preferred_model orelse if (self.selected_model_index) |idx| self.models[idx] else null;
 
         var next_selected: ?usize = if (owned_next.len > 0) 0 else null;
-        if (active_model_id) |id| {
+        if (active_model) |active| {
             for (owned_next, 0..) |model, idx| {
-                if (std.mem.eql(u8, model.id, id)) {
+                if (std.mem.eql(u8, model.id, active.id) and
+                    std.mem.eql(u8, model.provider, active.provider) and
+                    std.mem.eql(u8, model.api, active.api))
+                {
                     next_selected = idx;
                     break;
                 }
@@ -2888,6 +2911,41 @@ test "initial model id selects matching model" {
     defer runtime.deinit();
 
     try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "initial model ref selects exact duplicate id provider api tuple" {
+    const first = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Completions",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const second = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Responses",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const models = [_]ai_types.Model{ first, second };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .models = &models,
+        .initial_model = .{ .id = "gpt-4o", .provider = "openai", .api = "openai-responses" },
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("openai-responses", runtime.currentModel().?.api);
 }
 
 test "replaceModels preserves selected model when still available" {

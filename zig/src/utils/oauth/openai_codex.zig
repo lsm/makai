@@ -321,7 +321,15 @@ fn getObjectI64Field(obj: *const std.json.ObjectMap, key: []const u8) ?i64 {
     if (obj.get(key)) |value| {
         return switch (value) {
             .integer => value.integer,
-            .float => @intFromFloat(value.float),
+            .float => |float| {
+                if (!std.math.isFinite(float)) return null;
+                if (float < @as(f64, @floatFromInt(std.math.minInt(i64))) or
+                    float > @as(f64, @floatFromInt(std.math.maxInt(i64))))
+                {
+                    return null;
+                }
+                return @intFromFloat(float);
+            },
             else => null,
         };
     }
@@ -575,6 +583,16 @@ test "parseTokenResponse extracts tokens" {
     try std.testing.expectEqualStrings("acc", response.access_token);
     try std.testing.expectEqualStrings("ref", response.refresh_token.?);
     try std.testing.expectEqual(@as(i64, 1800), response.expires_in);
+}
+
+test "parseTokenResponse defaults malformed expires_in floats" {
+    const payload =
+        \\{"access_token":"acc","refresh_token":"ref","expires_in":1e400}
+    ;
+    const response = try parseTokenResponse(payload, std.testing.allocator);
+    defer deinitTokenResponse(std.testing.allocator, response);
+
+    try std.testing.expectEqual(@as(i64, 3600), response.expires_in);
 }
 
 test "parseTokenResponse extracts account metadata from account_id" {

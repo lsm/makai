@@ -40,6 +40,7 @@ pub const UiSettings = struct {
 pub const Config = struct {
     model: []u8,
     provider: []u8,
+    api: []u8,
     workspace: []u8,
     permissions: std.ArrayList(ToolPermission) = .empty,
     mode: ModeSettings = .{},
@@ -49,6 +50,7 @@ pub const Config = struct {
         return .{
             .model = try allocator.dupe(u8, "claude-sonnet-4-5"),
             .provider = try allocator.dupe(u8, "anthropic"),
+            .api = try allocator.dupe(u8, "anthropic-messages"),
             .workspace = try allocator.dupe(u8, "."),
             .ui = .{ .theme = try allocator.dupe(u8, "default") },
         };
@@ -57,6 +59,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.model);
         allocator.free(self.provider);
+        allocator.free(self.api);
         allocator.free(self.workspace);
         for (self.permissions.items) |*permission| permission.deinit(allocator);
         self.permissions.deinit(allocator);
@@ -140,6 +143,7 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
     var cfg = Config{
         .model = try dupStringField(allocator, obj, "model", "claude-sonnet-4-5"),
         .provider = try dupStringField(allocator, obj, "provider", "anthropic"),
+        .api = try dupStringField(allocator, obj, "api", ""),
         .workspace = try dupStringField(allocator, obj, "workspace", ""),
         .ui = .{ .theme = try allocator.dupe(u8, "default") },
     };
@@ -194,6 +198,7 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.beginObject();
     try w.writeStringField("model", cfg.model);
     try w.writeStringField("provider", cfg.provider);
+    try w.writeStringField("api", cfg.api);
     try w.writeStringField("workspace", cfg.workspace);
     try w.writeKey("permissions");
     try w.beginArray();
@@ -244,7 +249,7 @@ fn parsePermissionMode(value: []const u8) ToolPermission.Mode {
     return .ask;
 }
 
-test "save config reload preserves model and provider" {
+test "save config reload preserves model provider and api" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmpBase(std.testing.allocator, &tmp);
@@ -259,6 +264,8 @@ test "save config reload preserves model and provider" {
     cfg.model = try std.testing.allocator.dupe(u8, "model-b");
     std.testing.allocator.free(cfg.provider);
     cfg.provider = try std.testing.allocator.dupe(u8, "openai");
+    std.testing.allocator.free(cfg.api);
+    cfg.api = try std.testing.allocator.dupe(u8, "openai-responses");
     try cfg.permissions.append(std.testing.allocator, .{ .tool_name = try std.testing.allocator.dupe(u8, "shell_execute"), .mode = .deny });
     try store.save(cfg);
 
@@ -266,6 +273,7 @@ test "save config reload preserves model and provider" {
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("model-b", loaded.model);
     try std.testing.expectEqualStrings("openai", loaded.provider);
+    try std.testing.expectEqualStrings("openai-responses", loaded.api);
     try std.testing.expectEqual(@as(usize, 1), loaded.permissions.items.len);
     try std.testing.expectEqual(ToolPermission.Mode.deny, loaded.permissions.items[0].mode);
 }

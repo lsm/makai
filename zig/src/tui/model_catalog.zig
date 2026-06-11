@@ -121,7 +121,15 @@ fn loadOpenAICodexModels(allocator: std.mem.Allocator, mode: CatalogLoadMode) ![
                 .account_id = account_id,
                 .client_version = client_version,
             });
-        } else |_| {}
+        } else |err| {
+            if (mode == .force_fetch) {
+                if (try loadCachedCodexModels(allocator, account_id)) |models| {
+                    if (models.len > 0) return models;
+                    allocator.free(models);
+                }
+                return err;
+            }
+        }
     }
 
     return emptyModels(allocator);

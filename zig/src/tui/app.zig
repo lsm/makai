@@ -50,18 +50,22 @@ pub const ApprovalWaiter = struct {
 };
 
 fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.loadProductionModels);
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.loadProductionModels, true);
 }
 
 fn loadRuntimeModelsFresh(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.refreshProductionModels);
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.refreshProductionModels, false);
 }
 
 fn loadRuntimeModelsWithCatalog(
     allocator: std.mem.Allocator,
     comptime loadCatalog: fn (std.mem.Allocator) anyerror![]ai_types.Model,
+    comptime catch_catalog_errors: bool,
 ) ![]ai_types.Model {
-    var catalog_models = loadCatalog(allocator) catch try allocator.alloc(ai_types.Model, 0);
+    var catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
+        try allocator.alloc(ai_types.Model, 0)
+    else
+        return err;
     errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
 
     const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
@@ -82,7 +86,7 @@ pub const ProductionRuntime = struct {
     bridge: agent.InProcessProviderProtocolBridge,
     permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
-    initial_model_id: ?[]u8 = null,
+    initial_model: ?SavedModelRef = null,
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -99,11 +103,11 @@ pub const ProductionRuntime = struct {
         const models = try loadRuntimeModels(allocator);
         errdefer tui_model_catalog.deinitModels(allocator, models);
 
-        var initial_model_id = loadSavedModelId(allocator) catch |err| switch (err) {
+        var initial_model = loadSavedModelRef(allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        errdefer if (initial_model_id) |id| allocator.free(id);
+        errdefer if (initial_model) |*model| model.deinit(allocator);
 
         const runtime = ProductionRuntime{
             .allocator = allocator,
@@ -111,9 +115,9 @@ pub const ProductionRuntime = struct {
             .bridge = undefined,
             .permission_engine = permission_engine,
             .models = models,
-            .initial_model_id = initial_model_id,
+            .initial_model = initial_model,
         };
-        initial_model_id = null;
+        initial_model = null;
         return runtime;
     }
 
@@ -125,7 +129,11 @@ pub const ProductionRuntime = struct {
         return .{
             .protocol = (&self.bridge).protocolClient(),
             .models = self.models,
-            .initial_model_id = self.initial_model_id,
+            .initial_model = if (self.initial_model) |model| .{
+                .id = model.id,
+                .provider = model.provider,
+                .api = model.api,
+            } else null,
             .permission_engine = &self.permission_engine,
             .workspace_root = self.permission_engine.workspace_root,
             .run_async = true,
@@ -135,27 +143,50 @@ pub const ProductionRuntime = struct {
 
     pub fn deinit(self: *ProductionRuntime) void {
         tui_model_catalog.deinitModels(self.allocator, self.models);
-        if (self.initial_model_id) |id| self.allocator.free(id);
+        if (self.initial_model) |*model| model.deinit(self.allocator);
         self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;
     }
 };
 
-fn loadSavedModelId(allocator: std.mem.Allocator) !?[]u8 {
+const SavedModelRef = struct {
+    id: []u8,
+    provider: []u8,
+    api: []u8,
+
+    fn deinit(self: *SavedModelRef, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.provider);
+        allocator.free(self.api);
+        self.* = undefined;
+    }
+};
+
+fn loadSavedModelRef(allocator: std.mem.Allocator) !?SavedModelRef {
     var store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
         error.HomeNotFound => return null,
         else => return err,
     };
     defer store.deinit();
-    return try loadSavedModelIdFromStore(allocator, store);
+    return try loadSavedModelRefFromStore(allocator, store);
 }
 
-fn loadSavedModelIdFromStore(allocator: std.mem.Allocator, store: tui_config.Store) !?[]u8 {
+fn loadSavedModelRefFromStore(allocator: std.mem.Allocator, store: tui_config.Store) !?SavedModelRef {
     var cfg = (try store.loadIfExists()) orelse return null;
     defer cfg.deinit(allocator);
     if (cfg.model.len == 0) return null;
-    return try allocator.dupe(u8, cfg.model);
+    const id = try allocator.dupe(u8, cfg.model);
+    errdefer allocator.free(id);
+    const provider = try allocator.dupe(u8, cfg.provider);
+    errdefer allocator.free(provider);
+    const api = try allocator.dupe(u8, cfg.api);
+    errdefer allocator.free(api);
+    return .{
+        .id = id,
+        .provider = provider,
+        .api = api,
+    };
 }
 
 pub const App = struct {
@@ -590,10 +621,10 @@ pub const App = struct {
 
     fn refreshModelsAfterLogin(self: *App) !void {
         const runtime = self.runtime orelse return;
-        const current_id = if (runtime.currentModel()) |model| model.id else null;
+        const current_model = runtime.currentModel();
         const models = try loadRuntimeModelsFresh(self.allocator);
         defer tui_model_catalog.deinitModels(self.allocator, models);
-        try runtime.replaceModels(models, current_id);
+        try runtime.replaceModels(models, current_model);
     }
 
     /// Hand pasted input to the worker the login flow is blocked on.
@@ -893,6 +924,7 @@ pub const App = struct {
 
         try replaceOwnedString(self.allocator, &cfg.model, model.id);
         try replaceOwnedString(self.allocator, &cfg.provider, model.provider);
+        try replaceOwnedString(self.allocator, &cfg.api, model.api);
         try store.save(cfg);
     }
 
@@ -1761,7 +1793,7 @@ test "TUI program leaves plain mouse selection to the terminal" {
     try std.testing.expect(!tuiProgramOptions().mouse);
 }
 
-test "saved model id loads from config store" {
+test "saved model ref loads from config store" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
@@ -1775,11 +1807,15 @@ test "saved model id loads from config store" {
     cfg.model = try std.testing.allocator.dupe(u8, "persisted-model");
     std.testing.allocator.free(cfg.provider);
     cfg.provider = try std.testing.allocator.dupe(u8, "persisted-provider");
+    std.testing.allocator.free(cfg.api);
+    cfg.api = try std.testing.allocator.dupe(u8, "persisted-api");
     try store.save(cfg);
 
-    const model_id = (try loadSavedModelIdFromStore(std.testing.allocator, store)).?;
-    defer std.testing.allocator.free(model_id);
-    try std.testing.expectEqualStrings("persisted-model", model_id);
+    var model_ref = (try loadSavedModelRefFromStore(std.testing.allocator, store)).?;
+    defer model_ref.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("persisted-model", model_ref.id);
+    try std.testing.expectEqualStrings("persisted-provider", model_ref.provider);
+    try std.testing.expectEqualStrings("persisted-api", model_ref.api);
 }
 
 test "App saveEvent keeps debug-visible event types" {
