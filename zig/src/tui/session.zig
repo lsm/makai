@@ -35,6 +35,9 @@ pub const TuiEvent = union(enum) {
     text_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     thinking_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
     tool_call_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
+    provider_event: struct {
+        event_json: OwnedSlice(u8),
+    },
     message_end: struct {
         role: MessageRole,
         text: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -117,6 +120,7 @@ pub const TuiEvent = union(enum) {
             .text_delta => |*p| p.delta.deinit(allocator),
             .thinking_delta => |*p| p.delta.deinit(allocator),
             .tool_call_delta => |*p| p.delta.deinit(allocator),
+            .provider_event => |*p| p.event_json.deinit(allocator),
             .message_end => |*p| {
                 p.text.deinit(allocator);
                 p.content_json.deinit(allocator);
@@ -167,10 +171,12 @@ pub const TuiSessionResult = struct {
 pub const TuiEventStream = event_stream.EventStream(TuiEvent, TuiSessionResult);
 
 pub const QueuedCounts = agent.Agent.QueuedCounts;
+pub const CompactMessagesResult = ai_types.CompactMessagesResult;
 
 pub const TuiSessionOps = struct {
     start: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
     resume_session: *const fn (ctx: ?*anyopaque) anyerror!void = undefined,
+    compact_messages: *const fn (ctx: ?*anyopaque) anyerror!CompactMessagesResult = undefined,
     cancel: *const fn (ctx: ?*anyopaque) void = undefined,
     submit_turn: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     steer: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
@@ -178,6 +184,7 @@ pub const TuiSessionOps = struct {
     clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
+    switch_model_exact: *const fn (ctx: ?*anyopaque, model: ai_types.Model) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
     decide_tool_approval: *const fn (ctx: ?*anyopaque, tool_call_id: []const u8, decision: ToolApprovalDecision) anyerror!void = undefined,
     stream_events: *const fn (ctx: ?*anyopaque) *TuiEventStream = undefined,
@@ -193,6 +200,10 @@ pub const TuiSession = struct {
 
     pub fn resumeSession(self: *TuiSession) !void {
         try self.ops.resume_session(self.ctx);
+    }
+
+    pub fn compactMessages(self: *TuiSession) !CompactMessagesResult {
+        return try self.ops.compact_messages(self.ctx);
     }
 
     pub fn cancel(self: *TuiSession) void {
@@ -221,6 +232,10 @@ pub const TuiSession = struct {
 
     pub fn switchModel(self: *TuiSession, model_id: []const u8) !void {
         try self.ops.switch_model(self.ctx, model_id);
+    }
+
+    pub fn switchModelExact(self: *TuiSession, model: ai_types.Model) !void {
+        try self.ops.switch_model_exact(self.ctx, model);
     }
 
     pub fn currentModel(self: *TuiSession) ?ai_types.Model {

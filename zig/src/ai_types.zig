@@ -461,7 +461,149 @@ pub const Message = union(enum) {
             .tool_result => |*msg| msg.deinit(allocator),
         }
     }
+
+    pub fn timestamp(self: Message) i64 {
+        return switch (self) {
+            .user => |m| m.timestamp,
+            .assistant => |m| m.timestamp,
+            .tool_result => |m| m.timestamp,
+        };
+    }
 };
+
+pub const CompactMessagesResult = struct {
+    before: usize,
+    after: usize,
+};
+
+const compact_keep_recent_messages = 8;
+const compact_max_message_chars = 800;
+const compact_max_summary_chars = 12 * 1024;
+
+/// Replace older history with one bounded synthetic summary message while
+/// preserving the most recent messages verbatim.
+pub fn compactMessageHistory(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !CompactMessagesResult {
+    const before = messages.items.len;
+    if (before <= compact_keep_recent_messages + 1) return .{ .before = before, .after = before };
+
+    const keep_start = before - compact_keep_recent_messages;
+    const summary_text = try buildCompactSummary(allocator, messages.items[0..keep_start]);
+    var summary_transferred = false;
+    errdefer if (!summary_transferred) allocator.free(summary_text);
+
+    var next = std.ArrayList(Message).empty;
+    errdefer {
+        for (next.items) |*msg| msg.deinit(allocator);
+        next.deinit(allocator);
+    }
+
+    try next.append(allocator, .{ .user = .{
+        .content = .{ .text = summary_text },
+        .timestamp = messages.items[keep_start - 1].timestamp(),
+    } });
+    summary_transferred = true;
+
+    for (messages.items[keep_start..]) |msg| {
+        try next.append(allocator, try cloneMessage(allocator, msg));
+    }
+
+    for (messages.items) |*msg| msg.deinit(allocator);
+    messages.clearRetainingCapacity();
+    try messages.appendSlice(allocator, next.items);
+    next.clearRetainingCapacity();
+    next.deinit(allocator);
+
+    return .{ .before = before, .after = messages.items.len };
+}
+
+fn buildCompactSummary(allocator: std.mem.Allocator, messages: []const Message) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "Previous conversation context was compacted. Summary of older messages:\n");
+    for (messages) |msg| {
+        if (out.items.len >= compact_max_summary_chars) {
+            try out.appendSlice(allocator, "\n[summary truncated]\n");
+            break;
+        }
+        try appendMessageSummary(allocator, &out, msg);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendMessageSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), msg: Message) !void {
+    switch (msg) {
+        .user => |m| {
+            try out.appendSlice(allocator, "- User: ");
+            try appendUserContentSummary(allocator, out, m.content);
+        },
+        .assistant => |m| {
+            try out.appendSlice(allocator, "- Assistant: ");
+            try appendAssistantContentSummary(allocator, out, m.content);
+        },
+        .tool_result => |m| {
+            try appendFmt(allocator, out, "- Tool result ({s}{s}): ", .{ m.tool_name, if (m.is_error) ", error" else "" });
+            try appendUserContentPartsSummary(allocator, out, m.content);
+        },
+    }
+    try out.append(allocator, '\n');
+}
+
+fn appendUserContentSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), content: UserContent) !void {
+    switch (content) {
+        .text => |text| try appendBoundedText(allocator, out, text),
+        .parts => |parts| try appendUserContentPartsSummary(allocator, out, parts),
+    }
+}
+
+fn appendUserContentPartsSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), parts: []const UserContentPart) !void {
+    var wrote = false;
+    for (parts) |part| {
+        if (wrote) try out.appendSlice(allocator, " ");
+        switch (part) {
+            .text => |text| try appendBoundedText(allocator, out, text.text),
+            .image => |image| try appendFmt(allocator, out, "[image {s}, {d} bytes]", .{ image.mime_type, image.data.len }),
+        }
+        wrote = true;
+    }
+    if (!wrote) try out.appendSlice(allocator, "[empty]");
+}
+
+fn appendAssistantContentSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), content: []const AssistantContent) !void {
+    var wrote = false;
+    for (content) |block| {
+        if (wrote) try out.appendSlice(allocator, " ");
+        switch (block) {
+            .text => |text| try appendBoundedText(allocator, out, text.text),
+            .thinking => |thinking| {
+                try out.appendSlice(allocator, "[thinking] ");
+                try appendBoundedText(allocator, out, thinking.thinking);
+            },
+            .tool_call => |tool_call| try appendFmt(allocator, out, "[tool call {s} args={s}]", .{ tool_call.name, boundedSlice(tool_call.arguments_json) }),
+            .image => |image| try appendFmt(allocator, out, "[image {s}, {d} bytes]", .{ image.mime_type, image.data.len }),
+        }
+        wrote = true;
+    }
+    if (!wrote) try out.appendSlice(allocator, "[empty]");
+}
+
+fn appendBoundedText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    const slice = boundedSlice(text);
+    try out.appendSlice(allocator, slice);
+    if (slice.len < text.len) try out.appendSlice(allocator, "...");
+}
+
+fn appendFmt(allocator: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn boundedSlice(text: []const u8) []const u8 {
+    if (text.len <= compact_max_message_chars) return text;
+    return text[0..compact_max_message_chars];
+}
 
 pub const Tool = struct {
     name: []const u8,
@@ -1210,6 +1352,33 @@ test "ToolResultMessage details_json uses OwnedSlice and deep clones" {
     try std.testing.expectEqualStrings("{\"k\":1}", msg.getDetailsJson().?);
     try std.testing.expectEqualStrings("{\"k\":1}", cloned.getDetailsJson().?);
     try std.testing.expect(@intFromPtr(msg.details_json.slice().ptr) != @intFromPtr(cloned.details_json.slice().ptr));
+}
+
+test "compactMessageHistory summarizes older messages and keeps recent messages" {
+    var messages = std.ArrayList(Message).empty;
+    defer {
+        for (messages.items) |*msg| msg.deinit(std.testing.allocator);
+        messages.deinit(std.testing.allocator);
+    }
+
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "message {d}", .{i});
+        errdefer std.testing.allocator.free(text);
+        try messages.append(std.testing.allocator, .{ .user = .{
+            .content = .{ .text = text },
+            .timestamp = @intCast(i),
+        } });
+    }
+
+    const result = try compactMessageHistory(std.testing.allocator, &messages);
+
+    try std.testing.expectEqual(@as(usize, 12), result.before);
+    try std.testing.expectEqual(@as(usize, 9), result.after);
+    try std.testing.expectEqual(@as(usize, 9), messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].user.content.text, "Previous conversation context was compacted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].user.content.text, "message 3") != null);
+    try std.testing.expectEqualStrings("message 4", messages.items[1].user.content.text);
+    try std.testing.expectEqualStrings("message 11", messages.items[8].user.content.text);
 }
 
 test "AssistantMessageEventStream deinit drains unpolled events" {

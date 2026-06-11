@@ -2,12 +2,19 @@ const std = @import("std");
 const agent = @import("agent");
 const ai_types = @import("ai_types");
 const tui_runtime = @import("tui_runtime");
+const compat = @import("compat");
 
 pub const AppMode = enum {
     normal,
     approval,
     preview,
     session_picker,
+    model_picker,
+    login_picker,
+    permission_picker,
+    view_picker,
+    thinking_picker,
+    login_input,
 };
 
 pub const TranscriptKind = enum {
@@ -17,6 +24,22 @@ pub const TranscriptKind = enum {
     tool,
     system,
     @"error",
+};
+
+pub const TranscriptVisibilityMode = enum {
+    everything,
+    verbose,
+    balanced,
+    chat,
+
+    pub fn next(self: TranscriptVisibilityMode) TranscriptVisibilityMode {
+        return switch (self) {
+            .everything => .verbose,
+            .verbose => .balanced,
+            .balanced => .chat,
+            .chat => .everything,
+        };
+    }
 };
 
 pub const ToolStatus = enum {
@@ -42,15 +65,35 @@ pub const PreviewKind = enum {
 pub const TranscriptEntry = struct {
     kind: TranscriptKind,
     text: std.ArrayList(u8) = .empty,
+    /// Wall-clock time (epoch ms) the entry was created, for chat-style
+    /// timestamps in the transcript header.
+    timestamp_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, kind: TranscriptKind, text: []const u8) !TranscriptEntry {
-        var entry = TranscriptEntry{ .kind = kind };
+        var entry = TranscriptEntry{ .kind = kind, .timestamp_ms = compat.time.nowMillis() };
         try entry.text.appendSlice(allocator, text);
         return entry;
     }
 
     pub fn deinit(self: *TranscriptEntry, allocator: std.mem.Allocator) void {
         self.text.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+pub const ProtocolEventEntry = struct {
+    text: []u8,
+    timestamp_ms: i64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, event: tui_runtime.TuiEvent) !ProtocolEventEntry {
+        return .{
+            .text = try formatProtocolEvent(allocator, event),
+            .timestamp_ms = compat.time.nowMillis(),
+        };
+    }
+
+    pub fn deinit(self: *ProtocolEventEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
         self.* = undefined;
     }
 };
@@ -259,6 +302,7 @@ pub const SessionEntry = struct {
 
 pub const ComposerState = struct {
     buffer: std.ArrayList(u8) = .empty,
+    cursor: usize = 0,
     history: std.ArrayList([]u8) = .empty,
     history_index: ?usize = null,
     history_draft: std.ArrayList(u8) = .empty,
@@ -273,6 +317,7 @@ pub const ComposerState = struct {
 
     pub fn clear(self: *ComposerState) void {
         self.buffer.clearRetainingCapacity();
+        self.cursor = 0;
         self.history_index = null;
         self.history_draft.clearRetainingCapacity();
     }
@@ -280,7 +325,70 @@ pub const ComposerState = struct {
     pub fn text(self: ComposerState) []const u8 {
         return self.buffer.items;
     }
+
+    pub fn normalizeCursor(self: *ComposerState) void {
+        self.cursor = utf8BoundaryAtOrBefore(self.buffer.items, @min(self.cursor, self.buffer.items.len));
+    }
+
+    pub fn insertSlice(self: *ComposerState, allocator: std.mem.Allocator, bytes: []const u8) !void {
+        self.normalizeCursor();
+        try self.buffer.insertSlice(allocator, self.cursor, bytes);
+        self.cursor += bytes.len;
+    }
+
+    pub fn deleteBeforeCursor(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor == 0) return false;
+        const start = previousCodepointStart(self.buffer.items, self.cursor);
+        const removed = self.cursor - start;
+        std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[self.cursor..]);
+        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
+        self.cursor = start;
+        return true;
+    }
+
+    pub fn moveCursorPrev(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor == 0) return false;
+        self.cursor = previousCodepointStart(self.buffer.items, self.cursor);
+        return true;
+    }
+
+    pub fn moveCursorNext(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor >= self.buffer.items.len) return false;
+        self.cursor = nextCodepointEnd(self.buffer.items, self.cursor);
+        return true;
+    }
+
+    pub fn moveCursorHome(self: *ComposerState) void {
+        self.cursor = 0;
+    }
+
+    pub fn moveCursorEnd(self: *ComposerState) void {
+        self.cursor = self.buffer.items.len;
+    }
 };
+
+fn previousCodepointStart(text: []const u8, cursor: usize) usize {
+    if (cursor == 0) return 0;
+    var idx = @min(cursor, text.len) - 1;
+    while (idx > 0 and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
+    return idx;
+}
+
+fn nextCodepointEnd(text: []const u8, cursor: usize) usize {
+    const idx = utf8BoundaryAtOrBefore(text, @min(cursor, text.len));
+    if (idx >= text.len) return text.len;
+    const len = std.unicode.utf8ByteSequenceLength(text[idx]) catch 1;
+    return @min(text.len, idx + len);
+}
+
+fn utf8BoundaryAtOrBefore(text: []const u8, index: usize) usize {
+    var idx = @min(index, text.len);
+    while (idx > 0 and idx < text.len and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
+    return idx;
+}
 
 const max_hashline_preview_bytes: usize = 20 * 1024;
 const hashline_preview_truncated_marker = "\n... preview truncated ...\n";
@@ -289,20 +397,30 @@ pub const AppState = struct {
     allocator: std.mem.Allocator,
     mode: AppMode = .normal,
     transcript: std.ArrayList(TranscriptEntry) = .empty,
+    protocol_events: std.ArrayList(ProtocolEventEntry) = .empty,
     registered_tools: std.ArrayList(RegisteredToolEntry) = .empty,
     tools: std.ArrayList(ToolEntry) = .empty,
     sessions: std.ArrayList(SessionEntry) = .empty,
     composer: ComposerState = .{},
     approval: ApprovalState = .{},
+    permission_mode: tui_runtime.PermissionMode = .bypass,
     status: StatusState = .{},
     queue: QueueState = .{},
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
+    transcript_mode: TranscriptVisibilityMode = .balanced,
     show_thinking: bool = true,
+    thinking_level: ai_types.ThinkingLevel = .low,
+    /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
+    /// spinner frames and other time-based effects from this so animation stays
+    /// in lockstep with the render loop without each view tracking its own clock.
+    anim_tick: u64 = 0,
     transcript_scroll: usize = 0,
     tool_scroll: usize = 0,
     session_index: usize = 0,
     session_scroll: usize = 0,
+    menu_index: usize = 0,
+    menu_scroll: usize = 0,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
 
@@ -313,6 +431,8 @@ pub const AppState = struct {
     pub fn deinit(self: *AppState) void {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
+        for (self.protocol_events.items) |*entry| entry.deinit(self.allocator);
+        self.protocol_events.deinit(self.allocator);
         for (self.registered_tools.items) |*tool| tool.deinit(self.allocator);
         self.registered_tools.deinit(self.allocator);
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
@@ -340,8 +460,43 @@ pub const AppState = struct {
     pub fn clearTranscript(self: *AppState) void {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.clearRetainingCapacity();
+        self.clearProtocolEvents();
         self.transcript_scroll = 0;
         self.clearActiveTranscriptEntries();
+    }
+
+    /// Borrowed text of the most recent assistant reply, or null if none exists.
+    /// Valid until the transcript is next mutated.
+    pub fn lastAssistantText(self: *const AppState) ?[]const u8 {
+        var i = self.transcript.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.transcript.items[i].kind == .assistant) {
+                return self.transcript.items[i].text.items;
+            }
+        }
+        return null;
+    }
+
+    /// Render the whole transcript as plain text with role prefixes. Caller owns
+    /// the returned slice.
+    pub fn transcriptToText(self: *const AppState, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        for (self.transcript.items, 0..) |entry, idx| {
+            if (idx > 0) try buf.append(allocator, '\n');
+            const prefix: []const u8 = switch (entry.kind) {
+                .user => "> ",
+                .assistant => "",
+                .thinking => "[thinking] ",
+                .tool => "[tool] ",
+                .system => "[system] ",
+                .@"error" => "[error] ",
+            };
+            try buf.appendSlice(allocator, prefix);
+            try buf.appendSlice(allocator, entry.text.items);
+        }
+        return buf.toOwnedSlice(allocator);
     }
 
     pub fn clearTools(self: *AppState) void {
@@ -393,6 +548,7 @@ pub const AppState = struct {
     pub fn replaceComposerBuffer(self: *AppState, text: []const u8) !void {
         self.composer.buffer.clearRetainingCapacity();
         try self.composer.buffer.appendSlice(self.allocator, text);
+        self.composer.cursor = self.composer.buffer.items.len;
     }
 
     pub fn composerHistoryPrev(self: *AppState) !bool {
@@ -430,11 +586,33 @@ pub const AppState = struct {
         self.show_thinking = !self.show_thinking;
     }
 
+    pub fn setTranscriptMode(self: *AppState, mode: TranscriptVisibilityMode) void {
+        self.transcript_mode = mode;
+        self.transcript_scroll = 0;
+    }
+
+    pub fn cycleTranscriptMode(self: *AppState) TranscriptVisibilityMode {
+        self.setTranscriptMode(self.transcript_mode.next());
+        return self.transcript_mode;
+    }
+
+    pub fn cycleThinkingLevel(self: *AppState) ai_types.ThinkingLevel {
+        self.thinking_level = switch (self.thinking_level) {
+            .off, .minimal => .low,
+            .low => .medium,
+            .medium => .high,
+            .high => .xhigh,
+            .xhigh => .off,
+        };
+        return self.thinking_level;
+    }
+
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
         self.queue = counts;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
+        try self.appendProtocolEvent(event);
         switch (event) {
             .agent_start => {
                 self.status.streaming = true;
@@ -453,6 +631,7 @@ pub const AppState = struct {
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
             .thinking_delta => |payload| try self.appendDelta(.thinking, payload.delta.slice()),
             .tool_call_delta => |payload| try self.appendDelta(.tool, payload.delta.slice()),
+            .provider_event => {},
             .message_end => |payload| switch (payload.role) {
                 .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
                 .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), null, true),
@@ -482,7 +661,15 @@ pub const AppState = struct {
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                if (payload.is_error) try self.status.setError(self.allocator, payload.result_json.slice());
+                const summary = try toolResultSummary(self.allocator, payload.tool_name.slice(), payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
+                defer self.allocator.free(summary);
+                try self.appendTranscript(.tool, summary);
+                if (payload.is_error) {
+                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ payload.tool_name.slice(), payload.result_json.slice() });
+                    defer self.allocator.free(message);
+                    try self.status.setError(self.allocator, message);
+                    try self.appendTranscript(.@"error", message);
+                }
             },
             .context_usage => |payload| self.applyContextUsage(payload),
             .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
@@ -496,7 +683,12 @@ pub const AppState = struct {
                 switch (payload.reason) {
                     .completed => {},
                     .cancelled => try self.appendTranscript(.system, "agent cancelled"),
-                    .@"error" => try self.status.setError(self.allocator, "agent error"),
+                    .@"error" => {
+                        if (self.status.last_error.len == 0) {
+                            try self.status.setError(self.allocator, "agent ended with error, but no error details were provided");
+                            try self.appendTranscript(.@"error", self.status.last_error);
+                        }
+                    },
                 }
             },
             .@"error" => |payload| {
@@ -577,6 +769,17 @@ pub const AppState = struct {
     fn appendEmptyTranscript(self: *AppState, kind: TranscriptKind) !usize {
         try self.appendTranscript(kind, "");
         return self.transcript.items.len - 1;
+    }
+
+    fn appendProtocolEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
+        var entry = try ProtocolEventEntry.init(self.allocator, event);
+        errdefer entry.deinit(self.allocator);
+        try self.protocol_events.append(self.allocator, entry);
+    }
+
+    fn clearProtocolEvents(self: *AppState) void {
+        for (self.protocol_events.items) |*entry| entry.deinit(self.allocator);
+        self.protocol_events.clearRetainingCapacity();
     }
 
     fn appendDelta(self: *AppState, kind: TranscriptKind, delta: []const u8) !void {
@@ -739,6 +942,142 @@ pub const AppState = struct {
     }
 };
 
+fn formatProtocolEvent(allocator: std.mem.Allocator, event: tui_runtime.TuiEvent) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    switch (event) {
+        .agent_start => try writer.writeAll("protocol event: agent_start"),
+        .turn_start => try writer.writeAll("protocol event: turn_start"),
+        .message_start => |payload| {
+            try writer.writeAll("protocol event: message_start");
+            try writeEnumProtocolField(writer, "role", payload.role);
+        },
+        .text_delta => |payload| {
+            try writer.writeAll("protocol event: text_delta");
+            try writeUsizeProtocolField(writer, "content_index", payload.content_index);
+            try writeStringProtocolField(writer, "delta", payload.delta.slice());
+        },
+        .thinking_delta => |payload| {
+            try writer.writeAll("protocol event: thinking_delta");
+            try writeUsizeProtocolField(writer, "content_index", payload.content_index);
+            try writeStringProtocolField(writer, "delta", payload.delta.slice());
+        },
+        .tool_call_delta => |payload| {
+            try writer.writeAll("protocol event: tool_call_delta");
+            try writeUsizeProtocolField(writer, "content_index", payload.content_index);
+            try writeStringProtocolField(writer, "delta", payload.delta.slice());
+        },
+        .provider_event => |payload| {
+            try writer.writeAll("protocol event: provider_event");
+            try writeStringProtocolField(writer, "event_json", payload.event_json.slice());
+        },
+        .message_end => |payload| {
+            try writer.writeAll("protocol event: message_end");
+            try writeEnumProtocolField(writer, "role", payload.role);
+            try writeStringProtocolField(writer, "text", payload.text.slice());
+            try writeStringProtocolField(writer, "content_json", payload.content_json.slice());
+            try writeStringProtocolField(writer, "tool_call_id", payload.tool_call_id.slice());
+            try writeStringProtocolField(writer, "tool_name", payload.tool_name.slice());
+            try writeStringProtocolField(writer, "args_json", payload.args_json.slice());
+            try writeStringProtocolField(writer, "tool_calls_json", payload.tool_calls_json.slice());
+            try writeStringProtocolField(writer, "details_json", payload.details_json.slice());
+            try writeStringProtocolField(writer, "artifacts_json", payload.artifacts_json.slice());
+            try writeEnumProtocolField(writer, "stop_reason", payload.stop_reason);
+            try writeBoolProtocolField(writer, "is_error", payload.is_error);
+        },
+        .tool_approval_requested => |payload| {
+            try writer.writeAll("protocol event: tool_approval_requested");
+            try writeStringProtocolField(writer, "tool_call_id", payload.tool_call_id.slice());
+            try writeStringProtocolField(writer, "tool_name", payload.tool_name.slice());
+            try writeStringProtocolField(writer, "args_json", payload.args_json.slice());
+        },
+        .tool_execution_start => |payload| {
+            try writer.writeAll("protocol event: tool_execution_start");
+            try writeStringProtocolField(writer, "tool_call_id", payload.tool_call_id.slice());
+            try writeStringProtocolField(writer, "tool_name", payload.tool_name.slice());
+            try writeStringProtocolField(writer, "args_json", payload.args_json.slice());
+        },
+        .tool_execution_update => |payload| {
+            try writer.writeAll("protocol event: tool_execution_update");
+            try writeStringProtocolField(writer, "tool_call_id", payload.tool_call_id.slice());
+            try writeStringProtocolField(writer, "tool_name", payload.tool_name.slice());
+            try writeStringProtocolField(writer, "args_json", payload.args_json.slice());
+            try writeStringProtocolField(writer, "partial_result_json", payload.partial_result_json.slice());
+        },
+        .tool_execution_end => |payload| {
+            try writer.writeAll("protocol event: tool_execution_end");
+            try writeStringProtocolField(writer, "tool_call_id", payload.tool_call_id.slice());
+            try writeStringProtocolField(writer, "tool_name", payload.tool_name.slice());
+            try writeStringProtocolField(writer, "result_json", payload.result_json.slice());
+            try writeBoolProtocolField(writer, "is_error", payload.is_error);
+            try writeU64ProtocolField(writer, "raw_total_bytes", payload.raw_total_bytes);
+            try writeU64ProtocolField(writer, "returned_total_bytes", payload.returned_total_bytes);
+            try writeU64ProtocolField(writer, "estimated_returned_tokens", payload.estimated_returned_tokens);
+            try writeU32ProtocolField(writer, "artifact_count", payload.artifact_count);
+            try writeStringProtocolField(writer, "artifact_refs", payload.artifact_refs.slice());
+        },
+        .context_usage => |payload| {
+            try writer.writeAll("protocol event: context_usage");
+            try writeU64ProtocolField(writer, "system_prompt_bytes", payload.system_prompt_bytes);
+            try writeU64ProtocolField(writer, "message_bytes", payload.message_bytes);
+            try writeU64ProtocolField(writer, "tool_definition_bytes", payload.tool_definition_bytes);
+            try writeU64ProtocolField(writer, "total_bytes", payload.total_bytes);
+            try writeU64ProtocolField(writer, "estimated_tokens", payload.estimated_tokens);
+            try writeU32ProtocolField(writer, "message_count", payload.message_count);
+            try writeU32ProtocolField(writer, "tool_count", payload.tool_count);
+        },
+        .prompt_segment_usage => |payload| {
+            try writer.writeAll("protocol event: prompt_segment_usage");
+            try writeEnumProtocolField(writer, "segment", payload.segment);
+            try writeEnumProtocolField(writer, "cache_role", payload.cache_role);
+            try writeU64ProtocolField(writer, "bytes", payload.bytes);
+            try writeU64ProtocolField(writer, "estimated_tokens", payload.estimated_tokens);
+            try writeU32ProtocolField(writer, "item_count", payload.item_count);
+        },
+        .turn_end => |payload| {
+            try writer.writeAll("protocol event: turn_end");
+            try writeEnumProtocolField(writer, "stop_reason", payload.stop_reason);
+        },
+        .agent_end => |payload| {
+            try writer.writeAll("protocol event: agent_end");
+            try writeEnumProtocolField(writer, "reason", payload.reason);
+        },
+        .@"error" => |payload| {
+            try writer.writeAll("protocol event: error");
+            try writeStringProtocolField(writer, "message", payload.message.slice());
+        },
+    }
+
+    return out.toOwnedSlice();
+}
+
+fn writeStringProtocolField(writer: *std.Io.Writer, field: []const u8, value: []const u8) !void {
+    try writer.print("\n{s}=", .{field});
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn writeEnumProtocolField(writer: *std.Io.Writer, field: []const u8, value: anytype) !void {
+    try writer.print("\n{s}={s}", .{ field, @tagName(value) });
+}
+
+fn writeBoolProtocolField(writer: *std.Io.Writer, field: []const u8, value: bool) !void {
+    try writer.print("\n{s}={}", .{ field, value });
+}
+
+fn writeUsizeProtocolField(writer: *std.Io.Writer, field: []const u8, value: usize) !void {
+    try writer.print("\n{s}={d}", .{ field, value });
+}
+
+fn writeU64ProtocolField(writer: *std.Io.Writer, field: []const u8, value: u64) !void {
+    try writer.print("\n{s}={d}", .{ field, value });
+}
+
+fn writeU32ProtocolField(writer: *std.Io.Writer, field: []const u8, value: u32) !void {
+    try writer.print("\n{s}={d}", .{ field, value });
+}
+
 fn approvalScopeHint(allocator: std.mem.Allocator, tool_name: []const u8, args_json: []const u8) ![]u8 {
     const safe_tool_name = try sanitizeTerminalText(allocator, tool_name);
     defer allocator.free(safe_tool_name);
@@ -848,6 +1187,27 @@ fn toolSummary(allocator: std.mem.Allocator, name: []const u8, args_json: []cons
     return std.fmt.allocPrint(allocator, "◈ {s}", .{name});
 }
 
+fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, result_json: []const u8, is_error: bool, raw_total_bytes: u64, returned_total_bytes: u64, estimated_tokens: u64, artifact_count: u32) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    try writer.print("◈ {s} {s}", .{ name, if (is_error) "failed" else "ok" });
+    if (raw_total_bytes > 0 or returned_total_bytes > 0) {
+        try writer.print(" raw={d}B returned={d}B", .{ raw_total_bytes, returned_total_bytes });
+    } else {
+        try writer.print(" output={d}B", .{result_json.len});
+    }
+    if (estimated_tokens > 0) try writer.print(" ~{d} tok", .{estimated_tokens});
+    if (artifact_count > 0) try writer.print(" artifacts={d}", .{artifact_count});
+    if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" show full");
+    if (is_error and result_json.len > 0) {
+        const preview = try clipSummaryArg(allocator, result_json);
+        defer allocator.free(preview);
+        try writer.print(" \"{s}\"", .{preview});
+    }
+    return out.toOwnedSlice();
+}
+
 fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
     if (args_json.len == 0) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
@@ -906,6 +1266,17 @@ fn ownedText(text: []const u8) !@import("owned_slice").OwnedSlice(u8) {
     return @import("owned_slice").OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, text));
 }
 
+fn protocolLogText(allocator: std.mem.Allocator, state: *const AppState) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    for (state.protocol_events.items, 0..) |entry, index| {
+        if (index > 0) try writer.writeByte('\n');
+        try writer.writeAll(entry.text);
+    }
+    return out.toOwnedSlice();
+}
+
 pub fn noopToolForTest(
     tool_call_id: []const u8,
     args_json: []const u8,
@@ -921,6 +1292,140 @@ pub fn noopToolForTest(
     _ = on_update;
     _ = allocator;
     return error.NotImplemented;
+}
+
+test "AppState protocol log captures every supported TUI event variant" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.agent_start);
+    try state.applyEvent(.turn_start);
+    try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
+
+    var text_delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
+    defer text_delta.deinit(std.testing.allocator);
+    try state.applyEvent(text_delta);
+
+    var thinking_delta = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 1, .delta = try ownedText("plan") } };
+    defer thinking_delta.deinit(std.testing.allocator);
+    try state.applyEvent(thinking_delta);
+
+    var tool_call_delta = tui_runtime.TuiEvent{ .tool_call_delta = .{ .content_index = 2, .delta = try ownedText("{\"name\":\"shell_execute\"}") } };
+    defer tool_call_delta.deinit(std.testing.allocator);
+    try state.applyEvent(tool_call_delta);
+
+    var provider_event = tui_runtime.TuiEvent{ .provider_event = .{ .event_json = try ownedText("{\"type\":\"toolcall_end\",\"content_index\":2}") } };
+    defer provider_event.deinit(std.testing.allocator);
+    try state.applyEvent(provider_event);
+
+    var message_end = tui_runtime.TuiEvent{ .message_end = .{
+        .role = .assistant,
+        .text = try ownedText("final"),
+        .content_json = try ownedText("[{\"type\":\"output_text\"}]"),
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_execute"),
+        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+        .tool_calls_json = try ownedText("[{\"id\":\"call-1\"}]"),
+        .details_json = try ownedText("{\"finish\":\"stop\"}"),
+        .artifacts_json = try ownedText("[{\"name\":\"out\"}]"),
+        .stop_reason = .stop,
+        .is_error = false,
+    } };
+    defer message_end.deinit(std.testing.allocator);
+    try state.applyEvent(message_end);
+
+    var approval = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_execute"),
+        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+    } };
+    defer approval.deinit(std.testing.allocator);
+    try state.applyEvent(approval);
+
+    var tool_start = tui_runtime.TuiEvent{ .tool_execution_start = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_execute"),
+        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+    } };
+    defer tool_start.deinit(std.testing.allocator);
+    try state.applyEvent(tool_start);
+
+    var tool_update = tui_runtime.TuiEvent{ .tool_execution_update = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_execute"),
+        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+        .partial_result_json = try ownedText("{\"stdout\":\"/workspace\"}"),
+    } };
+    defer tool_update.deinit(std.testing.allocator);
+    try state.applyEvent(tool_update);
+
+    var tool_end = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-1"),
+        .tool_name = try ownedText("shell_execute"),
+        .result_json = try ownedText("{\"ok\":true}"),
+        .is_error = false,
+        .raw_total_bytes = 100,
+        .returned_total_bytes = 80,
+        .estimated_returned_tokens = 20,
+        .artifact_count = 1,
+        .artifact_refs = try ownedText("artifact://tool-output/1"),
+    } };
+    defer tool_end.deinit(std.testing.allocator);
+    try state.applyEvent(tool_end);
+
+    try state.applyEvent(.{ .context_usage = .{
+        .system_prompt_bytes = 10,
+        .message_bytes = 20,
+        .tool_definition_bytes = 30,
+        .total_bytes = 60,
+        .estimated_tokens = 15,
+        .message_count = 2,
+        .tool_count = 1,
+    } });
+    try state.applyEvent(.{ .prompt_segment_usage = .{
+        .segment = .tool_definitions,
+        .cache_role = .stable,
+        .bytes = 30,
+        .estimated_tokens = 8,
+        .item_count = 1,
+    } });
+    try state.applyEvent(.{ .turn_end = .{ .stop_reason = .stop } });
+    try state.applyEvent(.{ .agent_end = .{ .reason = .completed } });
+
+    var error_event = tui_runtime.TuiEvent{ .@"error" = .{ .message = try ownedText("provider failed") } };
+    defer error_event.deinit(std.testing.allocator);
+    try state.applyEvent(error_event);
+
+    try std.testing.expectEqual(@as(usize, 17), state.protocol_events.items.len);
+    const text = try protocolLogText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(text);
+
+    const expected = [_][]const u8{
+        "protocol event: agent_start",
+        "protocol event: turn_start",
+        "protocol event: message_start",
+        "protocol event: text_delta",
+        "protocol event: thinking_delta",
+        "protocol event: tool_call_delta",
+        "protocol event: provider_event",
+        "protocol event: message_end",
+        "protocol event: tool_approval_requested",
+        "protocol event: tool_execution_start",
+        "protocol event: tool_execution_update",
+        "protocol event: tool_execution_end",
+        "protocol event: context_usage",
+        "protocol event: prompt_segment_usage",
+        "protocol event: turn_end",
+        "protocol event: agent_end",
+        "protocol event: error",
+        "content_json=\"[{\\\"type\\\":\\\"output_text\\\"}]\"",
+        "event_json=\"{\\\"type\\\":\\\"toolcall_end\\\",\\\"content_index\\\":2}\"",
+        "artifact_refs=\"artifact://tool-output/1\"",
+        "message=\"provider failed\"",
+    };
+    for (expected) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, text, needle) != null);
+    }
 }
 
 test "AppState applies transcript and tool events" {
@@ -1170,9 +1675,25 @@ test "AppState clears stale active assistant before next inline message_end" {
     defer assistant_end.deinit(std.testing.allocator);
     try state.applyEvent(assistant_end);
 
-    try std.testing.expectEqual(@as(usize, 2), state.transcript.items.len);
+    try std.testing.expectEqual(@as(usize, 3), state.transcript.items.len);
     try std.testing.expectEqualStrings("interrupted", state.transcript.items[0].text.items);
-    try std.testing.expectEqualStrings("next response", state.transcript.items[1].text.items);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("agent ended with error, but no error details were provided", state.transcript.items[1].text.items);
+    try std.testing.expectEqualStrings("next response", state.transcript.items[2].text.items);
+}
+
+test "AppState does not append generic agent error after detailed error event" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var error_event = tui_runtime.TuiEvent{ .@"error" = .{ .message = try ownedText("provider failed: bad request") } };
+    defer error_event.deinit(std.testing.allocator);
+    try state.applyEvent(error_event);
+    try state.applyEvent(.{ .agent_end = .{ .reason = .@"error" } });
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("provider failed: bad request", state.transcript.items[0].text.items);
 }
 
 test "AppState clones registered tool metadata" {
@@ -1348,12 +1869,41 @@ test "Composer history navigation recalls entries and restores draft" {
     try std.testing.expectEqualStrings("draft", state.composer.text());
 }
 
+test "Composer cursor edits within the draft" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.composer.insertSlice(std.testing.allocator, "abc");
+    try std.testing.expectEqual(@as(usize, 3), state.composer.cursor);
+    try std.testing.expect(state.composer.moveCursorPrev());
+    try state.composer.insertSlice(std.testing.allocator, "X");
+    try std.testing.expectEqualStrings("abXc", state.composer.text());
+    try std.testing.expect(state.composer.deleteBeforeCursor());
+    try std.testing.expectEqualStrings("abc", state.composer.text());
+    state.composer.moveCursorHome();
+    try std.testing.expect(!state.composer.deleteBeforeCursor());
+    try state.composer.insertSlice(std.testing.allocator, "λ");
+    try std.testing.expectEqualStrings("λabc", state.composer.text());
+    try std.testing.expectEqual(@as(usize, "λ".len), state.composer.cursor);
+}
+
 test "AppState toggles thinking visibility" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     try std.testing.expect(state.show_thinking);
     state.toggleThinking();
     try std.testing.expect(!state.show_thinking);
+}
+
+test "AppState cycles thinking levels for TUI shortcut" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.medium, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.xhigh, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.off, state.cycleThinkingLevel());
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, state.cycleThinkingLevel());
 }
 
 test "AppState reset replay clears stale queue counts" {
@@ -1482,4 +2032,51 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
     try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "show full") != null);
+}
+
+test "AppState appends visible transcript row for tool execution errors" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var end_event = tui_runtime.TuiEvent{ .tool_execution_end = .{
+        .tool_call_id = try ownedText("call-error"),
+        .tool_name = try ownedText("shell_command"),
+        .result_json = try ownedText("OutOfMemory"),
+        .is_error = true,
+    } };
+    defer end_event.deinit(std.testing.allocator);
+    try state.applyEvent(end_event);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
+    try std.testing.expectEqual(ToolStatus.@"error", state.tools.items[0].status);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[state.transcript.items.len - 1].kind);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "shell_command failed: OutOfMemory") != null);
+}
+
+test "lastAssistantText returns the most recent assistant reply" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try std.testing.expect(state.lastAssistantText() == null);
+
+    try state.appendTranscript(.user, "hello");
+    try state.appendTranscript(.assistant, "first reply");
+    try state.appendTranscript(.user, "again");
+    try state.appendTranscript(.assistant, "second reply");
+    try state.appendTranscript(.system, "noise");
+
+    try std.testing.expectEqualStrings("second reply", state.lastAssistantText().?);
+}
+
+test "transcriptToText renders role-prefixed plain text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.appendTranscript(.user, "ping");
+    try state.appendTranscript(.assistant, "pong");
+    try state.appendTranscript(.@"error", "boom");
+
+    const text = try state.transcriptToText(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("> ping\npong\n[error] boom", text);
 }

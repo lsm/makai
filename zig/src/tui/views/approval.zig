@@ -14,7 +14,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     defer parts.deinit(allocator);
     defer for (parts.items) |part| allocator.free(part);
 
-    try parts.append(allocator, try tui_theme.errorText().render(allocator, "Approval required"));
+    try parts.append(allocator, try tui_theme.warningText().render(allocator, tui_theme.glyph.tool ++ " Approval required"));
     try parts.append(allocator, try std.fmt.allocPrint(allocator, "Tool: {s}", .{state.approval.tool_name}));
     const args = try tui_text.truncateToWidth(allocator, state.approval.args_json, options.width -| 10);
     defer allocator.free(args);

@@ -44,6 +44,14 @@ pub const MessageStartPayload = struct {
 pub const MessageUpdatePayload = struct {
     message: ai_types.AssistantMessage,
     event: ai_types.AssistantMessageEvent,
+    owns_event: bool = false,
+
+    pub fn deinit(self: *MessageUpdatePayload, allocator: std.mem.Allocator) void {
+        if (self.owns_event) {
+            ai_types.deinitAssistantMessageEvent(allocator, &self.event);
+            self.owns_event = false;
+        }
+    }
 };
 
 /// Payload for message_end event
@@ -137,6 +145,14 @@ pub const AgentEvent = union(enum) {
     tool_execution_start: ToolExecutionStartPayload,
     tool_execution_update: ToolExecutionUpdatePayload,
     tool_execution_end: ToolExecutionEndPayload,
+
+    pub fn deinit(self: *AgentEvent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .message_update => |*payload| payload.deinit(allocator),
+            else => {},
+        }
+        self.* = undefined;
+    }
 };
 
 // ============================================================================
@@ -148,6 +164,7 @@ pub const AgentToolResult = struct {
     content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
+    is_error: bool = false,
 
     pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
         const details = self.details_json.slice();
@@ -302,6 +319,7 @@ pub const ProtocolOptions = struct {
     api_key: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: u32 = 60_000,
     temperature: ?f32 = null,
@@ -414,6 +432,7 @@ pub const AgentLoopConfig = struct {
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
 
     // Agent-specific options
     max_iterations: ?u32 = null, // Max tool use iterations
@@ -510,10 +529,18 @@ pub const AgentState = struct {
             msg.deinit(self.allocator);
         }
         self.messages.deinit(self.allocator);
+        self.clearStreamMessage();
         if (self.system_prompt.len > 0) self.allocator.free(self.system_prompt);
         self.error_message.deinit(self.allocator);
         // Note: doesn't own model or tools
         self.pending_tool_calls.deinit();
+    }
+
+    pub fn clearStreamMessage(self: *AgentState) void {
+        if (self.stream_message) |*msg| {
+            msg.deinit(self.allocator);
+        }
+        self.stream_message = null;
     }
 };
 
@@ -739,6 +766,62 @@ test "AgentEventStream basic usage" {
     try std.testing.expect(stream.isDone());
 }
 
+test "AgentEvent deinit releases owned message update provider event" {
+    const allocator = std.testing.allocator;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    const borrowed = ai_types.AssistantMessageEvent{ .toolcall_start = .{
+        .content_index = 0,
+        .id = "call-1",
+        .name = "shell_execute",
+        .partial = partial,
+    } };
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, borrowed);
+
+    var event = AgentEvent{ .message_update = .{
+        .message = owned.toolcall_start.partial,
+        .event = owned,
+        .owns_event = true,
+    } };
+    event.deinit(allocator);
+}
+
+test "AgentEventStream deinit drains owned message update events" {
+    const allocator = std.testing.allocator;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const borrowed = ai_types.AssistantMessageEvent{ .text_delta = .{
+        .content_index = 0,
+        .delta = "hello",
+        .partial = partial,
+    } };
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, borrowed);
+
+    var stream = AgentEventStream.init(allocator);
+    defer stream.deinit();
+    try stream.push(.{ .message_update = .{
+        .message = owned.text_delta.partial,
+        .event = owned,
+        .owns_event = true,
+    } });
+}
+
 test "AgentEndPayload deinit with owned strings" {
     const msg = ai_types.Message{
         .user = .{
@@ -789,6 +872,7 @@ test "ProtocolOptions defaults" {
     try std.testing.expect(opts.api_key == null);
     try std.testing.expect(opts.session_id == null);
     try std.testing.expect(opts.cancel_token == null);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, opts.thinking_level);
     try std.testing.expect(opts.thinking_budgets == null);
     try std.testing.expectEqual(@as(u32, 60_000), opts.max_retry_delay_ms);
     try std.testing.expect(opts.temperature == null);

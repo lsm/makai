@@ -23,8 +23,6 @@ pub const ToolPermission = struct {
 
 pub const ModeSettings = struct {
     compact_output: bool = true,
-    vim_mode: bool = false,
-    caveman_mode: bool = false,
 };
 
 const borrowed_empty_theme: []u8 = &.{};
@@ -42,6 +40,7 @@ pub const UiSettings = struct {
 pub const Config = struct {
     model: []u8,
     provider: []u8,
+    api: []u8,
     workspace: []u8,
     permissions: std.ArrayList(ToolPermission) = .empty,
     mode: ModeSettings = .{},
@@ -51,6 +50,7 @@ pub const Config = struct {
         return .{
             .model = try allocator.dupe(u8, "claude-sonnet-4-5"),
             .provider = try allocator.dupe(u8, "anthropic"),
+            .api = try allocator.dupe(u8, "anthropic-messages"),
             .workspace = try allocator.dupe(u8, "."),
             .ui = .{ .theme = try allocator.dupe(u8, "default") },
         };
@@ -59,6 +59,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
         allocator.free(self.model);
         allocator.free(self.provider);
+        allocator.free(self.api);
         allocator.free(self.workspace);
         for (self.permissions.items) |*permission| permission.deinit(allocator);
         self.permissions.deinit(allocator);
@@ -76,8 +77,8 @@ pub const Store = struct {
     }
 
     pub fn initDefault(allocator: std.mem.Allocator) !Store {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.HomeNotFound,
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch |err| switch (err) {
+            error.EnvironmentVariableMissing => return error.HomeNotFound,
             else => return err,
         };
         defer allocator.free(home);
@@ -108,6 +109,17 @@ pub const Store = struct {
         return parseConfig(self.allocator, data);
     }
 
+    pub fn loadIfExists(self: Store) !?Config {
+        const path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "config.json" });
+        defer self.allocator.free(path);
+        const data = compat.fs.readFileAlloc(self.allocator, compat.fs.getCwd(), path, 1024 * 1024) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.allocator.free(data);
+        return try parseConfig(self.allocator, data);
+    }
+
     pub fn save(self: Store, cfg: Config) !void {
         try compat.fs.createDir(compat.fs.getCwd(), self.base_dir);
         const path = try std.fs.path.join(self.allocator, &.{ self.base_dir, "config.json" });
@@ -131,6 +143,7 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
     var cfg = Config{
         .model = try dupStringField(allocator, obj, "model", "claude-sonnet-4-5"),
         .provider = try dupStringField(allocator, obj, "provider", "anthropic"),
+        .api = try dupStringField(allocator, obj, "api", ""),
         .workspace = try dupStringField(allocator, obj, "workspace", ""),
         .ui = .{ .theme = try allocator.dupe(u8, "default") },
     };
@@ -160,8 +173,6 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
     if (obj.get("mode")) |value| switch (value) {
         .object => |mode_obj| {
             cfg.mode.compact_output = boolField(mode_obj, "compact_output", cfg.mode.compact_output);
-            cfg.mode.vim_mode = boolField(mode_obj, "vim_mode", cfg.mode.vim_mode);
-            cfg.mode.caveman_mode = boolField(mode_obj, "caveman_mode", cfg.mode.caveman_mode);
         },
         else => {},
     };
@@ -187,6 +198,7 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.beginObject();
     try w.writeStringField("model", cfg.model);
     try w.writeStringField("provider", cfg.provider);
+    try w.writeStringField("api", cfg.api);
     try w.writeStringField("workspace", cfg.workspace);
     try w.writeKey("permissions");
     try w.beginArray();
@@ -200,8 +212,6 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.writeKey("mode");
     try w.beginObject();
     try w.writeBoolField("compact_output", cfg.mode.compact_output);
-    try w.writeBoolField("vim_mode", cfg.mode.vim_mode);
-    try w.writeBoolField("caveman_mode", cfg.mode.caveman_mode);
     try w.endObject();
     try w.writeKey("ui");
     try w.beginObject();
@@ -239,7 +249,7 @@ fn parsePermissionMode(value: []const u8) ToolPermission.Mode {
     return .ask;
 }
 
-test "save config reload preserves model and provider" {
+test "save config reload preserves model provider and api" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmpBase(std.testing.allocator, &tmp);
@@ -254,6 +264,8 @@ test "save config reload preserves model and provider" {
     cfg.model = try std.testing.allocator.dupe(u8, "model-b");
     std.testing.allocator.free(cfg.provider);
     cfg.provider = try std.testing.allocator.dupe(u8, "openai");
+    std.testing.allocator.free(cfg.api);
+    cfg.api = try std.testing.allocator.dupe(u8, "openai-responses");
     try cfg.permissions.append(std.testing.allocator, .{ .tool_name = try std.testing.allocator.dupe(u8, "shell_execute"), .mode = .deny });
     try store.save(cfg);
 
@@ -261,6 +273,7 @@ test "save config reload preserves model and provider" {
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("model-b", loaded.model);
     try std.testing.expectEqualStrings("openai", loaded.provider);
+    try std.testing.expectEqualStrings("openai-responses", loaded.api);
     try std.testing.expectEqual(@as(usize, 1), loaded.permissions.items.len);
     try std.testing.expectEqual(ToolPermission.Mode.deny, loaded.permissions.items[0].mode);
 }
@@ -282,4 +295,21 @@ test "missing config creates defaults" {
     const data = try compat.fs.readFileAlloc(std.testing.allocator, compat.fs.getCwd(), path, 1024);
     defer std.testing.allocator.free(data);
     try std.testing.expect(std.mem.indexOf(u8, data, "claude-sonnet-4-5") != null);
+}
+
+test "loadIfExists returns null without creating defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    const missing = try store.loadIfExists();
+    try std.testing.expect(missing == null);
+
+    const path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.FileNotFound, compat.fs.readFileAlloc(std.testing.allocator, compat.fs.getCwd(), path, 1024));
 }

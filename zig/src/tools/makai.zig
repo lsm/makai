@@ -22,6 +22,7 @@ const json_writer = @import("json_writer");
 const in_process = @import("transports/in_process");
 const stdio = @import("stdio");
 const tui_app = @import("tui_app");
+const tui_model_catalog = @import("tui_model_catalog");
 
 pub const VERSION = "0.0.1";
 
@@ -55,6 +56,7 @@ const AgentRunOptions = struct {
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
+    thinking_level: ai_types.ThinkingLevel = .low,
     api_key: ?[]u8 = null,
 
     fn deinit(self: *AgentRunOptions, allocator: std.mem.Allocator) void {
@@ -559,6 +561,7 @@ const StdioProtocolLoop = struct {
             .temperature = prepared.options.temperature,
             .max_tokens = prepared.options.max_tokens,
             .max_iterations = prepared.options.max_iterations,
+            .thinking_level = prepared.options.thinking_level,
             .session_id = session_id_text,
             .api_key = prepared.options.api_key,
             .cancel_token = .{ .cancelled = cancel_flag },
@@ -605,9 +608,13 @@ const StdioProtocolLoop = struct {
             }
 
             while (run.stream.poll()) |event| {
+                var owned_event = event;
+                errdefer deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
+
                 const event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
                 defer self.allocator.free(event_json);
                 self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
+                deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
                 forwarded += 1;
             }
 
@@ -743,6 +750,10 @@ const StdioProtocolLoop = struct {
     }
 };
 
+fn deinitSerializedStdioAgentEvent(allocator: std.mem.Allocator, event: *agent_loop.AgentEvent) void {
+    event.deinit(allocator);
+}
+
 fn prepareAgentRun(
     allocator: std.mem.Allocator,
     pending: agent_protocol_server.PendingAgentMessage,
@@ -789,7 +800,7 @@ fn prepareAgentRun(
     const system_prompt = try allocator.dupe(u8, system_prompt_builder.items);
     errdefer allocator.free(system_prompt);
 
-    const options = try parseAgentRunOptions(allocator, message_obj, pending.options_json);
+    const options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
 
     return .{
         .model = model,
@@ -803,6 +814,11 @@ fn prepareAgentRun(
 fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_types.Model {
     var parsed = model_ref.parseModelRef(allocator, ref) catch return error.InvalidModelRef;
     errdefer parsed.deinit(allocator);
+
+    if (try modelFromProductionCatalog(allocator, parsed)) |model| {
+        parsed.deinit(allocator);
+        return model;
+    }
 
     const name = try allocator.dupe(u8, parsed.model_id);
     errdefer allocator.free(name);
@@ -832,7 +848,27 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     return model;
 }
 
-fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
+fn modelFromProductionCatalog(
+    allocator: std.mem.Allocator,
+    parsed: model_ref.ParsedModelRef,
+) !?ai_types.Model {
+    const models = tui_model_catalog.loadProductionModels(allocator) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return null;
+    };
+    defer tui_model_catalog.deinitModels(allocator, models);
+
+    for (models) |model| {
+        if (!std.mem.eql(u8, model.provider, parsed.provider_id)) continue;
+        if (!std.mem.eql(u8, model.api, parsed.api)) continue;
+        if (!std.mem.eql(u8, model.id, parsed.model_id)) continue;
+        return try ai_types.cloneModel(allocator, model);
+    }
+
+    return null;
+}
+
+fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.ObjectMap, config_obj: ?std.json.ObjectMap, options_json: []const u8) !AgentRunOptions {
     const message_options = if (message_obj.get("options")) |value|
         if (value == .object) value.object else null
     else
@@ -850,6 +886,7 @@ fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.Obje
         .temperature = optionF32(envelope_options, message_options, "temperature"),
         .max_tokens = optionU32(envelope_options, message_options, "max_tokens"),
         .max_iterations = optionU32(envelope_options, message_options, "max_iterations"),
+        .thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level") orelse .low,
         .api_key = if (optionString(envelope_options, message_options, "api_key")) |key| try allocator.dupe(u8, key) else null,
     };
 }
@@ -874,6 +911,25 @@ fn optionU32(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: [
 
 fn optionString(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (optionValue(primary, fallback, key)) |value| if (value == .string) value.string else null else null;
+}
+
+fn optionThinkingLevel(primary: ?std.json.ObjectMap, fallback: ?std.json.ObjectMap, config: ?std.json.ObjectMap, key: []const u8) ?ai_types.ThinkingLevel {
+    if (optionString(primary, fallback, key)) |value| {
+        if (std.meta.stringToEnum(ai_types.ThinkingLevel, value)) |level| return normalizeStdioThinkingLevel(level);
+    }
+    if (config) |obj| {
+        if (getStringField(obj, key)) |value| {
+            if (std.meta.stringToEnum(ai_types.ThinkingLevel, value)) |level| return normalizeStdioThinkingLevel(level);
+        }
+    }
+    return null;
+}
+
+fn normalizeStdioThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLevel {
+    return switch (level) {
+        .minimal => .low,
+        else => level,
+    };
 }
 
 fn parseAgentTools(
@@ -1031,7 +1087,6 @@ fn executeStdioToolViaAgentProtocol(
         if (executor.bridge.popResult(allocator, executor.session_id, tool_call_id)) |result| {
             var owned_result = result;
             defer owned_result.deinit(allocator);
-            if (owned_result.is_error) return error.RemoteToolExecutionFailed;
             const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
             errdefer deinitUserContentParts(allocator, content);
             const details_json = try allocator.dupe(u8, owned_result.details_json);
@@ -1039,6 +1094,7 @@ fn executeStdioToolViaAgentProtocol(
             return .{
                 .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
                 .details_json = ai_types.OwnedSlice(u8).initOwned(details_json),
+                .is_error = owned_result.is_error,
             };
         }
         compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
@@ -2716,6 +2772,71 @@ test "prepareAgentRun parses SDK-style request options from message json" {
     try std.testing.expectEqual(@as(?f32, 0.25), prepared.options.temperature);
     try std.testing.expectEqual(@as(?u32, 64), prepared.options.max_tokens);
     try std.testing.expectEqual(@as(?u32, 7), prepared.options.max_iterations);
+}
+
+test "prepareAgentRun reads thinking level from stdio config and allows message override" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var from_config = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"high\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_config.deinit(allocator);
+
+    var prepared_config = try prepareAgentRun(allocator, from_config);
+    defer prepared_config.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, prepared_config.options.thinking_level);
+
+    var from_message = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"options":{"thinking_level":"off"}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"high\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_message.deinit(allocator);
+
+    var prepared_message = try prepareAgentRun(allocator, from_message);
+    defer prepared_message.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.off, prepared_message.options.thinking_level);
+
+    var from_legacy_minimal = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{\"thinking_level\":\"minimal\"}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_legacy_minimal.deinit(allocator);
+
+    var prepared_minimal = try prepareAgentRun(allocator, from_legacy_minimal);
+    defer prepared_minimal.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, prepared_minimal.options.thinking_level);
+
+    var from_xhigh = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"fixture/fixture-ok-api@fixture-model","messages":[{"role":"user","content":"hello"}],"options":{"thinking_level":"xhigh"}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer from_xhigh.deinit(allocator);
+
+    var prepared_xhigh = try prepareAgentRun(allocator, from_xhigh);
+    defer prepared_xhigh.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.xhigh, prepared_xhigh.options.thinking_level);
 }
 
 test "parseToolResultHistoryMessage preserves structured tool_result content" {

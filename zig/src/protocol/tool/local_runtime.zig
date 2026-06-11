@@ -133,6 +133,7 @@ pub const ToolProtocolServer = struct {
                     .execution_id = req.execution_id,
                     .tool_call_id = try allocator.dupe(u8, req.tool_call_id),
                     .result_json = result_json,
+                    .is_error = result.is_error,
                     .details_json = details_json,
                     .artifacts = artifacts,
                     .duration_ms = @intCast(@max(compat.time.nowMillis() - start_ms, 0)),
@@ -263,7 +264,7 @@ pub const LocalToolProtocol = struct {
             defer response.deinit(allocator);
             switch (response.payload) {
                 .tool_result => |res| return try agentToolResultFromProtocol(allocator, res),
-                .tool_error => |err| return toolErrorToError(err.code),
+                .tool_error => |err| return try agentToolResultFromProtocolError(allocator, err.code, err.message),
                 else => {},
             }
         }
@@ -405,6 +406,26 @@ fn agentToolResultFromProtocol(allocator: std.mem.Allocator, res: tool_types.Too
         .content = OwnedSlice(ai_types.UserContentPart).initOwned(content),
         .details_json = details,
         .artifacts = artifacts,
+        .is_error = res.is_error,
+    };
+}
+
+fn agentToolResultFromProtocolError(allocator: std.mem.Allocator, code: tool_types.ToolErrorCode, message: []const u8) !agent_types.AgentToolResult {
+    const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    errdefer allocator.free(content);
+    const text = try std.fmt.allocPrint(allocator, "Tool execution failed: {s}", .{message});
+    errdefer allocator.free(text);
+    content[0] = .{ .text = .{ .text = text } };
+    const details = try std.json.Stringify.valueAlloc(allocator, .{
+        .ok = false,
+        .code = @tagName(code),
+        .err = message,
+    }, .{});
+    errdefer allocator.free(details);
+    return .{
+        .content = OwnedSlice(ai_types.UserContentPart).initOwned(content),
+        .details_json = OwnedSlice(u8).initOwned(details),
+        .is_error = true,
     };
 }
 
@@ -470,19 +491,6 @@ fn deinitToolMetadata(meta: *tool_types.ToolMetadata, allocator: std.mem.Allocat
     }
 }
 
-fn toolErrorToError(code: tool_types.ToolErrorCode) anyerror {
-    return switch (code) {
-        .tool_not_found => error.ToolNotFound,
-        .tool_timeout => error.ToolTimeout,
-        .invalid_arguments => error.InvalidToolArguments,
-        .tool_unavailable => error.ToolUnavailable,
-        .artifact_not_found => error.ArtifactNotFound,
-        .hashline_disabled => error.HashlineDisabled,
-        .stale_anchor => error.StaleAnchor,
-        else => error.ToolExecutionFailed,
-    };
-}
-
 test "tool protocol server wraps shell_execute and returns correct result" {
     const allocator = std.testing.allocator;
     const callbacks = struct {
@@ -514,6 +522,38 @@ test "tool protocol server wraps shell_execute and returns correct result" {
     try std.testing.expectEqual(@as(usize, 1), result.content.slice().len);
     try std.testing.expect(result.content.slice()[0] == .text);
     try std.testing.expectEqualStrings("shell ok", result.content.slice()[0].text.text);
+}
+
+test "tool protocol preserves execution error text" {
+    const allocator = std.testing.allocator;
+    const callbacks = struct {
+        fn execute(
+            tool_call_id: []const u8,
+            args_json: []const u8,
+            cancel_token: ?ai_types.CancelToken,
+            on_update_ctx: ?*anyopaque,
+            on_update: ?agent_types.ToolUpdateCallback,
+            test_allocator: std.mem.Allocator,
+        ) anyerror!agent_types.AgentToolResult {
+            _ = tool_call_id;
+            _ = args_json;
+            _ = cancel_token;
+            _ = on_update_ctx;
+            _ = on_update;
+            _ = test_allocator;
+            return error.FileNotFound;
+        }
+    };
+    const tool = agent_types.AgentTool{ .label = "Workspace Info", .name = "workspace_info", .description = "Workspace info", .parameters_schema_json = "{}", .execute = callbacks.execute };
+    var local = try LocalToolProtocol.init(allocator, &.{tool});
+    defer local.deinit();
+
+    var result = try local.execute("call_1", "workspace_info", "{}", null, null, null, allocator);
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.is_error);
+    try std.testing.expectEqualStrings("Tool execution failed: FileNotFound", result.content.slice()[0].text.text);
+    try std.testing.expect(std.mem.indexOf(u8, result.getDetailsJson().?, "FileNotFound") != null);
 }
 
 test "tool protocol server wraps MCP bridge-style tool and returns correct result" {

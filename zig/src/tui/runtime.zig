@@ -25,6 +25,7 @@ pub const TuiEvent = session.TuiEvent;
 pub const TuiEventStream = session.TuiEventStream;
 pub const TuiEndReason = session.TuiEndReason;
 pub const QueuedCounts = session.QueuedCounts;
+pub const CompactMessagesResult = session.CompactMessagesResult;
 pub const ToolApprovalCallback = session.ToolApprovalCallback;
 pub const ToolApprovalDecision = session.ToolApprovalDecision;
 pub const ToolApprovalRequest = session.ToolApprovalRequest;
@@ -90,6 +91,11 @@ pub const TuiRemoteTransport = enum {
     websocket,
 };
 
+pub const PermissionMode = enum {
+    ask,
+    bypass,
+};
+
 pub const TuiRemoteConfig = struct {
     mode: TuiBackendMode = .local,
     transport: TuiRemoteTransport = .stdio,
@@ -105,14 +111,50 @@ pub const TuiRuntimeOptions = struct {
     protocol: ?agent.ProtocolClient = null,
     models: []const ai_types.Model = &.{},
     initial_model_id: ?[]const u8 = null,
+    initial_model: ?InitialModelRef = null,
     tools: []const agent.AgentTool = &.{},
     mcp_config_json: ?[]const u8 = null,
     permission_engine: ?*permission.PermissionEngine = null,
+    workspace_root: []const u8 = "",
     tool_approval_ctx: ?*anyopaque = null,
     tool_approval_callback: ?ToolApprovalCallback = null,
+    permission_mode: PermissionMode = .bypass,
+    thinking_level: ai_types.ThinkingLevel = .low,
     compact_output: bool = false,
     run_async: bool = true,
 };
+
+pub const InitialModelRef = struct {
+    id: []const u8,
+    provider: []const u8 = "",
+    api: []const u8 = "",
+};
+
+fn normalizeTuiThinkingLevel(level: ai_types.ThinkingLevel) ai_types.ThinkingLevel {
+    return switch (level) {
+        .minimal => .low,
+        else => level,
+    };
+}
+
+fn cloneModels(allocator: std.mem.Allocator, models: []const ai_types.Model) ![]ai_types.Model {
+    const cloned = try allocator.alloc(ai_types.Model, models.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*model| model.deinit(allocator);
+        allocator.free(cloned);
+    }
+    for (models, 0..) |model, idx| {
+        cloned[idx] = try ai_types.cloneModel(allocator, model);
+        initialized += 1;
+    }
+    return cloned;
+}
+
+fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void {
+    for (models) |*model| model.deinit(allocator);
+    allocator.free(models);
+}
 
 pub const TuiRuntime = struct {
     allocator: std.mem.Allocator,
@@ -139,6 +181,7 @@ pub const TuiRuntime = struct {
     wrapped_tools: []agent.AgentTool,
     approval_contexts: []ApprovalContext,
     tool_protocol: tool_local_runtime.LocalToolProtocol,
+    workspace_root: []u8,
     tool_protocol_override_fn: ?agent_types.ToolProtocolExecuteFn = null,
     tool_protocol_override_ctx: ?*anyopaque = null,
     pending_approval: ApprovalDecisionState = .{},
@@ -146,6 +189,8 @@ pub const TuiRuntime = struct {
     tool_approval_ctx: ?*anyopaque,
     tool_approval_callback: ?ToolApprovalCallback,
     permission_engine: ?*permission.PermissionEngine,
+    permission_mode: PermissionMode = .bypass,
+    thinking_level: ai_types.ThinkingLevel = .low,
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     completed: bool = false,
     started: bool = false,
@@ -156,8 +201,8 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
-        var models = try allocator.dupe(ai_types.Model, options.models);
-        errdefer allocator.free(models);
+        var models = try cloneModels(allocator, options.models);
+        errdefer deinitModels(allocator, models);
 
         var tool_registry = local_tools.ToolRegistry.init();
         errdefer tool_registry.deinit(allocator);
@@ -177,7 +222,14 @@ pub const TuiRuntime = struct {
         var selected: ?usize = null;
         if (models.len > 0) {
             selected = 0;
-            if (options.initial_model_id) |id| {
+            if (options.initial_model) |initial| {
+                for (models, 0..) |model, i| {
+                    if (modelMatchesInitial(model, initial)) {
+                        selected = i;
+                        break;
+                    }
+                }
+            } else if (options.initial_model_id) |id| {
                 for (models, 0..) |model, i| {
                     if (std.mem.eql(u8, model.id, id)) {
                         selected = i;
@@ -235,7 +287,11 @@ pub const TuiRuntime = struct {
             }
         }
 
-        const tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
+        var tool_protocol = try tool_local_runtime.LocalToolProtocol.init(allocator, original_tools);
+        errdefer tool_protocol.deinit();
+
+        var workspace_root = try allocator.dupe(u8, options.workspace_root);
+        errdefer allocator.free(workspace_root);
 
         var runtime = TuiRuntime{
             .allocator = allocator,
@@ -256,9 +312,12 @@ pub const TuiRuntime = struct {
             .wrapped_tools = wrapped_tools,
             .approval_contexts = approval_contexts,
             .tool_protocol = tool_protocol,
+            .workspace_root = workspace_root,
             .tool_approval_ctx = options.tool_approval_ctx,
             .tool_approval_callback = options.tool_approval_callback,
             .permission_engine = options.permission_engine,
+            .permission_mode = options.permission_mode,
+            .thinking_level = normalizeTuiThinkingLevel(options.thinking_level),
             .compact_output = options.compact_output,
             .run_async = options.run_async,
         };
@@ -268,6 +327,8 @@ pub const TuiRuntime = struct {
         original_tools = &.{};
         wrapped_tools = &.{};
         models = &.{};
+        tool_protocol = undefined;
+        workspace_root = &.{};
         tool_registry = local_tools.ToolRegistry.init();
         approval_contexts = &.{};
         errdefer runtime.deinit();
@@ -293,7 +354,16 @@ pub const TuiRuntime = struct {
             runtime.wrapped_tools = next_wrapped_tools;
             runtime.approval_contexts = next_approval_contexts;
         }
+        if (runtime.permission_engine) |engine| engine.setBypassAll(runtime.permission_mode == .bypass);
+        runtime.rebuildWrappedTools();
         return runtime;
+    }
+
+    fn modelMatchesInitial(model: ai_types.Model, initial: InitialModelRef) bool {
+        if (!std.mem.eql(u8, model.id, initial.id)) return false;
+        if (initial.provider.len > 0 and !std.mem.eql(u8, model.provider, initial.provider)) return false;
+        if (initial.api.len > 0 and !std.mem.eql(u8, model.api, initial.api)) return false;
+        return true;
     }
 
     pub fn deinit(self: *TuiRuntime) void {
@@ -310,6 +380,7 @@ pub const TuiRuntime = struct {
         if (self.remote_config_sender) |sender| self.allocator.destroy(sender);
         self.clearPendingApproval();
         self.tool_protocol.deinit();
+        self.allocator.free(self.workspace_root);
         self.allocator.free(self.approval_contexts);
         self.allocator.free(self.wrapped_tools);
         self.allocator.free(self.original_tools);
@@ -318,7 +389,7 @@ pub const TuiRuntime = struct {
             self.allocator.destroy(bridge);
         }
         self.tool_registry.deinit(self.allocator);
-        self.allocator.free(self.models);
+        deinitModels(self.allocator, self.models);
         self.* = undefined;
     }
 
@@ -334,8 +405,10 @@ pub const TuiRuntime = struct {
                 client.setSender(sender);
                 const config_json = try self.remoteConfigJson();
                 defer self.allocator.free(config_json);
+                const system_prompt = try self.workspaceSystemPrompt();
+                defer self.allocator.free(system_prompt);
                 const sid = agent_protocol_types.generateSessionId();
-                _ = try client.sendAgentStartWithSession(sid, config_json, null);
+                _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
                 self.remote_pending_session_id = sid;
                 self.remote_client = client;
                 client_moved = true;
@@ -369,7 +442,11 @@ pub const TuiRuntime = struct {
                 });
                 self.local_agent.?.subscribeWithContext(self, onAgentEvent);
                 self.local_agent.?.setCompactToolOutput(self.compact_output);
+                const system_prompt = try self.workspaceSystemPrompt();
+                defer self.allocator.free(system_prompt);
+                try self.local_agent.?.setSystemPrompt(system_prompt);
                 if (self.selected_model_index) |idx| self.local_agent.?.setModel(self.models[idx]);
+                self.local_agent.?.setThinkingLevel(self.thinking_level);
                 self.tool_protocol.server.tools.clearRetainingCapacity();
                 try self.tool_protocol.server.registerTools(self.wrapped_tools);
                 self.local_agent.?.setTools(self.wrapped_tools);
@@ -414,6 +491,7 @@ pub const TuiRuntime = struct {
             .ops = .{
                 .start = sessionStart,
                 .resume_session = sessionResume,
+                .compact_messages = sessionCompactMessages,
                 .cancel = sessionCancel,
                 .submit_turn = sessionSubmitTurn,
                 .steer = sessionSteer,
@@ -421,6 +499,7 @@ pub const TuiRuntime = struct {
                 .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
                 .switch_model = sessionSwitchModel,
+                .switch_model_exact = sessionSwitchModelExact,
                 .current_model = sessionCurrentModel,
                 .decide_tool_approval = sessionDecideToolApproval,
                 .stream_events = sessionStreamEvents,
@@ -432,6 +511,39 @@ pub const TuiRuntime = struct {
         return self.models;
     }
 
+    pub fn replaceModels(self: *TuiRuntime, next_models: []const ai_types.Model, preferred_model: ?ai_types.Model) !void {
+        if (self.local_agent) |*local| {
+            if (!local.isIdle()) return error.AgentAlreadyStreaming;
+        }
+
+        var owned_next = try cloneModels(self.allocator, next_models);
+        errdefer deinitModels(self.allocator, owned_next);
+
+        const active_model = preferred_model orelse if (self.selected_model_index) |idx| self.models[idx] else null;
+
+        var next_selected: ?usize = if (owned_next.len > 0) 0 else null;
+        if (active_model) |active| {
+            for (owned_next, 0..) |model, idx| {
+                if (std.mem.eql(u8, model.id, active.id) and
+                    std.mem.eql(u8, model.provider, active.provider) and
+                    std.mem.eql(u8, model.api, active.api))
+                {
+                    next_selected = idx;
+                    break;
+                }
+            }
+        }
+
+        deinitModels(self.allocator, self.models);
+        self.models = owned_next;
+        owned_next = &.{};
+        self.selected_model_index = next_selected;
+
+        if (self.local_agent) |*local| {
+            if (next_selected) |idx| local.setModel(self.models[idx]);
+        }
+    }
+
     pub fn currentModel(self: *TuiRuntime) ?ai_types.Model {
         if (self.selected_model_index) |idx| return self.models[idx];
         return null;
@@ -441,6 +553,32 @@ pub const TuiRuntime = struct {
         return self.original_tools;
     }
 
+    pub fn permissionMode(self: *const TuiRuntime) PermissionMode {
+        return self.permission_mode;
+    }
+
+    pub fn thinkingLevel(self: *const TuiRuntime) ai_types.ThinkingLevel {
+        return self.thinking_level;
+    }
+
+    pub fn setThinkingLevel(self: *TuiRuntime, level: ai_types.ThinkingLevel) void {
+        const normalized = normalizeTuiThinkingLevel(level);
+        self.thinking_level = normalized;
+        if (self.local_agent) |*local| local.setThinkingLevel(normalized);
+    }
+
+    pub fn setPermissionMode(self: *TuiRuntime, mode: PermissionMode) !void {
+        self.permission_mode = mode;
+        if (self.permission_engine) |engine| engine.setBypassAll(mode == .bypass);
+        self.rebuildWrappedTools();
+        if (self.local_agent) |*local| {
+            local.setPermissionEngine(self.permission_engine);
+            local.setTools(self.wrapped_tools);
+        }
+        self.tool_protocol.server.tools.clearRetainingCapacity();
+        try self.tool_protocol.server.registerTools(self.wrapped_tools);
+    }
+
     pub fn switchModel(self: *TuiRuntime, model_id: []const u8) !void {
         if (self.local_agent) |*local| {
             if (!local.isIdle()) return error.AgentAlreadyStreaming;
@@ -448,6 +586,24 @@ pub const TuiRuntime = struct {
 
         for (self.models, 0..) |model, i| {
             if (std.mem.eql(u8, model.id, model_id)) {
+                self.selected_model_index = i;
+                if (self.local_agent) |*local| local.setModel(model);
+                return;
+            }
+        }
+        return error.ModelNotFound;
+    }
+
+    pub fn switchModelExact(self: *TuiRuntime, selected: ai_types.Model) !void {
+        if (self.local_agent) |*local| {
+            if (!local.isIdle()) return error.AgentAlreadyStreaming;
+        }
+
+        for (self.models, 0..) |model, i| {
+            if (std.mem.eql(u8, model.id, selected.id) and
+                std.mem.eql(u8, model.provider, selected.provider) and
+                std.mem.eql(u8, model.api, selected.api))
+            {
                 self.selected_model_index = i;
                 if (self.local_agent) |*local| local.setModel(model);
                 return;
@@ -496,7 +652,9 @@ pub const TuiRuntime = struct {
                 self.remote_reconnect_attempted = false;
                 client.clearSessionTerminalState(sid);
                 self.last_turn_stop_reason = null;
-                _ = try client.sendAgentMessage(sid, message_json, null);
+                const options_json = try self.remoteMessageOptionsJson();
+                defer self.allocator.free(options_json);
+                _ = try client.sendAgentMessage(sid, message_json, options_json);
                 message_sent = true;
                 self.pumpRemoteIncoming() catch |err| {
                     try self.completeRemoteWithError(@errorName(err));
@@ -578,6 +736,22 @@ pub const TuiRuntime = struct {
                 if (self.run_async) local.waitForIdle();
                 local.clearAllQueues();
                 try local.replaceMessages(messages);
+            },
+        }
+    }
+
+    pub fn compactMessages(self: *TuiRuntime) !CompactMessagesResult {
+        switch (self.backend) {
+            .remote => {
+                if (self.stream_active and !self.event_stream.isDone()) return error.AgentAlreadyStreaming;
+                return try ai_types.compactMessageHistory(self.allocator, &self.remote_messages);
+            },
+            .local => {
+                if (!self.started) try self.start();
+                const local = &(self.local_agent orelse return error.RuntimeNotStarted);
+                if (self.run_async) local.waitForIdle();
+                local.clearAllQueues();
+                return try local.compactMessages();
             },
         }
     }
@@ -690,6 +864,7 @@ pub const TuiRuntime = struct {
 
     fn rebuildWrappedTools(self: *TuiRuntime) void {
         for (self.original_tools, 0..) |tool, i| {
+            const bypass = self.permission_mode == .bypass;
             self.approval_contexts[i] = .{
                 .runtime = self,
                 .callback_ctx = self.tool_approval_ctx,
@@ -709,10 +884,10 @@ pub const TuiRuntime = struct {
                 .execute = tool.execute,
                 .runtime_ctx = tool.runtime_ctx,
                 .runtime_execute = tool.runtime_execute,
-                .approval_ctx = &self.approval_contexts[i],
-                .approval_fn = approveTool,
-                .approval_ui_ctx = &self.approval_contexts[i],
-                .approval_ui_fn = notifyToolApproval,
+                .approval_ctx = if (bypass) null else &self.approval_contexts[i],
+                .approval_fn = if (bypass) null else approveTool,
+                .approval_ui_ctx = if (bypass) null else &self.approval_contexts[i],
+                .approval_ui_fn = if (bypass) null else notifyToolApproval,
             };
         }
     }
@@ -752,6 +927,21 @@ pub const TuiRuntime = struct {
         try w.beginObject();
         if (self.currentModel()) |model| try w.writeStringField("model", model.id);
         try w.writeBoolField("compact_output", self.compact_output);
+        try w.writeStringField("permission_mode", @tagName(self.permission_mode));
+        try w.writeStringField("thinking_level", @tagName(self.thinking_level));
+        if (self.workspace_root.len > 0) try w.writeStringField("workspace_root", self.workspace_root);
+        try w.endObject();
+        const out = try self.allocator.dupe(u8, buffer.items);
+        buffer.deinit(self.allocator);
+        return out;
+    }
+
+    fn remoteMessageOptionsJson(self: *TuiRuntime) ![]u8 {
+        var buffer = std.ArrayList(u8).empty;
+        errdefer buffer.deinit(self.allocator);
+        var w = json_writer.JsonWriter.init(&buffer, self.allocator);
+        try w.beginObject();
+        try w.writeStringField("thinking_level", @tagName(self.thinking_level));
         try w.endObject();
         const out = try self.allocator.dupe(u8, buffer.items);
         buffer.deinit(self.allocator);
@@ -824,8 +1014,10 @@ pub const TuiRuntime = struct {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
+            const system_prompt = try self.workspaceSystemPrompt();
+            defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, null);
+            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
         }
         const timeout_ns = self.remote_session_timeout_ms * std.time.ns_per_ms;
@@ -854,6 +1046,15 @@ pub const TuiRuntime = struct {
         self.stream_active = false;
     }
 
+    fn workspaceSystemPrompt(self: *TuiRuntime) ![]u8 {
+        if (self.workspace_root.len == 0) return self.allocator.dupe(u8, "");
+        return std.fmt.allocPrint(self.allocator,
+            \\Current working directory: {s}
+            \\Default workspace root: {s}
+            \\Use this absolute path as the `workspace_root` argument for shell, file, search, edit, and workspace tools unless the user explicitly asks for a different path.
+        , .{ self.workspace_root, self.workspace_root });
+    }
+
     fn completeRemoteCancelled(self: *TuiRuntime) void {
         if (self.event_stream.isDone()) return;
         self.completed = true;
@@ -873,8 +1074,10 @@ pub const TuiRuntime = struct {
             if (was_stream_active) try self.completeRemoteWithError("remote connection disconnected");
             const config_json = try self.remoteConfigJson();
             defer self.allocator.free(config_json);
+            const system_prompt = try self.workspaceSystemPrompt();
+            defer self.allocator.free(system_prompt);
             const sid = agent_protocol_types.generateSessionId();
-            _ = try client.sendAgentStartWithSession(sid, config_json, null);
+            _ = try client.sendAgentStartWithSession(sid, config_json, system_prompt);
             self.remote_pending_session_id = sid;
             return;
         }
@@ -1121,6 +1324,7 @@ pub const TuiRuntime = struct {
         }
         if (std.mem.eql(u8, type_name, "message_update")) {
             const event_value = obj.get("event") orelse return error.InvalidRemoteEvent;
+            self.push(.{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(try jsonValueToOwnedString(self.allocator, event_value)) } });
             const msg = try deserializeRemoteMessageValue(self.allocator, event_value);
             switch (msg) {
                 .event => |ev| {
@@ -1205,6 +1409,7 @@ pub const TuiRuntime = struct {
             .turn_start => self.push(.turn_start),
             .message_start => |payload| self.push(.{ .message_start = .{ .role = messageRole(payload.message) } }),
             .message_update => |payload| {
+                try self.pushProviderEvent(payload.event);
                 if (self.backend == .remote and payload.event == .done) try self.recordRemoteAssistantMessage(payload.event.done.message);
                 try self.pushMessageUpdate(payload.event);
             },
@@ -1233,6 +1438,11 @@ pub const TuiRuntime = struct {
             } }),
             .turn_end => |payload| {
                 self.last_turn_stop_reason = payload.message.stop_reason;
+                if (payload.message.stop_reason == .@"error") {
+                    if (payload.message.getErrorMessage()) |message| {
+                        self.push(.{ .@"error" = .{ .message = try self.dupeOwned(message) } });
+                    }
+                }
                 self.pushTerminal(.{ .turn_end = .{ .stop_reason = payload.message.stop_reason } });
             },
             .agent_end => {
@@ -1366,6 +1576,11 @@ pub const TuiRuntime = struct {
             else => {},
         }
     }
+
+    fn pushProviderEvent(self: *TuiRuntime, event: ai_types.AssistantMessageEvent) !void {
+        const event_json = try transport.serializeEvent(event, self.allocator);
+        self.push(.{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(event_json) } });
+    }
 };
 
 fn remoteConfigStdioReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
@@ -1405,6 +1620,45 @@ fn remoteConfigStdioClose(ctx: *anyopaque) void {
 
 fn parseStopReason(value: []const u8) ai_types.StopReason {
     return std.meta.stringToEnum(ai_types.StopReason, value) orelse .stop;
+}
+
+fn jsonValueToOwnedString(allocator: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var buffer = std.ArrayList(u8).empty;
+    errdefer buffer.deinit(allocator);
+    var writer = json_writer.JsonWriter.init(&buffer, allocator);
+    try writeJsonValue(&writer, value, allocator);
+    return buffer.toOwnedSlice(allocator);
+}
+
+fn writeJsonValue(writer: *json_writer.JsonWriter, value: std.json.Value, allocator: std.mem.Allocator) !void {
+    switch (value) {
+        .null => try writer.writeNull(),
+        .bool => |b| try writer.writeBool(b),
+        .integer => |i| try writer.writeInt(i),
+        .float => |f| {
+            try writer.buffer.print(allocator, "{d}", .{f});
+            writer.needs_comma = true;
+        },
+        .number_string => |s| {
+            try writer.buffer.appendSlice(allocator, s);
+            writer.needs_comma = true;
+        },
+        .string => |s| try writer.writeString(s),
+        .array => |arr| {
+            try writer.beginArray();
+            for (arr.items) |item| try writeJsonValue(writer, item, allocator);
+            try writer.endArray();
+        },
+        .object => |obj| {
+            try writer.beginObject();
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                try writer.writeKey(entry.key_ptr.*);
+                try writeJsonValue(writer, entry.value_ptr.*, allocator);
+            }
+            try writer.endObject();
+        },
+    }
 }
 
 fn getJsonString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -1752,6 +2006,11 @@ fn sessionResume(ctx: ?*anyopaque) anyerror!void {
     try self.resumeSession();
 }
 
+fn sessionCompactMessages(ctx: ?*anyopaque) anyerror!CompactMessagesResult {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return try self.compactMessages();
+}
+
 fn sessionCancel(ctx: ?*anyopaque) void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     self.cancel();
@@ -1785,6 +2044,11 @@ fn sessionQueuedCounts(ctx: ?*anyopaque) QueuedCounts {
 fn sessionSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     try self.switchModel(model_id);
+}
+
+fn sessionSwitchModelExact(ctx: ?*anyopaque, model: ai_types.Model) anyerror!void {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    try self.switchModelExact(model);
 }
 
 fn sessionCurrentModel(ctx: ?*anyopaque) ?ai_types.Model {
@@ -1831,12 +2095,15 @@ const test_model_b = ai_types.Model{
 const MockProtocolCtx = struct {
     call_count: usize = 0,
     last_model_id: []const u8 = "",
+    last_thinking_level: ai_types.ThinkingLevel = .off,
+    saw_workspace_prompt: bool = false,
     wait_for_cancel: bool = false,
     flood_count: usize = 0,
     tool_first: bool = false,
     wait_after_tool_first: bool = false,
     tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
+    provider_error_message: []const u8 = "",
 };
 
 fn makeAssistantMessage(allocator: std.mem.Allocator, model: ai_types.Model, content: []const ai_types.AssistantContent, stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
@@ -1926,16 +2193,29 @@ fn mockStream(
     options: agent.ProtocolOptions,
     allocator: std.mem.Allocator,
 ) anyerror!*event_stream.AssistantMessageEventStream {
-    _ = context;
     const mock: *MockProtocolCtx = @ptrCast(@alignCast(ctx.?));
     mock.call_count += 1;
     mock.last_model_id = model.id;
+    mock.last_thinking_level = options.thinking_level;
+    const system_prompt = context.system_prompt.slice();
+    mock.saw_workspace_prompt = std.mem.indexOf(u8, system_prompt, "Default workspace root: /tmp/makai-workspace") != null and
+        std.mem.indexOf(u8, system_prompt, "`workspace_root`") != null;
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
 
     if (mock.force_error) {
         stream.completeWithError("forced provider error");
+        return stream;
+    }
+
+    if (mock.provider_error_message.len > 0) {
+        var event_message = emptyAssistantMessage(model, .@"error");
+        event_message.error_message = OwnedSlice(u8).initBorrowed(mock.provider_error_message);
+        var result_message = emptyAssistantMessage(model, .@"error");
+        result_message.error_message = OwnedSlice(u8).initBorrowed(mock.provider_error_message);
+        try stream.push(.{ .@"error" = .{ .reason = .@"error", .err = event_message } });
+        stream.complete(result_message);
         return stream;
     }
 
@@ -2040,6 +2320,47 @@ test "runtime submit turn emits normalized events" {
     try std.testing.expect(saw_message_end);
     try std.testing.expect(saw_turn_end);
     try std.testing.expectEqual(@as(usize, 0), runtime.remote_messages.items.len);
+}
+
+test "local runtime includes startup cwd as default workspace root in provider prompt" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .workspace_root = "/tmp/makai-workspace",
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("pwd");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expect(mock.saw_workspace_prompt);
+}
+
+test "local runtime surfaces provider error message details" {
+    var mock = MockProtocolCtx{ .provider_error_message = "provider rejected request: missing workspace_root" };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try std.testing.expectError(error.AgentLoopFailed, tui_session.submitTurn("hi"));
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_detail = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .@"error" and std.mem.eql(u8, ev.@"error".message.slice(), "provider rejected request: missing workspace_root")) {
+            saw_detail = true;
+        }
+    }
+    try std.testing.expect(saw_detail);
 }
 
 test "runtime cancel emits cancelled agent_end" {
@@ -2191,7 +2512,6 @@ test "MCP bridge exec context address remains stable in TUI runtime" {
     }
 }
 
-
 test "tool approval approve and reject paths emit tool events" {
     const tools = [_]agent.AgentTool{.{
         .label = "Demo",
@@ -2210,6 +2530,7 @@ test "tool approval approve and reject paths emit tool events" {
         .tools = &tools,
         .tool_approval_ctx = &approve_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer approve_runtime.deinit();
@@ -2242,6 +2563,7 @@ test "tool approval approve and reject paths emit tool events" {
         .tools = &tools,
         .tool_approval_ctx = &reject_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer reject_runtime.deinit();
@@ -2275,9 +2597,6 @@ test "runtime queues steering and follow-up messages" {
     try tui_session.submitTurn("first");
     try tui_session.steer("steer now");
     try tui_session.queueFollowUp("later");
-    const queued = tui_session.queuedCounts();
-    try std.testing.expectEqual(@as(usize, 1), queued.steering);
-    try std.testing.expectEqual(@as(usize, 1), queued.follow_up);
 
     if (runtime.local_agent) |*local| local.waitForIdle();
 
@@ -2404,6 +2723,7 @@ test "preserves original tool approval when wrapping" {
         .protocol = makeProtocol(&mock),
         .models = &models,
         .tools = &tools,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer runtime.deinit();
@@ -2428,6 +2748,55 @@ test "preserves original tool approval when wrapping" {
     try std.testing.expect(saw_rejected_tool);
 }
 
+test "permission bypass disables policy engine and approval wrappers" {
+    var engine = try permission.PermissionEngine.initEmpty(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = "zig-cache/test-tui-permission-bypass.json",
+    });
+    defer engine.deinit();
+
+    var original_ctx = OriginalApprovalCtx{ .decision = .reject };
+    const tools = [_]agent.AgentTool{.{
+        .label = "Demo",
+        .name = "demo_tool",
+        .description = "Demo tool",
+        .parameters_schema_json = "{}",
+        .execute = demoTool,
+        .approval_ctx = &original_ctx,
+        .approval_fn = originalApprovalCallback,
+    }};
+    const models = [_]ai_types.Model{test_model_a};
+    var mock = MockProtocolCtx{};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .tools = &tools,
+        .permission_engine = &engine,
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .allow);
+    for (runtime.wrapped_tools) |tool| {
+        try std.testing.expect(tool.approval_fn == null);
+        try std.testing.expect(tool.approval_ui_fn == null);
+    }
+
+    try runtime.setPermissionMode(.ask);
+    try std.testing.expectEqual(PermissionMode.ask, runtime.permissionMode());
+    try std.testing.expect(engine.evaluate("shell", "{\"command\":\"rm -rf /\"}") == .deny);
+    var found_demo = false;
+    for (runtime.wrapped_tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "demo_tool")) {
+            found_demo = true;
+            try std.testing.expect(tool.approval_fn != null);
+            try std.testing.expect(tool.approval_ui_fn != null);
+        }
+    }
+    try std.testing.expect(found_demo);
+}
+
 test "preserves original tool approval UI when wrapping" {
     var original_ctx = OriginalApprovalUiCtx{};
     var approval_ctx = ApprovalCtx{ .decision = .approve };
@@ -2448,6 +2817,7 @@ test "preserves original tool approval UI when wrapping" {
         .tools = &tools,
         .tool_approval_ctx = &approval_ctx,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer runtime.deinit();
@@ -2492,6 +2862,133 @@ test "model switch affects next turn" {
     collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
 
     try std.testing.expectEqualStrings("model-b", mock.last_model_id);
+}
+
+test "exact model switch distinguishes duplicate ids" {
+    const first = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Completions",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const second = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Responses",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const models = [_]ai_types.Model{ first, second };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &models });
+    defer runtime.deinit();
+
+    try runtime.switchModelExact(second);
+
+    try std.testing.expectEqualStrings("gpt-4o", runtime.currentModel().?.id);
+    try std.testing.expectEqualStrings("openai-responses", runtime.currentModel().?.api);
+}
+
+test "initial model id selects matching model" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{ test_model_a, test_model_b };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .protocol = makeProtocol(&mock),
+        .models = &models,
+        .initial_model_id = "model-b",
+        .run_async = false,
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "initial model ref selects exact duplicate id provider api tuple" {
+    const first = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Completions",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const second = ai_types.Model{
+        .id = "gpt-4o",
+        .name = "GPT-4o Responses",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 8192,
+        .max_tokens = 1024,
+    };
+    const models = [_]ai_types.Model{ first, second };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .models = &models,
+        .initial_model = .{ .id = "gpt-4o", .provider = "openai", .api = "openai-responses" },
+    });
+    defer runtime.deinit();
+
+    try std.testing.expectEqualStrings("openai-responses", runtime.currentModel().?.api);
+}
+
+test "replaceModels preserves selected model when still available" {
+    const initial = [_]ai_types.Model{ test_model_a, test_model_b };
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &initial, .initial_model_id = "model-b" });
+    defer runtime.deinit();
+
+    const replacement = [_]ai_types.Model{test_model_b};
+    try runtime.replaceModels(&replacement, null);
+
+    try std.testing.expectEqual(@as(usize, 1), runtime.availableModels().len);
+    try std.testing.expectEqualStrings("model-b", runtime.currentModel().?.id);
+}
+
+test "thinking level affects next local turn" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    runtime.setThinkingLevel(.high);
+    try tui_session.submitTurn("hi");
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    var saw_turn_start = false;
+    var saw_message_start = false;
+    var saw_text_delta = false;
+    var saw_message_end = false;
+    var saw_turn_end = false;
+    collectUntilEnd(&tui_session, &saw_turn_start, &saw_message_start, &saw_text_delta, &saw_message_end, &saw_turn_end);
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, mock.last_thinking_level);
+}
+
+test "TUI runtime normalizes hidden minimal thinking level" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .thinking_level = .minimal });
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, runtime.thinkingLevel());
+    runtime.setThinkingLevel(.minimal);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, runtime.thinkingLevel());
 }
 
 test "model switch is rejected while async turn is running" {
@@ -2654,7 +3151,12 @@ test "remote mode sends agent_start envelope via mock transport" {
         .payload = .{ .agent_started = .{ .session_id = sid } },
     });
 
-    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{
+        .backend = .remote,
+        .remote_sender = mock.sender(),
+        .remote_receiver = mock.receiver(),
+        .workspace_root = "/tmp/makai-workspace",
+    });
     defer runtime.deinit();
 
     var tui_session = runtime.createSession();
@@ -2664,6 +3166,9 @@ test "remote mode sends agent_start envelope via mock transport" {
     var env = try agent_envelope.deserializeEnvelope(mock.writes.items[0], std.testing.allocator);
     defer env.deinit(std.testing.allocator);
     try std.testing.expect(env.payload == .agent_start);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.config_json, "\"workspace_root\":\"/tmp/makai-workspace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.system_prompt.slice(), "Default workspace root: /tmp/makai-workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_start.system_prompt.slice(), "`workspace_root`") != null);
 }
 
 test "remote stop sends agent_stop before agent_started arrives" {
@@ -2904,6 +3409,32 @@ test "remote submit waits through pending startup polls" {
     try tui_session.submitTurn("hi");
     try std.testing.expectEqualSlices(u8, sid[0..], runtime.remote_session_id.?[0..]);
     try std.testing.expect(mock.writes.items.len >= 2);
+}
+
+test "remote submit sends current thinking level in message options" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = sid } },
+    });
+
+    runtime.setThinkingLevel(.high);
+    try tui_session.submitTurn("hi");
+    try std.testing.expect(mock.writes.items.len >= 2);
+
+    var env = try agent_envelope.deserializeEnvelope(mock.writes.items[1], std.testing.allocator);
+    defer env.deinit(std.testing.allocator);
+    try std.testing.expect(env.payload == .agent_message);
+    try std.testing.expect(std.mem.indexOf(u8, env.payload.agent_message.options_json.slice(), "\"thinking_level\":\"high\"") != null);
 }
 
 test "remote submit uses configurable startup timeout" {
@@ -3206,6 +3737,11 @@ test "remote done event records assistant history for next turn" {
     try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
     try std.testing.expect(runtime.remote_messages.items[0] == .assistant);
     try std.testing.expectEqualStrings("answer", runtime.remote_messages.items[0].assistant.content[0].text.text);
+    const provider_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable_provider = provider_ev;
+    defer mutable_provider.deinit(std.testing.allocator);
+    try std.testing.expect(mutable_provider == .provider_event);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_provider.provider_event.event_json.slice(), "\"type\":\"done\"") != null);
     const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
     var mutable = ev;
     defer mutable.deinit(std.testing.allocator);
@@ -3322,6 +3858,7 @@ test "remote submit preserves approval marker in serialized tools" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{
         .backend = .remote,
         .tools = &tools,
+        .permission_mode = .ask,
     });
     defer runtime.deinit();
     const json = try makeRemoteMessageJson(std.testing.allocator, test_model_a, &.{}, runtime.remoteSerializableTools());
@@ -3362,6 +3899,11 @@ test "remote message update extracts parsed event object" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
     try runtime.handleRemoteAgentEventJson("{\"type\":\"message_update\",\"note\":\"contains \\\"event\\\": inside string\",\"event\":{\"type\":\"text_delta\",\"content_index\":0,\"delta\":\"hi\"}} ");
+    const provider_ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
+    var mutable_provider = provider_ev;
+    defer mutable_provider.deinit(std.testing.allocator);
+    try std.testing.expect(mutable_provider == .provider_event);
+    try std.testing.expect(std.mem.indexOf(u8, mutable_provider.provider_event.event_json.slice(), "\"type\":\"text_delta\"") != null);
     const ev = runtime.event_stream.poll() orelse return error.NoRemoteEvent;
     var mutable = ev;
     defer mutable.deinit(std.testing.allocator);

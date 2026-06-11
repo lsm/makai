@@ -10,8 +10,13 @@ pub const ProcessResult = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.process.Child.Cwd, timeout_ms: u64, cancel_token: ?ai_types.CancelToken) !ProcessResult {
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    return runWithIo(allocator, threaded.io(), argv, cwd, timeout_ms, cancel_token);
+}
+
+fn runWithIo(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: std.process.Child.Cwd, timeout_ms: u64, cancel_token: ?ai_types.CancelToken) !ProcessResult {
     if (common.isCancelled(cancel_token)) return error.Cancelled;
-    const io = common.defaultIo();
     const start_ms = common.nowMs();
     var child = try std.process.spawn(io, .{
         .argv = argv,
@@ -37,7 +42,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
     while (true) {
         if (common.isCancelled(cancel_token)) return error.Cancelled;
         if (common.durationMs(start_ms) >= timeout_ms) return error.Timeout;
-        if (term == null) term = try pollTerm(&child);
+        if (term == null) term = try pollTerm(&child, io);
         if (!pipes_closed) {
             multi_reader.fill(64, poll_timeout) catch |err| switch (err) {
                 error.Timeout => {
@@ -48,7 +53,7 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
             };
             if (stdout_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
             if (stderr_reader.buffered().len > common.process_output_bytes) return error.StreamTooLong;
-        } else common.defaultIo().sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
+        } else io.sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
         if (term) |t| if (pipes_closed) return finish(allocator, &multi_reader, t, true);
     }
 }
@@ -78,8 +83,8 @@ fn finish(allocator: std.mem.Allocator, multi_reader: *std.Io.File.MultiReader, 
     return .{ .term = term, .stdout = stdout, .stderr = stderr };
 }
 
-fn pollTerm(child: *std.process.Child) !?std.process.Child.Term {
-    if (builtin.os.tag == .windows) return pollTermWindows(child);
+fn pollTerm(child: *std.process.Child, io: std.Io) !?std.process.Child.Term {
+    if (builtin.os.tag == .windows) return pollTermWindows(child, io);
     return pollTermPosix(child);
 }
 
@@ -113,7 +118,7 @@ fn statusToTerm(status: u32) std.process.Child.Term {
         .{ .unknown = status };
 }
 
-fn pollTermWindows(child: *std.process.Child) !?std.process.Child.Term {
+fn pollTermWindows(child: *std.process.Child, io: std.Io) !?std.process.Child.Term {
     if (child.id == null) return null;
     const windows = std.os.windows;
     const handle = child.id.?;
@@ -136,7 +141,7 @@ fn pollTermWindows(child: *std.process.Child) !?std.process.Child.Term {
             windows.CloseHandle(child.thread_handle);
             child.thread_handle = undefined;
             if (child.stdin) |stdin| {
-                stdin.close(common.defaultIo());
+                stdin.close(io);
                 child.stdin = null;
             }
             return term;
@@ -154,6 +159,21 @@ test "process runner honors cancellation" {
     else
         [_][]const u8{ "/bin/sh", "-c", "sleep 2" };
     try std.testing.expectError(error.Cancelled, run(std.testing.allocator, &argv, .inherit, 5_000, token));
+}
+
+test "process runner spawns with initialized threaded io" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var dir = try common.openWorkspace("/", false);
+    defer dir.close(common.defaultIo());
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    const argv = [_][]const u8{ "/bin/sh", "-c", "[ \"$(pwd)\" = / ] && ls -al >/dev/null && printf ok" };
+    const result = try runWithIo(std.testing.allocator, threaded.io(), &argv, .{ .dir = dir }, 10_000, null);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqualStrings("ok", result.stdout);
 }
 
 test "process runner captures output beyond small std process defaults" {

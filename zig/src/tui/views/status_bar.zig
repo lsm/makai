@@ -19,30 +19,32 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const writer = &out.writer;
     const model = if (state.status.model.len > 0) state.status.model else "no-model";
     const provider = if (state.status.provider.len > 0) state.status.provider else "local";
-    const stream = if (state.status.streaming) "streaming" else "idle";
-    const perm = if (state.mode == .approval) "pending" else "ask";
 
-    try writeOwnedSegment(writer, allocator, "model", try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model }));
-    try writer.writeAll(" • ");
+    try writeOwnedValue(writer, allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider, model }), tui_theme.statusSegment());
+    try writeSep(writer, allocator);
     try writeContext(writer, allocator, state);
-    try writer.writeAll(" • ");
-    try writeOwnedSegment(writer, allocator, "cost", try estimatedCost(allocator, state));
-    try writer.writeAll(" • ");
-    try writeStyledValue(writer, allocator, "state", stream, if (state.status.streaming) tui_theme.successText() else tui_theme.muted());
+    try writeSep(writer, allocator);
+    try writeOwnedValue(writer, allocator, try estimatedCost(allocator, state), tui_theme.statusSegment());
+    try writeSep(writer, allocator);
+    try writeState(writer, allocator, state);
     if (state.queue.total() > 0) {
-        try writer.writeAll(" • ");
+        try writeSep(writer, allocator);
         try writeOwnedSegment(writer, allocator, "queue", try std.fmt.allocPrint(allocator, "{d}", .{state.queue.total()}));
     }
-    try writer.writeAll(" • ");
-    try writeSegment(writer, allocator, "perm", perm);
-    try writer.writeAll(" • ");
-    try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
-    if (state.status.last_error.len > 0) {
-        try writer.writeAll(" • ");
-        const err = try tui_theme.errorText().render(allocator, state.status.last_error);
-        defer allocator.free(err);
-        try writer.writeAll(err);
+    try writeSep(writer, allocator);
+    if (state.mode == .approval) {
+        try writeStyledValue(writer, allocator, "perm", "pending", tui_theme.warningText());
+    } else if (state.permission_mode == .bypass) {
+        try writeStyledValue(writer, allocator, "perm", "bypass", tui_theme.warningText());
+    } else {
+        try writeSegment(writer, allocator, "perm", @tagName(state.permission_mode));
     }
+    try writeSep(writer, allocator);
+    try writeSegment(writer, allocator, "think", @tagName(state.thinking_level));
+    try writeSep(writer, allocator);
+    try writeSegment(writer, allocator, "view", @tagName(state.transcript_mode));
+    try writeSep(writer, allocator);
+    try writeOwnedSegment(writer, allocator, "turns", try std.fmt.allocPrint(allocator, "{d}", .{state.status.turn_count}));
 
     const items = out.written();
     if (tui_text.visibleWidth(items) > options.width) {
@@ -82,6 +84,26 @@ fn writeContext(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *co
     }
 }
 
+/// Dim vertical bar between segments — quieter and more structured than a
+/// bullet, so the colored values do the talking.
+fn writeSep(writer: *std.Io.Writer, allocator: std.mem.Allocator) !void {
+    const sep = try tui_theme.dim().render(allocator, " " ++ tui_theme.glyph.sep ++ " ");
+    defer allocator.free(sep);
+    try writer.writeAll(sep);
+}
+
+/// Live activity indicator: an animated braille spinner + "streaming" while a
+/// turn is in flight, a quiet dot + "idle" otherwise.
+fn writeState(writer: *std.Io.Writer, allocator: std.mem.Allocator, state: *const tui_state.AppState) !void {
+    if (state.status.streaming) {
+        const value = try std.fmt.allocPrint(allocator, "{s} streaming", .{tui_theme.spinnerFrame(state.anim_tick)});
+        defer allocator.free(value);
+        try writeValue(writer, allocator, value, tui_theme.runningText());
+    } else {
+        try writeValue(writer, allocator, tui_theme.glyph.system ++ " idle", tui_theme.muted());
+    }
+}
+
 fn estimatedCost(allocator: std.mem.Allocator, state: *const tui_state.AppState) ![]u8 {
     const tokens: f64 = @floatFromInt(if (state.telemetry.estimated_tokens > 0) state.telemetry.estimated_tokens else state.status.context_used);
     const dollars = (tokens / 1_000_000.0) * 3.0;
@@ -103,6 +125,19 @@ fn writeStyledValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: [
 fn writeOwnedSegment(writer: *std.Io.Writer, allocator: std.mem.Allocator, key: []const u8, value: []u8) !void {
     defer allocator.free(value);
     try writeSegment(writer, allocator, key, value);
+}
+
+/// Write a bare styled value with no `key:` prefix — used for segments that are
+/// self-evident from their content (model name, cost, activity state).
+fn writeValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, value: []const u8, value_style: zz.Style) !void {
+    const styled_value = try value_style.render(allocator, value);
+    defer allocator.free(styled_value);
+    try writer.writeAll(styled_value);
+}
+
+fn writeOwnedValue(writer: *std.Io.Writer, allocator: std.mem.Allocator, value: []u8, value_style: zz.Style) !void {
+    defer allocator.free(value);
+    try writeValue(writer, allocator, value, value_style);
 }
 
 test "status bar renders model and clips width" {
@@ -142,6 +177,38 @@ test "status bar renders context gauge cost and permission" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "ctx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "cost") != null);
+    // `cost`/`model`/`state` keys were intentionally dropped; the bare cost
+    // value still renders (e.g. "$0.0300").
+    try std.testing.expect(std.mem.indexOf(u8, text, "$") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "think") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "low") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "view") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "balanced") != null);
+}
+
+test "status bar renders bypass permission mode" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.permission_mode = .bypass;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "bypass") != null);
+}
+
+test "status bar does not render last error" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.status.setError(std.testing.allocator, "agent error");
+    state.status.turn_count = 7;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "turns") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "agent error") == null);
 }

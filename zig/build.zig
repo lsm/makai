@@ -106,6 +106,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compat", .module = compat_mod },
         },
     });
+    if (target.result.os.tag == .macos) {
+        oauth_storage_mod.linkFramework("Security", .{});
+        oauth_storage_mod.linkFramework("CoreFoundation", .{});
+    }
 
     const refresh_lock_mod = b.createModule(.{
         .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
@@ -152,6 +156,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
+    const oauth_openai_codex_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/oauth/openai_codex.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
             .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
             .{ .name = "compat", .module = compat_mod },
         },
@@ -300,6 +314,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
         },
     });
 
@@ -698,6 +714,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "compat", .module = compat_mod },
@@ -927,6 +944,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "agent", .module = agent_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
@@ -946,8 +964,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_theme_mod = b.createModule(.{ .root_source_file = b.path("src/tui/theme.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod } } });
-    const tui_text_mod = b.createModule(.{ .root_source_file = b.path("src/tui/text.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod } } });
-    const tui_render_mod = b.createModule(.{ .root_source_file = b.path("src/tui/render.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod } } });
+    const tui_text_mod = b.createModule(.{ .root_source_file = b.path("src/tui/text.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
+    const tui_render_mod = b.createModule(.{ .root_source_file = b.path("src/tui/render.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
 
     const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
@@ -957,6 +975,32 @@ pub fn build(b: *std.Build) void {
     const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
     const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_menu_picker_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/menu_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+
+    const tui_login_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/login.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+        },
+    });
+
+    const tui_model_catalog_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/model_catalog.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+        },
+    });
 
     const tui_app_mod = b.createModule(.{
         .root_source_file = b.path("src/tui/app.zig"),
@@ -973,6 +1017,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_commands", .module = tui_commands_mod },
+            .{ .name = "tui_login", .module = tui_login_mod },
+            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "tui_render", .module = tui_render_mod },
             .{ .name = "tui_session_store", .module = tui_session_store_mod },
             .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },
@@ -983,6 +1031,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_approval", .module = tui_view_approval_mod },
             .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
             .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
+            .{ .name = "tui_view_menu_picker", .module = tui_view_menu_picker_mod },
             .{ .name = "permission", .module = permission_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
         },
@@ -1034,6 +1083,27 @@ pub fn build(b: *std.Build) void {
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
             .{ .name = "tui_tests_mock_transport", .module = tui_tests_mock_transport_mod },
+            .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
+        },
+    });
+
+    const tui_tests_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("src/tui/tests/e2e_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "zigzag", .module = zigzag_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_app", .module = tui_app_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
             .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
         },
     });
@@ -1107,6 +1177,7 @@ pub fn build(b: *std.Build) void {
 
     const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
     const oauth_utils_pkce_test = b.addTest(.{ .root_module = oauth_utils_pkce_mod });
+    const oauth_openai_codex_test = b.addTest(.{ .root_module = oauth_openai_codex_mod });
 
     const refresh_lock_test = b.addTest(.{ .root_module = refresh_lock_mod });
 
@@ -1376,6 +1447,8 @@ pub fn build(b: *std.Build) void {
     const tui_session_store_test = b.addTest(.{ .root_module = tui_session_store_mod });
     const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
     const tui_commands_test = b.addTest(.{ .root_module = tui_commands_mod });
+    const tui_login_test = b.addTest(.{ .root_module = tui_login_mod });
+    const tui_model_catalog_test = b.addTest(.{ .root_module = tui_model_catalog_mod });
     const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
     const tui_theme_test = b.addTest(.{ .root_module = tui_theme_mod });
     const tui_text_test = b.addTest(.{ .root_module = tui_text_mod });
@@ -1388,7 +1461,9 @@ pub fn build(b: *std.Build) void {
     const tui_view_approval_test = b.addTest(.{ .root_module = tui_view_approval_mod });
     const tui_view_preview_test = b.addTest(.{ .root_module = tui_view_preview_mod });
     const tui_view_session_picker_test = b.addTest(.{ .root_module = tui_view_session_picker_mod });
+    const tui_view_menu_picker_test = b.addTest(.{ .root_module = tui_view_menu_picker_mod });
     const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
+    const tui_tests_e2e_test = b.addTest(.{ .root_module = tui_tests_e2e_mod });
     const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
     const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
     const tools_process_runner_test = b.addTest(.{ .root_module = tools_process_runner_mod });
@@ -1492,6 +1567,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
             .{ .name = "tui_app", .module = tui_app_mod },
+            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
@@ -1563,6 +1639,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
     test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_step.dependOn(&b.addRunArtifact(permission_test).step);
@@ -1586,6 +1663,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_login_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_text_test).step);
@@ -1598,7 +1677,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_e2e_test).step);
     test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
     test_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
@@ -1681,6 +1762,7 @@ pub fn build(b: *std.Build) void {
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);
@@ -1753,6 +1835,8 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_login_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_text_test).step);
@@ -1765,7 +1849,9 @@ pub fn build(b: *std.Build) void {
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_e2e_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_common_test).step);
     test_unit_tui_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);

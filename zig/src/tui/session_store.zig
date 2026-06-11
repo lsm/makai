@@ -220,7 +220,10 @@ pub const Store = struct {
             if (line.len == 0) continue;
             var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, line, .{}) catch continue;
             defer parsed.deinit();
-            const obj = switch (parsed.value) { .object => |o| o, else => continue };
+            const obj = switch (parsed.value) {
+                .object => |o| o,
+                else => continue,
+            };
             if (obj.get("metadata")) |value| switch (value) {
                 .object => |meta_obj| {
                     try updateMetadata(self.allocator, &meta, meta_obj);
@@ -462,10 +465,29 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
     switch (event) {
         .agent_start => try w.writeStringField("type", "agent_start"),
         .turn_start => try w.writeStringField("type", "turn_start"),
-        .message_start => |p| { try w.writeStringField("type", "message_start"); try w.writeStringField("role", @tagName(p.role)); },
-        .text_delta => |p| { try w.writeStringField("type", "text_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
-        .thinking_delta => |p| { try w.writeStringField("type", "thinking_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
-        .tool_call_delta => |p| { try w.writeStringField("type", "tool_call_delta"); try w.writeIntField("content_index", p.content_index); try w.writeStringField("delta", p.delta.slice()); },
+        .message_start => |p| {
+            try w.writeStringField("type", "message_start");
+            try w.writeStringField("role", @tagName(p.role));
+        },
+        .text_delta => |p| {
+            try w.writeStringField("type", "text_delta");
+            try w.writeIntField("content_index", p.content_index);
+            try w.writeStringField("delta", p.delta.slice());
+        },
+        .thinking_delta => |p| {
+            try w.writeStringField("type", "thinking_delta");
+            try w.writeIntField("content_index", p.content_index);
+            try w.writeStringField("delta", p.delta.slice());
+        },
+        .tool_call_delta => |p| {
+            try w.writeStringField("type", "tool_call_delta");
+            try w.writeIntField("content_index", p.content_index);
+            try w.writeStringField("delta", p.delta.slice());
+        },
+        .provider_event => |p| {
+            try w.writeStringField("type", "provider_event");
+            try w.writeStringField("event_json", p.event_json.slice());
+        },
         .message_end => |p| {
             try w.writeStringField("type", "message_end");
             try w.writeStringField("role", @tagName(p.role));
@@ -480,9 +502,19 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
             try w.writeStringField("stop_reason", @tagName(p.stop_reason));
             try w.writeBoolField("is_error", p.is_error);
         },
-        .tool_approval_requested => |p| { try w.writeStringField("type", "tool_approval_requested"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
-        .tool_execution_start => |p| { try w.writeStringField("type", "tool_execution_start"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); },
-        .tool_execution_update => |p| { try w.writeStringField("type", "tool_execution_update"); try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice()); try w.writeStringField("partial_result_json", p.partial_result_json.slice()); },
+        .tool_approval_requested => |p| {
+            try w.writeStringField("type", "tool_approval_requested");
+            try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice());
+        },
+        .tool_execution_start => |p| {
+            try w.writeStringField("type", "tool_execution_start");
+            try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice());
+        },
+        .tool_execution_update => |p| {
+            try w.writeStringField("type", "tool_execution_update");
+            try writeToolFields(w, p.tool_call_id.slice(), p.tool_name.slice(), p.args_json.slice());
+            try w.writeStringField("partial_result_json", p.partial_result_json.slice());
+        },
         .tool_execution_end => |p| {
             try w.writeStringField("type", "tool_execution_end");
             try w.writeStringField("tool_call_id", p.tool_call_id.slice());
@@ -513,9 +545,18 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
             try w.writeIntField("estimated_tokens", p.estimated_tokens);
             try w.writeIntField("item_count", p.item_count);
         },
-        .turn_end => |p| { try w.writeStringField("type", "turn_end"); try w.writeStringField("stop_reason", @tagName(p.stop_reason)); },
-        .agent_end => |p| { try w.writeStringField("type", "agent_end"); try w.writeStringField("reason", @tagName(p.reason)); },
-        .@"error" => |p| { try w.writeStringField("type", "error"); try w.writeStringField("message", p.message.slice()); },
+        .turn_end => |p| {
+            try w.writeStringField("type", "turn_end");
+            try w.writeStringField("stop_reason", @tagName(p.stop_reason));
+        },
+        .agent_end => |p| {
+            try w.writeStringField("type", "agent_end");
+            try w.writeStringField("reason", @tagName(p.reason));
+        },
+        .@"error" => |p| {
+            try w.writeStringField("type", "error");
+            try w.writeStringField("message", p.message.slice());
+        },
     }
     try w.endObject();
 }
@@ -527,7 +568,10 @@ fn writeToolFields(w: *json_writer.JsonWriter, id: []const u8, name: []const u8,
 }
 
 fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.TuiEvent {
-    const obj = switch (value) { .object => |o| o, else => return error.InvalidEvent };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidEvent,
+    };
     const kind = stringField(obj, "type") orelse return error.InvalidEvent;
     if (std.mem.eql(u8, kind, "agent_start")) return .agent_start;
     if (std.mem.eql(u8, kind, "turn_start")) return .turn_start;
@@ -535,6 +579,7 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
     if (std.mem.eql(u8, kind, "text_delta")) return .{ .text_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "thinking_delta")) return .{ .thinking_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "tool_call_delta")) return .{ .tool_call_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
+    if (std.mem.eql(u8, kind, "provider_event")) return .{ .provider_event = .{ .event_json = try owned(allocator, stringField(obj, "event_json") orelse "") } };
     if (std.mem.eql(u8, kind, "message_end")) return .{ .message_end = .{
         .role = parseRole(stringField(obj, "role") orelse "assistant"),
         .text = try owned(allocator, stringField(obj, "text") orelse ""),
@@ -595,7 +640,10 @@ fn userMessage(allocator: std.mem.Allocator, text: []const u8) !ai_types.Message
 fn parseUserContent(allocator: std.mem.Allocator, json: []const u8) !ai_types.UserContent {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
-    const arr = switch (parsed.value) { .array => |a| a, else => return error.InvalidMessage };
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidMessage,
+    };
     const parts = try allocator.alloc(ai_types.UserContentPart, arr.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -618,7 +666,10 @@ fn parseUserParts(allocator: std.mem.Allocator, json: []const u8) ![]const ai_ty
 }
 
 fn parseUserContentPart(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.UserContentPart {
-    const obj = switch (value) { .object => |o| o, else => return error.InvalidMessage };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidMessage,
+    };
     const kind = stringField(obj, "type") orelse return error.InvalidMessage;
     if (std.mem.eql(u8, kind, "text")) return .{ .text = .{
         .text = try allocator.dupe(u8, stringField(obj, "text") orelse ""),
@@ -634,7 +685,10 @@ fn parseUserContentPart(allocator: std.mem.Allocator, value: std.json.Value) !ai
 fn parseAssistantMessageFromContentJson(allocator: std.mem.Allocator, meta: SessionMetadata, json: []const u8, fallback_stop_reason: ai_types.StopReason) !ai_types.AssistantMessage {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
-    const arr = switch (parsed.value) { .array => |a| a, else => return error.InvalidMessage };
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidMessage,
+    };
     const content = try allocator.alloc(ai_types.AssistantContent, arr.items.len);
     var initialized: usize = 0;
     var has_tool_call = false;
@@ -652,7 +706,10 @@ fn parseAssistantMessageFromContentJson(allocator: std.mem.Allocator, meta: Sess
 }
 
 fn parseAssistantContent(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.AssistantContent {
-    const obj = switch (value) { .object => |o| o, else => return error.InvalidMessage };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidMessage,
+    };
     const kind = stringField(obj, "type") orelse return error.InvalidMessage;
     if (std.mem.eql(u8, kind, "text")) return .{ .text = .{
         .text = try allocator.dupe(u8, stringField(obj, "text") orelse ""),
@@ -691,7 +748,10 @@ fn parseArtifacts(allocator: std.mem.Allocator, json: []const u8) ![]ai_types.Ar
     if (json.len == 0) return allocator.alloc(ai_types.ArtifactReference, 0);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
     defer parsed.deinit();
-    const arr = switch (parsed.value) { .array => |a| a, else => return error.InvalidMessage };
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return error.InvalidMessage,
+    };
     const artifacts = try allocator.alloc(ai_types.ArtifactReference, arr.items.len);
     var initialized: usize = 0;
     errdefer {
@@ -699,7 +759,10 @@ fn parseArtifacts(allocator: std.mem.Allocator, json: []const u8) ![]ai_types.Ar
         allocator.free(artifacts);
     }
     for (arr.items, 0..) |item, i| {
-        const obj = switch (item) { .object => |o| o, else => return error.InvalidMessage };
+        const obj = switch (item) {
+            .object => |o| o,
+            else => return error.InvalidMessage,
+        };
         artifacts[i] = .{
             .artifact_id = try allocator.dupe(u8, stringField(obj, "artifact_id") orelse ""),
             .uri = OwnedSlice(u8).initOwned(try allocator.dupe(u8, stringField(obj, "uri") orelse "")),
@@ -807,15 +870,38 @@ fn toolResultFromFields(allocator: std.mem.Allocator, tool_call_id: []const u8, 
 fn writeMessage(w: *json_writer.JsonWriter, message: ai_types.Message) !void {
     try w.beginObject();
     switch (message) {
-        .user => |m| { try w.writeStringField("role", "user"); try w.writeStringField("text", switch (m.content) { .text => |t| t, .parts => "" }); try w.writeIntField("timestamp", m.timestamp); },
-        .assistant => |m| { try w.writeStringField("role", "assistant"); try w.writeStringField("text", assistantText(m.content)); try w.writeStringField("stop_reason", @tagName(m.stop_reason)); try w.writeIntField("timestamp", m.timestamp); },
-        .tool_result => |m| { try w.writeStringField("role", "tool_result"); try w.writeStringField("tool_call_id", m.tool_call_id); try w.writeStringField("tool_name", m.tool_name); try w.writeStringField("text", userPartsText(m.content)); try w.writeStringField("details_json", m.details_json.slice()); try w.writeBoolField("is_error", m.is_error); try w.writeIntField("timestamp", m.timestamp); },
+        .user => |m| {
+            try w.writeStringField("role", "user");
+            try w.writeStringField("text", switch (m.content) {
+                .text => |t| t,
+                .parts => "",
+            });
+            try w.writeIntField("timestamp", m.timestamp);
+        },
+        .assistant => |m| {
+            try w.writeStringField("role", "assistant");
+            try w.writeStringField("text", assistantText(m.content));
+            try w.writeStringField("stop_reason", @tagName(m.stop_reason));
+            try w.writeIntField("timestamp", m.timestamp);
+        },
+        .tool_result => |m| {
+            try w.writeStringField("role", "tool_result");
+            try w.writeStringField("tool_call_id", m.tool_call_id);
+            try w.writeStringField("tool_name", m.tool_name);
+            try w.writeStringField("text", userPartsText(m.content));
+            try w.writeStringField("details_json", m.details_json.slice());
+            try w.writeBoolField("is_error", m.is_error);
+            try w.writeIntField("timestamp", m.timestamp);
+        },
     }
     try w.endObject();
 }
 
 fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.Message {
-    const obj = switch (value) { .object => |o| o, else => return error.InvalidMessage };
+    const obj = switch (value) {
+        .object => |o| o,
+        else => return error.InvalidMessage,
+    };
     const role = stringField(obj, "role") orelse return error.InvalidMessage;
     if (std.mem.eql(u8, role, "user")) return .{ .user = .{ .content = .{ .text = try allocator.dupe(u8, stringField(obj, "text") orelse "") }, .timestamp = intField(obj, "timestamp") orelse 0 } };
     if (std.mem.eql(u8, role, "assistant")) return .{ .assistant = try assistantTextMessage(allocator, stringField(obj, "text") orelse "", parseStopReason(stringField(obj, "stop_reason") orelse "stop")) };
@@ -836,43 +922,67 @@ fn parseMessage(allocator: std.mem.Allocator, value: std.json.Value) !ai_types.M
 }
 
 fn assistantText(content: []const ai_types.AssistantContent) []const u8 {
-    for (content) |block| switch (block) { .text => |t| return t.text, else => {} };
+    for (content) |block| switch (block) {
+        .text => |t| return t.text,
+        else => {},
+    };
     return "";
 }
 
 fn userPartsText(parts: []const ai_types.UserContentPart) []const u8 {
-    for (parts) |part| switch (part) { .text => |t| return t.text, else => {} };
+    for (parts) |part| switch (part) {
+        .text => |t| return t.text,
+        else => {},
+    };
     return "";
 }
 
 fn stringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .string => |s| s, else => null };
+    return switch (value) {
+        .string => |s| s,
+        else => null,
+    };
 }
 
 fn boolField(obj: std.json.ObjectMap, key: []const u8, default: bool) bool {
     const value = obj.get(key) orelse return default;
-    return switch (value) { .bool => |b| b, else => default };
+    return switch (value) {
+        .bool => |b| b,
+        else => default,
+    };
 }
 
 fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .integer => |i| @intCast(i), else => null };
+    return switch (value) {
+        .integer => |i| @intCast(i),
+        else => null,
+    };
 }
 
 fn uintField(obj: std.json.ObjectMap, key: []const u8) ?usize {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
+    return switch (value) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        else => null,
+    };
 }
 
 fn uint64Field(obj: std.json.ObjectMap, key: []const u8) ?u64 {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .integer => |i| if (i >= 0) @intCast(i) else null, else => null };
+    return switch (value) {
+        .integer => |i| if (i >= 0) @intCast(i) else null,
+        else => null,
+    };
 }
 
 fn uint32Field(obj: std.json.ObjectMap, key: []const u8) ?u32 {
     const value = obj.get(key) orelse return null;
-    return switch (value) { .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null, else => null };
+    return switch (value) {
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
 }
 
 fn parseRole(value: []const u8) tui_session.TuiEvent.MessageRole {
@@ -1049,7 +1159,6 @@ const user_parts_json = "[{\"type\":\"text\",\"text\":\"see this\"},{\"type\":\"
 const assistant_mixed_json = "[{\"type\":\"text\",\"text\":\"I will call tools\"},{\"type\":\"tool_call\",\"id\":\"call-1\",\"name\":\"demo\",\"arguments_json\":\"{\\\"x\\\":1}\"}]";
 const assistant_image_json = "[{\"type\":\"image\",\"data\":\"assistant-image\",\"mime_type\":\"image/png\"}]";
 
-
 test "message_end replay preserves user image parts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1073,7 +1182,6 @@ test "message_end replay preserves user image parts" {
     try std.testing.expect(user.content.parts[1] == .image);
     try std.testing.expectEqualStrings("base64data", user.content.parts[1].image.data);
 }
-
 
 test "message_end replay preserves mixed assistant text and tool calls" {
     var tmp = std.testing.tmpDir(.{});
@@ -1100,7 +1208,6 @@ test "message_end replay preserves mixed assistant text and tool calls" {
     try std.testing.expectEqual(ai_types.StopReason.length, assistant.stop_reason);
 }
 
-
 test "message_end replay preserves assistant image content" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1123,7 +1230,6 @@ test "message_end replay preserves assistant image content" {
     try std.testing.expect(assistant.content[0] == .image);
     try std.testing.expectEqualStrings("assistant-image", assistant.content[0].image.data);
 }
-
 
 test "load skips malformed json but propagates replay errors" {
     var tmp = std.testing.tmpDir(.{});

@@ -10,6 +10,11 @@ const sanitize = @import("sanitize");
 const retry_util = @import("retry");
 const pre_transform = @import("pre_transform");
 const StringBuilder = @import("string_builder").StringBuilder;
+const oauth_storage = @import("oauth/storage");
+const codex_oauth = @import("oauth/openai_codex");
+
+const openai_codex_responses_api = "openai-codex-responses";
+const default_codex_instructions = "You are a helpful coding assistant.";
 
 /// Check if an assistant message should be skipped (aborted or error)
 fn shouldSkipAssistant(msg: ai_types.Message) bool {
@@ -66,6 +71,10 @@ fn isOrphanedToolResult(msg: ai_types.Message, tool_call_ids: *const std.StringH
         else => {},
     }
     return false;
+}
+
+fn isOpenAICodexResponsesModel(model: ai_types.Model) bool {
+    return std.mem.eql(u8, model.api, openai_codex_responses_api);
 }
 
 /// Free a StringHashMap's keys
@@ -137,6 +146,19 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.beginObject();
     try w.writeStringField("model", model.id);
 
+    const is_codex_model = isOpenAICodexResponsesModel(model);
+    const explicit_system_prompt = context.getSystemPrompt();
+    if (is_codex_model) {
+        const instructions = explicit_system_prompt orelse default_codex_instructions;
+        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, instructions);
+        defer {
+            if (sanitized.ptr != instructions.ptr) {
+                allocator.free(@constCast(sanitized));
+            }
+        }
+        try w.writeStringField("instructions", sanitized);
+    }
+
     // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
@@ -147,7 +169,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "function");
                 try w.writeStringField("name", tool.name);
                 try w.writeStringField("description", tool.description);
-                try w.writeBoolField("strict", true);
+                try w.writeBoolField("strict", false);
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
                 try w.endObject();
@@ -157,16 +179,16 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     try w.writeBoolField("stream", true);
-    try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
+    if (!is_codex_model) {
+        try w.writeIntField("max_output_tokens", options.max_tokens orelse model.max_tokens);
+    }
 
     // Add reasoning parameters for reasoning models (o1, o3, etc.)
     if (model.reasoning) {
         try w.writeKey("reasoning");
         try w.beginObject();
-        if (options.getReasoningEffort()) |effort| {
+        if (normalizedOpenAIReasoningEffort(options)) |effort| {
             try w.writeStringField("effort", effort);
-        } else {
-            try w.writeStringField("effort", "medium"); // default
         }
         if (options.getReasoningSummary()) |summary| {
             try w.writeStringField("summary", summary);
@@ -182,7 +204,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    if (std.mem.find(u8, model.base_url, "openai.com") != null) {
+    if (std.mem.find(u8, model.base_url, "openai.com") != null or is_codex_model) {
         try w.writeBoolField("store", false);
     }
 
@@ -219,19 +241,21 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     var tool_call_ids = collectToolCallIds(allocator, tx_context.messages) catch std.StringHashMap(void).init(allocator);
     defer freeToolCallIds(allocator, &tool_call_ids);
 
-    if (context.getSystemPrompt()) |sp| {
-        try w.beginObject();
-        const system_role: []const u8 = if (model.reasoning) "developer" else "system";
-        try w.writeStringField("role", system_role);
-        // Sanitize system prompt to remove unpaired surrogates
-        const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
-        defer {
-            if (sanitized.ptr != sp.ptr) {
-                allocator.free(@constCast(sanitized));
+    if (!is_codex_model) {
+        if (explicit_system_prompt) |sp| {
+            try w.beginObject();
+            const system_role: []const u8 = if (model.reasoning) "developer" else "system";
+            try w.writeStringField("role", system_role);
+            // Sanitize system prompt to remove unpaired surrogates
+            const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
+            defer {
+                if (sanitized.ptr != sp.ptr) {
+                    allocator.free(@constCast(sanitized));
+                }
             }
+            try w.writeStringField("content", sanitized);
+            try w.endObject();
         }
-        try w.writeStringField("content", sanitized);
-        try w.endObject();
     }
 
     // GPT-5 "juice" workaround: when reasoning is disabled for GPT-5 models,
@@ -347,6 +371,14 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     return buf.toOwnedSlice(allocator);
 }
 
+fn normalizedOpenAIReasoningEffort(options: ai_types.StreamOptions) ?[]const u8 {
+    if (!options.reasoning_enabled) return null;
+    const effort = options.getReasoningEffort() orelse return "medium";
+    if (std.mem.eql(u8, effort, "off")) return null;
+    if (std.mem.eql(u8, effort, "minimal")) return "low";
+    return effort;
+}
+
 fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix: []const u8) ![]const u8 {
     var sb = StringBuilder{};
     sb.count(base_url);
@@ -363,6 +395,11 @@ fn buildUrlWithSuffix(allocator: std.mem.Allocator, base_url: []const u8, suffix
     sb.cap = 0;
     sb.len = 0;
     return out;
+}
+
+fn responsesPathForModel(model: ai_types.Model) []const u8 {
+    if (isOpenAICodexResponsesModel(model)) return "/responses";
+    return "/v1/responses";
 }
 
 fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
@@ -402,6 +439,16 @@ fn buildCompoundId(allocator: std.mem.Allocator, call_id: []const u8, item_id: [
     sb.cap = 0;
     sb.len = 0;
     return out;
+}
+
+fn pushOwnedEvent(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream, event: ai_types.AssistantMessageEvent) !void {
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, event);
+    errdefer {
+        var cleanup = owned;
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
+    }
+
+    try stream.push(owned);
 }
 
 /// Event parsed from a response SSE event
@@ -580,17 +627,129 @@ fn parseResponseEventFromValue(json_value: std.json.Value) ?ParsedEvent {
     return null;
 }
 
-/// Parse a response event from raw SSE data bytes
-/// Allocates temporary memory for JSON parsing which is freed before returning.
-/// Note: The returned ParsedEvent contains slices that are invalid after this function returns!
-/// For tests, use parseResponseEventFromValue with a long-lived JSON value instead.
+fn cloneOptionalString(allocator: std.mem.Allocator, value: ?[]const u8) !?[]const u8 {
+    if (value) |s| return try allocator.dupe(u8, s);
+    return null;
+}
+
+fn cloneOutputItem(allocator: std.mem.Allocator, item: ParsedEvent.OutputItem) !ParsedEvent.OutputItem {
+    const item_type = try allocator.dupe(u8, item.item_type);
+    errdefer allocator.free(item_type);
+
+    const id = try cloneOptionalString(allocator, item.id);
+    errdefer if (id) |s| allocator.free(s);
+
+    const call_id = try cloneOptionalString(allocator, item.call_id);
+    errdefer if (call_id) |s| allocator.free(s);
+
+    const name = try cloneOptionalString(allocator, item.name);
+    errdefer if (name) |s| allocator.free(s);
+
+    const arguments = try cloneOptionalString(allocator, item.arguments);
+    errdefer if (arguments) |s| allocator.free(s);
+
+    return .{
+        .item_type = item_type,
+        .id = id,
+        .call_id = call_id,
+        .name = name,
+        .arguments = arguments,
+    };
+}
+
+fn deinitOutputItem(allocator: std.mem.Allocator, item: ParsedEvent.OutputItem) void {
+    allocator.free(item.item_type);
+    if (item.id) |s| allocator.free(s);
+    if (item.call_id) |s| allocator.free(s);
+    if (item.name) |s| allocator.free(s);
+    if (item.arguments) |s| allocator.free(s);
+}
+
+fn cloneParsedEvent(allocator: std.mem.Allocator, event: ParsedEvent) !ParsedEvent {
+    return switch (event.event_type) {
+        .text_delta => |delta| .{
+            .event_type = .{ .text_delta = try allocator.dupe(u8, delta) },
+            .output_index = event.output_index,
+        },
+        .output_item_added => |item| .{
+            .event_type = .{ .output_item_added = try cloneOutputItem(allocator, item) },
+            .output_index = event.output_index,
+        },
+        .function_call_args_delta => |args| blk: {
+            const item_id = try allocator.dupe(u8, args.item_id);
+            errdefer allocator.free(item_id);
+            const delta = try allocator.dupe(u8, args.delta);
+            errdefer allocator.free(delta);
+            break :blk .{
+                .event_type = .{ .function_call_args_delta = .{ .item_id = item_id, .delta = delta } },
+                .output_index = event.output_index,
+            };
+        },
+        .function_call_args_done => |args| blk: {
+            const item_id = try allocator.dupe(u8, args.item_id);
+            errdefer allocator.free(item_id);
+            const arguments = try allocator.dupe(u8, args.arguments);
+            errdefer allocator.free(arguments);
+            break :blk .{
+                .event_type = .{ .function_call_args_done = .{ .item_id = item_id, .arguments = arguments } },
+                .output_index = event.output_index,
+            };
+        },
+        .reasoning_delta => |delta| .{
+            .event_type = .{ .reasoning_delta = try allocator.dupe(u8, delta) },
+            .output_index = event.output_index,
+        },
+        .reasoning_done => .{
+            .event_type = .reasoning_done,
+            .output_index = event.output_index,
+        },
+        .output_item_done => |item| .{
+            .event_type = .{ .output_item_done = try cloneOutputItem(allocator, item) },
+            .output_index = event.output_index,
+        },
+        .completed => |info| .{
+            .event_type = .{ .completed = .{
+                .status = try cloneOptionalString(allocator, info.status),
+                .usage = info.usage,
+            } },
+            .output_index = event.output_index,
+        },
+    };
+}
+
+fn deinitParsedEvent(allocator: std.mem.Allocator, event: *ParsedEvent) void {
+    switch (event.event_type) {
+        .text_delta => |delta| allocator.free(delta),
+        .output_item_added => |item| deinitOutputItem(allocator, item),
+        .function_call_args_delta => |args| {
+            allocator.free(args.item_id);
+            allocator.free(args.delta);
+        },
+        .function_call_args_done => |args| {
+            allocator.free(args.item_id);
+            allocator.free(args.arguments);
+        },
+        .reasoning_delta => |delta| allocator.free(delta),
+        .reasoning_done => {},
+        .output_item_done => |item| deinitOutputItem(allocator, item),
+        .completed => |info| {
+            if (info.status) |status| allocator.free(status);
+        },
+    }
+    event.* = undefined;
+}
+
+/// Parse a response event from raw SSE data bytes.
+/// Returned string slices are owned by the caller and must be freed with
+/// deinitParsedEvent.
 fn parseResponseEventToStruct(data: []const u8, allocator: std.mem.Allocator) ?ParsedEvent {
     if (std.mem.eql(u8, data, "[DONE]")) return null;
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return null;
     defer parsed.deinit();
 
-    return parseResponseEventFromValue(parsed.value);
+    const borrowed = parseResponseEventFromValue(parsed.value) orelse return null;
+    return cloneParsedEvent(allocator, borrowed) catch null;
 }
 
 /// Tracking state for in-progress tool calls
@@ -657,7 +816,7 @@ fn runThread(ctx: *ThreadCtx) void {
     var client = compat.http.HttpClient.init(allocator);
     defer client.deinit();
 
-    const url = buildUrlWithSuffix(allocator, model.base_url, "/v1/responses") catch {
+    const url = buildUrlWithSuffix(allocator, model.base_url, responsesPathForModel(model)) catch {
         ctx.deinit();
         stream.markThreadDone();
         stream.completeWithError("oom url");
@@ -699,6 +858,18 @@ fn runThread(ctx: *ThreadCtx) void {
         stream.completeWithError("oom headers");
         return;
     };
+    if (model.headers) |model_headers| {
+        for (model_headers) |header| {
+            headers.append(allocator, .{ .name = header.name, .value = header.value }) catch {
+                allocator.free(auth);
+                allocator.free(url);
+                ctx.deinit();
+                stream.markThreadDone();
+                stream.completeWithError("oom headers");
+                return;
+            };
+        }
+    }
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -943,7 +1114,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     // Emit start event
-    _ = stream.push(.{
+    _ = pushOwnedEvent(allocator, stream, .{
         .start = .{
             .partial = .{
                 .content = &.{},
@@ -999,7 +1170,8 @@ fn runThread(ctx: *ThreadCtx) void {
         };
 
         for (events) |ev| {
-            const parsed = parseResponseEventToStruct(ev.data, allocator) orelse continue;
+            var parsed = parseResponseEventToStruct(ev.data, allocator) orelse continue;
+            defer deinitParsedEvent(allocator, &parsed);
 
             switch (parsed.event_type) {
                 .text_delta => |delta| {
@@ -1009,7 +1181,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         text_started = true;
 
                         // Emit text_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .text_start = .{
                                 .content_index = text_content_index.?,
                                 .partial = .{
@@ -1029,7 +1201,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Emit text_delta event
                     if (text_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .text_delta = .{
                                 .content_index = idx,
                                 .delta = delta,
@@ -1117,7 +1289,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         };
 
                         // Emit toolcall_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .toolcall_start = .{
                                 .content_index = content_index,
                                 .id = compound_id,
@@ -1141,7 +1313,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         tool_call_tracker_instance.appendDelta(content_index, args.delta) catch {};
 
                         // Emit toolcall_delta event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .toolcall_delta = .{
                                 .content_index = content_index,
                                 .delta = args.delta,
@@ -1169,7 +1341,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         thinking_started = true;
 
                         // Emit thinking_start event
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_start = .{
                                 .content_index = thinking_content_index.?,
                                 .partial = .{
@@ -1189,7 +1361,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Emit thinking_delta event
                     if (thinking_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_delta = .{
                                 .content_index = idx,
                                 .delta = delta,
@@ -1209,7 +1381,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .reasoning_done => {
                     // Emit thinking_end event
                     if (thinking_content_index) |idx| {
-                        _ = stream.push(.{
+                        _ = pushOwnedEvent(allocator, stream, .{
                             .thinking_end = .{
                                 .content_index = idx,
                                 .content = thinking.items,
@@ -1232,8 +1404,15 @@ fn runThread(ctx: *ThreadCtx) void {
                         if (item_id_to_content_index.get(item_id)) |content_index| {
                             // Complete the tool call
                             if (tool_call_tracker_instance.completeCall(content_index, allocator)) |tc| {
+                                defer {
+                                    allocator.free(tc.id);
+                                    allocator.free(tc.name);
+                                    if (tc.arguments_json.len > 0) allocator.free(tc.arguments_json);
+                                    if (tc.thought_signature) |sig| allocator.free(sig);
+                                }
+
                                 // Emit toolcall_end event
-                                _ = stream.push(.{
+                                _ = pushOwnedEvent(allocator, stream, .{
                                     .toolcall_end = .{
                                         .content_index = content_index,
                                         .tool_call = tc,
@@ -1443,6 +1622,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
     s.wait_for_thread_on_deinit = true;
 
     const ctx = try allocator.create(ThreadCtx);
@@ -1505,17 +1685,156 @@ pub fn registerOpenAIResponsesApiProvider(registry: *api_registry.ApiRegistry) !
     }, null);
 }
 
+fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !oauth_storage.Credentials {
+    const refreshed = try codex_oauth.refreshToken(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+        .provider_data = credentials.provider_data,
+    }, allocator);
+    errdefer {
+        allocator.free(refreshed.refresh);
+        allocator.free(refreshed.access);
+    }
+    const provider_data = refreshed.provider_data;
+    errdefer if (provider_data) |data| allocator.free(data);
+
+    return .{
+        .refresh = refreshed.refresh,
+        .access = refreshed.access,
+        .expires = refreshed.expires,
+        .provider_data = provider_data,
+    };
+}
+
+fn getOpenAICodexApiKey(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) ![]const u8 {
+    return try codex_oauth.getApiKey(.{
+        .refresh = credentials.refresh,
+        .access = credentials.access,
+        .expires = credentials.expires,
+    }, allocator);
+}
+
 pub fn registerOpenAICodexResponsesApiProvider(registry: *api_registry.ApiRegistry) !void {
     try registry.registerApiProvider(.{
         .api = "openai-codex-responses",
         .stream = streamOpenAIResponses,
         .stream_simple = streamSimpleOpenAIResponses,
+        .auth_provider_id = "openai-codex",
+        .auth_refresh_fn = refreshOpenAICodexCredentials,
+        .auth_get_api_key_fn = getOpenAICodexApiKey,
     }, null);
 }
 
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "OpenAI Codex provider registers OAuth hooks" {
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registerOpenAICodexResponsesApiProvider(&registry);
+
+    const provider = registry.getApiProvider("openai-codex-responses") orelse return error.TestExpectedCodexProvider;
+    try std.testing.expectEqualStrings("openai-codex", provider.auth_provider_id.?);
+    try std.testing.expect(provider.auth_refresh_fn != null);
+    try std.testing.expect(provider.auth_get_api_key_fn != null);
+}
+
+test "OpenAI Codex responses use Codex backend path" {
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    try std.testing.expectEqualStrings("/responses", responsesPathForModel(model));
+}
+
+test "OpenAI Codex request body includes default instructions" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{ .messages = &.{} };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"You are a helpful coding assistant.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"store\":false") != null);
+    try std.testing.expect(std.mem.find(u8, body, "max_output_tokens") == null);
+}
+
+test "OpenAI Codex request body uses system prompt as instructions" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("Use the project style."),
+        .messages = &.{},
+    };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Use the project style.\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") == null);
+}
+
+test "OpenAI Responses request body sends local tools without strict schema mode" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-test",
+        .name = "GPT Test",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 16384,
+    };
+    const tools = [_]ai_types.Tool{.{
+        .name = "file_read",
+        .description = "Read a file",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"workspace_root\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":0}},\"required\":[\"workspace_root\",\"path\"],\"additionalProperties\":false}",
+    }};
+    const context: ai_types.Context = .{
+        .messages = &.{},
+        .tools = &tools,
+    };
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"file_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\":false") != null);
+}
 
 /// Helper to parse JSON and return ParsedEvent for tests
 fn parseEventForTest(data: []const u8, allocator: std.mem.Allocator) ?struct { parsed: std.json.Parsed(std.json.Value), event: ParsedEvent } {
@@ -1746,6 +2065,102 @@ test "parseResponseEventToStruct returns null for invalid JSON" {
     try std.testing.expect(result == null);
 }
 
+test "parseResponseEventToStruct owns function call output item strings" {
+    const allocator = std.testing.allocator;
+    const data = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"shell_execute\",\"arguments\":\"\"}}";
+
+    var event = parseResponseEventToStruct(data, allocator) orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    defer deinitParsedEvent(allocator, &event);
+
+    const clobber = try allocator.alloc(u8, 4096);
+    defer allocator.free(clobber);
+    @memset(clobber, 'x');
+
+    switch (event.event_type) {
+        .output_item_added => |item| {
+            try std.testing.expectEqualStrings("function_call", item.item_type);
+            try std.testing.expectEqualStrings("fc_123", item.id.?);
+            try std.testing.expectEqualStrings("call_abc", item.call_id.?);
+            try std.testing.expectEqualStrings("shell_execute", item.name.?);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "OpenAI Responses stream events own cloned function call strings" {
+    const allocator = std.testing.allocator;
+
+    var stream = event_stream.AssistantMessageEventStream.init(allocator);
+    stream.owns_events = true;
+    defer stream.deinit();
+
+    const added_data = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"call_id\":\"call_abc\",\"name\":\"shell_execute\",\"arguments\":\"\"}}";
+    var added = parseResponseEventToStruct(added_data, allocator) orelse return error.TestExpectedAdded;
+    const added_item = added.event_type.output_item_added;
+    const compound_id = try buildCompoundId(allocator, added_item.call_id.?, added_item.id.?);
+    defer allocator.free(compound_id);
+
+    try pushOwnedEvent(allocator, &stream, .{ .toolcall_start = .{
+        .content_index = 0,
+        .id = compound_id,
+        .name = added_item.name.?,
+        .partial = .{
+            .content = &.{},
+            .api = "openai-codex-responses",
+            .provider = "openai-codex",
+            .model = "gpt-test",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 1,
+            .is_owned = false,
+        },
+    } });
+    deinitParsedEvent(allocator, &added);
+
+    const start_event = stream.poll() orelse return error.TestExpectedStartEvent;
+    switch (start_event) {
+        .toolcall_start => |start| {
+            try std.testing.expectEqualStrings("call_abc|fc_123", start.id);
+            try std.testing.expectEqualStrings("shell_execute", start.name);
+        },
+        else => return error.TestExpectedStartEvent,
+    }
+    var mutable_start = start_event;
+    ai_types.deinitAssistantMessageEvent(allocator, &mutable_start);
+
+    const delta_data = "{\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_123\",\"delta\":\"{\\\"command\\\":\\\"ls -al\\\"}\"}";
+    var delta = parseResponseEventToStruct(delta_data, allocator) orelse return error.TestExpectedDelta;
+    const args = delta.event_type.function_call_args_delta;
+    try pushOwnedEvent(allocator, &stream, .{ .toolcall_delta = .{
+        .content_index = 0,
+        .delta = args.delta,
+        .partial = .{
+            .content = &.{},
+            .api = "openai-codex-responses",
+            .provider = "openai-codex",
+            .model = "gpt-test",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 2,
+            .is_owned = false,
+        },
+    } });
+    deinitParsedEvent(allocator, &delta);
+
+    const delta_event = stream.poll() orelse return error.TestExpectedDeltaEvent;
+    switch (delta_event) {
+        .toolcall_delta => |tool_delta| {
+            try std.testing.expectEqualStrings("{\"command\":\"ls -al\"}", tool_delta.delta);
+        },
+        else => return error.TestExpectedDeltaEvent,
+    }
+    var mutable_delta = delta_event;
+    ai_types.deinitAssistantMessageEvent(allocator, &mutable_delta);
+}
+
 test "parseResponseEventFromValue returns null for unknown event type" {
     const allocator = std.testing.allocator;
     const data = "{\"type\":\"unknown.event\",\"output_index\":0}";
@@ -1839,6 +2254,67 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
 
     try std.testing.expect(std.mem.find(u8, body, "# Juice: 0 !important") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"medium\"") == null);
+}
+
+test "buildRequestBody normalizes minimal reasoning effort for OpenAI" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5.4-mini",
+        .name = "GPT-5.4-Mini",
+        .api = "openai-codex-responses",
+        .provider = "openai-codex",
+        .base_url = "https://chatgpt.com/backend-api/codex",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 272000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed("minimal"),
+        .reasoning_enabled = true,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"low\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"minimal\"") == null);
+}
+
+test "buildRequestBody omits unsupported none reasoning effort" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed("off"),
+        .reasoning_enabled = true,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\"") == null);
 }
 
 test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {

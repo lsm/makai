@@ -167,6 +167,11 @@ pub fn forwardStream(
     allocator: std.mem.Allocator,
 ) !void {
     while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer if (stream.owns_events) {
+            ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
+        };
+
         const json_bytes = try serializeEvent(ev, allocator);
         defer allocator.free(json_bytes);
         try sender.write(json_bytes);
