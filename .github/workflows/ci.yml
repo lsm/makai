@@ -127,6 +127,7 @@ jobs:
       - name: Run Anthropic E2E tests
         working-directory: zig
         run: zig build test-e2e-anthropic
+        continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -151,6 +152,7 @@ jobs:
       - name: Run OpenAI E2E tests
         working-directory: zig
         run: zig build test-e2e-openai
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini

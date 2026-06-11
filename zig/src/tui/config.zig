@@ -23,8 +23,6 @@ pub const ToolPermission = struct {
 
 pub const ModeSettings = struct {
     compact_output: bool = true,
-    vim_mode: bool = false,
-    caveman_mode: bool = false,
 };
 
 const borrowed_empty_theme: []u8 = &.{};
@@ -171,8 +169,6 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
     if (obj.get("mode")) |value| switch (value) {
         .object => |mode_obj| {
             cfg.mode.compact_output = boolField(mode_obj, "compact_output", cfg.mode.compact_output);
-            cfg.mode.vim_mode = boolField(mode_obj, "vim_mode", cfg.mode.vim_mode);
-            cfg.mode.caveman_mode = boolField(mode_obj, "caveman_mode", cfg.mode.caveman_mode);
         },
         else => {},
     };
@@ -211,8 +207,6 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.writeKey("mode");
     try w.beginObject();
     try w.writeBoolField("compact_output", cfg.mode.compact_output);
-    try w.writeBoolField("vim_mode", cfg.mode.vim_mode);
-    try w.writeBoolField("caveman_mode", cfg.mode.caveman_mode);
     try w.endObject();
     try w.writeKey("ui");
     try w.beginObject();
