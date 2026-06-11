@@ -50,7 +50,18 @@ pub const ApprovalWaiter = struct {
 };
 
 fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    var catalog_models = tui_model_catalog.loadProductionModels(allocator) catch try allocator.alloc(ai_types.Model, 0);
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.loadProductionModels);
+}
+
+fn loadRuntimeModelsFresh(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.refreshProductionModels);
+}
+
+fn loadRuntimeModelsWithCatalog(
+    allocator: std.mem.Allocator,
+    comptime loadCatalog: fn (std.mem.Allocator) anyerror![]ai_types.Model,
+) ![]ai_types.Model {
+    var catalog_models = loadCatalog(allocator) catch try allocator.alloc(ai_types.Model, 0);
     errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
 
     const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
@@ -580,7 +591,7 @@ pub const App = struct {
     fn refreshModelsAfterLogin(self: *App) !void {
         const runtime = self.runtime orelse return;
         const current_id = if (runtime.currentModel()) |model| model.id else null;
-        const models = try loadRuntimeModels(self.allocator);
+        const models = try loadRuntimeModelsFresh(self.allocator);
         defer tui_model_catalog.deinitModels(self.allocator, models);
         try runtime.replaceModels(models, current_id);
     }

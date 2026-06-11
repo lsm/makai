@@ -20,6 +20,11 @@ const CodexParseOptions = struct {
     client_version: ?[]const u8 = null,
 };
 
+const CatalogLoadMode = enum {
+    allow_cache,
+    force_fetch,
+};
+
 fn secureFree(allocator: std.mem.Allocator, data: []const u8) void {
     if (data.len > 0) {
         const writable: []u8 = @constCast(data);
@@ -38,7 +43,11 @@ pub fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void
 }
 
 pub fn loadProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadOpenAICodexModels(allocator);
+    return loadOpenAICodexModels(allocator, .allow_cache);
+}
+
+pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadOpenAICodexModels(allocator, .force_fetch);
 }
 
 fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !oauth_storage.Credentials {
@@ -81,7 +90,7 @@ fn codexOAuthProvider() oauth_storage.OAuthProvider {
     };
 }
 
-fn loadOpenAICodexModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+fn loadOpenAICodexModels(allocator: std.mem.Allocator, mode: CatalogLoadMode) ![]ai_types.Model {
     if (builtin.is_test) return emptyModels(allocator);
 
     var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
@@ -92,9 +101,11 @@ fn loadOpenAICodexModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     const account_id = try codexAccountIdFromStorage(allocator, &storage);
     defer if (account_id) |id| allocator.free(id);
 
-    if (try loadCachedCodexModels(allocator, account_id)) |models| {
-        if (models.len > 0) return models;
-        allocator.free(models);
+    if (mode == .allow_cache) {
+        if (try loadCachedCodexModels(allocator, account_id)) |models| {
+            if (models.len > 0) return models;
+            allocator.free(models);
+        }
     }
 
     const token = storage.getApiKey(openai_codex_provider_id, codexOAuthProvider()) catch null;
@@ -495,13 +506,18 @@ fn objectBool(obj: *const std.json.ObjectMap, key: []const u8) ?bool {
 
 fn objectU32(obj: *const std.json.ObjectMap, key: []const u8) ?u32 {
     const value = obj.get(key) orelse return null;
-    const int_value: i64 = switch (value) {
-        .integer => |v| v,
-        .float => |v| @intFromFloat(v),
+    return switch (value) {
+        .integer => |v| {
+            if (v < 0 or v > std.math.maxInt(u32)) return null;
+            return @intCast(v);
+        },
+        .float => |v| {
+            if (!std.math.isFinite(v)) return null;
+            if (v < 0 or v > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return null;
+            return @intFromFloat(v);
+        },
         else => return null,
     };
-    if (int_value < 0 or int_value > std.math.maxInt(u32)) return null;
-    return @intCast(int_value);
 }
 
 test "parseCodexModelsCache maps visible supported Codex models" {
@@ -567,4 +583,23 @@ test "parseCodexModelsCache accepts models response body" {
     try std.testing.expectEqual(@as(u32, 128000), models[0].context_window);
     try std.testing.expectEqual(@as(u32, default_max_output_tokens), models[0].max_tokens);
     try std.testing.expect(models[0].headers == null);
+}
+
+test "parseCodexModelsCache rejects oversized floating catalog sizes" {
+    const oversized_context =
+        \\{"models":[{"slug":"bad-context","visibility":"list","supported_in_api":true,"context_window":1e40}]}
+    ;
+
+    const no_models = try parseCodexModelsCache(std.testing.allocator, oversized_context);
+    defer deinitModels(std.testing.allocator, no_models);
+    try std.testing.expectEqual(@as(usize, 0), no_models.len);
+
+    const oversized_max_tokens =
+        \\{"models":[{"slug":"valid-context","visibility":"list","supported_in_api":true,"context_window":128000,"max_tokens":1e40}]}
+    ;
+
+    const models = try parseCodexModelsCache(std.testing.allocator, oversized_max_tokens);
+    defer deinitModels(std.testing.allocator, models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqual(@as(u32, default_max_output_tokens), models[0].max_tokens);
 }
