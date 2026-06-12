@@ -42,6 +42,16 @@ pub const ApprovalWaiter = struct {
         self.decision = .reject;
     }
 
+    /// Reject the currently pending approval wait without shutting the waiter
+    /// down, so future approval requests can still block normally.
+    pub fn rejectPending(self: *ApprovalWaiter) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.tool_call_id.len > 0) {
+            self.decision = .reject;
+        }
+    }
+
     pub fn deinit(self: *ApprovalWaiter) void {
         self.cancel();
         if (self.tool_call_id.len > 0) self.allocator.free(self.tool_call_id);
@@ -803,6 +813,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.state.stream_aborted = false;
         try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
@@ -872,6 +883,10 @@ pub const App = struct {
             return;
         };
         defer result.deinit(self.allocator);
+
+        if (command.kind == .abort) {
+            if (self.approval_waiter) |waiter| waiter.rejectPending();
+        }
 
         switch (result.action) {
             .quit => return error.QuitRequested,
@@ -1299,17 +1314,24 @@ pub const TuiModel = struct {
                     return .none;
                 }
                 if (app.state.mode == .approval) {
-                    switch (key.key) {
-                        .char => |c| switch (c) {
-                            'y' => app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {},
-                            'a' => app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {},
-                            'n' => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
+                    const composer_empty = app.state.composer.buffer.items.len == 0;
+                    if (composer_empty) {
+                        var decided = false;
+                        switch (key.key) {
+                            .char => |c| switch (c) {
+                                'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                else => {},
+                            },
+                            .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
                             else => {},
-                        },
-                        .escape => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
-                        else => {},
+                        }
+                        if (decided) return .none;
+                    } else if (key.key == .escape) {
+                        app.state.composer.clear();
+                        return .none;
                     }
-                    return .none;
                 }
                 // Session picker navigation (T10).
                 if (app.state.mode == .session_picker) {
@@ -1387,10 +1409,20 @@ pub const TuiModel = struct {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
-                        if (app.state.mode == .approval) return .none;
                         const text = app.state.composer.text();
+                        if (app.state.mode == .approval) {
+                            // Only /abort is allowed while a tool approval is pending.
+                            const command = tui_commands.parse(text) catch return .none;
+                            if (command.kind != .abort) return .none;
+                        }
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
-                        if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
+                        if (app.state.mode == .approval) {
+                            app.submit(text) catch |err| {
+                                if (err == error.QuitRequested) return .quit;
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        } else if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
@@ -1954,6 +1986,81 @@ test "App submit routes unknown command to error transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "unknown command") != null);
 }
 
+test "App submit abort when idle reports idle transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/abort");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Nothing to abort — agent is idle.", app.state.transcript.items[0].text.items);
+}
+
+test "App submit abort when streaming cancels and reports transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.state.status.streaming = true;
+
+    try app.submit("/abort");
+
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expect(!app.state.status.streaming);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
+}
+
+test "App submit abort when streaming via runtime-only cancels and reports transcript" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+    app.runtime.?.stream_active = true;
+
+    try app.submit("/abort");
+
+    try std.testing.expect(app.runtime.?.cancelled.load(.acquire));
+    try std.testing.expect(!app.state.status.streaming);
+    try std.testing.expect(app.state.stream_aborted);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
+}
+
+test "App submit does not clear stream_aborted for slash commands" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.state.stream_aborted = true;
+
+    try app.submit("/help");
+
+    try std.testing.expect(app.state.stream_aborted);
+    try std.testing.expect(app.state.transcript.items.len > 0);
+}
+
+test "App submit abort does not permanently shut down approval waiter" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const waiter = try app.allocator.create(ApprovalWaiter);
+    waiter.* = .{ .allocator = app.allocator };
+    app.approval_waiter = waiter;
+    waiter.tool_call_id = try app.allocator.dupe(u8, "call-1");
+
+    try app.submit("/abort");
+
+    try std.testing.expect(!waiter.shutting_down);
+    try std.testing.expect(waiter.decision == .reject);
+
+    // Verify the waiter can still accept a future approval decision.
+    waiter.decision = null;
+    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "{}");
+    try app.decideApproval(true, false);
+    try std.testing.expect(waiter.decision == .approve);
+}
+
 test "App welcome uses session count" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -1995,6 +2102,7 @@ const MockAppSession = struct {
     steer_count: usize = 0,
     queued_follow_up_count: usize = 0,
     submit_count: usize = 0,
+    cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
     events: tui_runtime.TuiEventStream = undefined,
@@ -2034,7 +2142,8 @@ const MockAppSession = struct {
     }
 
     fn cancel(ctx: ?*anyopaque) void {
-        _ = ctx;
+        const self = ptr(ctx);
+        self.cancel_count += 1;
     }
 
     fn submitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
@@ -2263,6 +2372,49 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
+}
+
+test "TuiModel allows /abort slash command during approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    model.app.?.state.mode = .approval;
+
+    const keys = [_]u21{ '/', 'a', 'b', 'o', 'r', 't' };
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.normal, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expect(!model.app.?.state.status.streaming);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, model.app.?.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", model.app.?.state.transcript.items[0].text.items);
+}
+
+test "TuiModel blocks non-abort slash commands during approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    model.app.?.state.mode = .approval;
+
+    const keys = [_]u21{ '/', 'h', 'e', 'l', 'p' };
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
+    try std.testing.expectEqualStrings("/help", model.app.?.state.composer.text());
 }
 
 test "TuiModel moves composer cursor and edits in place" {
