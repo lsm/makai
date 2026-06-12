@@ -416,7 +416,9 @@ fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
 
 fn handleAbort(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    if (ctx.state.status.streaming) {
+    const active = ctx.state.status.streaming or
+        (ctx.runtime != null and ctx.runtime.?.stream_active);
+    if (active) {
         if (ctx.session) |session| {
             session.cancel();
         } else if (ctx.runtime) |runtime| {
@@ -425,6 +427,11 @@ fn handleAbort(ctx: CommandContext, command: Command) !CommandResult {
             return .{ .output = try ctx.allocator.dupe(u8, "Nothing to abort — agent is idle.") };
         }
         ctx.state.status.streaming = false;
+        ctx.state.stream_aborted = true;
+        if (ctx.state.mode == .approval) {
+            ctx.state.approval.deinit(ctx.allocator);
+            ctx.state.mode = .normal;
+        }
         return .{ .output = try ctx.allocator.dupe(u8, "Turn aborted.") };
     }
     return .{ .output = try ctx.allocator.dupe(u8, "Nothing to abort — agent is idle.") };
@@ -703,6 +710,44 @@ test "abort when streaming cancels session" {
 
     try std.testing.expectEqualStrings("Turn aborted.", result.output);
     try std.testing.expect(!state.status.streaming);
+    try std.testing.expect(state.stream_aborted);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+}
+
+test "abort cancels active turn before streaming status is set" {
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{ .backend = .local });
+    defer runtime.deinit();
+    runtime.stream_active = true;
+
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expect(!state.status.streaming);
+    try std.testing.expect(state.stream_aborted);
+    try std.testing.expect(runtime.cancelled.load(.acquire));
+}
+
+test "abort during approval clears approval state" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    state.mode = .approval;
+    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "{\"path\":\"README.md\"}");
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expectEqual(tui_state.AppMode.normal, state.mode);
+    try std.testing.expectEqual(tui_state.ApprovalStatus.none, state.approval.status);
     try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
 }
 

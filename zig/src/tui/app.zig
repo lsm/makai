@@ -803,6 +803,7 @@ pub const App = struct {
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
+        self.state.stream_aborted = false;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
@@ -1300,17 +1301,18 @@ pub const TuiModel = struct {
                     return .none;
                 }
                 if (app.state.mode == .approval) {
+                    var decided = false;
                     switch (key.key) {
                         .char => |c| switch (c) {
-                            'y' => app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {},
-                            'a' => app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {},
-                            'n' => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
+                            'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                            'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                            'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
                             else => {},
                         },
-                        .escape => app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {},
+                        .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
                         else => {},
                     }
-                    return .none;
+                    if (decided) return .none;
                 }
                 // Session picker navigation (T10).
                 if (app.state.mode == .session_picker) {
@@ -1388,10 +1390,17 @@ pub const TuiModel = struct {
                             app.state.status.setError(app.allocator, @errorName(err)) catch {};
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
-                        if (app.state.mode == .approval) return .none;
                         const text = app.state.composer.text();
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
-                        if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
+                        if (app.state.mode == .approval) {
+                            // Allow slash commands (e.g. /abort) while a tool approval is pending.
+                            if (!std.mem.startsWith(u8, text, "/")) return .none;
+                            app.submit(text) catch |err| {
+                                if (err == error.QuitRequested) return .quit;
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        } else if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
@@ -2292,6 +2301,27 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
+}
+
+test "TuiModel allows /abort slash command during approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    model.app.?.state.mode = .approval;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/abort");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.normal, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expect(!model.app.?.state.status.streaming);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, model.app.?.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", model.app.?.state.transcript.items[0].text.items);
 }
 
 test "TuiModel moves composer cursor and edits in place" {
