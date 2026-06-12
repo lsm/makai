@@ -673,7 +673,9 @@ pub const TuiRuntime = struct {
         switch (self.backend) {
             .remote => {
                 if (!self.started) return error.RuntimeNotStarted;
-                try self.remote_steering_queue.append(self.allocator, try makeRemoteUserMessage(self.allocator, text));
+                var msg = try makeRemoteUserMessage(self.allocator, text);
+                errdefer msg.deinit(self.allocator);
+                try self.remote_steering_queue.append(self.allocator, msg);
             },
             .local => {
                 if (!self.started) return error.RuntimeNotStarted;
@@ -689,7 +691,9 @@ pub const TuiRuntime = struct {
         switch (self.backend) {
             .remote => {
                 if (!self.started) return error.RuntimeNotStarted;
-                try self.remote_follow_up_queue.append(self.allocator, try makeRemoteUserMessage(self.allocator, text));
+                var msg = try makeRemoteUserMessage(self.allocator, text);
+                errdefer msg.deinit(self.allocator);
+                try self.remote_follow_up_queue.append(self.allocator, msg);
             },
             .local => {
                 if (!self.started) return error.RuntimeNotStarted;
