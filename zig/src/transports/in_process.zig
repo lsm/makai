@@ -63,6 +63,7 @@ pub const InProcessTransport = struct {
         errdefer allocator.destroy(stream);
 
         stream.* = event_stream.AssistantMessageStream.init(allocator);
+        stream.owns_events = true;
 
         self.* = .{
             .stream = stream,
@@ -223,12 +224,12 @@ pub const InProcessTransport = struct {
     }
 };
 
-
 /// Create a connected pair of in-process transports.
 /// Returns client (for sending) and server (for receiving).
 pub fn createPair(allocator: std.mem.Allocator) !struct { client: *InProcessTransport, server: *InProcessTransport } {
     const stream = try allocator.create(event_stream.AssistantMessageStream);
     stream.* = event_stream.AssistantMessageStream.init(allocator);
+    stream.owns_events = true;
 
     const client = try allocator.create(InProcessTransport);
     client.* = InProcessTransport.initWithStream(stream, allocator);
@@ -503,6 +504,8 @@ pub const ZeroCopyForwarder = struct {
     /// Forward an event directly (takes ownership of the event).
     /// The caller must not use the event after calling this.
     pub fn forward(self: *Self, ev: ai_types.AssistantMessageEvent) !void {
+        var cleanup = ev;
+        errdefer ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
         try self.dest.push(ev);
     }
 

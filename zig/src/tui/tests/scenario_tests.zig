@@ -221,7 +221,6 @@ test "provider error injection propagates through session" {
     try std.testing.expectEqual(@as(usize, 1), provider.call_count);
 }
 
-
 test "tool approval approve runs tool and reject skips executor" {
     const models = [_]@TypeOf(mock_provider.test_model){mock_provider.test_model};
 
@@ -238,6 +237,7 @@ test "tool approval approve runs tool and reject skips executor" {
         .tools = &approve_tools,
         .tool_approval_ctx = &approve_state,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer approve_runtime.deinit();
@@ -275,6 +275,7 @@ test "tool approval approve runs tool and reject skips executor" {
         .tools = &reject_tools,
         .tool_approval_ctx = &reject_state,
         .tool_approval_callback = approvalCallback,
+        .permission_mode = .ask,
         .run_async = false,
     });
     defer reject_runtime.deinit();

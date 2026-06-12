@@ -115,6 +115,13 @@ test "shell execute captures stdout" {
     try std.testing.expect(result.getDetailsJson().?.len > 0);
 }
 
+test "shell execute supports filesystem root workspace" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var result = try execute("call-root", "{\"workspace_root\":\"/\",\"command\":\"pwd && ls -al\",\"timeout_ms\":10000,\"compact_output\":true}", null, null, null, std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.startsWith(u8, result.content.slice()[0].text.text, "ok stdout="));
+}
+
 test "shell execute stores large output as artifact and supports compact output" {
     const cwd = try std.process.currentPathAlloc(common.defaultIo(), std.testing.allocator);
     defer std.testing.allocator.free(cwd);

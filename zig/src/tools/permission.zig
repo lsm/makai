@@ -96,6 +96,7 @@ pub const PermissionEngineOptions = struct {
     workspace_root: []const u8,
     persistence_path: ?[]const u8 = null,
     approval_callback: ?ApprovalCallback = null,
+    bypass_all: bool = false,
 };
 
 pub const PermissionEngine = struct {
@@ -103,6 +104,7 @@ pub const PermissionEngine = struct {
     workspace_root: []u8,
     persistence_path: []u8,
     approval_callback: ?ApprovalCallback = null,
+    bypass_all: bool = false,
     persisted: std.ArrayList(PersistedDecision) = .empty,
 
     const Self = @This();
@@ -123,6 +125,7 @@ pub const PermissionEngine = struct {
             .workspace_root = workspace_root,
             .persistence_path = persistence_path,
             .approval_callback = options.approval_callback,
+            .bypass_all = options.bypass_all,
         };
         errdefer engine.deinit();
         try engine.load();
@@ -146,7 +149,12 @@ pub const PermissionEngine = struct {
             .workspace_root = workspace_root,
             .persistence_path = persistence_path,
             .approval_callback = options.approval_callback,
+            .bypass_all = options.bypass_all,
         };
+    }
+
+    pub fn setBypassAll(self: *Self, enabled: bool) void {
+        self.bypass_all = enabled;
     }
 
     pub fn deinit(self: *Self) void {
@@ -158,23 +166,27 @@ pub const PermissionEngine = struct {
     }
 
     pub fn evaluate(self: *Self, tool_name: []const u8, args_json: []const u8) PermissionDecision {
+        if (self.bypass_all) return .allow;
         const call = parseToolCall(self.allocator, tool_name, args_json) catch return .prompt;
         defer deinitParsedToolCall(self.allocator, call);
         return self.evaluateCall(call);
     }
 
     pub fn evaluateCall(self: *Self, call: ToolCall) PermissionDecision {
+        if (self.bypass_all) return .allow;
         if (self.findPersisted(call)) |decision| return decision;
         return self.defaultDecision(call);
     }
 
     pub fn approve(self: *Self, tool_name: []const u8, args_json: []const u8) !ApprovalDecision {
+        if (self.bypass_all) return .approve;
         const call = parseToolCall(self.allocator, tool_name, args_json) catch return .reject;
         defer deinitParsedToolCall(self.allocator, call);
         return try self.approveCall(call);
     }
 
     pub fn approveCall(self: *Self, call: ToolCall) !ApprovalDecision {
+        if (self.bypass_all) return .approve;
         switch (self.evaluateCall(call)) {
             .allow => return .approve,
             .deny => return .reject,
@@ -639,6 +651,29 @@ test "approval callback fires and can approve" {
 
     try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"path\":\"/workspace/file.txt\"}"));
     try std.testing.expectEqual(@as(usize, 1), approval_recorder.calls);
+}
+
+test "bypass mode allows all permission checks without approval callback" {
+    const persistence_path = "zig-cache/test-permissions-bypass.json";
+    compat.fs.getCwd().deleteFile(std.testing.io, persistence_path) catch {};
+
+    approval_recorder = .{ .decision = .reject };
+    var engine = try PermissionEngine.init(std.testing.allocator, .{
+        .workspace_root = "/workspace",
+        .persistence_path = persistence_path,
+        .approval_callback = approvalCallback,
+        .bypass_all = true,
+    });
+    defer engine.deinit();
+
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("shell", "{\"command\":\"rm -rf /\"}"));
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:write", "{\"path\":\"/tmp/outside.txt\"}"));
+    try std.testing.expectEqual(PermissionDecision.allow, engine.evaluate("file:write", "{"));
+    try std.testing.expectEqual(ApprovalDecision.approve, try engine.approve("file:write", "{\"path\":\"/tmp/outside.txt\"}"));
+    try std.testing.expectEqual(@as(usize, 0), approval_recorder.calls);
+
+    engine.setBypassAll(false);
+    try std.testing.expectEqual(PermissionDecision.deny, engine.evaluate("shell", "{\"command\":\"rm -rf /\"}"));
 }
 
 test "approval callback fires and can reject" {

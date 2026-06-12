@@ -116,6 +116,10 @@ const ParsedAuth = struct {
 
 /// Parse code and state from manual input (format: "code#state" or just "code")
 fn parseAuthFromManualInput(allocator: std.mem.Allocator, input: []const u8) !ParsedAuth {
+    // An empty paste means the user dismissed the prompt: treat it as a
+    // cancellation rather than attempting a doomed exchange with a blank code.
+    if (std.mem.trim(u8, input, " \t\r\n").len == 0) return error.OAuthCancelled;
+
     // Try to find #code= in URL
     if (std.mem.find(u8, input, "#code=")) |idx| {
         const code_start = idx + 6;

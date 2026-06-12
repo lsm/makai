@@ -106,6 +106,67 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
     }
 }
 
+fn reasoningEffort(level: ai_types.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "none",
+        .minimal => "low",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "xhigh",
+    };
+}
+
+fn thinkingEffort(level: ai_types.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "",
+        .minimal => "low",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "max",
+    };
+}
+
+fn thinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets) ?u32 {
+    if (level == .off) return null;
+    if (budgets) |b| {
+        return switch (level) {
+            .off => null,
+            .minimal => b.minimal orelse 256,
+            .low => b.low orelse 512,
+            .medium => b.medium orelse 1024,
+            .high => b.high orelse 2048,
+            .xhigh => b.xhigh orelse 4096,
+        };
+    }
+    return switch (level) {
+        .off => null,
+        .minimal => 256,
+        .low => 512,
+        .medium => 1024,
+        .high => 2048,
+        .xhigh => 4096,
+    };
+}
+
+fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
+    const reason_effort = reasoningEffort(options.thinking_level);
+    const think_effort = thinkingEffort(options.thinking_level);
+    return .{
+        .api_key = if (api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
+        .session_id = if (session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
+        .cancel_token = options.cancel_token,
+        .temperature = options.temperature,
+        .max_tokens = options.max_tokens,
+        .thinking_enabled = options.thinking_level != .off,
+        .thinking_budget_tokens = thinkingBudget(options.thinking_level, options.thinking_budgets),
+        .thinking_effort = ai_types.OwnedSlice(u8).initBorrowed(think_effort),
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed(reason_effort),
+        .reasoning_enabled = options.thinking_level != .off,
+    };
+}
+
 fn runStreamThread(ctx: *StreamThreadContext) void {
     defer {
         const out_stream = ctx.out_stream;
@@ -129,13 +190,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         .allocator = ctx.allocator,
     };
 
-    const stream_options = ai_types.StreamOptions{
-        .api_key = if (ctx.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
-        .session_id = if (ctx.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
-        .cancel_token = ctx.options.cancel_token,
-        .temperature = ctx.options.temperature,
-        .max_tokens = ctx.options.max_tokens,
-    };
+    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.api_key, ctx.session_id);
 
     // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
     var request_model = ctx.model;
@@ -312,4 +367,157 @@ test "InProcessProviderProtocolBridge smoke test" {
     stream.result = null;
 
     try std.testing.expect(saw_start);
+}
+
+test "provider protocol bridge maps thinking level to stream options" {
+    const opts = streamOptionsFromProtocolOptions(.{
+        .api_key = "key",
+        .session_id = "sid",
+        .thinking_level = .xhigh,
+        .thinking_budgets = .{ .xhigh = 8192 },
+    }, "key", "sid");
+
+    try std.testing.expect(opts.thinking_enabled);
+    try std.testing.expect(opts.reasoning_enabled);
+    try std.testing.expectEqual(@as(?u32, 8192), opts.thinking_budget_tokens);
+    try std.testing.expectEqualStrings("max", opts.getThinkingEffort().?);
+    try std.testing.expectEqualStrings("xhigh", opts.getReasoningEffort().?);
+
+    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, null, null);
+    try std.testing.expect(!off.thinking_enabled);
+    try std.testing.expect(!off.reasoning_enabled);
+    try std.testing.expect(off.getThinkingEffort() == null);
+    try std.testing.expectEqualStrings("none", off.getReasoningEffort().?);
+
+    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, null, null);
+    try std.testing.expectEqualStrings("low", minimal.getReasoningEffort().?);
+}
+
+test "InProcessProviderProtocolBridge preserves streamed tool call terminal result" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    const Mock = struct {
+        fn partial(model: ai_types.Model) ai_types.AssistantMessage {
+            return .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            };
+        }
+
+        fn stream(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.StreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = context;
+            _ = options;
+
+            const s = try a.create(event_stream.AssistantMessageEventStream);
+            s.* = event_stream.AssistantMessageEventStream.init(a);
+            const p = partial(model);
+
+            s.push(.{ .start = .{ .partial = p } }) catch {};
+            s.push(.{ .toolcall_start = .{
+                .content_index = 0,
+                .id = "call_shell",
+                .name = "shell_execute",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_delta = .{
+                .content_index = 0,
+                .delta = "{\"command\":\"ls -al\"}",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_end = .{
+                .content_index = 0,
+                .tool_call = .{ .id = "call_shell", .name = "shell_execute", .arguments_json = "{\"command\":\"ls -al\"}" },
+                .partial = p,
+            } }) catch {};
+
+            // Match OpenAI Responses behavior: terminal result can omit streamed
+            // function-call content and report a generic stop reason.
+            s.complete(try ai_types.cloneAssistantMessage(a, .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            }));
+            s.markThreadDone();
+            return s;
+        }
+
+        fn streamSimple(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.SimpleStreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = options;
+            return stream(model, context, null, a);
+        }
+    };
+
+    try registry.registerApiProvider(.{
+        .api = "mock-tool-api",
+        .stream = Mock.stream,
+        .stream_simple = Mock.streamSimple,
+    }, null);
+
+    var bridge = InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+    const model = ai_types.Model{
+        .id = "mock-tool-model",
+        .name = "Mock Tool",
+        .api = "mock-tool-api",
+        .provider = "mock",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const user = ai_types.Message{ .user = .{
+        .content = .{ .text = "run ls -al" },
+        .timestamp = compat.time.nowMillis(),
+    } };
+    const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
+
+    const stream = try protocol.stream(model, ctx, .{ .api_key = "test-key" }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var saw_tool_end = false;
+    while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
+        if (ev == .toolcall_end) saw_tool_end = true;
+    }
+
+    const result = stream.getResult().?;
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expect(result.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("shell_execute", result.content[0].tool_call.name);
+
+    var owned_result = result;
+    owned_result.deinit(allocator);
+    stream.result = null;
+    try std.testing.expect(saw_tool_end);
 }

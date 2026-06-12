@@ -6,14 +6,18 @@ const tui_state = @import("tui_state");
 pub const CommandKind = enum {
     help,
     model,
+    login,
     provider,
     status,
     sessions,
     @"resume",
     tools,
     permissions,
+    think,
+    view,
     compact,
     clear,
+    copy,
     diff,
     quit,
 };
@@ -34,15 +38,25 @@ pub const CommandAction = enum {
     quit,
     clear_transcript,
     open_session_picker,
+    open_model_picker,
+    open_login_picker,
+    open_permission_picker,
+    open_view_picker,
+    open_thinking_picker,
+    start_login_provider,
+    copy_last,
+    copy_all,
 };
 
 pub const CommandResult = struct {
     action: CommandAction = .none,
     output: []u8 = &.{},
+    login_provider: []u8 = &.{},
     is_error: bool = false,
 
     pub fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
         if (self.output.len > 0) allocator.free(self.output);
+        if (self.login_provider.len > 0) allocator.free(self.login_provider);
         self.* = undefined;
     }
 };
@@ -66,15 +80,20 @@ pub const CommandInfo = struct {
 
 pub const commands = [_]CommandInfo{
     .{ .name = "help", .kind = .help, .usage = "/help", .description = "List available commands", .handler = handleHelp },
-    .{ .name = "model", .kind = .model, .usage = "/model [name]", .description = "Show or switch active model", .handler = handleModel },
+    .{ .name = "model", .kind = .model, .usage = "/model [name]", .description = "Open model picker or switch active model", .handler = handleModel },
+    .{ .name = "login", .kind = .login, .usage = "/login [provider]", .description = "Sign in to a provider", .handler = handleLogin },
     .{ .name = "provider", .kind = .provider, .usage = "/provider [name]", .description = "Show or switch active provider", .handler = handleProvider },
     .{ .name = "status", .kind = .status, .usage = "/status", .description = "Show session status", .handler = handleStatus },
     .{ .name = "sessions", .kind = .sessions, .usage = "/sessions", .description = "List saved sessions", .handler = handleSessions },
-    .{ .name = "resume", .kind = .@"resume", .usage = "/resume [id]", .description = "Resume saved session", .handler = handleResume },
+    .{ .name = "resume", .kind = .@"resume", .usage = "/resume", .description = "Open saved sessions", .handler = handleResume },
     .{ .name = "tools", .kind = .tools, .usage = "/tools", .description = "List registered tools", .handler = handleTools },
-    .{ .name = "permissions", .kind = .permissions, .usage = "/permissions", .description = "Show tool permission policies", .handler = handlePermissions },
+    .{ .name = "permissions", .kind = .permissions, .usage = "/permissions [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
+    .{ .name = "perm", .kind = .permissions, .usage = "/perm [ask|bypass]", .description = "Pick or set tool permission mode", .handler = handlePermissions },
+    .{ .name = "think", .kind = .think, .usage = "/think [off|low|medium|high|xhigh]", .description = "Pick or set thinking level", .handler = handleThink },
+    .{ .name = "view", .kind = .view, .usage = "/view [everything|verbose|balanced|chat]", .description = "Show or set transcript detail level", .handler = handleView },
     .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
+    .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
 };
@@ -188,19 +207,18 @@ fn handleModel(ctx: CommandContext, command: Command) !CommandResult {
         if (model) |m| try ctx.state.status.setModel(ctx.allocator, m.id, m.provider);
         return .{ .output = try std.fmt.allocPrint(ctx.allocator, "model switched to {s}", .{model_id}) };
     }
+    // No argument: open the interactive picker instead of dumping a list.
+    return .{ .action = .open_model_picker };
+}
 
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    if (currentModel(ctx)) |model| {
-        try writer.print("current model: {s} ({s})\n", .{ model.id, model.provider });
-    } else {
-        try writer.writeAll("current model: none\n");
+fn handleLogin(ctx: CommandContext, command: Command) !CommandResult {
+    if (command.arg) |provider| {
+        return .{
+            .action = .start_login_provider,
+            .login_provider = try ctx.allocator.dupe(u8, provider),
+        };
     }
-    if (ctx.runtime) |runtime| {
-        try writer.writeAll("available models:");
-        for (runtime.availableModels()) |model| try writer.print("\n  {s} ({s})", .{ model.id, model.provider });
-    }
-    return .{ .output = try out.toOwnedSlice() };
+    return .{ .action = .open_login_picker };
 }
 
 fn handleProvider(ctx: CommandContext, command: Command) !CommandResult {
@@ -209,9 +227,9 @@ fn handleProvider(ctx: CommandContext, command: Command) !CommandResult {
         for (runtime.availableModels()) |model| {
             if (std.mem.eql(u8, model.provider, provider)) {
                 if (ctx.session) |session| {
-                    try session.switchModel(model.id);
+                    try session.switchModelExact(model);
                 } else {
-                    try runtime.switchModel(model.id);
+                    try runtime.switchModelExact(model);
                 }
                 try ctx.state.status.setModel(ctx.allocator, model.id, model.provider);
                 return .{ .output = try std.fmt.allocPrint(ctx.allocator, "provider switched to {s} via model {s}", .{ provider, model.id }) };
@@ -261,20 +279,7 @@ fn handleSessions(ctx: CommandContext, command: Command) !CommandResult {
 }
 
 fn handleResume(ctx: CommandContext, command: Command) !CommandResult {
-    if (command.arg) |id| {
-        for (ctx.state.sessions.items) |entry| {
-            if (std.mem.eql(u8, entry.id, id)) {
-                return .{
-                    .output = try std.fmt.allocPrint(ctx.allocator, "resume by id is not wired yet: {s}", .{id}),
-                    .is_error = true,
-                };
-            }
-        }
-        return error.SessionNotFound;
-    }
-    const session = ctx.session orelse return error.NoRuntimeConfigured;
-    try session.resumeSession();
-    return .{ .output = try ctx.allocator.dupe(u8, "current session resumed") };
+    return try handleSessions(ctx, command);
 }
 
 fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
@@ -291,33 +296,104 @@ fn handleTools(ctx: CommandContext, command: Command) !CommandResult {
 }
 
 fn handlePermissions(ctx: CommandContext, command: Command) !CommandResult {
-    _ = command;
-    var out: std.Io.Writer.Allocating = .init(ctx.allocator);
-    const writer = &out.writer;
-    try writer.writeAll("tool permissions:\n");
-    if (ctx.runtime) |runtime| {
-        if (runtime.tool_approval_callback != null) {
-            try writer.writeAll("  approval callback: configured\n");
-        } else {
-            try writer.writeAll("  approval callback: none (tools auto-approve unless tool policy rejects)\n");
-        }
-        try writer.print("  registered tools: {d}\n", .{runtime.tool_registry.list().len});
-    } else {
-        try writer.writeAll("  runtime: not configured\n");
+    if (command.arg) |arg| {
+        const mode = parsePermissionMode(arg) orelse {
+            return .{
+                .output = try std.fmt.allocPrint(ctx.allocator, "unknown permission mode: {s}", .{arg}),
+                .is_error = true,
+            };
+        };
+        const runtime = ctx.runtime orelse return error.NoRuntimeConfigured;
+        try runtime.setPermissionMode(mode);
+        ctx.state.permission_mode = mode;
+        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "permission mode set to {s}", .{@tagName(mode)}) };
     }
-    try writer.print("  current approval: {s}", .{@tagName(ctx.state.approval.status)});
-    if (ctx.state.approval.status == .pending) try writer.print("\n  pending tool: {s} ({s})", .{ ctx.state.approval.tool_name, ctx.state.approval.tool_call_id });
-    return .{ .output = try out.toOwnedSlice() };
+
+    if (ctx.runtime) |runtime| {
+        ctx.state.permission_mode = runtime.permissionMode();
+    }
+    return .{ .action = .open_permission_picker };
+}
+
+fn parsePermissionMode(value: []const u8) ?tui_runtime.PermissionMode {
+    if (std.mem.eql(u8, value, "ask")) return .ask;
+    if (std.mem.eql(u8, value, "bypass")) return .bypass;
+    return null;
+}
+
+fn handleView(ctx: CommandContext, command: Command) !CommandResult {
+    if (command.arg) |arg| {
+        const mode = parseTranscriptMode(arg) orelse {
+            return .{
+                .output = try std.fmt.allocPrint(ctx.allocator, "unknown view mode: {s}", .{arg}),
+                .is_error = true,
+            };
+        };
+        ctx.state.setTranscriptMode(mode);
+        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "view mode set to {s}", .{@tagName(mode)}) };
+    }
+    return .{ .action = .open_view_picker };
+}
+
+fn parseTranscriptMode(value: []const u8) ?tui_state.TranscriptVisibilityMode {
+    if (std.mem.eql(u8, value, "everything")) return .everything;
+    if (std.mem.eql(u8, value, "verbose")) return .verbose;
+    if (std.mem.eql(u8, value, "balanced")) return .balanced;
+    if (std.mem.eql(u8, value, "chat")) return .chat;
+    return null;
+}
+
+fn handleThink(ctx: CommandContext, command: Command) !CommandResult {
+    if (command.arg) |arg| {
+        const level = parseThinkingLevel(arg) orelse {
+            return .{
+                .output = try std.fmt.allocPrint(ctx.allocator, "unknown thinking level: {s}", .{arg}),
+                .is_error = true,
+            };
+        };
+        if (ctx.runtime) |runtime| runtime.setThinkingLevel(level);
+        ctx.state.thinking_level = level;
+        return .{ .output = try std.fmt.allocPrint(ctx.allocator, "thinking level set to {s}", .{@tagName(level)}) };
+    }
+    if (ctx.runtime) |runtime| ctx.state.thinking_level = runtime.thinkingLevel();
+    return .{ .action = .open_thinking_picker };
+}
+
+fn parseThinkingLevel(value: []const u8) ?ai_types.ThinkingLevel {
+    if (std.mem.eql(u8, value, "off") or std.mem.eql(u8, value, "none") or std.mem.eql(u8, value, "disabled")) return .off;
+    if (std.mem.eql(u8, value, "minimal") or std.mem.eql(u8, value, "min")) return .low;
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "medium") or std.mem.eql(u8, value, "med")) return .medium;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    if (std.mem.eql(u8, value, "xhigh") or std.mem.eql(u8, value, "max") or std.mem.eql(u8, value, "extra_high") or std.mem.eql(u8, value, "extra-high")) return .xhigh;
+    return null;
 }
 
 fn handleCompact(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
-    return .{ .output = try ctx.allocator.dupe(u8, "compact not yet implemented") };
+    const session = ctx.session orelse return error.NoRuntimeConfigured;
+    const result = try session.compactMessages();
+    const output = if (result.before == result.after)
+        try std.fmt.allocPrint(ctx.allocator, "conversation context already compact ({d} messages)", .{result.before})
+    else
+        try std.fmt.allocPrint(ctx.allocator, "conversation context compacted: {d} -> {d} messages", .{ result.before, result.after });
+    return .{ .output = output };
 }
 
 fn handleClear(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     return .{ .action = .clear_transcript, .output = try ctx.allocator.dupe(u8, "transcript cleared") };
+}
+
+fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
+    _ = ctx;
+    // The app stages the clipboard write and reports status itself, so no output.
+    if (command.arg) |arg| {
+        if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t"), "all")) {
+            return .{ .action = .copy_all };
+        }
+    }
+    return .{ .action = .copy_last };
 }
 
 fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
@@ -379,7 +455,7 @@ test "dispatch reaches command handlers" {
     _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .compact, .clear, .diff, .quit };
+    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .diff, .quit };
     for (kinds) |kind| {
         var result = try dispatch(ctx, .{ .kind = kind });
         defer result.deinit(std.testing.allocator);
@@ -389,22 +465,72 @@ test "dispatch reaches command handlers" {
             try std.testing.expectEqual(CommandAction.clear_transcript, result.action);
         } else if (kind == .sessions) {
             try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
+        } else if (kind == .permissions) {
+            try std.testing.expectEqual(CommandAction.open_permission_picker, result.action);
+        } else if (kind == .think) {
+            try std.testing.expectEqual(CommandAction.open_thinking_picker, result.action);
+        } else if (kind == .view) {
+            try std.testing.expectEqual(CommandAction.open_view_picker, result.action);
         } else {
             try std.testing.expect(result.output.len > 0);
         }
     }
 }
 
-test "resume by id does not resume current context" {
+test "login command can target a provider directly" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .login, .arg = "openai-codex" });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(CommandAction.start_login_provider, result.action);
+    try std.testing.expectEqualStrings("openai-codex", result.login_provider);
+}
+
+test "resume is an alias for sessions" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     try state.addSession("s1", "Saved");
 
-    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume", .arg = "s1" });
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .@"resume" });
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expect(result.is_error);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "not wired") != null);
+    try std.testing.expectEqual(CommandAction.open_session_picker, result.action);
+}
+
+const CompactCommandSession = struct {
+    before: usize = 12,
+    after: usize = 9,
+    compact_count: usize = 0,
+
+    fn session(self: *CompactCommandSession) tui_runtime.TuiSession {
+        return .{
+            .ctx = self,
+            .ops = .{
+                .compact_messages = compactMessages,
+            },
+        };
+    }
+
+    fn compactMessages(ctx: ?*anyopaque) anyerror!tui_runtime.CompactMessagesResult {
+        const self: *CompactCommandSession = @ptrCast(@alignCast(ctx.?));
+        self.compact_count += 1;
+        return .{ .before = self.before, .after = self.after };
+    }
+};
+
+test "compact command compacts session history" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    var compact = CompactCommandSession{};
+    var session = compact.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .compact });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), compact.compact_count);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "12 -> 9") != null);
 }
 
 test "sessions opens picker when sessions exist" {
@@ -428,15 +554,78 @@ test "sessions reports empty store" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "no saved sessions") != null);
 }
 
-test "permissions reports runtime approval state not hardcoded policy" {
+test "permissions opens picker without argument" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
 
     var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .permissions });
     defer result.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "runtime: not configured") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.output, "reads inside workspace") == null);
+    try std.testing.expectEqual(CommandAction.open_permission_picker, result.action);
+}
+
+test "permissions command switches runtime mode" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, state.permission_mode);
+
+    var bypass = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .permissions, .arg = "bypass" });
+    defer bypass.deinit(std.testing.allocator);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.bypass, state.permission_mode);
+    try std.testing.expect(std.mem.indexOf(u8, bypass.output, "permission mode set to bypass") != null);
+
+    var ask = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .permissions, .arg = "ask" });
+    defer ask.deinit(std.testing.allocator);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, runtime.permissionMode());
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, state.permission_mode);
+}
+
+test "view command switches transcript visibility mode" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view, .arg = "chat" });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(tui_state.TranscriptVisibilityMode.chat, state.transcript_mode);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "chat") != null);
+
+    var current = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view });
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.open_view_picker, current.action);
+
+    var legacy = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .view, .arg = "normal" });
+    defer legacy.deinit(std.testing.allocator);
+    try std.testing.expect(legacy.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, legacy.output, "unknown view mode") != null);
+}
+
+test "think command switches thinking level and opens picker without argument" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    var high = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .think, .arg = "high" });
+    defer high.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, runtime.thinkingLevel());
+    try std.testing.expect(std.mem.indexOf(u8, high.output, "thinking level set to high") != null);
+
+    var picker = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .think });
+    defer picker.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.open_thinking_picker, picker.action);
+}
+
+test "perm alias parses as permissions command" {
+    const command = try parse("/perm ask");
+    try std.testing.expectEqual(CommandKind.permissions, command.kind);
+    try std.testing.expectEqualStrings("ask", command.arg.?);
 }
 
 test "runtime dependent commands dispatch to no-runtime errors" {
@@ -447,5 +636,21 @@ test "runtime dependent commands dispatch to no-runtime errors" {
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .model, .arg = "model-a" }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .provider }));
     try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .tools }));
-    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .@"resume" }));
+    try std.testing.expectError(error.NoRuntimeConfigured, dispatch(ctx, .{ .kind = .compact }));
+}
+
+test "copy command selects last reply or whole transcript" {
+    try std.testing.expectEqual(CommandKind.copy, (try parse("/copy")).kind);
+
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
+
+    var last = try dispatch(ctx, .{ .kind = .copy });
+    defer last.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.copy_last, last.action);
+
+    var all = try dispatch(ctx, .{ .kind = .copy, .arg = "all" });
+    defer all.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.copy_all, all.action);
 }

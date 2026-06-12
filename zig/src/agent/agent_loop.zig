@@ -255,14 +255,19 @@ fn validateToolArguments(
 /// Create an error result for failed tool execution
 fn createErrorResult(allocator: std.mem.Allocator, err: anyerror) !AgentToolResult {
     const error_name = @errorName(err);
-    _ = error_name; // We could include this in the error message
     const content = try allocator.alloc(ai_types.UserContentPart, 1);
+    errdefer allocator.free(content);
+    const text = try std.fmt.allocPrint(allocator, "Tool execution failed: {s}", .{error_name});
+    errdefer allocator.free(text);
     content[0] = .{ .text = .{
-        .text = try allocator.dupe(u8, "Tool execution failed"),
+        .text = text,
     } };
+    const details = try std.json.Stringify.valueAlloc(allocator, .{ .ok = false, .err = error_name }, .{});
+    errdefer allocator.free(details);
     return .{
         .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
-        .details_json = ai_types.OwnedSlice(u8).initBorrowed(""),
+        .details_json = ai_types.OwnedSlice(u8).initOwned(details),
+        .is_error = true,
     };
 }
 
@@ -274,6 +279,7 @@ fn rejectedToolResult(allocator: std.mem.Allocator) !AgentToolResult {
     return .{
         .content = types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
         .details_json = types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, "{\"rejected\":true}")),
+        .is_error = true,
     };
 }
 
@@ -482,7 +488,34 @@ const ToolExecutionResult = struct {
             allocator.free(mut_msgs);
         }
     }
+
+    fn deinitAfterToolResultsTransferred(self: *const ToolExecutionResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.tool_results);
+        for (self.compact_args) |args| allocator.free(args);
+        allocator.free(self.compact_args);
+        if (self.steering_messages) |msgs| {
+            const mut_msgs: []ai_types.Message = @constCast(msgs);
+            for (mut_msgs) |*msg| msg.deinit(allocator);
+            allocator.free(mut_msgs);
+        }
+    }
 };
+
+test "ToolExecutionResult transferred cleanup frees compact args" {
+    const allocator = std.testing.allocator;
+
+    const tool_results = try allocator.alloc(ai_types.ToolResultMessage, 0);
+    const compact_args = try allocator.alloc([]u8, 1);
+    compact_args[0] = try allocator.dupe(u8, "{\"compact_output\":false}");
+
+    const result = ToolExecutionResult{
+        .tool_results = tool_results,
+        .compact_args = compact_args,
+        .has_steering = false,
+        .steering_messages = null,
+    };
+    result.deinitAfterToolResultsTransferred(allocator);
+}
 
 /// Execute tool calls from assistant message
 fn supportsCompactToolOutput(allocator: std.mem.Allocator, tool: AgentTool) !bool {
@@ -513,12 +546,51 @@ test "compact output support requires root schema property" {
     try std.testing.expect(try supportsCompactToolOutput(std.testing.allocator, root));
 }
 
+test "compact output injection preserves explicit caller choice" {
+    const explicit_false = try withCompactToolOutput(std.testing.allocator, "{\"command\":\"ls -al\",\"compact_output\":false}");
+    defer std.testing.allocator.free(explicit_false);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -al\",\"compact_output\":false}", explicit_false);
+
+    const missing = try withCompactToolOutput(std.testing.allocator, "{\"command\":\"ls -al\"}");
+    defer std.testing.allocator.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "\"compact_output\":true") != null);
+}
+
 fn withCompactToolOutput(allocator: std.mem.Allocator, args_json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args_json, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return try allocator.dupe(u8, args_json);
-    try parsed.value.object.put(allocator, "compact_output", .{ .bool = true });
+    if (parsed.value.object.contains("compact_output")) return try allocator.dupe(u8, args_json);
+    // Dynamic JSON values parsed by `parseFromSlice` own object-map storage
+    // through the parser arena. Grow the map with that same arena allocator;
+    // using the caller allocator can free arena-owned buckets and panic.
+    try parsed.value.object.put(parsed.arena.allocator(), "compact_output", .{ .bool = true });
     return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+test "compact output injection grows parsed object with parser arena" {
+    const args = "{\"workspace_root\":\"/workspace\",\"command\":\"ls -al\",\"timeout_ms\":10000,\"a\":1,\"b\":2,\"c\":3,\"d\":4,\"e\":5,\"f\":6,\"g\":7,\"h\":8}";
+    const injected = try withCompactToolOutput(std.testing.allocator, args);
+    defer std.testing.allocator.free(injected);
+    try std.testing.expect(std.mem.indexOf(u8, injected, "\"compact_output\":true") != null);
+}
+
+fn pushProviderMessageUpdate(
+    allocator: std.mem.Allocator,
+    event_stream: *AgentEventStream,
+    provider_event: ai_types.AssistantMessageEvent,
+    partial: ai_types.AssistantMessage,
+    owns_event: bool,
+) !void {
+    var cleanup_event = provider_event;
+    errdefer if (owns_event) {
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup_event);
+    };
+    try event_stream.push(.{ .message_update = .{
+        .message = partial,
+        .event = provider_event,
+        .owns_event = owns_event,
+    } });
 }
 
 fn executeToolCalls(
@@ -660,6 +732,7 @@ fn executeToolCalls(
                 is_error = true;
                 break :blk result;
             };
+            is_error = result.is_error;
         } else {
             result = try createErrorResult(allocator, error.ToolNotFound);
             is_error = true;
@@ -743,6 +816,7 @@ fn streamAssistantResponse(
         .api_key = config.api_key,
         .session_id = config.session_id,
         .cancel_token = config.cancel_token,
+        .thinking_level = config.thinking_level,
         .thinking_budgets = config.thinking_budgets,
         .max_retry_delay_ms = config.max_retry_delay_ms orelse 60_000,
         .temperature = config.temperature,
@@ -768,80 +842,82 @@ fn streamAssistantResponse(
     while (provider_stream.wait()) |provider_event| {
         switch (provider_event) {
             .start => |s| {
+                var owned_start_event = provider_event;
+                errdefer if (provider_stream.owns_events) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &owned_start_event);
+                };
+
                 // Create a Message wrapper for the assistant message
-                const msg: ai_types.Message = .{ .assistant = s.partial };
+                const msg: ai_types.Message = .{ .assistant = .{
+                    .content = &.{},
+                    .api = config.model.api,
+                    .provider = config.model.provider,
+                    .model = config.model.id,
+                    .usage = s.partial.usage,
+                    .stop_reason = s.partial.stop_reason,
+                    .timestamp = s.partial.timestamp,
+                    .is_owned = false,
+                } };
                 try event_stream.push(.{ .message_start = .{
                     .message = msg,
                 } });
+                if (provider_stream.owns_events) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &owned_start_event);
+                }
                 message_started = true;
             },
             .text_start => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .text_delta => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .text_end => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .thinking_start => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .thinking_delta => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .thinking_end => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .toolcall_start => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .toolcall_delta => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .toolcall_end => |evt| {
-                try event_stream.push(.{ .message_update = .{
-                    .message = evt.partial,
-                    .event = provider_event,
-                } });
+                try pushProviderMessageUpdate(allocator, event_stream, provider_event, evt.partial, provider_stream.owns_events);
             },
             .done => |d| {
+                var cleanup_event = provider_event;
+                var final_transferred = false;
+                errdefer if (provider_stream.owns_events and !final_transferred) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &cleanup_event);
+                };
                 final_message = d.message;
                 const msg: ai_types.Message = .{ .assistant = d.message };
                 try event_stream.push(.{ .message_end = .{
                     .message = msg,
                 } });
+                final_transferred = true;
             },
             .@"error" => |e| {
+                var cleanup_event = provider_event;
+                var final_transferred = false;
+                errdefer if (provider_stream.owns_events and !final_transferred) {
+                    ai_types.deinitAssistantMessageEvent(allocator, &cleanup_event);
+                };
                 final_message = e.err;
                 const msg: ai_types.Message = .{ .assistant = e.err };
                 try event_stream.push(.{ .message_end = .{
                     .message = msg,
                 } });
+                final_transferred = true;
             },
             .keepalive => {
                 // Ignore keepalive events
@@ -1078,15 +1154,9 @@ fn runLoop(
                         config,
                         event_stream,
                     );
-                    defer {
-                        // Tool results ownership is transferred to context
-                        allocator.free(tool_result.tool_results);
-                        if (tool_result.steering_messages) |msgs| {
-                            const mut_msgs: []ai_types.Message = @constCast(msgs);
-                            for (mut_msgs) |*msg| msg.deinit(allocator);
-                            allocator.free(mut_msgs);
-                        }
-                    }
+                    // Tool result messages are transferred to context below; the
+                    // wrapper still owns compact args and steering messages.
+                    defer tool_result.deinitAfterToolResultsTransferred(allocator);
 
                     // Emit turn_end with tool results
                     try event_stream.push(.{ .turn_end = .{

@@ -9,15 +9,18 @@ const event_stream = @import("event_stream");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_commands = @import("tui_commands");
+const tui_login = @import("tui_login");
+const tui_model_catalog = @import("tui_model_catalog");
+const tui_config = @import("tui_config");
+const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
 const composer_view = @import("tui_view_composer");
 const status_bar_view = @import("tui_view_status_bar");
-const tool_panel_view = @import("tui_view_tool_panel");
-const telemetry_view = @import("tui_view_telemetry");
 const approval_view = @import("tui_view_approval");
 const preview_view = @import("tui_view_preview");
 const session_picker_view = @import("tui_view_session_picker");
+const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
@@ -46,12 +49,44 @@ pub const ApprovalWaiter = struct {
     }
 };
 
+fn loadRuntimeModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.loadProductionModels, true);
+}
+
+fn loadRuntimeModelsFresh(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadRuntimeModelsWithCatalog(allocator, tui_model_catalog.refreshProductionModels, false);
+}
+
+fn loadRuntimeModelsWithCatalog(
+    allocator: std.mem.Allocator,
+    comptime loadCatalog: fn (std.mem.Allocator) anyerror![]ai_types.Model,
+    comptime catch_catalog_errors: bool,
+) ![]ai_types.Model {
+    var catalog_models = loadCatalog(allocator) catch |err| if (catch_catalog_errors)
+        try allocator.alloc(ai_types.Model, 0)
+    else
+        return err;
+    errdefer tui_model_catalog.deinitModels(allocator, catalog_models);
+
+    const models = try allocator.alloc(ai_types.Model, 1 + catalog_models.len);
+    errdefer allocator.free(models);
+    models[0] = defaultModel();
+    for (catalog_models, 0..) |model, idx| {
+        models[idx + 1] = model;
+    }
+    allocator.free(catalog_models);
+    catalog_models = &.{};
+    errdefer for (models) |*model| model.deinit(allocator);
+    return models;
+}
+
 pub const ProductionRuntime = struct {
     allocator: std.mem.Allocator,
     registry: api_registry.ApiRegistry,
     bridge: agent.InProcessProviderProtocolBridge,
     permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
+    initial_model: ?SavedModelRef = null,
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -65,14 +100,24 @@ pub const ProductionRuntime = struct {
             @panic("OOM initializing permission engine");
         errdefer permission_engine.deinit();
 
-        var runtime = ProductionRuntime{
+        const models = try loadRuntimeModels(allocator);
+        errdefer tui_model_catalog.deinitModels(allocator, models);
+
+        var initial_model = loadSavedModelRef(allocator) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+        errdefer if (initial_model) |*model| model.deinit(allocator);
+
+        const runtime = ProductionRuntime{
             .allocator = allocator,
             .registry = registry,
             .bridge = undefined,
             .permission_engine = permission_engine,
-            .models = try allocator.alloc(ai_types.Model, 1),
+            .models = models,
+            .initial_model = initial_model,
         };
-        runtime.models[0] = defaultModel();
+        initial_model = null;
         return runtime;
     }
 
@@ -84,31 +129,84 @@ pub const ProductionRuntime = struct {
         return .{
             .protocol = (&self.bridge).protocolClient(),
             .models = self.models,
+            .initial_model = if (self.initial_model) |model| .{
+                .id = model.id,
+                .provider = model.provider,
+                .api = model.api,
+            } else null,
             .permission_engine = &self.permission_engine,
+            .workspace_root = self.permission_engine.workspace_root,
             .run_async = true,
             .compact_output = true,
         };
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
-        self.allocator.free(self.models);
+        tui_model_catalog.deinitModels(self.allocator, self.models);
+        if (self.initial_model) |*model| model.deinit(self.allocator);
         self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;
     }
 };
 
+const SavedModelRef = struct {
+    id: []u8,
+    provider: []u8,
+    api: []u8,
+
+    fn deinit(self: *SavedModelRef, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.provider);
+        allocator.free(self.api);
+        self.* = undefined;
+    }
+};
+
+fn loadSavedModelRef(allocator: std.mem.Allocator) !?SavedModelRef {
+    var store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
+        error.HomeNotFound => return null,
+        else => return err,
+    };
+    defer store.deinit();
+    return try loadSavedModelRefFromStore(allocator, store);
+}
+
+fn loadSavedModelRefFromStore(allocator: std.mem.Allocator, store: tui_config.Store) !?SavedModelRef {
+    var cfg = (try store.loadIfExists()) orelse return null;
+    defer cfg.deinit(allocator);
+    if (cfg.model.len == 0) return null;
+    const id = try allocator.dupe(u8, cfg.model);
+    errdefer allocator.free(id);
+    const provider = try allocator.dupe(u8, cfg.provider);
+    errdefer allocator.free(provider);
+    const api = try allocator.dupe(u8, cfg.api);
+    errdefer allocator.free(api);
+    return .{
+        .id = id,
+        .provider = provider,
+        .api = api,
+    };
+}
+
 pub const App = struct {
     allocator: std.mem.Allocator,
     state: tui_state.AppState,
-    runtime: ?tui_runtime.TuiRuntime = null,
+    runtime: ?*tui_runtime.TuiRuntime = null,
     session: ?tui_runtime.TuiSession = null,
     approval_waiter: ?*ApprovalWaiter = null,
+    login: ?*tui_login.LoginSession = null,
     store: ?session_store.Store = null,
     session_id: []u8 = &.{},
     session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
+    /// Text staged for the system clipboard, flushed to the terminal via OSC 52
+    /// on the next `update` (where a mutable `Context` is available). Owned.
+    ///
+    /// `Ctrl+Y` / `/copy` provide an explicit OSC 52 copy path for when
+    /// dragging selection isn't convenient.
+    pending_clipboard: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, options: tui_runtime.TuiRuntimeOptions) !App {
         var runtime_options = options;
@@ -117,14 +215,25 @@ pub const App = struct {
         approval_waiter.* = .{ .allocator = allocator };
         runtime_options.tool_approval_ctx = approval_waiter;
         runtime_options.tool_approval_callback = approvalCallback;
+        // The runtime is heap-allocated so its address is stable: the session
+        // created below stores a pointer back to it, and `App` is returned by
+        // value (moved into its caller). An inline runtime would leave that
+        // pointer dangling after the move.
+        const runtime_ptr = try allocator.create(tui_runtime.TuiRuntime);
+        runtime_ptr.* = tui_runtime.TuiRuntime.init(allocator, runtime_options) catch |err| {
+            allocator.destroy(runtime_ptr);
+            return err;
+        };
         var app = App{
             .allocator = allocator,
             .state = tui_state.AppState.init(allocator),
-            .runtime = try tui_runtime.TuiRuntime.init(allocator, runtime_options),
+            .runtime = runtime_ptr,
             .approval_waiter = approval_waiter,
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
+        app.state.permission_mode = app.runtime.?.permissionMode();
+        app.state.thinking_level = app.runtime.?.thinkingLevel();
         try app.state.setRegisteredTools(app.runtime.?.availableTools());
         if (app.runtime.?.currentModel()) |model| {
             try app.state.status.setModelWithContext(allocator, model.id, model.provider, model.context_window);
@@ -147,13 +256,21 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.login) |session| {
+            session.deinit();
+            self.login = null;
+        }
         if (self.approval_waiter) |waiter| waiter.cancel();
-        if (self.runtime) |*runtime| runtime.deinit();
+        if (self.runtime) |runtime| {
+            runtime.deinit();
+            self.allocator.destroy(runtime);
+        }
         if (self.approval_waiter) |waiter| {
             waiter.deinit();
             self.allocator.destroy(waiter);
         }
         if (self.store) |*store| store.deinit();
+        if (self.pending_clipboard) |c| self.allocator.free(c);
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
         self.state.deinit();
@@ -181,7 +298,7 @@ pub const App = struct {
     /// Resume the session currently selected in the session picker.
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        const runtime = if (self.runtime) |*r| r else return error.NoRuntimeConfigured;
+        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         if (runtime.backend == .remote) return error.SessionResumeUnsupportedForRemoteRuntime;
         const sessions = self.state.sessions.items;
         if (sessions.len == 0) return;
@@ -213,17 +330,371 @@ pub const App = struct {
         self.state.mode = .normal;
     }
 
+    /// Providers that expose an OAuth login, in picker order.
+    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex" };
+
+    const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
+
+    const view_modes = [_]tui_state.TranscriptVisibilityMode{ .everything, .verbose, .balanced, .chat };
+
+    const thinking_levels = [_]ai_types.ThinkingLevel{ .off, .low, .medium, .high, .xhigh };
+
+    fn loginProviderEnum(idx: usize) tui_login.Provider {
+        return switch (idx) {
+            0 => .anthropic,
+            1 => .github_copilot,
+            2 => .openai_codex,
+            else => .anthropic,
+        };
+    }
+
+    fn loginProviderIndex(provider_id: []const u8) ?usize {
+        for (login_providers, 0..) |provider, idx| {
+            if (std.mem.eql(u8, provider_id, provider)) return idx;
+        }
+        if (std.mem.eql(u8, provider_id, "codex") or std.mem.eql(u8, provider_id, "openai")) return 2;
+        if (std.mem.eql(u8, provider_id, "github")) return 1;
+        return null;
+    }
+
+    /// Open the model picker, pre-selecting the currently active model.
+    fn openModelPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        const runtime = self.runtime orelse return self.enterMenu(.model_picker);
+        const current = runtime.currentModel();
+        if (current) |active| {
+            for (runtime.availableModels(), 0..) |model, i| {
+                if (std.mem.eql(u8, model.id, active.id)) {
+                    self.state.menu_index = i;
+                    break;
+                }
+            }
+        }
+        self.enterMenu(.model_picker);
+    }
+
+    fn openPermissionPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        if (self.runtime) |runtime| self.state.permission_mode = runtime.permissionMode();
+        for (permission_modes, 0..) |mode, i| {
+            if (mode == self.state.permission_mode) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.permission_picker);
+    }
+
+    fn openViewPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        for (view_modes, 0..) |mode, i| {
+            if (mode == self.state.transcript_mode) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.view_picker);
+    }
+
+    fn openThinkingPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        if (self.runtime) |runtime| self.state.thinking_level = runtime.thinkingLevel();
+        for (thinking_levels, 0..) |level, i| {
+            if (level == self.state.thinking_level) {
+                self.state.menu_index = i;
+                break;
+            }
+        }
+        self.enterMenu(.thinking_picker);
+    }
+
+    fn enterMenu(self: *App, mode: tui_state.AppMode) void {
+        self.state.mode = mode;
+        self.ensureMenuSelectionVisible();
+    }
+
+    fn menuItemCount(self: *const App) usize {
+        return switch (self.state.mode) {
+            .model_picker => if (self.runtime) |runtime| runtime.availableModels().len else 0,
+            .login_picker => login_providers.len,
+            .permission_picker => permission_modes.len,
+            .view_picker => view_modes.len,
+            .thinking_picker => thinking_levels.len,
+            else => 0,
+        };
+    }
+
+    /// Apply the model highlighted in the model picker, then return to normal.
+    fn applySelectedModel(self: *App) !void {
+        const runtime = self.runtime orelse return error.NoRuntimeConfigured;
+        const models = runtime.availableModels();
+        if (models.len == 0 or self.state.menu_index >= models.len) {
+            self.state.mode = .normal;
+            return;
+        }
+        const model = models[self.state.menu_index];
+        if (self.session) |*session| {
+            try session.switchModelExact(model);
+        } else {
+            try runtime.switchModelExact(model);
+        }
+        if (runtime.currentModel()) |m| {
+            try self.state.status.setModelWithContext(self.allocator, m.id, m.provider, m.context_window);
+            self.state.telemetry.context_window = m.context_window;
+        }
+        self.persistCurrentModel();
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "model switched to {s} ({s})", .{ model.id, model.provider });
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    /// Start the OAuth worker for a provider index. The flow then drives forward
+    /// via `pollLogin()` on each tick.
+    fn startLoginProviderIndex(self: *App, idx: usize) !void {
+        const provider = login_providers[idx];
+        self.state.mode = .normal;
+        if (self.login != null) {
+            try self.state.appendTranscript(.system, "a login is already in progress");
+            return;
+        }
+        self.login = tui_login.LoginSession.start(self.allocator, loginProviderEnum(idx)) catch |err| {
+            const msg = try std.fmt.allocPrint(self.allocator, "could not start login for {s}: {s}", .{ provider, @errorName(err) });
+            defer self.allocator.free(msg);
+            try self.state.appendTranscript(.@"error", msg);
+            return;
+        };
+        const msg = try std.fmt.allocPrint(self.allocator, "starting login for {s}…", .{provider});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn startLoginProviderName(self: *App, provider_id: []const u8) !void {
+        const idx = loginProviderIndex(provider_id) orelse {
+            const msg = try std.fmt.allocPrint(self.allocator, "unknown login provider: {s}", .{provider_id});
+            defer self.allocator.free(msg);
+            try self.state.status.setError(self.allocator, msg);
+            try self.state.appendTranscript(.@"error", msg);
+            return;
+        };
+        try self.startLoginProviderIndex(idx);
+    }
+
+    /// Start the OAuth worker for the highlighted provider.
+    fn applySelectedLogin(self: *App) !void {
+        const idx = @min(self.state.menu_index, login_providers.len - 1);
+        try self.startLoginProviderIndex(idx);
+    }
+
+    fn applySelectedPermission(self: *App) !void {
+        const idx = @min(self.state.menu_index, permission_modes.len - 1);
+        const mode = permission_modes[idx];
+        const runtime = self.runtime orelse return error.NoRuntimeConfigured;
+        try runtime.setPermissionMode(mode);
+        self.state.permission_mode = mode;
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "permission mode set to {s}", .{@tagName(mode)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn applySelectedView(self: *App) !void {
+        const idx = @min(self.state.menu_index, view_modes.len - 1);
+        const mode = view_modes[idx];
+        self.state.setTranscriptMode(mode);
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "view mode set to {s}", .{@tagName(mode)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn applySelectedThinking(self: *App) !void {
+        const idx = @min(self.state.menu_index, thinking_levels.len - 1);
+        const level = thinking_levels[idx];
+        if (self.runtime) |runtime| runtime.setThinkingLevel(level);
+        self.state.thinking_level = level;
+        self.state.mode = .normal;
+        const msg = try std.fmt.allocPrint(self.allocator, "thinking level set to {s}", .{@tagName(level)});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    /// Drive the active login session forward. Called each tick; surfaces the
+    /// authorization URL, switches to an input prompt when the worker blocks on
+    /// pasted input, and persists credentials when the flow completes.
+    fn pollLogin(self: *App) !void {
+        const session = self.login orelse return;
+        switch (session.poll()) {
+            .none => {},
+            .show_auth => |auth| {
+                const msg = if (auth.instructions) |ins|
+                    try std.fmt.allocPrint(self.allocator, "open this URL to authorize:\n{s}\n{s}", .{ auth.url, ins })
+                else
+                    try std.fmt.allocPrint(self.allocator, "open this URL to authorize:\n{s}", .{auth.url});
+                defer self.allocator.free(msg);
+                try self.state.appendTranscript(.system, msg);
+            },
+            .request_input => |req| {
+                const msg = try std.fmt.allocPrint(self.allocator, "{s} (type your answer and press Enter)", .{req.message});
+                defer self.allocator.free(msg);
+                try self.state.appendTranscript(.system, msg);
+                self.state.mode = .login_input;
+            },
+            .done => |creds| {
+                const provider_id = session.provider_id;
+                const save_err = self.saveLoginCredentials(provider_id, creds);
+                creds.deinit(self.allocator);
+                self.finishLogin();
+                if (save_err) |_| {
+                    const refresh_err = self.refreshModelsAfterLogin();
+                    const msg = try std.fmt.allocPrint(self.allocator, "logged in to {s}", .{provider_id});
+                    defer self.allocator.free(msg);
+                    try self.state.appendTranscript(.system, msg);
+                    if (refresh_err) |_| {
+                        try self.state.appendTranscript(.system, "model catalog refreshed");
+                    } else |err| {
+                        const refresh_msg = try std.fmt.allocPrint(self.allocator, "login succeeded but refreshing models failed: {s}", .{@errorName(err)});
+                        defer self.allocator.free(refresh_msg);
+                        try self.state.appendTranscript(.@"error", refresh_msg);
+                    }
+                } else |err| {
+                    const msg = try std.fmt.allocPrint(self.allocator, "login succeeded but saving credentials failed: {s}", .{@errorName(err)});
+                    defer self.allocator.free(msg);
+                    try self.state.appendTranscript(.@"error", msg);
+                }
+            },
+            .failed => |name| {
+                const msg = try std.fmt.allocPrint(self.allocator, "login failed: {s}", .{name});
+                defer self.allocator.free(msg);
+                self.finishLogin();
+                try self.state.appendTranscript(.@"error", msg);
+            },
+        }
+    }
+
+    /// Tear down the active login session and leave any input mode.
+    fn finishLogin(self: *App) void {
+        if (self.login) |session| {
+            session.deinit();
+            self.login = null;
+        }
+        if (self.state.mode == .login_input) self.state.mode = .normal;
+    }
+
+    /// Persist freshly obtained OAuth credentials into `~/.makai/auth.json`,
+    /// replacing any existing entry for the provider. Does not take ownership of
+    /// `creds`.
+    fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
+        var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
+        defer storage.deinit();
+
+        const key = try self.allocator.dupe(u8, provider_id);
+        var owned = false;
+        errdefer if (!owned) self.allocator.free(key);
+        const refresh = try self.allocator.dupe(u8, creds.refresh);
+        errdefer if (!owned) self.allocator.free(refresh);
+        const access = try self.allocator.dupe(u8, creds.access);
+        errdefer if (!owned) self.allocator.free(access);
+        const pd: ?[]const u8 = if (creds.provider_data) |d| try self.allocator.dupe(u8, d) else null;
+        errdefer if (!owned) {
+            if (pd) |d| self.allocator.free(d);
+        };
+
+        if (storage.providers.fetchRemove(provider_id)) |removed| {
+            self.allocator.free(removed.key);
+            removed.value.deinit(self.allocator);
+        }
+
+        try storage.providers.put(key, .{ .oauth = .{
+            .refresh = refresh,
+            .access = access,
+            .expires = creds.expires,
+            .provider_data = pd,
+        } });
+        owned = true;
+        try storage.persist();
+    }
+
+    fn refreshModelsAfterLogin(self: *App) !void {
+        const runtime = self.runtime orelse return;
+        const current_model = runtime.currentModel();
+        const models = try loadRuntimeModelsFresh(self.allocator);
+        defer tui_model_catalog.deinitModels(self.allocator, models);
+        try runtime.replaceModels(models, current_model);
+    }
+
+    /// Hand pasted input to the worker the login flow is blocked on.
+    fn submitLoginInput(self: *App, text: []const u8) void {
+        const session = self.login orelse {
+            self.state.mode = .normal;
+            return;
+        };
+        session.provideInput(text) catch |err| {
+            self.recordError(@errorName(err)) catch {};
+            return;
+        };
+        self.state.mode = .normal;
+    }
+
+    /// Abort an in-progress login.
+    fn cancelLogin(self: *App) void {
+        self.finishLogin();
+        self.state.appendTranscript(.system, "login cancelled") catch {};
+        self.state.mode = .normal;
+    }
+
+    fn moveMenuSelection(self: *App, delta: isize) void {
+        const n = self.menuItemCount();
+        if (n == 0) {
+            self.state.menu_index = 0;
+            self.state.menu_scroll = 0;
+            return;
+        }
+        if (delta < 0) {
+            self.state.menu_index -|= @as(usize, @intCast(-delta));
+        } else {
+            self.state.menu_index = @min(n - 1, self.state.menu_index + @as(usize, @intCast(delta)));
+        }
+        self.ensureMenuSelectionVisible();
+    }
+
+    fn ensureMenuSelectionVisible(self: *App) void {
+        const height = @max(self.last_view_height, 8) / 2;
+        if (self.state.menu_index < self.state.menu_scroll) {
+            self.state.menu_scroll = self.state.menu_index;
+        } else if (height > 0 and self.state.menu_index >= self.state.menu_scroll + height) {
+            self.state.menu_scroll = self.state.menu_index + 1 - height;
+        }
+    }
+
     /// Save one event to the session store (best-effort: ignores errors).
     fn saveEvent(self: *App, event: tui_runtime.TuiEvent) void {
         const store = self.store orelse return;
-        // Only save events that are needed for session replay.
+        // Save replay-critical and debug-visible events while still rejecting
+        // oversized payloads that would make the JSONL session unwieldy.
         switch (event) {
             .message_start, .tool_execution_start, .context_usage, .prompt_segment_usage, .agent_start, .turn_start, .turn_end, .agent_end => {},
             .text_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
             },
+            .thinking_delta => |payload| {
+                if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
+            },
             .tool_call_delta => |payload| {
                 if (jsonStringBudget(payload.delta.slice()) > max_session_event_payload_bytes) return;
+            },
+            .provider_event => |payload| {
+                if (jsonStringBudget(payload.event_json.slice()) > max_session_event_payload_bytes) return;
+            },
+            .tool_approval_requested => |payload| {
+                if (toolRequestPayloadSize(payload) > max_session_event_payload_bytes) return;
+            },
+            .tool_execution_update => |payload| {
+                if (toolUpdatePayloadSize(payload) > max_session_event_payload_bytes) return;
             },
             .message_end => |payload| {
                 if (messageEndPayloadSize(payload) > max_session_event_payload_bytes) return;
@@ -231,7 +702,9 @@ pub const App = struct {
             .tool_execution_end => |payload| {
                 if (toolExecutionEndPayloadSize(payload) > max_session_event_payload_bytes) return;
             },
-            else => return,
+            .@"error" => |payload| {
+                if (jsonStringBudget(payload.message.slice()) > max_session_event_payload_bytes) return;
+            },
         }
         const meta = self.currentSessionMetadata();
         store.save(meta, event) catch {};
@@ -253,6 +726,17 @@ pub const App = struct {
             jsonStringBudget(payload.tool_call_id.slice()) +
             jsonStringBudget(payload.tool_name.slice()) +
             jsonStringBudget(payload.artifact_refs.slice());
+    }
+
+    fn toolRequestPayloadSize(payload: anytype) usize {
+        return jsonStringBudget(payload.tool_call_id.slice()) +
+            jsonStringBudget(payload.tool_name.slice()) +
+            jsonStringBudget(payload.args_json.slice());
+    }
+
+    fn toolUpdatePayloadSize(payload: @TypeOf(@as(tui_runtime.TuiEvent, undefined).tool_execution_update)) usize {
+        return toolRequestPayloadSize(payload) +
+            jsonStringBudget(payload.partial_result_json.slice());
     }
 
     fn jsonStringBudget(value: []const u8) usize {
@@ -372,7 +856,7 @@ pub const App = struct {
             .command => |command| command,
         };
 
-        if (command.kind == .sessions) self.loadSessions() catch |err| {
+        if (command.kind == .sessions or command.kind == .@"resume") self.loadSessions() catch |err| {
             try self.state.status.setError(self.allocator, @errorName(err));
             try self.state.appendTranscript(.@"error", @errorName(err));
             return;
@@ -381,7 +865,7 @@ pub const App = struct {
         var result = tui_commands.dispatch(.{
             .allocator = self.allocator,
             .state = &self.state,
-            .runtime = if (self.runtime) |*runtime| runtime else null,
+            .runtime = if (self.runtime) |runtime| runtime else null,
             .session = if (self.session) |*session| session else null,
         }, command) catch |err| {
             try self.state.status.setError(self.allocator, @errorName(err));
@@ -400,8 +884,21 @@ pub const App = struct {
                 self.state.session_scroll = 0;
                 self.state.mode = .session_picker;
             },
+            .open_model_picker => self.openModelPicker(),
+            .open_login_picker => {
+                self.state.menu_index = 0;
+                self.state.menu_scroll = 0;
+                self.state.mode = .login_picker;
+            },
+            .open_permission_picker => self.openPermissionPicker(),
+            .open_view_picker => self.openViewPicker(),
+            .open_thinking_picker => self.openThinkingPicker(),
+            .start_login_provider => try self.startLoginProviderName(result.login_provider),
+            .copy_last => self.copyLastAssistant(),
+            .copy_all => self.copyTranscript(),
             .none => {},
         }
+        if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
         if (result.output.len > 0) {
             try self.state.appendTranscript(if (result.is_error) .@"error" else .system, result.output);
             if (result.is_error) try self.state.status.setError(self.allocator, result.output);
@@ -413,15 +910,85 @@ pub const App = struct {
         try self.state.appendTranscript(.@"error", message);
     }
 
+    fn persistCurrentModel(self: *App) void {
+        const runtime = self.runtime orelse return;
+        const model = runtime.currentModel() orelse return;
+        self.persistSelectedModel(model) catch |err| self.recordError(@errorName(err)) catch {};
+    }
+
+    fn persistSelectedModel(self: *App, model: ai_types.Model) !void {
+        var store = try tui_config.Store.initDefault(self.allocator);
+        defer store.deinit();
+        var cfg = try store.load();
+        defer cfg.deinit(self.allocator);
+
+        try replaceOwnedString(self.allocator, &cfg.model, model.id);
+        try replaceOwnedString(self.allocator, &cfg.provider, model.provider);
+        try replaceOwnedString(self.allocator, &cfg.api, model.api);
+        try store.save(cfg);
+    }
+
+    fn replaceOwnedString(allocator: std.mem.Allocator, field: *[]u8, value: []const u8) !void {
+        const next = try allocator.dupe(u8, value);
+        allocator.free(field.*);
+        field.* = next;
+    }
+
+    /// Stage text for the system clipboard. The bytes are copied; the actual
+    /// OSC 52 write happens in `update` via `flushClipboard`.
+    fn stageClipboard(self: *App, text: []const u8) void {
+        const dup = self.allocator.dupe(u8, text) catch return;
+        if (self.pending_clipboard) |old| self.allocator.free(old);
+        self.pending_clipboard = dup;
+    }
+
+    /// Write any staged clipboard text to the terminal's clipboard (OSC 52).
+    fn flushClipboard(self: *App, ctx: *zz.Context) void {
+        const text = self.pending_clipboard orelse return;
+        self.pending_clipboard = null;
+        defer self.allocator.free(text);
+        _ = ctx.setClipboard(text) catch {};
+    }
+
+    /// Copy the most recent assistant reply to the system clipboard.
+    fn copyLastAssistant(self: *App) void {
+        const text = self.state.lastAssistantText() orelse {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        };
+        self.stageClipboard(text);
+        self.state.appendTranscript(.system, "copied last reply to clipboard") catch {};
+    }
+
+    /// Copy the full transcript to the system clipboard.
+    fn copyTranscript(self: *App) void {
+        const text = self.state.transcriptToText(self.allocator) catch {
+            self.recordError("copy failed") catch {};
+            return;
+        };
+        defer self.allocator.free(text);
+        if (text.len == 0) {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        }
+        self.stageClipboard(text);
+        self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
+    }
+
+    fn cycleThinkingLevel(self: *App) void {
+        const level = self.state.cycleThinkingLevel();
+        if (self.runtime) |runtime| runtime.setThinkingLevel(level);
+    }
+
     pub fn appendWelcome(self: *App) !void {
         if (self.state.sessions.items.len == 0) {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
             const tips = if (self.supportsStreamingShortcuts())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands"
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • /sessions resumes • Ctrl+G editor • Ctrl+R thinking • /help commands";
+                "Enter submit • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -652,7 +1219,7 @@ fn runEditorPerform() ?TuiModel.Msg {
     return TuiModel.Msg{ .editor_done = content };
 }
 
-const TuiModel = struct {
+pub const TuiModel = struct {
     app: ?App = null,
     options: tui_runtime.TuiRuntimeOptions = .{},
 
@@ -682,10 +1249,7 @@ const TuiModel = struct {
             };
             app.appendWelcome() catch |err| app.recordError(@errorName(err)) catch {};
         }
-        return .{ .batch = &.{
-            .{ .every = 50 * std.time.ns_per_ms },
-            .enable_mouse,
-        } };
+        return .{ .every = 50 * std.time.ns_per_ms };
     }
 
     pub fn deinit(self: *TuiModel) void {
@@ -722,14 +1286,19 @@ const TuiModel = struct {
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
                         },
-                        'r' => {
-                            app.state.toggleThinking();
+                        'y' => {
+                            app.copyLastAssistant();
+                            app.flushClipboard(ctx);
                             return .none;
                         },
                         else => return .none,
                     },
                     else => {},
                 };
+                if (key.key == .tab and key.modifiers.eql(.{ .shift = true })) {
+                    app.cycleThinkingLevel();
+                    return .none;
+                }
                 if (app.state.mode == .approval) {
                     switch (key.key) {
                         .char => |c| switch (c) {
@@ -761,10 +1330,58 @@ const TuiModel = struct {
                     }
                     return .none;
                 }
+                // Pasted-input prompt during an OAuth login flow.
+                if (app.state.mode == .login_input) {
+                    switch (key.key) {
+                        .enter => {
+                            const text = app.state.composer.text();
+                            app.submitLoginInput(text);
+                            app.state.composer.clear();
+                        },
+                        .escape => app.cancelLogin(),
+                        .backspace => _ = app.state.composer.deleteBeforeCursor(),
+                        .char => |c| appendChar(app, c) catch {},
+                        .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
+                        .left => _ = app.state.composer.moveCursorPrev(),
+                        .right => _ = app.state.composer.moveCursorNext(),
+                        .home => app.state.composer.moveCursorHome(),
+                        .end => app.state.composer.moveCursorEnd(),
+                        else => {},
+                    }
+                    return .none;
+                }
+                // Single-column selector menu navigation.
+                if (isMenuMode(app.state.mode)) {
+                    switch (key.key) {
+                        .up => app.moveMenuSelection(-1),
+                        .down => app.moveMenuSelection(1),
+                        .char => |c| switch (c) {
+                            'k' => app.moveMenuSelection(-1),
+                            'j' => app.moveMenuSelection(1),
+                            else => {},
+                        },
+                        .enter => {
+                            if (app.state.mode == .model_picker) {
+                                app.applySelectedModel() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .login_picker) {
+                                app.applySelectedLogin() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .permission_picker) {
+                                app.applySelectedPermission() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .view_picker) {
+                                app.applySelectedView() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .thinking_picker) {
+                                app.applySelectedThinking() catch |err| app.recordError(@errorName(err)) catch {};
+                            }
+                        },
+                        .escape => app.state.mode = .normal,
+                        else => {},
+                    }
+                    return .none;
+                }
                 switch (key.key) {
                     .enter => {
                         if (key.modifiers.shift) {
-                            app.state.composer.buffer.append(app.allocator, '\n') catch |err| app.recordError(@errorName(err)) catch {};
+                            app.state.composer.insertSlice(app.allocator, "\n") catch |err| app.recordError(@errorName(err)) catch {};
                             return .none;
                         }
                         app.drainEvents() catch |err| {
@@ -799,9 +1416,13 @@ const TuiModel = struct {
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
                     },
-                    .backspace => deleteLastCodepoint(app),
+                    .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
-                    .space => app.state.composer.buffer.append(app.allocator, ' ') catch {},
+                    .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
+                    .left => _ = app.state.composer.moveCursorPrev(),
+                    .right => _ = app.state.composer.moveCursorNext(),
+                    .home => app.state.composer.moveCursorHome(),
+                    .end => app.state.composer.moveCursorEnd(),
                     .up => {
                         if (!(app.state.composerHistoryPrev() catch false)) app.state.transcript_scroll += 1;
                     },
@@ -815,16 +1436,17 @@ const TuiModel = struct {
                     else => {},
                 }
             },
-            .mouse => |mouse| {
-                if (mouse.event_type == .press) switch (mouse.button) {
-                    .wheel_up => app.state.transcript_scroll += 3,
-                    .wheel_down => app.state.transcript_scroll -|= 3,
-                    else => {},
-                };
+            .mouse => |mouse| handleMouse(app, mouse),
+            .tick => {
+                app.state.anim_tick +%= 1;
+                app.drainEvents() catch {};
+                app.pollLogin() catch {};
             },
-            .tick => app.drainEvents() catch {},
             .quit => return .quit,
         }
+        // A command (e.g. `/copy`) may have staged clipboard text; flush it now
+        // that a mutable Context is in hand.
+        app.flushClipboard(ctx);
         return .none;
     }
 
@@ -833,39 +1455,143 @@ const TuiModel = struct {
         const width: usize = @max(ctx.width, 20);
         const height: usize = @max(ctx.height, 8);
         app.last_view_height = height;
+        // A single one-line status bar sits below the composer; the transcript
+        // fills the rest of the screen. The tool panel and verbose telemetry
+        // panel were removed — their context/token data already lives in the
+        // status line, and tool details are available via `/tools`.
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
             .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
         }) catch "";
-        const tool_height: usize = if (app.state.tools.items.len > 0) @min(@as(usize, 8), height / 4) else 2;
-        const tools = tool_panel_view.render(ctx.allocator, &app.state, .{ .width = width, .height = tool_height }) catch "";
-        const telemetry = telemetry_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
             .session_picker => session_picker_view.render(ctx.allocator, &app.state, .{ .width = width, .height = sessionPickerHeight(app), .offset = app.state.session_scroll }) catch "",
+            .model_picker => blk: {
+                const models = if (app.runtime) |runtime| runtime.availableModels() else &[_]ai_types.Model{};
+                const items = ctx.allocator.alloc(menu_picker_view.Item, models.len) catch break :blk "";
+                for (models, 0..) |model, i| items[i] = .{ .label = model.id, .detail = model.provider };
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Select model",
+                    .items = items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                    .empty_message = "  no models available",
+                }) catch "";
+            },
+            .login_picker => blk: {
+                var items: [App.login_providers.len]menu_picker_view.Item = undefined;
+                for (App.login_providers, 0..) |provider, i| items[i] = .{ .label = provider };
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Login provider",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .permission_picker => blk: {
+                var items: [App.permission_modes.len]menu_picker_view.Item = undefined;
+                for (App.permission_modes, 0..) |mode, i| {
+                    items[i] = .{ .label = @tagName(mode), .detail = permissionModeDetail(mode) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Tool permissions",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .view_picker => blk: {
+                var items: [App.view_modes.len]menu_picker_view.Item = undefined;
+                for (App.view_modes, 0..) |mode, i| {
+                    items[i] = .{ .label = @tagName(mode), .detail = viewModeDetail(mode) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Transcript view",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .thinking_picker => blk: {
+                var items: [App.thinking_levels.len]menu_picker_view.Item = undefined;
+                for (App.thinking_levels, 0..) |level, i| {
+                    items[i] = .{ .label = @tagName(level), .detail = thinkingLevelDetail(level) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Thinking level",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .login_input => "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + countLines(tools) + countLines(telemetry) + @max(countLines(extra), 1);
+        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, tools, telemetry, extra, status, composer }) catch "";
+        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
     }
 
     fn appendChar(app: *App, c: u21) !void {
         var buf: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(c, &buf);
-        try app.state.composer.buffer.appendSlice(app.allocator, buf[0..len]);
+        try app.state.composer.insertSlice(app.allocator, buf[0..len]);
     }
 
-    fn deleteLastCodepoint(app: *App) void {
-        const text = app.state.composer.buffer.items;
-        if (text.len == 0) return;
-        var idx = text.len - 1;
-        while (idx > 0 and (text[idx] & 0b1100_0000) == 0b1000_0000) idx -= 1;
-        app.state.composer.buffer.shrinkRetainingCapacity(idx);
+    fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
+        if (mouse.event_type != .press) return;
+        switch (mouse.button) {
+            .wheel_up => app.state.transcript_scroll += 3,
+            .wheel_down => app.state.transcript_scroll -|= 3,
+            else => {},
+        }
+    }
+
+    fn isMenuMode(mode: tui_state.AppMode) bool {
+        return switch (mode) {
+            .model_picker, .login_picker, .permission_picker, .view_picker, .thinking_picker => true,
+            else => false,
+        };
+    }
+
+    fn permissionModeDetail(mode: tui_runtime.PermissionMode) []const u8 {
+        return switch (mode) {
+            .bypass => "run tools without prompts",
+            .ask => "ask before tool execution",
+        };
+    }
+
+    fn viewModeDetail(mode: tui_state.TranscriptVisibilityMode) []const u8 {
+        return switch (mode) {
+            .everything => "full protocol log",
+            .verbose => "more internals",
+            .balanced => "balanced details",
+            .chat => "mostly messages",
+        };
+    }
+
+    fn thinkingLevelDetail(level: ai_types.ThinkingLevel) []const u8 {
+        return switch (level) {
+            .off => "disabled",
+            .minimal, .low => "light reasoning",
+            .medium => "balanced reasoning",
+            .high => "deeper reasoning",
+            .xhigh => "maximum reasoning",
+        };
     }
 
     fn countLines(text: []const u8) usize {
@@ -1005,10 +1731,19 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
     defer production.deinit();
     production.initBridge();
 
-    var program = zz.Program(TuiModel).init(allocator, io, &environ_map);
+    var program = zz.Program(TuiModel).initWithOptions(allocator, io, &environ_map, tuiProgramOptions());
     program.model = .{ .options = production.options() };
     defer program.deinit();
     try program.run();
+}
+
+fn tuiProgramOptions() zz.Options {
+    return .{ .kitty_keyboard = true, .mouse = false };
+}
+
+pub fn tuiProgramOptionsForTest() zz.Options {
+    if (!@import("builtin").is_test) @compileError("test-only helper");
+    return tuiProgramOptions();
 }
 
 test "App init seeds registered tools from runtime" {
@@ -1022,6 +1757,117 @@ test "App init seeds registered tools from runtime" {
     try std.testing.expectEqual(app.runtime.?.availableTools().len, app.state.registered_tools.items.len);
     try std.testing.expectEqualStrings("shell_execute", app.state.registered_tools.items[0].name);
     try std.testing.expect(app.runtime.?.permission_engine.?.workspace_root.len > 0);
+}
+
+test "App refreshes runtime models after login" {
+    const extra_model = ai_types.Model{
+        .id = "temporary-extra-model",
+        .name = "Temporary Extra",
+        .api = "test-api",
+        .provider = "test",
+        .base_url = "https://example.invalid",
+        .reasoning = false,
+        .input = &.{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{ extra_model, defaultModel() }, .initial_model_id = "temporary-extra-model" });
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+
+    try std.testing.expectEqual(@as(usize, 2), runtime.availableModels().len);
+    try app.refreshModelsAfterLogin();
+    try std.testing.expectEqual(@as(usize, 1), runtime.availableModels().len);
+    try std.testing.expectEqualStrings(defaultModel().id, runtime.currentModel().?.id);
+}
+
+test "TUI program enables enhanced keyboard protocol" {
+    try std.testing.expect(tuiProgramOptions().kitty_keyboard);
+}
+
+test "TUI program leaves plain mouse selection to the terminal" {
+    try std.testing.expect(!tuiProgramOptions().mouse);
+}
+
+test "saved model ref loads from config store" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer std.testing.allocator.free(base);
+
+    var store = try tui_config.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    std.testing.allocator.free(cfg.model);
+    cfg.model = try std.testing.allocator.dupe(u8, "persisted-model");
+    std.testing.allocator.free(cfg.provider);
+    cfg.provider = try std.testing.allocator.dupe(u8, "persisted-provider");
+    std.testing.allocator.free(cfg.api);
+    cfg.api = try std.testing.allocator.dupe(u8, "persisted-api");
+    try store.save(cfg);
+
+    var model_ref = (try loadSavedModelRefFromStore(std.testing.allocator, store)).?;
+    defer model_ref.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("persisted-model", model_ref.id);
+    try std.testing.expectEqualStrings("persisted-provider", model_ref.provider);
+    try std.testing.expectEqualStrings("persisted-api", model_ref.api);
+}
+
+test "App saveEvent keeps debug-visible event types" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    defer std.testing.allocator.free(base);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    app.session_id = try std.testing.allocator.dupe(u8, "save-debug-events");
+    app.session_created_at = 1;
+
+    var thinking = tui_runtime.TuiEvent{ .thinking_delta = .{ .content_index = 0, .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "plan")) } };
+    defer thinking.deinit(std.testing.allocator);
+    app.saveEvent(thinking);
+
+    var approval = tui_runtime.TuiEvent{ .tool_approval_requested = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"command\":\"pwd\"}")),
+    } };
+    defer approval.deinit(std.testing.allocator);
+    app.saveEvent(approval);
+
+    var update = tui_runtime.TuiEvent{ .tool_execution_update = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "call-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"command\":\"pwd\"}")),
+        .partial_result_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"stdout\":\"/tmp\"}")),
+    } };
+    defer update.deinit(std.testing.allocator);
+    app.saveEvent(update);
+
+    var provider = tui_runtime.TuiEvent{ .provider_event = .{ .event_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{\"type\":\"done\"}")) } };
+    defer provider.deinit(std.testing.allocator);
+    app.saveEvent(provider);
+
+    var err = tui_runtime.TuiEvent{ .@"error" = .{ .message = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "boom")) } };
+    defer err.deinit(std.testing.allocator);
+    app.saveEvent(err);
+
+    var loaded = try app.store.?.load("save-debug-events");
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 5), loaded.events.items.len);
+    try std.testing.expect(loaded.events.items[0] == .thinking_delta);
+    try std.testing.expect(loaded.events.items[1] == .tool_approval_requested);
+    try std.testing.expect(loaded.events.items[2] == .tool_execution_update);
+    try std.testing.expect(loaded.events.items[3] == .provider_event);
+    try std.testing.expectEqualStrings("{\"type\":\"done\"}", loaded.events.items[3].provider_event.event_json.slice());
+    try std.testing.expect(loaded.events.items[4] == .@"error");
 }
 
 test "App approval decisions map to requested choices" {
@@ -1063,6 +1909,41 @@ test "App submit routes help command to system transcript" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
+}
+
+test "App submit starts direct OpenAI Codex login command" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.submit("/login openai-codex");
+
+    try std.testing.expect(app.login != null);
+    try std.testing.expectEqualStrings("openai-codex", app.login.?.provider_id);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for openai-codex") != null);
+}
+
+test "multi-line /help output renders all lines into transcript view" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/help");
+
+    const rendered = try transcript_view.render(std.testing.allocator, &app.state, .{ .width = 100, .height = 30 });
+    defer std.testing.allocator.free(rendered);
+
+    // Every command name must appear in the rendered transcript — the previous
+    // bug (inline_style theme stripped newlines) collapsed the whole help
+    // listing to a single truncated line.
+    const expect = [_][]const u8{
+        "/help",  "/model",       "/provider", "/status",
+        "/tools", "/permissions", "/view",     "/compact",
+        "/clear", "/diff",        "/quit",
+    };
+    for (expect) |needle| {
+        if (std.mem.indexOf(u8, rendered, needle) == null) {
+            std.debug.print("missing {s} in rendered output:\n{s}\n", .{ needle, rendered });
+            return error.TestExpectedHelpLine;
+        }
+    }
 }
 
 test "App submit routes unknown command to error transcript" {
@@ -1133,6 +2014,7 @@ const MockAppSession = struct {
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
                 .switch_model = switchModel,
+                .switch_model_exact = switchModelExact,
                 .current_model = currentModel,
                 .decide_tool_approval = decideToolApproval,
                 .stream_events = streamEvents,
@@ -1187,6 +2069,11 @@ const MockAppSession = struct {
     fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
         _ = ctx;
         _ = model_id;
+    }
+
+    fn switchModelExact(ctx: ?*anyopaque, model: ai_types.Model) anyerror!void {
+        _ = ctx;
+        _ = model;
     }
 
     fn currentModel(ctx: ?*anyopaque) ?ai_types.Model {
@@ -1261,10 +2148,61 @@ test "TuiModel exits quit command while streaming" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/quit");
+    try model.app.?.state.replaceComposerBuffer("/quit");
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).quit, cmd);
+}
+
+test "TuiModel Shift Enter inserts newline without submitting" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    try model.app.?.state.replaceComposerBuffer("first");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .shift = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqualStrings("first\n", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
+}
+
+test "TuiModel Shift Tab cycles thinking level" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    try std.testing.expectEqual(ai_types.ThinkingLevel.low, model.app.?.state.thinking_level);
+    const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
+}
+
+test "setting pickers apply selected values" {
+    const runtime_ptr = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    runtime_ptr.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime_ptr;
+
+    app.openViewPicker();
+    try std.testing.expectEqual(tui_state.AppMode.view_picker, app.state.mode);
+    app.state.menu_index = 0;
+    try app.applySelectedView();
+    try std.testing.expectEqual(tui_state.TranscriptVisibilityMode.everything, app.state.transcript_mode);
+    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
+
+    app.openThinkingPicker();
+    try std.testing.expectEqual(tui_state.AppMode.thinking_picker, app.state.mode);
+    app.state.menu_index = 3;
+    try app.applySelectedThinking();
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, app.state.thinking_level);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, runtime_ptr.thinkingLevel());
+
+    app.openPermissionPicker();
+    try std.testing.expectEqual(tui_state.AppMode.permission_picker, app.state.mode);
+    app.state.menu_index = 1;
+    try app.applySelectedPermission();
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, app.state.permission_mode);
+    try std.testing.expectEqual(tui_runtime.PermissionMode.ask, runtime_ptr.permissionMode());
 }
 
 test "TuiModel drains events before routing Enter while streaming" {
@@ -1328,6 +2266,20 @@ test "TuiModel stops Enter routing when drained event enters approval mode" {
     try std.testing.expectEqualStrings("should wait", model.app.?.state.composer.text());
 }
 
+test "TuiModel moves composer cursor and edits in place" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'a' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'b' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'c' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .left } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'X' } } }, undefined);
+    try std.testing.expectEqualStrings("abXc", model.app.?.state.composer.text());
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    try std.testing.expectEqualStrings("abc", model.app.?.state.composer.text());
+}
+
 test "session picker navigation pages through hidden rows" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -1348,8 +2300,13 @@ test "session picker navigation pages through hidden rows" {
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
 }
 
-fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !tui_runtime.TuiRuntime {
-    return tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote });
+fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
+    const runtime = try allocator.create(tui_runtime.TuiRuntime);
+    runtime.* = tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote }) catch |err| {
+        allocator.destroy(runtime);
+        return err;
+    };
+    return runtime;
 }
 
 test "resume selected session rejects remote runtime before store replay" {
