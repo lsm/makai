@@ -200,6 +200,8 @@ pub const TuiRuntime = struct {
     remote_follow_up_queue: std.ArrayList(ai_types.Message) = .empty,
     remote_auto_resume_pending: bool = false,
     remote_echo_suppression_remaining: usize = 0,
+    remote_turn_in_flight: bool = false,
+    remote_current_message_role: ?TuiEvent.MessageRole = null,
     last_turn_stop_reason: ?ai_types.StopReason = null,
     compact_output: bool = false,
     run_async: bool = true,
@@ -731,6 +733,7 @@ pub const TuiRuntime = struct {
             .remote => {
                 if (!self.started) try self.start();
                 if (self.stream_active and !self.event_stream.isDone()) return error.AgentAlreadyStreaming;
+                if (self.remote_turn_in_flight) return error.AgentAlreadyStreaming;
                 self.clearRemoteQueues();
                 self.clearRemoteMessages();
                 errdefer self.clearRemoteMessages();
@@ -1045,10 +1048,12 @@ pub const TuiRuntime = struct {
         self.remote_error_emitted = false;
         self.remote_reconnect_attempted = false;
         client.clearSessionTerminalState(sid);
+        self.remote_turn_in_flight = true;
         self.last_turn_stop_reason = null;
         const options_json = try self.remoteMessageOptionsJson();
         defer self.allocator.free(options_json);
-        self.remote_echo_suppression_remaining = messages.len;
+        self.remote_echo_suppression_remaining = if (messages.len > 0) messages.len - 1 else 0;
+        self.remote_current_message_role = null;
         _ = try client.sendAgentMessage(sid, message_json, options_json);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
@@ -1193,14 +1198,26 @@ pub const TuiRuntime = struct {
         }
         const sid = self.remote_session_id orelse self.remote_pending_session_id;
         if (sid) |session_id| {
+            if (client.isSessionComplete(session_id)) {
+                self.remote_turn_in_flight = false;
+                if (client.getLastResultJsonForSession(session_id)) |json| try self.recordRemoteResultJson(json);
+            }
             if (!self.remote_error_emitted) {
                 if (client.getLastErrorForSession(session_id)) |msg| {
+                    self.remote_turn_in_flight = false;
                     self.remote_error_emitted = true;
                     self.remote_pending_session_id = null;
                     try self.completeRemoteWithError(msg);
                 }
             }
         }
+    }
+
+    fn recordRemoteResultJson(self: *TuiRuntime, json: []const u8) !void {
+        if (self.remote_messages.items.len > 0 and self.remote_messages.items[self.remote_messages.items.len - 1] == .assistant) return;
+        var msg = (transport.deserialize(json, self.allocator) catch return).result;
+        defer msg.deinit(self.allocator);
+        try self.recordRemoteAssistantMessage(msg);
     }
 
     fn messageRole(message: ai_types.Message) TuiEvent.MessageRole {
@@ -1405,7 +1422,9 @@ pub const TuiRuntime = struct {
         if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
         if (std.mem.eql(u8, type_name, "message_start")) {
             if (self.remote_echo_suppression_remaining > 0) return;
-            return self.push(.{ .message_start = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+            const role = parseRemoteMessageRole(getJsonString(obj, "role"));
+            self.remote_current_message_role = role;
+            return self.push(.{ .message_start = .{ .role = role } });
         }
         if (std.mem.eql(u8, type_name, "message_end")) {
             if (obj.get("message")) |message_value| {
@@ -1426,7 +1445,9 @@ pub const TuiRuntime = struct {
                 self.remote_echo_suppression_remaining -= 1;
                 return;
             }
-            return self.push(.{ .message_end = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+            const role = if (getJsonString(obj, "role")) |role_text| parseRemoteMessageRole(role_text) else self.remote_current_message_role orelse .assistant;
+            self.remote_current_message_role = null;
+            return self.push(.{ .message_end = .{ .role = role } });
         }
         if (std.mem.eql(u8, type_name, "message_update")) {
             const event_value = obj.get("event") orelse return error.InvalidRemoteEvent;
@@ -1631,6 +1652,8 @@ pub const TuiRuntime = struct {
     fn clearRemoteQueues(self: *TuiRuntime) void {
         self.remote_auto_resume_pending = false;
         self.remote_echo_suppression_remaining = 0;
+        self.remote_turn_in_flight = false;
+        self.remote_current_message_role = null;
         for (self.remote_steering_queue.items) |*message| message.deinit(self.allocator);
         self.remote_steering_queue.clearRetainingCapacity();
         for (self.remote_follow_up_queue.items) |*message| message.deinit(self.allocator);
