@@ -12,6 +12,7 @@ const agent_protocol_runtime = @import("agent_protocol_runtime");
 const transport = @import("transport");
 const in_process = @import("transports/in_process");
 const stdio_transport = @import("transports/stdio");
+const sse_transport = @import("transports/sse");
 const json_writer = @import("json_writer");
 const model_ref = @import("model_ref");
 const session = @import("tui_session");
@@ -100,6 +101,7 @@ pub const TuiRemoteConfig = struct {
     mode: TuiBackendMode = .local,
     transport: TuiRemoteTransport = .stdio,
     endpoint: []const u8 = "",
+    auth_headers: []const ai_types.HeaderPair = &.{},
 };
 
 pub const TuiRuntimeOptions = struct {
@@ -167,6 +169,7 @@ pub const TuiRuntime = struct {
     remote_config_sender: ?*stdio_transport.AsyncStdioSender = null,
     remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null,
     remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null,
+    remote_config_sse_client: ?*sse_transport.SseHttpClient = null,
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
@@ -243,6 +246,7 @@ pub const TuiRuntime = struct {
         var remote_config_sender: ?*stdio_transport.AsyncStdioSender = null;
         var remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null;
         var remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null;
+        var remote_config_sse_client: ?*sse_transport.SseHttpClient = null;
         var remote_sender = options.remote_sender;
         var remote_receiver = options.remote_receiver;
         errdefer if (remote_config_stream_handle) |handle| {
@@ -251,6 +255,10 @@ pub const TuiRuntime = struct {
         };
         errdefer if (remote_config_sender) |sender| allocator.destroy(sender);
         errdefer if (remote_config_receiver) |receiver| allocator.destroy(receiver);
+        errdefer if (remote_config_sse_client) |client| {
+            client.deinit();
+            allocator.destroy(client);
+        };
         if (resolved_backend == .remote and remote_sender == null and remote_receiver == null and options.remote_config.mode == .remote) {
             switch (options.remote_config.transport) {
                 .stdio => {
@@ -283,7 +291,16 @@ pub const TuiRuntime = struct {
                     remote_sender = sender.sender();
                     remote_receiver = .{ .ctx = handle, .read_line_fn = remoteConfigStdioReadLine, .read_result_fn = remoteConfigStdioReadResult, .close_fn = remoteConfigStdioClose };
                 },
-                .sse, .websocket => return error.UnsupportedRemoteTransport,
+                .sse => {
+                    if (options.remote_config.endpoint.len == 0) return error.UnsupportedRemoteEndpoint;
+                    const client = try allocator.create(sse_transport.SseHttpClient);
+                    client.* = sse_transport.SseHttpClient.init(allocator);
+                    try client.connect(options.remote_config.endpoint, options.remote_config.auth_headers);
+                    remote_config_sse_client = client;
+                    remote_sender = client.asyncSender();
+                    remote_receiver = .{ .ctx = client, .read_line_fn = remoteConfigSseReadLine, .read_result_fn = remoteConfigSseReadResult, .close_fn = remoteConfigSseClose };
+                },
+                .websocket => return error.UnsupportedRemoteTransport,
             }
         }
 
@@ -300,6 +317,7 @@ pub const TuiRuntime = struct {
             .remote_config_sender = remote_config_sender,
             .remote_config_receiver = remote_config_receiver,
             .remote_config_stream_handle = remote_config_stream_handle,
+            .remote_config_sse_client = remote_config_sse_client,
             .remote_sender = remote_sender,
             .remote_receiver = remote_receiver,
             .remote_session_timeout_ms = options.remote_session_timeout_ms,
@@ -324,6 +342,7 @@ pub const TuiRuntime = struct {
         remote_config_sender = null;
         remote_config_receiver = null;
         remote_config_stream_handle = null;
+        remote_config_sse_client = null;
         original_tools = &.{};
         wrapped_tools = &.{};
         models = &.{};
@@ -378,6 +397,10 @@ pub const TuiRuntime = struct {
         }
         if (self.remote_config_receiver) |receiver| self.allocator.destroy(receiver);
         if (self.remote_config_sender) |sender| self.allocator.destroy(sender);
+        if (self.remote_config_sse_client) |client| {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
         self.clearPendingApproval();
         self.tool_protocol.deinit();
         self.allocator.free(self.workspace_root);
@@ -1616,6 +1639,24 @@ fn remoteConfigStdioReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !R
 fn remoteConfigStdioClose(ctx: *anyopaque) void {
     const handle: *stdio_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
     handle.cancel();
+}
+
+fn remoteConfigSseReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
+    return switch (try remoteConfigSseReadResult(ctx, allocator)) {
+        .line => |line| line,
+        .pending, .disconnected => null,
+    };
+}
+
+fn remoteConfigSseReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
+    const client: *sse_transport.SseHttpClient = @ptrCast(@alignCast(ctx));
+    if (try client.readLine(allocator)) |line| return .{ .line = line };
+    return if (client.connected) .pending else .disconnected;
+}
+
+fn remoteConfigSseClose(ctx: *anyopaque) void {
+    const client: *sse_transport.SseHttpClient = @ptrCast(@alignCast(ctx));
+    client.close();
 }
 
 fn parseStopReason(value: []const u8) ai_types.StopReason {

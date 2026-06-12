@@ -1,6 +1,8 @@
 const std = @import("std");
 const transport = @import("transport");
 const sse_parser = @import("sse_parser");
+const ai_types = @import("ai_types");
+const compat = @import("compat");
 
 fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
@@ -114,6 +116,184 @@ pub const SseReceiver = struct {
     fn closeFn(ctx: *anyopaque) void {
         const self: *SseReceiver = @ptrCast(@alignCast(ctx));
         self.deinit();
+    }
+};
+
+pub const ParsedHttpUrl = struct {
+    scheme: Scheme,
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+
+    pub const Scheme = enum { http, https };
+};
+
+pub fn parseHttpUrl(url: []const u8) !ParsedHttpUrl {
+    var result = ParsedHttpUrl{ .scheme = .http, .host = "", .port = 80, .path = "/" };
+    var offset: usize = 0;
+    if (std.mem.startsWith(u8, url, "http://")) {
+        offset = 7;
+    } else if (std.mem.startsWith(u8, url, "https://")) {
+        result.scheme = .https;
+        result.port = 443;
+        offset = 8;
+    } else {
+        return error.InvalidScheme;
+    }
+
+    const host_start = offset;
+    var host_end = url.len;
+    if (std.mem.indexOfScalarPos(u8, url, offset, '/')) |slash| host_end = slash;
+    if (std.mem.indexOfScalarPos(u8, url, offset, ':')) |colon| {
+        if (colon < host_end) {
+            host_end = colon;
+            const port_end = std.mem.indexOfScalarPos(u8, url, colon + 1, '/') orelse url.len;
+            result.port = try std.fmt.parseInt(u16, url[colon + 1 .. port_end], 10);
+            offset = port_end;
+        } else offset = host_end;
+    } else offset = host_end;
+
+    if (host_end == host_start) return error.InvalidUrl;
+    result.host = url[host_start..host_end];
+    if (offset < url.len) result.path = url[offset..];
+    return result;
+}
+
+pub const SseHttpClient = struct {
+    allocator: std.mem.Allocator,
+    endpoint: []u8 = &.{},
+    headers: []ai_types.HeaderPair = &.{},
+    stream: ?compat.net.Stream = null,
+    parser: sse_parser.SSEParser,
+    pending: std.ArrayList([]u8) = .empty,
+    pending_index: usize = 0,
+    read_buf: [4096]u8 = undefined,
+    transfer_buf: [4096]u8 = undefined,
+    connected: bool = false,
+
+    pub fn init(allocator: std.mem.Allocator) SseHttpClient {
+        return .{ .allocator = allocator, .parser = sse_parser.SSEParser.init(allocator) };
+    }
+
+    pub fn deinit(self: *SseHttpClient) void {
+        self.close();
+        for (self.headers) |*header| header.deinit(self.allocator);
+        if (self.headers.len > 0) self.allocator.free(self.headers);
+        if (self.endpoint.len > 0) self.allocator.free(self.endpoint);
+        self.pending.deinit(self.allocator);
+        self.parser.deinit();
+        self.* = undefined;
+    }
+
+    pub fn connect(self: *SseHttpClient, url: []const u8, headers: []const ai_types.HeaderPair) !void {
+        self.close();
+        const parsed = parseHttpUrl(url) catch return error.InvalidUrl;
+        if (parsed.scheme == .https) return error.TlsNotSupported;
+        if (self.endpoint.len > 0) self.allocator.free(self.endpoint);
+        self.endpoint = try self.allocator.dupe(u8, url);
+        try self.replaceHeaders(headers);
+        var stream = compat.net.tcpConnectHost(self.allocator, parsed.host, parsed.port) catch return error.ConnectionFailed;
+        errdefer stream.close();
+        var request = std.ArrayList(u8).empty;
+        defer request.deinit(self.allocator);
+        try request.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n", .{ parsed.path, parsed.host });
+        for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+        try request.appendSlice(self.allocator, "\r\n");
+        stream.writeAll(request.items) catch return error.ConnectionFailed;
+        try self.readResponseHeaders(&stream);
+        self.stream = stream;
+        self.connected = true;
+    }
+
+    pub fn asyncSender(self: *SseHttpClient) transport.AsyncSender {
+        return .{ .context = @ptrCast(self), .write_fn = writeFn, .flush_fn = flushFn, .close_fn = closeFn };
+    }
+
+    pub fn readLine(self: *SseHttpClient, allocator: std.mem.Allocator) !?[]const u8 {
+        while (true) {
+            if (self.pending_index < self.pending.items.len) {
+                const data = self.pending.items[self.pending_index];
+                self.pending_index += 1;
+                if (allocator.ptr == self.allocator.ptr) return data;
+                defer self.allocator.free(data);
+                return try allocator.dupe(u8, data);
+            }
+            self.pending.clearRetainingCapacity();
+            self.pending_index = 0;
+            if (!self.connected) return null;
+            var stream = self.stream orelse return null;
+            const n = stream.read(&self.read_buf) catch return error.ConnectionFailed;
+            self.stream = stream;
+            if (n == 0) {
+                self.connected = false;
+                return null;
+            }
+            const events = try self.parser.feed(self.read_buf[0..n]);
+            for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+        }
+    }
+
+    pub fn close(self: *SseHttpClient) void {
+        if (self.stream) |*stream| stream.close();
+        self.stream = null;
+        for (self.pending.items[self.pending_index..]) |item| self.allocator.free(item);
+        self.pending.clearRetainingCapacity();
+        self.pending_index = 0;
+        self.connected = false;
+    }
+
+    fn replaceHeaders(self: *SseHttpClient, headers: []const ai_types.HeaderPair) !void {
+        for (self.headers) |*header| header.deinit(self.allocator);
+        if (self.headers.len > 0) self.allocator.free(self.headers);
+        self.headers = try self.allocator.alloc(ai_types.HeaderPair, headers.len);
+        for (headers, 0..) |header, i| self.headers[i] = .{ .name = try self.allocator.dupe(u8, header.name), .value = try self.allocator.dupe(u8, header.value) };
+    }
+
+    fn readResponseHeaders(self: *SseHttpClient, stream: *compat.net.Stream) !void {
+        var buffer = std.ArrayList(u8).empty;
+        defer buffer.deinit(self.allocator);
+        var tmp: [512]u8 = undefined;
+        while (std.mem.indexOf(u8, buffer.items, "\r\n\r\n") == null) {
+            const n = stream.read(&tmp) catch return error.ConnectionFailed;
+            if (n == 0) return error.ConnectionFailed;
+            try buffer.appendSlice(self.allocator, tmp[0..n]);
+            if (buffer.items.len > 16 * 1024) return error.UnexpectedStatus;
+        }
+        if (!std.mem.startsWith(u8, buffer.items, "HTTP/1.1 2") and !std.mem.startsWith(u8, buffer.items, "HTTP/1.0 2")) return error.UnexpectedStatus;
+        if (std.mem.indexOf(u8, buffer.items, "\r\n\r\n")) |headers_end| {
+            const body_start = headers_end + 4;
+            if (body_start < buffer.items.len) {
+                const events = try self.parser.feed(buffer.items[body_start..]);
+                for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+            }
+        }
+    }
+
+    fn post(self: *SseHttpClient, data: []const u8) !void {
+        if (self.endpoint.len == 0) return error.NotConnected;
+        const parsed = parseHttpUrl(self.endpoint) catch return error.InvalidUrl;
+        var stream = compat.net.tcpConnectHost(self.allocator, parsed.host, parsed.port) catch return error.ConnectionFailed;
+        defer stream.close();
+        var request = std.ArrayList(u8).empty;
+        defer request.deinit(self.allocator);
+        try request.print(self.allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ parsed.path, parsed.host, data.len });
+        for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+        try request.appendSlice(self.allocator, "\r\n");
+        try request.appendSlice(self.allocator, data);
+        stream.writeAll(request.items) catch return error.ConnectionFailed;
+        self.readResponseHeaders(&stream) catch return error.HttpPostFailed;
+    }
+
+    fn writeFn(ctx: *anyopaque, data: []const u8) !void {
+        const self: *SseHttpClient = @ptrCast(@alignCast(ctx));
+        try self.post(data);
+    }
+
+    fn flushFn(_: *anyopaque) !void {}
+
+    fn closeFn(ctx: *anyopaque) void {
+        const self: *SseHttpClient = @ptrCast(@alignCast(ctx));
+        self.close();
     }
 };
 
@@ -353,6 +533,93 @@ pub const AsyncSseReceiver = struct {
 
 // Tests
 
+const MockHttpSseServer = struct {
+    server: compat.net.Server,
+    thread: ?std.Thread = null,
+    saw_get_auth: bool = false,
+    saw_post_auth: bool = false,
+    saw_post_body: bool = false,
+
+    fn start(self: *MockHttpSseServer) !void {
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    fn stop(self: *MockHttpSseServer) void {
+        if (self.thread) |thread| thread.join();
+        compat.net.closeServer(&self.server);
+    }
+
+    fn serve(self: *MockHttpSseServer) void {
+        handleGet(self) catch return;
+        handlePost(self) catch return;
+    }
+
+    fn readRequest(allocator: std.mem.Allocator, stream: *compat.net.Stream) ![]u8 {
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        var tmp: [512]u8 = undefined;
+        while (true) {
+            const n = try stream.read(&tmp);
+            if (n == 0) break;
+            try buf.appendSlice(allocator, tmp[0..n]);
+            if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |headers_end| {
+                const content_length = parseContentLength(buf.items[0..headers_end]) orelse 0;
+                const total = headers_end + 4 + content_length;
+                while (buf.items.len < total) {
+                    const more = try stream.read(&tmp);
+                    if (more == 0) break;
+                    try buf.appendSlice(allocator, tmp[0..more]);
+                }
+                break;
+            }
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
+    fn parseContentLength(request: []const u8) ?usize {
+        var lines = std.mem.splitSequence(u8, request, "\r\n");
+        while (lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
+                return std.fmt.parseInt(usize, std.mem.trim(u8, line[15..], " \t"), 10) catch null;
+            }
+        }
+        return null;
+    }
+
+    fn handleGet(self: *MockHttpSseServer) !void {
+        var conn = try compat.net.accept(&self.server);
+        defer conn.stream.close();
+        const req = try readRequest(std.testing.allocator, &conn.stream);
+        defer std.testing.allocator.free(req);
+        self.saw_get_auth = std.mem.indexOf(u8, req, "Authorization: Bearer test-token") != null;
+        try conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"agent_started\"}\n\n");
+    }
+
+    fn handlePost(self: *MockHttpSseServer) !void {
+        var conn = try compat.net.accept(&self.server);
+        defer conn.stream.close();
+        const req = try readRequest(std.testing.allocator, &conn.stream);
+        defer std.testing.allocator.free(req);
+        self.saw_post_auth = std.mem.indexOf(u8, req, "Authorization: Bearer test-token") != null;
+        self.saw_post_body = std.mem.indexOf(u8, req, "{\"hello\":true}") != null;
+        try conn.stream.writeAll("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    }
+};
+
+test "parseHttpUrl validates HTTP SSE URLs" {
+    const a = try parseHttpUrl("http://127.0.0.1:8080/events");
+    try std.testing.expectEqual(ParsedHttpUrl.Scheme.http, a.scheme);
+    try std.testing.expectEqualStrings("127.0.0.1", a.host);
+    try std.testing.expectEqual(@as(u16, 8080), a.port);
+    try std.testing.expectEqualStrings("/events", a.path);
+    const b = try parseHttpUrl("https://example.com/sse");
+    try std.testing.expectEqual(ParsedHttpUrl.Scheme.https, b.scheme);
+    try std.testing.expectEqual(@as(u16, 443), b.port);
+    try std.testing.expectError(error.InvalidUrl, parseHttpUrl("http:///bad"));
+    try std.testing.expectError(error.InvalidScheme, parseHttpUrl("ws://example.com"));
+}
+
+
 test "SseSender writes SSE format" {
     // Create a pipe
     const pipe = try std.Io.Threaded.pipe2(.{});
@@ -420,7 +687,6 @@ test "SseSender and SseReceiver round-trip with transport" {
     var sse_sender = SseSender.init(write_file);
     var s = sse_sender.sender();
 
-    const ai_types = @import("ai_types");
     const empty_partial = ai_types.AssistantMessage{
         .content = &.{},
         .api = "",
