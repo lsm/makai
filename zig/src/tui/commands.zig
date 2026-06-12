@@ -19,6 +19,7 @@ pub const CommandKind = enum {
     clear,
     copy,
     diff,
+    abort,
     quit,
 };
 
@@ -95,6 +96,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
     .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
+    .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
 };
 
@@ -412,6 +414,29 @@ fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
     return .{ .output = try out.toOwnedSlice() };
 }
 
+fn handleAbort(ctx: CommandContext, command: Command) !CommandResult {
+    _ = command;
+    const active = ctx.state.status.streaming or
+        (ctx.runtime != null and ctx.runtime.?.stream_active);
+    if (active) {
+        if (ctx.session) |session| {
+            session.cancel();
+        } else if (ctx.runtime) |runtime| {
+            runtime.cancel();
+        } else {
+            return .{ .output = try ctx.allocator.dupe(u8, "Nothing to abort — agent is idle.") };
+        }
+        ctx.state.status.streaming = false;
+        ctx.state.stream_aborted = true;
+        if (ctx.state.mode == .approval) {
+            ctx.state.approval.deinit(ctx.allocator);
+            ctx.state.mode = .normal;
+        }
+        return .{ .output = try ctx.allocator.dupe(u8, "Turn aborted.") };
+    }
+    return .{ .output = try ctx.allocator.dupe(u8, "Nothing to abort — agent is idle.") };
+}
+
 fn handleQuit(ctx: CommandContext, command: Command) !CommandResult {
     _ = ctx;
     _ = command;
@@ -428,6 +453,11 @@ test "parse model command with argument" {
     const command = try parse("/model gpt-4o");
     try std.testing.expectEqual(CommandKind.model, command.kind);
     try std.testing.expectEqualStrings("gpt-4o", command.arg.?);
+}
+
+test "parse abort command" {
+    const command = try parse("/abort");
+    try std.testing.expectEqual(CommandKind.abort, command.kind);
 }
 
 test "parse unknown command returns unknown message" {
@@ -455,7 +485,7 @@ test "dispatch reaches command handlers" {
     _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .diff, .quit };
+    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .diff, .abort, .quit };
     for (kinds) |kind| {
         var result = try dispatch(ctx, .{ .kind = kind });
         defer result.deinit(std.testing.allocator);
@@ -654,3 +684,187 @@ test "copy command selects last reply or whole transcript" {
     defer all.deinit(std.testing.allocator);
     try std.testing.expectEqual(CommandAction.copy_all, all.action);
 }
+
+test "abort when idle reports idle" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Nothing to abort — agent is idle.", result.output);
+    try std.testing.expect(!state.status.streaming);
+}
+
+test "abort when streaming cancels session" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expect(!state.status.streaming);
+    try std.testing.expect(state.stream_aborted);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+}
+
+test "abort cancels active turn before streaming status is set" {
+    var runtime = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{ .backend = .local });
+    defer runtime.deinit();
+    runtime.stream_active = true;
+
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .runtime = &runtime }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expect(!state.status.streaming);
+    try std.testing.expect(state.stream_aborted);
+    try std.testing.expect(runtime.cancelled.load(.acquire));
+}
+
+test "abort during approval clears approval state" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+    state.mode = .approval;
+    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "{\"path\":\"README.md\"}");
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Turn aborted.", result.output);
+    try std.testing.expectEqual(tui_state.AppMode.normal, state.mode);
+    try std.testing.expectEqual(tui_state.ApprovalStatus.none, state.approval.status);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+}
+
+test "double abort is harmless after first cancellation" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var first = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Turn aborted.", first.output);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+
+    var second = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Nothing to abort — agent is idle.", second.output);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+}
+
+const MockAbortSession = struct {
+    cancel_count: usize = 0,
+    events: tui_runtime.TuiEventStream = undefined,
+    events_initialized: bool = false,
+
+    fn session(self: *MockAbortSession) tui_runtime.TuiSession {
+        return .{
+            .ctx = self,
+            .ops = .{
+                .start = mockStart,
+                .resume_session = mockResumeSession,
+                .cancel = mockCancel,
+                .submit_turn = mockSubmitTurn,
+                .steer = mockSteer,
+                .queue_follow_up = mockQueueFollowUp,
+                .clear_queued_messages = mockClearQueuedMessages,
+                .queued_counts = mockQueuedCounts,
+                .switch_model = mockSwitchModel,
+                .current_model = mockCurrentModel,
+                .decide_tool_approval = mockDecideToolApproval,
+                .stream_events = mockStreamEvents,
+            },
+        };
+    }
+
+    fn ptr(ctx: ?*anyopaque) *MockAbortSession {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn mockStart(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn mockResumeSession(ctx: ?*anyopaque) anyerror!void {
+        _ = ctx;
+    }
+
+    fn mockCancel(ctx: ?*anyopaque) void {
+        ptr(ctx).cancel_count += 1;
+    }
+
+    fn mockSubmitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        _ = ctx;
+        _ = text;
+    }
+
+    fn mockSteer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        _ = ctx;
+        _ = text;
+    }
+
+    fn mockQueueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
+        _ = ctx;
+        _ = text;
+    }
+
+    fn mockClearQueuedMessages(ctx: ?*anyopaque) void {
+        _ = ctx;
+    }
+
+    fn mockQueuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
+        _ = ctx;
+        return .{};
+    }
+
+    fn mockSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
+        _ = ctx;
+        _ = model_id;
+    }
+
+    fn mockCurrentModel(ctx: ?*anyopaque) ?ai_types.Model {
+        _ = ctx;
+        return null;
+    }
+
+    fn mockDecideToolApproval(ctx: ?*anyopaque, tool_call_id: []const u8, decision: tui_runtime.ToolApprovalDecision) anyerror!void {
+        _ = ctx;
+        _ = tool_call_id;
+        _ = decision;
+    }
+
+    fn eventStream(self: *MockAbortSession) *tui_runtime.TuiEventStream {
+        if (!self.events_initialized) {
+            self.events = tui_runtime.TuiEventStream.init(std.testing.allocator);
+            self.events_initialized = true;
+        }
+        return &self.events;
+    }
+
+    fn mockStreamEvents(ctx: ?*anyopaque) *tui_runtime.TuiEventStream {
+        return ptr(ctx).eventStream();
+    }
+
+    fn deinit(self: *MockAbortSession) void {
+        if (self.events_initialized) self.events.deinit();
+    }
+};

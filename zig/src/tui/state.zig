@@ -423,6 +423,10 @@ pub const AppState = struct {
     menu_scroll: usize = 0,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
+    /// Set when the user aborts the active turn. Lifecycle events from the
+    /// cancelled turn that are drained afterwards must not flip the status bar
+    /// back to streaming.
+    stream_aborted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) AppState {
         return .{ .allocator = allocator };
@@ -513,6 +517,7 @@ pub const AppState = struct {
         self.status.context_used = 0;
         self.status.turn_count = 0;
         self.status.streaming = false;
+        self.stream_aborted = false;
         if (self.status.last_error.len > 0) {
             self.allocator.free(self.status.last_error);
             self.status.last_error = &.{};
@@ -613,6 +618,10 @@ pub const AppState = struct {
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
         try self.appendProtocolEvent(event);
+        if (self.stream_aborted) switch (event) {
+            .turn_end, .agent_end, .@"error" => {},
+            else => return,
+        };
         switch (event) {
             .agent_start => {
                 self.status.streaming = true;
@@ -675,10 +684,12 @@ pub const AppState = struct {
             .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
             .turn_end => {
                 self.status.streaming = false;
+                self.stream_aborted = false;
                 self.cleanupActiveTranscriptEntries();
             },
             .agent_end => |payload| {
                 self.status.streaming = false;
+                self.stream_aborted = false;
                 self.cleanupActiveTranscriptEntries();
                 switch (payload.reason) {
                     .completed => {},
@@ -693,6 +704,7 @@ pub const AppState = struct {
             },
             .@"error" => |payload| {
                 self.cleanupActiveTranscriptEntries();
+                self.stream_aborted = false;
                 try self.status.setError(self.allocator, payload.message.slice());
                 try self.appendTranscript(.@"error", payload.message.slice());
             },
@@ -2079,4 +2091,20 @@ test "transcriptToText renders role-prefixed plain text" {
     const text = try state.transcriptToText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("> ping\npong\n[error] boom", text);
+}
+
+test "AppState stream_aborted ignores stale lifecycle events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    state.stream_aborted = true;
+    try state.applyEvent(.agent_start);
+    try std.testing.expect(!state.status.streaming);
+
+    try state.applyEvent(.turn_start);
+    try std.testing.expect(!state.status.streaming);
+
+    try state.applyEvent(.{ .agent_end = .{ .reason = .cancelled } });
+    try std.testing.expect(!state.status.streaming);
+    try std.testing.expect(!state.stream_aborted);
 }
