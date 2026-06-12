@@ -199,6 +199,7 @@ pub const TuiRuntime = struct {
     remote_steering_queue: std.ArrayList(ai_types.Message) = .empty,
     remote_follow_up_queue: std.ArrayList(ai_types.Message) = .empty,
     remote_auto_resume_pending: bool = false,
+    remote_echo_suppression_remaining: usize = 0,
     last_turn_stop_reason: ?ai_types.StopReason = null,
     compact_output: bool = false,
     run_async: bool = true,
@@ -813,6 +814,14 @@ pub const TuiRuntime = struct {
                 };
             }
             if (self.remote_auto_resume_pending and self.event_stream.isDone() and !self.event_stream.hasPending()) {
+                self.pumpRemoteIncoming() catch |err| {
+                    self.completeRemoteWithError(@errorName(err)) catch {
+                        self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
+                    };
+                };
+            }
+            const remote_complete = if (self.remote_session_id) |sid| (self.remote_client != null and self.remote_client.?.isSessionComplete(sid)) else false;
+            if (self.remote_auto_resume_pending and remote_complete and self.event_stream.isDone() and !self.event_stream.hasPending()) {
                 self.remote_auto_resume_pending = false;
                 self.resumeRemoteSession() catch |err| {
                     self.completeRemoteWithError(@errorName(err)) catch {
@@ -1039,6 +1048,7 @@ pub const TuiRuntime = struct {
         self.last_turn_stop_reason = null;
         const options_json = try self.remoteMessageOptionsJson();
         defer self.allocator.free(options_json);
+        self.remote_echo_suppression_remaining = if (messages.len > 0) messages.len - 1 else 0;
         _ = try client.sendAgentMessage(sid, message_json, options_json);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
@@ -1392,7 +1402,10 @@ pub const TuiRuntime = struct {
 
         if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.agent_start);
         if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
-        if (std.mem.eql(u8, type_name, "message_start")) return self.push(.{ .message_start = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+        if (std.mem.eql(u8, type_name, "message_start")) {
+            if (self.remote_echo_suppression_remaining > 0) return;
+            return self.push(.{ .message_start = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
+        }
         if (std.mem.eql(u8, type_name, "message_end")) {
             if (obj.get("message")) |message_value| {
                 const message = try deserializeRemoteMessageValue(self.allocator, message_value);
@@ -1407,6 +1420,10 @@ pub const TuiRuntime = struct {
                     },
                     else => return error.InvalidRemoteEvent,
                 }
+            }
+            if (self.remote_echo_suppression_remaining > 0) {
+                self.remote_echo_suppression_remaining -= 1;
+                return;
             }
             return self.push(.{ .message_end = .{ .role = parseRemoteMessageRole(getJsonString(obj, "role")) } });
         }
@@ -1491,13 +1508,21 @@ pub const TuiRuntime = struct {
         switch (event) {
             .agent_start => self.push(.agent_start),
             .turn_start => self.push(.turn_start),
-            .message_start => |payload| self.push(.{ .message_start = .{ .role = messageRole(payload.message) } }),
+            .message_start => |payload| {
+                if (self.remote_echo_suppression_remaining == 0) self.push(.{ .message_start = .{ .role = messageRole(payload.message) } });
+            },
             .message_update => |payload| {
                 try self.pushProviderEvent(payload.event);
                 if (self.backend == .remote and payload.event == .done) try self.recordRemoteAssistantMessage(payload.event.done.message);
                 try self.pushMessageUpdate(payload.event);
             },
-            .message_end => |payload| self.push(.{ .message_end = try self.messageEndPayload(payload.message) }),
+            .message_end => |payload| {
+                if (self.remote_echo_suppression_remaining > 0) {
+                    self.remote_echo_suppression_remaining -= 1;
+                } else {
+                    self.push(.{ .message_end = try self.messageEndPayload(payload.message) });
+                }
+            },
             .tool_execution_start => |payload| self.push(.{ .tool_execution_start = .{
                 .tool_call_id = try self.dupeOwned(payload.tool_call_id),
                 .tool_name = try self.dupeOwned(payload.tool_name),
@@ -1603,6 +1628,8 @@ pub const TuiRuntime = struct {
     }
 
     fn clearRemoteQueues(self: *TuiRuntime) void {
+        self.remote_auto_resume_pending = false;
+        self.remote_echo_suppression_remaining = 0;
         for (self.remote_steering_queue.items) |*message| message.deinit(self.allocator);
         self.remote_steering_queue.clearRetainingCapacity();
         for (self.remote_follow_up_queue.items) |*message| message.deinit(self.allocator);
@@ -3782,6 +3809,16 @@ test "remote agent_end auto-dispatches one queued follow-up" {
         if (ev == .agent_end) saw_agent_end = true;
     }
     try std.testing.expect(saw_agent_end);
+    try std.testing.expectEqual(@as(usize, 2), mock.writes.items.len);
+    const result_json = try std.testing.allocator.dupe(u8, "{\"ok\":true}");
+    defer std.testing.allocator.free(result_json);
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 5,
+        .timestamp = 0,
+        .payload = .{ .agent_result = result_json },
+    });
     _ = tui_session.streamEvents();
     var env = try agent_envelope.deserializeEnvelope(mock.writes.items[mock.writes.items.len - 1], std.testing.allocator);
     defer env.deinit(std.testing.allocator);
