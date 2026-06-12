@@ -1955,6 +1955,32 @@ test "App submit routes unknown command to error transcript" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "unknown command") != null);
 }
 
+test "App submit abort when idle reports idle transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.submit("/abort");
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Nothing to abort — agent is idle.", app.state.transcript.items[0].text.items);
+}
+
+test "App submit abort when streaming cancels and reports transcript" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.state.status.streaming = true;
+
+    try app.submit("/abort");
+
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+    try std.testing.expect(!app.state.status.streaming);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
+}
+
 test "App welcome uses session count" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -1996,6 +2022,7 @@ const MockAppSession = struct {
     steer_count: usize = 0,
     queued_follow_up_count: usize = 0,
     submit_count: usize = 0,
+    cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
     events: tui_runtime.TuiEventStream = undefined,
@@ -2035,7 +2062,8 @@ const MockAppSession = struct {
     }
 
     fn cancel(ctx: ?*anyopaque) void {
-        _ = ctx;
+        const self = ptr(ctx);
+        self.cancel_count += 1;
     }
 
     fn submitTurn(ctx: ?*anyopaque, text: []const u8) anyerror!void {
