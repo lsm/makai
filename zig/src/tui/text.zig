@@ -209,6 +209,239 @@ fn flushWord(writer: *std.Io.Writer, word: *std.ArrayList(u8), word_width: usize
     word.clearRetainingCapacity();
 }
 
+/// Word-wrap `text` to `max_width` while preserving line-oriented block prefixes
+/// produced by ZigZag's markdown renderer (list bullets, code-block bars, ordered
+/// list numbers, and plain leading spaces). ANSI sequences are treated as zero-width
+/// and are never split; words that exceed the available width are hard-split.
+pub fn wrapTextPreservingPrefix(allocator: std.mem.Allocator, text: []const u8, max_width: usize) ![]u8 {
+    if (max_width == 0 or text.len == 0) return allocator.dupe(u8, text);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        const prefix = linePrefix(line);
+        try wrapLineWithPrefix(writer, allocator, line, prefix, max_width);
+    }
+
+    return out.toOwnedSlice();
+}
+
+const LinePrefix = struct {
+    first_bytes: []const u8,
+    width: usize,
+    content_start: usize,
+    continuation_is_bar: bool,
+};
+
+fn linePrefix(line: []const u8) LinePrefix {
+    var i: usize = 0;
+    var leading_spaces: usize = 0;
+    while (i < line.len) {
+        if (line[i] == ' ') {
+            leading_spaces += 1;
+            i += 1;
+            continue;
+        }
+        if (line[i] == 0x1b) {
+            skipAnsiSequence(line, &i);
+            continue;
+        }
+        break;
+    }
+
+    if (i < line.len) {
+        const char_len = std.unicode.utf8ByteSequenceLength(line[i]) catch 1;
+        const cp = if (i + char_len <= line.len)
+            std.unicode.utf8Decode(line[i .. i + char_len]) catch line[i]
+        else
+            line[i];
+
+        if (cp == '•' or cp == '│') {
+            const after = i + char_len;
+            const include_space = after < line.len and line[after] == ' ';
+            const end = if (include_space) after + 1 else after;
+            return .{
+                .first_bytes = line[0..end],
+                .width = leading_spaces + 1 + @as(usize, if (include_space) 1 else 0),
+                .content_start = end,
+                .continuation_is_bar = cp == '│',
+            };
+        }
+
+        if (cp >= '0' and cp <= '9') {
+            var j = i;
+            while (j < line.len and line[j] >= '0' and line[j] <= '9') j += 1;
+            if (j + 1 < line.len and line[j] == '.' and line[j + 1] == ' ') {
+                const num_width = j - i;
+                const end = j + 2;
+                return .{
+                    .first_bytes = line[0..end],
+                    .width = leading_spaces + num_width + 2,
+                    .content_start = end,
+                    .continuation_is_bar = false,
+                };
+            }
+        }
+    }
+
+    return .{ .first_bytes = "", .width = 0, .content_start = 0, .continuation_is_bar = false };
+}
+
+fn wrapLineWithPrefix(
+    writer: *std.Io.Writer,
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    prefix: LinePrefix,
+    max_width: usize,
+) !void {
+    try writer.writeAll(prefix.first_bytes);
+    const avail = if (max_width > prefix.width) max_width - prefix.width else 0;
+    if (avail == 0) {
+        try writer.writeAll(line[prefix.content_start..]);
+        return;
+    }
+
+    var cont_prefix_buf: ?[]u8 = null;
+    defer if (cont_prefix_buf) |buf| allocator.free(buf);
+    const cont_prefix: []const u8 = if (prefix.continuation_is_bar)
+        prefix.first_bytes
+    else blk: {
+        const buf = try allocator.alloc(u8, prefix.width);
+        cont_prefix_buf = buf;
+        @memset(buf, ' ');
+        break :blk buf;
+    };
+
+    var word = std.ArrayList(u8).empty;
+    defer word.deinit(allocator);
+    var word_width: usize = 0;
+    var word_has_visible = false;
+    var col: usize = 0;
+    var pending_space = false;
+
+    var i = prefix.content_start;
+    while (i < line.len) {
+        if (line[i] == 0x1b) {
+            var sink: std.Io.Writer.Allocating = .init(allocator);
+            defer sink.deinit();
+            try copyAnsiSequence(&sink.writer, line, &i);
+            try word.appendSlice(allocator, sink.written());
+            continue;
+        }
+
+        const c = line[i];
+        if (c == ' ' or c == '\t') {
+            if (!word_has_visible) {
+                // Preserve spaces that belong to a style-only prefix or indentation.
+                try word.appendSlice(allocator, " ");
+                word_width += 1;
+            } else {
+                try flushWordWithPrefix(writer, cont_prefix, &word, word_width, &col, &pending_space, avail);
+                word_width = 0;
+                word_has_visible = false;
+                pending_space = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+        if (i + len > line.len) break;
+        const codepoint = std.unicode.utf8Decode(line[i .. i + len]) catch c;
+        const cw = zz.measure.charWidth(@intCast(codepoint));
+
+        if (word_width + cw > avail and word_width > 0) {
+            try flushWordWithPrefix(writer, cont_prefix, &word, word_width, &col, &pending_space, avail);
+            word_width = 0;
+            word_has_visible = false;
+            pending_space = false;
+        }
+
+        try word.appendSlice(allocator, line[i .. i + len]);
+        word_width += cw;
+        word_has_visible = true;
+        i += len;
+    }
+
+    try flushWordWithPrefix(writer, cont_prefix, &word, word_width, &col, &pending_space, avail);
+}
+
+fn flushWordWithPrefix(
+    writer: *std.Io.Writer,
+    prefix: []const u8,
+    word: *std.ArrayList(u8),
+    word_width: usize,
+    col: *usize,
+    pending_space: *bool,
+    avail: usize,
+) !void {
+    if (word.items.len == 0) return;
+    const sep: usize = if (pending_space.* and col.* > 0) 1 else 0;
+    if (col.* + sep + word_width > avail) {
+        try writer.writeByte('\n');
+        try writer.writeAll(prefix);
+        col.* = 0;
+        pending_space.* = false;
+    } else if (sep == 1) {
+        try writer.writeByte(' ');
+        col.* += 1;
+    }
+    try writer.writeAll(word.items);
+    col.* += word_width;
+    word.clearRetainingCapacity();
+}
+
+fn skipAnsiSequence(text: []const u8, index: *usize) void {
+    if (index.* >= text.len or text[index.*] != 0x1b) return;
+    index.* += 1;
+    if (index.* >= text.len) return;
+    const second = text[index.*];
+    index.* += 1;
+
+    if (second == '[') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c >= 0x40 and c <= 0x7e) return;
+        }
+        return;
+    }
+    if (second == ']') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
+    if (second >= '(' and second <= '+') {
+        if (index.* < text.len) index.* += 1;
+        return;
+    }
+    if (second == 'P') {
+        while (index.* < text.len) {
+            const c = text[index.*];
+            index.* += 1;
+            if (c == 0x07) return;
+            if (c == 0x1b and index.* < text.len and text[index.*] == '\\') {
+                index.* += 1;
+                return;
+            }
+        }
+        return;
+    }
+}
+
 fn copyAnsiSequence(writer: *std.Io.Writer, text: []const u8, index: *usize) !void {
     const start = index.*;
     try writer.writeByte(text[index.*]);
@@ -331,4 +564,40 @@ test "wrapTextWithAnsi wraps words" {
     const text = try wrapTextWithAnsi(std.testing.allocator, "alpha beta gamma", 10);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("alpha beta\ngamma", text);
+}
+
+test "wrapTextPreservingPrefix preserves list bullet on continuation" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "• alpha beta gamma", 10);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("• alpha\n  beta\n  gamma", text);
+}
+
+test "wrapTextPreservingPrefix preserves ordered list prefix" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "12. alpha beta gamma", 10);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("12. alpha\n    beta\n    gamma", text);
+}
+
+test "wrapTextPreservingPrefix is ANSI aware" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "\x1b[31m• alpha beta\x1b[0m gamma", 10);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[31m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "gamma") != null);
+    try std.testing.expect(visibleWidth(text) <= 10);
+}
+
+test "wrapTextPreservingPrefix hard-splits long words" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "• abcdefghijklmnopqrstuvwxyz", 10);
+    defer std.testing.allocator.free(text);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(visibleWidth(line) <= 10);
+    }
+}
+
+test "wrapTextPreservingPrefix preserves code block bar" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "│ alpha beta gamma", 10);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "│ "));
+    try std.testing.expectEqualStrings("│ alpha\n│ beta\n│ gamma", text);
 }
