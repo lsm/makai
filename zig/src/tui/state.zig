@@ -618,13 +618,17 @@ pub const AppState = struct {
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
         try self.appendProtocolEvent(event);
+        if (self.stream_aborted) switch (event) {
+            .turn_end, .agent_end, .@"error" => {},
+            else => return,
+        };
         switch (event) {
             .agent_start => {
-                if (!self.stream_aborted) self.status.streaming = true;
+                self.status.streaming = true;
                 try self.appendTranscript(.system, "agent started");
             },
             .turn_start => {
-                if (!self.stream_aborted) self.status.streaming = true;
+                self.status.streaming = true;
                 self.status.turn_count += 1;
                 self.cleanupActiveTranscriptEntries();
             },

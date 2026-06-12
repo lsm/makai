@@ -751,6 +751,26 @@ test "abort during approval clears approval state" {
     try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
 }
 
+test "double abort is harmless after first cancellation" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.status.streaming = true;
+
+    var mock = MockAbortSession{};
+    defer mock.deinit();
+    var session = mock.session();
+
+    var first = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Turn aborted.", first.output);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+
+    var second = try dispatch(.{ .allocator = std.testing.allocator, .state = &state, .session = &session }, .{ .kind = .abort });
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Nothing to abort — agent is idle.", second.output);
+    try std.testing.expectEqual(@as(usize, 1), mock.cancel_count);
+}
+
 const MockAbortSession = struct {
     cancel_count: usize = 0,
     events: tui_runtime.TuiEventStream = undefined,

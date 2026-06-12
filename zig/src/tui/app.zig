@@ -875,6 +875,10 @@ pub const App = struct {
         };
         defer result.deinit(self.allocator);
 
+        if (command.kind == .abort) {
+            if (self.approval_waiter) |waiter| waiter.cancel();
+        }
+
         switch (result.action) {
             .quit => return error.QuitRequested,
             .clear_transcript => self.state.clearTranscript(),
@@ -1301,18 +1305,24 @@ pub const TuiModel = struct {
                     return .none;
                 }
                 if (app.state.mode == .approval) {
-                    var decided = false;
-                    switch (key.key) {
-                        .char => |c| switch (c) {
-                            'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                            'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                            'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                    const composer_empty = app.state.composer.buffer.items.len == 0;
+                    if (composer_empty) {
+                        var decided = false;
+                        switch (key.key) {
+                            .char => |c| switch (c) {
+                                'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                else => {},
+                            },
+                            .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
                             else => {},
-                        },
-                        .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                        else => {},
+                        }
+                        if (decided) return .none;
+                    } else if (key.key == .escape) {
+                        app.state.composer.clear();
+                        return .none;
                     }
-                    if (decided) return .none;
                 }
                 // Session picker navigation (T10).
                 if (app.state.mode == .session_picker) {
@@ -1990,6 +2000,24 @@ test "App submit abort when streaming cancels and reports transcript" {
     try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
 }
 
+test "App submit abort when streaming via runtime-only cancels and reports transcript" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+    app.runtime.?.stream_active = true;
+
+    try app.submit("/abort");
+
+    try std.testing.expect(app.runtime.?.cancelled.load(.acquire));
+    try std.testing.expect(!app.state.status.streaming);
+    try std.testing.expect(app.state.stream_aborted);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
+}
+
 test "App welcome uses session count" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2312,7 +2340,9 @@ test "TuiModel allows /abort slash command during approval mode" {
     model.app.?.state.status.streaming = true;
     try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
     model.app.?.state.mode = .approval;
-    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "/abort");
+
+    const keys = [_]u21{ '/', 'a', 'b', 'o', 'r', 't' };
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
