@@ -42,6 +42,16 @@ pub const ApprovalWaiter = struct {
         self.decision = .reject;
     }
 
+    /// Reject the currently pending approval wait without shutting the waiter
+    /// down, so future approval requests can still block normally.
+    pub fn rejectPending(self: *ApprovalWaiter) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.tool_call_id.len > 0) {
+            self.decision = .reject;
+        }
+    }
+
     pub fn deinit(self: *ApprovalWaiter) void {
         self.cancel();
         if (self.tool_call_id.len > 0) self.allocator.free(self.tool_call_id);
@@ -803,8 +813,8 @@ pub const App = struct {
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
-        self.state.stream_aborted = false;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.state.stream_aborted = false;
         try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
@@ -876,7 +886,7 @@ pub const App = struct {
         defer result.deinit(self.allocator);
 
         if (command.kind == .abort) {
-            if (self.approval_waiter) |waiter| waiter.cancel();
+            if (self.approval_waiter) |waiter| waiter.rejectPending();
         }
 
         switch (result.action) {
@@ -1401,10 +1411,13 @@ pub const TuiModel = struct {
                             app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                         };
                         const text = app.state.composer.text();
+                        if (app.state.mode == .approval) {
+                            // Only /abort is allowed while a tool approval is pending.
+                            const command = tui_commands.parse(text) catch return .none;
+                            if (command.kind != .abort) return .none;
+                        }
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         if (app.state.mode == .approval) {
-                            // Allow slash commands (e.g. /abort) while a tool approval is pending.
-                            if (!std.mem.startsWith(u8, text, "/")) return .none;
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -2018,6 +2031,37 @@ test "App submit abort when streaming via runtime-only cancels and reports trans
     try std.testing.expectEqualStrings("Turn aborted.", app.state.transcript.items[0].text.items);
 }
 
+test "App submit does not clear stream_aborted for slash commands" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.state.stream_aborted = true;
+
+    try app.submit("/help");
+
+    try std.testing.expect(app.state.stream_aborted);
+    try std.testing.expect(app.state.transcript.items.len > 0);
+}
+
+test "App submit abort does not permanently shut down approval waiter" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const waiter = try app.allocator.create(ApprovalWaiter);
+    waiter.* = .{ .allocator = app.allocator };
+    app.approval_waiter = waiter;
+    waiter.tool_call_id = try app.allocator.dupe(u8, "call-1");
+
+    try app.submit("/abort");
+
+    try std.testing.expect(!waiter.shutting_down);
+    try std.testing.expect(waiter.decision == .reject);
+
+    // Verify the waiter can still accept a future approval decision.
+    waiter.decision = null;
+    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "{}");
+    try app.decideApproval(true, false);
+    try std.testing.expect(waiter.decision == .approve);
+}
+
 test "App welcome uses session count" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2352,6 +2396,26 @@ test "TuiModel allows /abort slash command during approval mode" {
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, model.app.?.state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("Turn aborted.", model.app.?.state.transcript.items[0].text.items);
+}
+
+test "TuiModel blocks non-abort slash commands during approval mode" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    model.app.?.state.mode = .approval;
+
+    const keys = [_]u21{ '/', 'h', 'e', 'l', 'p' };
+    for (keys) |c| _ = model.update(.{ .key = .{ .key = .{ .char = c } } }, undefined);
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.AppMode.approval, model.app.?.state.mode);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.transcript.items.len);
+    try std.testing.expectEqualStrings("/help", model.app.?.state.composer.text());
 }
 
 test "TuiModel moves composer cursor and edits in place" {
