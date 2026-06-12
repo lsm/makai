@@ -198,6 +198,7 @@ pub const TuiRuntime = struct {
     remote_messages: std.ArrayList(ai_types.Message) = .empty,
     remote_steering_queue: std.ArrayList(ai_types.Message) = .empty,
     remote_follow_up_queue: std.ArrayList(ai_types.Message) = .empty,
+    remote_auto_resume_pending: bool = false,
     last_turn_stop_reason: ?ai_types.StopReason = null,
     compact_output: bool = false,
     run_async: bool = true,
@@ -799,12 +800,22 @@ pub const TuiRuntime = struct {
     }
 
     pub fn streamEvents(self: *TuiRuntime) *TuiEventStream {
-        if (self.backend == .remote and self.started and !self.event_stream.isDone()) {
-            self.pumpRemoteIncoming() catch |err| {
-                self.completeRemoteWithError(@errorName(err)) catch {
-                    self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
+        if (self.backend == .remote and self.started) {
+            if (!self.event_stream.isDone()) {
+                self.pumpRemoteIncoming() catch |err| {
+                    self.completeRemoteWithError(@errorName(err)) catch {
+                        self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
+                    };
                 };
-            };
+            }
+            if (self.remote_auto_resume_pending and self.event_stream.isDone() and !self.event_stream.hasPending()) {
+                self.remote_auto_resume_pending = false;
+                self.resumeRemoteSession() catch |err| {
+                    self.completeRemoteWithError(@errorName(err)) catch {
+                        self.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } });
+                    };
+                };
+            }
         }
         return &self.event_stream;
     }
@@ -1036,27 +1047,38 @@ pub const TuiRuntime = struct {
         if (self.stream_active and !self.event_stream.isDone()) return error.AgentAlreadyStreaming;
         if (self.remote_messages.items.len == 0) return error.NoMessagesToContinue;
         const last = self.remote_messages.items[self.remote_messages.items.len - 1];
+        var consumed_queue: ?*std.ArrayList(ai_types.Message) = null;
         if (last == .assistant) {
             if (self.remote_steering_queue.items.len > 0) {
-                try self.appendOneRemoteQueuedMessage(&self.remote_steering_queue);
+                try self.appendCloneOfFirstQueuedMessage(&self.remote_steering_queue);
+                consumed_queue = &self.remote_steering_queue;
             } else if (self.remote_follow_up_queue.items.len > 0) {
-                try self.appendOneRemoteQueuedMessage(&self.remote_follow_up_queue);
+                try self.appendCloneOfFirstQueuedMessage(&self.remote_follow_up_queue);
+                consumed_queue = &self.remote_follow_up_queue;
             } else {
                 return error.CannotContinueFromAssistant;
             }
         }
+        var sent = false;
+        errdefer if (!sent and consumed_queue != null) {
+            var appended = self.remote_messages.pop().?;
+            appended.deinit(self.allocator);
+        };
         try self.sendRemoteMessages(self.remote_messages.items);
+        sent = true;
+        if (consumed_queue) |queue| {
+            var removed = queue.orderedRemove(0);
+            removed.deinit(self.allocator);
+        }
     }
 
-    fn appendOneRemoteQueuedMessage(self: *TuiRuntime, queue: *std.ArrayList(ai_types.Message)) !void {
+    fn appendCloneOfFirstQueuedMessage(self: *TuiRuntime, queue: *std.ArrayList(ai_types.Message)) !void {
         if (queue.items.len == 0) return;
         var cloned = try ai_types.cloneMessage(self.allocator, queue.items[0]);
         var appended = false;
         errdefer if (!appended) cloned.deinit(self.allocator);
         try self.remote_messages.append(self.allocator, cloned);
         appended = true;
-        var removed = queue.orderedRemove(0);
-        removed.deinit(self.allocator);
     }
 
     fn handleRemoteAgentEnd(self: *TuiRuntime) anyerror!void {
@@ -1065,10 +1087,8 @@ pub const TuiRuntime = struct {
         self.pushTerminal(.{ .agent_end = .{ .reason = reason } });
         self.event_stream.complete(.{ .reason = reason });
         self.stream_active = false;
-        if (reason == .completed and self.remote_follow_up_queue.items.len > 0) {
-            self.event_stream.deinit();
-            self.event_stream = TuiEventStream.init(self.allocator);
-            try self.resumeRemoteSession();
+        if (reason == .completed and (self.remote_steering_queue.items.len > 0 or self.remote_follow_up_queue.items.len > 0)) {
+            self.remote_auto_resume_pending = true;
         }
     }
 
@@ -3750,6 +3770,14 @@ test "remote agent_end auto-dispatches one queued follow-up" {
         .payload = .{ .agent_event = agent_end_json },
     });
 
+    _ = tui_session.streamEvents();
+    var saw_agent_end = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end) saw_agent_end = true;
+    }
+    try std.testing.expect(saw_agent_end);
     _ = tui_session.streamEvents();
     var env = try agent_envelope.deserializeEnvelope(mock.writes.items[mock.writes.items.len - 1], std.testing.allocator);
     defer env.deinit(std.testing.allocator);
