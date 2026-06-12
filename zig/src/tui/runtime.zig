@@ -1048,11 +1048,12 @@ pub const TuiRuntime = struct {
         self.last_turn_stop_reason = null;
         const options_json = try self.remoteMessageOptionsJson();
         defer self.allocator.free(options_json);
-        self.remote_echo_suppression_remaining = if (messages.len > 0) messages.len - 1 else 0;
+        self.remote_echo_suppression_remaining = messages.len;
         _ = try client.sendAgentMessage(sid, message_json, options_json);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
         };
+        if (client.getLastErrorForSession(sid) != null) return error.RemoteMessageRejected;
     }
 
     fn resumeRemoteSession(self: *TuiRuntime) !void {
