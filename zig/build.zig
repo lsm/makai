@@ -444,6 +444,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -912,6 +913,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "transports/stdio", .module = stdio_transport_mod },
+            .{ .name = "transports/sse", .module = sse_transport_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "model_ref", .module = protocol_model_ref_mod },
             .{ .name = "tui_session", .module = tui_session_mod },
