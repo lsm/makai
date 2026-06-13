@@ -799,6 +799,8 @@ pub const TuiRuntime = struct {
                 self.remote_pending_session_id = null;
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
+                self.remote_auto_resume_pending = false;
+                self.remote_turn_in_flight = false;
             }
         }
         while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1215,9 +1217,14 @@ pub const TuiRuntime = struct {
 
     fn recordRemoteResultJson(self: *TuiRuntime, json: []const u8) !void {
         if (self.remote_messages.items.len > 0 and self.remote_messages.items[self.remote_messages.items.len - 1] == .assistant) return;
-        var msg = (transport.deserialize(json, self.allocator) catch return).result;
-        defer msg.deinit(self.allocator);
-        try self.recordRemoteAssistantMessage(msg);
+        var decoded = transport.deserialize(json, self.allocator) catch return;
+        switch (decoded) {
+            .result => |*msg| {
+                defer msg.deinit(self.allocator);
+                try self.recordRemoteAssistantMessage(msg.*);
+            },
+            else => |payload| transport.freeMessageOrControlStrings(payload, self.allocator),
+        }
     }
 
     fn messageRole(message: ai_types.Message) TuiEvent.MessageRole {
@@ -3935,6 +3942,58 @@ test "remote cancel completes stream and creates fresh session next turn" {
     defer restart_env.deinit(std.testing.allocator);
     try std.testing.expect(restart_env.payload == .agent_start);
     try std.testing.expect(!std.mem.eql(u8, sid1[0..], restart_env.session_id[0..]));
+}
+
+test "remote cancel clears in-flight turn before replaceMessages" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try tui_session.submitTurn("running");
+    try std.testing.expect(runtime.remote_turn_in_flight);
+
+    tui_session.cancel();
+    try std.testing.expect(!runtime.remote_turn_in_flight);
+    try runtime.replaceMessages(&.{});
+}
+
+test "remote ignores non-result agent_result payloads" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    try tui_session.submitTurn("running");
+
+    const result_json = try std.testing.allocator.dupe(u8, "{\"type\":\"ack\",\"acknowledged_id\":\"msg\"}");
+    defer std.testing.allocator.free(result_json);
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = 0,
+        .payload = .{ .agent_result = result_json },
+    });
+    _ = tui_session.streamEvents();
+    try std.testing.expect(!runtime.remote_turn_in_flight);
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_messages.items.len);
 }
 
 test "remote ignores late agent_started after cancel" {

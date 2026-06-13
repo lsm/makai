@@ -355,7 +355,7 @@ pub fn freeControlStrings(ctrl: ControlMessage, allocator: std.mem.Allocator) vo
 }
 
 /// Free allocated strings in a MessageOrControl
-fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
+pub fn freeMessageOrControlStrings(msg: MessageOrControl, allocator: std.mem.Allocator) void {
     switch (msg) {
         .event => |ev| freeEventStrings(ev, allocator),
         .result => |r| {
