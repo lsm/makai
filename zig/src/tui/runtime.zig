@@ -1147,6 +1147,8 @@ pub const TuiRuntime = struct {
     }
 
     fn completeRemoteWithError(self: *TuiRuntime, message: []const u8) !void {
+        self.remote_turn_in_flight = false;
+        self.remote_auto_resume_pending = false;
         if (self.event_stream.isDone()) return;
         self.completed = true;
         self.push(.{ .@"error" = .{ .message = try self.dupeOwned(message) } });
@@ -4478,6 +4480,8 @@ test "remote submit pump failure completes stream" {
     try mock.queueInvalid();
     _ = tui_session.streamEvents();
     try std.testing.expect(runtime.event_stream.isDone());
+    try std.testing.expect(!runtime.remote_turn_in_flight);
+    try runtime.replaceMessages(&.{});
 
     var saw_error_end = false;
     while (tui_session.popEvent()) |event| {
