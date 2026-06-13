@@ -1059,11 +1059,14 @@ pub const TuiRuntime = struct {
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
         _ = try client.sendAgentMessage(sid, message_json, options_json);
+        if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
         };
-        if (client.getLastErrorForSession(sid) != null) return error.RemoteMessageRejected;
-        if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
+        if (client.getLastErrorForSession(sid) != null) {
+            if (emit_tail_prompt) self.discardRemoteTailPromptEvent();
+            return error.RemoteMessageRejected;
+        }
     }
 
     fn resumeRemoteSession(self: *TuiRuntime) !void {
@@ -1111,6 +1114,26 @@ pub const TuiRuntime = struct {
         if (messages.len == 0) return;
         const event = TuiEvent{ .message_end = try self.messageEndPayload(messages[messages.len - 1]) };
         self.push(event);
+    }
+
+    fn discardRemoteTailPromptEvent(self: *TuiRuntime) void {
+        var pending = std.ArrayList(TuiEvent).empty;
+        defer pending.deinit(self.allocator);
+        while (self.event_stream.poll()) |event| pending.append(self.allocator, event) catch |err| {
+            var mutable = event;
+            mutable.deinit(self.allocator);
+            for (pending.items) |*queued| queued.deinit(self.allocator);
+            pending.clearRetainingCapacity();
+            self.completeRemoteWithError(@errorName(err)) catch {};
+            return;
+        };
+        if (pending.items.len == 0) return;
+        var tail = pending.orderedRemove(0);
+        tail.deinit(self.allocator);
+        while (pending.items.len > 0) {
+            const event = pending.orderedRemove(0);
+            self.push(event);
+        }
     }
 
     fn handleRemoteAgentEnd(self: *TuiRuntime) anyerror!void {
