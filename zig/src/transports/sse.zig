@@ -207,7 +207,8 @@ pub const SseHttpClient = struct {
         for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         try request.appendSlice(self.allocator, "\r\n");
         stream.writeAll(request.items) catch return error.ConnectionFailed;
-        const header_info = try self.readResponseHeaders(&stream, true);
+        var header_info = try self.readResponseHeaders(&stream, true);
+        defer header_info.deinit(self.allocator);
         self.chunked = header_info.chunked;
         const byte_stream = try self.allocator.create(transport.ByteStream);
         errdefer self.allocator.destroy(byte_stream);
@@ -215,7 +216,8 @@ pub const SseHttpClient = struct {
         errdefer byte_stream.deinit();
         const producer = try self.allocator.create(HttpProducer);
         errdefer self.allocator.destroy(producer);
-        producer.* = .{ .allocator = self.allocator, .stream = stream, .out = byte_stream, .chunked = header_info.chunked };
+        producer.* = .{ .allocator = self.allocator, .stream = stream, .out = byte_stream, .chunked = header_info.chunked, .prefix = header_info.body_prefix };
+        header_info.body_prefix = &.{};
         const thread = try std.Thread.spawn(.{}, httpProducerThread, .{producer});
         self.producer = producer;
         self.byte_stream = byte_stream;
@@ -261,6 +263,10 @@ pub const SseHttpClient = struct {
         }
         if (self.thread) |thread| thread.join();
         self.thread = null;
+        if (self.producer) |producer| {
+            producer.deinit();
+            self.allocator.destroy(producer);
+        }
         self.producer = null;
         if (self.byte_stream) |byte_stream| {
             byte_stream.deinit();
@@ -272,6 +278,8 @@ pub const SseHttpClient = struct {
         self.pending_index = 0;
         self.connected = false;
         self.chunked = false;
+        self.parser.deinit();
+        self.parser = sse_parser.SSEParser.init(self.allocator);
     }
 
     fn replaceHeaders(self: *SseHttpClient, headers: []const ai_types.HeaderPair) !void {
@@ -281,7 +289,15 @@ pub const SseHttpClient = struct {
         for (headers, 0..) |header, i| self.headers[i] = .{ .name = try self.allocator.dupe(u8, header.name), .value = try self.allocator.dupe(u8, header.value) };
     }
 
-    const HeaderInfo = struct { chunked: bool = false };
+    const HeaderInfo = struct {
+        chunked: bool = false,
+        body_prefix: []u8 = &.{},
+
+        fn deinit(self: *HeaderInfo, allocator: std.mem.Allocator) void {
+            if (self.body_prefix.len > 0) allocator.free(self.body_prefix);
+            self.* = .{};
+        }
+    };
 
     fn readResponseHeaders(self: *SseHttpClient, stream: *compat.net.Stream, feed_body: bool) !HeaderInfo {
         var buffer = std.ArrayList(u8).empty;
@@ -296,16 +312,14 @@ pub const SseHttpClient = struct {
         if (!std.mem.startsWith(u8, buffer.items, "HTTP/1.1 2") and !std.mem.startsWith(u8, buffer.items, "HTTP/1.0 2")) return error.UnexpectedStatus;
         const headers_end = std.mem.indexOf(u8, buffer.items, "\r\n\r\n") orelse return error.UnexpectedStatus;
         const headers = buffer.items[0..headers_end];
-        const info = HeaderInfo{ .chunked = hasHeaderValue(headers, "Transfer-Encoding", "chunked") };
+        var info = HeaderInfo{ .chunked = hasHeaderValue(headers, "Transfer-Encoding", "chunked") };
+        errdefer info.deinit(self.allocator);
         if (!feed_body) return info;
         const body_start = headers_end + 4;
         if (body_start < buffer.items.len) {
             const body = buffer.items[body_start..];
             if (info.chunked) {
-                const dechunked = try dechunkHttpBody(self.allocator, body);
-                defer self.allocator.free(dechunked);
-                const events = try self.parser.feed(dechunked);
-                for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+                info.body_prefix = try self.allocator.dupe(u8, body);
             } else {
                 const events = try self.parser.feed(body);
                 for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
@@ -361,15 +375,19 @@ const HttpProducer = struct {
     stream: compat.net.Stream,
     out: *transport.ByteStream,
     chunked: bool,
+    prefix: []u8 = &.{},
     cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn deinit(self: *HttpProducer) void {
+        if (self.prefix.len > 0) self.allocator.free(self.prefix);
+        self.* = undefined;
+    }
 };
 
 fn httpProducerThread(ctx: *HttpProducer) void {
-    const allocator = ctx.allocator;
     defer {
         ctx.stream.close();
         ctx.out.markThreadDone();
-        allocator.destroy(ctx);
     }
     if (ctx.chunked) {
         readChunkedBody(ctx) catch |err| ctx.out.completeWithError(@errorName(err));
@@ -379,6 +397,11 @@ fn httpProducerThread(ctx: *HttpProducer) void {
 }
 
 fn readPlainBody(ctx: *HttpProducer) !void {
+    if (ctx.prefix.len > 0) {
+        try ctx.out.push(.{ .data = try ctx.allocator.dupe(u8, ctx.prefix), .owned = true });
+        ctx.allocator.free(ctx.prefix);
+        ctx.prefix = &.{};
+    }
     var buf: [4096]u8 = undefined;
     while (!ctx.cancel.load(.acquire)) {
         const n = try ctx.stream.read(&buf);
@@ -396,6 +419,15 @@ fn readPlainBody(ctx: *HttpProducer) !void {
 fn readChunkedBody(ctx: *HttpProducer) !void {
     var raw = std.ArrayList(u8).empty;
     defer raw.deinit(ctx.allocator);
+    if (ctx.prefix.len > 0) {
+        try raw.appendSlice(ctx.allocator, ctx.prefix);
+        ctx.allocator.free(ctx.prefix);
+        ctx.prefix = &.{};
+        while (try popHttpChunk(ctx.allocator, &raw)) |chunk| {
+            errdefer ctx.allocator.free(chunk);
+            try ctx.out.push(.{ .data = chunk, .owned = true });
+        }
+    }
     var buf: [4096]u8 = undefined;
     while (!ctx.cancel.load(.acquire)) {
         const n = try ctx.stream.read(&buf);
