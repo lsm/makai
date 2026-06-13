@@ -170,6 +170,8 @@ pub const TuiRuntime = struct {
     remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null,
     remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null,
     remote_config_sse_client: ?*sse_transport.SseHttpClient = null,
+    remote_config_sse_endpoint: []u8 = &.{},
+    remote_config_sse_headers: []ai_types.HeaderPair = &.{},
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
@@ -253,6 +255,8 @@ pub const TuiRuntime = struct {
         var remote_config_receiver: ?*stdio_transport.AsyncStdioReceiver = null;
         var remote_config_stream_handle: ?*stdio_transport.AsyncStreamHandle = null;
         var remote_config_sse_client: ?*sse_transport.SseHttpClient = null;
+        var remote_config_sse_endpoint: []u8 = &.{};
+        var remote_config_sse_headers: []ai_types.HeaderPair = &.{};
         var remote_sender = options.remote_sender;
         var remote_receiver = options.remote_receiver;
         errdefer if (remote_config_stream_handle) |handle| {
@@ -265,6 +269,11 @@ pub const TuiRuntime = struct {
             client.deinit();
             allocator.destroy(client);
         };
+        errdefer if (remote_config_sse_endpoint.len > 0) allocator.free(remote_config_sse_endpoint);
+        errdefer {
+            for (remote_config_sse_headers) |*header| header.deinit(allocator);
+            if (remote_config_sse_headers.len > 0) allocator.free(remote_config_sse_headers);
+        }
         if (resolved_backend == .remote and remote_sender == null and remote_receiver == null and options.remote_config.mode == .remote) {
             switch (options.remote_config.transport) {
                 .stdio => {
@@ -302,6 +311,9 @@ pub const TuiRuntime = struct {
                     const client = try allocator.create(sse_transport.SseHttpClient);
                     client.* = sse_transport.SseHttpClient.init(allocator);
                     try client.connect(options.remote_config.endpoint, options.remote_config.auth_headers);
+                    remote_config_sse_endpoint = try allocator.dupe(u8, options.remote_config.endpoint);
+                    remote_config_sse_headers = try allocator.alloc(ai_types.HeaderPair, options.remote_config.auth_headers.len);
+                    for (options.remote_config.auth_headers, 0..) |header, i| remote_config_sse_headers[i] = .{ .name = try allocator.dupe(u8, header.name), .value = try allocator.dupe(u8, header.value) };
                     remote_config_sse_client = client;
                     remote_sender = client.asyncSender();
                     remote_receiver = .{ .ctx = client, .read_line_fn = remoteConfigSseReadLine, .read_result_fn = remoteConfigSseReadResult, .close_fn = remoteConfigSseClose };
@@ -324,6 +336,8 @@ pub const TuiRuntime = struct {
             .remote_config_receiver = remote_config_receiver,
             .remote_config_stream_handle = remote_config_stream_handle,
             .remote_config_sse_client = remote_config_sse_client,
+            .remote_config_sse_endpoint = remote_config_sse_endpoint,
+            .remote_config_sse_headers = remote_config_sse_headers,
             .remote_sender = remote_sender,
             .remote_receiver = remote_receiver,
             .remote_session_timeout_ms = options.remote_session_timeout_ms,
@@ -349,6 +363,8 @@ pub const TuiRuntime = struct {
         remote_config_receiver = null;
         remote_config_stream_handle = null;
         remote_config_sse_client = null;
+        remote_config_sse_endpoint = &.{};
+        remote_config_sse_headers = &.{};
         original_tools = &.{};
         wrapped_tools = &.{};
         models = &.{};
@@ -410,6 +426,9 @@ pub const TuiRuntime = struct {
             client.deinit();
             self.allocator.destroy(client);
         }
+        if (self.remote_config_sse_endpoint.len > 0) self.allocator.free(self.remote_config_sse_endpoint);
+        for (self.remote_config_sse_headers) |*header| header.deinit(self.allocator);
+        if (self.remote_config_sse_headers.len > 0) self.allocator.free(self.remote_config_sse_headers);
         self.clearPendingApproval();
         self.tool_protocol.deinit();
         self.allocator.free(self.workspace_root);
@@ -432,6 +451,9 @@ pub const TuiRuntime = struct {
                 var client = agent_protocol_client.AgentProtocolClient.init(self.allocator);
                 var client_moved = false;
                 errdefer if (!client_moved) client.deinit();
+                if (self.remote_config_sse_client) |sse_client| {
+                    if (!sse_client.connected) try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+                }
                 const sender = self.remote_sender orelse return error.NoRemoteTransportConfigured;
                 _ = self.remote_receiver orelse return error.NoRemoteTransportConfigured;
                 client.setSender(sender);

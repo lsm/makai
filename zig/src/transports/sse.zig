@@ -163,13 +163,14 @@ pub const SseHttpClient = struct {
     allocator: std.mem.Allocator,
     endpoint: []u8 = &.{},
     headers: []ai_types.HeaderPair = &.{},
-    stream: ?compat.net.Stream = null,
+    producer: ?*HttpProducer = null,
+    byte_stream: ?*transport.ByteStream = null,
+    thread: ?std.Thread = null,
     parser: sse_parser.SSEParser,
     pending: std.ArrayList([]u8) = .empty,
     pending_index: usize = 0,
-    read_buf: [4096]u8 = undefined,
-    transfer_buf: [4096]u8 = undefined,
     connected: bool = false,
+    chunked: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) SseHttpClient {
         return .{ .allocator = allocator, .parser = sse_parser.SSEParser.init(allocator) };
@@ -200,8 +201,19 @@ pub const SseHttpClient = struct {
         for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         try request.appendSlice(self.allocator, "\r\n");
         stream.writeAll(request.items) catch return error.ConnectionFailed;
-        try self.readResponseHeaders(&stream);
-        self.stream = stream;
+        const header_info = try self.readResponseHeaders(&stream, true);
+        self.chunked = header_info.chunked;
+        const byte_stream = try self.allocator.create(transport.ByteStream);
+        errdefer self.allocator.destroy(byte_stream);
+        byte_stream.* = transport.ByteStream.init(self.allocator);
+        errdefer byte_stream.deinit();
+        const producer = try self.allocator.create(HttpProducer);
+        errdefer self.allocator.destroy(producer);
+        producer.* = .{ .allocator = self.allocator, .stream = stream, .out = byte_stream, .chunked = header_info.chunked };
+        const thread = try std.Thread.spawn(.{}, httpProducerThread, .{producer});
+        self.producer = producer;
+        self.byte_stream = byte_stream;
+        self.thread = thread;
         self.connected = true;
     }
 
@@ -220,26 +232,40 @@ pub const SseHttpClient = struct {
             }
             self.pending.clearRetainingCapacity();
             self.pending_index = 0;
-            if (!self.connected) return null;
-            var stream = self.stream orelse return null;
-            const n = stream.read(&self.read_buf) catch return error.ConnectionFailed;
-            self.stream = stream;
-            if (n == 0) {
+            const byte_stream = self.byte_stream orelse return null;
+            if (byte_stream.poll()) |chunk| {
+                var mutable = chunk;
+                defer mutable.deinit(byte_stream.allocator);
+                const events = try self.parser.feed(chunk.data);
+                for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+                continue;
+            }
+            if (byte_stream.isDone()) {
                 self.connected = false;
                 return null;
             }
-            const events = try self.parser.feed(self.read_buf[0..n]);
-            for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+            return null;
         }
     }
 
     pub fn close(self: *SseHttpClient) void {
-        if (self.stream) |*stream| stream.close();
-        self.stream = null;
+        if (self.producer) |producer| {
+            producer.cancel.store(true, .release);
+            producer.stream.close();
+        }
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        self.producer = null;
+        if (self.byte_stream) |byte_stream| {
+            byte_stream.deinit();
+            self.allocator.destroy(byte_stream);
+        }
+        self.byte_stream = null;
         for (self.pending.items[self.pending_index..]) |item| self.allocator.free(item);
         self.pending.clearRetainingCapacity();
         self.pending_index = 0;
         self.connected = false;
+        self.chunked = false;
     }
 
     fn replaceHeaders(self: *SseHttpClient, headers: []const ai_types.HeaderPair) !void {
@@ -249,7 +275,9 @@ pub const SseHttpClient = struct {
         for (headers, 0..) |header, i| self.headers[i] = .{ .name = try self.allocator.dupe(u8, header.name), .value = try self.allocator.dupe(u8, header.value) };
     }
 
-    fn readResponseHeaders(self: *SseHttpClient, stream: *compat.net.Stream) !void {
+    const HeaderInfo = struct { chunked: bool = false };
+
+    fn readResponseHeaders(self: *SseHttpClient, stream: *compat.net.Stream, feed_body: bool) !HeaderInfo {
         var buffer = std.ArrayList(u8).empty;
         defer buffer.deinit(self.allocator);
         var tmp: [512]u8 = undefined;
@@ -260,13 +288,24 @@ pub const SseHttpClient = struct {
             if (buffer.items.len > 16 * 1024) return error.UnexpectedStatus;
         }
         if (!std.mem.startsWith(u8, buffer.items, "HTTP/1.1 2") and !std.mem.startsWith(u8, buffer.items, "HTTP/1.0 2")) return error.UnexpectedStatus;
-        if (std.mem.indexOf(u8, buffer.items, "\r\n\r\n")) |headers_end| {
-            const body_start = headers_end + 4;
-            if (body_start < buffer.items.len) {
-                const events = try self.parser.feed(buffer.items[body_start..]);
+        const headers_end = std.mem.indexOf(u8, buffer.items, "\r\n\r\n") orelse return error.UnexpectedStatus;
+        const headers = buffer.items[0..headers_end];
+        const info = HeaderInfo{ .chunked = hasHeaderValue(headers, "Transfer-Encoding", "chunked") };
+        if (!feed_body) return info;
+        const body_start = headers_end + 4;
+        if (body_start < buffer.items.len) {
+            const body = buffer.items[body_start..];
+            if (info.chunked) {
+                const dechunked = try dechunkHttpBody(self.allocator, body);
+                defer self.allocator.free(dechunked);
+                const events = try self.parser.feed(dechunked);
+                for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
+            } else {
+                const events = try self.parser.feed(body);
                 for (events) |event| try self.pending.append(self.allocator, try self.allocator.dupe(u8, event.data));
             }
         }
+        return info;
     }
 
     fn post(self: *SseHttpClient, data: []const u8) !void {
@@ -281,7 +320,7 @@ pub const SseHttpClient = struct {
         try request.appendSlice(self.allocator, "\r\n");
         try request.appendSlice(self.allocator, data);
         stream.writeAll(request.items) catch return error.ConnectionFailed;
-        self.readResponseHeaders(&stream) catch return error.HttpPostFailed;
+        _ = self.readResponseHeaders(&stream, false) catch return error.HttpPostFailed;
     }
 
     fn writeFn(ctx: *anyopaque, data: []const u8) !void {
@@ -296,6 +335,107 @@ pub const SseHttpClient = struct {
         self.close();
     }
 };
+
+const HttpProducer = struct {
+    allocator: std.mem.Allocator,
+    stream: compat.net.Stream,
+    out: *transport.ByteStream,
+    chunked: bool,
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn httpProducerThread(ctx: *HttpProducer) void {
+    const allocator = ctx.allocator;
+    defer {
+        ctx.stream.close();
+        ctx.out.markThreadDone();
+        allocator.destroy(ctx);
+    }
+    if (ctx.chunked) {
+        readChunkedBody(ctx) catch |err| ctx.out.completeWithError(@errorName(err));
+    } else {
+        readPlainBody(ctx) catch |err| ctx.out.completeWithError(@errorName(err));
+    }
+}
+
+fn readPlainBody(ctx: *HttpProducer) !void {
+    var buf: [4096]u8 = undefined;
+    while (!ctx.cancel.load(.acquire)) {
+        const n = try ctx.stream.read(&buf);
+        if (n == 0) {
+            ctx.out.complete({});
+            return;
+        }
+        const data = try ctx.allocator.dupe(u8, buf[0..n]);
+        errdefer ctx.allocator.free(data);
+        try ctx.out.push(.{ .data = data, .owned = true });
+    }
+    ctx.out.completeWithError("Cancelled");
+}
+
+fn readChunkedBody(ctx: *HttpProducer) !void {
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(ctx.allocator);
+    var buf: [4096]u8 = undefined;
+    while (!ctx.cancel.load(.acquire)) {
+        const n = try ctx.stream.read(&buf);
+        if (n == 0) {
+            ctx.out.complete({});
+            return;
+        }
+        try raw.appendSlice(ctx.allocator, buf[0..n]);
+        while (try popHttpChunk(ctx.allocator, &raw)) |chunk| {
+            errdefer ctx.allocator.free(chunk);
+            try ctx.out.push(.{ .data = chunk, .owned = true });
+        }
+    }
+    ctx.out.completeWithError("Cancelled");
+}
+
+fn popHttpChunk(allocator: std.mem.Allocator, raw: *std.ArrayList(u8)) !?[]u8 {
+    const line_end = std.mem.indexOf(u8, raw.items, "\r\n") orelse return null;
+    const size_text = raw.items[0..line_end];
+    const semi = std.mem.indexOfScalar(u8, size_text, ';') orelse size_text.len;
+    const size = try std.fmt.parseInt(usize, std.mem.trim(u8, size_text[0..semi], " \t"), 16);
+    const data_start = line_end + 2;
+    const total = data_start + size + 2;
+    if (raw.items.len < total) return null;
+    if (size == 0) {
+        raw.clearRetainingCapacity();
+        return null;
+    }
+    const out = try allocator.dupe(u8, raw.items[data_start..][0..size]);
+    const remaining = raw.items[total..];
+    std.mem.copyForwards(u8, raw.items[0..remaining.len], remaining);
+    raw.shrinkRetainingCapacity(remaining.len);
+    return out;
+}
+
+fn dechunkHttpBody(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(allocator);
+    try raw.appendSlice(allocator, body);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    while (try popHttpChunk(allocator, &raw)) |chunk| {
+        defer allocator.free(chunk);
+        try out.appendSlice(allocator, chunk);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn hasHeaderValue(headers: []const u8, name: []const u8, value: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        const header_value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (std.ascii.indexOfIgnoreCase(header_value, value) != null) return true;
+    }
+    return false;
+}
 
 // --- Async implementations ---
 
@@ -619,6 +759,12 @@ test "parseHttpUrl validates HTTP SSE URLs" {
     try std.testing.expectError(error.InvalidScheme, parseHttpUrl("ws://example.com"));
 }
 
+test "SseHttpClient dechunks HTTP body before SSE parsing" {
+    const chunked = "7\r\ndata: {\r\nC\r\n\"ok\":true}\n\n\r\n0\r\n\r\n";
+    const body = try dechunkHttpBody(std.testing.allocator, chunked);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("data: {\"ok\":true}\n\n", body);
+}
 
 test "SseSender writes SSE format" {
     // Create a pipe
