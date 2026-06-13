@@ -1003,7 +1003,7 @@ pub const App = struct {
             const tips = if (self.supportsStreamingShortcuts())
                 "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
+                "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1423,16 +1423,22 @@ pub const TuiModel = struct {
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
-                        } else if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
+                        } else if (app.state.status.streaming) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
                                 };
-                            } else {
+                            } else if (app.supportsStreamingShortcuts()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
+                                };
+                            } else {
+                                app.submit(text) catch |err| {
+                                    if (err == error.QuitRequested) return .quit;
+                                    app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                    app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                                 };
                             }
                         } else {
@@ -1494,7 +1500,7 @@ pub const TuiModel = struct {
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
-            .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
+            .steering_available = app.supportsStreamingShortcuts(),
         }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
@@ -2083,7 +2089,7 @@ test "App welcome uses session count" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
 }
 
-test "App welcome hides streaming shortcut tips for remote runtime" {
+test "App welcome shows follow-up tips but hides steering tips for remote runtime" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2094,7 +2100,7 @@ test "App welcome hides streaming shortcut tips for remote runtime" {
 
     try app.appendWelcome();
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter while streaming") == null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter submit") != null);
 }
@@ -2355,6 +2361,26 @@ test "TuiModel remote streaming Enter falls back to submit and preserves compose
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+}
+
+test "TuiModel remote streaming Alt+Enter still queues follow-up" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    runtime = undefined;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "follow later");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .alt = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
 }
 

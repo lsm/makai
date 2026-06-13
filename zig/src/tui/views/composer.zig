@@ -6,7 +6,7 @@ const tui_render = @import("tui_render");
 
 pub const Options = struct {
     width: usize = 80,
-    streaming_shortcuts_supported: bool = true,
+    steering_available: bool = true,
 };
 
 const cursor_blank = " ";
@@ -16,7 +16,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const inner_width = options.width -| 4;
     const input = try renderInput(allocator, state, inner_width);
     defer allocator.free(input);
-    const hint = try renderHint(allocator, state, options.streaming_shortcuts_supported, inner_width);
+    const hint = try renderHint(allocator, state, options.steering_available, inner_width);
     defer allocator.free(hint);
     const body = try tui_render.joinVertical(allocator, &.{ input, hint });
     defer allocator.free(body);
@@ -117,10 +117,10 @@ fn utf8BoundaryAtOrBefore(text: []const u8, index: usize) usize {
     return idx;
 }
 
-fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool, max_width: usize) ![]const u8 {
+fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, steering_available: bool, max_width: usize) ![]const u8 {
     const text = state.composer.text();
     if (state.status.streaming) {
-        if (streaming_shortcuts_supported) {
+        if (steering_available) {
             const queued = state.queue.total();
             const hint = if (queued > 0)
                 try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
@@ -131,7 +131,7 @@ fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, st
             defer allocator.free(truncated);
             return tui_theme.muted().render(allocator, truncated);
         }
-        const truncated = try tui_text.truncateToWidth(allocator, "steering not available in remote mode", max_width);
+        const truncated = try tui_text.truncateToWidth(allocator, "Alt+Enter queue follow-up • steering not available in remote mode", max_width);
         defer allocator.free(truncated);
         return tui_theme.muted().render(allocator, truncated);
     }
@@ -228,16 +228,16 @@ test "composer renders queued hint while streaming shortcuts are supported" {
     try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
 }
 
-test "composer shows unavailable steering hint when streaming shortcuts are unsupported" {
+test "composer shows unavailable steering hint while preserving follow-up shortcut" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     state.status.streaming = true;
     state.queue.follow_up = 2;
 
-    const text = try render(std.testing.allocator, &state, .{ .width = 80, .streaming_shortcuts_supported = false });
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .steering_available = false });
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter steer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "steering not available in remote mode") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Enter submit") == null);
 }
