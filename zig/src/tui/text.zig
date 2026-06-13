@@ -300,16 +300,32 @@ fn wrapLineWithPrefix(
     prefix: LinePrefix,
     max_width: usize,
 ) !void {
-    try writer.writeAll(prefix.first_bytes);
-    const avail = if (max_width > prefix.width) max_width - prefix.width else 0;
-    if (avail == 0) {
-        try writer.writeAll(line[prefix.content_start..]);
+    const prefix_fits = prefix.width < max_width;
+
+    if (prefix_fits) {
+        try writer.writeAll(prefix.first_bytes);
+    } else if (prefix.content_start < line.len) {
+        // The prefix alone is too wide for the viewport. Show as much of it as
+        // fits, then continue the content on the next line without a prefix.
+        const truncated = try truncateLineToWidth(allocator, prefix.first_bytes, max_width);
+        defer allocator.free(truncated);
+        try writer.writeAll(truncated);
+        try writer.writeByte('\n');
+    } else {
+        // The line is only a prefix; truncate it to the viewport.
+        const truncated = try truncateLineToWidth(allocator, prefix.first_bytes, max_width);
+        defer allocator.free(truncated);
+        try writer.writeAll(truncated);
         return;
     }
 
+    const avail = if (prefix_fits) max_width - prefix.width else max_width;
+
     var cont_prefix_buf: ?[]u8 = null;
     defer if (cont_prefix_buf) |buf| allocator.free(buf);
-    const cont_prefix: []const u8 = if (prefix.continuation_is_bar)
+    const cont_prefix: []const u8 = if (!prefix_fits)
+        ""
+    else if (prefix.continuation_is_bar)
         prefix.first_bytes
     else blk: {
         const buf = try allocator.alloc(u8, prefix.width);
@@ -592,6 +608,17 @@ test "wrapTextPreservingPrefix hard-splits long words" {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         try std.testing.expect(visibleWidth(line) <= 10);
+    }
+}
+
+test "wrapTextPreservingPrefix truncates a prefix wider than the viewport" {
+    const text = try wrapTextPreservingPrefix(std.testing.allocator, "12345678. item here", 8);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "here") != null);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(visibleWidth(line) <= 8);
     }
 }
 

@@ -780,9 +780,9 @@ test "transcript renders heading bold without markdown marker" {
 test "transcript renders list with indented continuation" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.appendTranscript(.assistant, "- first second");
+    try state.appendTranscript(.assistant, "- first second third");
 
-    const text = try render(std.testing.allocator, &state, .{ .width = 12, .height = 10 });
+    const text = try render(std.testing.allocator, &state, .{ .width = 15, .height = 10 });
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "•") != null);
@@ -792,7 +792,7 @@ test "transcript renders list with indented continuation" {
 
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        try std.testing.expect(tui_text.visibleWidth(line) <= 12);
+        try std.testing.expect(tui_text.visibleWidth(line) <= 15);
     }
 }
 
