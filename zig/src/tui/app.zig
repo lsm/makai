@@ -309,7 +309,6 @@ pub const App = struct {
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
         const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
-        if (runtime.backend == .remote) return error.SessionResumeUnsupportedForRemoteRuntime;
         const sessions = self.state.sessions.items;
         if (sessions.len == 0) return;
         const idx = self.state.session_index;
@@ -797,8 +796,8 @@ pub const App = struct {
     }
 
     fn supportsStreamingShortcuts(self: *const App) bool {
-        const runtime = self.runtime orelse return self.session != null;
-        return runtime.backend == .local;
+        _ = self.runtime orelse return self.session != null;
+        return self.session != null;
     }
 
     fn discardPendingEvents(self: *App) void {
@@ -2461,7 +2460,7 @@ fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRunti
     return runtime;
 }
 
-test "resume selected session rejects remote runtime before store replay" {
+test "resume selected session allows remote runtime" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2472,7 +2471,7 @@ test "resume selected session rejects remote runtime before store replay" {
 
     app.store = try session_store.Store.init(std.testing.allocator, ".");
 
-    try std.testing.expectError(error.SessionResumeUnsupportedForRemoteRuntime, app.resumeSelectedSession());
+    try app.resumeSelectedSession();
 }
 
 // ============================================================================

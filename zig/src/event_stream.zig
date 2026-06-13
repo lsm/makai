@@ -345,6 +345,12 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return self.completed.load(.acquire);
         }
 
+        pub fn hasPending(self: *Self) bool {
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
+            return self.head.load(.acquire) != self.tail.load(.acquire);
+        }
+
         pub fn getResult(self: *Self) ?R {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());

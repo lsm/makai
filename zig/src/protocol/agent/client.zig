@@ -160,6 +160,7 @@ pub const AgentProtocolClient = struct {
     }
 
     pub fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
+        self.session_complete_flags.put(session_id, false) catch {};
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
             err.deinit(self.allocator);
