@@ -1266,6 +1266,9 @@ pub const TuiRuntime = struct {
             var client = &(self.remote_client orelse return error.RuntimeNotStarted);
             if (self.remote_session_id) |sid| client.removeSessionState(sid);
             self.remote_session_id = null;
+            if (self.remote_config_sse_client) |sse_client| {
+                try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+            }
             if (was_stream_active) {
                 try self.completeRemoteWithError("remote connection disconnected");
             } else if (self.remote_turn_in_flight) {
