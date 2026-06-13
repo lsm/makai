@@ -649,7 +649,7 @@ pub const TuiRuntime = struct {
                     var mutable = self.remote_messages.pop().?;
                     mutable.deinit(self.allocator);
                 };
-                try self.sendRemoteMessages(self.remote_messages.items);
+                try self.sendRemoteMessages(self.remote_messages.items, true);
                 message_sent = true;
             },
             .local => {
@@ -1039,7 +1039,7 @@ pub const TuiRuntime = struct {
         client.session_id = null;
     }
 
-    fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message) !void {
+    fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message, emit_tail_prompt: bool) !void {
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
         const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
@@ -1059,11 +1059,11 @@ pub const TuiRuntime = struct {
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
         _ = try client.sendAgentMessage(sid, message_json, options_json);
-        try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
         };
         if (client.getLastErrorForSession(sid) != null) return error.RemoteMessageRejected;
+        if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
     }
 
     fn resumeRemoteSession(self: *TuiRuntime) !void {
@@ -1090,7 +1090,7 @@ pub const TuiRuntime = struct {
             var appended = self.remote_messages.pop().?;
             appended.deinit(self.allocator);
         };
-        try self.sendRemoteMessages(self.remote_messages.items);
+        try self.sendRemoteMessages(self.remote_messages.items, consumed_queue != null);
         sent = true;
         if (consumed_queue) |queue| {
             var removed = queue.orderedRemove(0);
@@ -1108,8 +1108,9 @@ pub const TuiRuntime = struct {
     }
 
     fn pushRemoteTailPromptEvent(self: *TuiRuntime, messages: []const ai_types.Message) !void {
-        if (messages.len <= 1) return;
-        try self.event_stream.push(.{ .message_end = try self.messageEndPayload(messages[messages.len - 1]) });
+        if (messages.len == 0) return;
+        const event = TuiEvent{ .message_end = try self.messageEndPayload(messages[messages.len - 1]) };
+        self.push(event);
     }
 
     fn handleRemoteAgentEnd(self: *TuiRuntime) anyerror!void {
@@ -3940,10 +3941,12 @@ test "remote stream_events keeps pumping pending events" {
     defer event_env.deinit(std.testing.allocator);
     try mock.queueEnvelope(std.testing.allocator, event_env);
 
-    const ev = tui_session.popEvent() orelse return error.NoRemoteEvent;
-    var mutable = ev;
-    defer mutable.deinit(std.testing.allocator);
-    try std.testing.expect(mutable == .turn_start);
+    while (tui_session.popEvent()) |event| {
+        var mutable = event;
+        defer mutable.deinit(std.testing.allocator);
+        if (mutable == .turn_start) return;
+    }
+    return error.NoRemoteEvent;
 }
 
 test "remote cancel completes stream and creates fresh session next turn" {
@@ -4303,6 +4306,94 @@ test "remote submit persists tail prompt while suppressing prompt echoes" {
     try std.testing.expect(tui_session.popEvent() == null);
 }
 
+test "remote submit persists first prompt while suppressing echo" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+
+    try tui_session.submitTurn("first");
+    const persisted = tui_session.popEvent() orelse return error.NoRemoteEvent;
+    var ev = persisted;
+    defer ev.deinit(std.testing.allocator);
+    try std.testing.expect(ev == .message_end);
+    try std.testing.expectEqual(TuiEvent.MessageRole.user, ev.message_end.role);
+    try std.testing.expectEqualStrings("first", ev.message_end.text.slice());
+    try std.testing.expectEqual(@as(usize, 1), runtime.remote_echo_suppression_remaining);
+
+    try runtime.handleRemoteAgentEventJson("{\"type\":\"message_end\"}");
+    try std.testing.expectEqual(@as(usize, 0), runtime.remote_echo_suppression_remaining);
+    try std.testing.expect(tui_session.popEvent() == null);
+}
+
+test "remote resume does not re-emit saved user tail" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = runtime.remote_pending_session_id.?,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = runtime.remote_pending_session_id.? } },
+    });
+    var history = try makeRemoteUserMessage(std.testing.allocator, "history");
+    defer history.deinit(std.testing.allocator);
+    var tail = try makeRemoteUserMessage(std.testing.allocator, "tail");
+    defer tail.deinit(std.testing.allocator);
+    try runtime.remote_messages.append(std.testing.allocator, try ai_types.cloneMessage(std.testing.allocator, history));
+    try runtime.remote_messages.append(std.testing.allocator, try ai_types.cloneMessage(std.testing.allocator, tail));
+
+    try tui_session.resumeSession();
+    try std.testing.expect(tui_session.popEvent() == null);
+}
+
+test "remote rejected submit does not emit tail prompt" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver(), .remote_session_timeout_ms = 1_000, .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    const pending_sid = runtime.remote_pending_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = pending_sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = 0,
+        .payload = .{ .agent_started = .{ .session_id = pending_sid } },
+    });
+    try runtime.ensureRemoteSession();
+    const sid = runtime.remote_session_id.?;
+    try mock.queueEnvelope(std.testing.allocator, .{
+        .session_id = sid,
+        .message_id = agent_protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = 0,
+        .payload = .{ .agent_error = .{ .code = .agent_busy, .message = "busy" } },
+    });
+
+    try std.testing.expectError(error.RemoteMessageRejected, tui_session.submitTurn("rejected"));
+    try std.testing.expectEqual(@as(usize, 0), runtime.remote_messages.items.len);
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        try std.testing.expect(ev != .message_end);
+    }
+}
+
 test "remote done event records assistant history for next turn" {
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote });
     defer runtime.deinit();
@@ -4620,8 +4711,12 @@ test "remote runtime integrates with in-process agent protocol server" {
     _ = try protocol_runtime.pumpServerOutbox();
     _ = tui_session.streamEvents();
 
-    const ev = tui_session.popEvent() orelse return error.NoRemoteEvent;
-    try std.testing.expect(ev == .turn_start);
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .turn_start) return;
+    }
+    return error.NoRemoteEvent;
 }
 
 fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
