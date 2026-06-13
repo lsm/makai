@@ -548,6 +548,10 @@ pub const TuiRuntime = struct {
         self.started = false;
     }
 
+    pub fn canSteer(self: *const TuiRuntime) bool {
+        return self.backend == .local;
+    }
+
     pub fn createSession(self: *TuiRuntime) TuiSession {
         return .{
             .ctx = self,
@@ -561,6 +565,7 @@ pub const TuiRuntime = struct {
                 .queue_follow_up = sessionQueueFollowUp,
                 .clear_queued_messages = sessionClearQueuedMessages,
                 .queued_counts = sessionQueuedCounts,
+                .can_steer = sessionCanSteer,
                 .switch_model = sessionSwitchModel,
                 .switch_model_exact = sessionSwitchModelExact,
                 .current_model = sessionCurrentModel,
@@ -2300,6 +2305,11 @@ fn sessionQueuedCounts(ctx: ?*anyopaque) QueuedCounts {
     return self.queuedCounts();
 }
 
+fn sessionCanSteer(ctx: ?*anyopaque) bool {
+    const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
+    return self.canSteer();
+}
+
 fn sessionSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
     const self: *TuiRuntime = @ptrCast(@alignCast(ctx.?));
     try self.switchModel(model_id);
@@ -2874,6 +2884,22 @@ test "runtime queues steering and follow-up messages" {
     try std.testing.expect(user_messages >= 2);
     try std.testing.expectEqual(@as(usize, 3), mock.call_count);
     try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
+}
+
+test "local runtime reports steering available" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+    try std.testing.expect(runtime.canSteer());
+    try std.testing.expect(runtime.createSession().canSteer());
+}
+
+test "remote runtime reports steering unavailable" {
+    var mock = RemoteMock.init();
+    defer mock.deinit(std.testing.allocator);
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .remote_sender = mock.sender(), .remote_receiver = mock.receiver() });
+    defer runtime.deinit();
+    try std.testing.expect(!runtime.canSteer());
+    try std.testing.expect(!runtime.createSession().canSteer());
 }
 
 test "remote queue operations retain steering and follow-up messages" {

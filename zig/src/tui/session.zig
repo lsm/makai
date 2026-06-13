@@ -183,6 +183,7 @@ pub const TuiSessionOps = struct {
     queue_follow_up: *const fn (ctx: ?*anyopaque, text: []const u8) anyerror!void = undefined,
     clear_queued_messages: *const fn (ctx: ?*anyopaque) void = undefined,
     queued_counts: *const fn (ctx: ?*anyopaque) QueuedCounts = undefined,
+    can_steer: *const fn (ctx: ?*anyopaque) bool = undefined,
     switch_model: *const fn (ctx: ?*anyopaque, model_id: []const u8) anyerror!void = undefined,
     switch_model_exact: *const fn (ctx: ?*anyopaque, model: ai_types.Model) anyerror!void = undefined,
     current_model: *const fn (ctx: ?*anyopaque) ?ai_types.Model = undefined,
@@ -228,6 +229,10 @@ pub const TuiSession = struct {
 
     pub fn queuedCounts(self: *TuiSession) QueuedCounts {
         return self.ops.queued_counts(self.ctx);
+    }
+
+    pub fn canSteer(self: *const TuiSession) bool {
+        return self.ops.can_steer(self.ctx);
     }
 
     pub fn switchModel(self: *TuiSession, model_id: []const u8) !void {

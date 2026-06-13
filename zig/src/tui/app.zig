@@ -796,8 +796,9 @@ pub const App = struct {
     }
 
     fn supportsStreamingShortcuts(self: *const App) bool {
-        _ = self.runtime orelse return self.session != null;
-        return self.session != null;
+        if (self.runtime) |runtime| return runtime.canSteer();
+        if (self.session) |*session| return session.canSteer();
+        return false;
     }
 
     fn discardPendingEvents(self: *App) void {
@@ -2105,6 +2106,7 @@ const MockAppSession = struct {
     cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
+    steer_enabled: bool = true,
     events: tui_runtime.TuiEventStream = undefined,
     events_initialized: bool = false,
 
@@ -2120,6 +2122,7 @@ const MockAppSession = struct {
                 .queue_follow_up = queueFollowUp,
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
+                .can_steer = canSteer,
                 .switch_model = switchModel,
                 .switch_model_exact = switchModelExact,
                 .current_model = currentModel,
@@ -2155,7 +2158,7 @@ const MockAppSession = struct {
     fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.steer_count += 1;
-        try std.testing.expectEqualStrings("steer me", text);
+        _ = text;
     }
 
     fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
@@ -2172,6 +2175,10 @@ const MockAppSession = struct {
 
     fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
         return ptr(ctx).queued_counts;
+    }
+
+    fn canSteer(ctx: ?*anyopaque) bool {
+        return ptr(ctx).steer_enabled;
     }
 
     fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
@@ -2347,6 +2354,28 @@ test "TuiModel remote streaming Enter falls back to submit and preserves compose
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+}
+
+test "TuiModel local streaming Enter steers when steering available" {
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "steer now");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
 }

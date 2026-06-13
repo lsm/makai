@@ -119,14 +119,19 @@ fn utf8BoundaryAtOrBefore(text: []const u8, index: usize) usize {
 
 fn renderHint(allocator: std.mem.Allocator, state: *const tui_state.AppState, streaming_shortcuts_supported: bool, max_width: usize) ![]const u8 {
     const text = state.composer.text();
-    if (state.status.streaming and streaming_shortcuts_supported) {
-        const queued = state.queue.total();
-        const hint = if (queued > 0)
-            try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
-        else
-            try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
-        defer allocator.free(hint);
-        const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
+    if (state.status.streaming) {
+        if (streaming_shortcuts_supported) {
+            const queued = state.queue.total();
+            const hint = if (queued > 0)
+                try std.fmt.allocPrint(allocator, "Enter steer • Alt+Enter queue follow-up • queued {d}", .{queued})
+            else
+                try allocator.dupe(u8, "Enter steer • Alt+Enter queue follow-up");
+            defer allocator.free(hint);
+            const truncated = try tui_text.truncateToWidth(allocator, hint, max_width);
+            defer allocator.free(truncated);
+            return tui_theme.muted().render(allocator, truncated);
+        }
+        const truncated = try tui_text.truncateToWidth(allocator, "steering not available in remote mode", max_width);
         defer allocator.free(truncated);
         return tui_theme.muted().render(allocator, truncated);
     }
@@ -223,7 +228,7 @@ test "composer renders queued hint while streaming shortcuts are supported" {
     try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") != null);
 }
 
-test "composer hides streaming shortcut hint when unsupported" {
+test "composer shows unavailable steering hint when streaming shortcuts are unsupported" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
     state.status.streaming = true;
@@ -233,7 +238,8 @@ test "composer hides streaming shortcut hint when unsupported" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "Alt+Enter") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "queued 2") == null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "Enter submit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "steering not available in remote mode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Enter submit") == null);
 }
 
 test "composer renders shell and file hints" {
