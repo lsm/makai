@@ -124,6 +124,7 @@ pub const ParsedHttpUrl = struct {
     host: []const u8,
     port: u16,
     path: []const u8,
+    explicit_port: bool = false,
 
     pub const Scheme = enum { http, https };
 };
@@ -142,16 +143,17 @@ pub fn parseHttpUrl(url: []const u8) !ParsedHttpUrl {
     }
 
     const host_start = offset;
-    var host_end = url.len;
-    if (std.mem.indexOfScalarPos(u8, url, offset, '/')) |slash| host_end = slash;
+    var authority_end = url.len;
+    if (std.mem.indexOfAnyPos(u8, url, offset, "/?")) |end| authority_end = end;
+    var host_end = authority_end;
     if (std.mem.indexOfScalarPos(u8, url, offset, ':')) |colon| {
-        if (colon < host_end) {
+        if (colon < authority_end) {
             host_end = colon;
-            const port_end = std.mem.indexOfScalarPos(u8, url, colon + 1, '/') orelse url.len;
-            result.port = try std.fmt.parseInt(u16, url[colon + 1 .. port_end], 10);
-            offset = port_end;
-        } else offset = host_end;
-    } else offset = host_end;
+            result.explicit_port = true;
+            result.port = try std.fmt.parseInt(u16, url[colon + 1 .. authority_end], 10);
+        }
+    }
+    offset = authority_end;
 
     if (host_end == host_start) return error.InvalidUrl;
     result.host = url[host_start..host_end];
@@ -197,7 +199,11 @@ pub const SseHttpClient = struct {
         errdefer stream.close();
         var request = std.ArrayList(u8).empty;
         defer request.deinit(self.allocator);
-        try request.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n", .{ parsed.path, parsed.host });
+        const host_header = try formatHostHeader(self.allocator, parsed);
+        defer self.allocator.free(host_header);
+        const path = try formatPath(self.allocator, parsed.path);
+        defer self.allocator.free(path);
+        try request.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n", .{ path, host_header });
         for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         try request.appendSlice(self.allocator, "\r\n");
         stream.writeAll(request.items) catch return error.ConnectionFailed;
@@ -315,7 +321,11 @@ pub const SseHttpClient = struct {
         defer stream.close();
         var request = std.ArrayList(u8).empty;
         defer request.deinit(self.allocator);
-        try request.print(self.allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ parsed.path, parsed.host, data.len });
+        const host_header = try formatHostHeader(self.allocator, parsed);
+        defer self.allocator.free(host_header);
+        const path = try formatPath(self.allocator, parsed.path);
+        defer self.allocator.free(path);
+        try request.print(self.allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ path, host_header, data.len });
         for (self.headers) |header| try request.print(self.allocator, "{s}: {s}\r\n", .{ header.name, header.value });
         try request.appendSlice(self.allocator, "\r\n");
         try request.appendSlice(self.allocator, data);
@@ -335,6 +345,16 @@ pub const SseHttpClient = struct {
         self.close();
     }
 };
+
+fn formatPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (path.len > 0 and path[0] == '?') return std.fmt.allocPrint(allocator, "/{s}", .{path});
+    return allocator.dupe(u8, path);
+}
+
+fn formatHostHeader(allocator: std.mem.Allocator, parsed: ParsedHttpUrl) ![]u8 {
+    if (!parsed.explicit_port) return allocator.dupe(u8, parsed.host);
+    return std.fmt.allocPrint(allocator, "{s}:{d}", .{ parsed.host, parsed.port });
+}
 
 const HttpProducer = struct {
     allocator: std.mem.Allocator,
@@ -752,6 +772,11 @@ test "parseHttpUrl validates HTTP SSE URLs" {
     try std.testing.expectEqualStrings("127.0.0.1", a.host);
     try std.testing.expectEqual(@as(u16, 8080), a.port);
     try std.testing.expectEqualStrings("/events", a.path);
+    try std.testing.expect(a.explicit_port);
+    const query_only = try parseHttpUrl("http://backend:8080?token=abc");
+    try std.testing.expectEqualStrings("backend", query_only.host);
+    try std.testing.expectEqual(@as(u16, 8080), query_only.port);
+    try std.testing.expectEqualStrings("?token=abc", query_only.path);
     const b = try parseHttpUrl("https://example.com/sse");
     try std.testing.expectEqual(ParsedHttpUrl.Scheme.https, b.scheme);
     try std.testing.expectEqual(@as(u16, 443), b.port);

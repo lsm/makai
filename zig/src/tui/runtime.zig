@@ -309,12 +309,21 @@ pub const TuiRuntime = struct {
                 .sse => {
                     if (options.remote_config.endpoint.len == 0) return error.UnsupportedRemoteEndpoint;
                     const client = try allocator.create(sse_transport.SseHttpClient);
+                    var client_initialized = false;
+                    errdefer if (!client_initialized) allocator.destroy(client);
                     client.* = sse_transport.SseHttpClient.init(allocator);
+                    client_initialized = true;
+                    var client_moved = false;
+                    errdefer if (!client_moved) {
+                        client.deinit();
+                        allocator.destroy(client);
+                    };
                     try client.connect(options.remote_config.endpoint, options.remote_config.auth_headers);
                     remote_config_sse_endpoint = try allocator.dupe(u8, options.remote_config.endpoint);
                     remote_config_sse_headers = try allocator.alloc(ai_types.HeaderPair, options.remote_config.auth_headers.len);
                     for (options.remote_config.auth_headers, 0..) |header, i| remote_config_sse_headers[i] = .{ .name = try allocator.dupe(u8, header.name), .value = try allocator.dupe(u8, header.value) };
                     remote_config_sse_client = client;
+                    client_moved = true;
                     remote_sender = client.asyncSender();
                     remote_receiver = .{ .ctx = client, .read_line_fn = remoteConfigSseReadLine, .read_result_fn = remoteConfigSseReadResult, .close_fn = remoteConfigSseClose };
                 },
