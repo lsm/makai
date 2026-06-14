@@ -795,7 +795,7 @@ pub const App = struct {
         if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
     }
 
-    fn supportsStreamingShortcuts(self: *const App) bool {
+    fn steeringAvailable(self: *const App) bool {
         if (self.runtime) |runtime| return runtime.canSteer();
         if (self.session) |*session| return session.canSteer();
         return false;
@@ -1000,7 +1000,7 @@ pub const App = struct {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
-            const tips = if (self.supportsStreamingShortcuts())
+            const tips = if (self.steeringAvailable())
                 "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
                 "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
@@ -1429,7 +1429,7 @@ pub const TuiModel = struct {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
                                 };
-                            } else if (app.supportsStreamingShortcuts()) {
+                            } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
@@ -1500,7 +1500,7 @@ pub const TuiModel = struct {
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
-            .steering_available = app.supportsStreamingShortcuts(),
+            .steering_available = app.steeringAvailable(),
         }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
