@@ -20,6 +20,7 @@ const local_tools = @import("tools/registry");
 const tool_local_runtime = @import("tool_local_runtime");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const tui_config = @import("tui_config");
 
 pub const TuiSession = session.TuiSession;
 pub const TuiEvent = session.TuiEvent;
@@ -101,8 +102,61 @@ pub const TuiRemoteConfig = struct {
     mode: TuiBackendMode = .local,
     transport: TuiRemoteTransport = .stdio,
     endpoint: []const u8 = "",
+    command: []const u8 = "",
+    auth_token: []const u8 = "",
     auth_headers: []const ai_types.HeaderPair = &.{},
+
+    pub fn deinit(self: *TuiRemoteConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.endpoint);
+        allocator.free(self.command);
+        allocator.free(self.auth_token);
+        for (self.auth_headers) |header| {
+            var h = header;
+            h.deinit(allocator);
+        }
+        allocator.free(self.auth_headers);
+        self.* = .{};
+    }
 };
+
+pub fn parseRemoteTransport(value: []const u8) ?TuiRemoteTransport {
+    if (std.mem.eql(u8, value, "stdio")) return .stdio;
+    if (std.mem.eql(u8, value, "sse")) return .sse;
+    if (std.mem.eql(u8, value, "ws")) return .websocket;
+    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    return null;
+}
+
+pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Config) !TuiRemoteConfig {
+    var result = TuiRemoteConfig{
+        .mode = if (cfg.remote.enabled) .remote else .local,
+        .transport = .stdio,
+        .endpoint = try allocator.dupe(u8, cfg.remote.endpoint),
+        .command = try allocator.dupe(u8, cfg.remote.command),
+        .auth_token = try allocator.dupe(u8, cfg.remote.auth_token),
+        .auth_headers = &.{},
+    };
+    errdefer result.deinit(allocator);
+
+    const transport_name = if (cfg.remote.transport.len > 0) cfg.remote.transport else "stdio";
+    result.transport = parseRemoteTransport(transport_name) orelse .stdio;
+
+    var headers: std.ArrayList(ai_types.HeaderPair) = .empty;
+    errdefer {
+        for (headers.items) |*header| header.deinit(allocator);
+        headers.deinit(allocator);
+    }
+    if (cfg.remote.auth_token.len > 0) {
+        const value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{cfg.remote.auth_token});
+        errdefer allocator.free(value);
+        try headers.append(allocator, .{ .name = try allocator.dupe(u8, "Authorization"), .value = value });
+    } else if (cfg.remote.auth_header_value.len > 0) {
+        const name = if (cfg.remote.auth_header_name.len > 0) cfg.remote.auth_header_name else "Authorization";
+        try headers.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, cfg.remote.auth_header_value) });
+    }
+    result.auth_headers = try headers.toOwnedSlice(allocator);
+    return result;
+}
 
 pub const TuiRuntimeOptions = struct {
     backend: TuiBackendMode = .local,

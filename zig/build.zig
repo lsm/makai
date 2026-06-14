@@ -922,6 +922,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "json/writer", .module = json_writer_mod },
             .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
         },
     });
 
@@ -960,8 +961,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
         },
     });
 
