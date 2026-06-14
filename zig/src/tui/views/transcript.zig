@@ -311,8 +311,9 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
             var markdown = zz.Markdown.init();
             markdown.width = @intCast(@min(budget, std.math.maxInt(u16)));
             const md = try markdown.render(arena, entry.text);
+            const wrapped = try tui_text.wrapTextPreservingPrefix(arena, md, budget);
             const open = try openSgr(arena, assistant_fg, assistant_bg);
-            break :blk try renderBubble(arena, md, open, false, width);
+            break :blk try renderBubble(arena, wrapped, open, false, width);
         },
         else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, width),
     };
@@ -761,4 +762,79 @@ test "transcript keeps one-line viewport within height when scrolled" {
 
     try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(text));
     try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
+}
+
+test "transcript renders heading bold without markdown marker" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "# Heading");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Heading") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "# Heading") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") != null);
+}
+
+test "transcript renders list with indented continuation" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "- first second third");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 15, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "•") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "second") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "- first") == null);
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 15);
+    }
+}
+
+test "transcript renders inline code without backticks" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "use `code` here");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "code") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`code`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[") != null);
+}
+
+test "transcript renders fenced code block with border" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "```zig\n    const x = 1;\n```\n");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "const x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "```zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "┌") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "└") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "│") != null);
+}
+
+test "transcript wraps assistant text within viewport width" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "alpha beta gamma delta epsilon zeta eta theta");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 30, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(tui_text.lineCount(text) > 1);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        try std.testing.expect(tui_text.visibleWidth(line) <= 30);
+    }
 }
