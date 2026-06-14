@@ -1417,6 +1417,7 @@ pub const TuiModel = struct {
                             if (command.kind != .abort) return .none;
                         }
                         app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
+                        var consumed = true;
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
@@ -1435,11 +1436,19 @@ pub const TuiModel = struct {
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
-                                app.submit(text) catch |err| {
-                                    if (err == error.QuitRequested) return .quit;
-                                    app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                    app.state.appendTranscript(.@"error", @errorName(err)) catch {};
-                                };
+                                // Remote backend does not support steering mid-stream; keep the
+                                // draft in the composer and let the composer hint explain why.
+                                // Still allow slash commands such as /quit and /abort to run.
+                                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                                if (std.mem.startsWith(u8, trimmed, "/")) {
+                                    app.submit(text) catch |err| {
+                                        if (err == error.QuitRequested) return .quit;
+                                        app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                        app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                    };
+                                } else {
+                                    consumed = false;
+                                }
                             }
                         } else {
                             app.submit(text) catch |err| {
@@ -1448,11 +1457,13 @@ pub const TuiModel = struct {
                                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         }
-                        app.state.composer.clear();
-                        app.drainEvents() catch |err| {
-                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
-                        };
+                        if (consumed) {
+                            app.state.composer.clear();
+                            app.drainEvents() catch |err| {
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        }
                     },
                     .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
@@ -2344,7 +2355,7 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expect(!model.app.?.state.status.streaming);
 }
 
-test "TuiModel remote streaming Enter falls back to submit and preserves composer" {
+test "TuiModel remote streaming Enter is ignored and preserves composer" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
@@ -2358,10 +2369,11 @@ test "TuiModel remote streaming Enter falls back to submit and preserves compose
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
-    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqualStrings("new turn", model.app.?.state.composer.text());
+    try std.testing.expectEqualStrings("", model.app.?.state.status.last_error);
 }
 
 test "TuiModel remote streaming Alt+Enter still queues follow-up" {
