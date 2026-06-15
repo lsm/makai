@@ -104,7 +104,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
-    .{ .name = "remote", .kind = .remote, .usage = "/remote [stdio|sse|ws|auth|header|off]", .description = "Configure remote transport", .handler = handleRemote },
+    .{ .name = "remote", .kind = .remote, .usage = "/remote [stdio|sse <url>|ws <url>|auth <token>|header <name> <value>|off]", .description = "Configure remote transport", .handler = handleRemote },
 };
 
 pub fn parse(input: []const u8) ParseError!Command {
@@ -473,11 +473,11 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
 
         if (std.mem.eql(u8, sub, "stdio")) {
             if (rest.len > 0) {
-                return .{ .output = try allocator.dupe(u8, "stdio command spawn not yet supported"), .is_error = true };
+                return .{ .output = try allocator.dupe(u8, "stdio transport uses the current process; no command argument is supported"), .is_error = true };
             }
             cfg.remote.enabled = true;
             try replaceRemoteString(allocator, &cfg.remote.transport, "stdio");
-            try replaceRemoteString(allocator, &cfg.remote.command, rest);
+            try replaceRemoteString(allocator, &cfg.remote.command, "");
             try replaceRemoteString(allocator, &cfg.remote.endpoint, "");
         } else if (std.mem.eql(u8, sub, "sse")) {
             if (rest.len == 0) {
@@ -536,7 +536,11 @@ fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
     const scheme = url[0..scheme_end];
     for (schemes) |allowed| {
-        if (std.mem.eql(u8, scheme, allowed)) return;
+        if (std.mem.eql(u8, scheme, allowed)) {
+            const host = std.mem.trim(u8, url[scheme_end + 3 ..], " \t\r\n/");
+            if (host.len == 0) return error.InvalidUrl;
+            return;
+        }
     }
     return error.InvalidUrl;
 }
@@ -1082,5 +1086,108 @@ test "remote command parses as slash command" {
     const command = try parse("/remote sse http://localhost:8080");
     try std.testing.expectEqual(CommandKind.remote, command.kind);
     try std.testing.expectEqualStrings("sse http://localhost:8080", command.arg.?);
+}
+
+test "remote command sets stdio transport and persists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer std.testing.allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+
+    var store = try tui_config.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "stdio");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: stdio") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(loaded.remote.enabled);
+    try std.testing.expectEqualStrings("stdio", loaded.remote.transport);
+    try std.testing.expectEqualStrings("", loaded.remote.command);
+    try std.testing.expectEqualStrings("", loaded.remote.endpoint);
+}
+
+test "remote command stdio rejects command argument" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .remote, .arg = "stdio /bin/foo" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "no command argument is supported") != null);
+}
+
+test "remote command off disables remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer std.testing.allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+
+    var store = try tui_config.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var sse_result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:8080");
+    defer sse_result.deinit(std.testing.allocator);
+    try std.testing.expect(!sse_result.is_error);
+
+    var off_result = try applyRemoteCommand(std.testing.allocator, store, "off");
+    defer off_result.deinit(std.testing.allocator);
+    try std.testing.expect(!off_result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "disabled") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
+}
+
+test "remote command header sets header and clears auth token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer std.testing.allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+
+    var store = try tui_config.Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var auth_result = try applyRemoteCommand(std.testing.allocator, store, "auth secret-token");
+    defer auth_result.deinit(std.testing.allocator);
+    try std.testing.expect(!auth_result.is_error);
+
+    var header_result = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc123");
+    defer header_result.deinit(std.testing.allocator);
+    try std.testing.expect(!header_result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", loaded.remote.auth_token);
+    try std.testing.expectEqualStrings("X-Api-Key", loaded.remote.auth_header_name);
+    try std.testing.expectEqualStrings("abc123", loaded.remote.auth_header_value);
+}
+
+test "remote command rejects unknown subcommand" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .remote, .arg = "bogus" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "unknown remote subcommand: bogus") != null);
+}
+
+test "remote command rejects sse endpoint with empty host" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var result = try dispatch(.{ .allocator = std.testing.allocator, .state = &state }, .{ .kind = .remote, .arg = "sse http://" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http or https scheme") != null);
 }
 

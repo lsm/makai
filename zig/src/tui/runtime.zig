@@ -107,14 +107,14 @@ pub const TuiRemoteConfig = struct {
     auth_headers: []const ai_types.HeaderPair = &.{},
 
     pub fn deinit(self: *TuiRemoteConfig, allocator: std.mem.Allocator) void {
-        allocator.free(self.endpoint);
-        allocator.free(self.command);
-        allocator.free(self.auth_token);
+        if (self.endpoint.len > 0) allocator.free(self.endpoint);
+        if (self.command.len > 0) allocator.free(self.command);
+        if (self.auth_token.len > 0) allocator.free(self.auth_token);
         for (self.auth_headers) |header| {
             var h = header;
             h.deinit(allocator);
         }
-        allocator.free(self.auth_headers);
+        if (self.auth_headers.len > 0) allocator.free(self.auth_headers);
         self.* = .{};
     }
 };
@@ -131,15 +131,21 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
     var result = TuiRemoteConfig{
         .mode = if (cfg.remote.enabled) .remote else .local,
         .transport = .stdio,
-        .endpoint = try allocator.dupe(u8, cfg.remote.endpoint),
-        .command = try allocator.dupe(u8, cfg.remote.command),
-        .auth_token = try allocator.dupe(u8, cfg.remote.auth_token),
+        .endpoint = if (cfg.remote.endpoint.len > 0) try allocator.dupe(u8, cfg.remote.endpoint) else &.{},
+        .command = if (cfg.remote.command.len > 0) try allocator.dupe(u8, cfg.remote.command) else &.{},
+        .auth_token = if (cfg.remote.auth_token.len > 0) try allocator.dupe(u8, cfg.remote.auth_token) else &.{},
         .auth_headers = &.{},
     };
     errdefer result.deinit(allocator);
 
     const transport_name = if (cfg.remote.transport.len > 0) cfg.remote.transport else "stdio";
     result.transport = parseRemoteTransport(transport_name) orelse .stdio;
+
+    // WebSocket backend is not wired up yet. If a hand-edited config requests
+    // it, gracefully fall back to local mode so the TUI still launches.
+    if (result.transport == .websocket) {
+        result.mode = .local;
+    }
 
     var headers: std.ArrayList(ai_types.HeaderPair) = .empty;
     errdefer {
@@ -154,7 +160,9 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
         const name = if (cfg.remote.auth_header_name.len > 0) cfg.remote.auth_header_name else "Authorization";
         try headers.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, cfg.remote.auth_header_value) });
     }
-    result.auth_headers = try headers.toOwnedSlice(allocator);
+    if (headers.items.len > 0) {
+        result.auth_headers = try headers.toOwnedSlice(allocator);
+    }
     return result;
 }
 
@@ -4049,6 +4057,37 @@ test "remote config rejects unsupported endpoint" {
 
 test "remote config rejects unsupported transport" {
     try std.testing.expectError(error.UnsupportedRemoteTransport, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "ws://localhost:1" } }));
+}
+
+test "remoteConfigFromConfig falls back to local for websocket" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "websocket");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "ws://localhost:1");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.websocket, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig skips empty allocations" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", rc.endpoint);
+    try std.testing.expectEqualStrings("", rc.command);
+    try std.testing.expectEqualStrings("", rc.auth_token);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "default TuiRemoteConfig deinit is safe" {
+    var rc: TuiRemoteConfig = .{};
+    rc.deinit(std.testing.allocator);
 }
 
 test "remote start resets state after pump error" {
