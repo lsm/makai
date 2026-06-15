@@ -253,7 +253,13 @@ pub const ProductionRuntime = struct {
         };
         if (maybe_store) |*store| {
             defer store.deinit();
-            saved_config = try store.loadIfExists();
+            // A malformed or unreadable config file must not brick TUI startup;
+            // fall back to defaults on non-OOM load errors (matching the
+            // previous saved-model loader behavior).
+            saved_config = store.loadIfExists() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
         }
         errdefer if (saved_config) |*cfg| cfg.deinit(allocator);
 
