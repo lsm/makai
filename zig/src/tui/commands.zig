@@ -538,14 +538,28 @@ fn replaceRemoteString(allocator: std.mem.Allocator, field: *[]u8, value: []cons
 fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
     const scheme = url[0..scheme_end];
+    var matched = false;
     for (schemes) |allowed| {
         if (std.mem.eql(u8, scheme, allowed)) {
-            const host = std.mem.trim(u8, url[scheme_end + 3 ..], " \t\r\n/");
-            if (host.len == 0) return error.InvalidUrl;
-            return;
+            matched = true;
+            break;
         }
     }
-    return error.InvalidUrl;
+    if (!matched) return error.InvalidUrl;
+
+    // Authority runs from after "://" up to the first path/query/fragment.
+    const after = url[scheme_end + 3 ..];
+    var auth_end: usize = 0;
+    while (auth_end < after.len and after[auth_end] != '/' and after[auth_end] != '?' and after[auth_end] != '#') : (auth_end += 1) {}
+    const authority = after[0..auth_end];
+    if (authority.len == 0) return error.InvalidUrl;
+
+    // Strip userinfo (everything up to and including the last '@').
+    var host = authority;
+    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| host = authority[at + 1 ..];
+    // Strip port.
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    if (host.len == 0) return error.InvalidUrl;
 }
 
 fn formatRemoteStatus(allocator: std.mem.Allocator, remote: tui_config.RemoteConfig) ![]u8 {
@@ -1205,5 +1219,35 @@ test "remote command rejects sse endpoint with empty host" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
+}
+
+test "remote command rejects sse endpoint with path-only authority" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http:///events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with port-only authority" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
 }
 
