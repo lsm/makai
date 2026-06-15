@@ -422,10 +422,8 @@ pub const App = struct {
         }
         // Initialize session store and generate a session ID.
         app.store = session_store.Store.initDefault(allocator) catch null;
-        app.session_id = generateSessionId(allocator) catch try allocator.dupe(u8, "default");
-        app.session_created_at = compat.time.nowMillis();
+        try app.ensureSessionId();
         app.working_dir = currentPathOwned(allocator) catch try allocator.dupe(u8, "");
-        try app.state.status.setSessionId(allocator, app.session_id);
         // Pre-populate sessions list on a best-effort basis. Startup should not
         // lose the interactive runtime just because saved-session discovery fails.
         app.loadSessions() catch |err| try app.recordError(@errorName(err));
@@ -456,6 +454,13 @@ pub const App = struct {
         if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
         self.state.deinit();
         self.* = undefined;
+    }
+
+    fn ensureSessionId(self: *App) !void {
+        if (self.session_id.len > 0) return;
+        self.session_id = generateSessionId(self.allocator) catch try self.allocator.dupe(u8, "default");
+        self.session_created_at = compat.time.nowMillis();
+        try self.state.status.setSessionId(self.allocator, self.session_id);
     }
 
     /// Load sessions from the store into state.sessions.
@@ -508,7 +513,36 @@ pub const App = struct {
         self.state.clearQueuedPreviews();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
+        self.state.session_delete_confirm = false;
         self.state.mode = .normal;
+    }
+
+    pub fn deleteSelectedSession(self: *App) !void {
+        const store = self.store orelse return error.NoStoreConfigured;
+        const sessions = self.state.sessions.items;
+        if (sessions.len == 0) return;
+        const idx = self.state.session_index;
+        if (idx >= sessions.len) return;
+        const id = try self.allocator.dupe(u8, sessions[idx].id);
+        defer self.allocator.free(id);
+
+        try store.delete(id);
+        if (std.mem.eql(u8, self.session_id, id)) {
+            if (self.session_id.len > 0) self.allocator.free(self.session_id);
+            self.session_id = &.{};
+            self.session_created_at = 0;
+            try self.state.status.setSessionId(self.allocator, "");
+        }
+
+        try self.loadSessions();
+        self.state.session_delete_confirm = false;
+        if (self.state.sessions.items.len == 0) {
+            self.state.session_index = 0;
+            self.state.session_scroll = 0;
+        } else if (self.state.session_index >= self.state.sessions.items.len) {
+            self.state.session_index = self.state.sessions.items.len - 1;
+        }
+        TuiModel.ensureSessionSelectionVisible(self);
     }
 
     /// Providers that expose an interactive login or API-key setup flow.
@@ -1108,6 +1142,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        try self.ensureSessionId();
         self.state.stream_aborted = false;
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
@@ -1801,12 +1836,32 @@ pub const TuiModel = struct {
                 }
                 // Session picker navigation and filtering.
                 if (app.state.mode == .session_picker) {
+                    if (app.state.session_delete_confirm) {
+                        switch (key.key) {
+                            .char => |c| switch (std.ascii.toLower(c)) {
+                                'y' => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
+                                'n' => app.state.session_delete_confirm = false,
+                                else => {},
+                            },
+                            .enter => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
+                            .escape => app.state.session_delete_confirm = false,
+                            else => {},
+                        }
+                        return .none;
+                    }
                     switch (key.key) {
                         .up => moveSessionSelection(app, -1),
                         .down => moveSessionSelection(app, 1),
                         .backspace => updateSessionFilter(app, .backspace, null),
                         .delete => updateSessionFilter(app, .delete, null),
-                        .char => |c| updateSessionFilter(app, .char, c),
+                        .char => |c| switch (c) {
+                            'k' => moveSessionSelection(app, -1),
+                            'j' => moveSessionSelection(app, 1),
+                            'd' => {
+                                if (app.state.session_index < app.state.filteredSessionCount()) app.state.session_delete_confirm = true;
+                            },
+                            else => updateSessionFilter(app, .char, c),
+                        },
                         .space => updateSessionFilter(app, .char, ' '),
                         .left => _ = app.state.session_filter.moveCursorPrev(),
                         .right => _ = app.state.session_filter.moveCursorNext(),
@@ -1815,7 +1870,10 @@ pub const TuiModel = struct {
                         .enter => {
                             app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
                         },
-                        .escape => app.state.mode = .normal,
+                        .escape => {
+                            app.state.session_delete_confirm = false;
+                            app.state.mode = .normal;
+                        },
                         else => {},
                     }
                     return .none;
@@ -3644,6 +3702,98 @@ test "session picker keeps selected session when still matched after filter" {
     try std.testing.expectEqual(@as(usize, 2), app.state.filteredSessionCount());
     try std.testing.expectEqual(@as(usize, 1), app.state.session_index);
     try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
+fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    errdefer allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+    return base;
+}
+
+fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64) !void {
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, id),
+        .model = try std.testing.allocator.dupe(u8, "model-a"),
+        .provider = try std.testing.allocator.dupe(u8, "provider-a"),
+        .created_at = last_active,
+        .last_active = last_active,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, ""),
+    };
+    defer meta.deinit(std.testing.allocator);
+    try store.save(meta, tui_runtime.TuiEvent.turn_start);
+}
+
+test "session picker delete confirmation can be cancelled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'n' } } }, undefined);
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+
+    var list = try model.app.?.store.?.list();
+    defer {
+        for (list.items) |*item| item.deinit(std.testing.allocator);
+        list.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+}
+
+test "session picker confirm deletes selected session and clamps selection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try saveTestSession(model.app.?.store.?, "s2", 2);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+    model.app.?.state.session_index = 1;
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'y' } } }, undefined);
+
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
+}
+
+test "deleting current session clears active session id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(app.store.?, "current", 1);
+    try app.loadSessions();
+    app.session_id = try std.testing.allocator.dupe(u8, "current");
+    try app.state.status.setSessionId(std.testing.allocator, "current");
+
+    try app.deleteSelectedSession();
+    try std.testing.expectEqual(@as(usize, 0), app.session_id.len);
+    try std.testing.expectEqual(@as(usize, 0), app.state.status.session_id.len);
+
+    try app.submit("next turn");
+    try std.testing.expect(app.session_id.len > 0);
+    try std.testing.expect(app.state.status.session_id.len > 0);
 }
 
 test "TuiModel Tab cycles focus through panes" {
@@ -3809,10 +3959,8 @@ test "resume selected session allows remote runtime" {
     try app.resumeSelectedSession();
 }
 
-// ============================================================================
-// Mock provider for ProductionRuntime lifetime regression tests
-// ============================================================================
-
+// =====================================================================// Mock provider for ProductionRuntime lifetime regression tests
+// =====================================================================
 const MockProvider = struct {
     fn stream(
         model: ai_types.Model,

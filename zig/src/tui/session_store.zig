@@ -180,6 +180,15 @@ pub const Store = struct {
         return loaded;
     }
 
+    pub fn delete(self: Store, session_id: []const u8) !void {
+        const path = try sessionPath(self.allocator, self.base_dir, session_id);
+        defer self.allocator.free(path);
+        compat.fs.getCwd().deleteFile(defaultIo(), path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+
     pub fn list(self: Store) !std.ArrayList(SessionMetadata) {
         var result: std.ArrayList(SessionMetadata) = .empty;
         errdefer {
@@ -1123,6 +1132,36 @@ test "session metadata updates from last valid line" {
     try std.testing.expectEqual(@as(usize, 1), list.items.len);
     try std.testing.expectEqual(@as(i64, 30), list.items[0].last_active);
     try std.testing.expectEqual(@as(usize, 2), list.items[0].turn_count);
+}
+
+test "delete removes session from store list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+    var meta = try defaultMetadata(std.testing.allocator, "delete-me");
+    defer meta.deinit(std.testing.allocator);
+    try store.save(meta, tui_session.TuiEvent.turn_start);
+
+    var before = try store.list();
+    defer {
+        for (before.items) |*item| item.deinit(std.testing.allocator);
+        before.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), before.items.len);
+
+    try store.delete("delete-me");
+    try store.delete("delete-me");
+    try std.testing.expectError(error.FileNotFound, store.load("delete-me"));
+
+    var after = try store.list();
+    defer {
+        for (after.items) |*item| item.deinit(std.testing.allocator);
+        after.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 0), after.items.len);
 }
 
 test "metadata loads from tail of large session file" {

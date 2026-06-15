@@ -528,6 +528,7 @@ pub const AppState = struct {
     session_index: usize = 0,
     session_scroll: usize = 0,
     session_filter: ComposerState = .{},
+    session_delete_confirm: bool = false,
     menu_index: usize = 0,
     menu_scroll: usize = 0,
     active_user_entry: ?usize = null,
