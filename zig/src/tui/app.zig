@@ -1416,7 +1416,6 @@ pub const TuiModel = struct {
                             const command = tui_commands.parse(text) catch return .none;
                             if (command.kind != .abort) return .none;
                         }
-                        app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                         var consumed = true;
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
@@ -1458,6 +1457,10 @@ pub const TuiModel = struct {
                             };
                         }
                         if (consumed) {
+                            // Only record history when the draft was actually consumed (submitted,
+                            // steered, queued, or run as a slash command). An ignored remote Enter
+                            // keeps the draft in the composer so it must not pollute Up-arrow history.
+                            app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
                             app.state.composer.clear();
                             app.drainEvents() catch |err| {
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
@@ -2374,6 +2377,7 @@ test "TuiModel remote streaming Enter is ignored and preserves composer" {
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("new turn", model.app.?.state.composer.text());
     try std.testing.expectEqualStrings("", model.app.?.state.status.last_error);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.composer.history.items.len);
 }
 
 test "TuiModel remote streaming Alt+Enter still queues follow-up" {
