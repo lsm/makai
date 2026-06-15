@@ -795,9 +795,10 @@ pub const App = struct {
         if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
     }
 
-    fn supportsStreamingShortcuts(self: *const App) bool {
-        _ = self.runtime orelse return self.session != null;
-        return self.session != null;
+    fn steeringAvailable(self: *const App) bool {
+        if (self.runtime) |runtime| return runtime.canSteer();
+        if (self.session) |*session| return session.canSteer();
+        return false;
     }
 
     fn discardPendingEvents(self: *App) void {
@@ -999,10 +1000,10 @@ pub const App = struct {
             const model = if (self.state.status.model.len > 0) self.state.status.model else "no-model";
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
-            const tips = if (self.supportsStreamingShortcuts())
+            const tips = if (self.steeringAvailable())
                 "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
             else
-                "Enter submit • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
+                "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1415,24 +1416,38 @@ pub const TuiModel = struct {
                             const command = tui_commands.parse(text) catch return .none;
                             if (command.kind != .abort) return .none;
                         }
-                        app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
+                        var consumed = true;
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
-                        } else if (app.state.status.streaming and app.supportsStreamingShortcuts()) {
+                        } else if (app.state.status.streaming) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
                                 };
-                            } else {
+                            } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
                                     app.recordError(@errorName(err)) catch {};
                                 };
+                            } else {
+                                // Remote backend does not support steering mid-stream; keep the
+                                // draft in the composer and let the composer hint explain why.
+                                // Still allow slash commands such as /quit and /abort to run.
+                                const trimmed = std.mem.trim(u8, text, " \t\r\n");
+                                if (std.mem.startsWith(u8, trimmed, "/")) {
+                                    app.submit(text) catch |err| {
+                                        if (err == error.QuitRequested) return .quit;
+                                        app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                        app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                    };
+                                } else {
+                                    consumed = false;
+                                }
                             }
                         } else {
                             app.submit(text) catch |err| {
@@ -1441,11 +1456,17 @@ pub const TuiModel = struct {
                                 app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         }
-                        app.state.composer.clear();
-                        app.drainEvents() catch |err| {
-                            app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                            app.state.appendTranscript(.@"error", @errorName(err)) catch {};
-                        };
+                        if (consumed) {
+                            // Only record history when the draft was actually consumed (submitted,
+                            // steered, queued, or run as a slash command). An ignored remote Enter
+                            // keeps the draft in the composer so it must not pollute Up-arrow history.
+                            app.state.recordComposerHistory(text) catch |err| app.recordError(@errorName(err)) catch {};
+                            app.state.composer.clear();
+                            app.drainEvents() catch |err| {
+                                app.state.status.setError(app.allocator, @errorName(err)) catch {};
+                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                            };
+                        }
                     },
                     .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
@@ -1493,7 +1514,7 @@ pub const TuiModel = struct {
         const status = status_bar_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "";
         const composer = composer_view.render(ctx.allocator, &app.state, .{
             .width = width,
-            .streaming_shortcuts_supported = app.supportsStreamingShortcuts(),
+            .steering_available = app.steeringAvailable(),
         }) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
@@ -2082,7 +2103,7 @@ test "App welcome uses session count" {
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/sessions") != null);
 }
 
-test "App welcome hides streaming shortcut tips for remote runtime" {
+test "App welcome shows follow-up tips but hides steering tips for remote runtime" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2093,7 +2114,7 @@ test "App welcome hides streaming shortcut tips for remote runtime" {
 
     try app.appendWelcome();
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "tips:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") == null);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Alt+Enter") != null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter while streaming") == null);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "Enter submit") != null);
 }
@@ -2105,6 +2126,7 @@ const MockAppSession = struct {
     cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
+    steer_enabled: bool = true,
     events: tui_runtime.TuiEventStream = undefined,
     events_initialized: bool = false,
 
@@ -2120,6 +2142,7 @@ const MockAppSession = struct {
                 .queue_follow_up = queueFollowUp,
                 .clear_queued_messages = clearQueuedMessages,
                 .queued_counts = queuedCounts,
+                .can_steer = canSteer,
                 .switch_model = switchModel,
                 .switch_model_exact = switchModelExact,
                 .current_model = currentModel,
@@ -2155,7 +2178,7 @@ const MockAppSession = struct {
     fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.steer_count += 1;
-        try std.testing.expectEqualStrings("steer me", text);
+        _ = text;
     }
 
     fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
@@ -2172,6 +2195,10 @@ const MockAppSession = struct {
 
     fn queuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
         return ptr(ctx).queued_counts;
+    }
+
+    fn canSteer(ctx: ?*anyopaque) bool {
+        return ptr(ctx).steer_enabled;
     }
 
     fn switchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
@@ -2331,7 +2358,7 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expect(!model.app.?.state.status.streaming);
 }
 
-test "TuiModel remote streaming Enter falls back to submit and preserves composer" {
+test "TuiModel remote streaming Enter is ignored and preserves composer" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
@@ -2345,8 +2372,52 @@ test "TuiModel remote streaming Enter falls back to submit and preserves compose
 
     const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
-    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("new turn", model.app.?.state.composer.text());
+    try std.testing.expectEqualStrings("", model.app.?.state.status.last_error);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.composer.history.items.len);
+}
+
+test "TuiModel remote streaming Alt+Enter still queues follow-up" {
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    runtime = undefined;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "follow later");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter, .modifiers = .{ .alt = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
+    try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+}
+
+test "TuiModel local streaming Enter steers when steering available" {
+    const runtime = try std.testing.allocator.create(tui_runtime.TuiRuntime);
+    errdefer std.testing.allocator.destroy(runtime);
+    runtime.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.runtime = runtime;
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    model.app.?.session = mock.session();
+    model.app.?.state.status.streaming = true;
+    try model.app.?.state.composer.buffer.appendSlice(std.testing.allocator, "steer now");
+
+    const cmd = model.update(.{ .key = .{ .key = .enter } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(@as(usize, 0), mock.submit_count);
+    try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
 }

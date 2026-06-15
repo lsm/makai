@@ -539,8 +539,14 @@ const CompactCommandSession = struct {
             .ctx = self,
             .ops = .{
                 .compact_messages = compactMessages,
+                .can_steer = canSteer,
             },
         };
+    }
+
+    fn canSteer(ctx: ?*anyopaque) bool {
+        _ = ctx;
+        return false;
     }
 
     fn compactMessages(ctx: ?*anyopaque) anyerror!tui_runtime.CompactMessagesResult {
@@ -788,6 +794,7 @@ const MockAbortSession = struct {
                 .queue_follow_up = mockQueueFollowUp,
                 .clear_queued_messages = mockClearQueuedMessages,
                 .queued_counts = mockQueuedCounts,
+                .can_steer = mockCanSteer,
                 .switch_model = mockSwitchModel,
                 .current_model = mockCurrentModel,
                 .decide_tool_approval = mockDecideToolApproval,
@@ -834,6 +841,11 @@ const MockAbortSession = struct {
     fn mockQueuedCounts(ctx: ?*anyopaque) tui_runtime.QueuedCounts {
         _ = ctx;
         return .{};
+    }
+
+    fn mockCanSteer(ctx: ?*anyopaque) bool {
+        _ = ctx;
+        return false;
     }
 
     fn mockSwitchModel(ctx: ?*anyopaque, model_id: []const u8) anyerror!void {
