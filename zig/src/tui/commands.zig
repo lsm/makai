@@ -4,6 +4,7 @@ const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
 const tui_config = @import("tui_config");
+const sse_transport = @import("transports/sse");
 
 pub const CommandKind = enum {
     help,
@@ -466,6 +467,7 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
     var cfg = try store.load();
     defer cfg.deinit(allocator);
 
+    var restart_notice = false;
     if (arg) |value| {
         var iter = std.mem.splitScalar(u8, value, ' ');
         const sub = iter.first();
@@ -520,10 +522,17 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
             try replaceRemoteString(allocator, &cfg.remote.auth_header_value, header_value);
         } else if (std.mem.eql(u8, sub, "off")) {
             cfg.remote.enabled = false;
+            restart_notice = true;
         } else {
             return .{ .output = try std.fmt.allocPrint(allocator, "unknown remote subcommand: {s}", .{sub}), .is_error = true };
         }
         try store.save(cfg);
+    }
+
+    if (restart_notice) {
+        const status = try formatRemoteStatus(allocator, cfg.remote);
+        defer allocator.free(status);
+        return .{ .output = try std.fmt.allocPrint(allocator, "{s}\nNote: change applies on next TUI start; active remote sessions keep using the current runtime.", .{status}) };
     }
 
     return .{ .output = try formatRemoteStatus(allocator, cfg.remote) };
@@ -547,17 +556,18 @@ fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     }
     if (!matched) return error.InvalidUrl;
 
-    // Authority runs from after "://" up to the first path/query/fragment.
+    if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) {
+        _ = sse_transport.parseHttpUrl(url) catch return error.InvalidUrl;
+        return;
+    }
+
     const after = url[scheme_end + 3 ..];
     var auth_end: usize = 0;
     while (auth_end < after.len and after[auth_end] != '/' and after[auth_end] != '?' and after[auth_end] != '#') : (auth_end += 1) {}
     const authority = after[0..auth_end];
     if (authority.len == 0) return error.InvalidUrl;
-
-    // Strip userinfo (everything up to and including the last '@').
     var host = authority;
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| host = authority[at + 1 ..];
-    // Strip port.
     if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
     if (host.len == 0) return error.InvalidUrl;
 }
@@ -1169,6 +1179,7 @@ test "remote command off disables remote" {
     defer off_result.deinit(std.testing.allocator);
     try std.testing.expect(!off_result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, off_result.output, "disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "applies on next TUI start") != null);
 
     var loaded = try store.load();
     defer loaded.deinit(std.testing.allocator);
@@ -1243,6 +1254,36 @@ test "remote command rejects sse endpoint with port-only authority" {
     defer store.deinit();
 
     var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with malformed port" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:abc");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with out-of-range port" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:70000");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 

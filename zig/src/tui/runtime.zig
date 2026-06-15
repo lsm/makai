@@ -139,7 +139,15 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
     errdefer result.deinit(allocator);
 
     const transport_name = if (cfg.remote.transport.len > 0) cfg.remote.transport else "stdio";
-    result.transport = parseRemoteTransport(transport_name) orelse .stdio;
+    if (parseRemoteTransport(transport_name)) |remote_transport| {
+        result.transport = remote_transport;
+    } else {
+        // Invalid hand-edited transport values must not fall back to stdio while
+        // remote remains enabled; that would bind the protocol to the TUI's own
+        // stdin/stdout. Fall back to local mode instead.
+        result.transport = .stdio;
+        result.mode = .local;
+    }
 
     // WebSocket backend is not wired up yet. If a hand-edited config requests
     // it, gracefully fall back to local mode so the TUI still launches.
@@ -4070,6 +4078,19 @@ test "remoteConfigFromConfig falls back to local for websocket" {
     var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
     defer rc.deinit(std.testing.allocator);
     try std.testing.expectEqual(TuiRemoteTransport.websocket, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for invalid transport" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "stido");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.stdio, rc.transport);
     try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
 }
 

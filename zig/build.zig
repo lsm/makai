@@ -965,6 +965,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_runtime", .module = tui_runtime_mod },
             .{ .name = "tui_state", .module = tui_state_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "transports/sse", .module = sse_transport_mod },
         },
     });
 
