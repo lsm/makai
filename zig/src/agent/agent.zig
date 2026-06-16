@@ -977,7 +977,7 @@ pub const Agent = struct {
             .execute_tool_via_protocol_fn = self._execute_tool_via_protocol_fn orelse tool_local_runtime.LocalToolProtocol.executeFn,
             .execute_tool_via_protocol_ctx = self._execute_tool_via_protocol_ctx orelse self._local_tool_protocol,
             .temperature = null,
-            .max_tokens = null,
+            .max_tokens = model.max_tokens,
             .api_key = null,
             .cancel_token = self._cancel_token,
             .thinking_level = self._state.thinking_level,
@@ -1365,6 +1365,37 @@ fn createDelayedErrorProtocol() types.ProtocolClient {
     };
 }
 
+const CaptureOptionsCtx = struct {
+    max_tokens: ?u32 = null,
+};
+
+fn captureOptionsStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_mod.AssistantMessageEventStream {
+    _ = context;
+    const capture: *CaptureOptionsCtx = @ptrCast(@alignCast(ctx.?));
+    capture.max_tokens = options.max_tokens;
+
+    const stream = try allocator.create(event_stream_mod.AssistantMessageEventStream);
+    stream.* = event_stream_mod.AssistantMessageEventStream.init(allocator);
+    const message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    stream.push(.{ .done = .{ .reason = .stop, .message = message } }) catch {};
+    stream.complete(message);
+    return stream;
+}
+
 const test_model = ai_types.Model{
     .id = "test-model",
     .name = "Test Model",
@@ -1389,6 +1420,21 @@ test "Agent async completion signals waitForIdle" {
 
     try std.testing.expect(agent.isIdle());
     try std.testing.expect(agent._thread == null);
+}
+
+test "Agent passes model max_tokens to protocol" {
+    var capture = CaptureOptionsCtx{};
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = .{ .stream_fn = captureOptionsStreamFn, .ctx = &capture } });
+    defer agent.deinit();
+    var model = test_model;
+    model.max_tokens = 8192;
+    agent.setModel(model);
+
+    const text = try std.testing.allocator.dupe(u8, "hello");
+    const message = ai_types.Message{ .user = .{ .content = .{ .text = text }, .timestamp = 0 } };
+    try agent.prompt(@as([]const ai_types.Message, &.{message}));
+
+    try std.testing.expectEqual(@as(?u32, 8192), capture.max_tokens);
 }
 
 test "Agent validateContinueFromContext reports resume errors" {
