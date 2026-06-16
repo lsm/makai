@@ -25,6 +25,9 @@ const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
 
@@ -339,8 +342,8 @@ pub const App = struct {
         self.state.mode = .normal;
     }
 
-    /// Providers that expose an OAuth login, in picker order.
-    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex" };
+    /// Providers that expose an interactive login or API-key setup flow.
+    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
 
     const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
 
@@ -353,6 +356,7 @@ pub const App = struct {
             0 => .anthropic,
             1 => .github_copilot,
             2 => .openai_codex,
+            3 => .kimi,
             else => .anthropic,
         };
     }
@@ -363,6 +367,7 @@ pub const App = struct {
         }
         if (std.mem.eql(u8, provider_id, "codex") or std.mem.eql(u8, provider_id, "openai")) return 2;
         if (std.mem.eql(u8, provider_id, "github")) return 1;
+        if (std.mem.eql(u8, provider_id, "moonshot")) return 3;
         return null;
     }
 
@@ -462,8 +467,8 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
-    /// Start the OAuth worker for a provider index. The flow then drives forward
-    /// via `pollLogin()` on each tick.
+    /// Start the login/setup worker for a provider index. The flow then drives
+    /// forward via `pollLogin()` on each tick.
     fn startLoginProviderIndex(self: *App, idx: usize) !void {
         const provider = login_providers[idx];
         self.state.mode = .normal;
@@ -493,7 +498,7 @@ pub const App = struct {
         try self.startLoginProviderIndex(idx);
     }
 
-    /// Start the OAuth worker for the highlighted provider.
+    /// Start the login/setup worker for the highlighted provider.
     fn applySelectedLogin(self: *App) !void {
         const idx = @min(self.state.menu_index, login_providers.len - 1);
         try self.startLoginProviderIndex(idx);
@@ -594,9 +599,8 @@ pub const App = struct {
         if (self.state.mode == .login_input) self.state.mode = .normal;
     }
 
-    /// Persist freshly obtained OAuth credentials into `~/.makai/auth.json`,
-    /// replacing any existing entry for the provider. Does not take ownership of
-    /// `creds`.
+    /// Persist freshly obtained credentials, replacing any existing entry for
+    /// the provider. Does not take ownership of `creds`.
     fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
         var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
         defer storage.deinit();
@@ -604,6 +608,19 @@ pub const App = struct {
         const key = try self.allocator.dupe(u8, provider_id);
         var owned = false;
         errdefer if (!owned) self.allocator.free(key);
+        if (std.mem.eql(u8, provider_id, "kimi")) {
+            const api_key = try self.allocator.dupe(u8, creds.access);
+            errdefer if (!owned) self.allocator.free(api_key);
+            if (storage.providers.fetchRemove(provider_id)) |removed| {
+                self.allocator.free(removed.key);
+                removed.value.deinit(self.allocator);
+            }
+            try storage.providers.put(key, .{ .api_key = api_key });
+            owned = true;
+            try storage.persist();
+            return;
+        }
+
         const refresh = try self.allocator.dupe(u8, creds.refresh);
         errdefer if (!owned) self.allocator.free(refresh);
         const access = try self.allocator.dupe(u8, creds.access);
@@ -1470,6 +1487,7 @@ pub const TuiModel = struct {
                     },
                     .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
+                    .paste => |text| app.state.composer.insertSlice(app.allocator, text) catch {},
                     .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
                     .left => _ = app.state.composer.moveCursorPrev(),
                     .right => _ = app.state.composer.moveCursorNext(),
@@ -1972,6 +1990,60 @@ test "App submit starts direct OpenAI Codex login command" {
     try std.testing.expect(app.login != null);
     try std.testing.expectEqualStrings("openai-codex", app.login.?.provider_id);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for openai-codex") != null);
+}
+
+test "App submit starts direct Kimi API key login command" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.submit("/login kimi");
+
+    try std.testing.expect(app.login != null);
+    try std.testing.expectEqualStrings("kimi", app.login.?.provider_id);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for kimi") != null);
+}
+
+test "App saves Kimi login credentials as api key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer std.testing.allocator.free(home);
+    try compat.fs.createDir(compat.fs.getCwd(), home);
+    const previous_home = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "HOME") catch null;
+    defer {
+        if (previous_home) |value| {
+            const value_z = std.testing.allocator.dupeZ(u8, value) catch null;
+            if (value_z) |home_z| {
+                defer std.testing.allocator.free(home_z);
+                _ = setenv("HOME", home_z.ptr, 1);
+            }
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    _ = setenv("HOME", home_z.ptr, 1);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const creds = oauth_storage.Credentials{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "moonshot-test-key"),
+        .expires = std.math.maxInt(i64),
+    };
+    defer creds.deinit(std.testing.allocator);
+
+    try app.saveLoginCredentials("kimi", creds);
+
+    var storage = try oauth_storage.AuthStorage.loadFromFile(std.testing.allocator);
+    defer storage.deinit();
+    const auth = storage.providers.get("kimi") orelse return error.MissingKimiAuth;
+    switch (auth) {
+        .api_key => |key| try std.testing.expectEqualStrings("moonshot-test-key", key),
+        .oauth => return error.ExpectedApiKeyAuth,
+    }
 }
 
 test "multi-line /help output renders all lines into transcript view" {
