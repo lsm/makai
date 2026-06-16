@@ -9,7 +9,7 @@ const openai_codex_provider_id = "openai-codex";
 const openai_codex_api_id = "openai-codex-responses";
 const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
-const kimi_api_id = "anthropic-messages";
+const kimi_api_id = "openai-completions";
 const kimi_model_id = "kimi-k2.7-code";
 const kimi_base_url = "https://api.kimi.com/coding/v1";
 const codex_models_cache_name = "models_cache.json";
@@ -119,9 +119,9 @@ fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     const provider = try allocator.dupe(u8, kimi_provider_id);
     errdefer allocator.free(provider);
 
-    // Select base_url based on region
+    // Select base_url based on region (OpenAI-compatible endpoints)
     const base_url_str = if (std.mem.eql(u8, region, "global"))
-        "https://api.moonshot.ai/anthropic"
+        "https://api.moonshot.ai/v1"
     else
         "https://api.kimi.com/coding/v1";
     const base_url = try allocator.dupe(u8, base_url_str);
