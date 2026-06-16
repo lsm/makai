@@ -1177,6 +1177,16 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
+    // Add Kimi-specific headers (required for authentication)
+    if (std.mem.eql(u8, model.provider, "kimi")) {
+        headers.append(allocator, .{ .name = "user-agent", .value = "claude-code/0.1.0" }) catch {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError("oom kimi headers");
+            return;
+        };
+    }
+
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
     const BASE_DELAY_MS: u32 = 1000;
