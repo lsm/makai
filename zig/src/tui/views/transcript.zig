@@ -3,6 +3,7 @@ const zz = @import("zigzag");
 const tui_state = @import("tui_state");
 const tui_theme = @import("tui_theme");
 const tui_text = @import("tui_text");
+const tui_markdown = @import("tui_markdown");
 
 const AppState = tui_state.AppState;
 const TranscriptKind = tui_state.TranscriptKind;
@@ -501,13 +502,14 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
         },
         .assistant => blk: {
             const budget = @max(body_layout.width -| 2, 8);
+            const prepared = try tui_markdown.preprocess(arena, entry.text);
             var markdown = zz.Markdown.init();
             markdown.width = @intCast(@min(budget, std.math.maxInt(u16)));
             markdown.text_style = (zz.Style{}).fg(assistant_fg).inline_style(true);
             markdown.code_style = (zz.Style{}).fg(zz.Color.fromRgb(255, 229, 120)).bg(assistant_code_bg).inline_style(true);
             markdown.code_block_style = (zz.Style{}).fg(zz.Color.fromRgb(96, 245, 150)).bg(assistant_code_bg).inline_style(true);
             markdown.code_block_border = (zz.Style{}).fg(zz.Color.fromRgb(124, 139, 160)).bg(assistant_code_bg).inline_style(true);
-            const md = try markdown.render(arena, entry.text);
+            const md = try markdown.render(arena, prepared);
             const wrapped = try tui_text.wrapTextPreservingPrefix(arena, md, budget);
             const open = try openSgr(arena, assistant_fg, assistant_bg);
             break :blk try renderBubble(arena, wrapped, open, false, body_layout.width);
@@ -1388,4 +1390,79 @@ test "transcript wraps assistant text within viewport width" {
     while (lines.next()) |line| {
         try std.testing.expect(tui_text.visibleWidth(line) <= 30);
     }
+}
+
+test "transcript renders inline LaTeX math as Unicode" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "energy is $E = mc^2$ here");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    // Greek/symbol substitution reaches the rendered bubble.
+    try std.testing.expect(std.mem.indexOf(u8, text, "E = mc²") != null);
+    // Raw LaTeX source markers must not leak through.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$E") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "^2$") == null);
+}
+
+test "transcript renders block LaTeX math inside assistant bubble" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "Integral:\n\n$$\\int_0^\\infty f(x)\\,dx$$\n\ndone");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "∫") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "∞") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "$$") == null);
+    // Surrounding prose survives.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Integral") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "done") != null);
+}
+
+test "transcript labels Mermaid diagrams and quotes raw source" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "Diagram:\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\nend");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 14 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid diagram: flowchart") != null);
+    // Raw diagram source remains available (in quoted form) so the user can
+    // still read/copy the original spec.
+    try std.testing.expect(std.mem.indexOf(u8, text, "A --> B") != null);
+    // Fenced fence markers themselves are stripped.
+    try std.testing.expect(std.mem.indexOf(u8, text, "```mermaid") == null);
+}
+
+test "transcript leaves non-mermaid fenced code blocks untouched by math pass" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "Code:\n\n```zig\nconst x = 1;\n```\n\nend");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 12 });
+    defer std.testing.allocator.free(text);
+
+    // Code block still renders with its border — the mermaid pass did not
+    // transform it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "const x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Mermaid") == null);
+}
+
+test "transcript math falls back to raw for unknown LaTeX commands" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.assistant, "weird $\\zztop$ end");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    // Unknown command preserved verbatim with backslash so user sees source.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\\zztop") != null);
+    // Math delimiters consumed.
+    try std.testing.expect(std.mem.indexOf(u8, text, "$\\") == null);
 }
