@@ -8,6 +8,8 @@ pub const Item = struct {
 
 pub const Options = struct {
     title: []const u8,
+    subtitle: ?[]const u8 = null,
+    footer: ?[]const u8 = null,
     items: []const Item,
     selected: usize = 0,
     width: usize = 80,
@@ -25,6 +27,12 @@ pub fn render(allocator: std.mem.Allocator, options: Options) ![]const u8 {
     const title = try tui_theme.panelTitle().render(allocator, options.title);
     defer allocator.free(title);
     try writer.writeAll(title);
+    if (options.subtitle) |subtitle| {
+        const styled = try tui_theme.muted().render(allocator, subtitle);
+        defer allocator.free(styled);
+        try writer.writeByte('\n');
+        try writer.writeAll(styled);
+    }
     if (options.items.len == 0) {
         const none = try tui_theme.muted().render(allocator, options.empty_message);
         defer allocator.free(none);
@@ -47,6 +55,13 @@ pub fn render(allocator: std.mem.Allocator, options: Options) ![]const u8 {
             defer allocator.free(styled);
             try writer.writeAll(styled);
         }
+    }
+    if (options.footer) |footer| {
+        const styled = try tui_theme.muted().render(allocator, footer);
+        defer allocator.free(styled);
+        try writer.writeByte('\n');
+        try writer.writeByte('\n');
+        try writer.writeAll(styled);
     }
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
@@ -97,4 +112,19 @@ test "menu picker honors offset for scrolling" {
     try std.testing.expect(std.mem.indexOf(u8, text, " a") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, " b") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "> c") != null);
+}
+
+test "menu picker renders subtitle and footer" {
+    const items = [_]Item{.{ .label = "Copy", .detail = "copy detail" }};
+    const text = try render(std.testing.allocator, .{
+        .title = "Export conversation",
+        .subtitle = "Select export method",
+        .footer = "Esc to cancel",
+        .items = &items,
+    });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Export conversation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Select export method") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Esc to cancel") != null);
 }

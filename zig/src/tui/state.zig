@@ -14,6 +14,7 @@ pub const AppMode = enum {
     permission_picker,
     view_picker,
     thinking_picker,
+    export_picker,
     login_input,
 };
 
@@ -618,6 +619,29 @@ pub const AppState = struct {
         return buf.toOwnedSlice(allocator);
     }
 
+    pub fn transcriptToMarkdown(self: *const AppState, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        for (self.transcript.items, 0..) |entry, idx| {
+            if (idx > 0) try buf.appendSlice(allocator, "\n\n");
+            switch (entry.kind) {
+                .user => {
+                    try buf.appendSlice(allocator, "## User\n\n");
+                    try appendBlockquote(&buf, allocator, entry.text.items);
+                },
+                .assistant => {
+                    try buf.appendSlice(allocator, "## Assistant\n\n");
+                    try buf.appendSlice(allocator, entry.text.items);
+                },
+                .thinking => try appendFencedSection(&buf, allocator, "Thinking", entry.text.items),
+                .tool => try appendFencedSection(&buf, allocator, "Tool", entry.text.items),
+                .system => try appendFencedSection(&buf, allocator, "System", entry.text.items),
+                .@"error" => try appendFencedSection(&buf, allocator, "Error", entry.text.items),
+            }
+        }
+        return buf.toOwnedSlice(allocator);
+    }
+
     pub fn clearTools(self: *AppState) void {
         for (self.tools.items) |*tool| tool.deinit(self.allocator);
         self.tools.clearRetainingCapacity();
@@ -1194,6 +1218,30 @@ pub const AppState = struct {
     }
 };
 
+fn appendBlockquote(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
+    if (text.len == 0) {
+        try buf.appendSlice(allocator, "> ");
+        return;
+    }
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try buf.append(allocator, '\n');
+        first = false;
+        try buf.appendSlice(allocator, "> ");
+        try buf.appendSlice(allocator, line);
+    }
+}
+
+fn appendFencedSection(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8, text: []const u8) !void {
+    try buf.appendSlice(allocator, "## ");
+    try buf.appendSlice(allocator, title);
+    try buf.appendSlice(allocator, "\n\n```text\n");
+    try buf.appendSlice(allocator, text);
+    if (text.len > 0 and text[text.len - 1] != '\n') try buf.append(allocator, '\n');
+    try buf.appendSlice(allocator, "```");
+}
+
 fn formatProtocolEvent(allocator: std.mem.Allocator, event: tui_runtime.TuiEvent) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -1553,6 +1601,33 @@ pub fn noopToolForTest(
     _ = on_update;
     _ = allocator;
     return error.NotImplemented;
+}
+
+test "AppState exports transcript as markdown" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendUserMessage("hello\nworld");
+    try state.appendTranscript(.assistant, "# Answer\n- item");
+    try state.appendTranscript(.tool, "shell_execute {\"command\":\"pwd\"}");
+    try state.appendTranscript(.@"error", "failed");
+
+    const text = try state.transcriptToMarkdown(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "## User\n\n> hello\n> world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Assistant\n\n# Answer\n- item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Tool\n\n```text\nshell_execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Error\n\n```text\nfailed\n```") != null);
+}
+
+test "AppState exports empty transcript as empty markdown" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const text = try state.transcriptToMarkdown(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqualStrings("", text);
 }
 
 test "AppState protocol log captures every supported TUI event variant" {
