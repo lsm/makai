@@ -83,23 +83,31 @@ pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 }
 
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    if (builtin.is_test) {
-        if (!test_force_kimi_model) return emptyModels(allocator);
-    } else {
+    var region: []const u8 = "china"; // Default to China region
+    if (!builtin.is_test) {
         var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
         defer storage.deinit();
         if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
+
+        // Extract region from stored credentials
+        if (storage.providers.get(kimi_provider_id)) |auth| {
+            if (auth == .oauth and auth.oauth.provider_data) |provider_data| {
+                if (std.mem.startsWith(u8, provider_data, "region:")) {
+                    region = provider_data[7..]; // Skip "region:" prefix
+                }
+            }
+        }
     }
 
     const models = try allocator.alloc(ai_types.Model, 1);
     errdefer allocator.free(models);
-    models[0] = try kimiModel(allocator);
+    models[0] = try kimiModel(allocator, region);
     return models;
 }
 
 var test_force_kimi_model: bool = false;
 
-fn kimiModel(allocator: std.mem.Allocator) !ai_types.Model {
+fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     const id = try allocator.dupe(u8, kimi_model_id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, "Kimi K2.7 Code");
@@ -108,8 +116,15 @@ fn kimiModel(allocator: std.mem.Allocator) !ai_types.Model {
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, kimi_provider_id);
     errdefer allocator.free(provider);
-    const base_url = try allocator.dupe(u8, kimi_base_url);
+
+    // Select base_url based on region
+    const base_url_str = if (std.mem.eql(u8, region, "global"))
+        "https://api.moonshot.ai/anthropic"
+    else
+        "https://api.kimi.com/coding/v1";
+    const base_url = try allocator.dupe(u8, base_url_str);
     errdefer allocator.free(base_url);
+
     const input = try allocator.alloc([]const u8, 1);
     errdefer allocator.free(input);
     input[0] = try allocator.dupe(u8, "text");

@@ -187,7 +187,27 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
         if (provider_obj.get("api_key")) |api_key_val| {
             const api_key = try allocator.dupe(u8, api_key_val.string);
             errdefer secureFree(allocator, api_key);
-            try providers.put(provider_id, .{ .api_key = api_key });
+
+            // Read region field if present (for providers like Kimi that need region-specific endpoints)
+            const region = if (provider_obj.get("region")) |region_val|
+                try allocator.dupe(u8, region_val.string)
+            else
+                null;
+            errdefer if (region) |r| allocator.free(r);
+
+            // Store region in provider_data by encoding it as "region:<value>"
+            const provider_data = if (region) |r|
+                try std.fmt.allocPrint(allocator, "region:{s}", r)
+            else
+                null;
+            errdefer if (provider_data) |pd| allocator.free(pd);
+
+            try providers.put(provider_id, .{ .oauth = .{
+                .refresh = "",
+                .access = api_key,
+                .expires = std.math.maxInt(i64),
+                .provider_data = provider_data,
+            } });
         } else if (provider_obj.get("refresh")) |refresh_val| {
             const refresh = try allocator.dupe(u8, refresh_val.string);
             errdefer secureFree(allocator, refresh);
@@ -249,6 +269,21 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
                 try json_buf.appendSlice(allocator, "}");
             },
             .oauth => |creds| {
+                // Special case for API keys stored as oauth (for region support)
+                const is_api_key_style = creds.refresh.len == 0 and creds.expires == std.math.maxInt(i64);
+                if (is_api_key_style and creds.provider_data) |data| {
+                    // Parse region from provider_data (format: "region:<value>")
+                    if (std.mem.startsWith(u8, data, "region:")) {
+                        const region = data[7..]; // Skip "region:" prefix
+                        try json_buf.appendSlice(allocator, "{\"api_key\":");
+                        try appendJsonString(allocator, &json_buf, creds.access);
+                        try json_buf.appendSlice(allocator, ",\"region\":");
+                        try appendJsonString(allocator, &json_buf, region);
+                        try json_buf.appendSlice(allocator, "}");
+                        break;
+                    }
+                }
+                // Standard OAuth credential serialization
                 try json_buf.appendSlice(allocator, "{\"refresh\":");
                 try appendJsonString(allocator, &json_buf, creds.refresh);
                 try json_buf.appendSlice(allocator, ",\"access\":");

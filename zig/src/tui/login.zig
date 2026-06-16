@@ -312,13 +312,30 @@ fn runCodex(self: *LoginSession) void {
 }
 
 fn runKimi(self: *LoginSession) void {
+    // First, ask for region selection
+    const region_prompt = "Select your region:\n  1. China (api.kimi.com)\n  2. Global (api.moonshot.ai)\nEnter choice (1 or 2):";
+    const region_choice = self.waitForInput(region_prompt, false);
+    defer self.allocator.free(region_choice);
+
+    const region = if (std.mem.eql(u8, std.mem.trim(u8, region_choice, " \t\r\n"), "2"))
+        "global"
+    else
+        "china"; // Default to China
+
     const api_key = self.waitForInput("Enter Kimi API key:", false);
     defer self.allocator.free(api_key);
     if (std.mem.trim(u8, api_key, " \t\r\n").len == 0) {
         self.finishError("ApiKeyRequired");
         return;
     }
-    self.finishSuccess("", api_key, std.math.maxInt(i64), null);
+
+    // Store region in provider_data as "region:china" or "region:global"
+    const provider_data = std.fmt.allocPrint(self.allocator, "region:{s}", .{region}) catch {
+        self.finishError("OutOfMemory");
+        return;
+    };
+
+    self.finishSuccess("", api_key, std.math.maxInt(i64), provider_data);
 }
 
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {
