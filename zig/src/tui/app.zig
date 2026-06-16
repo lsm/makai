@@ -1585,6 +1585,12 @@ pub const TuiModel = struct {
                             app.flushClipboard(ctx);
                             return .none;
                         },
+                        'd' => {
+                            // Issue #137: cycle time → date+time → off for
+                            // transcript message timestamps.
+                            _ = app.state.cycleTimestampDisplay();
+                            return .none;
+                        },
                         'p' => {
                             if (app.state.mode == .normal) _ = app.state.composerHistoryPrev() catch false;
                             return .none;

@@ -8,6 +8,7 @@ const AppState = tui_state.AppState;
 const TranscriptKind = tui_state.TranscriptKind;
 const TranscriptEntry = tui_state.TranscriptEntry;
 const ProtocolEventEntry = tui_state.ProtocolEventEntry;
+const TimestampDisplay = tui_state.TimestampDisplay;
 
 pub const Options = struct {
     width: usize = 80,
@@ -46,7 +47,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
     const all_writer = &all_rows.writer;
     for (visible_entries.items, 0..) |*entry, i| {
         if (i > 0) try all_writer.writeAll("\n\n"); // blank-line spacer between entries
-        const row = try renderEntry(allocator, entry, options.width);
+        const row = try renderEntry(allocator, entry, options.width, state.timestamp_display);
         defer allocator.free(row);
         try all_writer.writeAll(row);
     }
@@ -87,7 +88,7 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     };
-    return renderEntry(allocator, &display, width);
+    return renderEntry(allocator, &display, width, .clock);
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
@@ -480,7 +481,7 @@ const EntryLayout = struct {
 
 /// Render one transcript entry as a header line (role + time) followed by a
 /// bubble, plain tool row, or bordered card.
-fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize) ![]u8 {
+fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, ts_mode: TimestampDisplay) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -488,7 +489,7 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     const align_right = entry.kind == .user;
     const header_layout = entryHeaderLayout(entry.kind, width);
     const body_layout = entryBodyLayout(entry.kind, width);
-    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width);
+    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width, ts_mode);
     const header = try indentBlock(arena, header_inner, header_layout.left);
 
     const body_inner: []const u8 = switch (entry.kind) {
@@ -585,12 +586,12 @@ fn renderToolRow(allocator: std.mem.Allocator, tool_name: []const u8, text: []co
 
 /// "❯ You · 14:32" — role glyph + name in the role color, dim timestamp.
 /// Right-aligned for the user so it sits above their right-side bubble.
-fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize) ![]u8 {
+fn renderHeader(allocator: std.mem.Allocator, kind: TranscriptKind, tool_name: []const u8, title: []const u8, ts_ms: i64, align_right: bool, width: usize, ts_mode: TimestampDisplay) ![]u8 {
     const name = if (kind == .tool and title.len > 0) title else roleName(kind);
     const raw_label = try std.fmt.allocPrint(allocator, "{s} {s}", .{ tui_theme.roleGlyph(kind), name });
     const role_style = if (kind == .tool and tool_name.len > 0) tui_theme.toolRole(tool_name) else tui_theme.role(kind);
     const styled_label = try role_style.render(allocator, raw_label);
-    const clock = try formatClock(allocator, ts_ms);
+    const clock = try formatTimestamp(allocator, ts_ms, ts_mode, width);
 
     var time_raw: []const u8 = "";
     var styled_time: []const u8 = "";
@@ -695,13 +696,42 @@ fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Format an epoch-millisecond timestamp as "HH:MM" (UTC). Returns an empty
-/// string for unset (zero) timestamps so legacy entries render without a time.
-fn formatClock(allocator: std.mem.Allocator, ts_ms: i64) ![]u8 {
-    if (ts_ms <= 0) return allocator.dupe(u8, "");
+/// Format an epoch-millisecond timestamp for the transcript header. Returns
+/// an empty string when timestamps are disabled or the entry has no clock.
+/// `width` lets `.full` mode shed the date on narrow terminals so the role
+/// label and clock fit on a single line.
+fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64, mode: TimestampDisplay, width: usize) ![]u8 {
+    if (mode == .off or ts_ms <= 0) return allocator.dupe(u8, "");
     const secs: u64 = @intCast(@divFloor(ts_ms, 1000));
-    const day_secs = (std.time.epoch.EpochSeconds{ .secs = secs }).getDaySeconds();
-    return std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ day_secs.getHoursIntoDay(), day_secs.getMinutesIntoHour() });
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
+    const day_secs = epoch_seconds.getDaySeconds();
+    const hh = day_secs.getHoursIntoDay();
+    const mm = day_secs.getMinutesIntoHour();
+    const ss = day_secs.getSecondsIntoMinute();
+    return switch (mode) {
+        .off => allocator.dupe(u8, ""),
+        .clock => std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm }),
+        // Wide terminals get the full `YYYY-MM-DD HH:MM:SS`; medium terminals
+        // drop the year (`MM-DD HH:MM`); very narrow terminals fall back to
+        // the clock-only form so the timestamp never wraps or shoves the role
+        // label off-screen.
+        .full => blk: {
+            if (width < 28) {
+                break :blk try std.fmt.allocPrint(allocator, "{d:0>2}:{d:0>2}", .{ hh, mm });
+            }
+            const epoch_day = epoch_seconds.getEpochDay();
+            const year_day = epoch_day.calculateYearDay();
+            const month_day = year_day.calculateMonthDay();
+            const month: u4 = @intFromEnum(month_day.month);
+            const day: u5 = month_day.day_index;
+            if (width >= 40) {
+                break :blk try std.fmt.allocPrint(allocator, "{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+                    year_day.year, month, day + 1, hh, mm, ss,
+                });
+            }
+            break :blk try std.fmt.allocPrint(allocator, "{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{ month, day + 1, hh, mm });
+        },
+    };
 }
 
 fn roleName(kind: TranscriptKind) []const u8 {
@@ -859,6 +889,76 @@ test "transcript aligns error card content with role label text" {
     const label_col = tui_text.visibleWidth(header_line[0..std.mem.indexOf(u8, header_line, "Error").?]);
     const text_col = tui_text.visibleWidth(error_line[0..std.mem.indexOf(u8, error_line, "ProviderStreamError").?]);
     try std.testing.expectEqual(label_col, text_col);
+}
+
+test "transcript renders date and time in full timestamp mode" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.timestamp_display = .full;
+    try state.appendUserMessage("hello");
+    // 2026-05-28 14:32:00 UTC → epoch seconds 1779978720.
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "2026-05-28 14:32:00") != null);
+}
+
+test "transcript timestamp hidden in off mode" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.timestamp_display = .off;
+    try state.appendUserMessage("hello");
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 3_720_000; // 01:02
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 60, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "01:02") == null);
+}
+
+test "transcript full timestamp drops year on narrow terminals" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.timestamp_display = .full;
+    try state.appendUserMessage("hi");
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 32, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "05-28 14:32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2026") == null);
+}
+
+test "transcript full timestamp falls back to clock on very narrow terminals" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.timestamp_display = .full;
+    try state.appendUserMessage("hi");
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 18, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "14:32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "05-28") == null);
+}
+
+test "transcript clock mode renders only time" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.timestamp_display = .clock;
+    try state.appendUserMessage("hi");
+    for (state.transcript.items) |*entry| entry.timestamp_ms = 1779978720 * 1000;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "14:32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2026") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "05-28") == null);
 }
 
 test "transcript preserves multiline entries" {
