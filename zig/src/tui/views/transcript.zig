@@ -701,7 +701,7 @@ fn openSgr(allocator: std.mem.Allocator, fg: zz.Color, bg: zz.Color) ![]u8 {
 /// `width` lets `.full` mode shed the date on narrow terminals so the role
 /// label and clock fit on a single line.
 fn formatTimestamp(allocator: std.mem.Allocator, ts_ms: i64, mode: TimestampDisplay, width: usize) ![]u8 {
-    if (mode == .off or ts_ms <= 0) return allocator.dupe(u8, "");
+    if (ts_ms <= 0) return allocator.dupe(u8, "");
     const secs: u64 = @intCast(@divFloor(ts_ms, 1000));
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = secs };
     const day_secs = epoch_seconds.getDaySeconds();
