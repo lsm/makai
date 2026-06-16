@@ -149,9 +149,11 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
         result.mode = .local;
     }
 
-    // WebSocket backend is not wired up yet. If a hand-edited config requests
-    // it, gracefully fall back to local mode so the TUI still launches.
-    if (result.transport == .websocket) {
+    // Stdio subprocess spawning and WebSocket are not wired up yet. If a
+    // hand-edited/legacy config enables either transport, gracefully fall back to
+    // local mode so the TUI launches instead of binding protocol I/O to the
+    // TUI's own stdio or aborting on an unsupported backend.
+    if (result.transport == .stdio or result.transport == .websocket) {
         result.mode = .local;
     }
 
@@ -4065,6 +4067,17 @@ test "remote config rejects unsupported endpoint" {
 
 test "remote config rejects unsupported transport" {
     try std.testing.expectError(error.UnsupportedRemoteTransport, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "ws://localhost:1" } }));
+}
+
+test "remoteConfigFromConfig falls back to local for saved stdio" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.stdio, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
 }
 
 test "remoteConfigFromConfig falls back to local for websocket" {

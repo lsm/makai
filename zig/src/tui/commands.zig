@@ -492,6 +492,7 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
                 return .{ .output = try allocator.dupe(u8, "SSE endpoint must use http scheme (TLS not yet supported)"), .is_error = true };
             };
             cfg.remote.enabled = true;
+            restart_notice = true;
             try replaceRemoteString(allocator, &cfg.remote.transport, "sse");
             try replaceRemoteString(allocator, &cfg.remote.endpoint, rest);
             try replaceRemoteString(allocator, &cfg.remote.command, "");
@@ -516,6 +517,9 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
             const header_value = std.mem.trim(u8, hiter.rest(), " \t");
             if (name.len == 0 or header_value.len == 0) {
                 return .{ .output = try allocator.dupe(u8, "usage: /remote header <name> <value>"), .is_error = true };
+            }
+            if (!isValidHeaderName(name) or hasCrLf(header_value)) {
+                return .{ .output = try allocator.dupe(u8, "remote header name/value must not contain CR/LF; name must be a valid HTTP token"), .is_error = true };
             }
             try replaceRemoteString(allocator, &cfg.remote.auth_token, "");
             try replaceRemoteString(allocator, &cfg.remote.auth_header_name, name);
@@ -545,6 +549,7 @@ fn replaceRemoteString(allocator: std.mem.Allocator, field: *[]u8, value: []cons
 }
 
 fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
+    if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidUrl;
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
     const scheme = url[0..scheme_end];
     var matched = false;
@@ -570,6 +575,23 @@ fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| host = authority[at + 1 ..];
     if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
     if (host.len == 0) return error.InvalidUrl;
+}
+
+fn hasCrLf(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") != null;
+}
+
+fn isTchar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn isValidHeaderName(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| if (!isTchar(ch)) return false;
+    return true;
 }
 
 fn formatRemoteStatus(allocator: std.mem.Allocator, remote: tui_config.RemoteConfig) ![]u8 {
@@ -1039,6 +1061,7 @@ test "remote command sets sse transport and persists" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: sse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
 
     var loaded = try store.load();
     defer loaded.deinit(std.testing.allocator);
@@ -1208,6 +1231,35 @@ test "remote command header sets header and clears auth token" {
     try std.testing.expectEqualStrings("abc123", loaded.remote.auth_header_value);
 }
 
+test "remote command rejects header injection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var bad_name = try applyRemoteCommand(std.testing.allocator, store, "header X-Bad\r\nInjected value");
+    defer bad_name.deinit(std.testing.allocator);
+    try std.testing.expect(bad_name.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, bad_name.output, "must not contain CR/LF") != null);
+
+    var bad_value = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc\r\nInjected: yes");
+    defer bad_value.deinit(std.testing.allocator);
+    try std.testing.expect(bad_value.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, bad_value.output, "must not contain CR/LF") != null);
+}
+
+test "remote command rejects invalid header name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "header Bad:Name value");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "valid HTTP token") != null);
+}
+
 test "remote command rejects unknown subcommand" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1230,6 +1282,21 @@ test "remote command rejects sse endpoint with empty host" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
+}
+
+test "remote command rejects sse endpoint with fragment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost#events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
 }
 
 test "remote command rejects sse endpoint with path-only authority" {
