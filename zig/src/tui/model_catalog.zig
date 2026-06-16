@@ -8,6 +8,10 @@ const codex_oauth = @import("oauth/openai_codex");
 const openai_codex_provider_id = "openai-codex";
 const openai_codex_api_id = "openai-codex-responses";
 const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
+const kimi_provider_id = "kimi";
+const kimi_api_id = "anthropic-messages";
+const kimi_model_id = "kimi-k2.7-code";
+const kimi_base_url = "https://api.moonshot.ai/anthropic";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
@@ -43,11 +47,87 @@ pub fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void
 }
 
 pub fn loadProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadOpenAICodexModels(allocator, .allow_cache);
+    var codex_models = try loadOpenAICodexModels(allocator, .allow_cache);
+    errdefer deinitModels(allocator, codex_models);
+
+    const kimi_models = try loadKimiModels(allocator);
+    defer allocator.free(kimi_models);
+    errdefer for (kimi_models) |*model| model.deinit(allocator);
+
+    if (kimi_models.len == 0) return codex_models;
+
+    var models = try allocator.alloc(ai_types.Model, codex_models.len + kimi_models.len);
+    @memcpy(models[0..codex_models.len], codex_models);
+    @memcpy(models[codex_models.len..], kimi_models);
+    allocator.free(codex_models);
+    codex_models = &.{};
+    return models;
 }
 
 pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    return loadOpenAICodexModels(allocator, .force_fetch);
+    var codex_models = try loadOpenAICodexModels(allocator, .force_fetch);
+    errdefer deinitModels(allocator, codex_models);
+
+    const kimi_models = try loadKimiModels(allocator);
+    defer allocator.free(kimi_models);
+    errdefer for (kimi_models) |*model| model.deinit(allocator);
+
+    if (kimi_models.len == 0) return codex_models;
+
+    var models = try allocator.alloc(ai_types.Model, codex_models.len + kimi_models.len);
+    @memcpy(models[0..codex_models.len], codex_models);
+    @memcpy(models[codex_models.len..], kimi_models);
+    allocator.free(codex_models);
+    codex_models = &.{};
+    return models;
+}
+
+fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
+    if (builtin.is_test) {
+        if (!test_force_kimi_model) return emptyModels(allocator);
+    } else {
+        var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
+        defer storage.deinit();
+        if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
+    }
+
+    const models = try allocator.alloc(ai_types.Model, 1);
+    errdefer allocator.free(models);
+    models[0] = try kimiModel(allocator);
+    return models;
+}
+
+var test_force_kimi_model: bool = false;
+
+fn kimiModel(allocator: std.mem.Allocator) !ai_types.Model {
+    const id = try allocator.dupe(u8, kimi_model_id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, "Kimi K2.7 Code");
+    errdefer allocator.free(name);
+    const api = try allocator.dupe(u8, kimi_api_id);
+    errdefer allocator.free(api);
+    const provider = try allocator.dupe(u8, kimi_provider_id);
+    errdefer allocator.free(provider);
+    const base_url = try allocator.dupe(u8, kimi_base_url);
+    errdefer allocator.free(base_url);
+    const input = try allocator.alloc([]const u8, 1);
+    errdefer allocator.free(input);
+    input[0] = try allocator.dupe(u8, "text");
+    errdefer allocator.free(input[0]);
+
+    return .{
+        .id = id,
+        .name = name,
+        .api = api,
+        .provider = provider,
+        .base_url = base_url,
+        .reasoning = false,
+        .input = input,
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 16_384,
+        .is_owned = true,
+    };
 }
 
 fn refreshOpenAICodexCredentials(credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !oauth_storage.Credentials {
@@ -576,6 +656,23 @@ test "parseCodexModelsCache maps visible supported Codex models" {
     try std.testing.expect(models[0].headers != null);
     try std.testing.expectEqualStrings("version", models[0].headers.?[0].name);
     try std.testing.expectEqualStrings("0.135.0", models[0].headers.?[0].value);
+}
+
+test "loadProductionModels includes Kimi model when enabled" {
+    test_force_kimi_model = true;
+    defer test_force_kimi_model = false;
+
+    const models = try loadProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings(kimi_model_id, models[0].id);
+    try std.testing.expectEqualStrings("Kimi K2.7 Code", models[0].name);
+    try std.testing.expectEqualStrings(kimi_provider_id, models[0].provider);
+    try std.testing.expectEqualStrings(kimi_api_id, models[0].api);
+    try std.testing.expectEqualStrings(kimi_base_url, models[0].base_url);
+    try std.testing.expectEqual(@as(u32, 262_144), models[0].context_window);
+    try std.testing.expectEqual(@as(u32, 16_384), models[0].max_tokens);
 }
 
 test "parseCodexModelsCache accepts models response body" {

@@ -19,6 +19,7 @@ pub const Provider = enum {
     anthropic,
     github_copilot,
     openai_codex,
+    kimi,
 };
 
 /// Storage key under which credentials are persisted in `~/.makai/auth.json`.
@@ -28,6 +29,7 @@ pub fn providerStorageKey(provider: Provider) []const u8 {
         .anthropic => "anthropic",
         .github_copilot => "github-copilot",
         .openai_codex => "openai-codex",
+        .kimi => "kimi",
     };
 }
 
@@ -92,6 +94,7 @@ pub const LoginSession = struct {
             .anthropic => try std.Thread.spawn(.{}, runAnthropic, .{self}),
             .github_copilot => try std.Thread.spawn(.{}, runGithub, .{self}),
             .openai_codex => try std.Thread.spawn(.{}, runCodex, .{self}),
+            .kimi => try std.Thread.spawn(.{}, runKimi, .{self}),
         };
         return self;
     }
@@ -308,6 +311,16 @@ fn runCodex(self: *LoginSession) void {
     self.finishSuccess(creds.refresh, creds.access, creds.expires, creds.provider_data);
 }
 
+fn runKimi(self: *LoginSession) void {
+    const api_key = self.waitForInput("Enter Kimi API key:", false);
+    defer self.allocator.free(api_key);
+    if (std.mem.trim(u8, api_key, " \t\r\n").len == 0) {
+        self.finishError("ApiKeyRequired");
+        return;
+    }
+    self.finishSuccess("", api_key, std.math.maxInt(i64), null);
+}
+
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {
     allocator.free(creds.refresh);
     allocator.free(creds.access);
@@ -323,6 +336,7 @@ test "providerStorageKey maps to expected ids" {
     try std.testing.expectEqualStrings("anthropic", providerStorageKey(.anthropic));
     try std.testing.expectEqualStrings("github-copilot", providerStorageKey(.github_copilot));
     try std.testing.expectEqualStrings("openai-codex", providerStorageKey(.openai_codex));
+    try std.testing.expectEqualStrings("kimi", providerStorageKey(.kimi));
 }
 
 test "LoginSession start rejects a second concurrent login" {
