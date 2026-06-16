@@ -2363,7 +2363,7 @@ fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store
     return a.last_active > b.last_active;
 }
 
-/// Generate a collision-resistant session ID, e.g. "20260523-150405-123-a1b2c3d4e5f60708".
+/// Build the default export filename, e.g. "transcript-20260615-120000.md".
 fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
     const millis = compat.time.nowMillis();
     const secs: i64 = @divFloor(millis, 1000);

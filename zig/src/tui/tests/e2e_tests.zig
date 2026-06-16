@@ -471,6 +471,40 @@ test "e2e: /export opens picker and copies transcript" {
     try std.testing.expect(d.frameContains("exported transcript to clipboard"));
 }
 
+test "e2e: /export picker saves transcript to default file" {
+    const models = [_]ai_types.Model{mock_provider.test_model};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
+    var d = try Driver.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    }, .{});
+    defer d.deinit();
+
+    try d.app().state.appendUserMessage("question");
+    try d.app().state.appendTranscript(.assistant, "answer");
+    d.typeText("/export");
+    d.pressEnter();
+    d.sendKey(.down);
+    d.sendKey(.enter);
+
+    try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
+    try std.testing.expect(d.frameContains("exported transcript to transcript-"));
+
+    var found = false;
+    var dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, ".", .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var it = dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "transcript-") and std.mem.endsWith(u8, entry.name, ".md")) {
+            found = true;
+            try std.Io.Dir.deleteFile(.cwd(), std.testing.io, entry.name);
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
 test "e2e: /export writes explicit file and reports file errors" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });

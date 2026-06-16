@@ -1234,12 +1234,33 @@ fn appendBlockquote(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, text:
 }
 
 fn appendFencedSection(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8, text: []const u8) !void {
+    const fence_len = markdownFenceLength(text);
     try buf.appendSlice(allocator, "## ");
     try buf.appendSlice(allocator, title);
-    try buf.appendSlice(allocator, "\n\n```text\n");
+    try buf.appendSlice(allocator, "\n\n");
+    try appendRepeated(buf, allocator, '`', fence_len);
+    try buf.appendSlice(allocator, "text\n");
     try buf.appendSlice(allocator, text);
     if (text.len > 0 and text[text.len - 1] != '\n') try buf.append(allocator, '\n');
-    try buf.appendSlice(allocator, "```");
+    try appendRepeated(buf, allocator, '`', fence_len);
+}
+
+fn markdownFenceLength(text: []const u8) usize {
+    var longest: usize = 0;
+    var current: usize = 0;
+    for (text) |c| {
+        if (c == '`') {
+            current += 1;
+            longest = @max(longest, current);
+        } else {
+            current = 0;
+        }
+    }
+    return @max(@as(usize, 3), longest + 1);
+}
+
+fn appendRepeated(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: u8, count: usize) !void {
+    for (0..count) |_| try buf.append(allocator, byte);
 }
 
 fn formatProtocolEvent(allocator: std.mem.Allocator, event: tui_runtime.TuiEvent) ![]u8 {
@@ -1608,7 +1629,9 @@ test "AppState exports transcript as markdown" {
     defer state.deinit();
     try state.appendUserMessage("hello\nworld");
     try state.appendTranscript(.assistant, "# Answer\n- item");
+    try state.appendTranscript(.thinking, "plan");
     try state.appendTranscript(.tool, "shell_execute {\"command\":\"pwd\"}");
+    try state.appendTranscript(.system, "notice");
     try state.appendTranscript(.@"error", "failed");
 
     const text = try state.transcriptToMarkdown(std.testing.allocator);
@@ -1616,8 +1639,21 @@ test "AppState exports transcript as markdown" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "## User\n\n> hello\n> world") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "## Assistant\n\n# Answer\n- item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Thinking\n\n```text\nplan\n```") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "## Tool\n\n```text\nshell_execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "## System\n\n```text\nnotice\n```") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "## Error\n\n```text\nfailed\n```") != null);
+}
+
+test "AppState markdown export uses longer fences when content contains backticks" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.tool, "before\n```\nafter");
+
+    const text = try state.transcriptToMarkdown(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "## Tool\n\n````text\nbefore\n```\nafter\n````") != null);
 }
 
 test "AppState exports empty transcript as empty markdown" {
