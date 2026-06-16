@@ -1380,6 +1380,7 @@ pub const TuiModel = struct {
                         .escape => app.cancelLogin(),
                         .backspace => _ = app.state.composer.deleteBeforeCursor(),
                         .char => |c| appendChar(app, c) catch {},
+                        .paste => |text| app.state.composer.insertSlice(app.allocator, text) catch {},
                         .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
                         .left => _ = app.state.composer.moveCursorPrev(),
                         .right => _ = app.state.composer.moveCursorNext(),
