@@ -11,7 +11,7 @@ const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
 const kimi_api_id = "openai-completions";
 const kimi_model_id = "kimi-k2.7-code";
-const kimi_base_url = "https://api.kimi.com/coding/v1";
+const kimi_base_url = "https://api.kimi.com/coding/";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
@@ -120,10 +120,11 @@ fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     errdefer allocator.free(provider);
 
     // Select base_url based on region (OpenAI-compatible endpoints)
+    // openai-completions appends /v1/chat/completions
     const base_url_str = if (std.mem.eql(u8, region, "global"))
-        "https://api.moonshot.ai/v1"
+        "https://api.moonshot.ai/"
     else
-        "https://api.kimi.com/coding/v1";
+        "https://api.kimi.com/coding/";
     const base_url = try allocator.dupe(u8, base_url_str);
     errdefer allocator.free(base_url);
 
