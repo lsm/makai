@@ -197,7 +197,7 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
 
             // Store region in provider_data by encoding it as "region:<value>"
             const provider_data = if (region) |r|
-                try std.fmt.allocPrint(allocator, "region:{s}", r)
+                try std.fmt.allocPrint(allocator, "region:{s}", .{r})
             else
                 null;
             errdefer if (provider_data) |pd| allocator.free(pd);
@@ -271,7 +271,8 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
             .oauth => |creds| {
                 // Special case for API keys stored as oauth (for region support)
                 const is_api_key_style = creds.refresh.len == 0 and creds.expires == std.math.maxInt(i64);
-                if (is_api_key_style and creds.provider_data) |data| {
+                if (is_api_key_style) {
+                    if (creds.provider_data) |data| {
                     // Parse region from provider_data (format: "region:<value>")
                     if (std.mem.startsWith(u8, data, "region:")) {
                         const region = data[7..]; // Skip "region:" prefix
@@ -282,6 +283,7 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
                         try json_buf.appendSlice(allocator, "}");
                         break;
                     }
+                }
                 }
                 // Standard OAuth credential serialization
                 try json_buf.appendSlice(allocator, "{\"refresh\":");

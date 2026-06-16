@@ -91,9 +91,11 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 
         // Extract region from stored credentials
         if (storage.providers.get(kimi_provider_id)) |auth| {
-            if (auth == .oauth and auth.oauth.provider_data) |provider_data| {
+            if (auth == .oauth) {
+                if (auth.oauth.provider_data) |provider_data| {
                 if (std.mem.startsWith(u8, provider_data, "region:")) {
                     region = provider_data[7..]; // Skip "region:" prefix
+                    }
                 }
             }
         }
