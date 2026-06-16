@@ -2785,4 +2785,3 @@ test "streamSimpleOpenAICompletions exits early when pre-cancelled" {
     try std.testing.expect(stream.getError() != null);
     try std.testing.expectEqualStrings("request cancelled", stream.getError().?);
 }
-

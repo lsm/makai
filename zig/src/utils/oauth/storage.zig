@@ -202,12 +202,18 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
                 null;
             errdefer if (provider_data) |pd| allocator.free(pd);
 
-            try providers.put(provider_id, .{ .oauth = .{
-                .refresh = "",
-                .access = api_key,
-                .expires = std.math.maxInt(i64),
-                .provider_data = provider_data,
-            } });
+            // Store as api_key variant for pure API key auth (no region support)
+            // or as oauth with provider_data for region-aware providers like Kimi
+            if (region == null) {
+                try providers.put(provider_id, .{ .api_key = api_key });
+            } else {
+                try providers.put(provider_id, .{ .oauth = .{
+                    .refresh = "",
+                    .access = api_key,
+                    .expires = std.math.maxInt(i64),
+                    .provider_data = provider_data,
+                } });
+            }
         } else if (provider_obj.get("refresh")) |refresh_val| {
             const refresh = try allocator.dupe(u8, refresh_val.string);
             errdefer secureFree(allocator, refresh);

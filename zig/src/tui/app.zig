@@ -609,13 +609,33 @@ pub const App = struct {
         var owned = false;
         errdefer if (!owned) self.allocator.free(key);
         if (std.mem.eql(u8, provider_id, "kimi")) {
+            // Kimi uses API key auth with optional region in provider_data
             const api_key = try self.allocator.dupe(u8, creds.access);
             errdefer if (!owned) self.allocator.free(api_key);
+
+            // Copy provider_data if present (format: "region:china" or "region:global")
+            const provider_data: ?[]const u8 = if (creds.provider_data) |pd|
+                try self.allocator.dupe(u8, pd)
+            else
+                null;
+            errdefer if (provider_data) |pd| self.allocator.free(pd);
+
             if (storage.providers.fetchRemove(provider_id)) |removed| {
                 self.allocator.free(removed.key);
                 removed.value.deinit(self.allocator);
             }
-            try storage.providers.put(key, .{ .api_key = api_key });
+
+            // Store with region data if present
+            if (provider_data) |pd| {
+                try storage.providers.put(key, .{ .oauth = .{
+                    .refresh = "",
+                    .access = api_key,
+                    .expires = std.math.maxInt(i64),
+                    .provider_data = pd,
+                } });
+            } else {
+                try storage.providers.put(key, .{ .api_key = api_key });
+            }
             owned = true;
             try storage.persist();
             return;
