@@ -486,13 +486,17 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
 };
 
 fn loadFromKeychain(allocator: std.mem.Allocator) !KeychainLoadResult {
+    return loadFromKeychainWithCodexImport(allocator, true);
+}
+
+fn loadFromKeychainWithCodexImport(allocator: std.mem.Allocator, import_codex: bool) !KeychainLoadResult {
     const content = macos_keychain.read(allocator) catch return .unavailable;
     const owned = content orelse return .not_found;
     defer secureFree(allocator, owned);
 
     var storage = parseAuthJson(allocator, owned, keychain_save_fn) catch return .unavailable;
     errdefer storage.deinit();
-    try maybeImportCodexCliCredentials(&storage);
+    if (import_codex) try maybeImportCodexCliCredentials(&storage);
     return .{ .found = storage };
 }
 
@@ -699,6 +703,23 @@ pub const AuthStorage = struct {
         var storage = try loadFromFile(allocator);
         try maybeImportCodexCliCredentials(&storage);
         return storage;
+    }
+
+    /// Load only Makai-owned auth storage, without importing Codex CLI
+    /// credentials from a separate keychain/file. Provider streams for plain
+    /// API-key providers only need entries saved by Makai itself; importing
+    /// unrelated Codex credentials can trigger keychain UI on background
+    /// threads before a provider request has even started.
+    pub fn loadDefaultStoredOnly(allocator: std.mem.Allocator) !AuthStorage {
+        if (shouldUseKeychain()) {
+            switch (try loadFromKeychainWithCodexImport(allocator, false)) {
+                .found => |storage| return storage,
+                .not_found => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
+                .unavailable => {},
+            }
+        }
+
+        return try loadFromFile(allocator);
     }
 
     /// Save auth storage to ~/.makai/auth.json atomically.

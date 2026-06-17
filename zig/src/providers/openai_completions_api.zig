@@ -1375,9 +1375,13 @@ fn runThread(ctx: *ThreadCtx) void {
             std.debug.print("Error body: {s}\n", .{eb});
         }
 
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const error_msg = std.fmt.allocPrint(allocator, "openai request failed: status={d}", .{status_code}) catch "openai request failed";
+        defer if (!std.mem.eql(u8, error_msg, "openai request failed")) allocator.free(error_msg);
+
         ctx.deinit();
         stream.markThreadDone();
-        stream.completeWithError("openai request failed");
+        stream.completeWithError(error_msg);
         return;
     }
 

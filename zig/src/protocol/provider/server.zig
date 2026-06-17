@@ -586,7 +586,19 @@ fn streamWithResolvedKey(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
 ) !*event_stream.AssistantMessageEventStream {
-    const resolved = auth_resolver.resolveApiKey(server.allocator, server.options.auth_storage, provider_id, null) catch |err| switch (err) {
+    var loaded_storage: ?oauth_storage.AuthStorage = null;
+    defer if (loaded_storage) |*storage| storage.deinit();
+
+    const storage = if (server.options.auth_storage) |auth_storage|
+        auth_storage
+    else
+        blk: {
+            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
+                break :blk null;
+            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+        };
+
+    const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
         error.AuthRequired => return error.AuthRequired,
         error.OutOfMemory => return error.OutOfMemory,
     };
@@ -652,7 +664,10 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
-    const provider_id = provider.auth_provider_id orelse model.provider;
+    const provider_id = if (std.mem.eql(u8, model.provider, "kimi"))
+        model.provider
+    else
+        provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 

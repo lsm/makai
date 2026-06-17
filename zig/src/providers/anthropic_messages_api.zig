@@ -1215,9 +1215,15 @@ fn runThread(ctx: *ThreadCtx) void {
         // Use .headers.accept_encoding = .{ .override = "identity" } to
         // replace the Zig HTTP client's built-in "accept-encoding: gzip, deflate"
         // with "accept-encoding: identity" (no compression).
+        const user_agent_override: ?[]const u8 = if (std.mem.eql(u8, model.provider, "kimi"))
+            "claude-code/0.1.0"
+        else
+            null;
+
         req = http_client.openRequest(.POST, uri, .{
             .extra_headers = headers,
             .accept_encoding = "identity",
+            .user_agent = user_agent_override,
         }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {

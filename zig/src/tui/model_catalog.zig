@@ -10,8 +10,10 @@ const openai_codex_api_id = "openai-codex-responses";
 const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
 const kimi_api_id = "openai-completions";
+const kimi_anthropic_api_id = "anthropic-messages";
 const kimi_model_id = "kimi-k2.7-code";
 const kimi_base_url = "https://api.kimi.com/coding/";
+const kimi_global_base_url = "https://api.moonshot.ai/anthropic";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
@@ -92,7 +94,7 @@ pub fn loadKimiModelsPublic(allocator: std.mem.Allocator) ![]ai_types.Model {
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     var region: []const u8 = "china"; // Default to China region
     if (!builtin.is_test) {
-        var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
+        var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return emptyModels(allocator);
         defer storage.deinit();
         if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
 
@@ -121,15 +123,16 @@ fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, "Kimi K2.7 Code");
     errdefer allocator.free(name);
-    const api = try allocator.dupe(u8, kimi_api_id);
+    const use_global = std.mem.eql(u8, region, "global");
+    const api = try allocator.dupe(u8, if (use_global) kimi_anthropic_api_id else kimi_api_id);
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, kimi_provider_id);
     errdefer allocator.free(provider);
 
     // Select base_url based on region (OpenAI-compatible endpoints)
     // openai-completions appends /v1/chat/completions
-    const base_url_str = if (std.mem.eql(u8, region, "global"))
-        "https://api.moonshot.ai/"
+    const base_url_str = if (use_global)
+        kimi_global_base_url
     else
         "https://api.kimi.com/coding/";
     const base_url = try allocator.dupe(u8, base_url_str);

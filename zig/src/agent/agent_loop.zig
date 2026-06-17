@@ -938,6 +938,45 @@ fn streamAssistantResponse(
         }
     }
 
+    if (final_message == null) {
+        if (provider_stream.getError()) |provider_error| {
+            if (std.mem.eql(u8, provider_error, "auth_required") or
+                std.mem.indexOf(u8, provider_error, "Authentication required") != null)
+            {
+                return error.AuthRequired;
+            }
+            if (std.mem.startsWith(u8, provider_error, "openai request failed")) {
+                if (std.mem.indexOf(u8, provider_error, "status=401") != null) return error.ProviderHttp401;
+                if (std.mem.indexOf(u8, provider_error, "status=403") != null) return error.ProviderHttp403;
+                if (std.mem.indexOf(u8, provider_error, "status=404") != null) return error.ProviderHttp404;
+                if (std.mem.indexOf(u8, provider_error, "status=429") != null) return error.ProviderHttp429;
+                if (std.mem.indexOf(u8, provider_error, "status=500") != null) return error.ProviderHttp500;
+                if (std.mem.indexOf(u8, provider_error, "status=502") != null) return error.ProviderHttp502;
+                if (std.mem.indexOf(u8, provider_error, "status=503") != null) return error.ProviderHttp503;
+                return error.ProviderRequestFailed;
+            }
+            if (std.mem.startsWith(u8, provider_error, "anthropic request failed")) {
+                if (std.mem.indexOf(u8, provider_error, "HTTP 401") != null) return error.ProviderHttp401;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 403") != null) return error.ProviderHttp403;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 404") != null) return error.ProviderHttp404;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 429") != null) return error.ProviderHttp429;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 500") != null) return error.ProviderHttp500;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 502") != null) return error.ProviderHttp502;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 503") != null) return error.ProviderHttp503;
+                return error.ProviderRequestFailed;
+            }
+            if (std.mem.eql(u8, provider_error, "json parse error")) return error.ProviderJsonParseError;
+            if (std.mem.eql(u8, provider_error, "sse parse error")) return error.ProviderSseParseError;
+            if (std.mem.eql(u8, provider_error, "read error")) return error.ProviderReadError;
+            if (std.mem.eql(u8, provider_error, "failed to receive response")) return error.ProviderReceiveFailed;
+            if (std.mem.eql(u8, provider_error, "failed to send request")) return error.ProviderSendFailed;
+            if (std.mem.eql(u8, provider_error, "failed to open request")) return error.ProviderOpenFailed;
+            if (std.mem.eql(u8, provider_error, "invalid provider URL")) return error.InvalidProviderUrl;
+            if (std.mem.indexOf(u8, provider_error, "timed out") != null) return error.ProviderStreamTimeout;
+            return error.ProviderStreamError;
+        }
+    }
+
     return final_message orelse error.NoFinalMessage;
 }
 
