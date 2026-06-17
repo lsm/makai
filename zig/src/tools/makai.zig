@@ -1936,6 +1936,13 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
             use_agent_loop = true;
         } else if (std.mem.eql(u8, args[prompt_index], "--storage")) {
             use_storage_auth = true;
+        } else if (std.mem.eql(u8, args[prompt_index], "--tui-runtime")) {
+            prompt_index += 1;
+            if (prompt_index >= args.len) {
+                perr("error: --tui-runtime requires a prompt\n");
+                return error.InvalidArgument;
+            }
+            return runPrintTuiRuntime(allocator, args[prompt_index]);
         } else if (std.mem.eql(u8, args[prompt_index], "--model")) {
             prompt_index += 1;
             if (prompt_index >= args.len) {
@@ -1972,7 +1979,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(region_env);
     const is_global_kimi = std.mem.eql(u8, std.mem.trim(u8, region_env, " \t\r\n"), "global");
     const base_url = if (is_global_kimi)
-        "https://api.moonshot.ai/anthropic"
+        "https://api.moonshot.ai/"
     else
         "https://api.kimi.com/coding/";
 
@@ -1980,7 +1987,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     const model = ai_types.Model{
         .id = "kimi-k2.7-code",
         .name = "Kimi K2.7 Code",
-        .api = if (is_global_kimi) "anthropic-messages" else "openai-completions",
+        .api = "openai-completions",
         .provider = "kimi",
         .base_url = base_url,
         .reasoning = false,
@@ -2161,6 +2168,100 @@ fn runPrintAgentLoop(
         }
     } else {
         perrf("[print-agent] NoFinalMessage after {d} events\n", .{event_count});
+    }
+}
+
+fn runPrintTuiRuntime(allocator: std.mem.Allocator, prompt: []const u8) !void {
+    perr("[print-tui] starting TUI runtime path with production tool registry...\n");
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
+    var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
+
+    const models = [_]ai_types.Model{.{
+        .id = "kimi-k2.7-code",
+        .name = "Kimi K2.7 Code",
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = "https://api.kimi.com/coding/",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 16_384,
+    }};
+
+    const options = tui_app.TuiRuntimeOptions{
+        .protocol = (&bridge).protocolClient(),
+        .models = &models,
+        .initial_model_id = "kimi-k2.7-code",
+        .run_async = false,
+        .compact_output = true,
+    };
+
+    var runtime = try tui_app.TuiRuntime.init(allocator, options);
+    defer runtime.deinit();
+
+    if (runtime.currentModel()) |model| {
+        perrf("[print-tui] initial model={s} api={s} provider={s} base_url={s}\n", .{ model.id, model.api, model.provider, model.base_url });
+    } else {
+        perr("[print-tui] no initial model\n");
+    }
+
+    runtime.switchModel("kimi-k2.7-code") catch |err| {
+        perrf("[print-tui] switchModel(kimi-k2.7-code) failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    if (runtime.currentModel()) |model| {
+        perrf("[print-tui] active model={s} api={s} provider={s} base_url={s} tools={d}\n", .{
+            model.id,
+            model.api,
+            model.provider,
+            model.base_url,
+            runtime.availableTools().len,
+        });
+    }
+
+    try runtime.submitTurn(prompt);
+
+    var event_count: usize = 0;
+    while (true) {
+        const stream = runtime.streamEvents();
+        if (stream.wait()) |event| {
+            event_count += 1;
+            var owned_event = event;
+            defer owned_event.deinit(allocator);
+            switch (owned_event) {
+                .text_delta => |td| perrf("[print-tui-text] ({d}b) {s}\n", .{ td.delta.slice().len, td.delta.slice() }),
+                .thinking_delta => |td| perrf("[print-tui-think] ({d}b) {s}\n", .{ td.delta.slice().len, td.delta.slice() }),
+                .message_end => |payload| perrf("[print-tui-message-end] role={s} stop={s} is_error={any} text={s}\n", .{
+                    @tagName(payload.role),
+                    @tagName(payload.stop_reason),
+                    payload.is_error,
+                    payload.text.slice(),
+                }),
+                .turn_end => |payload| perrf("[print-tui-turn-end] stop={s}\n", .{@tagName(payload.stop_reason)}),
+                .agent_end => |payload| {
+                    perrf("[print-tui-agent-end] reason={s} events={d}\n", .{ @tagName(payload.reason), event_count });
+                    break;
+                },
+                .@"error" => |payload| perrf("[print-tui-error] {s}\n", .{payload.message.slice()}),
+                else => perrf("[print-tui-event#{d}] {s}\n", .{ event_count, @tagName(owned_event) }),
+            }
+            continue;
+        }
+
+        if (stream.getError()) |err_msg| {
+            perrf("[print-tui] stream error: {s}\n", .{err_msg});
+            break;
+        }
+        if (stream.getResult()) |result| {
+            perrf("[print-tui] COMPLETE reason={s} events={d}\n", .{ @tagName(result.reason), event_count });
+            break;
+        }
+        break;
     }
 }
 

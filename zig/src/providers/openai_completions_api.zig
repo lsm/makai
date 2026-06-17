@@ -480,6 +480,7 @@ fn writeMessagesArray(
                         try writer.writeStringField("name", tc.name);
                         try writer.writeStringField("arguments", tc.arguments_json);
                         try writer.endObject();
+                        try writer.endObject();
                     },
                     else => {},
                 };
@@ -665,8 +666,12 @@ fn buildRequestBody(
     // Use appropriate max tokens field based on provider
     try w.writeIntField(merged.max_tokens_field, options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
-        try w.writeKey("temperature");
-        try w.writeFloat(t);
+        // Kimi Coding only accepts temperature=1. Omit incompatible inherited
+        // TUI defaults instead of turning a valid request into HTTP 400.
+        if (!isKimiModel(model) or t == 1.0) {
+            try w.writeKey("temperature");
+            try w.writeFloat(t);
+        }
     }
     // Add reasoning_effort for providers that support it
     if (options.getReasoningEffort()) |effort| {
@@ -692,6 +697,7 @@ fn buildRequestBody(
                 if (merged.supports_strict_mode) {
                     try w.writeBoolField("strict", true);
                 }
+                try w.endObject();
                 try w.endObject();
             }
             try w.endArray();
@@ -1060,6 +1066,17 @@ fn pushOwnedEvent(
     };
 }
 
+fn isKimiModel(model: ai_types.Model) bool {
+    return std.mem.eql(u8, model.provider, "kimi");
+}
+
+fn maybeDumpProviderPayload(allocator: std.mem.Allocator, request_body: []const u8) void {
+    const path = compat_mod.getEnvVarOwned(allocator, "MAKAI_DEBUG_PROVIDER_PAYLOAD") catch return;
+    defer allocator.free(path);
+    if (path.len == 0) return;
+    compat_mod.fs.writeFile(compat_mod.fs.getCwd(), path, request_body) catch {};
+}
+
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1077,6 +1094,7 @@ fn runThread(ctx: *ThreadCtx) void {
     if (on_payload_fn) |cb| {
         cb(on_payload_ctx, request_body);
     }
+    maybeDumpProviderPayload(allocator, request_body);
 
     // Check cancellation before sending
     if (cancel_token) |ct| {
@@ -1201,7 +1219,7 @@ fn runThread(ctx: *ThreadCtx) void {
     // the client's default user-agent (which would otherwise be `zig/...` and
     // collide with any value added via extra_headers, producing a duplicate
     // header). The override is applied in openRequest below.
-    const user_agent_override: ?[]const u8 = if (std.mem.eql(u8, model.provider, "kimi"))
+    const user_agent_override: ?[]const u8 = if (isKimiModel(model))
         "claude-code/0.1.0"
     else
         null;
@@ -1520,7 +1538,7 @@ fn runThread(ctx: *ThreadCtx) void {
             }
 
             // Emit thinking_delta event if thinking was appended
-            if (thinking.items.len > prev_thinking_len) {
+            if (thinking.items.len > prev_thinking_len and !isKimiModel(model)) {
                 const delta = thinking.items[prev_thinking_len..];
                 pushOwnedEvent(allocator, stream, .{
                     .thinking_delta = .{
@@ -1940,11 +1958,45 @@ test "buildRequestBody includes stream_options and tools without memory leak" {
     defer allocator.free(body);
 
     // Verify the body contains expected fields
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
     try std.testing.expect(std.mem.find(u8, body, "stream_options") != null);
     try std.testing.expect(std.mem.find(u8, body, "include_usage") != null);
     try std.testing.expect(std.mem.find(u8, body, "tools") != null);
     try std.testing.expect(std.mem.find(u8, body, "tool_calls") != null);
     try std.testing.expect(std.mem.find(u8, body, "test_tool") != null);
+}
+
+test "buildRequestBody omits non-default temperature for Kimi" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "kimi-k2.7-code",
+        .name = "Kimi K2.7 Code",
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = "https://api.kimi.com/coding/",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 100,
+    };
+
+    const messages = [_]ai_types.Message{.{ .user = .{
+        .content = .{ .text = "Hello" },
+        .timestamp = 0,
+    } }};
+    const ctx = ai_types.Context{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful"),
+        .messages = &messages,
+        .tools = null,
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100, .temperature = 0.7 }, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"temperature\"") == null);
 }
 
 test "buildRequestBody with assistant message containing tool_calls" {

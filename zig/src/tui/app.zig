@@ -28,6 +28,9 @@ const OwnedSlice = @import("owned_slice").OwnedSlice;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
+pub const TuiRuntime = tui_runtime.TuiRuntime;
+pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
+
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
 

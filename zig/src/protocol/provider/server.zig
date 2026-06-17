@@ -664,10 +664,7 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
-    const provider_id = if (std.mem.eql(u8, model.provider, "kimi"))
-        model.provider
-    else
-        provider.auth_provider_id orelse model.provider;
+    const provider_id = provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 

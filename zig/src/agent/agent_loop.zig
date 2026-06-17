@@ -946,9 +946,15 @@ fn streamAssistantResponse(
                 return error.AuthRequired;
             }
             if (std.mem.startsWith(u8, provider_error, "openai request failed")) {
+                if (std.mem.indexOf(u8, provider_error, "status=400") != null) return error.ProviderHttp400;
                 if (std.mem.indexOf(u8, provider_error, "status=401") != null) return error.ProviderHttp401;
                 if (std.mem.indexOf(u8, provider_error, "status=403") != null) return error.ProviderHttp403;
                 if (std.mem.indexOf(u8, provider_error, "status=404") != null) return error.ProviderHttp404;
+                if (std.mem.indexOf(u8, provider_error, "status=405") != null) return error.ProviderHttp405;
+                if (std.mem.indexOf(u8, provider_error, "status=409") != null) return error.ProviderHttp409;
+                if (std.mem.indexOf(u8, provider_error, "status=413") != null) return error.ProviderHttp413;
+                if (std.mem.indexOf(u8, provider_error, "status=415") != null) return error.ProviderHttp415;
+                if (std.mem.indexOf(u8, provider_error, "status=422") != null) return error.ProviderHttp422;
                 if (std.mem.indexOf(u8, provider_error, "status=429") != null) return error.ProviderHttp429;
                 if (std.mem.indexOf(u8, provider_error, "status=500") != null) return error.ProviderHttp500;
                 if (std.mem.indexOf(u8, provider_error, "status=502") != null) return error.ProviderHttp502;
@@ -956,9 +962,15 @@ fn streamAssistantResponse(
                 return error.ProviderRequestFailed;
             }
             if (std.mem.startsWith(u8, provider_error, "anthropic request failed")) {
+                if (std.mem.indexOf(u8, provider_error, "HTTP 400") != null) return error.ProviderHttp400;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 401") != null) return error.ProviderHttp401;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 403") != null) return error.ProviderHttp403;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 404") != null) return error.ProviderHttp404;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 405") != null) return error.ProviderHttp405;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 409") != null) return error.ProviderHttp409;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 413") != null) return error.ProviderHttp413;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 415") != null) return error.ProviderHttp415;
+                if (std.mem.indexOf(u8, provider_error, "HTTP 422") != null) return error.ProviderHttp422;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 429") != null) return error.ProviderHttp429;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 500") != null) return error.ProviderHttp500;
                 if (std.mem.indexOf(u8, provider_error, "HTTP 502") != null) return error.ProviderHttp502;

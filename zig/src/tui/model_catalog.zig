@@ -10,10 +10,9 @@ const openai_codex_api_id = "openai-codex-responses";
 const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
 const kimi_api_id = "openai-completions";
-const kimi_anthropic_api_id = "anthropic-messages";
 const kimi_model_id = "kimi-k2.7-code";
 const kimi_base_url = "https://api.kimi.com/coding/";
-const kimi_global_base_url = "https://api.moonshot.ai/anthropic";
+const kimi_global_base_url = "https://api.moonshot.ai/";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
@@ -102,11 +101,15 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
         if (storage.providers.get(kimi_provider_id)) |auth| {
             if (auth == .oauth) {
                 if (auth.oauth.provider_data) |provider_data| {
-                if (std.mem.startsWith(u8, provider_data, "region:")) {
-                    region = provider_data[7..]; // Skip "region:" prefix
+                    if (std.mem.startsWith(u8, provider_data, "region:")) {
+                        region = provider_data[7..]; // Skip "region:" prefix
                     }
                 }
             }
+        }
+
+        if (kimiRegionFromEnv(allocator)) |env_region| {
+            region = env_region;
         }
     }
 
@@ -118,13 +121,31 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 
 var test_force_kimi_model: bool = false;
 
+fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "global") or std.ascii.eqlIgnoreCase(trimmed, "moonshot")) return "global";
+    if (std.ascii.eqlIgnoreCase(trimmed, "china") or
+        std.ascii.eqlIgnoreCase(trimmed, "cn") or
+        std.ascii.eqlIgnoreCase(trimmed, "coding"))
+    {
+        return "china";
+    }
+    return null;
+}
+
+fn kimiRegionFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
+    const env_region = compat.getEnvVarOwned(allocator, "KIMI_REGION") catch return null;
+    defer allocator.free(env_region);
+    return normalizeKimiRegion(env_region);
+}
+
 fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     const id = try allocator.dupe(u8, kimi_model_id);
     errdefer allocator.free(id);
     const name = try allocator.dupe(u8, "Kimi K2.7 Code");
     errdefer allocator.free(name);
     const use_global = std.mem.eql(u8, region, "global");
-    const api = try allocator.dupe(u8, if (use_global) kimi_anthropic_api_id else kimi_api_id);
+    const api = try allocator.dupe(u8, kimi_api_id);
     errdefer allocator.free(api);
     const provider = try allocator.dupe(u8, kimi_provider_id);
     errdefer allocator.free(provider);
