@@ -188,23 +188,22 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
             const api_key = try allocator.dupe(u8, api_key_val.string);
             errdefer secureFree(allocator, api_key);
 
-            // Read region field if present (for providers like Kimi that need region-specific endpoints)
-            const region = if (provider_obj.get("region")) |region_val|
-                try allocator.dupe(u8, region_val.string)
-            else
-                null;
-            errdefer if (region) |r| allocator.free(r);
-
-            // Store region in provider_data by encoding it as "region:<value>"
-            const provider_data = if (region) |r|
-                try std.fmt.allocPrint(allocator, "region:{s}", .{r})
-            else
-                null;
+            // Read region field if present (for providers like Kimi that need region-specific endpoints).
+            // `region` is only needed to build `provider_data` (which owns its own copy via
+            // allocPrint), so it is freed at the end of the scoped block below — never leaked.
+            const provider_data: ?[]const u8 = blk: {
+                const r = if (provider_obj.get("region")) |region_val|
+                    try allocator.dupe(u8, region_val.string)
+                else
+                    break :blk null;
+                defer allocator.free(r);
+                break :blk try std.fmt.allocPrint(allocator, "region:{s}", .{r});
+            };
             errdefer if (provider_data) |pd| allocator.free(pd);
 
             // Store as api_key variant for pure API key auth (no region support)
             // or as oauth with provider_data for region-aware providers like Kimi
-            if (region == null) {
+            if (provider_data == null) {
                 try providers.put(provider_id, .{ .api_key = api_key });
             } else {
                 try providers.put(provider_id, .{ .oauth = .{
