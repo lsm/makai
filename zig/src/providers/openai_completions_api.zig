@@ -1041,6 +1041,25 @@ fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     return out;
 }
 
+/// Clone an event (deep-copy all string/content fields into stable heap
+/// allocations) before pushing it onto the stream. Required because this
+/// provider accumulates text/thinking into growing ArrayLists whose backing
+/// buffers move on reallocation; delta events that borrow a slice
+/// (`buf.items[prev..]`) would dangle after the next append. Cloning makes
+/// every pushed event self-owned so it survives buffer growth. The stream is
+/// configured with `owns_events = true` so consumers free the clones.
+fn pushOwnedEvent(
+    allocator: std.mem.Allocator,
+    stream: *event_stream.AssistantMessageEventStream,
+    event: ai_types.AssistantMessageEvent,
+) void {
+    const owned = ai_types.cloneAssistantMessageEvent(allocator, event) catch return;
+    stream.push(owned) catch {
+        var cleanup = owned;
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
+    };
+}
+
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1404,7 +1423,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     // Emit start event
-    _ = stream.push(.{
+    pushOwnedEvent(allocator, stream, .{
         .start = .{
             .partial = .{
                 .content = &.{},
@@ -1416,7 +1435,7 @@ fn runThread(ctx: *ThreadCtx) void {
                 .timestamp = compat_mod.time.nowMillis(),
             },
         },
-    }) catch {};
+    });
 
     while (true) {
         // Emit ping if interval is configured
@@ -1479,7 +1498,7 @@ fn runThread(ctx: *ThreadCtx) void {
             // Emit text_delta event if text was appended
             if (text.items.len > prev_text_len) {
                 const delta = text.items[prev_text_len..];
-                _ = stream.push(.{
+                pushOwnedEvent(allocator, stream, .{
                     .text_delta = .{
                         .content_index = 0, // Text is always first content block
                         .delta = delta,
@@ -1493,13 +1512,13 @@ fn runThread(ctx: *ThreadCtx) void {
                             .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
-                }) catch {};
+                });
             }
 
             // Emit thinking_delta event if thinking was appended
             if (thinking.items.len > prev_thinking_len) {
                 const delta = thinking.items[prev_thinking_len..];
-                _ = stream.push(.{
+                pushOwnedEvent(allocator, stream, .{
                     .thinking_delta = .{
                         .content_index = 0, // Thinking is always first if present
                         .delta = delta,
@@ -1513,7 +1532,7 @@ fn runThread(ctx: *ThreadCtx) void {
                             .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
-                }) catch {};
+                });
             }
 
             // Process reasoning detail events - set thought_signature on matching tool calls
@@ -1538,7 +1557,7 @@ fn runThread(ctx: *ThreadCtx) void {
                     tool_call_count += 1;
 
                     // Emit toolcall_start event
-                    _ = stream.push(.{
+                    pushOwnedEvent(allocator, stream, .{
                         .toolcall_start = .{
                             .content_index = content_index,
                             .id = id,
@@ -1553,7 +1572,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .timestamp = compat_mod.time.nowMillis(),
                             },
                         },
-                    }) catch {};
+                    });
                 } else if (tce.arguments_delta) |delta| {
                     // Append arguments delta
                     tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
@@ -1565,7 +1584,7 @@ fn runThread(ctx: *ThreadCtx) void {
 
                     // Emit toolcall_delta event
                     if (tool_call_tracker_instance.getContentIndex(tce.api_index)) |content_index| {
-                        _ = stream.push(.{
+                        pushOwnedEvent(allocator, stream, .{
                             .toolcall_delta = .{
                                 .content_index = content_index,
                                 .delta = delta,
@@ -1579,7 +1598,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .timestamp = compat_mod.time.nowMillis(),
                                 },
                             },
-                        }) catch {};
+                        });
                     }
                 }
             }
@@ -1719,7 +1738,7 @@ fn runThread(ctx: *ThreadCtx) void {
             };
 
             // Emit toolcall_end event
-            _ = stream.push(.{
+            pushOwnedEvent(allocator, stream, .{
                 .toolcall_end = .{
                     .content_index = idx,
                     .tool_call = event_tc,
@@ -1733,7 +1752,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         .timestamp = compat_mod.time.nowMillis(),
                     },
                 },
-            }) catch {};
+            });
 
             idx += 1;
         }
@@ -1792,6 +1811,9 @@ pub fn streamOpenAICompletions(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    // Events are deep-cloned in pushOwnedEvent, so the stream owns them and
+    // consumers must free each polled event via deinitAssistantMessageEvent.
+    s.owns_events = true;
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer {
