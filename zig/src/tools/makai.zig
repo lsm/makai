@@ -1921,66 +1921,45 @@ fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
 /// Mirrors the exact provider code path the TUI uses, so it reproduces (and
 /// exposes) streaming bugs without needing a real terminal.
 fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const oauth_storage = @import("oauth/storage");
-
     if (args.len < 1) {
         perr("error: -p requires a prompt argument\n");
         return error.InvalidArgument;
     }
     const prompt = args[0];
 
-    // Optional --model <id>; defaults to the first available model.
-    var want_model_id: ?[]const u8 = null;
-    if (args.len >= 3 and std.mem.eql(u8, args[1], "--model")) {
-        want_model_id = args[2];
-    }
+    perr("[print] building kimi model from env...\n");
 
-    perr("[print] loading kimi models (no network)...\n");
-
-    // Resolve Kimi model + region directly from storage. We deliberately do NOT
-    // call loadProductionModels here because it fetches the OpenAI Codex catalog
-    // over the network, which blocks in this I/O context and would mask the
-    // Kimi streaming bug we are trying to isolate.
-    const models = try tui_model_catalog.loadKimiModelsPublic(allocator);
-    defer tui_model_catalog.deinitModels(allocator, models);
-    if (models.len == 0) {
-        perr("error: no kimi models — run `makai auth login --provider kimi` first\n");
-        return error.NoModels;
-    }
-
-    var chosen_index: usize = 0;
-    if (want_model_id) |id| {
-        var found: ?usize = null;
-        for (models, 0..) |m, i| {
-            if (std.mem.eql(u8, m.id, id)) {
-                found = i;
-                break;
-            }
-        }
-        if (found) |f| {
-            chosen_index = f;
-        } else {
-            perr("error: model id not found in kimi catalog\n");
-            return error.ModelNotFound;
-        }
-    }
-    const model = models[chosen_index];
-
-    // Load API key from storage for this provider. Match auth_resolver's logic:
-    // .api_key → stored key; .oauth → access token (Kimi stores its API key here).
-    var storage = try oauth_storage.AuthStorage.loadDefault(allocator);
-    defer storage.deinit();
-
-    const auth = storage.providers.get(model.provider) orelse {
-        perrf("error: no credentials for provider '{s}'\n", .{model.provider});
+    // Read the API key from KIMI_API_KEY. We deliberately avoid loading the
+    // macOS Keychain here — the `security` subprocess it spawns blocks outside
+    // the TUI's threaded I/O context, which would mask the streaming bug. For
+    // region, default to china unless KIMI_REGION=global.
+    const api_key_env = compat.getEnvVarOwned(allocator, "KIMI_API_KEY") catch |err| {
+        perrf("error: set KIMI_API_KEY to use -p (storage load skipped to avoid blocking): {s}\n", .{@errorName(err)});
         return error.NoCredentials;
     };
-    const api_key: []const u8 = switch (auth) {
-        .api_key => |key| key,
-        .oauth => |creds| creds.access,
-    };
-    const api_key_copy = try allocator.dupe(u8, api_key);
+    const api_key_copy = api_key_env;
     defer allocator.free(api_key_copy);
+
+    const region_env = compat.getEnvVarOwned(allocator, "KIMI_REGION") catch try allocator.dupe(u8, "china");
+    defer allocator.free(region_env);
+    const base_url = if (std.mem.eql(u8, std.mem.trim(u8, region_env, " \t\r\n"), "global"))
+        "https://api.moonshot.ai/"
+    else
+        "https://api.kimi.com/coding/";
+
+    // Build the Kimi model inline (same shape as model_catalog.kimiModel).
+    const model = ai_types.Model{
+        .id = "kimi-k2.7-code",
+        .name = "Kimi K2.7 Code",
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = base_url,
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 16_384,
+    };
 
     // Register built-in API providers so we can resolve the stream fn.
     var registry = api_registry.ApiRegistry.init(allocator);
@@ -1991,6 +1970,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
         perrf("error: no provider registered for api '{s}'\n", .{model.api});
         return error.NoProvider;
     };
+    _ = provider;
 
     // Build a single-turn context from the prompt.
     const messages = try allocator.alloc(ai_types.Message, 1);
@@ -2000,9 +1980,15 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     perrf("[print] model={s} api={s} provider={s} base_url={s}\n", .{ model.id, model.api, model.provider, model.base_url });
     perrf("[print] api_key_len={d} reasoning={any}\n", .{ api_key_copy.len, model.reasoning });
-    perr("[print] starting stream...\n");
+    perr("[print] starting stream via protocol bridge (same path as TUI)...\n");
 
-    const stream = try provider.stream_simple(model, context, .{
+    // Use the in-process protocol bridge — the EXACT path the TUI's agent loop
+    // uses (streamViaProtocol → runStreamThread → ProtocolServer/Client). This
+    // reproduces TUI streaming bugs that the direct stream_simple path misses.
+    var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+
+    const stream = try protocol.stream(model, context, .{
         .api_key = api_key_copy,
     }, allocator);
     defer {
@@ -2039,8 +2025,15 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
-    // If we exit the loop without [done], the stream hung.
-    perrf("[print] stream ended after {d} events\n", .{event_count});
+    // Direct provider path signals completion via complete()+getResult(), not a
+    // pushed .done event, so a null return here can be normal — check the result.
+    if (stream.getError()) |e| {
+        perrf("[print] stream error: {s}\n", .{e});
+    } else if (stream.getResult()) |result| {
+        perrf("[print] COMPLETE stop={s} events={d} content_blocks={d}\n", .{ @tagName(result.stop_reason), event_count, result.content.len });
+    } else {
+        perrf("[print] NoFinalMessage after {d} events\n", .{event_count});
+    }
 }
 
 /// Write directly to stderr — `std.debug.print` is unbuffered (lock-protected
