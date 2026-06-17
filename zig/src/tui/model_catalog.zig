@@ -82,6 +82,13 @@ pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     return models;
 }
 
+/// Public entry point that loads ONLY Kimi models (no network fetch). Used by
+/// the non-interactive `-p` print mode to avoid the OpenAI Codex catalog fetch
+/// (which can block on the network and masks Kimi-specific streaming bugs).
+pub fn loadKimiModelsPublic(allocator: std.mem.Allocator) ![]ai_types.Model {
+    return loadKimiModels(allocator);
+}
+
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     var region: []const u8 = "china"; // Default to China region
     if (!builtin.is_test) {

@@ -1177,15 +1177,15 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
-    // Add Kimi-specific headers (required for authentication)
-    if (std.mem.eql(u8, model.provider, "kimi")) {
-        headers.append(allocator, .{ .name = "user-agent", .value = "claude-code/0.1.0" }) catch {
-            ctx.deinit();
-            stream.markThreadDone();
-            stream.completeWithError("oom kimi headers");
-            return;
-        };
-    }
+    // Kimi requires a specific User-Agent header for authentication; without it
+    // the WAF returns 403 ("only available for Coding Agents"). We must OVERRIDE
+    // the client's default user-agent (which would otherwise be `zig/...` and
+    // collide with any value added via extra_headers, producing a duplicate
+    // header). The override is applied in openRequest below.
+    const user_agent_override: ?[]const u8 = if (std.mem.eql(u8, model.provider, "kimi"))
+        "claude-code/0.1.0"
+    else
+        null;
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1216,7 +1216,7 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
-        req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch {
+        req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items, .user_agent = user_agent_override }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);

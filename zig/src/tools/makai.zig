@@ -1895,6 +1895,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --tui
+        \\  makai -p "<prompt>" [--model <id>]
         \\  makai auth providers [--json]
         \\  makai auth login --provider <id> [--json]
         \\
@@ -1902,6 +1903,9 @@ fn printUsage(file: std.Io.File) !void {
         \\  --version        Print binary version
         \\  --stdio          Start stdio mode
         \\  --tui            Start terminal UI shell
+        \\  -p               Non-interactive print mode: stream a prompt using
+        \\                   stored credentials and print every event to stdout.
+        \\                   Useful for debugging provider streaming.
         \\  auth providers   List oauth-capable providers
         \\  auth login       Run OAuth flow and persist credentials
         \\
@@ -1910,6 +1914,144 @@ fn printUsage(file: std.Io.File) !void {
 
 fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
     try tui_app.run(allocator, io);
+}
+
+/// Non-interactive print mode: stream a single prompt against a model resolved
+/// from the production catalog (using stored credentials) and print every event.
+/// Mirrors the exact provider code path the TUI uses, so it reproduces (and
+/// exposes) streaming bugs without needing a real terminal.
+fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const oauth_storage = @import("oauth/storage");
+
+    if (args.len < 1) {
+        perr("error: -p requires a prompt argument\n");
+        return error.InvalidArgument;
+    }
+    const prompt = args[0];
+
+    // Optional --model <id>; defaults to the first available model.
+    var want_model_id: ?[]const u8 = null;
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "--model")) {
+        want_model_id = args[2];
+    }
+
+    perr("[print] loading kimi models (no network)...\n");
+
+    // Resolve Kimi model + region directly from storage. We deliberately do NOT
+    // call loadProductionModels here because it fetches the OpenAI Codex catalog
+    // over the network, which blocks in this I/O context and would mask the
+    // Kimi streaming bug we are trying to isolate.
+    const models = try tui_model_catalog.loadKimiModelsPublic(allocator);
+    defer tui_model_catalog.deinitModels(allocator, models);
+    if (models.len == 0) {
+        perr("error: no kimi models — run `makai auth login --provider kimi` first\n");
+        return error.NoModels;
+    }
+
+    var chosen_index: usize = 0;
+    if (want_model_id) |id| {
+        var found: ?usize = null;
+        for (models, 0..) |m, i| {
+            if (std.mem.eql(u8, m.id, id)) {
+                found = i;
+                break;
+            }
+        }
+        if (found) |f| {
+            chosen_index = f;
+        } else {
+            perr("error: model id not found in kimi catalog\n");
+            return error.ModelNotFound;
+        }
+    }
+    const model = models[chosen_index];
+
+    // Load API key from storage for this provider. Match auth_resolver's logic:
+    // .api_key → stored key; .oauth → access token (Kimi stores its API key here).
+    var storage = try oauth_storage.AuthStorage.loadDefault(allocator);
+    defer storage.deinit();
+
+    const auth = storage.providers.get(model.provider) orelse {
+        perrf("error: no credentials for provider '{s}'\n", .{model.provider});
+        return error.NoCredentials;
+    };
+    const api_key: []const u8 = switch (auth) {
+        .api_key => |key| key,
+        .oauth => |creds| creds.access,
+    };
+    const api_key_copy = try allocator.dupe(u8, api_key);
+    defer allocator.free(api_key_copy);
+
+    // Register built-in API providers so we can resolve the stream fn.
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
+    const provider = registry.getApiProvider(model.api) orelse {
+        perrf("error: no provider registered for api '{s}'\n", .{model.api});
+        return error.NoProvider;
+    };
+
+    // Build a single-turn context from the prompt.
+    const messages = try allocator.alloc(ai_types.Message, 1);
+    defer allocator.free(messages);
+    messages[0] = .{ .user = .{ .content = .{ .text = prompt }, .timestamp = compat.time.nowSeconds() } };
+    const context = ai_types.Context{ .messages = messages };
+
+    perrf("[print] model={s} api={s} provider={s} base_url={s}\n", .{ model.id, model.api, model.provider, model.base_url });
+    perrf("[print] api_key_len={d} reasoning={any}\n", .{ api_key_copy.len, model.reasoning });
+    perr("[print] starting stream...\n");
+
+    const stream = try provider.stream_simple(model, context, .{
+        .api_key = api_key_copy,
+    }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    perr("[print] stream created, polling events...\n");
+
+    var event_count: usize = 0;
+    while (stream.wait()) |ev| {
+        event_count += 1;
+        switch (ev) {
+            .text_delta => |td| {
+                perrf("[text] ({d}b) {s}\n", .{ td.delta.len, td.delta });
+            },
+            .thinking_delta => |td| {
+                perrf("[think] ({d}b) {s}\n", .{ td.delta.len, td.delta });
+            },
+            .toolcall_delta => |td| {
+                perrf("[tool_delta] {s}\n", .{td.delta});
+            },
+            .done => |d| {
+                perrf("[done] stop_reason={s} events={d}\n", .{ @tagName(d.message.stop_reason), event_count });
+                break;
+            },
+            .@"error" => |e| {
+                perrf("[error] reason={s} events={d}\n", .{ @tagName(e.reason), event_count });
+                break;
+            },
+            else => {
+                perrf("[event#{d}] {s}\n", .{ event_count, @tagName(ev) });
+            },
+        }
+    }
+
+    // If we exit the loop without [done], the stream hung.
+    perrf("[print] stream ended after {d} events\n", .{event_count});
+}
+
+/// Write directly to stderr — `std.debug.print` is unbuffered (lock-protected
+/// direct writer) so diagnostics survive even if the process is killed mid-hang.
+fn perr(msg: []const u8) void {
+    std.debug.print("{s}", .{msg});
+}
+
+/// Formatted variant of `perr`.
+fn perrf(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
 }
 
 /// Production auth-server options for the CLI wrapper. Real OAuth flows are
@@ -3656,6 +3798,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "--tui")) {
         try runTui(allocator, init.io);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "-p")) {
+        try runPrintMode(allocator, args[2..]);
         return;
     }
 
