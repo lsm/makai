@@ -356,9 +356,23 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         data: ?*anyopaque,
     ) OSStatus;
     extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+    /// Returns the user's default keychain (the login keychain on a standard
+    /// setup), which unlocks automatically at login. We target it explicitly so
+    /// credentials live in the login keychain rather than an arbitrary default.
+    extern "c" fn SecKeychainCopyDefault(outKeychain: *?*const anyopaque) OSStatus;
 
     fn asUInt32(value: usize) !UInt32 {
         return std.math.cast(UInt32, value) orelse error.KeychainUnavailable;
+    }
+
+    /// Obtain the default (login) keychain reference. The caller must CFRelease
+    /// the returned ref. Returns null (→ caller falls back to the search list)
+    /// if the keychain cannot be opened.
+    fn defaultKeychain() ?*const anyopaque {
+        var kc: ?*const anyopaque = null;
+        const status = SecKeychainCopyDefault(&kc);
+        if (status != errSecSuccess) return null;
+        return kc;
     }
 
     fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
@@ -366,8 +380,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
+        // Target the login (default) keychain explicitly so reads come from the
+        // keychain that is already unlocked at login — avoiding a per-launch prompt.
+        const kc = defaultKeychain();
+        defer if (kc) |ref| CFRelease(ref);
+
         const status = SecKeychainFindGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
@@ -392,8 +411,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
+        // Write to the login (default) keychain explicitly so the item lives in
+        // the keychain unlocked at login.
+        const kc = defaultKeychain();
+        defer if (kc) |ref| CFRelease(ref);
+
         const find_status = SecKeychainFindGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
@@ -421,7 +445,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         if (find_status != errSecItemNotFound) return error.KeychainUnavailable;
 
         const add_status = SecKeychainAddGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
