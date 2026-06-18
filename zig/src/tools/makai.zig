@@ -2187,7 +2187,7 @@ fn runPrintTuiRuntime(allocator: std.mem.Allocator, prompt: []const u8) !void {
         .name = "Kimi K2.7 Code",
         .api = "openai-completions",
         .provider = "kimi",
-        .base_url = "https://api.kimi.com/coding/",
+        .base_url = "https://api.kimi.com/coding",
         .reasoning = false,
         .input = &[_][]const u8{"text"},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },

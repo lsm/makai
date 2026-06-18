@@ -1655,7 +1655,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const has_thinking = thinking.items.len > 0;
     const has_text = text.items.len > 0;
     const content_count: usize = if (has_thinking) 1 else 0;
-    const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0) + tool_call_count;
+    const content_count_final = content_count + (if (has_text) @as(usize, 1) else @as(usize, 0)) + tool_call_count;
 
     if (content_count_final == 0) {
         // No content - create empty text block with borrowed empty string reference

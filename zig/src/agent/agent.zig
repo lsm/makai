@@ -679,7 +679,7 @@ pub const Agent = struct {
         }
 
         // Spawn thread
-        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, false });
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, true });
     }
 
     /// Deep copy messages for thread ownership
@@ -913,7 +913,7 @@ pub const Agent = struct {
 
     fn runLoop(self: *Agent, messages: []const ai_types.Message) !void {
         var run_messages: ?[]const ai_types.Message = messages;
-        try self.runLoopInternal(&run_messages, .{});
+        try self.runLoopInternal(&run_messages, .{ .skip_initial_steering_poll = true });
     }
 
     fn runLoopInternal(

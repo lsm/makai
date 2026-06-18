@@ -1172,6 +1172,28 @@ fn runLoop(
                     // Add assistant message to context
                     try context.appendMessage(.{ .assistant = assistant_message });
 
+                    // Steering interrupts the next assistant call even when the
+                    // current response stopped without entering a tool phase.
+                    if (config.get_steering_messages_fn) |get_steering| {
+                        if (try get_steering(config.get_steering_messages_ctx, allocator)) |queued_steering| {
+                            if (queued_steering.len > 0) {
+                                for (queued_steering) |steering_msg| {
+                                    try context.appendMessage(steering_msg);
+                                    try event_stream.push(.{ .message_start = .{
+                                        .message = steering_msg,
+                                    } });
+                                    try event_stream.push(.{ .message_end = .{
+                                        .message = steering_msg,
+                                    } });
+                                    try appendClonedStateMessage(&state.messages, allocator, steering_msg);
+                                }
+                                allocator.free(queued_steering);
+                                continue;
+                            }
+                            allocator.free(queued_steering);
+                        }
+                    }
+
                     // Check for follow-up messages
                     if (config.get_follow_up_messages_fn) |get_follow_up| {
                         if (try get_follow_up(config.get_follow_up_messages_ctx, allocator)) |follow_ups| {

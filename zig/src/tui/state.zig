@@ -448,6 +448,7 @@ pub const AppState = struct {
     session_scroll: usize = 0,
     menu_index: usize = 0,
     menu_scroll: usize = 0,
+    active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
     /// Set when the user aborts the active turn. Lifecycle events from the
@@ -705,7 +706,7 @@ pub const AppState = struct {
             },
             .message_start => |payload| switch (payload.role) {
                 .assistant => self.active_assistant_entry = try self.appendEmptyTranscript(.assistant),
-                .user => _ = try self.ensureTrailingEntry(.user),
+                .user => self.active_user_entry = try self.ensureTrailingEntry(.user),
                 .tool_result => self.active_tool_result_entry = try self.appendEmptyTranscript(.tool),
             },
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
@@ -714,7 +715,7 @@ pub const AppState = struct {
             .provider_event => {},
             .message_end => |payload| switch (payload.role) {
                 .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
-                .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), null, true),
+                .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), &self.active_user_entry, true),
                 .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice(), &self.active_tool_result_entry),
             },
             .tool_approval_requested => |payload| {
@@ -922,11 +923,13 @@ pub const AppState = struct {
     }
 
     fn clearActiveTranscriptEntries(self: *AppState) void {
+        self.active_user_entry = null;
         self.active_assistant_entry = null;
         self.active_tool_result_entry = null;
     }
 
     fn cleanupActiveTranscriptEntries(self: *AppState) void {
+        self.removeEmptyActiveTranscriptEntry(&self.active_user_entry, .user);
         self.removeEmptyActiveTranscriptEntry(&self.active_assistant_entry, .assistant);
         self.removeEmptyActiveTranscriptEntry(&self.active_tool_result_entry, .tool);
         self.clearActiveTranscriptEntries();
@@ -943,6 +946,7 @@ pub const AppState = struct {
     fn removeTranscriptEntry(self: *AppState, index: usize) void {
         var entry = self.transcript.orderedRemove(index);
         entry.deinit(self.allocator);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
     }
@@ -1637,6 +1641,20 @@ test "AppState message_end user text avoids duplicate submitted message" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello", state.transcript.items[0].text.items);
+}
+
+test "AppState user message_start and message_end do not leave empty transcript row" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .user } });
+    var user_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .user, .text = try ownedText("queued prompt") } };
+    defer user_end.deinit(std.testing.allocator);
+    try state.applyEvent(user_end);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("queued prompt", state.transcript.items[0].text.items);
 }
 
 test "AppState message_end updates active assistant before trailing tool" {
