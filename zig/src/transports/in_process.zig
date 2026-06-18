@@ -812,8 +812,8 @@ test "InProcessTransport applies queue backpressure under burst writes" {
         .timestamp = 0,
     };
 
-    // Fill ring buffer capacity (255 usable slots).
-    for (0..255) |_| {
+    // Fill ring buffer capacity; the exact size is owned by EventStream.
+    for (0..event_stream.AssistantMessageStream.usable_capacity) |_| {
         const event_json = try transport_mod.serializeEvent(
             .{ .start = .{ .partial = partial } },
             allocator,
