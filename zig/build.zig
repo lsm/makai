@@ -1022,6 +1022,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_login", .module = tui_login_mod },
             .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "tui_theme", .module = tui_theme_mod },
+            .{ .name = "tui_text", .module = tui_text_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "tui_render", .module = tui_render_mod },
             .{ .name = "tui_session_store", .module = tui_session_store_mod },

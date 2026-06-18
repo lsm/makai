@@ -28,6 +28,13 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     defer allocator.free(prompt);
     const content_width = width -| tui_text.visibleWidth(promptFor(state));
     if (content_width == 0) return prefixFirstLine(allocator, prompt, "");
+    if (state.mode == .login_input and state.login_input_secret and state.composer.text().len > 0) {
+        const masked = try maskedSecretInput(allocator, state.composer.text());
+        defer allocator.free(masked);
+        const draft = try renderDraftWithCursor(allocator, masked, masked.len, content_width);
+        defer allocator.free(draft);
+        return prefixFirstLine(allocator, prompt, draft);
+    }
     if (state.composer.text().len == 0) {
         const draft_width = content_width -| cursor_cell_width;
         const placeholder = try tui_text.truncateLineToWidth(allocator, "Ask Makai…", draft_width);
@@ -43,6 +50,13 @@ fn renderInput(allocator: std.mem.Allocator, state: *const tui_state.AppState, w
     const draft = try renderDraftWithCursor(allocator, state.composer.text(), state.composer.cursor, content_width);
     defer allocator.free(draft);
     return prefixFirstLine(allocator, prompt, draft);
+}
+
+fn maskedSecretInput(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    if (text.len == 0) return allocator.dupe(u8, "");
+    const mask = try allocator.alloc(u8, text.len);
+    @memset(mask, '*');
+    return mask;
 }
 
 fn renderDraftWithCursor(allocator: std.mem.Allocator, text: []const u8, cursor: usize, width: usize) ![]u8 {
@@ -219,6 +233,21 @@ test "composer renders multiline draft content" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
+}
+
+test "composer masks secret login input" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.mode = .login_input;
+    state.login_input_secret = true;
+    try state.composer.buffer.appendSlice(std.testing.allocator, "sk-secret-value");
+    state.composer.cursor = state.composer.buffer.items.len;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "sk-secret-value") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "***************") != null);
 }
 
 test "composer renders queued hint while streaming shortcuts are supported" {

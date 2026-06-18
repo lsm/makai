@@ -12,6 +12,8 @@ const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
 const tui_model_catalog = @import("tui_model_catalog");
 const tui_config = @import("tui_config");
+const tui_theme = @import("tui_theme");
+const tui_text = @import("tui_text");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -33,6 +35,10 @@ pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
+
+fn isSecretLoginPrompt(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "API key") != null or std.mem.indexOf(u8, message, "api key") != null;
+}
 
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
@@ -340,6 +346,7 @@ pub const App = struct {
             try self.state.applyEvent(event.*);
         }
         if (self.session) |*session| session.clearQueuedMessages();
+        self.state.clearQueuedPreviews();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
         self.state.mode = .normal;
@@ -559,6 +566,7 @@ pub const App = struct {
                 const msg = try std.fmt.allocPrint(self.allocator, "{s} (type your answer and press Enter)", .{req.message});
                 defer self.allocator.free(msg);
                 try self.state.appendTranscript(.system, msg);
+                self.state.login_input_secret = isSecretLoginPrompt(req.message);
                 self.state.mode = .login_input;
             },
             .done => |creds| {
@@ -686,6 +694,7 @@ pub const App = struct {
             self.recordError(@errorName(err)) catch {};
             return;
         };
+        self.state.login_input_secret = false;
         self.state.mode = .normal;
     }
 
@@ -693,6 +702,7 @@ pub const App = struct {
     fn cancelLogin(self: *App) void {
         self.finishLogin();
         self.state.appendTranscript(.system, "login cancelled") catch {};
+        self.state.login_input_secret = false;
         self.state.mode = .normal;
     }
 
@@ -872,6 +882,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.steer(trimmed);
+            try self.state.addQueuedPreview(.steering, trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -884,6 +895,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
+            try self.state.addQueuedPreview(.follow_up, trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -1364,12 +1376,24 @@ pub const TuiModel = struct {
                         var decided = false;
                         switch (key.key) {
                             .char => |c| switch (c) {
-                                'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                                'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                                'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'y' => {
+                                    app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
+                                'a' => {
+                                    app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
+                                'n' => {
+                                    app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
                                 else => {},
                             },
-                            .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                            .escape => {
+                                app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                decided = true;
+                            },
                             else => {},
                         }
                         if (decided) return .none;
@@ -1562,6 +1586,7 @@ pub const TuiModel = struct {
             .width = width,
             .steering_available = app.steeringAvailable(),
         }) catch "";
+        const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
@@ -1637,11 +1662,46 @@ pub const TuiModel = struct {
             .login_input => "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
+        const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
+        const frame = if (queued.len > 0)
+            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, queued, composer, status }) catch ""
+        else
+            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
+    }
+
+    fn renderQueuedShelf(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]const u8 {
+        if (state.queued_previews.items.len == 0) return allocator.dupe(u8, "");
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        const max_width = width -| 4;
+        for (state.queued_previews.items, 0..) |preview, i| {
+            if (i > 0) try writer.writeByte('\n');
+            const label = switch (preview.kind) {
+                .steering => "steering",
+                .follow_up => "queued follow-up",
+            };
+            const raw_prefix = try std.fmt.allocPrint(allocator, "  {s} {s}: ", .{ tui_theme.glyph.prompt, label });
+            defer allocator.free(raw_prefix);
+            const prefix_style = switch (preview.kind) {
+                .steering => tui_theme.runningText(),
+                .follow_up => tui_theme.warningText(),
+            };
+            const prefix = try prefix_style.render(allocator, raw_prefix);
+            defer allocator.free(prefix);
+            const body_width = max_width -| tui_text.visibleWidth(raw_prefix);
+            const body = try tui_text.truncateToWidth(allocator, preview.text, body_width);
+            defer allocator.free(body);
+            const styled_body = try tui_theme.bodyStyle(.user).render(allocator, body);
+            defer allocator.free(styled_body);
+            try writer.writeAll(prefix);
+            try writer.writeAll(styled_body);
+        }
+        return out.toOwnedSlice();
     }
 
     fn appendChar(app: *App, c: u21) !void {
@@ -2278,12 +2338,14 @@ const MockAppSession = struct {
     fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.steer_count += 1;
+        if (self.queued_counts.total() == 0) self.queued_counts.steering += 1;
         _ = text;
     }
 
     fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.queued_follow_up_count += 1;
+        if (self.queued_counts.total() == 0) self.queued_counts.follow_up += 1;
         try std.testing.expectEqualStrings("follow later", text);
     }
 
@@ -2370,6 +2432,9 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqual(tui_state.QueuedPreviewKind.steering, app.state.queued_previews.items[0].kind);
+    try std.testing.expectEqualStrings("steer me", app.state.queued_previews.items[0].text);
 
     mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
     try app.queueFollowUp(" follow later ");
@@ -2377,6 +2442,9 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 2), app.state.queued_previews.items.len);
+    try std.testing.expectEqual(tui_state.QueuedPreviewKind.follow_up, app.state.queued_previews.items[1].kind);
+    try std.testing.expectEqualStrings("follow later", app.state.queued_previews.items[1].text);
 }
 
 test "TuiModel exits quit command while streaming" {
@@ -2498,6 +2566,9 @@ test "TuiModel remote streaming Alt+Enter still queues follow-up" {
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("follow later", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel local streaming Enter steers when steering available" {
@@ -2520,6 +2591,9 @@ test "TuiModel local streaming Enter steers when steering available" {
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("steer now", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel stops Enter routing when drained event enters approval mode" {

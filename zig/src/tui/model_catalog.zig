@@ -11,8 +11,8 @@ const openai_codex_base_url = "https://chatgpt.com/backend-api/codex";
 const kimi_provider_id = "kimi";
 const kimi_api_id = "openai-completions";
 const kimi_model_id = "kimi-k2.7-code";
-const kimi_base_url = "https://api.kimi.com/coding/";
-const kimi_global_base_url = "https://api.moonshot.ai/";
+const kimi_base_url = "https://api.kimi.com/coding";
+const kimi_global_base_url = "https://api.moonshot.ai";
 const codex_models_cache_name = "models_cache.json";
 const makai_catalog_dir_name = "model_catalog";
 const makai_codex_catalog_name = "openai-codex.json";
@@ -66,14 +66,21 @@ pub fn loadProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 }
 
 pub fn refreshProductionModels(allocator: std.mem.Allocator) ![]ai_types.Model {
-    var codex_models = try loadOpenAICodexModels(allocator, .force_fetch);
+    var codex_refresh_error: ?anyerror = null;
+    var codex_models = loadOpenAICodexModels(allocator, .force_fetch) catch |err| blk: {
+        codex_refresh_error = err;
+        break :blk try emptyModels(allocator);
+    };
     errdefer deinitModels(allocator, codex_models);
 
     const kimi_models = try loadKimiModels(allocator);
     defer allocator.free(kimi_models);
     errdefer for (kimi_models) |*model| model.deinit(allocator);
 
-    if (kimi_models.len == 0) return codex_models;
+    if (kimi_models.len == 0) {
+        if (codex_refresh_error) |err| return err;
+        return codex_models;
+    }
 
     var models = try allocator.alloc(ai_types.Model, codex_models.len + kimi_models.len);
     @memcpy(models[0..codex_models.len], codex_models);
@@ -120,6 +127,7 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
 }
 
 var test_force_kimi_model: bool = false;
+var test_force_codex_refresh_error: bool = false;
 
 fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
@@ -155,7 +163,7 @@ fn kimiModel(allocator: std.mem.Allocator, region: []const u8) !ai_types.Model {
     const base_url_str = if (use_global)
         kimi_global_base_url
     else
-        "https://api.kimi.com/coding/";
+        kimi_base_url;
     const base_url = try allocator.dupe(u8, base_url_str);
     errdefer allocator.free(base_url);
 
@@ -220,6 +228,7 @@ fn codexOAuthProvider() oauth_storage.OAuthProvider {
 }
 
 fn loadOpenAICodexModels(allocator: std.mem.Allocator, mode: CatalogLoadMode) ![]ai_types.Model {
+    if (builtin.is_test and mode == .force_fetch and test_force_codex_refresh_error) return error.ModelCatalogFetchFailed;
     if (builtin.is_test) return emptyModels(allocator);
 
     var storage = oauth_storage.AuthStorage.loadDefault(allocator) catch return emptyModels(allocator);
@@ -722,6 +731,18 @@ test "loadProductionModels includes Kimi model when enabled" {
     try std.testing.expectEqualStrings(kimi_base_url, models[0].base_url);
     try std.testing.expectEqual(@as(u32, 262_144), models[0].context_window);
     try std.testing.expectEqual(@as(u32, 16_384), models[0].max_tokens);
+}
+
+test "refreshProductionModels keeps Kimi when Codex refresh fails" {
+    test_force_codex_refresh_error = true;
+    defer test_force_codex_refresh_error = false;
+
+    const models = try refreshProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings(kimi_model_id, models[0].id);
+    try std.testing.expectEqualStrings(kimi_provider_id, models[0].provider);
 }
 
 test "parseCodexModelsCache accepts models response body" {

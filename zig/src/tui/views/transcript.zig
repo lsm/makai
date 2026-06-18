@@ -96,27 +96,75 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
             try appendDebugToolState(allocator, arena, state, entries, false);
         },
         .balanced => {
-            var emitted_tool_summaries = false;
-            for (state.transcript.items) |*entry| {
-                if (entry.kind == .thinking and !state.show_thinking) continue;
-                if (isLowValueSystem(entry)) continue;
+            var tool_index: usize = 0;
+            var i: usize = 0;
+            while (i < state.transcript.items.len) {
+                const entry = &state.transcript.items[i];
+                if (entry.kind == .thinking and !state.show_thinking) {
+                    i += 1;
+                    continue;
+                }
+                if (isLowValueSystem(entry)) {
+                    i += 1;
+                    continue;
+                }
                 if (entry.kind == .tool) {
-                    if (state.tools.items.len == 0) {
-                        if (isRawToolArgs(entry.text.items)) continue;
-                        try appendOriginal(allocator, entries, entry);
-                        continue;
-                    }
-                    if (!emitted_tool_summaries) {
-                        for (state.tools.items) |tool| try appendToolSummary(allocator, arena, entries, tool);
-                        emitted_tool_summaries = true;
-                    }
+                    const cluster_start = i;
+                    while (i < state.transcript.items.len and state.transcript.items[i].kind == .tool) : (i += 1) {}
+                    tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
                     continue;
                 }
                 try appendOriginal(allocator, entries, entry);
+                i += 1;
             }
         },
         .chat => try appendConversationEntries(allocator, arena, state, entries),
     }
+}
+
+fn appendBalancedToolCluster(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    entries: *std.ArrayList(DisplayEntry),
+    state: *const AppState,
+    start: usize,
+    end: usize,
+    initial_tool_index: usize,
+) !usize {
+    var tool_index = initial_tool_index;
+    if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
+        for (state.transcript.items[start..end]) |*entry| {
+            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry);
+        }
+        return tool_index;
+    }
+
+    const calls_in_cluster = @max(countToolStarts(state.transcript.items[start..end]), 1);
+    var emitted: usize = 0;
+    while (emitted < calls_in_cluster and tool_index < state.tools.items.len) : ({
+        emitted += 1;
+        tool_index += 1;
+    }) {
+        try appendToolSummary(allocator, arena, entries, state.tools.items[tool_index]);
+    }
+    return tool_index;
+}
+
+fn countToolStarts(entries: []const TranscriptEntry) usize {
+    var count: usize = 0;
+    for (entries) |entry| {
+        if (isToolStartSummary(entry.text.items)) count += 1;
+    }
+    return count;
+}
+
+fn isToolStartSummary(text: []const u8) bool {
+    if (!std.mem.startsWith(u8, text, "◈ ")) return false;
+    const rest = text["◈ ".len..];
+    const quote = std.mem.indexOfScalar(u8, rest, '"') orelse return false;
+    const ok = std.mem.indexOf(u8, rest, " ok ") orelse rest.len;
+    const failed = std.mem.indexOf(u8, rest, " failed ") orelse rest.len;
+    return quote < @min(ok, failed);
 }
 
 fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
@@ -348,14 +396,23 @@ fn scrollPercent(total_lines: usize, view_height: usize, scroll: usize) usize {
 }
 
 // Chat-bubble palette. User messages sit in a light-blue bubble with dark
-// text (like an outgoing iMessage); assistant replies in a neutral grey
-// bubble. System/thinking/error are framed as bordered cards in their role
-// color. Tool entries are rendered as plain rows so copying transcript text
-// does not include box drawing around command metadata.
+// text (like an outgoing iMessage); assistant replies use a dark neutral
+// surface so markdown accents and command highlights pop without tinting the
+// whole answer. System, thinking, and error entries remain role-colored cards.
+// Tool entries are rendered as plain rows so copying transcript text does not
+// include box drawing around command metadata.
 const user_bg = zz.Color.color256(111); // soft periwinkle blue
 const user_fg = zz.Color.color256(235); // near-black ink for contrast
-const assistant_bg = zz.Color.color256(238); // graphite
-const assistant_fg = zz.Color.color256(253); // bright grey ink
+const assistant_bg = zz.Color.fromRgb(42, 44, 52); // dark graphite
+const assistant_fg = zz.Color.fromRgb(238, 241, 247); // high-contrast cool white
+const assistant_code_bg = zz.Color.fromRgb(28, 30, 36);
+
+const chat_max_column: usize = 108;
+
+const EntryLayout = struct {
+    left: usize,
+    width: usize,
+};
 
 /// Render one transcript entry as a header line (role + time) followed by a
 /// bubble, plain tool row, or bordered card.
@@ -365,27 +422,35 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     const arena = arena_state.allocator();
 
     const align_right = entry.kind == .user;
-    const header = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, width);
+    const header_layout = entryHeaderLayout(entry.kind, width);
+    const body_layout = entryBodyLayout(entry.kind, width);
+    const header_inner = try renderHeader(arena, entry.kind, entry.tool_name, entry.title, entry.timestamp_ms, align_right, header_layout.width);
+    const header = try indentBlock(arena, header_inner, header_layout.left);
 
-    const body: []const u8 = switch (entry.kind) {
+    const body_inner: []const u8 = switch (entry.kind) {
         .user => blk: {
-            const budget = @max(width -| 2, 8);
+            const budget = @max(body_layout.width -| 2, 8);
             const wrapped = try tui_text.wrapTextWithAnsi(arena, entry.text, budget);
             const open = try openSgr(arena, user_fg, user_bg);
-            break :blk try renderBubble(arena, wrapped, open, true, width);
+            break :blk try renderBubble(arena, wrapped, open, true, body_layout.width);
         },
         .assistant => blk: {
-            const budget = @max(width -| 2, 8);
+            const budget = @max(body_layout.width -| 2, 8);
             var markdown = zz.Markdown.init();
             markdown.width = @intCast(@min(budget, std.math.maxInt(u16)));
+            markdown.text_style = (zz.Style{}).fg(assistant_fg).inline_style(true);
+            markdown.code_style = (zz.Style{}).fg(zz.Color.fromRgb(255, 229, 120)).bg(assistant_code_bg).inline_style(true);
+            markdown.code_block_style = (zz.Style{}).fg(zz.Color.fromRgb(96, 245, 150)).bg(assistant_code_bg).inline_style(true);
+            markdown.code_block_border = (zz.Style{}).fg(zz.Color.fromRgb(124, 139, 160)).bg(assistant_code_bg).inline_style(true);
             const md = try markdown.render(arena, entry.text);
             const wrapped = try tui_text.wrapTextPreservingPrefix(arena, md, budget);
             const open = try openSgr(arena, assistant_fg, assistant_bg);
-            break :blk try renderBubble(arena, wrapped, open, false, width);
+            break :blk try renderBubble(arena, wrapped, open, false, body_layout.width);
         },
-        .tool => try renderToolRow(arena, entry.tool_name, entry.text, width),
-        else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, width),
+        .tool => try renderToolRow(arena, entry.tool_name, entry.text, body_layout.width),
+        else => try renderCard(arena, entry.kind, entry.tool_name, entry.text, body_layout.width),
     };
+    const body = try indentBlock(arena, body_inner, body_layout.left);
 
     // Compose header + body, then hand a single owned copy back to the caller.
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -395,6 +460,52 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     if (body.len > 0) {
         try writer.writeByte('\n');
         try writer.writeAll(body);
+    }
+    return out.toOwnedSlice();
+}
+
+fn entryHeaderLayout(kind: TranscriptKind, width: usize) EntryLayout {
+    if (width <= 24) return .{ .left = 0, .width = width };
+
+    const gutter: usize = 1;
+    const available = width -| (gutter * 2);
+    const left = if (kind == .user) width -| gutter -| available else gutter;
+    return .{ .left = left, .width = available };
+}
+
+fn entryBodyLayout(kind: TranscriptKind, width: usize) EntryLayout {
+    if (width <= 24) return .{ .left = 0, .width = width };
+
+    const user_gutter: usize = if (width >= 100) 4 else 2;
+    const label_text_left: usize = 3; // edge gutter + role glyph + following space
+    const left_edge_right_gutter: usize = 1;
+    const user_available = width -| (user_gutter * 2);
+    const left_available = width -| label_text_left -| left_edge_right_gutter;
+    const column = switch (kind) {
+        .user => @min(user_available, chat_max_column),
+        .assistant => @min(left_available, chat_max_column),
+        else => left_available,
+    };
+    const left = switch (kind) {
+        .user => width -| user_gutter -| column,
+        else => label_text_left,
+    };
+    return .{ .left = left, .width = column };
+}
+
+fn indentBlock(allocator: std.mem.Allocator, text: []const u8, spaces: usize) ![]const u8 {
+    if (spaces == 0) return allocator.dupe(u8, text);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        try writeSpaces(writer, spaces);
+        try writer.writeAll(line);
     }
     return out.toOwnedSlice();
 }
@@ -661,11 +772,11 @@ test "transcript renders chat-style alignment and cards" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{256d}") != null); // rounded card top-left
 
     const assistant_line = renderedLineContaining(text, "assistant reply").?;
-    try std.testing.expect(!std.mem.startsWith(u8, assistant_line, " "));
+    try std.testing.expect(std.mem.startsWith(u8, assistant_line, "   "));
 
     const user_line = renderedLineContaining(text, "user reply").?;
     try std.testing.expect(std.mem.startsWith(u8, user_line, "          "));
-    try std.testing.expectEqual(@as(usize, 48), tui_text.visibleWidth(user_line));
+    try std.testing.expectEqual(@as(usize, 46), tui_text.visibleWidth(user_line));
 }
 
 test "transcript preserves multiline entries" {
@@ -785,6 +896,54 @@ test "transcript balanced mode expands latest tool details" {
     try std.testing.expect(std.mem.indexOf(u8, text, "\u{25be} Inspect current directory") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "args: {\"description\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "stdout:") != null);
+}
+
+test "transcript balanced mode preserves tool call order across turns" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.transcript_mode = .balanced;
+
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-1",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Inspect pwd now\",\"command\":\"pwd\"}",
+        .done,
+    ));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(
+        std.testing.allocator,
+        "call-2",
+        "shell_execute",
+        "Shell Execute",
+        "{\"description\":\"Inspect uname now\",\"command\":\"uname -a\"}",
+        .done,
+    ));
+
+    try state.appendUserMessage("first request");
+    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect pwd now\"");
+    try state.appendTranscript(.tool, "◈ Shell Execute ok output=10B");
+    try state.appendTranscript(.assistant, "PWD done");
+    try state.appendUserMessage("second request");
+    try state.appendTranscript(.tool, "◈ Shell Execute \"Inspect uname now\"");
+    try state.appendTranscript(.tool, "◈ Shell Execute ok output=20B");
+    try state.appendTranscript(.assistant, "UNAME done");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 140, .height = 30 });
+    defer std.testing.allocator.free(text);
+
+    const first_user = std.mem.indexOf(u8, text, "first request") orelse return error.MissingFirstUser;
+    const first_tool = std.mem.indexOf(u8, text, "Inspect pwd now") orelse return error.MissingFirstTool;
+    const first_answer = std.mem.indexOf(u8, text, "PWD done") orelse return error.MissingFirstAnswer;
+    const second_user = std.mem.indexOf(u8, text, "second request") orelse return error.MissingSecondUser;
+    const second_tool = std.mem.indexOf(u8, text, "Inspect uname now") orelse return error.MissingSecondTool;
+    const second_answer = std.mem.indexOf(u8, text, "UNAME done") orelse return error.MissingSecondAnswer;
+
+    try std.testing.expect(first_user < first_tool);
+    try std.testing.expect(first_tool < first_answer);
+    try std.testing.expect(first_answer < second_user);
+    try std.testing.expect(second_user < second_tool);
+    try std.testing.expect(second_tool < second_answer);
 }
 
 test "transcript everything mode includes low value system and full tool state" {
@@ -979,6 +1138,10 @@ test "transcript renders fenced code block with border" {
     try std.testing.expect(std.mem.indexOf(u8, text, "┌") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "└") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "│") != null);
+
+    const border_line = renderedLineContaining(text, "┌").?;
+    try std.testing.expect(tui_text.visibleWidth(border_line) > 45);
+    try std.testing.expect(tui_text.visibleWidth(border_line) <= 80);
 }
 
 test "transcript wraps assistant text within viewport width" {

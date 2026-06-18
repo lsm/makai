@@ -324,7 +324,8 @@ fn runKimi(self: *LoginSession) void {
 
     const api_key = self.waitForInput("Enter Kimi API key:", false);
     defer self.allocator.free(api_key);
-    if (std.mem.trim(u8, api_key, " \t\r\n").len == 0) {
+    const trimmed_api_key = std.mem.trim(u8, api_key, " \t\r\n");
+    if (trimmed_api_key.len == 0) {
         self.finishError("ApiKeyRequired");
         return;
     }
@@ -334,8 +335,9 @@ fn runKimi(self: *LoginSession) void {
         self.finishError("OutOfMemory");
         return;
     };
+    defer self.allocator.free(provider_data);
 
-    self.finishSuccess("", api_key, std.math.maxInt(i64), provider_data);
+    self.finishSuccess("", trimmed_api_key, std.math.maxInt(i64), provider_data);
 }
 
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {
@@ -421,4 +423,54 @@ test "LoginSession bridges prompt input through the worker" {
     defer creds.?.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("my-code", creds.?.access);
     try std.testing.expectEqualStrings("refresh-tok", creds.?.refresh);
+}
+
+test "LoginSession trims Kimi API key before storing" {
+    const session = try LoginSession.start(std.testing.allocator, .kimi);
+    defer session.deinit();
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .request_input => |req| {
+                try std.testing.expect(std.mem.indexOf(u8, req.message, "region") != null);
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 200);
+    try session.provideInput("1\n");
+
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .request_input => |req| {
+                try std.testing.expect(std.mem.indexOf(u8, req.message, "API key") != null);
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 200);
+    try session.provideInput("  kimi-secret\n");
+
+    var creds: ?storage.Credentials = null;
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .done => |c| {
+                creds = c;
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(creds != null);
+    defer creds.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("kimi-secret", creds.?.access);
+    try std.testing.expectEqualStrings("region:china", creds.?.provider_data.?);
 }

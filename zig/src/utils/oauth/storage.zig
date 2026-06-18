@@ -276,20 +276,20 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
             .oauth => |creds| {
                 // Special case for API keys stored as oauth (for region support)
                 const is_api_key_style = creds.refresh.len == 0 and creds.expires == std.math.maxInt(i64);
-                if (is_api_key_style) {
-                    if (creds.provider_data) |data| {
+                var wrote_api_key_style = false;
+                if (is_api_key_style) if (creds.provider_data) |data| {
                     // Parse region from provider_data (format: "region:<value>")
                     if (std.mem.startsWith(u8, data, "region:")) {
-                        const region = data[7..]; // Skip "region:" prefix
+                        const region = data["region:".len..];
                         try json_buf.appendSlice(allocator, "{\"api_key\":");
                         try appendJsonString(allocator, &json_buf, creds.access);
                         try json_buf.appendSlice(allocator, ",\"region\":");
                         try appendJsonString(allocator, &json_buf, region);
                         try json_buf.appendSlice(allocator, "}");
-                        break;
+                        wrote_api_key_style = true;
                     }
-                }
-                }
+                };
+                if (wrote_api_key_style) continue;
                 // Standard OAuth credential serialization
                 try json_buf.appendSlice(allocator, "{\"refresh\":");
                 try appendJsonString(allocator, &json_buf, creds.refresh);
@@ -902,6 +902,27 @@ test "oauth_storage_imports_codex_cli_credentials" {
         },
         .api_key => return error.TestExpectedOAuthCredentials,
     }
+}
+
+test "serializeAuthJson preserves providers after region api key oauth entry" {
+    var auth_storage = emptyStorage(std.testing.allocator, null);
+    defer auth_storage.deinit();
+
+    try auth_storage.providers.put(try std.testing.allocator.dupe(u8, "kimi"), .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "kimi-key"),
+        .expires = std.math.maxInt(i64),
+        .provider_data = try std.testing.allocator.dupe(u8, "region:china"),
+    } });
+    try auth_storage.providers.put(try std.testing.allocator.dupe(u8, "openai-codex"), .{ .api_key = try std.testing.allocator.dupe(u8, "codex-key") });
+
+    const json = try serializeAuthJson(&auth_storage, std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kimi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"region\":\"china\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"openai-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"codex-key\"") != null);
 }
 
 test "codexKeychainAccountForHome uses Codex CLI account format" {

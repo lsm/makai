@@ -1931,6 +1931,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     var prompt_index: usize = 0;
     var use_agent_loop = false;
     var use_storage_auth = false;
+    var model_id: []const u8 = "kimi-k2.7-code";
     while (prompt_index < args.len and std.mem.startsWith(u8, args[prompt_index], "--")) : (prompt_index += 1) {
         if (std.mem.eql(u8, args[prompt_index], "--agent")) {
             use_agent_loop = true;
@@ -1949,6 +1950,7 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
                 perr("error: --model requires a value\n");
                 return error.InvalidArgument;
             }
+            model_id = args[prompt_index];
         } else {
             perrf("error: unsupported -p option: {s}\n", .{args[prompt_index]});
             return error.InvalidArgument;
@@ -1979,14 +1981,14 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     defer allocator.free(region_env);
     const is_global_kimi = std.mem.eql(u8, std.mem.trim(u8, region_env, " \t\r\n"), "global");
     const base_url = if (is_global_kimi)
-        "https://api.moonshot.ai/"
+        "https://api.moonshot.ai"
     else
-        "https://api.kimi.com/coding/";
+        "https://api.kimi.com/coding";
 
     // Build the Kimi model inline (same shape as model_catalog.kimiModel).
     const model = ai_types.Model{
-        .id = "kimi-k2.7-code",
-        .name = "Kimi K2.7 Code",
+        .id = model_id,
+        .name = model_id,
         .api = "openai-completions",
         .provider = "kimi",
         .base_url = base_url,

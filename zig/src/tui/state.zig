@@ -223,6 +223,28 @@ pub const TelemetryState = struct {
 
 pub const QueueState = tui_runtime.QueuedCounts;
 
+pub const QueuedPreviewKind = enum {
+    steering,
+    follow_up,
+};
+
+pub const QueuedPreview = struct {
+    kind: QueuedPreviewKind,
+    text: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, kind: QueuedPreviewKind, text: []const u8) !QueuedPreview {
+        return .{
+            .kind = kind,
+            .text = try allocator.dupe(u8, text),
+        };
+    }
+
+    pub fn deinit(self: *QueuedPreview, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
+
 pub const StatusState = struct {
     model: []u8 = &.{},
     provider: []u8 = &.{},
@@ -409,11 +431,13 @@ pub const AppState = struct {
     permission_mode: tui_runtime.PermissionMode = .bypass,
     status: StatusState = .{},
     queue: QueueState = .{},
+    queued_previews: std.ArrayList(QueuedPreview) = .empty,
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     transcript_mode: TranscriptVisibilityMode = .balanced,
     show_thinking: bool = true,
     thinking_level: ai_types.ThinkingLevel = .low,
+    login_input_secret: bool = false,
     /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
     /// spinner frames and other time-based effects from this so animation stays
     /// in lockstep with the render loop without each view tracking its own clock.
@@ -448,6 +472,8 @@ pub const AppState = struct {
         self.sessions.deinit(self.allocator);
         self.composer.deinit(self.allocator);
         self.approval.deinit(self.allocator);
+        self.clearQueuedPreviews();
+        self.queued_previews.deinit(self.allocator);
         self.status.deinit(self.allocator);
         self.preview.deinit(self.allocator);
         self.* = undefined;
@@ -523,6 +549,7 @@ pub const AppState = struct {
         self.clearTranscript();
         self.clearTools();
         self.telemetry = .{};
+        self.clearQueuedPreviews();
         self.queue = .{};
         self.status.context_used = 0;
         self.status.turn_count = 0;
@@ -624,6 +651,40 @@ pub const AppState = struct {
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
         self.queue = counts;
+        self.trimQueuedPreviews();
+    }
+
+    pub fn addQueuedPreview(self: *AppState, kind: QueuedPreviewKind, text: []const u8) !void {
+        try self.queued_previews.append(self.allocator, try QueuedPreview.init(self.allocator, kind, text));
+    }
+
+    pub fn clearQueuedPreviews(self: *AppState) void {
+        for (self.queued_previews.items) |*preview| preview.deinit(self.allocator);
+        self.queued_previews.clearRetainingCapacity();
+    }
+
+    fn trimQueuedPreviews(self: *AppState) void {
+        self.trimQueuedPreviewKind(.steering, self.queue.steering);
+        self.trimQueuedPreviewKind(.follow_up, self.queue.follow_up);
+    }
+
+    fn trimQueuedPreviewKind(self: *AppState, kind: QueuedPreviewKind, target: usize) void {
+        var existing: usize = 0;
+        for (self.queued_previews.items) |preview| {
+            if (preview.kind == kind) existing += 1;
+        }
+
+        while (existing > target) {
+            var idx: usize = 0;
+            while (idx < self.queued_previews.items.len) : (idx += 1) {
+                if (self.queued_previews.items[idx].kind == kind) {
+                    var removed = self.queued_previews.orderedRemove(idx);
+                    removed.deinit(self.allocator);
+                    existing -= 1;
+                    break;
+                }
+            } else break;
+        }
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
@@ -1953,10 +2014,30 @@ test "AppState reset replay clears stale queue counts" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     state.queue = .{ .steering = 1, .follow_up = 2 };
+    try state.addQueuedPreview(.steering, "now");
+    try state.addQueuedPreview(.follow_up, "later");
 
     state.resetReplayState();
 
     try std.testing.expectEqual(@as(usize, 0), state.queue.total());
+    try std.testing.expectEqual(@as(usize, 0), state.queued_previews.items.len);
+}
+
+test "AppState trims queued previews when counts are consumed" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.addQueuedPreview(.steering, "steer now");
+    try state.addQueuedPreview(.follow_up, "follow later");
+    try state.addQueuedPreview(.follow_up, "follow after");
+
+    state.setQueuedCounts(.{ .steering = 1, .follow_up = 2 });
+    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
+
+    state.setQueuedCounts(.{ .steering = 0, .follow_up = 1 });
+    try std.testing.expectEqual(@as(usize, 1), state.queued_previews.items.len);
+    try std.testing.expectEqual(QueuedPreviewKind.follow_up, state.queued_previews.items[0].kind);
+    try std.testing.expectEqualStrings("follow after", state.queued_previews.items[0].text);
 }
 
 test "AppState applies thinking tool call and lifecycle events" {
