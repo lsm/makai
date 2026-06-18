@@ -30,10 +30,10 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         for (state.registered_tools.items) |tool| {
             if (rows >= options.height) break;
             try writer.writeByte('\n');
-            try writer.print("  {s}", .{tool.name});
+            try writer.print("  {s}", .{tool.label});
             if (tool.short_description.len > 0) {
                 try writer.writeAll(" ");
-                const desc = try tui_text.truncateToWidth(allocator, tool.short_description, options.width -| tool.name.len -| 7);
+                const desc = try tui_text.truncateToWidth(allocator, tool.short_description, options.width -| tui_text.visibleWidth(tool.label) -| 7);
                 defer allocator.free(desc);
                 const styled_desc = try tui_theme.muted().render(allocator, desc);
                 defer allocator.free(styled_desc);
@@ -53,10 +53,13 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         try writer.writeAll("  ");
         const status = try tui_theme.toolStatus(tool.status).render(allocator, statusText(tool.status));
         defer allocator.free(status);
-        try writer.print("[{s}] {s}", .{ status, tool.name });
+        try writer.print("[{s}] {s}", .{ status, tool.label });
         var meta_out: std.Io.Writer.Allocating = .init(allocator);
         defer meta_out.deinit();
         const meta_writer = &meta_out.writer;
+        const intent = try invocationDescription(allocator, tool.args_json);
+        defer if (intent) |value| allocator.free(value);
+        if (intent) |value| if (value.len > 0) try meta_writer.print(" - {s}", .{value});
         if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
             try meta_writer.print(" ({d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
             if (tool.estimated_returned_tokens > 0) try meta_writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
@@ -65,7 +68,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         if (tool.truncated) try meta_writer.writeAll(" truncated · show full");
         if (tool.artifact_refs.len > 0) try meta_writer.print(" · artifact:{s}", .{tool.artifact_refs});
         if (tool.expanded) try meta_writer.writeAll(" · expanded");
-        const prefix_visible = 5 + tui_text.visibleWidth(status) + tool.name.len;
+        const prefix_visible = 5 + tui_text.visibleWidth(status) + tui_text.visibleWidth(tool.label);
         const remaining = (options.width -| 4) -| prefix_visible;
         const meta_str = meta_out.written();
         if (meta_str.len > 0 and remaining > 0) {
@@ -81,6 +84,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
     return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+}
+
+fn invocationDescription(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
+    if (args_json.len == 0) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get("description") orelse return null;
+    if (value != .string or value.string.len == 0) return null;
+    return try allocator.dupe(u8, value.string);
 }
 
 fn statusText(status: tui_state.ToolStatus) []const u8 {
@@ -233,7 +246,8 @@ test "tool panel renders registered tools when idle" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "Tools (1 registered)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "shell_execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Shell Execute") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "shell_execute") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Run shell commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "none") == null);
 }
@@ -241,7 +255,7 @@ test "tool panel renders registered tools when idle" {
 test "tool panel renders tool status and multiline output" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "{\"command\":\"pwd\"}", .running));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{\"description\":\"Check the current workspace directory\",\"command\":\"pwd\"}", .running));
     state.tools.items[0].expanded = true;
     try state.tools.items[0].output.appendSlice(std.testing.allocator, "first line\nsecond line");
 
@@ -249,7 +263,8 @@ test "tool panel renders tool status and multiline output" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "running") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "shell_command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Shell Command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Check the current workspace directory") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "expanded") != null);
@@ -258,10 +273,10 @@ test "tool panel renders tool status and multiline output" {
 test "tool panel renders diff and error output" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "hashline_edit", "{}", .done));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "hashline_edit", "Hashline Edit", "{}", .done));
     state.tools.items[0].expanded = true;
     try state.tools.items[0].output.appendSlice(std.testing.allocator, "- 2:hash|old\n+ 2|new");
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "shell_command", "{}", .@"error"));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "shell_command", "Shell Command", "{}", .@"error"));
     state.tools.items[1].expanded = true;
     try state.tools.items[1].output.appendSlice(std.testing.allocator, "boom");
 
@@ -277,7 +292,7 @@ test "tool panel renders diff and error output" {
 test "tool panel preserves spaces and narrows diff detection" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "{}", .done));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{}", .done));
     state.tools.items[0].expanded = true;
     try state.tools.items[0].output.appendSlice(std.testing.allocator, "key    value\n--help\n-42");
 
@@ -292,10 +307,10 @@ test "tool panel preserves spaces and narrows diff detection" {
 test "tool panel keeps diff styling across wrapped segments and errors win" {
     var state = tui_state.AppState.init(std.testing.allocator);
     defer state.deinit();
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "hashline_edit", "{}", .done));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "hashline_edit", "Hashline Edit", "{}", .done));
     state.tools.items[0].expanded = true;
     try state.tools.items[0].output.appendSlice(std.testing.allocator, "+ 2|abcdefghijklmnopqrstuvwxyz");
-    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "shell_command", "{}", .@"error"));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "shell_command", "Shell Command", "{}", .@"error"));
     state.tools.items[1].expanded = true;
     try state.tools.items[1].output.appendSlice(std.testing.allocator, "+ cmd failed");
 

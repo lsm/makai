@@ -4,13 +4,13 @@ const agent = @import("agent");
 const common = @import("tools/common");
 
 pub const schema_read =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":0}},"required":["workspace_root","path"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":0}},"required":["description","workspace_root","path"],"additionalProperties":false}
 ;
 pub const schema_write =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"},"compact_output":{"type":"boolean"}},"required":["workspace_root","path","content"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"},"compact_output":{"type":"boolean"}},"required":["description","workspace_root","path","content"],"additionalProperties":false}
 ;
 pub const schema_stat =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"compact_output":{"type":"boolean"}},"required":["workspace_root","path"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"compact_output":{"type":"boolean"}},"required":["description","workspace_root","path"],"additionalProperties":false}
 ;
 
 pub const read_tool = agent.AgentTool{ .label = "File Read", .name = "file_read", .description = "Read a text file from the workspace, optionally by byte range. Output includes per-line content hashes as line_no:hash|content for hash-anchored edits.", .short_description = "Read file with line hashes.", .parameters_schema_json = schema_read, .execute = readExecute };

@@ -742,7 +742,7 @@ test "abort during approval clears approval state" {
     defer state.deinit();
     state.status.streaming = true;
     state.mode = .approval;
-    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "{\"path\":\"README.md\"}");
+    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
 
     var mock = MockAbortSession{};
     defer mock.deinit();

@@ -4,7 +4,7 @@ const agent = @import("agent");
 const common = @import("tools/common");
 
 pub const schema_text =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"query":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root","query"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"query":{"type":"string"},"glob":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["description","workspace_root","query"],"additionalProperties":false}
 ;
 
 pub const text_tool = agent.AgentTool{ .label = "Text Search", .name = "search_text", .description = "Search workspace text files using literal text plus '.' wildcard and '.*' gaps, optional glob substring filter, and return file:line:content results. Large result sets are stored as artifacts.", .short_description = "Search text; large results become artifact.", .parameters_schema_json = schema_text, .execute = textExecute };

@@ -1341,6 +1341,10 @@ pub const TuiModel = struct {
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
                         },
+                        't' => {
+                            app.state.toggleLatestToolExpanded();
+                            return .none;
+                        },
                         'y' => {
                             app.copyLastAssistant();
                             app.flushClipboard(ctx);
@@ -1967,7 +1971,7 @@ test "App saveEvent keeps debug-visible event types" {
 test "App approval decisions map to requested choices" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
 
     try app.decideApproval(true, false);
@@ -1975,13 +1979,13 @@ test "App approval decisions map to requested choices" {
     try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
     try std.testing.expect(!app.state.approval.always);
 
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
     try app.decideApproval(true, true);
     try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
     try std.testing.expect(app.state.approval.always);
 
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
     try app.decideApproval(false, false);
     try std.testing.expectEqual(tui_state.ApprovalStatus.rejected, app.state.approval.status);
@@ -2173,7 +2177,7 @@ test "App submit abort does not permanently shut down approval waiter" {
 
     // Verify the waiter can still accept a future approval decision.
     waiter.decision = null;
-    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "{}");
+    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "edit_file", "{}");
     try app.decideApproval(true, false);
     try std.testing.expect(waiter.decision == .approve);
 }
@@ -2548,7 +2552,7 @@ test "TuiModel allows /abort slash command during approval mode" {
     defer mock.deinit();
     model.app.?.session = mock.session();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'a', 'b', 'o', 'r', 't' };
@@ -2571,7 +2575,7 @@ test "TuiModel blocks non-abort slash commands during approval mode" {
     defer mock.deinit();
     model.app.?.session = mock.session();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'h', 'e', 'l', 'p' };

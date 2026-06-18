@@ -128,6 +128,7 @@ pub const RegisteredToolEntry = struct {
 pub const ToolEntry = struct {
     id: []u8,
     name: []u8,
+    label: []u8,
     args_json: []u8,
     output: std.ArrayList(u8) = .empty,
     status: ToolStatus = .pending,
@@ -139,10 +140,11 @@ pub const ToolEntry = struct {
     artifact_refs: []u8 = &.{},
     truncated: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
+    pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
             .id = try allocator.dupe(u8, id),
             .name = try allocator.dupe(u8, name),
+            .label = try allocator.dupe(u8, label),
             .args_json = try allocator.dupe(u8, args_json),
             .status = status,
         };
@@ -151,6 +153,7 @@ pub const ToolEntry = struct {
     pub fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        allocator.free(self.label);
         allocator.free(self.args_json);
         self.output.deinit(allocator);
         if (self.artifact_refs.len > 0) allocator.free(self.artifact_refs);
@@ -174,9 +177,9 @@ pub const ApprovalState = struct {
         self.* = .{};
     }
 
-    pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, args_json: []const u8) !void {
+    pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, display_name: []const u8, args_json: []const u8) !void {
         self.deinit(allocator);
-        const scope_hint = try approvalScopeHint(allocator, tool_name, args_json);
+        const scope_hint = try approvalScopeHint(allocator, display_name, args_json);
         errdefer allocator.free(scope_hint);
         self.* = .{
             .status = .pending,
@@ -461,6 +464,13 @@ pub const AppState = struct {
         for (tools) |tool| self.registered_tools.appendAssumeCapacity(try RegisteredToolEntry.init(self.allocator, tool));
     }
 
+    pub fn toolLabel(self: *const AppState, name: []const u8) []const u8 {
+        for (self.registered_tools.items) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) return tool.label;
+        }
+        return name;
+    }
+
     pub fn clearTranscript(self: *AppState) void {
         for (self.transcript.items) |*entry| entry.deinit(self.allocator);
         self.transcript.clearRetainingCapacity();
@@ -647,15 +657,15 @@ pub const AppState = struct {
                 .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice(), &self.active_tool_result_entry),
             },
             .tool_approval_requested => |payload| {
-                try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice());
+                const label = self.toolLabel(payload.tool_name.slice());
+                try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), label, payload.args_json.slice());
                 if (std.mem.eql(u8, payload.tool_name.slice(), "hashline_edit")) try self.setHashlinePreview(payload.args_json.slice());
                 self.mode = .approval;
                 _ = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .pending);
             },
             .tool_execution_start => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
-                tool.expanded = true;
-                const summary = try toolSummary(self.allocator, payload.tool_name.slice(), payload.args_json.slice());
+                const summary = try toolSummary(self.allocator, tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
                 try self.appendTranscript(.tool, summary);
             },
@@ -670,11 +680,11 @@ pub const AppState = struct {
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                const summary = try toolResultSummary(self.allocator, payload.tool_name.slice(), payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
+                const summary = try toolResultSummary(self.allocator, tool.label, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
                 try self.appendTranscript(.tool, summary);
                 if (payload.is_error) {
-                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ payload.tool_name.slice(), payload.result_json.slice() });
+                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, payload.result_json.slice() });
                     defer self.allocator.free(message);
                     try self.status.setError(self.allocator, message);
                     try self.appendTranscript(.@"error", message);
@@ -720,6 +730,11 @@ pub const AppState = struct {
     pub fn toggleToolExpanded(self: *AppState, index: usize) void {
         if (index >= self.tools.items.len) return;
         self.tools.items[index].expanded = !self.tools.items[index].expanded;
+    }
+
+    pub fn toggleLatestToolExpanded(self: *AppState) void {
+        if (self.tools.items.len == 0) return;
+        self.toggleToolExpanded(self.tools.items.len - 1);
     }
 
     pub fn setPreview(self: *AppState, kind: PreviewKind, title: []const u8, content: []const u8) !void {
@@ -920,7 +935,7 @@ pub const AppState = struct {
             var out: std.Io.Writer.Allocating = .init(self.allocator);
             defer out.deinit();
             const writer = &out.writer;
-            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.name, raw_total_bytes, returned_total_bytes });
+            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.label, raw_total_bytes, returned_total_bytes });
             if (artifact_refs.len > 0) try writer.print(": {s}", .{artifact_refs});
             try writer.writeByte(']');
             const indicator = try out.toOwnedSlice();
@@ -941,15 +956,20 @@ pub const AppState = struct {
     }
 
     fn upsertTool(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
+        const label = self.toolLabel(name);
         if (self.findTool(id)) |tool| {
             tool.status = status;
+            if (!std.mem.eql(u8, tool.label, label)) {
+                self.allocator.free(tool.label);
+                tool.label = try self.allocator.dupe(u8, label);
+            }
             if (args_json.len > 0 and !std.mem.eql(u8, tool.args_json, args_json)) {
                 self.allocator.free(tool.args_json);
                 tool.args_json = try self.allocator.dupe(u8, args_json);
             }
             return tool;
         }
-        try self.tools.append(self.allocator, try ToolEntry.init(self.allocator, id, name, args_json, status));
+        try self.tools.append(self.allocator, try ToolEntry.init(self.allocator, id, name, label, args_json, status));
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
@@ -1225,7 +1245,7 @@ fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const keys = [_][]const u8{ "command", "path", "query", "pattern", "file", "operation" };
+    const keys = [_][]const u8{ "description", "command", "path", "query", "pattern", "file", "operation" };
     for (keys) |key| {
         if (jsonString(parsed.value.object, key)) |value| {
             if (value.len > 0) return try allocator.dupe(u8, value);
@@ -1443,6 +1463,15 @@ test "AppState protocol log captures every supported TUI event variant" {
 test "AppState applies transcript and tool events" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
+    const tools = [_]agent.AgentTool{.{
+        .label = "Shell Execute",
+        .name = "shell_command",
+        .description = "Run shell command",
+        .short_description = "Run shell",
+        .parameters_schema_json = "{}",
+        .execute = noopToolForTest,
+    }};
+    try state.setRegisteredTools(&tools);
 
     var text_event = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
     defer text_event.deinit(std.testing.allocator);
@@ -1463,7 +1492,7 @@ test "AppState applies transcript and tool events" {
     var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
         .tool_call_id = try ownedText("call-1"),
         .tool_name = try ownedText("shell_command"),
-        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+        .args_json = try ownedText("{\"description\":\"Check the current workspace directory\",\"command\":\"pwd\"}"),
     } };
     defer start_event.deinit(std.testing.allocator);
     try state.applyEvent(start_event);
@@ -1479,8 +1508,10 @@ test "AppState applies transcript and tool events" {
 
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqualStrings("Shell Execute", state.tools.items[0].label);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ shell_command \"pwd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command") == null);
 }
 
 test "AppState strips control bytes from tool summaries" {

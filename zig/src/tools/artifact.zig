@@ -8,7 +8,7 @@ pub const retrieve_tool = agent.AgentTool{
     .name = "artifact_retrieve",
     .description = "Retrieve full tool output previously stored as a local artifact. Use when a tool result summary references an artifact path and complete output is needed.",
     .short_description = "Retrieve stored full tool output by artifact path.",
-    .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"reference\":{\"type\":\"string\"}},\"required\":[\"reference\"],\"additionalProperties\":false}",
+    .parameters_schema_json = "{\"type\":\"object\",\"properties\":{\"description\":{\"type\":\"string\",\"description\":\"Why this tool call is needed and what information or change it is intended to produce.\"},\"reference\":{\"type\":\"string\"}},\"required\":[\"description\",\"reference\"],\"additionalProperties\":false}",
     .execute = executeRetrieve,
 };
 

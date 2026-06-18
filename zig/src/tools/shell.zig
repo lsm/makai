@@ -5,7 +5,7 @@ const common = @import("tools/common");
 const process_runner = @import("tools/process_runner");
 
 pub const schema_execute =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"compact_output":{"type":"boolean"}},"required":["workspace_root","command"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},"compact_output":{"type":"boolean"}},"required":["description","workspace_root","command"],"additionalProperties":false}
 ;
 
 pub const execute_tool = agent.AgentTool{
