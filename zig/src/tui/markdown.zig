@@ -46,8 +46,11 @@ const mermaid_fence = "```";
 const mermaid_lang = "mermaid";
 
 /// Replace each ```mermaid ... ``` block with a labeled summary plus the raw
-/// source as a Markdown blockquote. If the closing fence is missing we emit
-/// the label only and pass the remainder through verbatim.
+/// source as a Markdown blockquote. Fenced code blocks in other languages
+/// are passed through verbatim, including any literal ```mermaid lines they
+/// may contain — we walk the source line-by-line and track fence state so a
+/// mermaid syntax example embedded inside a `text`/`zig`/etc. block is not
+/// mis-transformed.
 fn replaceMermaidBlocks(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
@@ -60,30 +63,43 @@ fn replaceMermaidBlocks(allocator: std.mem.Allocator, source: []const u8) ![]u8 
             break;
         };
 
+        // Only treat a fence that starts a line (optionally indented). A
+        // ``` buried inside a word is not a fence opener.
+        const line_start = lineStartBefore(source, fence_pos);
+        const indent = source[line_start..fence_pos];
+        if (!std.mem.allEqual(u8, indent, ' ') and indent.len != 0) {
+            // Not a real fence — emit one byte and keep scanning so we don't
+            // loop forever on the same position.
+            try writer.writeByte(source[cursor]);
+            cursor += 1;
+            continue;
+        }
+
         // Scan the language tag immediately after the fence.
         const tag_start = fence_pos + mermaid_fence.len;
         const line_end = std.mem.indexOfScalarPos(u8, source, tag_start, '\n') orelse source.len;
         const tag = std.mem.trim(u8, source[tag_start..line_end], " \t\r");
 
         if (!std.mem.eql(u8, tag, mermaid_lang)) {
-            // Not a mermaid block — copy through the fence line and keep
-            // scanning from after it so nested non-mermaid blocks are
-            // unaffected. Use min to stay in bounds when the fence runs to
-            // end-of-input without a trailing newline.
-            const advance = @min(line_end + 1, source.len);
+            // Non-mermaid fenced code block. Walk line-by-line until the
+            // matching closing fence, copying everything verbatim — any
+            // literal ```mermaid lines inside belong to the code block, not
+            // to us.
+            const block_end = findCodeBlockClose(source, line_end);
+            const advance = block_end;
             try writer.writeAll(source[cursor..advance]);
             cursor = advance;
             continue;
         }
 
-        // Find the closing fence.
+        // Mermaid block — find the closing fence.
         const body_start = if (line_end < source.len) line_end + 1 else source.len;
-        const close_pos = findMermaidClose(source, body_start);
+        const close_pos = findCodeBlockCloseLine(source, body_start);
 
         // Emit any plain text leading up to the fence verbatim.
         try writer.writeAll(source[cursor..fence_pos]);
 
-        const body_end = close_pos orelse source.len;
+        const body_end = if (close_pos) |cp| cp else source.len;
         const body = source[body_start..body_end];
         const diagram_type = detectMermaidType(body);
 
@@ -112,23 +128,39 @@ fn replaceMermaidBlocks(allocator: std.mem.Allocator, source: []const u8) ![]u8 
     return out.toOwnedSlice();
 }
 
-/// Locate the closing ``` for a mermaid block starting at `body_start`.
-/// Returns the absolute index of the closing fence or null if none is found.
-fn findMermaidClose(source: []const u8, body_start: usize) ?usize {
-    var i: usize = body_start;
+/// Find the start of the next line that is exactly a fenced-code-block
+/// closer (a line whose only non-newline content is ``` optionally preceded
+/// by spaces). Returns the index just past the closer's trailing newline
+/// (or `source.len` when none is found, in which case the rest of the source
+/// is treated as part of the unterminated code block).
+fn findCodeBlockClose(source: []const u8, after_open_line_end: usize) usize {
+    var i = after_open_line_end;
     while (i < source.len) {
-        if (source[i] == '`') {
-            // Only treat lines whose first non-space content is ``` as the
-            // closing fence — indented triple backticks inside a diagram are
-            // part of the diagram source.
-            const line_start = lineStartBefore(source, i);
-            const prefix = source[line_start..i];
-            const all_space = std.mem.allEqual(u8, prefix, ' ') or prefix.len == 0;
-            if (all_space and i + 3 <= source.len and std.mem.eql(u8, source[i .. i + 3], mermaid_fence)) {
-                return i;
-            }
+        const line_start = i;
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        const line = source[line_start..line_end];
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.eql(u8, trimmed, mermaid_fence)) {
+            // Position just past the newline that terminates the closer line.
+            return if (line_end < source.len) line_end + 1 else source.len;
         }
-        i += 1;
+        i = if (line_end < source.len) line_end + 1 else source.len;
+    }
+    return source.len;
+}
+
+/// Same as findCodeBlockClose but returns the index of the closer's first
+/// backtick (used by the mermaid path so the body excludes the closing
+/// fence). Returns null when no closer is found.
+fn findCodeBlockCloseLine(source: []const u8, body_start: usize) ?usize {
+    var i = body_start;
+    while (i < source.len) {
+        const line_start = i;
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        const line = source[line_start..line_end];
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.eql(u8, trimmed, mermaid_fence)) return line_start;
+        i = if (line_end < source.len) line_end + 1 else source.len;
     }
     return null;
 }
@@ -219,16 +251,18 @@ fn replaceBlockMath(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
         const body_start = open + 2;
         const close = std.mem.indexOfPos(u8, source, body_start, "$$");
 
-        try writer.writeAll(source[cursor..open]);
-
         if (close) |cp| {
+            try writer.writeAll(source[cursor..open]);
             const body = source[body_start..cp];
             try writeBlockMath(allocator, writer, body);
             cursor = cp + 2;
         } else {
-            // Unterminated — render what's left as a block and stop.
-            const body = source[body_start..];
-            try writeBlockMath(allocator, writer, body);
+            // Unterminated `$$` — not actually a math block. Emit the rest
+            // of the source verbatim (including the literal `$$`) so prose
+            // like "cost $$5 total" survives unchanged. Mirrors the inline
+            // math path, which writes the bare `$` and moves on when no
+            // closer is found.
+            try writer.writeAll(source[cursor..]);
             cursor = source.len;
         }
     }
@@ -515,9 +549,8 @@ const BraceGroup = struct {
 };
 
 /// Read a `{...}` group starting at `i` (after skipping leading spaces).
-/// Returns null if `i` doesn't point at a `{`. Does not handle nested
-/// braces — math operands rarely nest, and raw fallback preserves the
-/// source when they do.
+/// Returns null if `i` doesn't point at a `{`. Handles nested braces via a
+/// depth counter so `\frac{\frac{a}{b}}{c}` renders as `((a)/(b))/(c)`.
 fn readGroup(body: []const u8, i: usize) ?BraceGroup {
     if (i >= body.len or body[i] != '{') return null;
     var depth: usize = 1;
@@ -781,6 +814,15 @@ fn lookupCommand(name: []const u8) ?[]const u8 {
             .{ .name = "mathtt", .sym = "" },
             .{ .name = "mathcal", .sym = "" },
             .{ .name = "mathbb", .sym = "" },
+            .{ .name = "textbf", .sym = "" },
+            .{ .name = "textit", .sym = "" },
+            .{ .name = "textrm", .sym = "" },
+            .{ .name = "texttt", .sym = "" },
+            .{ .name = "textsf", .sym = "" },
+            .{ .name = "emph", .sym = "" },
+            .{ .name = "underline", .sym = "" },
+            .{ .name = "boldsymbol", .sym = "" },
+            .{ .name = "pmb", .sym = "" },
             .{ .name = "displaystyle", .sym = "" },
             .{ .name = "textstyle", .sym = "" },
             .{ .name = "scriptstyle", .sym = "" },
@@ -881,12 +923,20 @@ test "inline math ignores dollar signs used as currency" {
     try std.testing.expectEqualStrings(src, out);
 }
 
-test "unterminated block math falls back gracefully" {
+test "unterminated block math passes through verbatim per doc" {
     const src = "text $$\\alpha no closer";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "$$") == null);
+    // Doc contract: unterminated `$$` is not a math block. Source must
+    // survive unchanged so prose like "cost $$5 total" doesn't lose data.
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "unterminated block math preserves currency-style double dollar" {
+    const src = "cost $$5 total";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
 }
 
 test "unknown LaTeX command falls back to raw with backslash" {
@@ -915,6 +965,41 @@ test "mermaid sequenceDiagram type classified correctly" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "**Mermaid diagram: sequence**") != null);
+}
+
+test "mermaid fence inside a non-mermaid code block is not transformed" {
+    // A code block that documents mermaid syntax must survive verbatim —
+    // we cannot eat its closing fence or rewrite its contents.
+    const src = "```text\n```mermaid\nflowchart TD\n  A --> B\n```\n```";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "mermaid fence inside a zig code block is not transformed" {
+    const src = "```zig\nconst s = \"```mermaid\\nflowchart\\n```\";\n```";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "unterminated non-mermaid code block passes through verbatim" {
+    // No closing fence at all — everything after the opener survives.
+    const src = "```text\nsome\nraw\nlines";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "text style commands drop their wrapper" {
+    const src = "math $\\textbf{X} + \\textit{Y} + \\textrm{Z} + \\texttt{W}$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "X + Y + Z + W") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\textbf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\textit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\textrm") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\texttt") == null);
 }
 
 test "mermaid block without closing fence still labels" {
