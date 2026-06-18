@@ -4,8 +4,9 @@ const ai_types = @import("ai_types");
 pub fn EventStream(comptime T: type, comptime R: type) type {
     return struct {
         const Self = @This();
-        const RING_BUFFER_SIZE = 256;
+        const RING_BUFFER_SIZE = 1024;
         const RING_BUFFER_MASK = RING_BUFFER_SIZE - 1;
+        pub const usable_capacity = RING_BUFFER_SIZE - 1;
 
         ring_buffer: [RING_BUFFER_SIZE]T,
         /// Published flags ensure data is visible before consumers read.
@@ -519,10 +520,10 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
     defer stream.deinit();
 
     // Capacity is RING_BUFFER_SIZE - 1 because head==tail means empty.
-    for (0..255) |i| {
+    for (0..TestStream.usable_capacity) |i| {
         try stream.push(@intCast(i));
     }
-    try std.testing.expectError(error.QueueFull, stream.push(255));
+    try std.testing.expectError(error.QueueFull, stream.push(TestStream.usable_capacity));
 }
 
 test "EventStream ring buffer wrap-around preserves order" {
@@ -530,8 +531,8 @@ test "EventStream ring buffer wrap-around preserves order" {
     var stream = TestStream.init(std.testing.allocator);
     defer stream.deinit();
 
-    // Force head/tail wrap-around across the 256-slot ring.
-    for (0..300) |i| {
+    // Force head/tail wrap-around across the ring.
+    for (0..TestStream.usable_capacity + 44) |i| {
         try stream.push(@intCast(i));
         const v = stream.poll().?;
         try std.testing.expectEqual(@as(u32, @intCast(i)), v);
@@ -561,7 +562,6 @@ test "EventStream wait wakes and returns pushed event" {
     const got = stream.wait();
     try std.testing.expectEqual(@as(?u32, 42), got);
 }
-
 
 const CompletionAfterErrorCtx = struct {
     stream: *EventStream(u32, u32),

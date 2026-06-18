@@ -391,7 +391,7 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     try std.testing.expect(d.frameContains("starting login for anthropic"));
 }
 
-test "e2e: TUI leaves pointer selection to the terminal and still handles wheel events when provided" {
+test "e2e: TUI uses alternate-scroll keys for transcript scrolling" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
     var d = try Driver.init(std.testing.allocator, .{
@@ -407,10 +407,11 @@ test "e2e: TUI leaves pointer selection to the terminal and still handles wheel 
     );
 
     try std.testing.expect(!tui_app.tuiProgramOptionsForTest().mouse);
+    try std.testing.expect(tui_app.tuiProgramOptionsForTest().alternate_scroll);
     d.app().state.transcript_scroll = 0;
-    _ = d.model.update(.{ .mouse = .{ .x = 0, .y = 0, .button = .wheel_up, .event_type = .press } }, &d.ctx);
-    try std.testing.expectEqual(@as(usize, 3), d.app().state.transcript_scroll);
-    _ = d.model.update(.{ .mouse = .{ .x = 0, .y = 0, .button = .wheel_down, .event_type = .press } }, &d.ctx);
+    d.sendKey(.up);
+    try std.testing.expectEqual(@as(usize, 1), d.app().state.transcript_scroll);
+    d.sendKey(.down);
     try std.testing.expectEqual(@as(usize, 0), d.app().state.transcript_scroll);
 }
 

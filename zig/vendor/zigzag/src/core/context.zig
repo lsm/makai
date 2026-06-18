@@ -348,6 +348,10 @@ pub const Options = struct {
     /// Enable mouse tracking
     mouse: bool = false,
 
+    /// Enable terminal wheel scrolling in the alternate screen without
+    /// capturing mouse button events.
+    alternate_scroll: bool = false,
+
     /// Show cursor
     cursor: bool = false,
 

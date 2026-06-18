@@ -1014,13 +1014,10 @@ pub const TuiRuntime = struct {
     }
 
     fn push(self: *TuiRuntime, event: TuiEvent) void {
-        self.event_stream.push(event) catch {
-            var mutable = event;
-            mutable.deinit(self.allocator);
-        };
+        self.pushDroppingOldest(event);
     }
 
-    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+    fn pushDroppingOldest(self: *TuiRuntime, event: TuiEvent) void {
         while (true) {
             self.event_stream.push(event) catch |err| switch (err) {
                 error.QueueFull => {
@@ -1035,6 +1032,10 @@ pub const TuiRuntime = struct {
             };
             return;
         }
+    }
+
+    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+        self.pushDroppingOldest(event);
     }
 
     fn dupeOwned(self: *TuiRuntime, value: []const u8) !OwnedSlice(u8) {
@@ -3507,11 +3508,15 @@ test "failed turns emit error end reason" {
     try std.testing.expectError(error.AgentLoopFailed, tui_session.submitTurn("fail"));
     if (runtime.local_agent) |*local| local.waitForIdle();
 
+    var saw_error_detail = false;
     var saw_error_end = false;
     while (tui_session.waitEvent()) |event| {
         var ev = event;
         defer ev.deinit(std.testing.allocator);
         switch (ev) {
+            .@"error" => {
+                if (std.mem.eql(u8, ev.@"error".message.slice(), "forced provider error")) saw_error_detail = true;
+            },
             .agent_end => {
                 saw_error_end = ev.agent_end.reason == .@"error";
                 break;
@@ -3519,7 +3524,28 @@ test "failed turns emit error end reason" {
             else => {},
         }
     }
+    try std.testing.expect(saw_error_detail);
     try std.testing.expect(saw_error_end);
+}
+
+test "runtime push preserves newest event when event stream is full" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+
+    for (0..TuiEventStream.usable_capacity) |_| {
+        runtime.push(.turn_start);
+    }
+    runtime.push(.{ .@"error" = .{ .message = try runtime.dupeOwned("latest error") } });
+
+    var saw_latest_error = false;
+    while (runtime.event_stream.poll()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .@"error" and std.mem.eql(u8, ev.@"error".message.slice(), "latest error")) {
+            saw_latest_error = true;
+        }
+    }
+    try std.testing.expect(saw_latest_error);
 }
 
 const RemoteMock = struct {

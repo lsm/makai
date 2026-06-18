@@ -107,11 +107,7 @@ fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
         // Extract region from stored credentials
         if (storage.providers.get(kimi_provider_id)) |auth| {
             if (auth == .oauth) {
-                if (auth.oauth.provider_data) |provider_data| {
-                    if (std.mem.startsWith(u8, provider_data, "region:")) {
-                        region = provider_data[7..]; // Skip "region:" prefix
-                    }
-                }
+                if (auth.oauth.provider_data) |provider_data| region = kimiRegionFromProviderData(provider_data);
             }
         }
 
@@ -139,6 +135,13 @@ fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
         return "china";
     }
     return null;
+}
+
+fn kimiRegionFromProviderData(provider_data: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, provider_data, "region:")) {
+        return normalizeKimiRegion(provider_data["region:".len..]) orelse "china";
+    }
+    return "china";
 }
 
 fn kimiRegionFromEnv(allocator: std.mem.Allocator) ?[]const u8 {
@@ -731,6 +734,14 @@ test "loadProductionModels includes Kimi model when enabled" {
     try std.testing.expectEqualStrings(kimi_base_url, models[0].base_url);
     try std.testing.expectEqual(@as(u32, 262_144), models[0].context_window);
     try std.testing.expectEqual(@as(u32, 16_384), models[0].max_tokens);
+}
+
+test "Kimi stored provider_data region normalizes to stable static values" {
+    try std.testing.expectEqualStrings("global", kimiRegionFromProviderData("region:global"));
+    try std.testing.expectEqualStrings("global", kimiRegionFromProviderData("region:moonshot"));
+    try std.testing.expectEqualStrings("china", kimiRegionFromProviderData("region:cn"));
+    try std.testing.expectEqualStrings("china", kimiRegionFromProviderData("region:unknown"));
+    try std.testing.expectEqualStrings("china", kimiRegionFromProviderData("not-region:global"));
 }
 
 test "refreshProductionModels keeps Kimi when Codex refresh fails" {

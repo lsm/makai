@@ -488,9 +488,11 @@ fn entryBodyLayout(kind: TranscriptKind, width: usize) EntryLayout {
     };
     const left = switch (kind) {
         .user => width -| user_gutter -| column,
+        .@"error" => label_text_left -| 2,
         else => label_text_left,
     };
-    return .{ .left = left, .width = column };
+    const adjusted_column = if (kind == .@"error") column + (label_text_left -| left) else column;
+    return .{ .left = left, .width = adjusted_column };
 }
 
 fn indentBlock(allocator: std.mem.Allocator, text: []const u8, spaces: usize) ![]const u8 {
@@ -777,6 +779,22 @@ test "transcript renders chat-style alignment and cards" {
     const user_line = renderedLineContaining(text, "user reply").?;
     try std.testing.expect(std.mem.startsWith(u8, user_line, "          "));
     try std.testing.expectEqual(@as(usize, 46), tui_text.visibleWidth(user_line));
+}
+
+test "transcript aligns error card content with role label text" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.@"error", "ProviderStreamError");
+    state.transcript.items[0].timestamp_ms = 3_720_000;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 8 });
+    defer std.testing.allocator.free(text);
+
+    const header_line = renderedLineContaining(text, "Error").?;
+    const error_line = renderedLineContaining(text, "ProviderStreamError").?;
+    const label_col = tui_text.visibleWidth(header_line[0..std.mem.indexOf(u8, header_line, "Error").?]);
+    const text_col = tui_text.visibleWidth(error_line[0..std.mem.indexOf(u8, error_line, "ProviderStreamError").?]);
+    try std.testing.expectEqual(label_col, text_col);
 }
 
 test "transcript preserves multiline entries" {

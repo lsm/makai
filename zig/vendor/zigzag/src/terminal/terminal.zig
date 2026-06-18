@@ -248,6 +248,8 @@ pub const Config = struct {
     hide_cursor: bool = true,
     /// Enable mouse tracking
     mouse: bool = false,
+    /// Enable wheel scrolling in the alternate screen without mouse tracking.
+    alternate_scroll: bool = false,
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,
     /// Custom input file (default: stdin)
@@ -333,10 +335,19 @@ pub const Terminal = struct {
         }
 
         // Enable normal mouse tracking (button/wheel only) with SGR encoding.
-        // This reports scroll wheel events while leaving drag selection to the terminal.
+        // This can capture plain clicks in many terminals, so apps that need
+        // native drag selection should prefer alternate_scroll below.
         if (self.config.mouse) {
             try self.writeBytes(mouse.enableSequence(.normal));
             self.state.mouse_enabled = true;
+        }
+
+        // In xterm-compatible terminals, alternate-scroll converts wheel
+        // input in the alternate screen into cursor up/down key events. This
+        // preserves native drag selection because mouse buttons are not
+        // reported to the application.
+        if (self.config.alternate_scroll) {
+            try self.writeBytes("\x1b[?1007h");
         }
 
         // Enable bracketed paste
@@ -379,6 +390,10 @@ pub const Terminal = struct {
         if (self.state.mouse_enabled) {
             self.writeBytes(mouse.disableSequence(.normal)) catch {};
             self.state.mouse_enabled = false;
+        }
+
+        if (self.config.alternate_scroll) {
+            self.writeBytes("\x1b[?1007l") catch {};
         }
 
         // Show cursor

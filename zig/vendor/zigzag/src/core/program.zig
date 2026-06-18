@@ -239,6 +239,7 @@ pub fn Program(comptime Model: type) type {
                 .alt_screen = self.options.alt_screen,
                 .hide_cursor = !self.options.cursor,
                 .mouse = self.options.mouse,
+                .alternate_scroll = self.options.alternate_scroll,
                 .bracketed_paste = self.options.bracketed_paste,
                 .input = self.options.input,
                 .output = self.options.output,

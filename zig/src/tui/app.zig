@@ -702,6 +702,7 @@ pub const App = struct {
     fn cancelLogin(self: *App) void {
         self.finishLogin();
         self.state.appendTranscript(.system, "login cancelled") catch {};
+        self.state.composer.clear();
         self.state.login_input_secret = false;
         self.state.mode = .normal;
     }
@@ -1896,7 +1897,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true, .mouse = false };
+    return .{ .kitty_keyboard = true, .alternate_scroll = true };
 }
 
 pub fn tuiProgramOptionsForTest() zz.Options {
@@ -1947,8 +1948,9 @@ test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
 
-test "TUI program leaves plain mouse selection to the terminal" {
+test "TUI program enables wheel scrolling without mouse capture" {
     try std.testing.expect(!tuiProgramOptions().mouse);
+    try std.testing.expect(tuiProgramOptions().alternate_scroll);
 }
 
 test "saved model ref loads from config store" {
@@ -2089,6 +2091,21 @@ test "App submit starts direct Kimi API key login command" {
     try std.testing.expect(app.login != null);
     try std.testing.expectEqualStrings("kimi", app.login.?.provider_id);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for kimi") != null);
+}
+
+test "App cancel login clears secret composer draft" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    app.state.mode = .login_input;
+    app.state.login_input_secret = true;
+    try app.state.composer.insertSlice(std.testing.allocator, "moonshot-secret-key");
+
+    app.cancelLogin();
+
+    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
+    try std.testing.expect(!app.state.login_input_secret);
+    try std.testing.expectEqual(@as(usize, 0), app.state.composer.text().len);
 }
 
 test "App saves Kimi login credentials as api key" {

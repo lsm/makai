@@ -1,0 +1,19 @@
+total 152
+drwxr-xr-x@ 18 lsm  staff    576 Jun 15 19:58 [1m[34m.[39;49m[0m
+drwxr-xr-x@  3 lsm  staff     96 Jun 15 19:58 [1m[34m..[39;49m[0m
+drwxr-xr-x@  3 lsm  staff     96 Jun 15 19:58 [1m[34m.claude[39;49m[0m
+drwxr-xr-x@  3 lsm  staff     96 Jun 15 19:58 [1m[34m.codegraph[39;49m[0m
+-rw-r--r--@  1 lsm  staff     36 Jun 15 21:22 .git
+drwxr-xr-x@  6 lsm  staff    192 Jun 15 19:58 [1m[34m.github[39;49m[0m
+-rw-r--r--@  1 lsm  staff    408 Jun 15 21:25 .gitignore
+-rw-r--r--@  1 lsm  staff    741 Jun 15 19:58 CHANGELOG.md
+-rw-r--r--@  1 lsm  staff  13341 Jun 15 19:58 CLAUDE.md
+-rw-r--r--@  1 lsm  staff  15252 Jun 15 19:58 DESIGN.md
+drwxr-xr-x@ 13 lsm  staff    416 Jun 15 19:58 [1m[34mdocs[39;49m[0m
+-rw-r--r--@  1 lsm  staff   2377 Jun 15 19:58 package-lock.json
+-rw-r--r--@  1 lsm  staff    717 Jun 15 19:58 package.json
+-rw-r--r--@  1 lsm  staff  16619 Jun 15 19:58 plan.md
+drwxr-xr-x@  4 lsm  staff    128 Jun 15 19:58 [1m[34mscripts[39;49m[0m
+-rw-r--r--@  1 lsm  staff    356 Jun 15 19:58 tsconfig.json
+drwxr-xr-x@  6 lsm  staff    192 Jun 15 19:58 [1m[34mtypescript[39;49m[0m
+drwxr-xr-x@ 15 lsm  staff    480 Jun 17 21:59 [1m[34mzig[39;49m[0m

@@ -415,15 +415,22 @@ fn summarizeArtifactBackedOutput(allocator: std.mem.Allocator, text: []const u8,
     if (stderr.len > 0) {
         return std.fmt.allocPrint(
             allocator,
-            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact: {s}\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
-            .{ text.len, countLines(text), artifact_path, head, tail, stderr },
+            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nretrieve_full_output: call artifact_retrieve with reference exactly \"{s}\"\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
+            .{ text.len, countLines(text), artifact_path, artifact_path, head, tail, stderr },
         );
     }
     return std.fmt.allocPrint(
         allocator,
-        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact: {s}\nhead:\n{s}\ntail:\n{s}",
-        .{ text.len, countLines(text), artifact_path, head, tail },
+        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nretrieve_full_output: call artifact_retrieve with reference exactly \"{s}\"\nhead:\n{s}\ntail:\n{s}",
+        .{ text.len, countLines(text), artifact_path, artifact_path, head, tail },
     );
+}
+
+test "artifact-backed summary tells the model how to retrieve full output" {
+    const summary = try summarizeArtifactBackedOutput(std.testing.allocator, "line 1\nline 2\n", "", ".makai/tool-artifacts/test.txt");
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "artifact_reference: .makai/tool-artifacts/test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "artifact_retrieve with reference exactly") != null);
 }
 
 fn sanitizeKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {

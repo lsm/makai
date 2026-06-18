@@ -1,0 +1,15 @@
+total 560
+drwxr-xr-x@ 14 lsm  staff     448 Jun 17 21:59 [1m[34m.[39;49m[0m
+drwxr-xr-x@ 18 lsm  staff     576 Jun 15 19:58 [1m[34m..[39;49m[0m
+drwxr-xr-x@  2 lsm  staff      64 Jun 17 21:59 [1m[34m.makai[39;49m[0m
+drwxr-xr-x@  6 lsm  staff     192 Jun 17 21:50 [1m[34m.zig-cache[39;49m[0m
+-rw-r--r--@  1 lsm  staff  104309 Jun 17 20:59 build.zig
+-rw-r--r--@  1 lsm  staff     206 Jun 15 19:58 build.zig.zon
+drwxr-xr-x@  3 lsm  staff      96 Jun 15 19:58 [1m[34mdocs[39;49m[0m
+-rw-r--r--@  1 lsm  staff       0 Jun 17 21:59 ls_zig.txt
+-rw-r--r--@  1 lsm  staff  172795 Jun 17 21:52 processes.txt
+drwxr-xr-x@ 25 lsm  staff     800 Jun 16 00:04 [1m[34msrc[39;49m[0m
+drwxr-xr-x@  4 lsm  staff     128 Jun 15 19:58 [1m[34mtest[39;49m[0m
+drwxr-xr-x@  3 lsm  staff      96 Jun 15 19:58 [1m[34mvendor[39;49m[0m
+drwxr-xr-x@  5 lsm  staff     160 Jun 16 23:11 [1m[34mzig-cache[39;49m[0m
+drwxr-xr-x@  3 lsm  staff      96 Jun 17 21:51 [1m[34mzig-out[39;49m[0m

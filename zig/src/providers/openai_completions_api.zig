@@ -809,6 +809,10 @@ fn findReasoningField(delta: std.json.ObjectMap) ?struct { field: []const u8, va
     return null;
 }
 
+fn canCompletePartialTextOnStreamError(text_len: usize, thinking_len: usize, tool_call_count: usize) bool {
+    return tool_call_count == 0 and (text_len > 0 or thinking_len > 0);
+}
+
 fn parseChunk(
     data: []const u8,
     text: *std.ArrayList(u8),
@@ -1459,7 +1463,7 @@ fn runThread(ctx: *ThreadCtx) void {
         },
     });
 
-    while (true) {
+    read_loop: while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat_mod.time.nowMillis();
@@ -1480,6 +1484,10 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         const n = compat_mod.http.readResponse(reader, &read_buf) catch {
+            if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
+                stop_reason = .length;
+                break :read_loop;
+            }
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("read error");
@@ -1488,6 +1496,10 @@ fn runThread(ctx: *ThreadCtx) void {
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
+            if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
+                stop_reason = .length;
+                break :read_loop;
+            }
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("sse parse error");
@@ -1511,6 +1523,10 @@ fn runThread(ctx: *ThreadCtx) void {
             const prev_thinking_len = thinking.items.len;
 
             parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, &reasoning_detail_events, allocator) catch {
+                if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
+                    stop_reason = .length;
+                    break :read_loop;
+                }
                 ctx.deinit();
                 stream.markThreadDone();
                 stream.completeWithError("json parse error");
@@ -2046,6 +2062,13 @@ test "buildRequestBody with assistant message containing tool_calls" {
     try std.testing.expect(std.mem.find(u8, body, "call_456") != null);
     try std.testing.expect(std.mem.find(u8, body, "bash") != null);
     try std.testing.expect(std.mem.find(u8, body, "ls -la") != null);
+}
+
+test "stream errors can finalize accumulated text but not partial tool calls" {
+    try std.testing.expect(canCompletePartialTextOnStreamError(1, 0, 0));
+    try std.testing.expect(canCompletePartialTextOnStreamError(0, 1, 0));
+    try std.testing.expect(!canCompletePartialTextOnStreamError(0, 0, 0));
+    try std.testing.expect(!canCompletePartialTextOnStreamError(1, 0, 1));
 }
 
 test "parseChunk does not leak memory with reasoning content" {

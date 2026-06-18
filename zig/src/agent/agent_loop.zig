@@ -159,31 +159,69 @@ fn estimateContextUsage(context: ai_types.Context) ContextUsage {
     };
 }
 
+fn pushAgentEvent(event_stream: *AgentEventStream, event: AgentEvent) !void {
+    while (true) {
+        event_stream.push(event) catch |err| switch (err) {
+            error.QueueFull => {
+                if (event_stream.poll()) |dropped| {
+                    var mutable = dropped;
+                    mutable.deinit(event_stream.allocator);
+                } else {
+                    std.Thread.yield() catch {};
+                }
+                continue;
+            },
+        };
+        return;
+    }
+}
+
+test "agent event push drops oldest event instead of failing when full" {
+    const allocator = std.testing.allocator;
+    var stream = AgentEventStream.init(allocator);
+    defer stream.deinit();
+
+    for (0..AgentEventStream.usable_capacity) |_| {
+        try pushAgentEvent(&stream, .turn_start);
+    }
+    try pushAgentEvent(&stream, .agent_start);
+
+    var saw_agent_start = false;
+    var count: usize = 0;
+    while (stream.poll()) |event| {
+        count += 1;
+        if (event == .agent_start) saw_agent_start = true;
+    }
+
+    try std.testing.expectEqual(@as(usize, AgentEventStream.usable_capacity), count);
+    try std.testing.expect(saw_agent_start);
+}
+
 fn emitContextUsage(event_stream: *AgentEventStream, context: ai_types.Context) !void {
     const usage = estimateContextUsage(context);
     const system_prompt: []const u8 = context.getSystemPrompt() orelse "";
-    try event_stream.push(.{ .prompt_segment_usage = .{
+    try pushAgentEvent(event_stream, .{ .prompt_segment_usage = .{
         .segment = .system_prompt,
         .cache_role = .stable,
         .bytes = usage.system_prompt.bytes,
         .estimated_tokens = usage.system_prompt.estimated_tokens,
         .item_count = if (system_prompt.len > 0) 1 else 0,
     } });
-    try event_stream.push(.{ .prompt_segment_usage = .{
+    try pushAgentEvent(event_stream, .{ .prompt_segment_usage = .{
         .segment = .tool_definitions,
         .cache_role = .stable,
         .bytes = usage.tools.bytes,
         .estimated_tokens = usage.tools.estimated_tokens,
         .item_count = if (context.tools) |tools| @intCast(tools.len) else 0,
     } });
-    try event_stream.push(.{ .prompt_segment_usage = .{
+    try pushAgentEvent(event_stream, .{ .prompt_segment_usage = .{
         .segment = .message_history,
         .cache_role = .dynamic,
         .bytes = usage.messages.bytes,
         .estimated_tokens = usage.messages.estimated_tokens,
         .item_count = @intCast(context.messages.len),
     } });
-    try event_stream.push(.{ .context_usage = .{
+    try pushAgentEvent(event_stream, .{ .context_usage = .{
         .system_prompt_bytes = usage.system_prompt.bytes,
         .message_bytes = usage.messages.bytes,
         .tool_definition_bytes = usage.tools.bytes,
@@ -349,14 +387,14 @@ fn skipToolCall(
     const skip_message = "Skipped due to queued user message.";
 
     // Emit start event
-    try event_stream.push(.{ .tool_execution_start = .{
+    try pushAgentEvent(event_stream, .{ .tool_execution_start = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .args_json = tool_call.arguments_json,
     } });
 
     // Emit end event with skip result
-    try event_stream.push(.{ .tool_execution_end = .{
+    try pushAgentEvent(event_stream, .{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .result_json = skip_message,
@@ -436,7 +474,7 @@ fn finalizeToolExecution(
     defer allocator.free(content_json);
     const args_bytes: u64 = @intCast(args_json.len);
 
-    try event_stream.push(.{ .tool_execution_end = .{
+    try pushAgentEvent(event_stream, .{ .tool_execution_end = .{
         .tool_call_id = tool_call.id,
         .tool_name = tool_call.name,
         .result_json = result_json,
@@ -586,7 +624,7 @@ fn pushProviderMessageUpdate(
     errdefer if (owns_event) {
         ai_types.deinitAssistantMessageEvent(allocator, &cleanup_event);
     };
-    try event_stream.push(.{ .message_update = .{
+    try pushAgentEvent(event_stream, .{ .message_update = .{
         .message = partial,
         .event = provider_event,
         .owns_event = owns_event,
@@ -623,7 +661,7 @@ fn executeToolCalls(
         const tool = findTool(config.tools, tool_call.name);
 
         // Emit start event
-        try event_stream.push(.{ .tool_execution_start = .{
+        try pushAgentEvent(event_stream, .{ .tool_execution_start = .{
             .tool_call_id = tool_call.id,
             .tool_name = tool_call.name,
             .args_json = tool_call.arguments_json,
@@ -858,7 +896,7 @@ fn streamAssistantResponse(
                     .timestamp = s.partial.timestamp,
                     .is_owned = false,
                 } };
-                try event_stream.push(.{ .message_start = .{
+                try pushAgentEvent(event_stream, .{ .message_start = .{
                     .message = msg,
                 } });
                 if (provider_stream.owns_events) {
@@ -901,7 +939,7 @@ fn streamAssistantResponse(
                 };
                 final_message = d.message;
                 const msg: ai_types.Message = .{ .assistant = d.message };
-                try event_stream.push(.{ .message_end = .{
+                try pushAgentEvent(event_stream, .{ .message_end = .{
                     .message = msg,
                 } });
                 final_transferred = true;
@@ -914,7 +952,7 @@ fn streamAssistantResponse(
                 };
                 final_message = e.err;
                 const msg: ai_types.Message = .{ .assistant = e.err };
-                try event_stream.push(.{ .message_end = .{
+                try pushAgentEvent(event_stream, .{ .message_end = .{
                     .message = msg,
                 } });
                 final_transferred = true;
@@ -932,7 +970,7 @@ fn streamAssistantResponse(
             errdefer cloned.deinit(allocator);
             final_message = cloned;
             const msg: ai_types.Message = .{ .assistant = final_message.? };
-            try event_stream.push(.{ .message_end = .{
+            try pushAgentEvent(event_stream, .{ .message_end = .{
                 .message = msg,
             } });
         }
@@ -945,51 +983,36 @@ fn streamAssistantResponse(
             {
                 return error.AuthRequired;
             }
-            if (std.mem.startsWith(u8, provider_error, "openai request failed")) {
-                if (std.mem.indexOf(u8, provider_error, "status=400") != null) return error.ProviderHttp400;
-                if (std.mem.indexOf(u8, provider_error, "status=401") != null) return error.ProviderHttp401;
-                if (std.mem.indexOf(u8, provider_error, "status=403") != null) return error.ProviderHttp403;
-                if (std.mem.indexOf(u8, provider_error, "status=404") != null) return error.ProviderHttp404;
-                if (std.mem.indexOf(u8, provider_error, "status=405") != null) return error.ProviderHttp405;
-                if (std.mem.indexOf(u8, provider_error, "status=409") != null) return error.ProviderHttp409;
-                if (std.mem.indexOf(u8, provider_error, "status=413") != null) return error.ProviderHttp413;
-                if (std.mem.indexOf(u8, provider_error, "status=415") != null) return error.ProviderHttp415;
-                if (std.mem.indexOf(u8, provider_error, "status=422") != null) return error.ProviderHttp422;
-                if (std.mem.indexOf(u8, provider_error, "status=429") != null) return error.ProviderHttp429;
-                if (std.mem.indexOf(u8, provider_error, "status=500") != null) return error.ProviderHttp500;
-                if (std.mem.indexOf(u8, provider_error, "status=502") != null) return error.ProviderHttp502;
-                if (std.mem.indexOf(u8, provider_error, "status=503") != null) return error.ProviderHttp503;
-                return error.ProviderRequestFailed;
-            }
-            if (std.mem.startsWith(u8, provider_error, "anthropic request failed")) {
-                if (std.mem.indexOf(u8, provider_error, "HTTP 400") != null) return error.ProviderHttp400;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 401") != null) return error.ProviderHttp401;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 403") != null) return error.ProviderHttp403;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 404") != null) return error.ProviderHttp404;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 405") != null) return error.ProviderHttp405;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 409") != null) return error.ProviderHttp409;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 413") != null) return error.ProviderHttp413;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 415") != null) return error.ProviderHttp415;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 422") != null) return error.ProviderHttp422;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 429") != null) return error.ProviderHttp429;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 500") != null) return error.ProviderHttp500;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 502") != null) return error.ProviderHttp502;
-                if (std.mem.indexOf(u8, provider_error, "HTTP 503") != null) return error.ProviderHttp503;
-                return error.ProviderRequestFailed;
-            }
-            if (std.mem.eql(u8, provider_error, "json parse error")) return error.ProviderJsonParseError;
-            if (std.mem.eql(u8, provider_error, "sse parse error")) return error.ProviderSseParseError;
-            if (std.mem.eql(u8, provider_error, "read error")) return error.ProviderReadError;
-            if (std.mem.eql(u8, provider_error, "failed to receive response")) return error.ProviderReceiveFailed;
-            if (std.mem.eql(u8, provider_error, "failed to send request")) return error.ProviderSendFailed;
-            if (std.mem.eql(u8, provider_error, "failed to open request")) return error.ProviderOpenFailed;
-            if (std.mem.eql(u8, provider_error, "invalid provider URL")) return error.InvalidProviderUrl;
-            if (std.mem.indexOf(u8, provider_error, "timed out") != null) return error.ProviderStreamTimeout;
-            return error.ProviderStreamError;
+            return try makeProviderErrorAssistantMessage(allocator, config.model, provider_error);
         }
     }
 
     return final_message orelse error.NoFinalMessage;
+}
+
+fn makeProviderErrorAssistantMessage(
+    allocator: std.mem.Allocator,
+    model: ai_types.Model,
+    provider_error: []const u8,
+) !ai_types.AssistantMessage {
+    const content = try allocator.alloc(ai_types.AssistantContent, 1);
+    errdefer allocator.free(content);
+    content[0] = .{ .text = .{ .text = "" } };
+
+    const error_message = try allocator.dupe(u8, provider_error);
+    errdefer allocator.free(error_message);
+
+    return .{
+        .content = content,
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initOwned(error_message),
+        .timestamp = compat.time.nowMillis(),
+        .is_owned = false,
+    };
 }
 
 /// Run state for the agent loop
@@ -1052,10 +1075,10 @@ fn runLoop(
             try context.appendMessage(prompt);
 
             // Emit message_start/message_end for each prompt
-            try event_stream.push(.{ .message_start = .{
+            try pushAgentEvent(event_stream, .{ .message_start = .{
                 .message = prompt,
             } });
-            try event_stream.push(.{ .message_end = .{
+            try pushAgentEvent(event_stream, .{ .message_end = .{
                 .message = prompt,
             } });
 
@@ -1065,7 +1088,7 @@ fn runLoop(
     }
 
     // Emit agent_start
-    try event_stream.push(.agent_start);
+    try pushAgentEvent(event_stream, .agent_start);
 
     const max_iterations = config.max_iterations orelse 100;
 
@@ -1091,10 +1114,10 @@ fn runLoop(
                     // Add steering messages to context
                     for (msgs) |steering_msg| {
                         try context.appendMessage(steering_msg);
-                        try event_stream.push(.{ .message_start = .{
+                        try pushAgentEvent(event_stream, .{ .message_start = .{
                             .message = steering_msg,
                         } });
-                        try event_stream.push(.{ .message_end = .{
+                        try pushAgentEvent(event_stream, .{ .message_end = .{
                             .message = steering_msg,
                         } });
                         try appendClonedStateMessage(&state.messages, allocator, steering_msg);
@@ -1106,7 +1129,7 @@ fn runLoop(
             }
 
             // Emit turn_start before streaming assistant response
-            try event_stream.push(.turn_start);
+            try pushAgentEvent(event_stream, .turn_start);
 
             // Stream assistant response
             const assistant_message = streamAssistantResponse(
@@ -1134,8 +1157,9 @@ fn runLoop(
                 try appendClonedStateMessage(&state.messages, allocator, .{ .assistant = error_msg });
 
                 // Emit turn_end with error
-                try event_stream.push(.{ .turn_end = .{
-                    .message = error_msg,
+                const final_error_msg = state.final_message orelse error_msg;
+                try pushAgentEvent(event_stream, .{ .turn_end = .{
+                    .message = final_error_msg,
                     .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                 } });
 
@@ -1150,21 +1174,20 @@ fn runLoop(
             switch (assistant_message.stop_reason) {
                 .@"error", .aborted => {
                     // Emit turn_end and exit
-                    try event_stream.push(.{ .turn_end = .{
-                        .message = assistant_message,
+                    const final_error_msg = state.final_message orelse assistant_message;
+                    try pushAgentEvent(event_stream, .{ .turn_end = .{
+                        .message = final_error_msg,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
-                    // NOTE: We intentionally do NOT deinit assistant_message here.
-                    // AgentEventStream.push performs shallow copies, so event consumers
-                    // may read message fields after this branch exits. Deiniting would
-                    // cause use-after-free. The state clones (setFinalMessage/
-                    // appendClonedStateMessage) own independent copies; this local copy
-                    // is kept alive for the event stream lifetime.
+                    if (assistant_message.error_message.is_owned) {
+                        var owned_assistant_message = assistant_message;
+                        owned_assistant_message.deinit(allocator);
+                    }
                     break :outer;
                 },
                 .stop, .length, .content_filter => {
                     // Emit turn_end, check follow-up messages
-                    try event_stream.push(.{ .turn_end = .{
+                    try pushAgentEvent(event_stream, .{ .turn_end = .{
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                     } });
@@ -1179,10 +1202,10 @@ fn runLoop(
                             if (queued_steering.len > 0) {
                                 for (queued_steering) |steering_msg| {
                                     try context.appendMessage(steering_msg);
-                                    try event_stream.push(.{ .message_start = .{
+                                    try pushAgentEvent(event_stream, .{ .message_start = .{
                                         .message = steering_msg,
                                     } });
-                                    try event_stream.push(.{ .message_end = .{
+                                    try pushAgentEvent(event_stream, .{ .message_end = .{
                                         .message = steering_msg,
                                     } });
                                     try appendClonedStateMessage(&state.messages, allocator, steering_msg);
@@ -1201,10 +1224,10 @@ fn runLoop(
                                 // Add follow-up messages and continue outer loop
                                 for (follow_ups) |follow_up| {
                                     try context.appendMessage(follow_up);
-                                    try event_stream.push(.{ .message_start = .{
+                                    try pushAgentEvent(event_stream, .{ .message_start = .{
                                         .message = follow_up,
                                     } });
-                                    try event_stream.push(.{ .message_end = .{
+                                    try pushAgentEvent(event_stream, .{ .message_end = .{
                                         .message = follow_up,
                                     } });
                                     try appendClonedStateMessage(&state.messages, allocator, follow_up);
@@ -1232,7 +1255,7 @@ fn runLoop(
                     defer tool_result.deinitAfterToolResultsTransferred(allocator);
 
                     // Emit turn_end with tool results
-                    try event_stream.push(.{ .turn_end = .{
+                    try pushAgentEvent(event_stream, .{ .turn_end = .{
                         .message = assistant_message,
                         .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(tool_result.tool_results),
                     } });
@@ -1243,11 +1266,11 @@ fn runLoop(
                     // Add tool results to context with message_start/end events
                     for (tool_result.tool_results) |tool_result_msg| {
                         const msg: ai_types.Message = .{ .tool_result = tool_result_msg };
-                        try event_stream.push(.{ .message_start = .{
+                        try pushAgentEvent(event_stream, .{ .message_start = .{
                             .message = msg,
                         } });
                         try context.appendMessage(msg);
-                        try event_stream.push(.{ .message_end = .{
+                        try pushAgentEvent(event_stream, .{ .message_end = .{
                             .message = msg,
                         } });
                         try appendClonedStateMessage(&state.messages, allocator, msg);
@@ -1286,7 +1309,7 @@ fn runLoop(
     };
 
     // Emit agent_end
-    try event_stream.push(.{
+    try pushAgentEvent(event_stream, .{
         .agent_end = .{
             .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
         },
