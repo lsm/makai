@@ -12,9 +12,17 @@
 //!   summary line plus the raw diagram source as a blockquote.
 //!
 //! Unknown LaTeX commands fall back to their raw form (with the leading
-//! backslash preserved) so nothing is silently dropped. The conversion is
-//! intentionally lightweight — no external math engine, no unicode table
-//! beyond a curated symbol map.
+//! backslash preserved and any `{...}` argument left intact) so nothing is
+//! silently dropped. The conversion is intentionally lightweight — no
+//! external math engine, no unicode table beyond a curated symbol map.
+//!
+//! All three transformations run in a single source pass so that:
+//! - the interior of any non-mermaid fenced code block is left untouched
+//!   (including any literal ```` ```mermaid ```` lines it may contain, and
+//!   any `$` shell variables / currency prose inside); and
+//! - the blockquote emitted for a Mermaid block is not subsequently
+//!   re-processed by the math pass (which would otherwise eat `$` labels in
+//!   the diagram source).
 
 const std = @import("std");
 
@@ -24,134 +32,131 @@ const std = @import("std");
 pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     if (source.len == 0) return allocator.dupe(u8, source);
 
-    // Pass 1: replace ```mermaid ... ``` blocks. Doing this first avoids any
-    // accidental `$`/math interaction with diagram source.
-    const after_mermaid = try replaceMermaidBlocks(allocator, source);
-    defer allocator.free(after_mermaid);
-
-    // Pass 2: replace $$...$$ block math. Done before inline math so the `$$`
-    // sentinel doesn't get mis-parsed as two adjacent `$...$` spans.
-    const after_block = try replaceBlockMath(allocator, after_mermaid);
-    defer allocator.free(after_block);
-
-    // Pass 3: replace $...$ inline math.
-    return replaceInlineMath(allocator, after_block);
-}
-
-// ---------------------------------------------------------------------------
-// Mermaid
-// ---------------------------------------------------------------------------
-
-const mermaid_fence = "```";
-const mermaid_lang = "mermaid";
-
-/// Replace each ```mermaid ... ``` block with a labeled summary plus the raw
-/// source as a Markdown blockquote. Fenced code blocks in other languages
-/// are passed through verbatim, including any literal ```mermaid lines they
-/// may contain — we walk the source line-by-line and track fence state so a
-/// mermaid syntax example embedded inside a `text`/`zig`/etc. block is not
-/// mis-transformed.
-fn replaceMermaidBlocks(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
 
-    var cursor: usize = 0;
-    while (cursor < source.len) {
-        const fence_pos = std.mem.indexOfPos(u8, source, cursor, mermaid_fence) orelse {
-            try writer.writeAll(source[cursor..]);
-            break;
-        };
-
-        // Only treat a fence that starts a line (optionally indented). A
-        // ``` buried inside a word is not a fence opener.
-        const line_start = lineStartBefore(source, fence_pos);
-        const indent = source[line_start..fence_pos];
-        if (!std.mem.allEqual(u8, indent, ' ') and indent.len != 0) {
-            // Not a real fence — emit one byte and keep scanning so we don't
-            // loop forever on the same position.
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
+    var i: usize = 0;
+    while (i < source.len) {
+        // 1. Fenced code block opener at line start. Consumed whole: mermaid
+        //    blocks are transformed in place, every other language is copied
+        //    verbatim (including any literal ```mermaid lines or `$` chars
+        //    inside). Emits directly to the writer so the math steps below
+        //    never re-process the interior.
+        if (isAtLineStart(source, i)) {
+            if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
-        // Scan the language tag immediately after the fence.
-        const tag_start = fence_pos + mermaid_fence.len;
-        const line_end = std.mem.indexOfScalarPos(u8, source, tag_start, '\n') orelse source.len;
-        const tag = std.mem.trim(u8, source[tag_start..line_end], " \t\r");
-
-        if (!std.mem.eql(u8, tag, mermaid_lang)) {
-            // Non-mermaid fenced code block. Walk line-by-line until the
-            // matching closing fence, copying everything verbatim — any
-            // literal ```mermaid lines inside belong to the code block, not
-            // to us.
-            const block_end = findCodeBlockClose(source, line_end);
-            const advance = block_end;
-            try writer.writeAll(source[cursor..advance]);
-            cursor = advance;
-            continue;
+        // 2. Block math `$$...$$`. Checked before inline `$` so the leading
+        //    `$$` isn't mis-parsed as two adjacent single-dollar spans.
+        if (i + 1 < source.len and source[i] == '$' and source[i + 1] == '$') {
+            if (try consumeBlockMath(allocator, writer, source, &i)) continue;
         }
 
-        // Mermaid block — find the closing fence.
-        const body_start = if (line_end < source.len) line_end + 1 else source.len;
-        const close_pos = findCodeBlockCloseLine(source, body_start);
-
-        // Emit any plain text leading up to the fence verbatim.
-        try writer.writeAll(source[cursor..fence_pos]);
-
-        const body_end = if (close_pos) |cp| cp else source.len;
-        const body = source[body_start..body_end];
-        const diagram_type = detectMermaidType(body);
-
-        // Header line: bold "Mermaid diagram: <type>" — bold survives the
-        // downstream markdown pass and clearly delineates the diagram region.
-        if (diagram_type.len > 0) {
-            try writer.print("**Mermaid diagram: {s}**\n\n", .{diagram_type});
-        } else {
-            try writer.writeAll("**Mermaid diagram**\n\n");
+        // 3. Inline math `$...$`.
+        if (source[i] == '$') {
+            if (try consumeInlineMath(writer, source, &i)) continue;
         }
 
-        // Raw source as a blockquote so the markdown renderer offsets it from
-        // surrounding prose. Skip blank trailing lines to avoid empty quote
-        // lines.
-        try writeQuotedLines(writer, body);
-
-        if (close_pos) |cp| {
-            // Skip past the closing fence line.
-            const after_close = std.mem.indexOfScalarPos(u8, source, cp, '\n');
-            cursor = if (after_close) |ac| ac + 1 else source.len;
-        } else {
-            cursor = source.len;
-        }
+        // 4. Plain byte.
+        try writer.writeByte(source[i]);
+        i += 1;
     }
 
     return out.toOwnedSlice();
 }
 
-/// Find the start of the next line that is exactly a fenced-code-block
-/// closer (a line whose only non-newline content is ``` optionally preceded
-/// by spaces). Returns the index just past the closer's trailing newline
-/// (or `source.len` when none is found, in which case the rest of the source
-/// is treated as part of the unterminated code block).
-fn findCodeBlockClose(source: []const u8, after_open_line_end: usize) usize {
-    var i = after_open_line_end;
-    while (i < source.len) {
-        const line_start = i;
-        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
-        const line = source[line_start..line_end];
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, trimmed, mermaid_fence)) {
-            // Position just past the newline that terminates the closer line.
-            return if (line_end < source.len) line_end + 1 else source.len;
-        }
-        i = if (line_end < source.len) line_end + 1 else source.len;
-    }
-    return source.len;
+fn isAtLineStart(source: []const u8, i: usize) bool {
+    if (i == 0) return true;
+    return source[i - 1] == '\n';
 }
 
-/// Same as findCodeBlockClose but returns the index of the closer's first
-/// backtick (used by the mermaid path so the body excludes the closing
-/// fence). Returns null when no closer is found.
+// ---------------------------------------------------------------------------
+// Fence + mermaid
+// ---------------------------------------------------------------------------
+
+const mermaid_fence = "```";
+const mermaid_lang = "mermaid";
+
+/// If `source[i..]` opens a fenced code block at line start (optionally
+/// indented), consume the whole block in place:
+///
+/// - mermaid blocks become the labeled summary + quoted source;
+/// - any other language is copied verbatim, including any literal
+///   ```` ```mermaid ```` lines or `$` chars inside.
+///
+/// Updates `*i` past the consumed block and returns true. Returns false
+/// (without modifying `*i`) if `i` is not at a fence opener.
+fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    const start = i.*;
+    // Allow leading space indentation (a line of spaces followed by ```).
+    var indent_end = start;
+    while (indent_end < source.len and source[indent_end] == ' ') indent_end += 1;
+    if (indent_end + mermaid_fence.len > source.len) return false;
+    if (!std.mem.eql(u8, source[indent_end .. indent_end + mermaid_fence.len], mermaid_fence)) return false;
+    // The fence opener must sit at the start of the line — we've already
+    // returned false above if `i` is not at a line start.
+
+    // Lang tag occupies the rest of the opener line.
+    const fence_end = indent_end + mermaid_fence.len;
+    const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
+    const tag = std.mem.trim(u8, source[fence_end..line_end], " \t\r");
+
+    // Body starts on the line after the opener.
+    const body_start = if (line_end < source.len) line_end + 1 else source.len;
+    const close_line_start = findCodeBlockCloseLine(source, body_start);
+    const body_end = if (close_line_start) |cls| cls else source.len;
+    const body = source[body_start..body_end];
+
+    if (std.mem.eql(u8, tag, mermaid_lang)) {
+        // Mermaid block — emit the label + quoted source directly to the
+        // writer. The caller never sees these bytes again so a later math
+        // step can't mutate the quoted diagram source.
+        const diagram_type = detectMermaidType(body);
+        if (diagram_type.len > 0) {
+            try writer.print("**Mermaid diagram: {s}**\n\n", .{diagram_type});
+        } else {
+            try writer.writeAll("**Mermaid diagram**\n\n");
+        }
+        try writeQuotedLines(writer, body);
+    } else {
+        // Non-mermaid fenced code block — copy opener, body, and closer
+        // verbatim so any literal ```mermaid lines or `$` shell vars inside
+        // survive unchanged.
+        try writer.writeAll(source[start..body_end]);
+        if (close_line_start) |cls| {
+            // Include the closer line together with its trailing newline so
+            // the verbatim copy stays byte-identical with the source.
+            const close_line_end = std.mem.indexOfScalarPos(u8, source, cls, '\n') orelse source.len;
+            const emit_end = if (close_line_end < source.len) close_line_end + 1 else source.len;
+            try writer.writeAll(source[cls..emit_end]);
+            i.* = emit_end;
+        } else {
+            // Unterminated fence — copy through the trailing newline if any.
+            i.* = body_end;
+            if (body_end < source.len and source[body_end] == '\n') {
+                try writer.writeByte('\n');
+                i.* = body_end + 1;
+            }
+        }
+        _ = allocator;
+        return true;
+    }
+
+    // Mermaid path: advance past the closing fence line (or end of source
+    // when unterminated).
+    if (close_line_start) |cls| {
+        const close_line_end = std.mem.indexOfScalarPos(u8, source, cls, '\n') orelse source.len;
+        i.* = if (close_line_end < source.len) close_line_end + 1 else source.len;
+    } else {
+        i.* = source.len;
+    }
+    return true;
+}
+
+/// Locate the first line at or after `body_start` whose content (after
+/// trimming whitespace) is exactly ```` ``` ````. Returns the absolute index
+/// of that closer line's first byte, or null if none is found.
 fn findCodeBlockCloseLine(source: []const u8, body_start: usize) ?usize {
     var i = body_start;
     while (i < source.len) {
@@ -163,12 +168,6 @@ fn findCodeBlockCloseLine(source: []const u8, body_start: usize) ?usize {
         i = if (line_end < source.len) line_end + 1 else source.len;
     }
     return null;
-}
-
-fn lineStartBefore(source: []const u8, pos: usize) usize {
-    var i: usize = pos;
-    while (i > 0 and source[i - 1] != '\n') i -= 1;
-    return i;
 }
 
 /// Inspect the first non-blank line of a Mermaid block to classify the
@@ -202,15 +201,21 @@ fn detectMermaidType(body: []const u8) []const u8 {
     return "";
 }
 
+/// Quote each line of `body` for the markdown renderer. Trailing whitespace
+/// and fully-blank lines are dropped, but **leading indentation is
+/// preserved** — mindmap, state diagrams, and several other Mermaid types
+/// rely on indentation as structural syntax, and the raw source must remain
+/// copyable from the transcript.
 fn writeQuotedLines(writer: *std.Io.Writer, body: []const u8) !void {
     var lines = std.mem.splitScalar(u8, body, '\n');
     var wrote_any = false;
     while (lines.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        // Skip blank lines so the quote stays tight.
-        if (line.len == 0) continue;
+        const line = std.mem.trimEnd(u8, raw_line, " \t\r");
+        // Skip lines that are entirely whitespace so the quote stays tight.
+        if (std.mem.allEqual(u8, line, ' ') or line.len == 0) continue;
         if (wrote_any) try writer.writeByte('\n');
         try writer.writeAll("> ");
+        // Preserve any leading indentation (e.g. mindmap nesting).
         try writer.writeAll(line);
         wrote_any = true;
     }
@@ -225,49 +230,31 @@ fn writeQuotedLines(writer: *std.Io.Writer, body: []const u8) !void {
 // Math
 // ---------------------------------------------------------------------------
 
-/// Replace `$$...$$` blocks. The closing `$$` may appear on the same line
-/// or on a later line; both forms are supported. An unterminated `$$` is
-/// passed through verbatim.
-fn replaceBlockMath(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
+/// Try to consume a `$$...$$` block math span at `*i`. Returns true and
+/// advances `*i` past the closing `$$` on success. Returns false (without
+/// modifying `*i`) when the bytes at `*i` aren't a real block-math opener —
+/// either because there's no closing `$$`, or because the opening looks like
+/// currency (`$$$` or `$$<digit>`). In the false cases the caller emits the
+/// `$` byte by byte via the default path so prose like "cost $$5 total"
+/// survives unchanged.
+fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    const open = i.*;
+    // Reject `$$$` — ambiguous with inline math like `$$$x$$`.
+    if (open + 2 < source.len and source[open + 2] == '$') return false;
+    // Reject `$$<digit>` — currency like "$$5" is not block math.
+    if (open + 2 < source.len and std.ascii.isDigit(source[open + 2])) return false;
 
-    var cursor: usize = 0;
-    while (cursor < source.len) {
-        const open = std.mem.indexOfPos(u8, source, cursor, "$$") orelse {
-            try writer.writeAll(source[cursor..]);
-            break;
-        };
-        // `$$$` is ambiguous — treat as not-a-block so we don't swallow the
-        // third `$` from inline math like `$$$x$$`. Require the char after
-        // the opening pair to not be another `$`.
-        if (open + 2 < source.len and source[open + 2] == '$') {
-            try writer.writeAll(source[cursor .. open + 1]);
-            cursor = open + 1;
-            continue;
-        }
+    const body_start = open + 2;
+    const close = std.mem.indexOfPos(u8, source, body_start, "$$") orelse {
+        // Unterminated — let the caller emit `$$` verbatim via the default
+        // byte-by-byte path. We must NOT swallow the remainder.
+        return false;
+    };
 
-        const body_start = open + 2;
-        const close = std.mem.indexOfPos(u8, source, body_start, "$$");
-
-        if (close) |cp| {
-            try writer.writeAll(source[cursor..open]);
-            const body = source[body_start..cp];
-            try writeBlockMath(allocator, writer, body);
-            cursor = cp + 2;
-        } else {
-            // Unterminated `$$` — not actually a math block. Emit the rest
-            // of the source verbatim (including the literal `$$`) so prose
-            // like "cost $$5 total" survives unchanged. Mirrors the inline
-            // math path, which writes the bare `$` and moves on when no
-            // closer is found.
-            try writer.writeAll(source[cursor..]);
-            cursor = source.len;
-        }
-    }
-
-    return out.toOwnedSlice();
+    const body = source[body_start..close];
+    try writeBlockMath(allocator, writer, body);
+    i.* = close + 2;
+    return true;
 }
 
 fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []const u8) !void {
@@ -291,66 +278,52 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
     if (!wrote_any) try writer.writeAll("> ");
 }
 
-/// Replace inline `$...$` spans. Refuses to match if the opening `$` is
-/// preceded by a non-space char or if the body contains a newline — both
-/// are common false-positive sources (currency, "5$ for x" etc.).
-fn replaceInlineMath(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    const writer = &out.writer;
+/// Try to consume an inline `$...$` math span at `*i`. Returns true and
+/// advances `*i` past the closing `$` on success. Returns false (leaving
+/// `*i` unmodified) when the bytes don't form a real inline-math span.
+///
+/// Common currency patterns are explicitly rejected by the open/close guards
+/// so they pass through verbatim:
+/// - `$5` — opening `$` followed by a digit.
+/// - `5$` — opening `$` preceded by a non-space char.
+/// - `$5-$10`, `$5/$10` — the second `$` is preceded or followed by a digit.
+fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    const open = i.*;
 
-    var cursor: usize = 0;
-    while (cursor < source.len) {
-        if (source[cursor] != '$') {
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
-        }
-        // Reject opening preceded by a non-space, non-start byte (e.g. "5$").
-        if (cursor > 0) {
-            const prev = source[cursor - 1];
-            if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '(' and prev != '[') {
-                try writer.writeByte(source[cursor]);
-                cursor += 1;
-                continue;
-            }
-        }
-        // Reject opening with no body or body starting with space.
-        if (cursor + 1 >= source.len or source[cursor + 1] == ' ' or source[cursor + 1] == '$') {
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
-        }
-
-        const body_start = cursor + 1;
-        const close = std.mem.indexOfScalarPos(u8, source, body_start, '$');
-        if (close == null) {
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
-        }
-        const cp = close.?;
-        // Closing `$` must not be preceded by whitespace and must not be
-        // followed by another `$` (which would be a different block math
-        // boundary handled elsewhere).
-        if (source[cp - 1] == ' ' or (cp + 1 < source.len and source[cp + 1] == '$')) {
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
-        }
-        const body = source[body_start..cp];
-        // Reject newlines — inline math is a single line.
-        if (std.mem.indexOfScalar(u8, body, '\n') != null) {
-            try writer.writeByte(source[cursor]);
-            cursor += 1;
-            continue;
-        }
-
-        try renderMathBody(writer, body);
-        cursor = cp + 1;
+    // Opening `$` must be preceded by whitespace, start-of-text, or an
+    // opening bracket — anything else (e.g. `5$`) is currency.
+    if (open > 0) {
+        const prev = source[open - 1];
+        if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '(' and prev != '[') return false;
+    }
+    // Body must start with a non-space, non-`$`, non-digit char. Digit
+    // adjacency (`$5`) indicates currency, not math.
+    if (open + 1 >= source.len) return false;
+    {
+        const next = source[open + 1];
+        if (next == ' ' or next == '$' or std.ascii.isDigit(next)) return false;
     }
 
-    return out.toOwnedSlice();
+    const body_start = open + 1;
+    const close = std.mem.indexOfScalarPos(u8, source, body_start, '$') orelse return false;
+
+    // Closing `$` must not be preceded by whitespace, must not be followed
+    // by another `$`, and must not be followed by a digit (the second `$`
+    // in `$5-$10` is currency). Preceded-by-digit is fine — `$x^2$` is real
+    // math where the closer abuts a superscript digit.
+    if (source[close - 1] == ' ') return false;
+    if (close + 1 < source.len) {
+        const after = source[close + 1];
+        if (after == '$' or std.ascii.isDigit(after)) return false;
+    }
+
+    const body = source[body_start..close];
+    // Reject newlines — inline math is a single line.
+    if (std.mem.indexOfScalar(u8, body, '\n') != null) return false;
+
+    try renderMathBody(writer, body);
+    i.* = close + 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +332,9 @@ fn replaceInlineMath(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
 /// Render a math body to `writer`. Walks the source, substituting recognized
 /// LaTeX commands and a small set of superscript/subscript forms. Anything
-/// unknown is emitted verbatim (with the backslash preserved) so the
-/// rendered output remains useful as a fallback.
+/// unknown is emitted verbatim (with the backslash preserved and any
+/// immediate `{...}` argument left intact) so the rendered output remains a
+/// useful fallback.
 fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
     var i: usize = 0;
     while (i < body.len) {
@@ -410,19 +384,32 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
 
             if (lookupCommand(name)) |sym| {
                 try writer.writeAll(sym);
-            } else {
-                // Unknown command — emit raw so it stays visible as a fallback.
-                try writer.writeByte('\\');
-                try writer.writeAll(name);
+                i = j;
+                continue;
             }
-            i = j;
+
+            // Unknown command — emit raw so it stays visible as a fallback.
+            // Preserve any immediate `{...}` argument verbatim so users can
+            // still read / copy unsupported LaTeX like `\boxed{x+1}` instead
+            // of having the brace-stripping pass run the operand into the
+            // command name (e.g. `\boxedx+1`).
+            try writer.writeByte('\\');
+            try writer.writeAll(name);
+            var after = j;
+            if (after < body.len and body[after] == '{') {
+                if (readGroup(body, after)) |grp| {
+                    try writer.writeAll(body[after..grp.end]);
+                    after = grp.end;
+                }
+            }
+            i = after;
             continue;
         }
 
         if (c == '^' or c == '_') {
             // Superscript / subscript. If the next char is `{`, read until
             // `}`; otherwise consume a single char. Render with Unicode
-            // superscripts when possible; otherwise emit `^x` / `_x` as
+            // superscripts when possible; otherwise emit `^x` / `^{x}` as
             // plain-text fallback (still readable, no semantic loss).
             try writeScript(writer, body, &i);
             continue;
@@ -455,7 +442,9 @@ fn writeScript(writer: *std.Io.Writer, body: []const u8, i: *usize) !void {
 
     var token_start = i.*;
     var token_end: usize = undefined;
+    var had_braces = false;
     if (body[i.*] == '{') {
+        had_braces = true;
         token_start = i.* + 1;
         const close = std.mem.indexOfScalarPos(u8, body, token_start, '}') orelse {
             // No closing brace — emit marker + rest verbatim.
@@ -487,10 +476,13 @@ fn writeScript(writer: *std.Io.Writer, body: []const u8, i: *usize) !void {
     const token = body[token_start..token_end];
     if (marker == '^') {
         if (writeSuperscript(writer, token)) return;
-        try writer.print("^{s}", .{token});
+        // Preserve the source brace grouping in the fallback so multi-char
+        // scripts like `^{abc}` render as `^{abc}` (not `^abc`); single-char
+        // fallbacks stay in the bare `^x` form for readability.
+        if (had_braces) try writer.print("^{{{s}}}", .{token}) else try writer.print("^{s}", .{token});
     } else {
         if (writeSubscript(writer, token)) return;
-        try writer.print("_{s}", .{token});
+        if (had_braces) try writer.print("_{{{s}}}", .{token}) else try writer.print("_{s}", .{token});
     }
 }
 
@@ -548,9 +540,9 @@ const BraceGroup = struct {
     end: usize,
 };
 
-/// Read a `{...}` group starting at `i` (after skipping leading spaces).
-/// Returns null if `i` doesn't point at a `{`. Handles nested braces via a
-/// depth counter so `\frac{\frac{a}{b}}{c}` renders as `((a)/(b))/(c)`.
+/// Read a `{...}` group starting at `i`. Returns null if `i` doesn't point
+/// at a `{`. Handles nested braces via a depth counter so
+/// `\frac{\frac{a}{b}}{c}` renders as `((a)/(b))/(c)`.
 fn readGroup(body: []const u8, i: usize) ?BraceGroup {
     if (i >= body.len or body[i] != '{') return null;
     var depth: usize = 1;
@@ -910,8 +902,9 @@ test "multi-line block math collapses to quoted lines" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "> ∑") != null);
     // `^n` becomes Unicode superscript n; `_{i=1}` has no single-char form
-    // so it stays as the literal `_{i=1}` fallback.
+    // so the brace-preserving fallback emits `_{i=1}`.
     try std.testing.expect(std.mem.indexOf(u8, out, "ⁿ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "_{i=1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "xᵢ") != null);
 }
 
@@ -920,6 +913,22 @@ test "inline math ignores dollar signs used as currency" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     // No transform should occur — currency stays as-is.
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "currency price range preserves both dollar signs" {
+    const src = "price $5-$10 today";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The second `$` in `$5-$10` is adjacent to digits on both sides and
+    // must NOT be treated as a math closer.
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "currency slash range preserves both dollar signs" {
+    const src = "split $5/$10 ratio";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
 }
 
@@ -946,15 +955,25 @@ test "unknown LaTeX command falls back to raw with backslash" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\\zzzx") != null);
 }
 
+test "unknown LaTeX command with brace argument preserves group" {
+    const src = "boxed $\\boxed{x+1}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Unknown `\boxed` must survive together with its `{x+1}` argument so
+    // the raw fallback stays copyable (NOT `\boxedx+1`).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed{x+1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxedx") == null);
+}
+
 test "mermaid block replaced with labeled summary" {
     const src = "intro\n\n```mermaid\nflowchart TD\n  A --> B\n```\n\noutro";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "**Mermaid diagram: flowchart**") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "> flowchart TD") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "> A --> B") != null);
-    // Raw fence must be gone — copy behavior relies on raw text being inside
-    // the quoted section, but the fence delimiters themselves are stripped.
+    // Indentation from the source is preserved ("> " + "  A --> B").
+    try std.testing.expect(std.mem.indexOf(u8, out, ">   A --> B") != null);
+    // Raw fence delimiters stripped.
     try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "intro") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "outro") != null);
@@ -991,6 +1010,44 @@ test "unterminated non-mermaid code block passes through verbatim" {
     try std.testing.expectEqualStrings(src, out);
 }
 
+test "math inside non-mermaid fenced code block is not transformed" {
+    // Shell-style `$$` (PID var) and `$x$` inside a bash block must survive
+    // unchanged — the math pass only runs outside fenced code.
+    const src = "```sh\necho $$ $HOME\nx=5\n```\nthen $\\alpha$ math";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Code block interior unchanged.
+    try std.testing.expect(std.mem.indexOf(u8, out, "echo $$ $HOME") != null);
+    // Outside-fence math still rendered.
+    try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$\\alpha$") == null);
+}
+
+test "mermaid quoted source preserves indentation" {
+    // Indentation-sensitive diagram (mindmap shape) — leading spaces must
+    // survive so the raw spec stays copyable from the transcript.
+    const src = "```mermaid\nmindmap\n  root\n    child\n      grandchild\n```";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // `> ` prefix + original indentation, so "  root" becomes ">   root".
+    try std.testing.expect(std.mem.indexOf(u8, out, ">   root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ">     child") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ">       grandchild") != null);
+}
+
+test "mermaid source with dollar labels is not mutated by math pass" {
+    // Mermaid label `$x$` and `$5-$10` must reach the output unchanged —
+    // the quoted body is emitted directly by the fence consumer and never
+    // re-processed by the inline math step.
+    const src = "```mermaid\nflowchart TD\n  A[$x$] --> B[$5-$10]\n```";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "A[$x$]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "B[$5-$10]") != null);
+    // Math pass did not eat the labels.
+    try std.testing.expect(std.mem.indexOf(u8, out, "A[x]") == null);
+}
+
 test "text style commands drop their wrapper" {
     const src = "math $\\textbf{X} + \\textit{Y} + \\textrm{Z} + \\texttt{W}$";
     const out = try preprocess(std.testing.allocator, src);
@@ -1024,6 +1081,13 @@ test "fraction command keeps operands visible" {
     // \frac{a}{b} renders as (a)/(b) so both operands and the slash survive.
     try std.testing.expect(std.mem.indexOf(u8, out, "(a)/(b)") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\frac") == null);
+}
+
+test "nested fraction renders fully" {
+    const src = "deep $\\frac{\\frac{a}{b}}{c}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "((a)/(b))/(c)") != null);
 }
 
 test "style modifiers are silently dropped" {
