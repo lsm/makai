@@ -300,6 +300,7 @@ pub fn Program(comptime Model: type) type {
             // Drain queued messages before resetting the frame arena. This preserves
             // payloads created from the previous frame allocator until delivery.
             try self.drainMessageQueue();
+            if (!self.isRunning()) return;
 
             self.resetFrameAllocator();
 
@@ -316,6 +317,7 @@ pub fn Program(comptime Model: type) type {
                         .height = size.rows,
                     } });
                     try self.processCommand(cmd);
+                    if (!self.isRunning()) return;
                 }
             }
 
@@ -333,6 +335,7 @@ pub fn Program(comptime Model: type) type {
                     };
                     if (user_cmd) |cmd| {
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -349,6 +352,7 @@ pub fn Program(comptime Model: type) type {
                         } };
                         const cmd = self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -364,6 +368,7 @@ pub fn Program(comptime Model: type) type {
                         } };
                         const cmd = self.dispatchToModel(user_msg);
                         try self.processCommand(cmd);
+                        if (!self.isRunning()) return;
                     }
                 }
             }
@@ -429,8 +434,7 @@ pub fn Program(comptime Model: type) type {
                 switch (key.key) {
                     .char => |c| {
                         if (c == 'c') {
-                            self.running.store(false, .release);
-                            return null;
+                            return .quit;
                         }
                         // Handle Ctrl+Z for suspend
                         if (c == 'z' and self.options.suspend_enabled) {

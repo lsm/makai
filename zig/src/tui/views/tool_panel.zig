@@ -61,12 +61,21 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         defer if (intent) |value| allocator.free(value);
         if (intent) |value| if (value.len > 0) try meta_writer.print(" - {s}", .{value});
         if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
-            try meta_writer.print(" ({d}->{d} bytes", .{ tool.raw_total_bytes, tool.returned_total_bytes });
+            const raw = try formatBytes(allocator, tool.raw_total_bytes);
+            defer allocator.free(raw);
+            const returned = try formatBytes(allocator, tool.returned_total_bytes);
+            defer allocator.free(returned);
+            try meta_writer.print(" ({s}->{s}", .{ raw, returned });
             if (tool.estimated_returned_tokens > 0) try meta_writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
             try meta_writer.writeByte(')');
         }
-        if (tool.truncated) try meta_writer.writeAll(" truncated · show full");
-        if (tool.artifact_refs.len > 0) try meta_writer.print(" · artifact:{s}", .{tool.artifact_refs});
+        if (tool.artifact_count > 0) {
+            const raw = try formatBytes(allocator, tool.raw_total_bytes);
+            defer allocator.free(raw);
+            try meta_writer.print(" · {s} artifact · open/view/filter", .{raw});
+        } else if (tool.truncated) {
+            try meta_writer.writeAll(" · preview capped");
+        }
         if (tool.expanded) try meta_writer.writeAll(" · expanded");
         const prefix_visible = 5 + tui_text.visibleWidth(status) + tui_text.visibleWidth(tool.label);
         const remaining = (options.width -| 4) -| prefix_visible;
@@ -84,6 +93,12 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
     return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+}
+
+fn formatBytes(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
+    if (bytes < 1024) return std.fmt.allocPrint(allocator, "{d}B", .{bytes});
+    if (bytes < 1024 * 1024) return std.fmt.allocPrint(allocator, "{d}KB", .{(bytes + 1023) / 1024});
+    return std.fmt.allocPrint(allocator, "{d}MB", .{(bytes + 1024 * 1024 - 1) / (1024 * 1024)});
 }
 
 fn invocationDescription(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
@@ -106,7 +121,12 @@ fn statusText(status: tui_state.ToolStatus) []const u8 {
 }
 
 fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, tool: tui_state.ToolEntry, width: usize, height: usize, rows: usize) !usize {
-    const source = if (tool.output.items.len > 0) tool.output.items else tool.args_json;
+    const source = if (tool.display_preview.len > 0)
+        tool.display_preview
+    else if (tool.output.items.len > 0)
+        tool.output.items
+    else
+        tool.args_json;
     if (source.len == 0) return rows;
     const available_lines = height - rows;
     if (available_lines == 0) return rows;

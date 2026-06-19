@@ -415,22 +415,24 @@ fn summarizeArtifactBackedOutput(allocator: std.mem.Allocator, text: []const u8,
     if (stderr.len > 0) {
         return std.fmt.allocPrint(
             allocator,
-            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nretrieve_full_output: call artifact_retrieve with reference exactly \"{s}\"\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
-            .{ text.len, countLines(text), artifact_path, artifact_path, head, tail, stderr },
+            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nmodel_safe_retrieval: use artifact_retrieve mode \"preview\" (default), \"range\", or \"grep\" with this reference. Use \"full_for_context\" only when the complete output is required by the model.\ndisplay: the TUI can open the full artifact without inserting it into model context.\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
+            .{ text.len, countLines(text), artifact_path, head, tail, stderr },
         );
     }
     return std.fmt.allocPrint(
         allocator,
-        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nretrieve_full_output: call artifact_retrieve with reference exactly \"{s}\"\nhead:\n{s}\ntail:\n{s}",
-        .{ text.len, countLines(text), artifact_path, artifact_path, head, tail },
+        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nmodel_safe_retrieval: use artifact_retrieve mode \"preview\" (default), \"range\", or \"grep\" with this reference. Use \"full_for_context\" only when the complete output is required by the model.\ndisplay: the TUI can open the full artifact without inserting it into model context.\nhead:\n{s}\ntail:\n{s}",
+        .{ text.len, countLines(text), artifact_path, head, tail },
     );
 }
 
-test "artifact-backed summary tells the model how to retrieve full output" {
+test "artifact-backed summary points the model at capped retrieval modes" {
     const summary = try summarizeArtifactBackedOutput(std.testing.allocator, "line 1\nline 2\n", "", ".makai/tool-artifacts/test.txt");
     defer std.testing.allocator.free(summary);
     try std.testing.expect(std.mem.indexOf(u8, summary, "artifact_reference: .makai/tool-artifacts/test.txt") != null);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "artifact_retrieve with reference exactly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "mode \"preview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "full_for_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "retrieve_full_output") == null);
 }
 
 fn sanitizeKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {

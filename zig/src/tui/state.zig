@@ -139,6 +139,7 @@ pub const ToolEntry = struct {
     artifact_count: u32 = 0,
     artifact_refs: []u8 = &.{},
     truncated: bool = false,
+    display_preview: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
@@ -157,6 +158,7 @@ pub const ToolEntry = struct {
         allocator.free(self.args_json);
         self.output.deinit(allocator);
         if (self.artifact_refs.len > 0) allocator.free(self.artifact_refs);
+        if (self.display_preview.len > 0) allocator.free(self.display_preview);
         self.* = undefined;
     }
 };
@@ -1000,9 +1002,9 @@ pub const AppState = struct {
             var out: std.Io.Writer.Allocating = .init(self.allocator);
             defer out.deinit();
             const writer = &out.writer;
-            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.label, raw_total_bytes, returned_total_bytes });
-            if (artifact_refs.len > 0) try writer.print(": {s}", .{artifact_refs});
-            try writer.writeByte(']');
+            try writer.print("{s} [preview {d}->{d} bytes", .{ tool.label, raw_total_bytes, returned_total_bytes });
+            if (artifact_refs.len > 0) try writer.writeAll("; artifact available in TUI viewer");
+            try writer.writeAll("]");
             const indicator = try out.toOwnedSlice();
             defer self.allocator.free(indicator);
             try self.appendTranscript(.tool, indicator);
@@ -1296,7 +1298,7 @@ fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, result_json
     }
     if (estimated_tokens > 0) try writer.print(" ~{d} tok", .{estimated_tokens});
     if (artifact_count > 0) try writer.print(" artifacts={d}", .{artifact_count});
-    if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" show full");
+    if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" preview-capped");
     if (is_error and result_json.len > 0) {
         const preview = try clipSummaryArg(allocator, result_json);
         defer allocator.free(preview);
@@ -2173,7 +2175,11 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expect(state.tools.items[0].truncated);
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "show full") != null);
+    var found_marker = false;
+    for (state.transcript.items) |entry| {
+        if (std.mem.indexOf(u8, entry.text.items, "artifact available") != null) found_marker = true;
+    }
+    try std.testing.expect(found_marker);
 }
 
 test "AppState appends visible transcript row for tool execution errors" {

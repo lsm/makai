@@ -189,6 +189,24 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             }
         }
 
+        /// Push an event, waiting for the consumer to make room when the ring is full.
+        ///
+        /// Use this for ordered producer streams where dropping an event would corrupt
+        /// the logical stream. UI projection layers that can tolerate loss should still
+        /// prefer an explicit drop-oldest policy at that boundary.
+        pub fn pushBlocking(self: *Self, event: T) bool {
+            while (true) {
+                self.push(event) catch |err| switch (err) {
+                    error.QueueFull => {
+                        if (self.completed.load(.acquire)) return false;
+                        waitTimeoutMs(self, self.futex.load(.acquire), 1);
+                        continue;
+                    },
+                };
+                return true;
+            }
+        }
+
         pub fn complete(self: *Self, result: R) void {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
@@ -524,6 +542,19 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
         try stream.push(@intCast(i));
     }
     try std.testing.expectError(error.QueueFull, stream.push(TestStream.usable_capacity));
+}
+
+test "EventStream pushBlocking reports completed full stream" {
+    const TestStream = EventStream(u32, bool);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    for (0..TestStream.usable_capacity) |i| {
+        try stream.push(@intCast(i));
+    }
+    stream.complete(true);
+
+    try std.testing.expect(!stream.pushBlocking(TestStream.usable_capacity));
 }
 
 test "EventStream ring buffer wrap-around preserves order" {

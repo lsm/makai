@@ -308,7 +308,10 @@ pub const Terminal = struct {
             };
         };
 
-        try term.setup();
+        term.setup() catch |err| {
+            term.cleanup();
+            return err;
+        };
         return term;
     }
 
@@ -322,6 +325,15 @@ pub const Terminal = struct {
 
         // Enable raw mode
         try platform.enableRawMode(&self.state);
+
+        // Clear terminal modes that can survive a crashed previous run. This is
+        // especially important for Kitty keyboard protocol: if left enabled,
+        // Ctrl+C reaches the user's shell as CSI bytes like `99;5u`.
+        try self.writeBytes(ansi.kitty_keyboard_disable_all);
+        try self.writeBytes(ansi.kitty_keyboard_reset);
+        try self.writeBytes(ansi.bracketed_paste_disable);
+        try self.writeBytes("\x1b[?1007l");
+        try self.writeBytes(mouse.disableSequence(.normal));
 
         // Enter alternate screen
         if (self.config.alt_screen) {
@@ -373,7 +385,9 @@ pub const Terminal = struct {
     pub fn cleanup(self: *Terminal) void {
         // Disable Kitty keyboard protocol
         if (self.config.kitty_keyboard) {
+            self.writeBytes(ansi.kitty_keyboard_disable_all) catch {};
             self.writeBytes(ansi.kitty_keyboard_disable) catch {};
+            self.writeBytes(ansi.kitty_keyboard_reset) catch {};
         }
 
         if (self.unicode_width_caps.mode_2027) {

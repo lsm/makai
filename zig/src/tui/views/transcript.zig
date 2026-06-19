@@ -249,11 +249,22 @@ fn appendToolSummary(
         try writer.print(", {d}B", .{tool.output.items.len});
     }
     if (tool.estimated_returned_tokens > 0) try writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
-    if (tool.artifact_count > 0) try writer.print(", {d} artifact{s}", .{ tool.artifact_count, if (tool.artifact_count == 1) "" else "s" });
+    if (tool.artifact_count > 0) {
+        if (tool.raw_total_bytes > 0) {
+            try writer.print(", {d}KB artifact", .{(tool.raw_total_bytes + 1023) / 1024});
+        } else {
+            try writer.print(", {d} artifact{s}", .{ tool.artifact_count, if (tool.artifact_count == 1) "" else "s" });
+        }
+        try writer.writeAll(", open/view/filter");
+    }
     try writer.writeByte(']');
     if (tool.expanded) {
         try writer.print("\n  args: {s}", .{tool.args_json});
-        if (tool.output.items.len > 0) try writer.print("\n  output:\n{s}", .{tool.output.items});
+        if (tool.display_preview.len > 0) {
+            try writer.print("\n  output preview:\n{s}", .{tool.display_preview});
+        } else if (tool.output.items.len > 0) {
+            try writer.print("\n  output:\n{s}", .{tool.output.items});
+        }
         if (tool.artifact_refs.len > 0) try writer.print("\n  artifacts: {s}", .{tool.artifact_refs});
     }
 

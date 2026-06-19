@@ -448,7 +448,7 @@ fn pushOwnedEvent(allocator: std.mem.Allocator, stream: *event_stream.AssistantM
         ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
     }
 
-    try stream.push(owned);
+    if (!stream.pushBlocking(owned)) return error.StreamCompleted;
 }
 
 /// Event parsed from a response SSE event

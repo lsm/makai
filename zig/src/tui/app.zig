@@ -26,6 +26,7 @@ const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const tools_common = @import("tools/common");
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -35,9 +36,86 @@ pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
+const artifact_preview_head_lines = 40;
+const artifact_preview_tail_lines = 20;
 
 fn isSecretLoginPrompt(message: []const u8) bool {
     return std.mem.indexOf(u8, message, "API key") != null or std.mem.indexOf(u8, message, "api key") != null;
+}
+
+fn firstArtifactReference(refs: []const u8) ?[]const u8 {
+    var iter = std.mem.splitSequence(u8, refs, ", ");
+    while (iter.next()) |ref| {
+        const trimmed = std.mem.trim(u8, ref, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, ".makai/tool-artifacts/")) return trimmed;
+    }
+    return null;
+}
+
+fn artifactDisplayPreview(allocator: std.mem.Allocator, data: []const u8, raw_total_bytes: u64, reference: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    const line_count = countTextLines(data);
+    const byte_count = if (raw_total_bytes > 0) raw_total_bytes else data.len;
+    try writer.print("raw output preview ({d} bytes, {d} lines)\n", .{ byte_count, line_count });
+    try writer.writeAll("head:\n");
+    try writeFirstTextLines(writer, data, artifact_preview_head_lines);
+    if (line_count > artifact_preview_head_lines + artifact_preview_tail_lines) {
+        try writer.writeAll("\n...\ntail:\n");
+        try writeLastTextLines(allocator, writer, data, artifact_preview_tail_lines);
+    }
+    try writer.print("\nartifact: {s}\nCtrl+O or /artifact opens the full local output. Ask for grep/range to filter without loading full output into context.", .{reference});
+    return out.toOwnedSlice();
+}
+
+fn writeFirstTextLines(writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
+    var emitted: usize = 0;
+    var iter = std.mem.splitScalar(u8, data, '\n');
+    while (iter.next()) |line| {
+        if (emitted >= max_lines) break;
+        try writer.writeAll(line);
+        try writer.writeByte('\n');
+        emitted += 1;
+    }
+}
+
+fn writeLastTextLines(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
+    if (max_lines == 0) return;
+    const capacity = max_lines + 1;
+    var starts = try allocator.alloc(usize, capacity);
+    defer allocator.free(starts);
+    var starts_len: usize = 1;
+    starts[0] = 0;
+    for (data, 0..) |c, i| {
+        if (c == '\n' and i + 1 < data.len) {
+            if (starts_len == capacity) {
+                std.mem.copyForwards(usize, starts[0 .. capacity - 1], starts[1..capacity]);
+                starts_len -= 1;
+            }
+            starts[starts_len] = i + 1;
+            starts_len += 1;
+        }
+    }
+    const start_index = if (starts_len > max_lines) starts_len - max_lines else 0;
+    var i = start_index;
+    while (i < starts_len) : (i += 1) {
+        const start = starts[i];
+        const end = if (i + 1 < starts_len) starts[i + 1] - 1 else data.len;
+        try writer.writeAll(data[start..end]);
+        try writer.writeByte('\n');
+    }
+}
+
+fn countTextLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var lines: usize = 1;
+    for (text) |c| {
+        if (c == '\n') lines += 1;
+    }
+    if (text[text.len - 1] == '\n') lines -= 1;
+    return lines;
 }
 
 pub const ApprovalWaiter = struct {
@@ -344,6 +422,7 @@ pub const App = struct {
         // Replay events into transcript and status counters.
         for (loaded.events.items) |*event| {
             try self.state.applyEvent(event.*);
+            self.hydrateToolDisplayPreview(event.*) catch |err| try self.recordError(@errorName(err));
         }
         if (self.session) |*session| session.clearQueuedMessages();
         self.state.clearQueuedPreviews();
@@ -629,7 +708,9 @@ pub const App = struct {
                 try self.allocator.dupe(u8, pd)
             else
                 null;
-            errdefer if (provider_data) |pd| self.allocator.free(pd);
+            errdefer if (!owned) {
+                if (provider_data) |pd| self.allocator.free(pd);
+            };
 
             if (storage.providers.fetchRemove(provider_id)) |removed| {
                 self.allocator.free(removed.key);
@@ -838,6 +919,7 @@ pub const App = struct {
             defer ev.deinit(self.allocator);
             self.saveEvent(ev);
             try self.state.applyEvent(ev);
+            try self.hydrateToolDisplayPreview(ev);
         }
         self.refreshQueuedCounts();
     }
@@ -866,14 +948,15 @@ pub const App = struct {
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.state.stream_aborted = false;
-        try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
+                if (err == error.QueueFull) return err;
                 try self.state.status.setError(self.allocator, @errorName(err));
                 try self.state.appendTranscript(.@"error", @errorName(err));
                 return;
             };
         }
+        try self.state.appendUserMessage(trimmed);
         self.refreshQueuedCounts();
     }
 
@@ -964,6 +1047,7 @@ pub const App = struct {
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
+            .open_artifact_viewer => try self.openLatestArtifact(),
             .none => {},
         }
         if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
@@ -974,6 +1058,10 @@ pub const App = struct {
     }
 
     pub fn recordError(self: *App, message: []const u8) !void {
+        if (std.mem.eql(u8, message, "QueueFull")) {
+            try self.state.status.setError(self.allocator, "stream backlog; draining");
+            return;
+        }
         try self.state.status.setError(self.allocator, message);
         try self.state.appendTranscript(.@"error", message);
     }
@@ -1041,6 +1129,53 @@ pub const App = struct {
         }
         self.stageClipboard(text);
         self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
+    }
+
+    fn copyPreview(self: *App) void {
+        if (self.state.preview.content.len == 0) {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        }
+        self.stageClipboard(self.state.preview.content);
+        self.state.appendTranscript(.system, "copied preview to clipboard") catch {};
+    }
+
+    fn openLatestArtifact(self: *App) !void {
+        var i = self.state.tools.items.len;
+        while (i > 0) {
+            i -= 1;
+            const refs = self.state.tools.items[i].artifact_refs;
+            const reference = firstArtifactReference(refs) orelse continue;
+            const data = tools_common.retrieveArtifact(self.allocator, reference, 64 * 1024 * 1024) catch |err| {
+                try self.recordError(@errorName(err));
+                return;
+            };
+            defer self.allocator.free(data);
+            try self.state.setPreview(.artifact, reference, data);
+            return;
+        }
+        try self.state.appendTranscript(.system, "no local artifact to open");
+    }
+
+    fn hydrateToolDisplayPreview(self: *App, event: tui_runtime.TuiEvent) !void {
+        switch (event) {
+            .tool_execution_end => |payload| {
+                if (payload.artifact_count == 0) return;
+                const reference = firstArtifactReference(payload.artifact_refs.slice()) orelse return;
+                const data = tools_common.retrieveArtifact(self.allocator, reference, 64 * 1024 * 1024) catch return;
+                defer self.allocator.free(data);
+                const preview = try artifactDisplayPreview(self.allocator, data, payload.raw_total_bytes, reference);
+                errdefer self.allocator.free(preview);
+                for (self.state.tools.items) |*tool| {
+                    if (!std.mem.eql(u8, tool.id, payload.tool_call_id.slice())) continue;
+                    if (tool.display_preview.len > 0) self.allocator.free(tool.display_preview);
+                    tool.display_preview = preview;
+                    return;
+                }
+                self.allocator.free(preview);
+            },
+            else => {},
+        }
     }
 
     fn cycleThinkingLevel(self: *App) void {
@@ -1358,8 +1493,12 @@ pub const TuiModel = struct {
                             app.state.toggleLatestToolExpanded();
                             return .none;
                         },
+                        'o' => {
+                            app.openLatestArtifact() catch |err| app.recordError(@errorName(err)) catch {};
+                            return .none;
+                        },
                         'y' => {
-                            app.copyLastAssistant();
+                            if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
                             app.flushClipboard(ctx);
                             return .none;
                         },
@@ -1470,6 +1609,18 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
+                if (app.state.mode == .preview) {
+                    switch (key.key) {
+                        .up => app.state.preview.scroll += 1,
+                        .down => app.state.preview.scroll -|= 1,
+                        .page_up => app.state.preview.scroll += 10,
+                        .page_down => app.state.preview.scroll -|= 10,
+                        .home => app.state.preview.scroll = 0,
+                        .escape => app.state.mode = .normal,
+                        else => {},
+                    }
+                    return .none;
+                }
                 switch (key.key) {
                     .enter => {
                         if (key.modifiers.shift) {
@@ -1490,18 +1641,21 @@ pub const TuiModel = struct {
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
+                                if (err == error.QueueFull) consumed = false;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         } else if (app.state.status.streaming) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
+                                    if (err == error.QueueFull) consumed = false;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
+                                    if (err == error.QueueFull) consumed = false;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
@@ -1512,8 +1666,9 @@ pub const TuiModel = struct {
                                 if (std.mem.startsWith(u8, trimmed, "/")) {
                                     app.submit(text) catch |err| {
                                         if (err == error.QuitRequested) return .quit;
+                                        if (err == error.QueueFull) consumed = false;
                                         app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                        app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                        if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                                     };
                                 } else {
                                     consumed = false;
@@ -1522,8 +1677,9 @@ pub const TuiModel = struct {
                         } else {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
+                                if (err == error.QueueFull) consumed = false;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         }
                         if (consumed) {

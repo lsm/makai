@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ai_types = @import("ai_types");
+const compat = @import("compat");
 const common = @import("tools/common");
 
 pub const ProcessResult = struct {
@@ -62,8 +63,10 @@ fn runWithIo(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8,
 }
 
 fn saneChildEnv(allocator: std.mem.Allocator) !std.process.Environ.Map {
-    var environ_map = try std.process.Environ.createMap(runtimeEnviron(), allocator);
+    var environ_map = try compat.createEnvMap(allocator);
     errdefer environ_map.deinit();
+
+    try copyOperationalEnvFallbacks(allocator, &environ_map);
 
     if (isMissingOrEmpty(environ_map, "HOME") or
         isMissingOrEmpty(environ_map, "USER") or
@@ -85,18 +88,33 @@ fn saneChildEnv(allocator: std.mem.Allocator) !std.process.Environ.Map {
     return environ_map;
 }
 
-fn runtimeEnviron() std.process.Environ {
-    if (builtin.is_test) return std.testing.environ;
-
-    const Block = std.process.Environ.Block;
-    if (@hasField(Block, "use_global")) return .{ .block = .global };
-
-    if (!builtin.link_libc) return .empty;
-
-    const c_environ = std.c.environ;
-    var env_count: usize = 0;
-    while (c_environ[env_count] != null) : (env_count += 1) {}
-    return .{ .block = .{ .slice = @ptrCast(c_environ[0..env_count :null]) } };
+fn copyOperationalEnvFallbacks(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map) !void {
+    const names = [_][]const u8{
+        "PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "HOME",
+        "USER",
+        "LOGNAME",
+    };
+    for (&names) |name| {
+        if (!isMissingOrEmpty(environ_map.*, name)) continue;
+        const value = compat.getEnvVarOwned(allocator, name) catch continue;
+        defer allocator.free(value);
+        if (value.len > 0) try environ_map.put(name, value);
+    }
 }
 
 fn isMissingOrEmpty(environ_map: std.process.Environ.Map, key: []const u8) bool {
@@ -238,7 +256,7 @@ test "process runner spawns with initialized threaded io" {
 
 test "process runner supplies login-like env fallbacks" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    const argv = [_][]const u8{ "/bin/sh", "-c", "test -n \"$HOME\" && test -n \"$USER\" && test -n \"$LOGNAME\" && printf '%s\\n%s\\n%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\"" };
+    const argv = [_][]const u8{ "/bin/sh", "-c", "test -n \"$HOME\" && test -n \"$USER\" && test -n \"$LOGNAME\" && test -n \"$PATH\" && printf '%s\\n%s\\n%s\\n%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$PATH\"" };
     const result = try run(std.testing.allocator, &argv, .inherit, 5_000, null);
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);

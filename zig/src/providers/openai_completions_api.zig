@@ -1064,10 +1064,10 @@ fn pushOwnedEvent(
     event: ai_types.AssistantMessageEvent,
 ) void {
     const owned = ai_types.cloneAssistantMessageEvent(allocator, event) catch return;
-    stream.push(owned) catch {
+    if (!stream.pushBlocking(owned)) {
         var cleanup = owned;
         ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
-    };
+    }
 }
 
 fn isKimiModel(model: ai_types.Model) bool {
@@ -1484,10 +1484,6 @@ fn runThread(ctx: *ThreadCtx) void {
         }
 
         const n = compat_mod.http.readResponse(reader, &read_buf) catch {
-            if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
-                stop_reason = .length;
-                break :read_loop;
-            }
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("read error");
@@ -1496,10 +1492,6 @@ fn runThread(ctx: *ThreadCtx) void {
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
-            if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
-                stop_reason = .length;
-                break :read_loop;
-            }
             ctx.deinit();
             stream.markThreadDone();
             stream.completeWithError("sse parse error");
@@ -1765,21 +1757,11 @@ fn runThread(ctx: *ThreadCtx) void {
         if (tool_call_tracker_instance.completeCall(api_idx, allocator)) |tc| {
             content[idx] = .{ .tool_call = tc };
 
-            // Dupe the tool_call for the event so it owns its own memory
-            // The content array's tool_call is owned by the final message,
-            // and the event's tool_call needs its own copies for proper cleanup
-            const event_tc = ai_types.ToolCall{
-                .id = allocator.dupe(u8, tc.id) catch tc.id,
-                .name = allocator.dupe(u8, tc.name) catch tc.name,
-                .arguments_json = if (tc.arguments_json.len > 0) allocator.dupe(u8, tc.arguments_json) catch tc.arguments_json else "",
-                .thought_signature = if (tc.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
-            };
-
             // Emit toolcall_end event
             pushOwnedEvent(allocator, stream, .{
                 .toolcall_end = .{
                     .content_index = idx,
-                    .tool_call = event_tc,
+                    .tool_call = tc,
                     .partial = .{
                         .content = content[0..idx],
                         .api = model.api,
