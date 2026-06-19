@@ -421,7 +421,7 @@ pub const App = struct {
         }
         // Replay events into transcript and status counters.
         for (loaded.events.items) |*event| {
-            try self.state.applyEvent(event.*);
+            try self.applyRuntimeEvent(event.*);
             self.hydrateToolDisplayPreview(event.*) catch |err| try self.recordError(@errorName(err));
         }
         if (self.session) |*session| session.clearQueuedMessages();
@@ -914,14 +914,50 @@ pub const App = struct {
 
     pub fn drainEvents(self: *App) !void {
         var session = &(self.session orelse return);
+        var completed_agent_end = false;
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
+            if (ev == .agent_end and ev.agent_end.reason == .completed) completed_agent_end = true;
             self.saveEvent(ev);
-            try self.state.applyEvent(ev);
+            try self.applyRuntimeEvent(ev);
             try self.hydrateToolDisplayPreview(ev);
         }
         self.refreshQueuedCounts();
+        if (completed_agent_end and self.state.queue.total() > 0) {
+            session.resumeSession() catch |err| {
+                try self.state.status.setError(self.allocator, @errorName(err));
+                try self.state.appendTranscript(.@"error", @errorName(err));
+                return;
+            };
+            self.refreshQueuedCounts();
+        }
+    }
+
+    fn applyRuntimeEvent(self: *App, event: tui_runtime.TuiEvent) !void {
+        switch (event) {
+            .message_start => |payload| {
+                if (payload.role == .user) return;
+            },
+            .message_end => |payload| {
+                if (payload.role == .user) {
+                    try self.appendRuntimeUserMessage(payload.text.slice());
+                    return;
+                }
+            },
+            else => {},
+        }
+        try self.state.applyEvent(event);
+    }
+
+    fn appendRuntimeUserMessage(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        if (self.state.transcript.items.len > 0) {
+            const last = &self.state.transcript.items[self.state.transcript.items.len - 1];
+            if (last.kind == .user and std.mem.eql(u8, last.text.items, trimmed)) return;
+        }
+        try self.state.appendUserMessage(trimmed);
     }
 
     fn refreshQueuedCounts(self: *App) void {
@@ -2456,6 +2492,7 @@ const MockAppSession = struct {
     steer_count: usize = 0,
     queued_follow_up_count: usize = 0,
     submit_count: usize = 0,
+    resume_count: usize = 0,
     cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
@@ -2494,7 +2531,13 @@ const MockAppSession = struct {
     }
 
     fn resumeSession(ctx: ?*anyopaque) anyerror!void {
-        _ = ctx;
+        const self = ptr(ctx);
+        self.resume_count += 1;
+        if (self.queued_counts.steering > 0) {
+            self.queued_counts.steering -= 1;
+        } else if (self.queued_counts.follow_up > 0) {
+            self.queued_counts.follow_up -= 1;
+        }
     }
 
     fn cancel(ctx: ?*anyopaque) void {
@@ -2697,6 +2740,66 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expect(!model.app.?.state.status.streaming);
+}
+
+test "App drain keeps consecutive user messages distinct" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try mock.eventStream().push(.{ .message_start = .{ .role = .user } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run pwd")),
+    } });
+    try mock.eventStream().push(.{ .message_start = .{ .role = .user } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run uname -a")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("run pwd", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("run uname -a", app.state.transcript.items[1].text.items);
+}
+
+test "App drain auto-resumes remaining steering after completed turn" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run pwd");
+    try app.state.addQueuedPreview(.steering, "run uname -a");
+    app.state.setQueuedCounts(mock.queued_counts);
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
+}
+
+test "App drain does not auto-resume queued steering after error turn" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 1 } };
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .@"error" } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
 }
 
 test "TuiModel remote streaming Enter is ignored and preserves composer" {

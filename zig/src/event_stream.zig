@@ -83,6 +83,13 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.wait_for_thread_on_deinit) {
+                // Wake any blocking producer before waiting for it. Without this,
+                // a full queue can leave the producer stuck in pushBlocking() until
+                // this wait times out, after which deinit poisons memory that the
+                // producer may still touch.
+                self.completed.store(true, .release);
+                _ = self.futex.fetchAdd(1, .release);
+                self.wake(std.math.maxInt(u32));
                 _ = self.waitForThread(120_000);
             }
 
@@ -161,6 +168,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         /// before calling push(), and manage cleanup separately.
         pub fn push(self: *Self, event: T) !void {
             while (true) {
+                if (self.completed.load(.acquire)) return error.StreamCompleted;
                 const current_head = self.head.load(.acquire);
                 const current_tail = self.tail.load(.acquire);
 
@@ -202,6 +210,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                         waitTimeoutMs(self, self.futex.load(.acquire), 1);
                         continue;
                     },
+                    error.StreamCompleted => return false,
                 };
                 return true;
             }
@@ -557,6 +566,56 @@ test "EventStream pushBlocking reports completed full stream" {
     try std.testing.expect(!stream.pushBlocking(TestStream.usable_capacity));
 }
 
+const BlockingPushDeinitCtx = struct {
+    stream: *EventStream(u32, bool),
+    started: *std.atomic.Value(bool),
+    returned: *std.atomic.Value(bool),
+    ok: *std.atomic.Value(bool),
+
+    fn run(self: *@This()) void {
+        self.started.store(true, .release);
+        const pushed = self.stream.pushBlocking(TestStream.usable_capacity);
+        self.ok.store(pushed, .release);
+        self.returned.store(true, .release);
+        self.stream.markThreadDone();
+    }
+
+    const TestStream = EventStream(u32, bool);
+};
+
+test "EventStream deinit unblocks producer waiting in pushBlocking" {
+    const TestStream = EventStream(u32, bool);
+    const stream = try std.testing.allocator.create(TestStream);
+    stream.* = TestStream.init(std.testing.allocator);
+    stream.wait_for_thread_on_deinit = true;
+
+    for (0..TestStream.usable_capacity) |i| {
+        try stream.push(@intCast(i));
+    }
+
+    var started = std.atomic.Value(bool).init(false);
+    var returned = std.atomic.Value(bool).init(false);
+    var ok = std.atomic.Value(bool).init(true);
+    var ctx = BlockingPushDeinitCtx{
+        .stream = stream,
+        .started = &started,
+        .returned = &returned,
+        .ok = &ok,
+    };
+
+    const thread = try std.Thread.spawn(.{}, BlockingPushDeinitCtx.run, .{&ctx});
+    thread.detach();
+    while (!started.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    stream.deinit();
+    std.testing.allocator.destroy(stream);
+
+    try std.testing.expect(returned.load(.acquire));
+    try std.testing.expect(!ok.load(.acquire));
+}
+
 test "EventStream ring buffer wrap-around preserves order" {
     const TestStream = EventStream(u32, bool);
     var stream = TestStream.init(std.testing.allocator);
@@ -689,6 +748,7 @@ const MultiProducerStressCtx = struct {
                         std.Thread.yield() catch {};
                         continue;
                     },
+                    error.StreamCompleted => return,
                 };
                 break;
             }

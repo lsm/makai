@@ -1029,6 +1029,11 @@ pub const TuiRuntime = struct {
                     }
                     continue;
                 },
+                error.StreamCompleted => {
+                    var mutable = event;
+                    mutable.deinit(self.allocator);
+                    return;
+                },
             };
             return;
         }

@@ -171,6 +171,7 @@ fn pushAgentEvent(event_stream: *AgentEventStream, event: AgentEvent) !void {
                 }
                 continue;
             },
+            error.StreamCompleted => return err,
         };
         return;
     }

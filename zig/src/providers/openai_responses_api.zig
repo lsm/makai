@@ -807,8 +807,8 @@ fn runThread(ctx: *ThreadCtx) void {
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request cancelled");
+            stream.markThreadDone();
             return;
         }
     }
@@ -818,16 +818,16 @@ fn runThread(ctx: *ThreadCtx) void {
 
     const url = buildUrlWithSuffix(allocator, model.base_url, responsesPathForModel(model)) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom url");
+        stream.markThreadDone();
         return;
     };
 
     const auth = buildBearerAuthValue(allocator, api_key) catch {
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom auth");
+        stream.markThreadDone();
         return;
     };
 
@@ -835,8 +835,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("invalid URL");
+        stream.markThreadDone();
         return;
     };
 
@@ -846,16 +846,16 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     if (model.headers) |model_headers| {
@@ -864,8 +864,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("oom headers");
+                stream.markThreadDone();
                 return;
             };
         }
@@ -890,8 +890,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -914,15 +914,15 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request failed");
+            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -939,15 +939,15 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("send failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -963,15 +963,15 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("receive failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -1030,8 +1030,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
 
@@ -1059,8 +1059,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("responses request failed");
+        stream.markThreadDone();
         return;
     }
 
@@ -1144,8 +1144,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 allocator.free(auth);
                 allocator.free(url);
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -1154,8 +1154,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("read failed");
+            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
@@ -1164,8 +1164,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("parse failed");
+            stream.markThreadDone();
             return;
         };
 
@@ -1230,8 +1230,8 @@ fn runThread(ctx: *ThreadCtx) void {
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom compound id");
+                            stream.markThreadDone();
                             return;
                         };
 
@@ -1244,8 +1244,8 @@ fn runThread(ctx: *ThreadCtx) void {
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom item_id");
+                            stream.markThreadDone();
                             return;
                         };
                         item_id_to_content_index.put(duped_item_id, content_index) catch {
@@ -1254,8 +1254,8 @@ fn runThread(ctx: *ThreadCtx) void {
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom item map");
+                            stream.markThreadDone();
                             return;
                         };
 
@@ -1265,16 +1265,16 @@ fn runThread(ctx: *ThreadCtx) void {
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom compound map");
+                            stream.markThreadDone();
                             return;
                         }, compound_id) catch {
                             allocator.free(compound_id);
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom compound map");
+                            stream.markThreadDone();
                             return;
                         };
 
@@ -1283,8 +1283,8 @@ fn runThread(ctx: *ThreadCtx) void {
                             allocator.free(auth);
                             allocator.free(url);
                             ctx.deinit();
-                            stream.markThreadDone();
                             stream.completeWithError("oom tool call start");
+                            stream.markThreadDone();
                             return;
                         };
 
@@ -1480,8 +1480,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom result");
+            stream.markThreadDone();
             return;
         };
         content_slice[0] = .{ .text = .{ .text = "" } };
@@ -1490,8 +1490,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building result");
+            stream.markThreadDone();
             return;
         };
         var idx: usize = 0;
@@ -1503,8 +1503,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     allocator.free(auth);
                     allocator.free(url);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building thinking");
+                    stream.markThreadDone();
                     return;
                 },
             } };
@@ -1526,8 +1526,8 @@ fn runThread(ctx: *ThreadCtx) void {
                         allocator.free(auth);
                         allocator.free(url);
                         ctx.deinit();
-                        stream.markThreadDone();
                         stream.completeWithError("oom building text");
+                        stream.markThreadDone();
                         return;
                     },
                 },
@@ -1545,8 +1545,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const provider_dup = allocator.dupe(u8, model.provider) catch {
@@ -1555,8 +1555,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const model_dup = allocator.dupe(u8, model.id) catch {
@@ -1566,8 +1566,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(auth);
         allocator.free(url);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
 
@@ -1587,8 +1587,8 @@ fn runThread(ctx: *ThreadCtx) void {
     allocator.free(url);
     ctx.deinit();
 
-    stream.markThreadDone();
     stream.complete(out);
+    stream.markThreadDone();
 }
 
 pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, options: ?ai_types.StreamOptions, allocator: std.mem.Allocator) !*event_stream.AssistantMessageEventStream {

@@ -99,7 +99,9 @@ pub fn loadKimiModelsPublic(allocator: std.mem.Allocator) ![]ai_types.Model {
 
 fn loadKimiModels(allocator: std.mem.Allocator) ![]ai_types.Model {
     var region: []const u8 = "china"; // Default to China region
-    if (!builtin.is_test) {
+    if (builtin.is_test) {
+        if (!test_force_kimi_model) return emptyModels(allocator);
+    } else {
         var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return emptyModels(allocator);
         defer storage.deinit();
         if (!storage.providers.contains(kimi_provider_id)) return emptyModels(allocator);
@@ -736,6 +738,15 @@ test "loadProductionModels includes Kimi model when enabled" {
     try std.testing.expectEqual(@as(u32, 16_384), models[0].max_tokens);
 }
 
+test "loadProductionModels omits Kimi model by default in tests" {
+    const models = try loadProductionModels(std.testing.allocator);
+    defer deinitModels(std.testing.allocator, models);
+
+    for (models) |model| {
+        try std.testing.expect(!std.mem.eql(u8, kimi_provider_id, model.provider));
+    }
+}
+
 test "Kimi stored provider_data region normalizes to stable static values" {
     try std.testing.expectEqualStrings("global", kimiRegionFromProviderData("region:global"));
     try std.testing.expectEqualStrings("global", kimiRegionFromProviderData("region:moonshot"));
@@ -745,6 +756,8 @@ test "Kimi stored provider_data region normalizes to stable static values" {
 }
 
 test "refreshProductionModels keeps Kimi when Codex refresh fails" {
+    test_force_kimi_model = true;
+    defer test_force_kimi_model = false;
     test_force_codex_refresh_error = true;
     defer test_force_codex_refresh_error = false;
 

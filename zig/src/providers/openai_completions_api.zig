@@ -1104,8 +1104,8 @@ fn runThread(ctx: *ThreadCtx) void {
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request cancelled");
+            stream.markThreadDone();
             return;
         }
     }
@@ -1117,31 +1117,31 @@ fn runThread(ctx: *ThreadCtx) void {
     const url = if (std.mem.eql(u8, model.provider, "github-copilot"))
         buildUrlWithSuffix(allocator, model.base_url, "/chat/completions") catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building url");
+            stream.markThreadDone();
             return;
         }
     else
         buildUrlWithSuffix(allocator, model.base_url, "/v1/chat/completions") catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building url");
+            stream.markThreadDone();
             return;
         };
     defer allocator.free(url);
 
     const auth = buildBearerAuthValue(allocator, api_key) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom building auth header");
+        stream.markThreadDone();
         return;
     };
     defer allocator.free(auth);
 
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("invalid provider URL");
+        stream.markThreadDone();
         return;
     };
 
@@ -1149,20 +1149,20 @@ fn runThread(ctx: *ThreadCtx) void {
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     headers.append(allocator, .{ .name = "accept", .value = "text/event-stream" }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
 
@@ -1171,26 +1171,26 @@ fn runThread(ctx: *ThreadCtx) void {
         // Static Copilot headers (required for all requests)
         headers.append(allocator, .{ .name = "user-agent", .value = github_copilot.COPILOT_HEADERS.user_agent }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "editor-version", .value = github_copilot.COPILOT_HEADERS.editor_version }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "editor-plugin-version", .value = github_copilot.COPILOT_HEADERS.editor_plugin_version }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "copilot-integration-id", .value = github_copilot.COPILOT_HEADERS.copilot_integration_id }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
 
@@ -1202,8 +1202,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator,
         ) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         defer allocator.free(copilot_headers);
@@ -1211,8 +1211,8 @@ fn runThread(ctx: *ThreadCtx) void {
         for (copilot_headers) |h| {
             headers.append(allocator, h) catch {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("oom headers");
+                stream.markThreadDone();
                 return;
             };
         }
@@ -1245,8 +1245,8 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -1267,13 +1267,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to open request");
+            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -1288,13 +1288,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to send request");
+            stream.markThreadDone();
             return;
         };
 
@@ -1308,13 +1308,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to receive response");
+            stream.markThreadDone();
             return;
         };
 
@@ -1371,8 +1371,8 @@ fn runThread(ctx: *ThreadCtx) void {
             if (!retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
 
@@ -1402,8 +1402,8 @@ fn runThread(ctx: *ThreadCtx) void {
         defer if (!std.mem.eql(u8, error_msg, "openai request failed")) allocator.free(error_msg);
 
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError(error_msg);
+        stream.markThreadDone();
         return;
     }
 
@@ -1477,24 +1477,24 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
 
         const n = compat_mod.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("read error");
+            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
 
         const events = parser.feed(read_buf[0..n]) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("sse parse error");
+            stream.markThreadDone();
             return;
         };
 
@@ -1520,8 +1520,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     break :read_loop;
                 }
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("json parse error");
+                stream.markThreadDone();
                 return;
             };
 
@@ -1579,8 +1579,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     const name = tce.name orelse "";
                     _ = tool_call_tracker_instance.startCall(tce.api_index, content_index, id, name) catch {
                         ctx.deinit();
-                        stream.markThreadDone();
                         stream.completeWithError("oom tool call start");
+                        stream.markThreadDone();
                         return;
                     };
                     next_content_index += 1;
@@ -1607,8 +1607,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     // Append arguments delta
                     tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
                         ctx.deinit();
-                        stream.markThreadDone();
                         stream.completeWithError("oom tool call delta");
+                        stream.markThreadDone();
                         return;
                     };
 
@@ -1670,8 +1670,8 @@ fn runThread(ctx: *ThreadCtx) void {
         // Using a static empty string avoids an unnecessary allocation for the empty case
         var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building result");
+            stream.markThreadDone();
             return;
         };
         content[0] = .{ .text = .{ .text = "" } };
@@ -1685,15 +1685,15 @@ fn runThread(ctx: *ThreadCtx) void {
             .timestamp = compat_mod.time.nowMillis(),
         };
         ctx.deinit();
-        stream.markThreadDone();
         stream.complete(out);
+        stream.markThreadDone();
         return;
     }
 
     var content = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom building result");
+        stream.markThreadDone();
         return;
     };
     var idx: usize = 0;
@@ -1704,8 +1704,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 .thinking = allocator.dupe(u8, thinking.items) catch {
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building thinking");
+                    stream.markThreadDone();
                     return;
                 },
                 .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
@@ -1718,8 +1718,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building signature");
+                    stream.markThreadDone();
                     return;
                 } else null,
             },
@@ -1743,8 +1743,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building text");
+                    stream.markThreadDone();
                     return;
                 },
             },
@@ -1789,8 +1789,8 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     ctx.deinit();
-    stream.markThreadDone();
     stream.complete(out);
+    stream.markThreadDone();
 }
 
 pub fn streamOpenAICompletions(
