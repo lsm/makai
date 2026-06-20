@@ -76,6 +76,7 @@ pub fn Program(comptime Model: type) type {
         pending_image: ?PendingImage,
         logger: ?Logger,
         paste_buffer: std.array_list.Managed(u8),
+        paste_pending_prefix: std.array_list.Managed(u8),
         paste_active: bool,
 
         /// Message filter function
@@ -173,6 +174,7 @@ pub fn Program(comptime Model: type) type {
                 .pending_image = null,
                 .logger = null,
                 .paste_buffer = std.array_list.Managed(u8).init(allocator),
+                .paste_pending_prefix = std.array_list.Managed(u8).init(allocator),
                 .paste_active = false,
                 .filter = null,
             };
@@ -194,6 +196,7 @@ pub fn Program(comptime Model: type) type {
             }
             self.message_queue.deinit();
             self.paste_buffer.deinit();
+            self.paste_pending_prefix.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -433,6 +436,24 @@ pub fn Program(comptime Model: type) type {
             try results.appendSlice(parsed);
         }
 
+        fn appendParsedInputEventsPreservingPastePrefix(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+            data: []const u8,
+            paste_start: []const u8,
+        ) !void {
+            if (data.len == 0) return;
+            const keep = pasteDelimiterPrefixSuffixLen(data, paste_start);
+            if (keep > 0 and keep < paste_start.len) {
+                const parse_len = data.len - keep;
+                try self.appendParsedInputEvents(results, data[0..parse_len]);
+                self.paste_pending_prefix.clearRetainingCapacity();
+                try self.paste_pending_prefix.appendSlice(data[parse_len..]);
+                return;
+            }
+            try self.appendParsedInputEvents(results, data);
+        }
+
         fn appendPasteEvent(
             self: *Self,
             results: *std.array_list.Managed(keyboard.ParseResult),
@@ -448,10 +469,22 @@ pub fn Program(comptime Model: type) type {
             var results = std.array_list.Managed(keyboard.ParseResult).init(self.context.allocator);
             errdefer results.deinit();
 
+            var owned_data: ?[]u8 = null;
+            defer if (owned_data) |buf| self.context.allocator.free(buf);
+            var input = data;
+            if (self.paste_pending_prefix.items.len > 0) {
+                const combined = try self.context.allocator.alloc(u8, self.paste_pending_prefix.items.len + data.len);
+                @memcpy(combined[0..self.paste_pending_prefix.items.len], self.paste_pending_prefix.items);
+                @memcpy(combined[self.paste_pending_prefix.items.len..], data);
+                self.paste_pending_prefix.clearRetainingCapacity();
+                owned_data = combined;
+                input = combined;
+            }
+
             var offset: usize = 0;
-            while (offset < data.len) {
+            while (offset < input.len) {
                 if (self.paste_active) {
-                    const rest = data[offset..];
+                    const rest = input[offset..];
                     if (std.mem.indexOf(u8, rest, paste_end)) |end_offset| {
                         try self.paste_buffer.appendSlice(rest[0..end_offset]);
                         try self.appendPasteEvent(&results);
@@ -464,18 +497,27 @@ pub fn Program(comptime Model: type) type {
                     continue;
                 }
 
-                const rest = data[offset..];
+                const rest = input[offset..];
                 if (std.mem.indexOf(u8, rest, paste_start)) |start_offset| {
-                    try self.appendParsedInputEvents(&results, rest[0..start_offset]);
+                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest[0..start_offset], paste_start);
                     self.paste_active = true;
                     offset += start_offset + paste_start.len;
                 } else {
-                    try self.appendParsedInputEvents(&results, rest);
-                    offset = data.len;
+                    try self.appendParsedInputEventsPreservingPastePrefix(&results, rest, paste_start);
+                    offset = input.len;
                 }
             }
 
             return results.toOwnedSlice();
+        }
+
+        fn pasteDelimiterPrefixSuffixLen(data: []const u8, delimiter: []const u8) usize {
+            const max = @min(data.len, delimiter.len -| 1);
+            var len = max;
+            while (len > 0) : (len -= 1) {
+                if (std.mem.eql(u8, data[data.len - len ..], delimiter[0..len])) return len;
+            }
+            return 0;
         }
 
         /// Dispatch a message to the model, applying the filter if set

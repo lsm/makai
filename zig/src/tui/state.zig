@@ -656,6 +656,29 @@ pub const AppState = struct {
         self.queue = counts;
     }
 
+    pub fn pruneQueuedPreviewsToCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
+        self.pruneQueuedPreviewKind(.steering, counts.steering);
+        self.pruneQueuedPreviewKind(.follow_up, counts.follow_up);
+    }
+
+    fn pruneQueuedPreviewKind(self: *AppState, kind: QueuedPreviewKind, keep_count: usize) void {
+        var existing: usize = 0;
+        for (self.queued_previews.items) |preview| {
+            if (preview.kind == kind) existing += 1;
+        }
+        var remove_count = existing -| keep_count;
+        var idx: usize = 0;
+        while (idx < self.queued_previews.items.len and remove_count > 0) {
+            if (self.queued_previews.items[idx].kind != kind) {
+                idx += 1;
+                continue;
+            }
+            var removed = self.queued_previews.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            remove_count -= 1;
+        }
+    }
+
     pub fn addQueuedPreview(self: *AppState, kind: QueuedPreviewKind, text: []const u8) !void {
         try self.queued_previews.append(self.allocator, try QueuedPreview.init(self.allocator, kind, text));
     }
@@ -2048,6 +2071,24 @@ test "AppState keeps queued previews until matching user message is consumed" {
     try std.testing.expect(state.consumeQueuedPreviewText("follow later"));
     try std.testing.expectEqual(@as(usize, 1), state.queued_previews.items.len);
     try std.testing.expectEqualStrings("follow after", state.queued_previews.items[0].text);
+}
+
+test "AppState prunes stale queued previews to authoritative counts" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.addQueuedPreview(.steering, "old steering");
+    try state.addQueuedPreview(.follow_up, "old follow");
+    try state.addQueuedPreview(.steering, "remaining steering");
+    try state.addQueuedPreview(.follow_up, "remaining follow");
+
+    state.pruneQueuedPreviewsToCounts(.{ .steering = 1, .follow_up = 1 });
+
+    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
+    try std.testing.expectEqual(QueuedPreviewKind.steering, state.queued_previews.items[0].kind);
+    try std.testing.expectEqualStrings("remaining steering", state.queued_previews.items[0].text);
+    try std.testing.expectEqual(QueuedPreviewKind.follow_up, state.queued_previews.items[1].kind);
+    try std.testing.expectEqualStrings("remaining follow", state.queued_previews.items[1].text);
 }
 
 test "AppState applies thinking tool call and lifecycle events" {

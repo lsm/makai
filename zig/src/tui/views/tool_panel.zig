@@ -108,7 +108,49 @@ fn invocationDescription(allocator: std.mem.Allocator, args_json: []const u8) !?
     if (parsed.value != .object) return null;
     const value = parsed.value.object.get("description") orelse return null;
     if (value != .string or value.string.len == 0) return null;
-    return try allocator.dupe(u8, value.string);
+    return try sanitizeAndClipToolDescription(allocator, value.string);
+}
+
+fn sanitizeAndClipToolDescription(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and width < 96) {
+        const c = text[i];
+        switch (c) {
+            '\n', '\r', '\t' => {
+                try writer.writeByte(' ');
+                width += 1;
+                i += 1;
+                continue;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        const codepoint = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (codepoint < 0x20 or codepoint == 0x7f or (codepoint >= 0x80 and codepoint <= 0x9f)) {
+            i += len;
+            continue;
+        }
+        try writer.writeAll(text[i .. i + len]);
+        width += 1;
+        i += len;
+    }
+    if (i < text.len) try writer.writeAll("...");
+    return out.toOwnedSlice();
 }
 
 fn statusText(status: tui_state.ToolStatus) []const u8 {
@@ -288,6 +330,21 @@ test "tool panel renders tool status and multiline output" {
     try std.testing.expect(std.mem.indexOf(u8, text, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "second line") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "expanded") != null);
+}
+
+test "tool panel sanitizes model supplied tool descriptions" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{\"description\":\"before\\u001b[2Jafter\\u0007\",\"command\":\"pwd\"}", .running));
+
+    const intent = (try invocationDescription(std.testing.allocator, state.tools.items[0].args_json)).?;
+    defer std.testing.allocator.free(intent);
+    try std.testing.expectEqualStrings("before[2Jafter", intent);
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "before[2Jafter") != null);
 }
 
 test "tool panel renders diff and error output" {

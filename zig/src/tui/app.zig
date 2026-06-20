@@ -412,6 +412,7 @@ pub const App = struct {
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
         self.discardPendingEvents();
         self.state.resetReplayState();
+        self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
         self.session_created_at = loaded.metadata.created_at;
@@ -965,7 +966,11 @@ pub const App = struct {
     }
 
     fn refreshQueuedCounts(self: *App) void {
-        if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
+        if (self.session) |*session| {
+            const counts = session.queuedCounts();
+            self.state.setQueuedCounts(counts);
+            if (!self.state.status.streaming) self.state.pruneQueuedPreviewsToCounts(counts);
+        }
     }
 
     fn steeringAvailable(self: *const App) bool {
@@ -1067,7 +1072,10 @@ pub const App = struct {
 
         switch (result.action) {
             .quit => return error.QuitRequested,
-            .clear_transcript => self.state.clearTranscript(),
+            .clear_transcript => {
+                self.state.clearTranscript();
+                self.inline_history_flushed = 0;
+            },
             .open_session_picker => {
                 // Refresh sessions list from store then open the picker.
                 try self.loadSessions();
@@ -2879,6 +2887,25 @@ test "App drain auto-resumes remaining steering after completed turn" {
     try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
 }
 
+test "App drain prunes consumed steering preview after resume without user echo" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run pwd");
+    try app.state.addQueuedPreview(.steering, "run ps -ef");
+    app.state.setQueuedCounts(mock.queued_counts);
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run ps -ef", app.state.queued_previews.items[0].text);
+}
+
 test "App drain keeps steering preview until runtime user message arrives" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2887,6 +2914,7 @@ test "App drain keeps steering preview until runtime user message arrives" {
     app.session = mock.session();
     try app.state.addQueuedPreview(.steering, "run uname -a");
     app.state.setQueuedCounts(.{ .steering = 1 });
+    app.state.status.streaming = true;
 
     try mock.eventStream().push(.{ .tool_execution_start = .{
         .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "tool-1")),
@@ -2910,6 +2938,22 @@ test "App drain keeps steering preview until runtime user message arrives" {
     const last = app.state.transcript.items[app.state.transcript.items.len - 1];
     try std.testing.expectEqual(tui_state.TranscriptKind.user, last.kind);
     try std.testing.expectEqualStrings("run uname -a", last.text.items);
+}
+
+test "App refresh prunes stale idle steering preview" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{} };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run ps -ef");
+    app.state.setQueuedCounts(.{ .steering = 1 });
+    app.state.status.streaming = false;
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queue.total());
+    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
 }
 
 test "App drain does not auto-resume queued steering after error turn" {
