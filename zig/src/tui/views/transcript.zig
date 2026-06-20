@@ -79,6 +79,17 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
     return padTopToHeight(allocator, composed, options.height);
 }
 
+pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
+    var display = DisplayEntry{
+        .kind = entry.kind,
+        .text = entry.text.items,
+        .timestamp_ms = entry.timestamp_ms,
+        .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
+        .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
+    };
+    return renderEntry(allocator, &display, width);
+}
+
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
     switch (state.transcript_mode) {
         .everything => {

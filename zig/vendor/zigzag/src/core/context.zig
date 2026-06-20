@@ -358,6 +358,11 @@ pub const Options = struct {
     /// Use alternate screen buffer
     alt_screen: bool = true,
 
+    /// Render into a managed bottom viewport in the normal screen instead of
+    /// repainting from the top of the terminal. This lets terminal scrollback
+    /// remain native while the app owns the live input area.
+    inline_bottom_viewport: bool = false,
+
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,
 

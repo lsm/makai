@@ -654,7 +654,6 @@ pub const AppState = struct {
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
         self.queue = counts;
-        self.trimQueuedPreviews();
     }
 
     pub fn addQueuedPreview(self: *AppState, kind: QueuedPreviewKind, text: []const u8) !void {
@@ -666,28 +665,16 @@ pub const AppState = struct {
         self.queued_previews.clearRetainingCapacity();
     }
 
-    fn trimQueuedPreviews(self: *AppState) void {
-        self.trimQueuedPreviewKind(.steering, self.queue.steering);
-        self.trimQueuedPreviewKind(.follow_up, self.queue.follow_up);
-    }
-
-    fn trimQueuedPreviewKind(self: *AppState, kind: QueuedPreviewKind, target: usize) void {
-        var existing: usize = 0;
-        for (self.queued_previews.items) |preview| {
-            if (preview.kind == kind) existing += 1;
+    pub fn consumeQueuedPreviewText(self: *AppState, text: []const u8) bool {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        var idx: usize = 0;
+        while (idx < self.queued_previews.items.len) : (idx += 1) {
+            if (!std.mem.eql(u8, self.queued_previews.items[idx].text, trimmed)) continue;
+            var removed = self.queued_previews.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            return true;
         }
-
-        while (existing > target) {
-            var idx: usize = 0;
-            while (idx < self.queued_previews.items.len) : (idx += 1) {
-                if (self.queued_previews.items[idx].kind == kind) {
-                    var removed = self.queued_previews.orderedRemove(idx);
-                    removed.deinit(self.allocator);
-                    existing -= 1;
-                    break;
-                }
-            } else break;
-        }
+        return false;
     }
 
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
@@ -2043,7 +2030,7 @@ test "AppState reset replay clears stale queue counts" {
     try std.testing.expectEqual(@as(usize, 0), state.queued_previews.items.len);
 }
 
-test "AppState trims queued previews when counts are consumed" {
+test "AppState keeps queued previews until matching user message is consumed" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
@@ -2055,8 +2042,11 @@ test "AppState trims queued previews when counts are consumed" {
     try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
 
     state.setQueuedCounts(.{ .steering = 0, .follow_up = 1 });
+    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
+    try std.testing.expect(state.consumeQueuedPreviewText("steer now"));
+    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
+    try std.testing.expect(state.consumeQueuedPreviewText("follow later"));
     try std.testing.expectEqual(@as(usize, 1), state.queued_previews.items.len);
-    try std.testing.expectEqual(QueuedPreviewKind.follow_up, state.queued_previews.items[0].kind);
     try std.testing.expectEqualStrings("follow after", state.queued_previews.items[0].text);
 }
 

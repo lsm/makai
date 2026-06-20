@@ -307,6 +307,26 @@ pub fn retrieveArtifact(allocator: std.mem.Allocator, reference: []const u8, max
     };
 }
 
+pub fn retrieveArtifactPrefix(allocator: std.mem.Allocator, reference: []const u8, max_bytes: usize) ![]u8 {
+    if (!std.mem.startsWith(u8, reference, ".makai/tool-artifacts/")) return error.InvalidArtifactReference;
+    if (hasParentTraversal(reference) or std.Io.Dir.path.isAbsolute(reference)) return error.InvalidArtifactReference;
+    var cwd = std.Io.Dir.cwd();
+    const st = try cwd.statFile(defaultIo(), reference, .{ .follow_symlinks = false });
+    if (st.kind == .sym_link) return error.InvalidArtifactReference;
+    var file = try cwd.openFile(defaultIo(), reference, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    defer file.close(defaultIo());
+
+    const buffer = try allocator.alloc(u8, max_bytes);
+    errdefer allocator.free(buffer);
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try file.readStreaming(defaultIo(), &.{buffer[total..]});
+        if (n == 0) break;
+        total += n;
+    }
+    return allocator.realloc(buffer, total);
+}
+
 pub fn telemetryDetails(allocator: std.mem.Allocator, raw_bytes: usize, returned_bytes: usize, compressed: bool) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":{s}}}", .{ raw_bytes, returned_bytes, raw_bytes -| returned_bytes, if (compressed) "true" else "false" });
 }

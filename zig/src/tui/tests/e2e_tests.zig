@@ -106,6 +106,10 @@ const Driver = struct {
         _ = self.model.update(.{ .key = .{ .key = key } }, &self.ctx);
     }
 
+    fn sendCtrlChar(self: *Driver, c: u21) void {
+        _ = self.model.update(.{ .key = .{ .key = .{ .char = c }, .modifiers = .{ .ctrl = true } } }, &self.ctx);
+    }
+
     fn typeText(self: *Driver, text: []const u8) void {
         const view = std.unicode.Utf8View.init(text) catch return;
         var it = view.iterator();
@@ -224,7 +228,6 @@ test "e2e: up arrow recalls the previous submission into the composer" {
     d.typeText("second message");
     d.pressEnter();
 
-    // Composer is empty after submitting; arrow-up walks back through history.
     try std.testing.expectEqualStrings("", d.app().state.composer.text());
     d.sendKey(.up);
     try std.testing.expectEqualStrings("second message", d.app().state.composer.text());
@@ -232,6 +235,14 @@ test "e2e: up arrow recalls the previous submission into the composer" {
     try std.testing.expectEqualStrings("first message", d.app().state.composer.text());
     d.sendKey(.down);
     try std.testing.expectEqualStrings("second message", d.app().state.composer.text());
+    d.sendKey(.down);
+    try std.testing.expectEqualStrings("", d.app().state.composer.text());
+
+    d.typeText("draft");
+    d.sendKey(.up);
+    try std.testing.expectEqualStrings("second message", d.app().state.composer.text());
+    d.sendKey(.down);
+    try std.testing.expectEqualStrings("draft", d.app().state.composer.text());
 }
 
 test "e2e: tool approval prompt appears and approving runs the tool to completion" {
@@ -391,7 +402,7 @@ test "e2e: /login opens the provider picker and selecting starts the flow" {
     try std.testing.expect(d.frameContains("starting login for anthropic"));
 }
 
-test "e2e: TUI uses alternate-scroll keys for transcript scrolling" {
+test "e2e: production TUI uses native scrollback mode" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
     var d = try Driver.init(std.testing.allocator, .{
@@ -407,12 +418,9 @@ test "e2e: TUI uses alternate-scroll keys for transcript scrolling" {
     );
 
     try std.testing.expect(!tui_app.tuiProgramOptionsForTest().mouse);
-    try std.testing.expect(tui_app.tuiProgramOptionsForTest().alternate_scroll);
-    d.app().state.transcript_scroll = 0;
-    d.sendKey(.up);
-    try std.testing.expectEqual(@as(usize, 1), d.app().state.transcript_scroll);
-    d.sendKey(.down);
-    try std.testing.expectEqual(@as(usize, 0), d.app().state.transcript_scroll);
+    try std.testing.expect(!tui_app.tuiProgramOptionsForTest().alternate_scroll);
+    try std.testing.expect(!tui_app.tuiProgramOptionsForTest().alt_screen);
+    try std.testing.expect(tui_app.tuiProgramOptionsForTest().inline_bottom_viewport);
 }
 
 test "e2e: /copy reports when there is a reply to copy" {

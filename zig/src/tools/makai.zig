@@ -13,6 +13,7 @@ const auth_protocol_server = @import("auth_server");
 const auth_protocol_runtime = @import("auth_runtime");
 const auth_protocol_envelope = @import("auth_envelope");
 const auth_cli = @import("auth_cli");
+const oauth_storage = @import("oauth/storage");
 const event_stream = @import("event_stream");
 const agent_loop = @import("agent_loop");
 const agent_bridge = @import("agent_bridge");
@@ -45,6 +46,47 @@ const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP
 const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30; // ~30ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AGENT_POLL_ITERS_DEFAULT: usize = 2_000; // ~2s with STDIO_IDLE_SLEEP_NS.
+
+fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "global") or std.ascii.eqlIgnoreCase(trimmed, "moonshot")) return "global";
+    if (std.ascii.eqlIgnoreCase(trimmed, "china") or
+        std.ascii.eqlIgnoreCase(trimmed, "cn") or
+        std.ascii.eqlIgnoreCase(trimmed, "coding"))
+    {
+        return "china";
+    }
+    return null;
+}
+
+fn kimiRegionFromProviderData(provider_data: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, provider_data, "region:")) {
+        return normalizeKimiRegion(provider_data["region:".len..]) orelse "china";
+    }
+    return "china";
+}
+
+fn loadStoredKimiRegion(allocator: std.mem.Allocator) ?[]const u8 {
+    var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return null;
+    defer storage.deinit();
+    const auth = storage.providers.get("kimi") orelse return null;
+    return switch (auth) {
+        .api_key => null,
+        .oauth => |creds| if (creds.provider_data) |data| kimiRegionFromProviderData(data) else null,
+    };
+}
+
+fn resolvePrintKimiRegion(allocator: std.mem.Allocator, use_storage_auth: bool) []const u8 {
+    const region_env = compat.getEnvVarOwned(allocator, "KIMI_REGION") catch null;
+    if (region_env) |env| {
+        defer allocator.free(env);
+        if (normalizeKimiRegion(env)) |region| return region;
+    }
+    if (use_storage_auth) {
+        if (loadStoredKimiRegion(allocator)) |region| return region;
+    }
+    return "china";
+}
 
 const RuntimeErrorCode = enum {
     dispatch_error,
@@ -1964,10 +2006,9 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     perr("[print] building kimi model from env...\n");
 
-    // Read the API key from KIMI_API_KEY. We deliberately avoid loading the
-    // macOS Keychain here — the `security` subprocess it spawns blocks outside
-    // the TUI's threaded I/O context, which would mask the streaming bug. For
-    // region, default to china unless KIMI_REGION=global.
+    // Read the API key from KIMI_API_KEY unless explicitly asked to use saved
+    // credentials. Region follows KIMI_REGION first, then the stored Kimi
+    // provider_data when --storage is used, then China as the default.
     const api_key_copy: ?[]u8 = if (use_storage_auth) null else blk: {
         const api_key_env = compat.getEnvVarOwned(allocator, "KIMI_API_KEY") catch |err| {
             perrf("error: set KIMI_API_KEY to use -p, or pass --storage to use saved credentials: {s}\n", .{@errorName(err)});
@@ -1977,9 +2018,8 @@ fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
     defer if (api_key_copy) |key| allocator.free(key);
 
-    const region_env = compat.getEnvVarOwned(allocator, "KIMI_REGION") catch try allocator.dupe(u8, "china");
-    defer allocator.free(region_env);
-    const is_global_kimi = std.mem.eql(u8, std.mem.trim(u8, region_env, " \t\r\n"), "global");
+    const region = resolvePrintKimiRegion(allocator, use_storage_auth);
+    const is_global_kimi = std.mem.eql(u8, region, "global");
     const base_url = if (is_global_kimi)
         "https://api.moonshot.ai"
     else

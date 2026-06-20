@@ -75,6 +75,8 @@ pub fn Program(comptime Model: type) type {
         last_line_count: usize,
         pending_image: ?PendingImage,
         logger: ?Logger,
+        paste_buffer: std.array_list.Managed(u8),
+        paste_active: bool,
 
         /// Message filter function
         filter: ?*const fn (UserMsg) ?UserMsg,
@@ -170,6 +172,8 @@ pub fn Program(comptime Model: type) type {
                 .last_line_count = 0,
                 .pending_image = null,
                 .logger = null,
+                .paste_buffer = std.array_list.Managed(u8).init(allocator),
+                .paste_active = false,
                 .filter = null,
             };
 
@@ -189,6 +193,7 @@ pub fn Program(comptime Model: type) type {
                 l.deinit();
             }
             self.message_queue.deinit();
+            self.paste_buffer.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -240,6 +245,7 @@ pub fn Program(comptime Model: type) type {
                 .hide_cursor = !self.options.cursor,
                 .mouse = self.options.mouse,
                 .alternate_scroll = self.options.alternate_scroll,
+                .clear_on_setup = !self.options.inline_bottom_viewport,
                 .bracketed_paste = self.options.bracketed_paste,
                 .input = self.options.input,
                 .output = self.options.output,
@@ -326,7 +332,7 @@ pub fn Program(comptime Model: type) type {
             const bytes_read = try self.terminal.?.readInput(&input_buf, 0);
 
             if (bytes_read > 0) {
-                const events = try keyboard.parseAll(self.context.allocator, input_buf[0..bytes_read]);
+                const events = try self.parseInputEvents(input_buf[0..bytes_read]);
                 for (events) |event| {
                     const user_cmd = switch (event) {
                         .key => |k| self.processKeyEvent(k),
@@ -415,6 +421,61 @@ pub fn Program(comptime Model: type) type {
                     return err;
                 };
             }
+        }
+
+        fn appendParsedInputEvents(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+            data: []const u8,
+        ) !void {
+            if (data.len == 0) return;
+            const parsed = try keyboard.parseAll(self.context.allocator, data);
+            try results.appendSlice(parsed);
+        }
+
+        fn appendPasteEvent(
+            self: *Self,
+            results: *std.array_list.Managed(keyboard.ParseResult),
+        ) !void {
+            const text = try self.context.allocator.dupe(u8, self.paste_buffer.items);
+            try results.append(.{ .key = .{ .key = .{ .paste = text } } });
+            self.paste_buffer.clearRetainingCapacity();
+        }
+
+        fn parseInputEvents(self: *Self, data: []const u8) ![]keyboard.ParseResult {
+            const paste_start = "\x1b[200~";
+            const paste_end = "\x1b[201~";
+            var results = std.array_list.Managed(keyboard.ParseResult).init(self.context.allocator);
+            errdefer results.deinit();
+
+            var offset: usize = 0;
+            while (offset < data.len) {
+                if (self.paste_active) {
+                    const rest = data[offset..];
+                    if (std.mem.indexOf(u8, rest, paste_end)) |end_offset| {
+                        try self.paste_buffer.appendSlice(rest[0..end_offset]);
+                        try self.appendPasteEvent(&results);
+                        self.paste_active = false;
+                        offset += end_offset + paste_end.len;
+                    } else {
+                        try self.paste_buffer.appendSlice(rest);
+                        offset = data.len;
+                    }
+                    continue;
+                }
+
+                const rest = data[offset..];
+                if (std.mem.indexOf(u8, rest, paste_start)) |start_offset| {
+                    try self.appendParsedInputEvents(&results, rest[0..start_offset]);
+                    self.paste_active = true;
+                    offset += start_offset + paste_start.len;
+                } else {
+                    try self.appendParsedInputEvents(&results, rest);
+                    offset = data.len;
+                }
+            }
+
+            return results.toOwnedSlice();
         }
 
         /// Dispatch a message to the model, applying the filter if set
@@ -888,8 +949,23 @@ pub fn Program(comptime Model: type) type {
                 // Start synchronized output (prevents tearing on supporting terminals)
                 try writer.writeAll(ansi.sync_start);
 
-                // Move cursor home (don't clear entire screen to reduce flicker)
-                try writer.writeAll(ansi.cursor_home);
+                const view_line_count = countLines(view_output);
+                const render_line_capacity = if (self.options.inline_bottom_viewport)
+                    @max(view_line_count, self.last_line_count)
+                else
+                    view_line_count;
+
+                if (self.options.inline_bottom_viewport) {
+                    const clamped_capacity = @min(render_line_capacity, @as(usize, self.context.height));
+                    const start_row: u16 = if (clamped_capacity >= self.context.height)
+                        1
+                    else
+                        self.context.height - @as(u16, @intCast(clamped_capacity)) + 1;
+                    try ansi.cursorTo(writer, start_row, 1);
+                } else {
+                    // Move cursor home (don't clear entire screen to reduce flicker)
+                    try writer.writeAll(ansi.cursor_home);
+                }
 
                 // Write each line, clearing to end of line
                 var lines = std.mem.splitScalar(u8, view_output, '\n');
@@ -904,14 +980,22 @@ pub fn Program(comptime Model: type) type {
                 }
 
                 // Clear remaining lines if previous content was taller
-                if (self.last_line_count > line_count) {
-                    var remaining = self.last_line_count - line_count;
+                const visible_line_count = if (self.options.inline_bottom_viewport)
+                    @min(line_count, @as(usize, self.context.height))
+                else
+                    line_count;
+                const previous_line_count = if (self.options.inline_bottom_viewport)
+                    @min(self.last_line_count, @as(usize, self.context.height))
+                else
+                    self.last_line_count;
+                if (previous_line_count > visible_line_count) {
+                    var remaining = previous_line_count - visible_line_count;
                     while (remaining > 0) : (remaining -= 1) {
                         try writer.writeAll("\r\n");
                         try writer.writeAll(ansi.line_clear);
                     }
                 }
-                self.last_line_count = line_count;
+                self.last_line_count = visible_line_count;
 
                 // End synchronized output
                 try writer.writeAll(ansi.sync_end);
@@ -921,6 +1005,15 @@ pub fn Program(comptime Model: type) type {
                 // Save hash for comparison
                 self.last_view_hash = view_hash;
             }
+        }
+
+        fn countLines(text: []const u8) usize {
+            if (text.len == 0) return 1;
+            var count: usize = 1;
+            for (text) |c| {
+                if (c == '\n') count += 1;
+            }
+            return count;
         }
 
         /// Send a message to the model.

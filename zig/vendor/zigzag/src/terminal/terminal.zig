@@ -250,6 +250,8 @@ pub const Config = struct {
     mouse: bool = false,
     /// Enable wheel scrolling in the alternate screen without mouse tracking.
     alternate_scroll: bool = false,
+    /// Clear the full screen during setup.
+    clear_on_setup: bool = true,
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,
     /// Custom input file (default: stdin)
@@ -376,8 +378,10 @@ pub const Terminal = struct {
         self.detectImageCapabilities();
 
         // Clear screen
-        try self.writeBytes(ansi.screen_clear);
-        try self.writeBytes(ansi.cursor_home);
+        if (self.config.clear_on_setup) {
+            try self.writeBytes(ansi.screen_clear);
+            try self.writeBytes(ansi.cursor_home);
+        }
 
         try self.flush();
     }

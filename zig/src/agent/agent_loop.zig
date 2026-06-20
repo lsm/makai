@@ -160,42 +160,45 @@ fn estimateContextUsage(context: ai_types.Context) ContextUsage {
 }
 
 fn pushAgentEvent(event_stream: *AgentEventStream, event: AgentEvent) !void {
-    while (true) {
-        event_stream.push(event) catch |err| switch (err) {
-            error.QueueFull => {
-                if (event_stream.poll()) |dropped| {
-                    var mutable = dropped;
-                    mutable.deinit(event_stream.allocator);
-                } else {
-                    std.Thread.yield() catch {};
-                }
-                continue;
-            },
-            error.StreamCompleted => return err,
-        };
-        return;
+    if (!event_stream.pushBlocking(event)) {
+        var mutable = event;
+        mutable.deinit(event_stream.allocator);
+        return error.StreamCompleted;
     }
 }
 
-test "agent event push drops oldest event instead of failing when full" {
+fn delayedAgentEventPush(stream: *AgentEventStream) void {
+    pushAgentEvent(stream, .{ .agent_end = .{} }) catch {};
+}
+
+test "agent event push blocks instead of dropping ordered events" {
     const allocator = std.testing.allocator;
     var stream = AgentEventStream.init(allocator);
     defer stream.deinit();
 
-    for (0..AgentEventStream.usable_capacity) |_| {
+    try pushAgentEvent(&stream, .agent_start);
+    for (0..AgentEventStream.usable_capacity - 1) |_| {
         try pushAgentEvent(&stream, .turn_start);
     }
-    try pushAgentEvent(&stream, .agent_start);
+
+    const thread = try std.Thread.spawn(.{}, delayedAgentEventPush, .{&stream});
+    defer thread.join();
+
+    const first = stream.poll() orelse return error.ExpectedEvent;
+    try std.testing.expectEqual(AgentEvent.agent_start, first);
 
     var saw_agent_start = false;
+    var saw_agent_end = false;
     var count: usize = 0;
     while (stream.poll()) |event| {
         count += 1;
         if (event == .agent_start) saw_agent_start = true;
+        if (event == .agent_end) saw_agent_end = true;
     }
 
     try std.testing.expectEqual(@as(usize, AgentEventStream.usable_capacity), count);
-    try std.testing.expect(saw_agent_start);
+    try std.testing.expect(!saw_agent_start);
+    try std.testing.expect(saw_agent_end);
 }
 
 fn emitContextUsage(event_stream: *AgentEventStream, context: ai_types.Context) !void {

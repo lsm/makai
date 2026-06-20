@@ -36,6 +36,7 @@ pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
+const artifact_display_preview_read_limit = 256 * 1024;
 const artifact_preview_head_lines = 40;
 const artifact_preview_tail_lines = 20;
 
@@ -301,6 +302,8 @@ pub const App = struct {
     session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
+    inline_history_flushed: usize = 0,
+    last_inline_view_lines: usize = 4,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -953,6 +956,7 @@ pub const App = struct {
     fn appendRuntimeUserMessage(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
+        _ = self.state.consumeQueuedPreviewText(trimmed);
         if (self.state.transcript.items.len > 0) {
             const last = &self.state.transcript.items[self.state.transcript.items.len - 1];
             if (last.kind == .user and std.mem.eql(u8, last.text.items, trimmed)) return;
@@ -1198,7 +1202,7 @@ pub const App = struct {
             .tool_execution_end => |payload| {
                 if (payload.artifact_count == 0) return;
                 const reference = firstArtifactReference(payload.artifact_refs.slice()) orelse return;
-                const data = tools_common.retrieveArtifact(self.allocator, reference, 64 * 1024 * 1024) catch return;
+                const data = tools_common.retrieveArtifactPrefix(self.allocator, reference, artifact_display_preview_read_limit) catch return;
                 defer self.allocator.free(data);
                 const preview = try artifactDisplayPreview(self.allocator, data, payload.raw_total_bytes, reference);
                 errdefer self.allocator.free(preview);
@@ -1538,6 +1542,14 @@ pub const TuiModel = struct {
                             app.flushClipboard(ctx);
                             return .none;
                         },
+                        'p' => {
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryPrev() catch false;
+                            return .none;
+                        },
+                        'n' => {
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryNext() catch false;
+                            return .none;
+                        },
                         else => return .none,
                     },
                     else => {},
@@ -1739,10 +1751,10 @@ pub const TuiModel = struct {
                     .home => app.state.composer.moveCursorHome(),
                     .end => app.state.composer.moveCursorEnd(),
                     .up => {
-                        if (!(app.state.composerHistoryPrev() catch false)) app.state.transcript_scroll += 1;
+                        _ = app.state.composerHistoryPrev() catch false;
                     },
                     .down => {
-                        if (!(app.state.composerHistoryNext() catch false)) app.state.transcript_scroll -|= 1;
+                        _ = app.state.composerHistoryNext() catch false;
                     },
                     // PageUp/PageDown scroll by 5 lines for faster navigation.
                     .page_up => app.state.transcript_scroll += 5,
@@ -1756,11 +1768,13 @@ pub const TuiModel = struct {
                 app.state.anim_tick +%= 1;
                 app.drainEvents() catch {};
                 app.pollLogin() catch {};
+                flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
             },
             .quit => return .quit,
         }
         // A command (e.g. `/copy`) may have staged clipboard text; flush it now
         // that a mutable Context is in hand.
+        flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
         app.flushClipboard(ctx);
         return .none;
     }
@@ -1855,6 +1869,15 @@ pub const TuiModel = struct {
             .login_input => "",
             .normal => "",
         };
+        if (ctx._terminal != null) {
+            const live_frame = if (queued.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ extra, queued, composer, status }) catch ""
+            else
+                tui_render.joinVertical(ctx.allocator, &.{ extra, composer, status }) catch "";
+            app.last_inline_view_lines = @max(countLines(live_frame), 1);
+            return tui_render.withSynchronizedOutput(ctx.allocator, live_frame) catch live_frame;
+        }
+
         const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
@@ -1901,6 +1924,68 @@ pub const TuiModel = struct {
         var buf: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(c, &buf);
         try app.state.composer.insertSlice(app.allocator, buf[0..len]);
+    }
+
+    fn flushInlineHistory(app: *App, ctx: *zz.Context) !void {
+        if (@import("builtin").is_test) {
+            const ok: anyerror!void = {};
+            return ok;
+        }
+        if (ctx._terminal == null) return;
+        if (app.inline_history_flushed >= app.state.transcript.items.len) return;
+
+        const stop = inlineFlushStop(app);
+        if (stop <= app.inline_history_flushed) return;
+
+        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer out.deinit();
+        const writer = &out.writer;
+        for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
+            if (rel_i > 0) try writer.writeAll("\n\n");
+            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
+            defer ctx.allocator.free(rendered);
+            try writer.writeAll(rendered);
+        }
+        const rendered_history = out.written();
+        if (rendered_history.len > 0) {
+            try writeInlineHistory(ctx, app.last_inline_view_lines, rendered_history);
+            app.inline_history_flushed = stop;
+            app.state.transcript_scroll = 0;
+        }
+    }
+
+    fn inlineFlushStop(app: *const App) usize {
+        var stop = app.state.transcript.items.len;
+        if (app.state.active_user_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_assistant_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
+        return stop;
+    }
+
+    fn writeInlineHistory(ctx: *zz.Context, reserved_lines: usize, text: []const u8) !void {
+        const term = ctx._terminal orelse return;
+        const reserved: u16 = @intCast(@min(@max(reserved_lines, 1), @as(usize, ctx.height -| 1)));
+        const history_bottom: u16 = if (ctx.height > reserved) ctx.height - reserved else 1;
+        const writer = term.writer();
+
+        try writer.writeAll(zz.ansi.sync_start);
+        try zz.ansi.setScrollRegion(writer, 1, history_bottom);
+        try zz.ansi.cursorTo(writer, history_bottom, 1);
+
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) try writer.writeAll("\r\n");
+            first = false;
+            try writer.writeAll(line);
+            try writer.writeAll(zz.ansi.line_clear_right);
+        }
+        try writer.writeAll("\r\n");
+
+        try zz.ansi.resetScrollRegion(writer);
+        try zz.ansi.cursorTo(writer, history_bottom + 1, 1);
+        try writer.writeAll(zz.ansi.sync_end);
+        try term.flush();
     }
 
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
@@ -2089,7 +2174,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true, .alternate_scroll = true };
+    return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = true };
 }
 
 pub fn tuiProgramOptionsForTest() zz.Options {
@@ -2140,9 +2225,11 @@ test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
 
-test "TUI program enables wheel scrolling without mouse capture" {
+test "TUI program preserves native text selection" {
     try std.testing.expect(!tuiProgramOptions().mouse);
-    try std.testing.expect(tuiProgramOptions().alternate_scroll);
+    try std.testing.expect(!tuiProgramOptions().alternate_scroll);
+    try std.testing.expect(!tuiProgramOptions().alt_screen);
+    try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
 }
 
 test "saved model ref loads from config store" {
@@ -2778,6 +2865,10 @@ test "App drain auto-resumes remaining steering after completed turn" {
     try app.state.addQueuedPreview(.steering, "run pwd");
     try app.state.addQueuedPreview(.steering, "run uname -a");
     app.state.setQueuedCounts(mock.queued_counts);
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run pwd")),
+    } });
 
     try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
     try app.drainEvents();
@@ -2786,6 +2877,39 @@ test "App drain auto-resumes remaining steering after completed turn" {
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
     try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
+}
+
+test "App drain keeps steering preview until runtime user message arrives" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 0 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run uname -a");
+    app.state.setQueuedCounts(.{ .steering = 1 });
+
+    try mock.eventStream().push(.{ .tool_execution_start = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "tool-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{}")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
+
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run uname -a")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
+    try std.testing.expect(app.state.transcript.items.len >= 1);
+    const last = app.state.transcript.items[app.state.transcript.items.len - 1];
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, last.kind);
+    try std.testing.expectEqualStrings("run uname -a", last.text.items);
 }
 
 test "App drain does not auto-resume queued steering after error turn" {
