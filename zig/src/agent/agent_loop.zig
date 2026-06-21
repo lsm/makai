@@ -161,8 +161,6 @@ fn estimateContextUsage(context: ai_types.Context) ContextUsage {
 
 fn pushAgentEvent(event_stream: *AgentEventStream, event: AgentEvent) !void {
     if (!event_stream.pushBlocking(event)) {
-        var mutable = event;
-        mutable.deinit(event_stream.allocator);
         return error.StreamCompleted;
     }
 }

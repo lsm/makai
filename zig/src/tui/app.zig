@@ -1515,18 +1515,11 @@ pub const TuiModel = struct {
                 // Content was read back from the external editor. Load into composer.
                 defer ctx.persistent_allocator.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
-                // Re-enter alt screen and hide cursor after editor exit.
-                return .{ .sequence = &.{
-                    .enter_alt_screen,
-                    .hide_cursor,
-                } };
+                return editorReturnCommand();
             },
             .editor_failed => {
                 app.recordError("external editor failed") catch {};
-                return .{ .sequence = &.{
-                    .enter_alt_screen,
-                    .hide_cursor,
-                } };
+                return editorReturnCommand();
             },
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
@@ -2185,6 +2178,16 @@ fn tuiProgramOptions() zz.Options {
     return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = true };
 }
 
+fn editorReturnCommand() zz.Cmd(TuiModel.Msg) {
+    if (tuiProgramOptions().alt_screen) {
+        return .{ .sequence = &.{
+            .enter_alt_screen,
+            .hide_cursor,
+        } };
+    }
+    return .none;
+}
+
 pub fn tuiProgramOptionsForTest() zz.Options {
     if (!@import("builtin").is_test) @compileError("test-only helper");
     return tuiProgramOptions();
@@ -2238,6 +2241,10 @@ test "TUI program preserves native text selection" {
     try std.testing.expect(!tuiProgramOptions().alternate_scroll);
     try std.testing.expect(!tuiProgramOptions().alt_screen);
     try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
+}
+
+test "editor return does not enter alt screen in inline mode" {
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, editorReturnCommand());
 }
 
 test "saved model ref loads from config store" {

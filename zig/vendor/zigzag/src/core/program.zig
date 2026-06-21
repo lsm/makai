@@ -492,7 +492,7 @@ pub fn Program(comptime Model: type) type {
                         offset += end_offset + paste_end.len;
                     } else {
                         try self.paste_buffer.appendSlice(rest);
-                        offset = data.len;
+                        offset = input.len;
                     }
                     continue;
                 }

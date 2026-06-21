@@ -78,6 +78,7 @@ pub const AuthProtocolServer = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        const allocator = self.allocator;
         self.mutex.lockUncancelable(defaultIo());
 
         var flow_iter = self.flows.iterator();
@@ -90,11 +91,11 @@ pub const AuthProtocolServer = struct {
         }
 
         var join_list = std.ArrayList(*FlowState).empty;
-        defer join_list.deinit(self.allocator);
+        defer join_list.deinit(allocator);
 
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
-            join_list.append(self.allocator, entry.value_ptr.*) catch {};
+            join_list.append(allocator, entry.value_ptr.*) catch {};
         }
 
         self.mutex.unlock(defaultIo());
@@ -111,8 +112,8 @@ pub const AuthProtocolServer = struct {
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
             const flow = entry.value_ptr.*;
-            flow.deinit(self.allocator);
-            self.allocator.destroy(flow);
+            flow.deinit(allocator);
+            allocator.destroy(flow);
         }
 
         self.flows.deinit();
@@ -120,9 +121,9 @@ pub const AuthProtocolServer = struct {
         self.outgoing_sequences.deinit();
 
         for (self.outbox.items) |*env| {
-            env.deinit(self.allocator);
+            env.deinit(allocator);
         }
-        self.outbox.deinit(self.allocator);
+        self.outbox.deinit(allocator);
 
         self.mutex.unlock(defaultIo());
         self.* = undefined;
