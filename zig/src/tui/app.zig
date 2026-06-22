@@ -55,17 +55,19 @@ fn firstArtifactReference(refs: []const u8) ?[]const u8 {
 }
 
 fn artifactDisplayPreview(allocator: std.mem.Allocator, data: []const u8, raw_total_bytes: u64, reference: []const u8) ![]u8 {
+    const safe_data = try sanitizeTerminalPreviewText(allocator, data);
+    defer allocator.free(safe_data);
     var out: std.Io.Writer.Allocating = .init(allocator);
     errdefer out.deinit();
     const writer = &out.writer;
-    const line_count = countTextLines(data);
+    const line_count = countTextLines(safe_data);
     const byte_count = if (raw_total_bytes > 0) raw_total_bytes else data.len;
     try writer.print("raw output preview ({d} bytes, {d} lines)\n", .{ byte_count, line_count });
     try writer.writeAll("head:\n");
-    try writeFirstTextLines(writer, data, artifact_preview_head_lines);
+    try writeFirstTextLines(writer, safe_data, artifact_preview_head_lines);
     if (line_count > artifact_preview_head_lines + artifact_preview_tail_lines) {
         try writer.writeAll("\n...\ntail:\n");
-        try writeLastTextLines(allocator, writer, data, artifact_preview_tail_lines);
+        try writeLastTextLines(allocator, writer, safe_data, artifact_preview_tail_lines);
     }
     try writer.print("\nartifact: {s}\nCtrl+O or /artifact opens the full local output. Ask for grep/range to filter without loading full output into context.", .{reference});
     return out.toOwnedSlice();
@@ -117,6 +119,45 @@ fn countTextLines(text: []const u8) usize {
     }
     if (text[text.len - 1] == '\n') lines -= 1;
     return lines;
+}
+
+fn sanitizeTerminalPreviewText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        switch (c) {
+            '\n', '\t' => {
+                try writer.writeByte(c);
+                i += 1;
+                continue;
+            },
+            '\r' => {
+                try writer.writeByte('\n');
+                i += 1;
+                continue;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        _ = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        try writer.writeAll(text[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice();
 }
 
 pub const ApprovalWaiter = struct {
@@ -1199,7 +1240,9 @@ pub const App = struct {
                 return;
             };
             defer self.allocator.free(data);
-            try self.state.setPreview(.artifact, reference, data);
+            const safe_data = try sanitizeTerminalPreviewText(self.allocator, data);
+            defer self.allocator.free(safe_data);
+            try self.state.setPreview(.artifact, reference, safe_data);
             return;
         }
         try self.state.appendTranscript(.system, "no local artifact to open");
@@ -2795,6 +2838,16 @@ test "App submit quit command requests quit" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
+}
+
+test "artifact previews strip terminal control bytes" {
+    const preview = try artifactDisplayPreview(std.testing.allocator, "head\x1b[2J\nok\x1b]0;title\x07\n", 0, ".makai/tool-artifacts/test");
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x07) == null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "head[2J") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "ok]0;title") != null);
 }
 
 test "App steer and queue follow-up handle fallback empty and session paths" {

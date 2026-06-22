@@ -447,7 +447,7 @@ pub fn Program(comptime Model: type) type {
         ) !void {
             if (data.len == 0) return;
             const keep = pasteDelimiterPrefixSuffixLen(data, paste_start);
-            if (keep > 0 and keep < paste_start.len) {
+            if (keep > 1 and keep < paste_start.len) {
                 const parse_len = data.len - keep;
                 try self.appendParsedInputEvents(results, data[0..parse_len]);
                 self.paste_pending_prefix.clearRetainingCapacity();
