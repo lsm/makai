@@ -77,6 +77,7 @@ pub fn Program(comptime Model: type) type {
         logger: ?Logger,
         paste_buffer: std.array_list.Managed(u8),
         paste_pending_prefix: std.array_list.Managed(u8),
+        paste_pending_end_prefix: std.array_list.Managed(u8),
         paste_active: bool,
 
         /// Message filter function
@@ -175,6 +176,7 @@ pub fn Program(comptime Model: type) type {
                 .logger = null,
                 .paste_buffer = std.array_list.Managed(u8).init(allocator),
                 .paste_pending_prefix = std.array_list.Managed(u8).init(allocator),
+                .paste_pending_end_prefix = std.array_list.Managed(u8).init(allocator),
                 .paste_active = false,
                 .filter = null,
             };
@@ -197,6 +199,7 @@ pub fn Program(comptime Model: type) type {
             self.message_queue.deinit();
             self.paste_buffer.deinit();
             self.paste_pending_prefix.deinit();
+            self.paste_pending_end_prefix.deinit();
             self.arena.deinit();
 
             // Call model's deinit if it exists
@@ -472,11 +475,12 @@ pub fn Program(comptime Model: type) type {
             var owned_data: ?[]u8 = null;
             defer if (owned_data) |buf| self.context.allocator.free(buf);
             var input = data;
-            if (self.paste_pending_prefix.items.len > 0) {
-                const combined = try self.context.allocator.alloc(u8, self.paste_pending_prefix.items.len + data.len);
-                @memcpy(combined[0..self.paste_pending_prefix.items.len], self.paste_pending_prefix.items);
-                @memcpy(combined[self.paste_pending_prefix.items.len..], data);
-                self.paste_pending_prefix.clearRetainingCapacity();
+            const pending_prefix = if (self.paste_active) &self.paste_pending_end_prefix else &self.paste_pending_prefix;
+            if (pending_prefix.items.len > 0) {
+                const combined = try self.context.allocator.alloc(u8, pending_prefix.items.len + data.len);
+                @memcpy(combined[0..pending_prefix.items.len], pending_prefix.items);
+                @memcpy(combined[pending_prefix.items.len..], data);
+                pending_prefix.clearRetainingCapacity();
                 owned_data = combined;
                 input = combined;
             }
@@ -489,9 +493,14 @@ pub fn Program(comptime Model: type) type {
                         try self.paste_buffer.appendSlice(rest[0..end_offset]);
                         try self.appendPasteEvent(&results);
                         self.paste_active = false;
+                        self.paste_pending_end_prefix.clearRetainingCapacity();
                         offset += end_offset + paste_end.len;
                     } else {
-                        try self.paste_buffer.appendSlice(rest);
+                        const keep = pasteDelimiterPrefixSuffixLen(rest, paste_end);
+                        const append_len = rest.len - keep;
+                        try self.paste_buffer.appendSlice(rest[0..append_len]);
+                        self.paste_pending_end_prefix.clearRetainingCapacity();
+                        if (keep > 0) try self.paste_pending_end_prefix.appendSlice(rest[append_len..]);
                         offset = input.len;
                     }
                     continue;

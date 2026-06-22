@@ -1871,7 +1871,14 @@ pub const TuiModel = struct {
             .normal => "",
         };
         if (ctx._terminal != null) {
-            const live_frame = if (queued.len > 0)
+            const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
+            const active_height = height -| fixed;
+            const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
+            const live_frame = if (active.len > 0 and queued.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ active, extra, queued, composer, status }) catch ""
+            else if (active.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ active, extra, composer, status }) catch ""
+            else if (queued.len > 0)
                 tui_render.joinVertical(ctx.allocator, &.{ extra, queued, composer, status }) catch ""
             else
                 tui_render.joinVertical(ctx.allocator, &.{ extra, composer, status }) catch "";
@@ -1887,6 +1894,71 @@ pub const TuiModel = struct {
         else
             tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
+    }
+
+    fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize) ![]const u8 {
+        if (max_lines == 0) return allocator.dupe(u8, "");
+
+        var indices: [3]usize = undefined;
+        var len: usize = 0;
+        addActiveTranscriptIndex(&indices, &len, state.active_user_entry, state.transcript.items.len);
+        addActiveTranscriptIndex(&indices, &len, state.active_assistant_entry, state.transcript.items.len);
+        addActiveTranscriptIndex(&indices, &len, state.active_tool_result_entry, state.transcript.items.len);
+        if (len == 0) return allocator.dupe(u8, "");
+        sortSmallIndices(indices[0..len]);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        for (indices[0..len], 0..) |idx, i| {
+            if (i > 0) try writer.writeAll("\n\n");
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
+            defer allocator.free(rendered);
+            try writer.writeAll(rendered);
+        }
+        const rendered_active = try out.toOwnedSlice();
+        defer allocator.free(rendered_active);
+        return tailLines(allocator, rendered_active, max_lines);
+    }
+
+    fn addActiveTranscriptIndex(indices: *[3]usize, len: *usize, maybe_index: ?usize, transcript_len: usize) void {
+        const idx = maybe_index orelse return;
+        if (idx >= transcript_len) return;
+        for (indices[0..len.*]) |existing| {
+            if (existing == idx) return;
+        }
+        indices[len.*] = idx;
+        len.* += 1;
+    }
+
+    fn sortSmallIndices(indices: []usize) void {
+        var i: usize = 1;
+        while (i < indices.len) : (i += 1) {
+            const value = indices[i];
+            var j = i;
+            while (j > 0 and indices[j - 1] > value) : (j -= 1) {
+                indices[j] = indices[j - 1];
+            }
+            indices[j] = value;
+        }
+    }
+
+    fn tailLines(allocator: std.mem.Allocator, text: []const u8, max_lines: usize) ![]const u8 {
+        if (max_lines == 0 or text.len == 0) return allocator.dupe(u8, "");
+        var lines: usize = 1;
+        for (text) |byte| {
+            if (byte == '\n') lines += 1;
+        }
+        if (lines <= max_lines) return allocator.dupe(u8, text);
+
+        var line_start = text.len;
+        var remaining = max_lines;
+        while (line_start > 0 and remaining > 0) {
+            line_start -= 1;
+            if (text[line_start] == '\n') remaining -= 1;
+        }
+        const start = if (remaining == 0) line_start + 1 else 0;
+        return allocator.dupe(u8, text[start..]);
     }
 
     fn renderQueuedShelf(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]const u8 {
