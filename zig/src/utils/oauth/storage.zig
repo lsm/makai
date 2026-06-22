@@ -187,7 +187,32 @@ fn parseAuthJson(allocator: std.mem.Allocator, content: []const u8, save_fn: ?Sa
         if (provider_obj.get("api_key")) |api_key_val| {
             const api_key = try allocator.dupe(u8, api_key_val.string);
             errdefer secureFree(allocator, api_key);
-            try providers.put(provider_id, .{ .api_key = api_key });
+
+            // Read region field if present (for providers like Kimi that need region-specific endpoints).
+            // `region` is only needed to build `provider_data` (which owns its own copy via
+            // allocPrint), so it is freed at the end of the scoped block below — never leaked.
+            const provider_data: ?[]const u8 = blk: {
+                const r = if (provider_obj.get("region")) |region_val|
+                    try allocator.dupe(u8, region_val.string)
+                else
+                    break :blk null;
+                defer allocator.free(r);
+                break :blk try std.fmt.allocPrint(allocator, "region:{s}", .{r});
+            };
+            errdefer if (provider_data) |pd| allocator.free(pd);
+
+            // Store as api_key variant for pure API key auth (no region support)
+            // or as oauth with provider_data for region-aware providers like Kimi
+            if (provider_data == null) {
+                try providers.put(provider_id, .{ .api_key = api_key });
+            } else {
+                try providers.put(provider_id, .{ .oauth = .{
+                    .refresh = "",
+                    .access = api_key,
+                    .expires = std.math.maxInt(i64),
+                    .provider_data = provider_data,
+                } });
+            }
         } else if (provider_obj.get("refresh")) |refresh_val| {
             const refresh = try allocator.dupe(u8, refresh_val.string);
             errdefer secureFree(allocator, refresh);
@@ -249,6 +274,23 @@ fn serializeAuthJson(storage: *const AuthStorage, allocator: std.mem.Allocator) 
                 try json_buf.appendSlice(allocator, "}");
             },
             .oauth => |creds| {
+                // Special case for API keys stored as oauth (for region support)
+                const is_api_key_style = creds.refresh.len == 0 and creds.expires == std.math.maxInt(i64);
+                var wrote_api_key_style = false;
+                if (is_api_key_style) if (creds.provider_data) |data| {
+                    // Parse region from provider_data (format: "region:<value>")
+                    if (std.mem.startsWith(u8, data, "region:")) {
+                        const region = data["region:".len..];
+                        try json_buf.appendSlice(allocator, "{\"api_key\":");
+                        try appendJsonString(allocator, &json_buf, creds.access);
+                        try json_buf.appendSlice(allocator, ",\"region\":");
+                        try appendJsonString(allocator, &json_buf, region);
+                        try json_buf.appendSlice(allocator, "}");
+                        wrote_api_key_style = true;
+                    }
+                };
+                if (wrote_api_key_style) continue;
+                // Standard OAuth credential serialization
                 try json_buf.appendSlice(allocator, "{\"refresh\":");
                 try appendJsonString(allocator, &json_buf, creds.refresh);
                 try json_buf.appendSlice(allocator, ",\"access\":");
@@ -314,9 +356,23 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         data: ?*anyopaque,
     ) OSStatus;
     extern "c" fn CFRelease(cf: ?*const anyopaque) void;
+    /// Returns the user's default keychain (the login keychain on a standard
+    /// setup), which unlocks automatically at login. We target it explicitly so
+    /// credentials live in the login keychain rather than an arbitrary default.
+    extern "c" fn SecKeychainCopyDefault(outKeychain: *?*const anyopaque) OSStatus;
 
     fn asUInt32(value: usize) !UInt32 {
         return std.math.cast(UInt32, value) orelse error.KeychainUnavailable;
+    }
+
+    /// Obtain the default (login) keychain reference. The caller must CFRelease
+    /// the returned ref. Returns null (→ caller falls back to the search list)
+    /// if the keychain cannot be opened.
+    fn defaultKeychain() ?*const anyopaque {
+        var kc: ?*const anyopaque = null;
+        const status = SecKeychainCopyDefault(&kc);
+        if (status != errSecSuccess) return null;
+        return kc;
     }
 
     fn readServiceAccount(allocator: std.mem.Allocator, service: []const u8, account: []const u8) !?[]u8 {
@@ -324,8 +380,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
+        // Target the login (default) keychain explicitly so reads come from the
+        // keychain that is already unlocked at login — avoiding a per-launch prompt.
+        const kc = defaultKeychain();
+        defer if (kc) |ref| CFRelease(ref);
+
         const status = SecKeychainFindGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
@@ -350,8 +411,13 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         var password_data: ?*anyopaque = null;
         var item: SecKeychainItemRef = null;
 
+        // Write to the login (default) keychain explicitly so the item lives in
+        // the keychain unlocked at login.
+        const kc = defaultKeychain();
+        defer if (kc) |ref| CFRelease(ref);
+
         const find_status = SecKeychainFindGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
@@ -379,7 +445,7 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
         if (find_status != errSecItemNotFound) return error.KeychainUnavailable;
 
         const add_status = SecKeychainAddGenericPassword(
-            null,
+            kc,
             try asUInt32(service.len),
             service.ptr,
             try asUInt32(account.len),
@@ -420,13 +486,17 @@ const macos_keychain = if (builtin.os.tag == .macos) struct {
 };
 
 fn loadFromKeychain(allocator: std.mem.Allocator) !KeychainLoadResult {
+    return loadFromKeychainWithCodexImport(allocator, true);
+}
+
+fn loadFromKeychainWithCodexImport(allocator: std.mem.Allocator, import_codex: bool) !KeychainLoadResult {
     const content = macos_keychain.read(allocator) catch return .unavailable;
     const owned = content orelse return .not_found;
     defer secureFree(allocator, owned);
 
     var storage = parseAuthJson(allocator, owned, keychain_save_fn) catch return .unavailable;
     errdefer storage.deinit();
-    try maybeImportCodexCliCredentials(&storage);
+    if (import_codex) try maybeImportCodexCliCredentials(&storage);
     return .{ .found = storage };
 }
 
@@ -635,6 +705,23 @@ pub const AuthStorage = struct {
         return storage;
     }
 
+    /// Load only Makai-owned auth storage, without importing Codex CLI
+    /// credentials from a separate keychain/file. Provider streams for plain
+    /// API-key providers only need entries saved by Makai itself; importing
+    /// unrelated Codex credentials can trigger keychain UI on background
+    /// threads before a provider request has even started.
+    pub fn loadDefaultStoredOnly(allocator: std.mem.Allocator) !AuthStorage {
+        if (shouldUseKeychain()) {
+            switch (try loadFromKeychainWithCodexImport(allocator, false)) {
+                .found => |storage| return storage,
+                .not_found => return try loadFromFileWithSaveFn(allocator, keychain_save_fn),
+                .unavailable => {},
+            }
+        }
+
+        return try loadFromFile(allocator);
+    }
+
     /// Save auth storage to ~/.makai/auth.json atomically.
     ///
     /// Atomicity: writes to a temp file (with 0o600 permissions set
@@ -815,6 +902,27 @@ test "oauth_storage_imports_codex_cli_credentials" {
         },
         .api_key => return error.TestExpectedOAuthCredentials,
     }
+}
+
+test "serializeAuthJson preserves providers after region api key oauth entry" {
+    var auth_storage = emptyStorage(std.testing.allocator, null);
+    defer auth_storage.deinit();
+
+    try auth_storage.providers.put(try std.testing.allocator.dupe(u8, "kimi"), .{ .oauth = .{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "kimi-key"),
+        .expires = std.math.maxInt(i64),
+        .provider_data = try std.testing.allocator.dupe(u8, "region:china"),
+    } });
+    try auth_storage.providers.put(try std.testing.allocator.dupe(u8, "openai-codex"), .{ .api_key = try std.testing.allocator.dupe(u8, "codex-key") });
+
+    const json = try serializeAuthJson(&auth_storage, std.testing.allocator);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kimi\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"region\":\"china\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"openai-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"codex-key\"") != null);
 }
 
 test "codexKeychainAccountForHome uses Codex CLI account format" {

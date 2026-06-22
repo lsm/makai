@@ -4,7 +4,7 @@ const agent = @import("agent");
 const common = @import("tools/common");
 
 pub const schema_apply =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"operation":{"type":"string","enum":["find_replace","line_replace","insert","delete","hash_replace","hash_range_replace"]},"find":{"type":"string"},"replace":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"line_hash":{"type":"string"},"start_hash":{"type":"string"},"end_hash":{"type":"string"},"content":{"type":"string"}},"required":["workspace_root","path","operation"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"operation":{"type":"string","enum":["find_replace","line_replace","insert","delete","hash_replace","hash_range_replace"]},"find":{"type":"string"},"replace":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"line_hash":{"type":"string"},"start_hash":{"type":"string"},"end_hash":{"type":"string"},"content":{"type":"string"}},"required":["description","workspace_root","path","operation"],"additionalProperties":false}
 ;
 
 pub const apply_tool = agent.AgentTool{ .label = "Structured Edit", .name = "edit_apply", .description = "Apply structured edits: find/replace, line range replace, insert, delete, hash_replace, or hash_range_replace. Hash operations reject stale reads before mutation.", .short_description = "Edit file; supports hash-anchored replacements.", .parameters_schema_json = schema_apply, .execute = applyExecute };

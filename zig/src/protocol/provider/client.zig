@@ -402,6 +402,11 @@ pub const ProtocolClient = struct {
                 if (self.pending_requests.fetchRemove(nack.rejected_id)) |pending| {
                     var sid = pending.value.stream_id;
                     if (std.mem.allEqual(u8, &sid, 0)) sid = env.stream_id;
+                    self.current_stream_id = sid;
+                    try self.setStreamError(sid, nack.reason.slice());
+                } else {
+                    const sid = env.stream_id;
+                    self.current_stream_id = sid;
                     try self.setStreamError(sid, nack.reason.slice());
                 }
 
@@ -1006,9 +1011,10 @@ test "processEnvelope handles nack" {
     // Create a nack envelope
     const nack_reason = try allocator.dupe(u8, "Model not found");
     // Note: nack_reason ownership is transferred to envelope, will be freed by env.deinit()
+    const stream_id = protocol_types.generateUlid();
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUlid(),
+        .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = compat.time.nowMillis(),
@@ -1027,8 +1033,42 @@ test "processEnvelope handles nack" {
     // Verify error was stored
     try std.testing.expect(client.getLastError() != null);
     try std.testing.expectEqualStrings("Model not found", client.getLastError().?);
+    try std.testing.expect(client.isComplete());
+    try std.testing.expect(client.getLastErrorFor(stream_id) != null);
+    try std.testing.expectEqualStrings("Model not found", client.getLastErrorFor(stream_id).?);
 
     env.deinit(allocator);
+}
+
+test "processEnvelope attributes unmatched nack to envelope stream" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const current_stream_id = protocol_types.generateUlid();
+    const nack_stream_id = protocol_types.generateUlid();
+    client.current_stream_id = current_stream_id;
+
+    const nack_reason = try allocator.dupe(u8, "Abort rejected");
+    var env = protocol_types.Envelope{
+        .stream_id = nack_stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = protocol_types.generateUlid(),
+            .reason = OwnedSlice(u8).initOwned(nack_reason),
+            .error_code = .internal_error,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    try client.processEnvelope(env);
+
+    try std.testing.expect(client.getLastErrorFor(nack_stream_id) != null);
+    try std.testing.expectEqualStrings("Abort rejected", client.getLastErrorFor(nack_stream_id).?);
+    try std.testing.expect(client.getLastErrorFor(current_stream_id) == null);
 }
 
 test "processEnvelope handles events" {

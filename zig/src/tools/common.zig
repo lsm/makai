@@ -307,6 +307,26 @@ pub fn retrieveArtifact(allocator: std.mem.Allocator, reference: []const u8, max
     };
 }
 
+pub fn retrieveArtifactPrefix(allocator: std.mem.Allocator, reference: []const u8, max_bytes: usize) ![]u8 {
+    if (!std.mem.startsWith(u8, reference, ".makai/tool-artifacts/")) return error.InvalidArtifactReference;
+    if (hasParentTraversal(reference) or std.Io.Dir.path.isAbsolute(reference)) return error.InvalidArtifactReference;
+    var cwd = std.Io.Dir.cwd();
+    const st = try cwd.statFile(defaultIo(), reference, .{ .follow_symlinks = false });
+    if (st.kind == .sym_link) return error.InvalidArtifactReference;
+    var file = try cwd.openFile(defaultIo(), reference, .{ .allow_directory = false, .follow_symlinks = false, .resolve_beneath = true });
+    defer file.close(defaultIo());
+
+    const buffer = try allocator.alloc(u8, max_bytes);
+    errdefer allocator.free(buffer);
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try file.readStreaming(defaultIo(), &.{buffer[total..]});
+        if (n == 0) break;
+        total += n;
+    }
+    return allocator.realloc(buffer, total);
+}
+
 pub fn telemetryDetails(allocator: std.mem.Allocator, raw_bytes: usize, returned_bytes: usize, compressed: bool) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"raw_bytes\":{d},\"returned_bytes\":{d},\"saved_bytes\":{d},\"compressed\":{s}}}", .{ raw_bytes, returned_bytes, raw_bytes -| returned_bytes, if (compressed) "true" else "false" });
 }
@@ -415,15 +435,24 @@ fn summarizeArtifactBackedOutput(allocator: std.mem.Allocator, text: []const u8,
     if (stderr.len > 0) {
         return std.fmt.allocPrint(
             allocator,
-            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact: {s}\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
+            "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nmodel_safe_retrieval: use artifact_retrieve mode \"preview\" (default), \"range\", or \"grep\" with this reference. Use \"full_for_context\" only when the complete output is required by the model.\ndisplay: the TUI can open the full artifact without inserting it into model context.\nhead:\n{s}\ntail:\n{s}\nstderr:\n{s}",
             .{ text.len, countLines(text), artifact_path, head, tail, stderr },
         );
     }
     return std.fmt.allocPrint(
         allocator,
-        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact: {s}\nhead:\n{s}\ntail:\n{s}",
+        "output stored as artifact\nbytes: {d}\nlines: {d}\nartifact_reference: {s}\nmodel_safe_retrieval: use artifact_retrieve mode \"preview\" (default), \"range\", or \"grep\" with this reference. Use \"full_for_context\" only when the complete output is required by the model.\ndisplay: the TUI can open the full artifact without inserting it into model context.\nhead:\n{s}\ntail:\n{s}",
         .{ text.len, countLines(text), artifact_path, head, tail },
     );
+}
+
+test "artifact-backed summary points the model at capped retrieval modes" {
+    const summary = try summarizeArtifactBackedOutput(std.testing.allocator, "line 1\nline 2\n", "", ".makai/tool-artifacts/test.txt");
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "artifact_reference: .makai/tool-artifacts/test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "mode \"preview\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "full_for_context") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "retrieve_full_output") == null);
 }
 
 fn sanitizeKey(allocator: std.mem.Allocator, key: []const u8) ![]u8 {

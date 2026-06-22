@@ -12,6 +12,8 @@ const tui_commands = @import("tui_commands");
 const tui_login = @import("tui_login");
 const tui_model_catalog = @import("tui_model_catalog");
 const tui_config = @import("tui_config");
+const tui_theme = @import("tui_theme");
+const tui_text = @import("tui_text");
 const oauth_storage = @import("oauth/storage");
 const session_store = @import("tui_session_store");
 const transcript_view = @import("tui_view_transcript");
@@ -24,9 +26,139 @@ const menu_picker_view = @import("tui_view_menu_picker");
 const tui_render = @import("tui_render");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const tools_common = @import("tools/common");
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+pub const TuiRuntime = tui_runtime.TuiRuntime;
+pub const TuiRuntimeOptions = tui_runtime.TuiRuntimeOptions;
 
 const max_session_event_jsonl_bytes = 8 * 1024 * 1024;
 const max_session_event_payload_bytes = max_session_event_jsonl_bytes / 2;
+const artifact_display_preview_read_limit = 256 * 1024;
+const artifact_preview_head_lines = 40;
+const artifact_preview_tail_lines = 20;
+
+fn isSecretLoginPrompt(message: []const u8) bool {
+    return std.mem.indexOf(u8, message, "API key") != null or std.mem.indexOf(u8, message, "api key") != null;
+}
+
+fn firstArtifactReference(refs: []const u8) ?[]const u8 {
+    var iter = std.mem.splitSequence(u8, refs, ", ");
+    while (iter.next()) |ref| {
+        const trimmed = std.mem.trim(u8, ref, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, ".makai/tool-artifacts/")) return trimmed;
+    }
+    return null;
+}
+
+fn artifactDisplayPreview(allocator: std.mem.Allocator, data: []const u8, raw_total_bytes: u64, reference: []const u8) ![]u8 {
+    const safe_data = try sanitizeTerminalPreviewText(allocator, data);
+    defer allocator.free(safe_data);
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    const line_count = countTextLines(safe_data);
+    const byte_count = if (raw_total_bytes > 0) raw_total_bytes else data.len;
+    try writer.print("raw output preview ({d} bytes, {d} lines)\n", .{ byte_count, line_count });
+    try writer.writeAll("head:\n");
+    try writeFirstTextLines(writer, safe_data, artifact_preview_head_lines);
+    if (line_count > artifact_preview_head_lines + artifact_preview_tail_lines) {
+        try writer.writeAll("\n...\ntail:\n");
+        try writeLastTextLines(allocator, writer, safe_data, artifact_preview_tail_lines);
+    }
+    try writer.print("\nartifact: {s}\nCtrl+O or /artifact opens the full local output. Ask for grep/range to filter without loading full output into context.", .{reference});
+    return out.toOwnedSlice();
+}
+
+fn writeFirstTextLines(writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
+    var emitted: usize = 0;
+    var iter = std.mem.splitScalar(u8, data, '\n');
+    while (iter.next()) |line| {
+        if (emitted >= max_lines) break;
+        try writer.writeAll(line);
+        try writer.writeByte('\n');
+        emitted += 1;
+    }
+}
+
+fn writeLastTextLines(allocator: std.mem.Allocator, writer: *std.Io.Writer, data: []const u8, max_lines: usize) !void {
+    if (max_lines == 0) return;
+    const capacity = max_lines + 1;
+    var starts = try allocator.alloc(usize, capacity);
+    defer allocator.free(starts);
+    var starts_len: usize = 1;
+    starts[0] = 0;
+    for (data, 0..) |c, i| {
+        if (c == '\n' and i + 1 < data.len) {
+            if (starts_len == capacity) {
+                std.mem.copyForwards(usize, starts[0 .. capacity - 1], starts[1..capacity]);
+                starts_len -= 1;
+            }
+            starts[starts_len] = i + 1;
+            starts_len += 1;
+        }
+    }
+    const start_index = if (starts_len > max_lines) starts_len - max_lines else 0;
+    var i = start_index;
+    while (i < starts_len) : (i += 1) {
+        const start = starts[i];
+        const end = if (i + 1 < starts_len) starts[i + 1] - 1 else data.len;
+        try writer.writeAll(data[start..end]);
+        try writer.writeByte('\n');
+    }
+}
+
+fn countTextLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var lines: usize = 1;
+    for (text) |c| {
+        if (c == '\n') lines += 1;
+    }
+    if (text[text.len - 1] == '\n') lines -= 1;
+    return lines;
+}
+
+fn sanitizeTerminalPreviewText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        switch (c) {
+            '\n', '\t' => {
+                try writer.writeByte(c);
+                i += 1;
+                continue;
+            },
+            '\r' => {
+                try writer.writeByte('\n');
+                i += 1;
+                continue;
+            },
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f => {
+                i += 1;
+                continue;
+            },
+            else => {},
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch {
+            i += 1;
+            continue;
+        };
+        if (i + len > text.len) break;
+        _ = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        try writer.writeAll(text[i .. i + len]);
+        i += len;
+    }
+    return out.toOwnedSlice();
+}
 
 pub const ApprovalWaiter = struct {
     allocator: std.mem.Allocator,
@@ -211,6 +343,8 @@ pub const App = struct {
     session_created_at: i64 = 0,
     working_dir: []u8 = &.{},
     last_view_height: usize = 8,
+    inline_history_flushed: usize = 0,
+    last_inline_view_lines: usize = 4,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -319,6 +453,7 @@ pub const App = struct {
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
         self.discardPendingEvents();
         self.state.resetReplayState();
+        self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
         self.session_created_at = loaded.metadata.created_at;
@@ -331,16 +466,18 @@ pub const App = struct {
         }
         // Replay events into transcript and status counters.
         for (loaded.events.items) |*event| {
-            try self.state.applyEvent(event.*);
+            try self.applyRuntimeEvent(event.*);
+            self.hydrateToolDisplayPreview(event.*) catch |err| try self.recordError(@errorName(err));
         }
         if (self.session) |*session| session.clearQueuedMessages();
+        self.state.clearQueuedPreviews();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
         self.state.mode = .normal;
     }
 
-    /// Providers that expose an OAuth login, in picker order.
-    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex" };
+    /// Providers that expose an interactive login or API-key setup flow.
+    const login_providers = [_][]const u8{ "anthropic", "github-copilot", "openai-codex", "kimi" };
 
     const permission_modes = [_]tui_runtime.PermissionMode{ .bypass, .ask };
 
@@ -353,6 +490,7 @@ pub const App = struct {
             0 => .anthropic,
             1 => .github_copilot,
             2 => .openai_codex,
+            3 => .kimi,
             else => .anthropic,
         };
     }
@@ -363,6 +501,7 @@ pub const App = struct {
         }
         if (std.mem.eql(u8, provider_id, "codex") or std.mem.eql(u8, provider_id, "openai")) return 2;
         if (std.mem.eql(u8, provider_id, "github")) return 1;
+        if (std.mem.eql(u8, provider_id, "moonshot")) return 3;
         return null;
     }
 
@@ -462,8 +601,8 @@ pub const App = struct {
         try self.state.appendTranscript(.system, msg);
     }
 
-    /// Start the OAuth worker for a provider index. The flow then drives forward
-    /// via `pollLogin()` on each tick.
+    /// Start the login/setup worker for a provider index. The flow then drives
+    /// forward via `pollLogin()` on each tick.
     fn startLoginProviderIndex(self: *App, idx: usize) !void {
         const provider = login_providers[idx];
         self.state.mode = .normal;
@@ -493,7 +632,7 @@ pub const App = struct {
         try self.startLoginProviderIndex(idx);
     }
 
-    /// Start the OAuth worker for the highlighted provider.
+    /// Start the login/setup worker for the highlighted provider.
     fn applySelectedLogin(self: *App) !void {
         const idx = @min(self.state.menu_index, login_providers.len - 1);
         try self.startLoginProviderIndex(idx);
@@ -551,6 +690,7 @@ pub const App = struct {
                 const msg = try std.fmt.allocPrint(self.allocator, "{s} (type your answer and press Enter)", .{req.message});
                 defer self.allocator.free(msg);
                 try self.state.appendTranscript(.system, msg);
+                self.state.login_input_secret = isSecretLoginPrompt(req.message);
                 self.state.mode = .login_input;
             },
             .done => |creds| {
@@ -594,9 +734,8 @@ pub const App = struct {
         if (self.state.mode == .login_input) self.state.mode = .normal;
     }
 
-    /// Persist freshly obtained OAuth credentials into `~/.makai/auth.json`,
-    /// replacing any existing entry for the provider. Does not take ownership of
-    /// `creds`.
+    /// Persist freshly obtained credentials, replacing any existing entry for
+    /// the provider. Does not take ownership of `creds`.
     fn saveLoginCredentials(self: *App, provider_id: []const u8, creds: oauth_storage.Credentials) !void {
         var storage = try oauth_storage.AuthStorage.loadDefault(self.allocator);
         defer storage.deinit();
@@ -604,6 +743,41 @@ pub const App = struct {
         const key = try self.allocator.dupe(u8, provider_id);
         var owned = false;
         errdefer if (!owned) self.allocator.free(key);
+        if (std.mem.eql(u8, provider_id, "kimi")) {
+            // Kimi uses API key auth with optional region in provider_data
+            const api_key = try self.allocator.dupe(u8, creds.access);
+            errdefer if (!owned) self.allocator.free(api_key);
+
+            // Copy provider_data if present (format: "region:china" or "region:global")
+            const provider_data: ?[]const u8 = if (creds.provider_data) |pd|
+                try self.allocator.dupe(u8, pd)
+            else
+                null;
+            errdefer if (!owned) {
+                if (provider_data) |pd| self.allocator.free(pd);
+            };
+
+            if (storage.providers.fetchRemove(provider_id)) |removed| {
+                self.allocator.free(removed.key);
+                removed.value.deinit(self.allocator);
+            }
+
+            // Store with region data if present
+            if (provider_data) |pd| {
+                try storage.providers.put(key, .{ .oauth = .{
+                    .refresh = "",
+                    .access = api_key,
+                    .expires = std.math.maxInt(i64),
+                    .provider_data = pd,
+                } });
+            } else {
+                try storage.providers.put(key, .{ .api_key = api_key });
+            }
+            owned = true;
+            try storage.persist();
+            return;
+        }
+
         const refresh = try self.allocator.dupe(u8, creds.refresh);
         errdefer if (!owned) self.allocator.free(refresh);
         const access = try self.allocator.dupe(u8, creds.access);
@@ -646,6 +820,7 @@ pub const App = struct {
             self.recordError(@errorName(err)) catch {};
             return;
         };
+        self.state.login_input_secret = false;
         self.state.mode = .normal;
     }
 
@@ -653,6 +828,8 @@ pub const App = struct {
     fn cancelLogin(self: *App) void {
         self.finishLogin();
         self.state.appendTranscript(.system, "login cancelled") catch {};
+        self.state.composer.clear();
+        self.state.login_input_secret = false;
         self.state.mode = .normal;
     }
 
@@ -782,17 +959,59 @@ pub const App = struct {
 
     pub fn drainEvents(self: *App) !void {
         var session = &(self.session orelse return);
+        var completed_agent_end = false;
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
+            if (ev == .agent_end and ev.agent_end.reason == .completed) completed_agent_end = true;
             self.saveEvent(ev);
-            try self.state.applyEvent(ev);
+            try self.applyRuntimeEvent(ev);
+            try self.hydrateToolDisplayPreview(ev);
         }
         self.refreshQueuedCounts();
+        if (completed_agent_end and self.state.queue.total() > 0) {
+            session.resumeSession() catch |err| {
+                try self.state.status.setError(self.allocator, @errorName(err));
+                try self.state.appendTranscript(.@"error", @errorName(err));
+                return;
+            };
+            self.refreshQueuedCounts();
+        }
+    }
+
+    fn applyRuntimeEvent(self: *App, event: tui_runtime.TuiEvent) !void {
+        switch (event) {
+            .message_start => |payload| {
+                if (payload.role == .user) return;
+            },
+            .message_end => |payload| {
+                if (payload.role == .user) {
+                    try self.appendRuntimeUserMessage(payload.text.slice());
+                    return;
+                }
+            },
+            else => {},
+        }
+        try self.state.applyEvent(event);
+    }
+
+    fn appendRuntimeUserMessage(self: *App, text: []const u8) !void {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return;
+        _ = self.state.consumeQueuedPreviewText(trimmed);
+        if (self.state.transcript.items.len > 0) {
+            const last = &self.state.transcript.items[self.state.transcript.items.len - 1];
+            if (last.kind == .user and std.mem.eql(u8, last.text.items, trimmed)) return;
+        }
+        try self.state.appendUserMessage(trimmed);
     }
 
     fn refreshQueuedCounts(self: *App) void {
-        if (self.session) |*session| self.state.setQueuedCounts(session.queuedCounts());
+        if (self.session) |*session| {
+            const counts = session.queuedCounts();
+            self.state.setQueuedCounts(counts);
+            if (!self.state.status.streaming) self.state.pruneQueuedPreviewsToCounts(counts);
+        }
     }
 
     fn steeringAvailable(self: *const App) bool {
@@ -815,14 +1034,15 @@ pub const App = struct {
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.state.stream_aborted = false;
-        try self.state.appendUserMessage(trimmed);
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
+                if (err == error.QueueFull) return err;
                 try self.state.status.setError(self.allocator, @errorName(err));
                 try self.state.appendTranscript(.@"error", @errorName(err));
                 return;
             };
         }
+        try self.state.appendUserMessage(trimmed);
         self.refreshQueuedCounts();
     }
 
@@ -832,6 +1052,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.steer(trimmed);
+            try self.state.addQueuedPreview(.steering, trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -844,6 +1065,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
+            try self.state.addQueuedPreview(.follow_up, trimmed);
             self.refreshQueuedCounts();
             return;
         }
@@ -891,7 +1113,10 @@ pub const App = struct {
 
         switch (result.action) {
             .quit => return error.QuitRequested,
-            .clear_transcript => self.state.clearTranscript(),
+            .clear_transcript => {
+                self.state.clearTranscript();
+                self.inline_history_flushed = 0;
+            },
             .open_session_picker => {
                 // Refresh sessions list from store then open the picker.
                 try self.loadSessions();
@@ -911,6 +1136,7 @@ pub const App = struct {
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
+            .open_artifact_viewer => try self.openLatestArtifact(),
             .none => {},
         }
         if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
@@ -921,6 +1147,10 @@ pub const App = struct {
     }
 
     pub fn recordError(self: *App, message: []const u8) !void {
+        if (std.mem.eql(u8, message, "QueueFull")) {
+            try self.state.status.setError(self.allocator, "stream backlog; draining");
+            return;
+        }
         try self.state.status.setError(self.allocator, message);
         try self.state.appendTranscript(.@"error", message);
     }
@@ -988,6 +1218,55 @@ pub const App = struct {
         }
         self.stageClipboard(text);
         self.state.appendTranscript(.system, "copied transcript to clipboard") catch {};
+    }
+
+    fn copyPreview(self: *App) void {
+        if (self.state.preview.content.len == 0) {
+            self.state.appendTranscript(.system, "nothing to copy yet") catch {};
+            return;
+        }
+        self.stageClipboard(self.state.preview.content);
+        self.state.appendTranscript(.system, "copied preview to clipboard") catch {};
+    }
+
+    fn openLatestArtifact(self: *App) !void {
+        var i = self.state.tools.items.len;
+        while (i > 0) {
+            i -= 1;
+            const refs = self.state.tools.items[i].artifact_refs;
+            const reference = firstArtifactReference(refs) orelse continue;
+            const data = tools_common.retrieveArtifact(self.allocator, reference, 64 * 1024 * 1024) catch |err| {
+                try self.recordError(@errorName(err));
+                return;
+            };
+            defer self.allocator.free(data);
+            const safe_data = try sanitizeTerminalPreviewText(self.allocator, data);
+            defer self.allocator.free(safe_data);
+            try self.state.setPreview(.artifact, reference, safe_data);
+            return;
+        }
+        try self.state.appendTranscript(.system, "no local artifact to open");
+    }
+
+    fn hydrateToolDisplayPreview(self: *App, event: tui_runtime.TuiEvent) !void {
+        switch (event) {
+            .tool_execution_end => |payload| {
+                if (payload.artifact_count == 0) return;
+                const reference = firstArtifactReference(payload.artifact_refs.slice()) orelse return;
+                const data = tools_common.retrieveArtifactPrefix(self.allocator, reference, artifact_display_preview_read_limit) catch return;
+                defer self.allocator.free(data);
+                const preview = try artifactDisplayPreview(self.allocator, data, payload.raw_total_bytes, reference);
+                errdefer self.allocator.free(preview);
+                for (self.state.tools.items) |*tool| {
+                    if (!std.mem.eql(u8, tool.id, payload.tool_call_id.slice())) continue;
+                    if (tool.display_preview.len > 0) self.allocator.free(tool.display_preview);
+                    tool.display_preview = preview;
+                    return;
+                }
+                self.allocator.free(preview);
+            },
+            else => {},
+        }
     }
 
     fn cycleThinkingLevel(self: *App) void {
@@ -1279,18 +1558,11 @@ pub const TuiModel = struct {
                 // Content was read back from the external editor. Load into composer.
                 defer ctx.persistent_allocator.free(content);
                 app.state.replaceComposerBuffer(content) catch {};
-                // Re-enter alt screen and hide cursor after editor exit.
-                return .{ .sequence = &.{
-                    .enter_alt_screen,
-                    .hide_cursor,
-                } };
+                return editorReturnCommand();
             },
             .editor_failed => {
                 app.recordError("external editor failed") catch {};
-                return .{ .sequence = &.{
-                    .enter_alt_screen,
-                    .hide_cursor,
-                } };
+                return editorReturnCommand();
             },
             .key => |key| {
                 if (key.modifiers.ctrl) switch (key.key) {
@@ -1301,9 +1573,25 @@ pub const TuiModel = struct {
                             if (launchExternalEditor(app, ctx.persistent_allocator)) |cmd| return cmd;
                             return .none;
                         },
+                        't' => {
+                            app.state.toggleLatestToolExpanded();
+                            return .none;
+                        },
+                        'o' => {
+                            app.openLatestArtifact() catch |err| app.recordError(@errorName(err)) catch {};
+                            return .none;
+                        },
                         'y' => {
-                            app.copyLastAssistant();
+                            if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
                             app.flushClipboard(ctx);
+                            return .none;
+                        },
+                        'p' => {
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryPrev() catch false;
+                            return .none;
+                        },
+                        'n' => {
+                            if (app.state.mode == .normal) _ = app.state.composerHistoryNext() catch false;
                             return .none;
                         },
                         else => return .none,
@@ -1320,12 +1608,24 @@ pub const TuiModel = struct {
                         var decided = false;
                         switch (key.key) {
                             .char => |c| switch (c) {
-                                'y' => { app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                                'a' => { app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
-                                'n' => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                                'y' => {
+                                    app.decideApproval(true, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
+                                'a' => {
+                                    app.decideApproval(true, true) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
+                                'n' => {
+                                    app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                    decided = true;
+                                },
                                 else => {},
                             },
-                            .escape => { app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {}; decided = true; },
+                            .escape => {
+                                app.decideApproval(false, false) catch |err| app.recordError(@errorName(err)) catch {};
+                                decided = true;
+                            },
                             else => {},
                         }
                         if (decided) return .none;
@@ -1363,6 +1663,7 @@ pub const TuiModel = struct {
                         .escape => app.cancelLogin(),
                         .backspace => _ = app.state.composer.deleteBeforeCursor(),
                         .char => |c| appendChar(app, c) catch {},
+                        .paste => |text| app.state.composer.insertSlice(app.allocator, text) catch {},
                         .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
                         .left => _ = app.state.composer.moveCursorPrev(),
                         .right => _ = app.state.composer.moveCursorNext(),
@@ -1400,6 +1701,18 @@ pub const TuiModel = struct {
                     }
                     return .none;
                 }
+                if (app.state.mode == .preview) {
+                    switch (key.key) {
+                        .up => app.state.preview.scroll += 1,
+                        .down => app.state.preview.scroll -|= 1,
+                        .page_up => app.state.preview.scroll += 10,
+                        .page_down => app.state.preview.scroll -|= 10,
+                        .home => app.state.preview.scroll = 0,
+                        .escape => app.state.mode = .normal,
+                        else => {},
+                    }
+                    return .none;
+                }
                 switch (key.key) {
                     .enter => {
                         if (key.modifiers.shift) {
@@ -1420,18 +1733,21 @@ pub const TuiModel = struct {
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
+                                if (err == error.QueueFull) consumed = false;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         } else if (app.state.status.streaming) {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
+                                    if (err == error.QueueFull) consumed = false;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
+                                    if (err == error.QueueFull) consumed = false;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
@@ -1442,8 +1758,9 @@ pub const TuiModel = struct {
                                 if (std.mem.startsWith(u8, trimmed, "/")) {
                                     app.submit(text) catch |err| {
                                         if (err == error.QuitRequested) return .quit;
+                                        if (err == error.QueueFull) consumed = false;
                                         app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                        app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                        if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                                     };
                                 } else {
                                     consumed = false;
@@ -1452,8 +1769,9 @@ pub const TuiModel = struct {
                         } else {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
+                                if (err == error.QueueFull) consumed = false;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
-                                app.state.appendTranscript(.@"error", @errorName(err)) catch {};
+                                if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
                         }
                         if (consumed) {
@@ -1470,16 +1788,17 @@ pub const TuiModel = struct {
                     },
                     .backspace => _ = app.state.composer.deleteBeforeCursor(),
                     .char => |c| appendChar(app, c) catch {},
+                    .paste => |text| app.state.composer.insertSlice(app.allocator, text) catch {},
                     .space => app.state.composer.insertSlice(app.allocator, " ") catch {},
                     .left => _ = app.state.composer.moveCursorPrev(),
                     .right => _ = app.state.composer.moveCursorNext(),
                     .home => app.state.composer.moveCursorHome(),
                     .end => app.state.composer.moveCursorEnd(),
                     .up => {
-                        if (!(app.state.composerHistoryPrev() catch false)) app.state.transcript_scroll += 1;
+                        _ = app.state.composerHistoryPrev() catch false;
                     },
                     .down => {
-                        if (!(app.state.composerHistoryNext() catch false)) app.state.transcript_scroll -|= 1;
+                        _ = app.state.composerHistoryNext() catch false;
                     },
                     // PageUp/PageDown scroll by 5 lines for faster navigation.
                     .page_up => app.state.transcript_scroll += 5,
@@ -1493,11 +1812,13 @@ pub const TuiModel = struct {
                 app.state.anim_tick +%= 1;
                 app.drainEvents() catch {};
                 app.pollLogin() catch {};
+                flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
             },
             .quit => return .quit,
         }
         // A command (e.g. `/copy`) may have staged clipboard text; flush it now
         // that a mutable Context is in hand.
+        flushInlineHistory(app, ctx) catch |err| app.recordError(@errorName(err)) catch {};
         app.flushClipboard(ctx);
         return .none;
     }
@@ -1516,6 +1837,7 @@ pub const TuiModel = struct {
             .width = width,
             .steering_available = app.steeringAvailable(),
         }) catch "";
+        const queued = renderQueuedShelf(ctx.allocator, &app.state, width) catch "";
         const extra = switch (app.state.mode) {
             .approval => approval_view.render(ctx.allocator, &app.state, .{ .width = width }) catch "",
             .preview => preview_view.render(ctx.allocator, &app.state, .{ .width = width, .height = height / 2 }) catch "",
@@ -1591,17 +1913,195 @@ pub const TuiModel = struct {
             .login_input => "",
             .normal => "",
         };
-        const fixed = countLines(status) + countLines(composer) + @max(countLines(extra), 1);
+        if (ctx._terminal != null) {
+            const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
+            const active_height = height -| fixed;
+            const active = renderInlineActiveTranscript(ctx.allocator, &app.state, width, active_height) catch "";
+            const live_frame = if (active.len > 0 and queued.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ active, extra, queued, composer, status }) catch ""
+            else if (active.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ active, extra, composer, status }) catch ""
+            else if (queued.len > 0)
+                tui_render.joinVertical(ctx.allocator, &.{ extra, queued, composer, status }) catch ""
+            else
+                tui_render.joinVertical(ctx.allocator, &.{ extra, composer, status }) catch "";
+            app.last_inline_view_lines = @max(countLines(live_frame), 1);
+            return tui_render.withSynchronizedOutput(ctx.allocator, live_frame) catch live_frame;
+        }
+
+        const fixed = countLines(status) + countLines(composer) + countLines(queued) + @max(countLines(extra), 1);
         const transcript_height = if (height > fixed) height - fixed else 3;
         const transcript = transcript_view.render(ctx.allocator, &app.state, .{ .width = width, .height = transcript_height }) catch "";
-        const frame = tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
+        const frame = if (queued.len > 0)
+            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, queued, composer, status }) catch ""
+        else
+            tui_render.joinVertical(ctx.allocator, &.{ transcript, extra, composer, status }) catch "";
         return tui_render.withSynchronizedOutput(ctx.allocator, frame) catch frame;
+    }
+
+    fn renderInlineActiveTranscript(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize, max_lines: usize) ![]const u8 {
+        if (max_lines == 0) return allocator.dupe(u8, "");
+
+        var indices: [3]usize = undefined;
+        var len: usize = 0;
+        addActiveTranscriptIndex(&indices, &len, state.active_user_entry, state.transcript.items.len);
+        addActiveTranscriptIndex(&indices, &len, state.active_assistant_entry, state.transcript.items.len);
+        addActiveTranscriptIndex(&indices, &len, state.active_tool_result_entry, state.transcript.items.len);
+        if (len == 0) return allocator.dupe(u8, "");
+        sortSmallIndices(indices[0..len]);
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        for (indices[0..len], 0..) |idx, i| {
+            if (i > 0) try writer.writeAll("\n\n");
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
+            defer allocator.free(rendered);
+            try writer.writeAll(rendered);
+        }
+        const rendered_active = try out.toOwnedSlice();
+        defer allocator.free(rendered_active);
+        return tailLines(allocator, rendered_active, max_lines);
+    }
+
+    fn addActiveTranscriptIndex(indices: *[3]usize, len: *usize, maybe_index: ?usize, transcript_len: usize) void {
+        const idx = maybe_index orelse return;
+        if (idx >= transcript_len) return;
+        for (indices[0..len.*]) |existing| {
+            if (existing == idx) return;
+        }
+        indices[len.*] = idx;
+        len.* += 1;
+    }
+
+    fn sortSmallIndices(indices: []usize) void {
+        var i: usize = 1;
+        while (i < indices.len) : (i += 1) {
+            const value = indices[i];
+            var j = i;
+            while (j > 0 and indices[j - 1] > value) : (j -= 1) {
+                indices[j] = indices[j - 1];
+            }
+            indices[j] = value;
+        }
+    }
+
+    fn tailLines(allocator: std.mem.Allocator, text: []const u8, max_lines: usize) ![]const u8 {
+        if (max_lines == 0 or text.len == 0) return allocator.dupe(u8, "");
+        var lines: usize = 1;
+        for (text) |byte| {
+            if (byte == '\n') lines += 1;
+        }
+        if (lines <= max_lines) return allocator.dupe(u8, text);
+
+        var line_start = text.len;
+        var remaining = max_lines;
+        while (line_start > 0 and remaining > 0) {
+            line_start -= 1;
+            if (text[line_start] == '\n') remaining -= 1;
+        }
+        const start = if (remaining == 0) line_start + 1 else 0;
+        return allocator.dupe(u8, text[start..]);
+    }
+
+    fn renderQueuedShelf(allocator: std.mem.Allocator, state: *const tui_state.AppState, width: usize) ![]const u8 {
+        if (state.queued_previews.items.len == 0) return allocator.dupe(u8, "");
+
+        var out: std.Io.Writer.Allocating = .init(allocator);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        const max_width = width -| 4;
+        for (state.queued_previews.items, 0..) |preview, i| {
+            if (i > 0) try writer.writeByte('\n');
+            const label = switch (preview.kind) {
+                .steering => "steering",
+                .follow_up => "queued follow-up",
+            };
+            const raw_prefix = try std.fmt.allocPrint(allocator, "  {s} {s}: ", .{ tui_theme.glyph.prompt, label });
+            defer allocator.free(raw_prefix);
+            const prefix_style = switch (preview.kind) {
+                .steering => tui_theme.runningText(),
+                .follow_up => tui_theme.warningText(),
+            };
+            const prefix = try prefix_style.render(allocator, raw_prefix);
+            defer allocator.free(prefix);
+            const body_width = max_width -| tui_text.visibleWidth(raw_prefix);
+            const body = try tui_text.truncateToWidth(allocator, preview.text, body_width);
+            defer allocator.free(body);
+            const styled_body = try tui_theme.bodyStyle(.user).render(allocator, body);
+            defer allocator.free(styled_body);
+            try writer.writeAll(prefix);
+            try writer.writeAll(styled_body);
+        }
+        return out.toOwnedSlice();
     }
 
     fn appendChar(app: *App, c: u21) !void {
         var buf: [4]u8 = undefined;
         const len = try std.unicode.utf8Encode(c, &buf);
         try app.state.composer.insertSlice(app.allocator, buf[0..len]);
+    }
+
+    fn flushInlineHistory(app: *App, ctx: *zz.Context) !void {
+        if (@import("builtin").is_test) {
+            const ok: anyerror!void = {};
+            return ok;
+        }
+        if (ctx._terminal == null) return;
+        if (app.inline_history_flushed >= app.state.transcript.items.len) return;
+
+        const stop = inlineFlushStop(app);
+        if (stop <= app.inline_history_flushed) return;
+
+        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer out.deinit();
+        const writer = &out.writer;
+        for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
+            if (rel_i > 0) try writer.writeAll("\n\n");
+            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
+            defer ctx.allocator.free(rendered);
+            try writer.writeAll(rendered);
+        }
+        const rendered_history = out.written();
+        if (rendered_history.len > 0) {
+            try writeInlineHistory(ctx, app.last_inline_view_lines, rendered_history);
+            app.inline_history_flushed = stop;
+            app.state.transcript_scroll = 0;
+        }
+    }
+
+    fn inlineFlushStop(app: *const App) usize {
+        var stop = app.state.transcript.items.len;
+        if (app.state.active_user_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_assistant_entry) |idx| stop = @min(stop, idx);
+        if (app.state.active_tool_result_entry) |idx| stop = @min(stop, idx);
+        return stop;
+    }
+
+    fn writeInlineHistory(ctx: *zz.Context, reserved_lines: usize, text: []const u8) !void {
+        const term = ctx._terminal orelse return;
+        const reserved: u16 = @intCast(@min(@max(reserved_lines, 1), @as(usize, ctx.height -| 1)));
+        const history_bottom: u16 = if (ctx.height > reserved) ctx.height - reserved else 1;
+        const writer = term.writer();
+
+        try writer.writeAll(zz.ansi.sync_start);
+        try zz.ansi.setScrollRegion(writer, 1, history_bottom);
+        try zz.ansi.cursorTo(writer, history_bottom, 1);
+
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var first = true;
+        while (lines.next()) |line| {
+            if (!first) try writer.writeAll("\r\n");
+            first = false;
+            try writer.writeAll(line);
+            try writer.writeAll(zz.ansi.line_clear_right);
+        }
+        try writer.writeAll("\r\n");
+
+        try zz.ansi.resetScrollRegion(writer);
+        try zz.ansi.cursorTo(writer, history_bottom + 1, 1);
+        try writer.writeAll(zz.ansi.sync_end);
+        try term.flush();
     }
 
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
@@ -1790,7 +2290,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn tuiProgramOptions() zz.Options {
-    return .{ .kitty_keyboard = true, .mouse = false };
+    return .{ .kitty_keyboard = true, .mouse = false, .alternate_scroll = false, .alt_screen = false, .inline_bottom_viewport = true, .cursor = true };
+}
+
+fn editorReturnCommand() zz.Cmd(TuiModel.Msg) {
+    if (tuiProgramOptions().alt_screen) {
+        return .{ .sequence = &.{
+            .enter_alt_screen,
+            .hide_cursor,
+        } };
+    }
+    return .none;
 }
 
 pub fn tuiProgramOptionsForTest() zz.Options {
@@ -1841,8 +2351,15 @@ test "TUI program enables enhanced keyboard protocol" {
     try std.testing.expect(tuiProgramOptions().kitty_keyboard);
 }
 
-test "TUI program leaves plain mouse selection to the terminal" {
+test "TUI program preserves native text selection" {
     try std.testing.expect(!tuiProgramOptions().mouse);
+    try std.testing.expect(!tuiProgramOptions().alternate_scroll);
+    try std.testing.expect(!tuiProgramOptions().alt_screen);
+    try std.testing.expect(tuiProgramOptions().inline_bottom_viewport);
+}
+
+test "editor return does not enter alt screen in inline mode" {
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, editorReturnCommand());
 }
 
 test "saved model ref loads from config store" {
@@ -1925,7 +2442,7 @@ test "App saveEvent keeps debug-visible event types" {
 test "App approval decisions map to requested choices" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
 
     try app.decideApproval(true, false);
@@ -1933,13 +2450,13 @@ test "App approval decisions map to requested choices" {
     try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
     try std.testing.expect(!app.state.approval.always);
 
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
     try app.decideApproval(true, true);
     try std.testing.expectEqual(tui_state.ApprovalStatus.approved, app.state.approval.status);
     try std.testing.expect(app.state.approval.always);
 
-    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try app.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     app.state.mode = .approval;
     try app.decideApproval(false, false);
     try std.testing.expectEqual(tui_state.ApprovalStatus.rejected, app.state.approval.status);
@@ -1972,6 +2489,75 @@ test "App submit starts direct OpenAI Codex login command" {
     try std.testing.expect(app.login != null);
     try std.testing.expectEqualStrings("openai-codex", app.login.?.provider_id);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for openai-codex") != null);
+}
+
+test "App submit starts direct Kimi API key login command" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    try app.submit("/login kimi");
+
+    try std.testing.expect(app.login != null);
+    try std.testing.expectEqualStrings("kimi", app.login.?.provider_id);
+    try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "starting login for kimi") != null);
+}
+
+test "App cancel login clears secret composer draft" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+
+    app.state.mode = .login_input;
+    app.state.login_input_secret = true;
+    try app.state.composer.insertSlice(std.testing.allocator, "moonshot-secret-key");
+
+    app.cancelLogin();
+
+    try std.testing.expectEqual(tui_state.AppMode.normal, app.state.mode);
+    try std.testing.expect(!app.state.login_input_secret);
+    try std.testing.expectEqual(@as(usize, 0), app.state.composer.text().len);
+}
+
+test "App saves Kimi login credentials as api key" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "home" });
+    defer std.testing.allocator.free(home);
+    try compat.fs.createDir(compat.fs.getCwd(), home);
+    const previous_home = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "HOME") catch null;
+    defer {
+        if (previous_home) |value| {
+            const value_z = std.testing.allocator.dupeZ(u8, value) catch null;
+            if (value_z) |home_z| {
+                defer std.testing.allocator.free(home_z);
+                _ = setenv("HOME", home_z.ptr, 1);
+            }
+            std.testing.allocator.free(value);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    const home_z = try std.testing.allocator.dupeZ(u8, home);
+    defer std.testing.allocator.free(home_z);
+    _ = setenv("HOME", home_z.ptr, 1);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const creds = oauth_storage.Credentials{
+        .refresh = try std.testing.allocator.dupe(u8, ""),
+        .access = try std.testing.allocator.dupe(u8, "moonshot-test-key"),
+        .expires = std.math.maxInt(i64),
+    };
+    defer creds.deinit(std.testing.allocator);
+
+    try app.saveLoginCredentials("kimi", creds);
+
+    var storage = try oauth_storage.AuthStorage.loadFromFile(std.testing.allocator);
+    defer storage.deinit();
+    const auth = storage.providers.get("kimi") orelse return error.MissingKimiAuth;
+    switch (auth) {
+        .api_key => |key| try std.testing.expectEqualStrings("moonshot-test-key", key),
+        .oauth => return error.ExpectedApiKeyAuth,
+    }
 }
 
 test "multi-line /help output renders all lines into transcript view" {
@@ -2077,7 +2663,7 @@ test "App submit abort does not permanently shut down approval waiter" {
 
     // Verify the waiter can still accept a future approval decision.
     waiter.decision = null;
-    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "{}");
+    try app.state.approval.setPending(app.allocator, "call-1", "edit_file", "edit_file", "{}");
     try app.decideApproval(true, false);
     try std.testing.expect(waiter.decision == .approve);
 }
@@ -2123,6 +2709,7 @@ const MockAppSession = struct {
     steer_count: usize = 0,
     queued_follow_up_count: usize = 0,
     submit_count: usize = 0,
+    resume_count: usize = 0,
     cancel_count: usize = 0,
     clear_count: usize = 0,
     queued_counts: tui_runtime.QueuedCounts = .{},
@@ -2161,7 +2748,13 @@ const MockAppSession = struct {
     }
 
     fn resumeSession(ctx: ?*anyopaque) anyerror!void {
-        _ = ctx;
+        const self = ptr(ctx);
+        self.resume_count += 1;
+        if (self.queued_counts.steering > 0) {
+            self.queued_counts.steering -= 1;
+        } else if (self.queued_counts.follow_up > 0) {
+            self.queued_counts.follow_up -= 1;
+        }
     }
 
     fn cancel(ctx: ?*anyopaque) void {
@@ -2178,12 +2771,14 @@ const MockAppSession = struct {
     fn steer(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.steer_count += 1;
+        if (self.queued_counts.total() == 0) self.queued_counts.steering += 1;
         _ = text;
     }
 
     fn queueFollowUp(ctx: ?*anyopaque, text: []const u8) anyerror!void {
         const self = ptr(ctx);
         self.queued_follow_up_count += 1;
+        if (self.queued_counts.total() == 0) self.queued_counts.follow_up += 1;
         try std.testing.expectEqualStrings("follow later", text);
     }
 
@@ -2245,6 +2840,16 @@ test "App submit quit command requests quit" {
     try std.testing.expectError(error.QuitRequested, app.submit("/quit"));
 }
 
+test "artifact previews strip terminal control bytes" {
+    const preview = try artifactDisplayPreview(std.testing.allocator, "head\x1b[2J\nok\x1b]0;title\x07\n", 0, ".makai/tool-artifacts/test");
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 0x07) == null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "head[2J") != null);
+    try std.testing.expect(std.mem.indexOf(u8, preview, "ok]0;title") != null);
+}
+
 test "App steer and queue follow-up handle fallback empty and session paths" {
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
@@ -2270,6 +2875,9 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 2), app.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqual(tui_state.QueuedPreviewKind.steering, app.state.queued_previews.items[0].kind);
+    try std.testing.expectEqualStrings("steer me", app.state.queued_previews.items[0].text);
 
     mock.queued_counts = .{ .steering = 3, .follow_up = 4 };
     try app.queueFollowUp(" follow later ");
@@ -2277,6 +2885,9 @@ test "App steer and queue follow-up handle fallback empty and session paths" {
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.state.queue.steering);
     try std.testing.expectEqual(@as(usize, 4), app.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 2), app.state.queued_previews.items.len);
+    try std.testing.expectEqual(tui_state.QueuedPreviewKind.follow_up, app.state.queued_previews.items[1].kind);
+    try std.testing.expectEqualStrings("follow later", app.state.queued_previews.items[1].text);
 }
 
 test "TuiModel exits quit command while streaming" {
@@ -2358,6 +2969,139 @@ test "TuiModel drains events before routing Enter while streaming" {
     try std.testing.expect(!model.app.?.state.status.streaming);
 }
 
+test "App drain keeps consecutive user messages distinct" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try mock.eventStream().push(.{ .message_start = .{ .role = .user } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run pwd")),
+    } });
+    try mock.eventStream().push(.{ .message_start = .{ .role = .user } });
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run uname -a")),
+    } });
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 2), app.state.transcript.items.len);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("run pwd", app.state.transcript.items[0].text.items);
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, app.state.transcript.items[1].kind);
+    try std.testing.expectEqualStrings("run uname -a", app.state.transcript.items[1].text.items);
+}
+
+test "App drain auto-resumes remaining steering after completed turn" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run pwd");
+    try app.state.addQueuedPreview(.steering, "run uname -a");
+    app.state.setQueuedCounts(mock.queued_counts);
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run pwd")),
+    } });
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
+}
+
+test "App drain prunes consumed steering preview after resume without user echo" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 2 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run pwd");
+    try app.state.addQueuedPreview(.steering, "run ps -ef");
+    app.state.setQueuedCounts(mock.queued_counts);
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .completed } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 1), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run ps -ef", app.state.queued_previews.items[0].text);
+}
+
+test "App drain keeps steering preview until runtime user message arrives" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 0 } };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run uname -a");
+    app.state.setQueuedCounts(.{ .steering = 1 });
+    app.state.status.streaming = true;
+
+    try mock.eventStream().push(.{ .tool_execution_start = .{
+        .tool_call_id = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "tool-1")),
+        .tool_name = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "shell_execute")),
+        .args_json = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "{}")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("run uname -a", app.state.queued_previews.items[0].text);
+
+    try mock.eventStream().push(.{ .message_end = .{
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "run uname -a")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
+    try std.testing.expect(app.state.transcript.items.len >= 1);
+    const last = app.state.transcript.items[app.state.transcript.items.len - 1];
+    try std.testing.expectEqual(tui_state.TranscriptKind.user, last.kind);
+    try std.testing.expectEqualStrings("run uname -a", last.text.items);
+}
+
+test "App refresh prunes stale idle steering preview" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{} };
+    defer mock.deinit();
+    app.session = mock.session();
+    try app.state.addQueuedPreview(.steering, "run ps -ef");
+    app.state.setQueuedCounts(.{ .steering = 1 });
+    app.state.status.streaming = false;
+
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), app.state.queue.total());
+    try std.testing.expectEqual(@as(usize, 0), app.state.queued_previews.items.len);
+}
+
+test "App drain does not auto-resume queued steering after error turn" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{ .queued_counts = .{ .steering = 1 } };
+    defer mock.deinit();
+    app.session = mock.session();
+
+    try mock.eventStream().push(.{ .agent_end = .{ .reason = .@"error" } });
+    try app.drainEvents();
+
+    try std.testing.expectEqual(@as(usize, 0), mock.resume_count);
+    try std.testing.expectEqual(@as(usize, 1), app.state.queue.steering);
+}
+
 test "TuiModel remote streaming Enter is ignored and preserves composer" {
     var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
@@ -2398,6 +3142,9 @@ test "TuiModel remote streaming Alt+Enter still queues follow-up" {
     try std.testing.expectEqual(@as(usize, 0), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 1), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.follow_up);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("follow later", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel local streaming Enter steers when steering available" {
@@ -2420,6 +3167,9 @@ test "TuiModel local streaming Enter steers when steering available" {
     try std.testing.expectEqual(@as(usize, 1), mock.steer_count);
     try std.testing.expectEqual(@as(usize, 0), mock.queued_follow_up_count);
     try std.testing.expectEqualStrings("", model.app.?.state.composer.text());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queue.steering);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("steer now", model.app.?.state.queued_previews.items[0].text);
 }
 
 test "TuiModel stops Enter routing when drained event enters approval mode" {
@@ -2452,7 +3202,7 @@ test "TuiModel allows /abort slash command during approval mode" {
     defer mock.deinit();
     model.app.?.session = mock.session();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'a', 'b', 'o', 'r', 't' };
@@ -2475,7 +3225,7 @@ test "TuiModel blocks non-abort slash commands during approval mode" {
     defer mock.deinit();
     model.app.?.session = mock.session();
     model.app.?.state.status.streaming = true;
-    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "{\"path\":\"README.md\"}");
+    try model.app.?.state.approval.setPending(std.testing.allocator, "call-approval", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
     model.app.?.state.mode = .approval;
 
     const keys = [_]u21{ '/', 'h', 'e', 'l', 'p' };

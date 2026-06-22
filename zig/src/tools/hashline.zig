@@ -5,11 +5,11 @@ const common = @import("tools/common");
 const tool_types = @import("protocol_tool_types");
 
 pub const schema_read =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"byte_limit":{"type":"integer","minimum":0}},"required":["workspace_root","path"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"byte_limit":{"type":"integer","minimum":0}},"required":["description","workspace_root","path"],"additionalProperties":false}
 ;
 
 pub const schema_edit =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"path":{"type":"string"},"operation":{"type":"string","enum":["replace_range","insert_before","insert_after","delete_range"]},"start_line":{"type":"integer","minimum":1},"start_hash":{"type":"string"},"end_line":{"type":"integer","minimum":1},"end_hash":{"type":"string"},"replacement":{"type":"string"},"preview_only":{"type":"boolean"}},"required":["workspace_root","path","operation","start_line","start_hash"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"path":{"type":"string"},"operation":{"type":"string","enum":["replace_range","insert_before","insert_after","delete_range"]},"start_line":{"type":"integer","minimum":1},"start_hash":{"type":"string"},"end_line":{"type":"integer","minimum":1},"end_hash":{"type":"string"},"replacement":{"type":"string"},"preview_only":{"type":"boolean"}},"required":["description","workspace_root","path","operation","start_line","start_hash"],"additionalProperties":false}
 ;
 
 pub const read_tool = agent.AgentTool{ .label = "Hashline Read", .name = "hashline_read", .description = "Read a workspace file line range with stable SHA-256 per-line anchors for large-file edits.", .short_description = "Read line range with SHA-256 anchors.", .parameters_schema_json = schema_read, .execute = readExecute };

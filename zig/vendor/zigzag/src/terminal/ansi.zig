@@ -61,6 +61,8 @@ pub const unicode_width_mode_disable = CSI ++ "?2027l";
 // Kitty keyboard protocol
 pub const kitty_keyboard_enable = CSI ++ ">1u";
 pub const kitty_keyboard_disable = CSI ++ "<u";
+pub const kitty_keyboard_disable_all = CSI ++ "<10u";
+pub const kitty_keyboard_reset = CSI ++ "=0u";
 
 /// Move cursor to position (1-indexed)
 pub fn cursorTo(writer: *Writer, row: u16, col: u16) !void {

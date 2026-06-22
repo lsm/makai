@@ -152,7 +152,8 @@ pub const Markdown = struct {
                     const bar = try self.code_block_border.render(tmp, "┌");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
-                    for (0..@min(self.width - 2, 40)) |_| {
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
                         try writer.writeAll(dash);
                     }
                     const end = try self.code_block_border.render(tmp, "┐");
@@ -162,7 +163,8 @@ pub const Markdown = struct {
                     const bar = try self.code_block_border.render(tmp, "└");
                     try writer.writeAll(bar);
                     const dash = try self.code_block_border.render(tmp, "─");
-                    for (0..@min(self.width - 2, 40)) |_| {
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
                         try writer.writeAll(dash);
                     }
                     const end = try self.code_block_border.render(tmp, "┘");
@@ -172,10 +174,16 @@ pub const Markdown = struct {
             }
 
             if (in_code_block) {
-                const bar = try self.code_block_border.render(tmp, "│ ");
-                try writer.writeAll(bar);
-                const styled = try self.code_block_style.render(tmp, line);
+                const block_width = self.codeBlockWidth();
+                const inner_width = block_width - 4; // border + side padding
+                const visible_len = @min(line.len, inner_width);
+                const start_bar = try self.code_block_border.render(tmp, "│ ");
+                try writer.writeAll(start_bar);
+                const styled = try self.code_block_style.render(tmp, line[0..visible_len]);
                 try writer.writeAll(styled);
+                for (visible_len..inner_width) |_| try writer.writeByte(' ');
+                const end_bar = try self.code_block_border.render(tmp, " │");
+                try writer.writeAll(end_bar);
                 continue;
             }
 
@@ -339,6 +347,10 @@ pub const Markdown = struct {
         }
 
         return result.toOwnedSlice();
+    }
+
+    fn codeBlockWidth(self: *const Markdown) usize {
+        return @max(@as(usize, self.width), 8);
     }
 
     fn isAllChar(s: []const u8, c: u8) bool {

@@ -90,9 +90,12 @@ fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.Assista
     }
 
     while (true) {
-        stream.push(cloned) catch {
-            compat.time.sleepNs(1 * std.time.ns_per_ms);
-            continue;
+        stream.push(cloned) catch |err| switch (err) {
+            error.QueueFull => {
+                compat.time.sleepNs(1 * std.time.ns_per_ms);
+                continue;
+            },
+            error.StreamCompleted => return error.StreamCompleted,
         };
         return;
     }

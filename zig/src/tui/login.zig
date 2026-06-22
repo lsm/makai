@@ -19,6 +19,7 @@ pub const Provider = enum {
     anthropic,
     github_copilot,
     openai_codex,
+    kimi,
 };
 
 /// Storage key under which credentials are persisted in `~/.makai/auth.json`.
@@ -28,6 +29,7 @@ pub fn providerStorageKey(provider: Provider) []const u8 {
         .anthropic => "anthropic",
         .github_copilot => "github-copilot",
         .openai_codex => "openai-codex",
+        .kimi => "kimi",
     };
 }
 
@@ -92,6 +94,7 @@ pub const LoginSession = struct {
             .anthropic => try std.Thread.spawn(.{}, runAnthropic, .{self}),
             .github_copilot => try std.Thread.spawn(.{}, runGithub, .{self}),
             .openai_codex => try std.Thread.spawn(.{}, runCodex, .{self}),
+            .kimi => try std.Thread.spawn(.{}, runKimi, .{self}),
         };
         return self;
     }
@@ -308,6 +311,35 @@ fn runCodex(self: *LoginSession) void {
     self.finishSuccess(creds.refresh, creds.access, creds.expires, creds.provider_data);
 }
 
+fn runKimi(self: *LoginSession) void {
+    // First, ask for region selection
+    const region_prompt = "Select your region:\n  1. China (api.kimi.com)\n  2. Global (api.moonshot.ai)\nEnter choice (1 or 2):";
+    const region_choice = self.waitForInput(region_prompt, false);
+    defer self.allocator.free(region_choice);
+
+    const region = if (std.mem.eql(u8, std.mem.trim(u8, region_choice, " \t\r\n"), "2"))
+        "global"
+    else
+        "china"; // Default to China
+
+    const api_key = self.waitForInput("Enter Kimi API key:", false);
+    defer self.allocator.free(api_key);
+    const trimmed_api_key = std.mem.trim(u8, api_key, " \t\r\n");
+    if (trimmed_api_key.len == 0) {
+        self.finishError("ApiKeyRequired");
+        return;
+    }
+
+    // Store region in provider_data as "region:china" or "region:global"
+    const provider_data = std.fmt.allocPrint(self.allocator, "region:{s}", .{region}) catch {
+        self.finishError("OutOfMemory");
+        return;
+    };
+    defer self.allocator.free(provider_data);
+
+    self.finishSuccess("", trimmed_api_key, std.math.maxInt(i64), provider_data);
+}
+
 fn freeGithubCredentials(allocator: std.mem.Allocator, creds: github.Credentials) void {
     allocator.free(creds.refresh);
     allocator.free(creds.access);
@@ -323,6 +355,7 @@ test "providerStorageKey maps to expected ids" {
     try std.testing.expectEqualStrings("anthropic", providerStorageKey(.anthropic));
     try std.testing.expectEqualStrings("github-copilot", providerStorageKey(.github_copilot));
     try std.testing.expectEqualStrings("openai-codex", providerStorageKey(.openai_codex));
+    try std.testing.expectEqualStrings("kimi", providerStorageKey(.kimi));
 }
 
 test "LoginSession start rejects a second concurrent login" {
@@ -390,4 +423,54 @@ test "LoginSession bridges prompt input through the worker" {
     defer creds.?.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("my-code", creds.?.access);
     try std.testing.expectEqualStrings("refresh-tok", creds.?.refresh);
+}
+
+test "LoginSession trims Kimi API key before storing" {
+    const session = try LoginSession.start(std.testing.allocator, .kimi);
+    defer session.deinit();
+
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .request_input => |req| {
+                try std.testing.expect(std.mem.indexOf(u8, req.message, "region") != null);
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 200);
+    try session.provideInput("1\n");
+
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .request_input => |req| {
+                try std.testing.expect(std.mem.indexOf(u8, req.message, "API key") != null);
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(attempts < 200);
+    try session.provideInput("  kimi-secret\n");
+
+    var creds: ?storage.Credentials = null;
+    attempts = 0;
+    while (attempts < 200) : (attempts += 1) {
+        switch (session.poll()) {
+            .done => |c| {
+                creds = c;
+                break;
+            },
+            else => {},
+        }
+        compat.time.sleepNs(2 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(creds != null);
+    defer creds.?.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("kimi-secret", creds.?.access);
+    try std.testing.expectEqualStrings("region:china", creds.?.provider_data.?);
 }

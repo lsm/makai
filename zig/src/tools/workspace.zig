@@ -5,13 +5,13 @@ const common = @import("tools/common");
 const process_runner = @import("tools/process_runner");
 
 pub const schema_info =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"}},"required":["workspace_root"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"}},"required":["description","workspace_root"],"additionalProperties":false}
 ;
 pub const schema_list =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["workspace_root"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"max_results":{"type":"integer","minimum":0}},"required":["description","workspace_root"],"additionalProperties":false}
 ;
 pub const schema_git_status =
-    \\{"type":"object","properties":{"workspace_root":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["workspace_root"],"additionalProperties":false}
+    \\{"type":"object","properties":{"description":{"type":"string","description":"Why this tool call is needed and what information or change it is intended to produce."},"workspace_root":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1}},"required":["description","workspace_root"],"additionalProperties":false}
 ;
 
 pub const info_tool = agent.AgentTool{ .label = "Workspace Info", .name = "workspace_info", .description = "Return workspace root metadata and detected project root.", .short_description = "Show workspace path info.", .parameters_schema_json = schema_info, .execute = infoExecute };

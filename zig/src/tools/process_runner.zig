@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ai_types = @import("ai_types");
+const compat = @import("compat");
 const common = @import("tools/common");
 
 pub const ProcessResult = struct {
@@ -18,9 +19,12 @@ pub fn run(allocator: std.mem.Allocator, argv: []const []const u8, cwd: std.proc
 fn runWithIo(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: std.process.Child.Cwd, timeout_ms: u64, cancel_token: ?ai_types.CancelToken) !ProcessResult {
     if (common.isCancelled(cancel_token)) return error.Cancelled;
     const start_ms = common.nowMs();
+    var environ_map = try saneChildEnv(allocator);
+    defer environ_map.deinit();
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .cwd = cwd,
+        .environ_map = &environ_map,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -56,6 +60,80 @@ fn runWithIo(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8,
         } else io.sleep(.fromMilliseconds(common.process_poll_ms), .boot) catch {};
         if (term) |t| if (pipes_closed) return finish(allocator, &multi_reader, t, true);
     }
+}
+
+fn saneChildEnv(allocator: std.mem.Allocator) !std.process.Environ.Map {
+    var environ_map = try compat.createEnvMap(allocator);
+    errdefer environ_map.deinit();
+
+    try copyOperationalEnvFallbacks(allocator, &environ_map);
+
+    if (isMissingOrEmpty(environ_map, "HOME") or
+        isMissingOrEmpty(environ_map, "USER") or
+        isMissingOrEmpty(environ_map, "LOGNAME"))
+    {
+        if (lookupCurrentUser()) |user| {
+            if (isMissingOrEmpty(environ_map, "HOME")) {
+                if (user.home.len > 0) try environ_map.put("HOME", user.home);
+            }
+            if (isMissingOrEmpty(environ_map, "USER")) {
+                if (user.name.len > 0) try environ_map.put("USER", user.name);
+            }
+            if (isMissingOrEmpty(environ_map, "LOGNAME")) {
+                if (user.name.len > 0) try environ_map.put("LOGNAME", user.name);
+            }
+        }
+    }
+
+    return environ_map;
+}
+
+fn copyOperationalEnvFallbacks(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map) !void {
+    const names = [_][]const u8{
+        "PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "SSH_AUTH_SOCK",
+        "GIT_ASKPASS",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "HOME",
+        "USER",
+        "LOGNAME",
+    };
+    for (&names) |name| {
+        if (!isMissingOrEmpty(environ_map.*, name)) continue;
+        const value = compat.getEnvVarOwned(allocator, name) catch continue;
+        defer allocator.free(value);
+        if (value.len > 0) try environ_map.put(name, value);
+    }
+}
+
+fn isMissingOrEmpty(environ_map: std.process.Environ.Map, key: []const u8) bool {
+    const value = environ_map.get(key) orelse return true;
+    return value.len == 0;
+}
+
+const CurrentUser = struct {
+    name: []const u8,
+    home: []const u8,
+};
+
+fn lookupCurrentUser() ?CurrentUser {
+    if (builtin.os.tag == .windows or !builtin.link_libc) return null;
+    const passwd = std.c.getpwuid(std.c.getuid()) orelse return null;
+    return .{
+        .name = if (passwd.name) |name| std.mem.span(name) else "",
+        .home = if (passwd.dir) |dir| std.mem.span(dir) else "",
+    };
 }
 
 fn cleanupChild(child: *std.process.Child, io: std.Io) void {
@@ -174,6 +252,16 @@ test "process runner spawns with initialized threaded io" {
     defer std.testing.allocator.free(result.stdout);
     defer std.testing.allocator.free(result.stderr);
     try std.testing.expectEqualStrings("ok", result.stdout);
+}
+
+test "process runner supplies login-like env fallbacks" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const argv = [_][]const u8{ "/bin/sh", "-c", "test -n \"$HOME\" && test -n \"$USER\" && test -n \"$LOGNAME\" && test -n \"$PATH\" && printf '%s\\n%s\\n%s\\n%s\\n' \"$HOME\" \"$USER\" \"$LOGNAME\" \"$PATH\"" };
+    const result = try run(std.testing.allocator, &argv, .inherit, 5_000, null);
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(u8, 0), result.term.exited);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\n\n") == null);
 }
 
 test "process runner captures output beyond small std process defaults" {

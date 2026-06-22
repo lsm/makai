@@ -15,6 +15,12 @@ pub const RequestOptions = struct {
     extra_headers: []const std.http.Header = &.{},
     keep_alive: bool = true,
     accept_encoding: ?[]const u8 = null,
+    /// Overrides the client's default `user-agent` header. Must be used instead
+    /// of appending `user-agent` via `extra_headers`, which would collide with
+    /// the client's built-in default (`user-agent: zig/...`) and produce a
+    /// duplicate header. Some upstreams (e.g. Kimi's WAF) reject requests whose
+    /// user-agent is not the expected value.
+    user_agent: ?[]const u8 = null,
 };
 
 /// Thin HTTP client wrapper for the Zig 0.16 I/O migration seam.
@@ -39,7 +45,10 @@ pub const HttpClient = struct {
         return self.client.request(method, uri, .{
             .extra_headers = options.extra_headers,
             .keep_alive = options.keep_alive,
-            .headers = .{ .accept_encoding = if (options.accept_encoding) |value| .{ .override = value } else .default },
+            .headers = .{
+                .accept_encoding = if (options.accept_encoding) |value| .{ .override = value } else .default,
+                .user_agent = if (options.user_agent) |value| .{ .override = value } else .default,
+            },
         });
     }
 

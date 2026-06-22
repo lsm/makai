@@ -883,7 +883,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
-    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "compat", .module = compat_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
     const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
     const tools_file_mod = b.createModule(.{ .root_source_file = b.path("src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
@@ -1022,6 +1022,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_login", .module = tui_login_mod },
             .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "tui_theme", .module = tui_theme_mod },
+            .{ .name = "tui_text", .module = tui_text_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "tui_render", .module = tui_render_mod },
             .{ .name = "tui_session_store", .module = tui_session_store_mod },
@@ -1036,6 +1038,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_view_menu_picker", .module = tui_view_menu_picker_mod },
             .{ .name = "permission", .module = permission_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tools/common", .module = tools_common_mod },
         },
     });
 

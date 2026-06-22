@@ -737,15 +737,21 @@ pub const TuiRuntime = struct {
             .remote => {
                 if (!self.started) return error.RuntimeNotStarted;
                 var msg = try makeRemoteUserMessage(self.allocator, text);
-                errdefer msg.deinit(self.allocator);
+                var queued = false;
+                errdefer if (!queued) msg.deinit(self.allocator);
                 try self.remote_steering_queue.append(self.allocator, msg);
+                queued = true;
+                try self.resumeQueuedMessagesIfIdle();
             },
             .local => {
                 if (!self.started) return error.RuntimeNotStarted;
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 var msg = try self.makeUserMessage(text);
-                errdefer msg.deinit(self.allocator);
+                var queued = false;
+                errdefer if (!queued) msg.deinit(self.allocator);
                 try local.steer(msg);
+                queued = true;
+                try self.resumeQueuedMessagesIfIdle();
             },
         }
     }
@@ -755,15 +761,40 @@ pub const TuiRuntime = struct {
             .remote => {
                 if (!self.started) return error.RuntimeNotStarted;
                 var msg = try makeRemoteUserMessage(self.allocator, text);
-                errdefer msg.deinit(self.allocator);
+                var queued = false;
+                errdefer if (!queued) msg.deinit(self.allocator);
                 try self.remote_follow_up_queue.append(self.allocator, msg);
+                queued = true;
+                try self.resumeQueuedMessagesIfIdle();
             },
             .local => {
                 if (!self.started) return error.RuntimeNotStarted;
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 var msg = try self.makeUserMessage(text);
-                errdefer msg.deinit(self.allocator);
+                var queued = false;
+                errdefer if (!queued) msg.deinit(self.allocator);
                 try local.followUp(msg);
+                queued = true;
+                try self.resumeQueuedMessagesIfIdle();
+            },
+        }
+    }
+
+    fn resumeQueuedMessagesIfIdle(self: *TuiRuntime) !void {
+        switch (self.backend) {
+            .remote => {
+                if (self.remote_turn_in_flight or self.stream_active) return;
+                if (!self.event_stream.isDone() or self.event_stream.hasPending()) return;
+                if (self.remote_messages.items.len == 0) return;
+                if (self.remote_messages.items[self.remote_messages.items.len - 1] != .assistant) return;
+                if (self.remote_steering_queue.items.len == 0 and self.remote_follow_up_queue.items.len == 0) return;
+                self.resumeRemoteSession() catch return;
+            },
+            .local => {
+                const local = &(self.local_agent orelse return);
+                if (!local.isIdle()) return;
+                local.validateContinueFromContext() catch return;
+                try self.resumeSession();
             },
         }
     }
@@ -983,13 +1014,10 @@ pub const TuiRuntime = struct {
     }
 
     fn push(self: *TuiRuntime, event: TuiEvent) void {
-        self.event_stream.push(event) catch {
-            var mutable = event;
-            mutable.deinit(self.allocator);
-        };
+        self.pushDroppingOldest(event);
     }
 
-    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+    fn pushDroppingOldest(self: *TuiRuntime, event: TuiEvent) void {
         while (true) {
             self.event_stream.push(event) catch |err| switch (err) {
                 error.QueueFull => {
@@ -1001,9 +1029,18 @@ pub const TuiRuntime = struct {
                     }
                     continue;
                 },
+                error.StreamCompleted => {
+                    var mutable = event;
+                    mutable.deinit(self.allocator);
+                    return;
+                },
             };
             return;
         }
+    }
+
+    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+        self.pushDroppingOldest(event);
     }
 
     fn dupeOwned(self: *TuiRuntime, value: []const u8) !OwnedSlice(u8) {
@@ -2370,6 +2407,7 @@ const MockProtocolCtx = struct {
     flood_count: usize = 0,
     tool_first: bool = false,
     wait_after_tool_first: bool = false,
+    wait_before_text_first: bool = false,
     tool_name: []const u8 = "demo_tool",
     force_error: bool = false,
     provider_error_message: []const u8 = "",
@@ -2524,6 +2562,13 @@ fn mockStream(
         try stream.push(.{ .start = .{ .partial = emptyAssistantMessage(model, .tool_use) } });
         try pushDoneAndComplete(stream, allocator, model, &content, .tool_use);
         return stream;
+    }
+
+    if (mock.wait_before_text_first and mock.call_count == 1) {
+        var waits: usize = 0;
+        while (waits < 50) : (waits += 1) {
+            std.testing.io.sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .boot) catch {};
+        }
     }
 
     try pushTextResponse(stream, allocator, model, "hello");
@@ -2884,6 +2929,108 @@ test "runtime queues steering and follow-up messages" {
     try std.testing.expect(user_messages >= 2);
     try std.testing.expectEqual(@as(usize, 3), mock.call_count);
     try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().total());
+}
+
+test "runtime idle steering resumes immediately" {
+    var mock = MockProtocolCtx{};
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .agent_end) break;
+    }
+    try std.testing.expectEqual(@as(usize, 1), mock.call_count);
+
+    try tui_session.steer("steer after idle");
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().steering);
+
+    var saw_steering_user = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and std.mem.eql(u8, payload.text.slice(), "steer after idle")) {
+                    saw_steering_user = true;
+                }
+            },
+            .agent_end => break,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_steering_user);
+}
+
+test "runtime active steering continues after plain assistant stop" {
+    var mock = MockProtocolCtx{ .wait_before_text_first = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.steer("steer during response");
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().steering);
+
+    var saw_steering_user = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and std.mem.eql(u8, payload.text.slice(), "steer during response")) {
+                    saw_steering_user = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_steering_user);
+}
+
+test "runtime active follow-up continues after plain assistant stop" {
+    var mock = MockProtocolCtx{ .wait_before_text_first = true };
+    const models = [_]ai_types.Model{test_model_a};
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = true });
+    defer runtime.deinit();
+
+    var tui_session = runtime.createSession();
+    try tui_session.start();
+    try tui_session.submitTurn("first");
+    try tui_session.queueFollowUp("follow after response");
+
+    if (runtime.local_agent) |*local| local.waitForIdle();
+
+    try std.testing.expectEqual(@as(usize, 2), mock.call_count);
+    try std.testing.expectEqual(@as(usize, 0), tui_session.queuedCounts().follow_up);
+
+    var saw_follow_up_user = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .message_end => |payload| {
+                if (payload.role == .user and std.mem.eql(u8, payload.text.slice(), "follow after response")) {
+                    saw_follow_up_user = true;
+                }
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_follow_up_user);
 }
 
 test "local runtime reports steering available" {
@@ -3366,11 +3513,15 @@ test "failed turns emit error end reason" {
     try std.testing.expectError(error.AgentLoopFailed, tui_session.submitTurn("fail"));
     if (runtime.local_agent) |*local| local.waitForIdle();
 
+    var saw_error_detail = false;
     var saw_error_end = false;
     while (tui_session.waitEvent()) |event| {
         var ev = event;
         defer ev.deinit(std.testing.allocator);
         switch (ev) {
+            .@"error" => {
+                if (std.mem.eql(u8, ev.@"error".message.slice(), "forced provider error")) saw_error_detail = true;
+            },
             .agent_end => {
                 saw_error_end = ev.agent_end.reason == .@"error";
                 break;
@@ -3378,7 +3529,28 @@ test "failed turns emit error end reason" {
             else => {},
         }
     }
+    try std.testing.expect(saw_error_detail);
     try std.testing.expect(saw_error_end);
+}
+
+test "runtime push preserves newest event when event stream is full" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+
+    for (0..TuiEventStream.usable_capacity) |_| {
+        runtime.push(.turn_start);
+    }
+    runtime.push(.{ .@"error" = .{ .message = try runtime.dupeOwned("latest error") } });
+
+    var saw_latest_error = false;
+    while (runtime.event_stream.poll()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .@"error" and std.mem.eql(u8, ev.@"error".message.slice(), "latest error")) {
+            saw_latest_error = true;
+        }
+    }
+    try std.testing.expect(saw_latest_error);
 }
 
 const RemoteMock = struct {

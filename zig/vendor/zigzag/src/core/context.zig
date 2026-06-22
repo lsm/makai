@@ -348,11 +348,20 @@ pub const Options = struct {
     /// Enable mouse tracking
     mouse: bool = false,
 
+    /// Enable terminal wheel scrolling in the alternate screen without
+    /// capturing mouse button events.
+    alternate_scroll: bool = false,
+
     /// Show cursor
     cursor: bool = false,
 
     /// Use alternate screen buffer
     alt_screen: bool = true,
+
+    /// Render into a managed bottom viewport in the normal screen instead of
+    /// repainting from the top of the terminal. This lets terminal scrollback
+    /// remain native while the app owns the live input area.
+    inline_bottom_viewport: bool = false,
 
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,

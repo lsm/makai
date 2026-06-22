@@ -248,6 +248,10 @@ pub const Config = struct {
     hide_cursor: bool = true,
     /// Enable mouse tracking
     mouse: bool = false,
+    /// Enable wheel scrolling in the alternate screen without mouse tracking.
+    alternate_scroll: bool = false,
+    /// Clear the full screen during setup.
+    clear_on_setup: bool = true,
     /// Enable bracketed paste mode
     bracketed_paste: bool = true,
     /// Custom input file (default: stdin)
@@ -306,7 +310,10 @@ pub const Terminal = struct {
             };
         };
 
-        try term.setup();
+        term.setup() catch |err| {
+            term.cleanup();
+            return err;
+        };
         return term;
     }
 
@@ -321,6 +328,15 @@ pub const Terminal = struct {
         // Enable raw mode
         try platform.enableRawMode(&self.state);
 
+        // Clear terminal modes that can survive a crashed previous run. This is
+        // especially important for Kitty keyboard protocol: if left enabled,
+        // Ctrl+C reaches the user's shell as CSI bytes like `99;5u`.
+        try self.writeBytes(ansi.kitty_keyboard_disable_all);
+        try self.writeBytes(ansi.kitty_keyboard_reset);
+        try self.writeBytes(ansi.bracketed_paste_disable);
+        try self.writeBytes("\x1b[?1007l");
+        try self.writeBytes(mouse.disableSequence(.normal));
+
         // Enter alternate screen
         if (self.config.alt_screen) {
             try self.writeBytes(ansi.alt_screen_enter);
@@ -333,10 +349,19 @@ pub const Terminal = struct {
         }
 
         // Enable normal mouse tracking (button/wheel only) with SGR encoding.
-        // This reports scroll wheel events while leaving drag selection to the terminal.
+        // This can capture plain clicks in many terminals, so apps that need
+        // native drag selection should prefer alternate_scroll below.
         if (self.config.mouse) {
             try self.writeBytes(mouse.enableSequence(.normal));
             self.state.mouse_enabled = true;
+        }
+
+        // In xterm-compatible terminals, alternate-scroll converts wheel
+        // input in the alternate screen into cursor up/down key events. This
+        // preserves native drag selection because mouse buttons are not
+        // reported to the application.
+        if (self.config.alternate_scroll) {
+            try self.writeBytes("\x1b[?1007h");
         }
 
         // Enable bracketed paste
@@ -353,8 +378,10 @@ pub const Terminal = struct {
         self.detectImageCapabilities();
 
         // Clear screen
-        try self.writeBytes(ansi.screen_clear);
-        try self.writeBytes(ansi.cursor_home);
+        if (self.config.clear_on_setup) {
+            try self.writeBytes(ansi.screen_clear);
+            try self.writeBytes(ansi.cursor_home);
+        }
 
         try self.flush();
     }
@@ -362,7 +389,9 @@ pub const Terminal = struct {
     pub fn cleanup(self: *Terminal) void {
         // Disable Kitty keyboard protocol
         if (self.config.kitty_keyboard) {
+            self.writeBytes(ansi.kitty_keyboard_disable_all) catch {};
             self.writeBytes(ansi.kitty_keyboard_disable) catch {};
+            self.writeBytes(ansi.kitty_keyboard_reset) catch {};
         }
 
         if (self.unicode_width_caps.mode_2027) {
@@ -379,6 +408,10 @@ pub const Terminal = struct {
         if (self.state.mouse_enabled) {
             self.writeBytes(mouse.disableSequence(.normal)) catch {};
             self.state.mouse_enabled = false;
+        }
+
+        if (self.config.alternate_scroll) {
+            self.writeBytes("\x1b[?1007l") catch {};
         }
 
         // Show cursor

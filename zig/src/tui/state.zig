@@ -128,6 +128,7 @@ pub const RegisteredToolEntry = struct {
 pub const ToolEntry = struct {
     id: []u8,
     name: []u8,
+    label: []u8,
     args_json: []u8,
     output: std.ArrayList(u8) = .empty,
     status: ToolStatus = .pending,
@@ -138,11 +139,13 @@ pub const ToolEntry = struct {
     artifact_count: u32 = 0,
     artifact_refs: []u8 = &.{},
     truncated: bool = false,
+    display_preview: []u8 = &.{},
 
-    pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
+    pub fn init(allocator: std.mem.Allocator, id: []const u8, name: []const u8, label: []const u8, args_json: []const u8, status: ToolStatus) !ToolEntry {
         return .{
             .id = try allocator.dupe(u8, id),
             .name = try allocator.dupe(u8, name),
+            .label = try allocator.dupe(u8, label),
             .args_json = try allocator.dupe(u8, args_json),
             .status = status,
         };
@@ -151,9 +154,11 @@ pub const ToolEntry = struct {
     pub fn deinit(self: *ToolEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.name);
+        allocator.free(self.label);
         allocator.free(self.args_json);
         self.output.deinit(allocator);
         if (self.artifact_refs.len > 0) allocator.free(self.artifact_refs);
+        if (self.display_preview.len > 0) allocator.free(self.display_preview);
         self.* = undefined;
     }
 };
@@ -174,9 +179,9 @@ pub const ApprovalState = struct {
         self.* = .{};
     }
 
-    pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, args_json: []const u8) !void {
+    pub fn setPending(self: *ApprovalState, allocator: std.mem.Allocator, tool_call_id: []const u8, tool_name: []const u8, display_name: []const u8, args_json: []const u8) !void {
         self.deinit(allocator);
-        const scope_hint = try approvalScopeHint(allocator, tool_name, args_json);
+        const scope_hint = try approvalScopeHint(allocator, display_name, args_json);
         errdefer allocator.free(scope_hint);
         self.* = .{
             .status = .pending,
@@ -219,6 +224,28 @@ pub const TelemetryState = struct {
 };
 
 pub const QueueState = tui_runtime.QueuedCounts;
+
+pub const QueuedPreviewKind = enum {
+    steering,
+    follow_up,
+};
+
+pub const QueuedPreview = struct {
+    kind: QueuedPreviewKind,
+    text: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, kind: QueuedPreviewKind, text: []const u8) !QueuedPreview {
+        return .{
+            .kind = kind,
+            .text = try allocator.dupe(u8, text),
+        };
+    }
+
+    pub fn deinit(self: *QueuedPreview, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+};
 
 pub const StatusState = struct {
     model: []u8 = &.{},
@@ -406,11 +433,13 @@ pub const AppState = struct {
     permission_mode: tui_runtime.PermissionMode = .bypass,
     status: StatusState = .{},
     queue: QueueState = .{},
+    queued_previews: std.ArrayList(QueuedPreview) = .empty,
     telemetry: TelemetryState = .{},
     preview: PreviewState = .{},
     transcript_mode: TranscriptVisibilityMode = .balanced,
     show_thinking: bool = true,
     thinking_level: ai_types.ThinkingLevel = .low,
+    login_input_secret: bool = false,
     /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
     /// spinner frames and other time-based effects from this so animation stays
     /// in lockstep with the render loop without each view tracking its own clock.
@@ -421,6 +450,7 @@ pub const AppState = struct {
     session_scroll: usize = 0,
     menu_index: usize = 0,
     menu_scroll: usize = 0,
+    active_user_entry: ?usize = null,
     active_assistant_entry: ?usize = null,
     active_tool_result_entry: ?usize = null,
     /// Set when the user aborts the active turn. Lifecycle events from the
@@ -445,6 +475,8 @@ pub const AppState = struct {
         self.sessions.deinit(self.allocator);
         self.composer.deinit(self.allocator);
         self.approval.deinit(self.allocator);
+        self.clearQueuedPreviews();
+        self.queued_previews.deinit(self.allocator);
         self.status.deinit(self.allocator);
         self.preview.deinit(self.allocator);
         self.* = undefined;
@@ -459,6 +491,13 @@ pub const AppState = struct {
         self.registered_tools.clearRetainingCapacity();
         try self.registered_tools.ensureTotalCapacity(self.allocator, tools.len);
         for (tools) |tool| self.registered_tools.appendAssumeCapacity(try RegisteredToolEntry.init(self.allocator, tool));
+    }
+
+    pub fn toolLabel(self: *const AppState, name: []const u8) []const u8 {
+        for (self.registered_tools.items) |tool| {
+            if (std.mem.eql(u8, tool.name, name)) return tool.label;
+        }
+        return name;
     }
 
     pub fn clearTranscript(self: *AppState) void {
@@ -513,6 +552,7 @@ pub const AppState = struct {
         self.clearTranscript();
         self.clearTools();
         self.telemetry = .{};
+        self.clearQueuedPreviews();
         self.queue = .{};
         self.status.context_used = 0;
         self.status.turn_count = 0;
@@ -616,6 +656,50 @@ pub const AppState = struct {
         self.queue = counts;
     }
 
+    pub fn pruneQueuedPreviewsToCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
+        self.pruneQueuedPreviewKind(.steering, counts.steering);
+        self.pruneQueuedPreviewKind(.follow_up, counts.follow_up);
+    }
+
+    fn pruneQueuedPreviewKind(self: *AppState, kind: QueuedPreviewKind, keep_count: usize) void {
+        var existing: usize = 0;
+        for (self.queued_previews.items) |preview| {
+            if (preview.kind == kind) existing += 1;
+        }
+        var remove_count = existing -| keep_count;
+        var idx: usize = 0;
+        while (idx < self.queued_previews.items.len and remove_count > 0) {
+            if (self.queued_previews.items[idx].kind != kind) {
+                idx += 1;
+                continue;
+            }
+            var removed = self.queued_previews.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            remove_count -= 1;
+        }
+    }
+
+    pub fn addQueuedPreview(self: *AppState, kind: QueuedPreviewKind, text: []const u8) !void {
+        try self.queued_previews.append(self.allocator, try QueuedPreview.init(self.allocator, kind, text));
+    }
+
+    pub fn clearQueuedPreviews(self: *AppState) void {
+        for (self.queued_previews.items) |*preview| preview.deinit(self.allocator);
+        self.queued_previews.clearRetainingCapacity();
+    }
+
+    pub fn consumeQueuedPreviewText(self: *AppState, text: []const u8) bool {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        var idx: usize = 0;
+        while (idx < self.queued_previews.items.len) : (idx += 1) {
+            if (!std.mem.eql(u8, self.queued_previews.items[idx].text, trimmed)) continue;
+            var removed = self.queued_previews.orderedRemove(idx);
+            removed.deinit(self.allocator);
+            return true;
+        }
+        return false;
+    }
+
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
         try self.appendProtocolEvent(event);
         if (self.stream_aborted) switch (event) {
@@ -634,7 +718,7 @@ pub const AppState = struct {
             },
             .message_start => |payload| switch (payload.role) {
                 .assistant => self.active_assistant_entry = try self.appendEmptyTranscript(.assistant),
-                .user => _ = try self.ensureTrailingEntry(.user),
+                .user => self.active_user_entry = try self.ensureTrailingEntry(.user),
                 .tool_result => self.active_tool_result_entry = try self.appendEmptyTranscript(.tool),
             },
             .text_delta => |payload| try self.appendDelta(.assistant, payload.delta.slice()),
@@ -643,19 +727,19 @@ pub const AppState = struct {
             .provider_event => {},
             .message_end => |payload| switch (payload.role) {
                 .assistant => try self.finishTranscriptEntry(.assistant, payload.text.slice(), &self.active_assistant_entry),
-                .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), null, true),
+                .user => try self.finishTranscriptEntryWithOptions(.user, payload.text.slice(), &self.active_user_entry, true),
                 .tool_result => try self.finishTranscriptEntry(.tool, payload.text.slice(), &self.active_tool_result_entry),
             },
             .tool_approval_requested => |payload| {
-                try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice());
+                const label = self.toolLabel(payload.tool_name.slice());
+                try self.approval.setPending(self.allocator, payload.tool_call_id.slice(), payload.tool_name.slice(), label, payload.args_json.slice());
                 if (std.mem.eql(u8, payload.tool_name.slice(), "hashline_edit")) try self.setHashlinePreview(payload.args_json.slice());
                 self.mode = .approval;
                 _ = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .pending);
             },
             .tool_execution_start => |payload| {
                 const tool = try self.upsertTool(payload.tool_call_id.slice(), payload.tool_name.slice(), payload.args_json.slice(), .running);
-                tool.expanded = true;
-                const summary = try toolSummary(self.allocator, payload.tool_name.slice(), payload.args_json.slice());
+                const summary = try toolSummary(self.allocator, tool.label, payload.args_json.slice());
                 defer self.allocator.free(summary);
                 try self.appendTranscript(.tool, summary);
             },
@@ -670,11 +754,11 @@ pub const AppState = struct {
                 if (tool.output.items.len > 0) try tool.output.append(self.allocator, '\n');
                 try tool.output.appendSlice(self.allocator, payload.result_json.slice());
                 try self.applyToolTelemetry(tool, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count, payload.artifact_refs.slice());
-                const summary = try toolResultSummary(self.allocator, payload.tool_name.slice(), payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
+                const summary = try toolResultSummary(self.allocator, tool.label, payload.result_json.slice(), payload.is_error, payload.raw_total_bytes, payload.returned_total_bytes, payload.estimated_returned_tokens, payload.artifact_count);
                 defer self.allocator.free(summary);
                 try self.appendTranscript(.tool, summary);
                 if (payload.is_error) {
-                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ payload.tool_name.slice(), payload.result_json.slice() });
+                    const message = try std.fmt.allocPrint(self.allocator, "{s} failed: {s}", .{ tool.label, payload.result_json.slice() });
                     defer self.allocator.free(message);
                     try self.status.setError(self.allocator, message);
                     try self.appendTranscript(.@"error", message);
@@ -720,6 +804,11 @@ pub const AppState = struct {
     pub fn toggleToolExpanded(self: *AppState, index: usize) void {
         if (index >= self.tools.items.len) return;
         self.tools.items[index].expanded = !self.tools.items[index].expanded;
+    }
+
+    pub fn toggleLatestToolExpanded(self: *AppState) void {
+        if (self.tools.items.len == 0) return;
+        self.toggleToolExpanded(self.tools.items.len - 1);
     }
 
     pub fn setPreview(self: *AppState, kind: PreviewKind, title: []const u8, content: []const u8) !void {
@@ -846,11 +935,13 @@ pub const AppState = struct {
     }
 
     fn clearActiveTranscriptEntries(self: *AppState) void {
+        self.active_user_entry = null;
         self.active_assistant_entry = null;
         self.active_tool_result_entry = null;
     }
 
     fn cleanupActiveTranscriptEntries(self: *AppState) void {
+        self.removeEmptyActiveTranscriptEntry(&self.active_user_entry, .user);
         self.removeEmptyActiveTranscriptEntry(&self.active_assistant_entry, .assistant);
         self.removeEmptyActiveTranscriptEntry(&self.active_tool_result_entry, .tool);
         self.clearActiveTranscriptEntries();
@@ -867,6 +958,7 @@ pub const AppState = struct {
     fn removeTranscriptEntry(self: *AppState, index: usize) void {
         var entry = self.transcript.orderedRemove(index);
         entry.deinit(self.allocator);
+        self.adjustActiveTranscriptEntryAfterRemove(&self.active_user_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_assistant_entry, index);
         self.adjustActiveTranscriptEntryAfterRemove(&self.active_tool_result_entry, index);
     }
@@ -920,9 +1012,9 @@ pub const AppState = struct {
             var out: std.Io.Writer.Allocating = .init(self.allocator);
             defer out.deinit();
             const writer = &out.writer;
-            try writer.print("{s} [truncated {d}->{d} bytes; show full", .{ tool.name, raw_total_bytes, returned_total_bytes });
-            if (artifact_refs.len > 0) try writer.print(": {s}", .{artifact_refs});
-            try writer.writeByte(']');
+            try writer.print("{s} [preview {d}->{d} bytes", .{ tool.label, raw_total_bytes, returned_total_bytes });
+            if (artifact_refs.len > 0) try writer.writeAll("; artifact available in TUI viewer");
+            try writer.writeAll("]");
             const indicator = try out.toOwnedSlice();
             defer self.allocator.free(indicator);
             try self.appendTranscript(.tool, indicator);
@@ -941,15 +1033,20 @@ pub const AppState = struct {
     }
 
     fn upsertTool(self: *AppState, id: []const u8, name: []const u8, args_json: []const u8, status: ToolStatus) !*ToolEntry {
+        const label = self.toolLabel(name);
         if (self.findTool(id)) |tool| {
             tool.status = status;
+            if (!std.mem.eql(u8, tool.label, label)) {
+                self.allocator.free(tool.label);
+                tool.label = try self.allocator.dupe(u8, label);
+            }
             if (args_json.len > 0 and !std.mem.eql(u8, tool.args_json, args_json)) {
                 self.allocator.free(tool.args_json);
                 tool.args_json = try self.allocator.dupe(u8, args_json);
             }
             return tool;
         }
-        try self.tools.append(self.allocator, try ToolEntry.init(self.allocator, id, name, args_json, status));
+        try self.tools.append(self.allocator, try ToolEntry.init(self.allocator, id, name, label, args_json, status));
         return &self.tools.items[self.tools.items.len - 1];
     }
 };
@@ -1211,7 +1308,7 @@ fn toolResultSummary(allocator: std.mem.Allocator, name: []const u8, result_json
     }
     if (estimated_tokens > 0) try writer.print(" ~{d} tok", .{estimated_tokens});
     if (artifact_count > 0) try writer.print(" artifacts={d}", .{artifact_count});
-    if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" show full");
+    if (raw_total_bytes > returned_total_bytes or artifact_count > 0) try writer.writeAll(" preview-capped");
     if (is_error and result_json.len > 0) {
         const preview = try clipSummaryArg(allocator, result_json);
         defer allocator.free(preview);
@@ -1225,7 +1322,7 @@ fn primaryToolArg(allocator: std.mem.Allocator, args_json: []const u8) !?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, args_json, .{}) catch return null;
     defer parsed.deinit();
     if (parsed.value != .object) return null;
-    const keys = [_][]const u8{ "command", "path", "query", "pattern", "file", "operation" };
+    const keys = [_][]const u8{ "description", "command", "path", "query", "pattern", "file", "operation" };
     for (keys) |key| {
         if (jsonString(parsed.value.object, key)) |value| {
             if (value.len > 0) return try allocator.dupe(u8, value);
@@ -1443,6 +1540,15 @@ test "AppState protocol log captures every supported TUI event variant" {
 test "AppState applies transcript and tool events" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
+    const tools = [_]agent.AgentTool{.{
+        .label = "Shell Execute",
+        .name = "shell_command",
+        .description = "Run shell command",
+        .short_description = "Run shell",
+        .parameters_schema_json = "{}",
+        .execute = noopToolForTest,
+    }};
+    try state.setRegisteredTools(&tools);
 
     var text_event = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
     defer text_event.deinit(std.testing.allocator);
@@ -1463,7 +1569,7 @@ test "AppState applies transcript and tool events" {
     var start_event = tui_runtime.TuiEvent{ .tool_execution_start = .{
         .tool_call_id = try ownedText("call-1"),
         .tool_name = try ownedText("shell_command"),
-        .args_json = try ownedText("{\"command\":\"pwd\"}"),
+        .args_json = try ownedText("{\"description\":\"Check the current workspace directory\",\"command\":\"pwd\"}"),
     } };
     defer start_event.deinit(std.testing.allocator);
     try state.applyEvent(start_event);
@@ -1479,8 +1585,10 @@ test "AppState applies transcript and tool events" {
 
     try std.testing.expectEqual(@as(usize, 1), state.tools.items.len);
     try std.testing.expectEqual(ToolStatus.done, state.tools.items[0].status);
+    try std.testing.expectEqualStrings("Shell Execute", state.tools.items[0].label);
     try std.testing.expect(std.mem.indexOf(u8, state.tools.items[0].output.items, "ok") != null);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ shell_command \"pwd\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "◈ Shell Execute \"Check the current workspace directory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[1].text.items, "shell_command") == null);
 }
 
 test "AppState strips control bytes from tool summaries" {
@@ -1545,6 +1653,20 @@ test "AppState message_end user text avoids duplicate submitted message" {
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
     try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("hello", state.transcript.items[0].text.items);
+}
+
+test "AppState user message_start and message_end do not leave empty transcript row" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .message_start = .{ .role = .user } });
+    var user_end = tui_runtime.TuiEvent{ .message_end = .{ .role = .user, .text = try ownedText("queued prompt") } };
+    defer user_end.deinit(std.testing.allocator);
+    try state.applyEvent(user_end);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.user, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("queued prompt", state.transcript.items[0].text.items);
 }
 
 test "AppState message_end updates active assistant before trailing tool" {
@@ -1922,10 +2044,51 @@ test "AppState reset replay clears stale queue counts" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     state.queue = .{ .steering = 1, .follow_up = 2 };
+    try state.addQueuedPreview(.steering, "now");
+    try state.addQueuedPreview(.follow_up, "later");
 
     state.resetReplayState();
 
     try std.testing.expectEqual(@as(usize, 0), state.queue.total());
+    try std.testing.expectEqual(@as(usize, 0), state.queued_previews.items.len);
+}
+
+test "AppState keeps queued previews until matching user message is consumed" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.addQueuedPreview(.steering, "steer now");
+    try state.addQueuedPreview(.follow_up, "follow later");
+    try state.addQueuedPreview(.follow_up, "follow after");
+
+    state.setQueuedCounts(.{ .steering = 1, .follow_up = 2 });
+    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
+
+    state.setQueuedCounts(.{ .steering = 0, .follow_up = 1 });
+    try std.testing.expectEqual(@as(usize, 3), state.queued_previews.items.len);
+    try std.testing.expect(state.consumeQueuedPreviewText("steer now"));
+    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
+    try std.testing.expect(state.consumeQueuedPreviewText("follow later"));
+    try std.testing.expectEqual(@as(usize, 1), state.queued_previews.items.len);
+    try std.testing.expectEqualStrings("follow after", state.queued_previews.items[0].text);
+}
+
+test "AppState prunes stale queued previews to authoritative counts" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.addQueuedPreview(.steering, "old steering");
+    try state.addQueuedPreview(.follow_up, "old follow");
+    try state.addQueuedPreview(.steering, "remaining steering");
+    try state.addQueuedPreview(.follow_up, "remaining follow");
+
+    state.pruneQueuedPreviewsToCounts(.{ .steering = 1, .follow_up = 1 });
+
+    try std.testing.expectEqual(@as(usize, 2), state.queued_previews.items.len);
+    try std.testing.expectEqual(QueuedPreviewKind.steering, state.queued_previews.items[0].kind);
+    try std.testing.expectEqualStrings("remaining steering", state.queued_previews.items[0].text);
+    try std.testing.expectEqual(QueuedPreviewKind.follow_up, state.queued_previews.items[1].kind);
+    try std.testing.expectEqualStrings("remaining follow", state.queued_previews.items[1].text);
 }
 
 test "AppState applies thinking tool call and lifecycle events" {
@@ -2043,7 +2206,11 @@ test "AppState detects truncated tool execution end events" {
     try std.testing.expect(state.tools.items[0].truncated);
     try std.testing.expectEqual(@as(u64, 4096), state.tools.items[0].raw_total_bytes);
     try std.testing.expectEqualStrings("artifact://tool-output/1", state.tools.items[0].artifact_refs);
-    try std.testing.expect(std.mem.indexOf(u8, state.transcript.items[state.transcript.items.len - 1].text.items, "show full") != null);
+    var found_marker = false;
+    for (state.transcript.items) |entry| {
+        if (std.mem.indexOf(u8, entry.text.items, "artifact available") != null) found_marker = true;
+    }
+    try std.testing.expect(found_marker);
 }
 
 test "AppState appends visible transcript row for tool execution errors" {

@@ -18,6 +18,7 @@ pub const CommandKind = enum {
     compact,
     clear,
     copy,
+    artifact,
     diff,
     abort,
     quit,
@@ -47,6 +48,7 @@ pub const CommandAction = enum {
     start_login_provider,
     copy_last,
     copy_all,
+    open_artifact_viewer,
 };
 
 pub const CommandResult = struct {
@@ -95,6 +97,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
     .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
+    .{ .name = "artifact", .kind = .artifact, .usage = "/artifact", .description = "Open the latest artifact in a local viewer", .handler = handleArtifact },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
@@ -396,6 +399,12 @@ fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
         }
     }
     return .{ .action = .copy_last };
+}
+
+fn handleArtifact(ctx: CommandContext, command: Command) !CommandResult {
+    _ = ctx;
+    _ = command;
+    return .{ .action = .open_artifact_viewer };
 }
 
 fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
@@ -742,7 +751,7 @@ test "abort during approval clears approval state" {
     defer state.deinit();
     state.status.streaming = true;
     state.mode = .approval;
-    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "{\"path\":\"README.md\"}");
+    try state.approval.setPending(std.testing.allocator, "call-1", "edit_file", "edit_file", "{\"path\":\"README.md\"}");
 
     var mock = MockAbortSession{};
     defer mock.deinit();

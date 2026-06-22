@@ -13,6 +13,7 @@ const auth_protocol_server = @import("auth_server");
 const auth_protocol_runtime = @import("auth_runtime");
 const auth_protocol_envelope = @import("auth_envelope");
 const auth_cli = @import("auth_cli");
+const oauth_storage = @import("oauth/storage");
 const event_stream = @import("event_stream");
 const agent_loop = @import("agent_loop");
 const agent_bridge = @import("agent_bridge");
@@ -45,6 +46,47 @@ const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP
 const TEST_AUTH_POLL_ITERS_FAILURE: usize = 200; // ~200ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_POST_CANCEL: usize = 30; // ~30ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AGENT_POLL_ITERS_DEFAULT: usize = 2_000; // ~2s with STDIO_IDLE_SLEEP_NS.
+
+fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "global") or std.ascii.eqlIgnoreCase(trimmed, "moonshot")) return "global";
+    if (std.ascii.eqlIgnoreCase(trimmed, "china") or
+        std.ascii.eqlIgnoreCase(trimmed, "cn") or
+        std.ascii.eqlIgnoreCase(trimmed, "coding"))
+    {
+        return "china";
+    }
+    return null;
+}
+
+fn kimiRegionFromProviderData(provider_data: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, provider_data, "region:")) {
+        return normalizeKimiRegion(provider_data["region:".len..]) orelse "china";
+    }
+    return "china";
+}
+
+fn loadStoredKimiRegion(allocator: std.mem.Allocator) ?[]const u8 {
+    var storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(allocator) catch return null;
+    defer storage.deinit();
+    const auth = storage.providers.get("kimi") orelse return null;
+    return switch (auth) {
+        .api_key => null,
+        .oauth => |creds| if (creds.provider_data) |data| kimiRegionFromProviderData(data) else null,
+    };
+}
+
+fn resolvePrintKimiRegion(allocator: std.mem.Allocator, use_storage_auth: bool) []const u8 {
+    const region_env = compat.getEnvVarOwned(allocator, "KIMI_REGION") catch null;
+    if (region_env) |env| {
+        defer allocator.free(env);
+        if (normalizeKimiRegion(env)) |region| return region;
+    }
+    if (use_storage_auth) {
+        if (loadStoredKimiRegion(allocator)) |region| return region;
+    }
+    return "china";
+}
 
 const RuntimeErrorCode = enum {
     dispatch_error,
@@ -1895,6 +1937,7 @@ fn printUsage(file: std.Io.File) !void {
         \\  makai --version
         \\  makai --stdio
         \\  makai --tui
+        \\  makai -p [--agent] [--storage] "<prompt>" [--model <id>]
         \\  makai auth providers [--json]
         \\  makai auth login --provider <id> [--json]
         \\
@@ -1902,6 +1945,11 @@ fn printUsage(file: std.Io.File) !void {
         \\  --version        Print binary version
         \\  --stdio          Start stdio mode
         \\  --tui            Start terminal UI shell
+        \\  -p               Non-interactive print mode: stream a prompt using
+        \\                   stored credentials and print every event to stdout.
+        \\                   Useful for debugging provider streaming.
+        \\                   Use --agent to run through the full agent loop.
+        \\                   Use --storage to resolve credentials like the TUI.
         \\  auth providers   List oauth-capable providers
         \\  auth login       Run OAuth flow and persist credentials
         \\
@@ -1910,6 +1958,364 @@ fn printUsage(file: std.Io.File) !void {
 
 fn runTui(allocator: std.mem.Allocator, io: std.Io) !void {
     try tui_app.run(allocator, io);
+}
+
+/// Non-interactive print mode: stream a single prompt against a model resolved
+/// from the production catalog (using stored credentials) and print every event.
+/// Mirrors the exact provider code path the TUI uses, so it reproduces (and
+/// exposes) streaming bugs without needing a real terminal.
+fn runPrintMode(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len < 1) {
+        perr("error: -p requires a prompt argument\n");
+        return error.InvalidArgument;
+    }
+
+    var prompt_index: usize = 0;
+    var use_agent_loop = false;
+    var use_storage_auth = false;
+    var model_id: []const u8 = "kimi-k2.7-code";
+    while (prompt_index < args.len and std.mem.startsWith(u8, args[prompt_index], "--")) : (prompt_index += 1) {
+        if (std.mem.eql(u8, args[prompt_index], "--agent")) {
+            use_agent_loop = true;
+        } else if (std.mem.eql(u8, args[prompt_index], "--storage")) {
+            use_storage_auth = true;
+        } else if (std.mem.eql(u8, args[prompt_index], "--tui-runtime")) {
+            prompt_index += 1;
+            if (prompt_index >= args.len) {
+                perr("error: --tui-runtime requires a prompt\n");
+                return error.InvalidArgument;
+            }
+            return runPrintTuiRuntime(allocator, args[prompt_index]);
+        } else if (std.mem.eql(u8, args[prompt_index], "--model")) {
+            prompt_index += 1;
+            if (prompt_index >= args.len) {
+                perr("error: --model requires a value\n");
+                return error.InvalidArgument;
+            }
+            model_id = args[prompt_index];
+        } else {
+            perrf("error: unsupported -p option: {s}\n", .{args[prompt_index]});
+            return error.InvalidArgument;
+        }
+    }
+    if (prompt_index >= args.len) {
+        perr("error: -p requires a prompt argument\n");
+        return error.InvalidArgument;
+    }
+    const prompt = args[prompt_index];
+
+    perr("[print] building kimi model from env...\n");
+
+    // Read the API key from KIMI_API_KEY unless explicitly asked to use saved
+    // credentials. Region follows KIMI_REGION first, then the stored Kimi
+    // provider_data when --storage is used, then China as the default.
+    const api_key_copy: ?[]u8 = if (use_storage_auth) null else blk: {
+        const api_key_env = compat.getEnvVarOwned(allocator, "KIMI_API_KEY") catch |err| {
+            perrf("error: set KIMI_API_KEY to use -p, or pass --storage to use saved credentials: {s}\n", .{@errorName(err)});
+            return error.NoCredentials;
+        };
+        break :blk api_key_env;
+    };
+    defer if (api_key_copy) |key| allocator.free(key);
+
+    const region = resolvePrintKimiRegion(allocator, use_storage_auth);
+    const is_global_kimi = std.mem.eql(u8, region, "global");
+    const base_url = if (is_global_kimi)
+        "https://api.moonshot.ai"
+    else
+        "https://api.kimi.com/coding";
+
+    // Build the Kimi model inline (same shape as model_catalog.kimiModel).
+    const model = ai_types.Model{
+        .id = model_id,
+        .name = model_id,
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = base_url,
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 16_384,
+    };
+
+    // Register built-in API providers so we can resolve the stream fn.
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
+    const provider = registry.getApiProvider(model.api) orelse {
+        perrf("error: no provider registered for api '{s}'\n", .{model.api});
+        return error.NoProvider;
+    };
+    _ = provider;
+
+    // Build a single-turn context from the prompt.
+    const messages = try allocator.alloc(ai_types.Message, 1);
+    defer allocator.free(messages);
+    messages[0] = .{ .user = .{ .content = .{ .text = prompt }, .timestamp = compat.time.nowSeconds() } };
+    const context = ai_types.Context{ .messages = messages };
+
+    perrf("[print] model={s} api={s} provider={s} base_url={s}\n", .{ model.id, model.api, model.provider, model.base_url });
+    if (api_key_copy) |key| {
+        perrf("[print] api_key_len={d} reasoning={any}\n", .{ key.len, model.reasoning });
+    } else {
+        perrf("[print] api_key=storage reasoning={any}\n", .{model.reasoning});
+    }
+    if (use_agent_loop) {
+        return runPrintAgentLoop(allocator, model, prompt, api_key_copy);
+    }
+
+    perr("[print] starting stream via protocol bridge...\n");
+
+    // Use the in-process protocol bridge — the EXACT path the TUI's agent loop
+    // uses (streamViaProtocol → runStreamThread → ProtocolServer/Client). This
+    // reproduces TUI streaming bugs that the direct stream_simple path misses.
+    var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+
+    const stream = try protocol.stream(model, context, .{
+        .api_key = api_key_copy,
+    }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    perr("[print] stream created, polling events...\n");
+
+    var event_count: usize = 0;
+    while (stream.wait()) |ev| {
+        event_count += 1;
+        var owned_event = ev;
+        defer if (stream.owns_events) ai_types.deinitAssistantMessageEvent(allocator, &owned_event);
+        switch (ev) {
+            .text_delta => |td| {
+                perrf("[text] ({d}b) {s}\n", .{ td.delta.len, td.delta });
+            },
+            .thinking_delta => |td| {
+                perrf("[think] ({d}b) {s}\n", .{ td.delta.len, td.delta });
+            },
+            .toolcall_delta => |td| {
+                perrf("[tool_delta] {s}\n", .{td.delta});
+            },
+            .done => |d| {
+                perrf("[done] stop_reason={s} events={d}\n", .{ @tagName(d.message.stop_reason), event_count });
+                break;
+            },
+            .@"error" => |e| {
+                perrf("[error] reason={s} events={d}\n", .{ @tagName(e.reason), event_count });
+                break;
+            },
+            else => {
+                perrf("[event#{d}] {s}\n", .{ event_count, @tagName(ev) });
+            },
+        }
+    }
+
+    // Direct provider path signals completion via complete()+getResult(), not a
+    // pushed .done event, so a null return here can be normal — check the result.
+    if (stream.getError()) |e| {
+        perrf("[print] stream error: {s}\n", .{e});
+    } else if (stream.getResult()) |result| {
+        perrf("[print] COMPLETE stop={s} events={d} content_blocks={d}\n", .{ @tagName(result.stop_reason), event_count, result.content.len });
+    } else {
+        perrf("[print] NoFinalMessage after {d} events\n", .{event_count});
+    }
+}
+
+fn runPrintAgentLoop(
+    allocator: std.mem.Allocator,
+    model: ai_types.Model,
+    prompt: []const u8,
+    api_key: ?[]const u8,
+) !void {
+    perr("[print-agent] starting full agent loop via protocol bridge...\n");
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
+    var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+
+    var context = agent_loop.AgentContext.init(allocator);
+    defer context.deinit();
+    context.system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are Makai running a Kimi debug print request. Reply concisely.");
+
+    const messages = try allocator.alloc(ai_types.Message, 1);
+    defer allocator.free(messages);
+    messages[0] = .{ .user = .{ .content = .{ .text = try allocator.dupe(u8, prompt) }, .timestamp = compat.time.nowSeconds() } };
+
+    const stream = try agent_loop.agentLoop(allocator, messages, &context, .{
+        .model = model,
+        .protocol = protocol,
+        .tools = &.{},
+        .api_key = api_key,
+        .max_tokens = model.max_tokens,
+        .thinking_level = .low,
+        .max_iterations = 1,
+    });
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var event_count: usize = 0;
+    while (stream.wait()) |event| {
+        event_count += 1;
+        var owned_event = event;
+        defer owned_event.deinit(allocator);
+
+        switch (owned_event) {
+            .message_update => |update| {
+                switch (update.event) {
+                    .text_delta => |td| perrf("[agent-text] ({d}b) {s}\n", .{ td.delta.len, td.delta }),
+                    .thinking_delta => |td| perrf("[agent-think] ({d}b) {s}\n", .{ td.delta.len, td.delta }),
+                    else => perrf("[agent-provider-event#{d}] {s}\n", .{ event_count, @tagName(update.event) }),
+                }
+            },
+            .message_end => |payload| {
+                if (payload.message == .assistant) {
+                    const msg = payload.message.assistant;
+                    perrf("[agent-message-end] stop={s} content_blocks={d}\n", .{ @tagName(msg.stop_reason), msg.content.len });
+                } else {
+                    perrf("[agent-message-end] {s}\n", .{@tagName(payload.message)});
+                }
+            },
+            .turn_end => |payload| {
+                perrf("[agent-turn-end] stop={s} content_blocks={d}\n", .{ @tagName(payload.message.stop_reason), payload.message.content.len });
+                if (payload.message.error_message.slice().len > 0) {
+                    perrf("[agent-turn-end] error={s}\n", .{payload.message.error_message.slice()});
+                }
+            },
+            .agent_end => |payload| {
+                perrf("[agent-end] messages={d}\n", .{payload.messages.slice().len});
+            },
+            else => perrf("[agent-event#{d}] {s}\n", .{ event_count, @tagName(owned_event) }),
+        }
+    }
+
+    if (stream.getError()) |e| {
+        perrf("[print-agent] stream error: {s}\n", .{e});
+    } else if (stream.getResult()) |result| {
+        perrf("[print-agent] COMPLETE iterations={d} stop={s} events={d} content_blocks={d}\n", .{
+            result.iterations,
+            @tagName(result.final_message.stop_reason),
+            event_count,
+            result.final_message.content.len,
+        });
+        if (result.final_message.error_message.slice().len > 0) {
+            perrf("[print-agent] final error={s}\n", .{result.final_message.error_message.slice()});
+        }
+    } else {
+        perrf("[print-agent] NoFinalMessage after {d} events\n", .{event_count});
+    }
+}
+
+fn runPrintTuiRuntime(allocator: std.mem.Allocator, prompt: []const u8) !void {
+    perr("[print-tui] starting TUI runtime path with production tool registry...\n");
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try register_builtins.registerBuiltInApiProviders(&registry);
+
+    var bridge = agent_bridge.InProcessProviderProtocolBridge.init(&registry);
+
+    const models = [_]ai_types.Model{.{
+        .id = "kimi-k2.7-code",
+        .name = "Kimi K2.7 Code",
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = "https://api.kimi.com/coding",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 16_384,
+    }};
+
+    const options = tui_app.TuiRuntimeOptions{
+        .protocol = (&bridge).protocolClient(),
+        .models = &models,
+        .initial_model_id = "kimi-k2.7-code",
+        .run_async = false,
+        .compact_output = true,
+    };
+
+    var runtime = try tui_app.TuiRuntime.init(allocator, options);
+    defer runtime.deinit();
+
+    if (runtime.currentModel()) |model| {
+        perrf("[print-tui] initial model={s} api={s} provider={s} base_url={s}\n", .{ model.id, model.api, model.provider, model.base_url });
+    } else {
+        perr("[print-tui] no initial model\n");
+    }
+
+    runtime.switchModel("kimi-k2.7-code") catch |err| {
+        perrf("[print-tui] switchModel(kimi-k2.7-code) failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    if (runtime.currentModel()) |model| {
+        perrf("[print-tui] active model={s} api={s} provider={s} base_url={s} tools={d}\n", .{
+            model.id,
+            model.api,
+            model.provider,
+            model.base_url,
+            runtime.availableTools().len,
+        });
+    }
+
+    try runtime.submitTurn(prompt);
+
+    var event_count: usize = 0;
+    while (true) {
+        const stream = runtime.streamEvents();
+        if (stream.wait()) |event| {
+            event_count += 1;
+            var owned_event = event;
+            defer owned_event.deinit(allocator);
+            switch (owned_event) {
+                .text_delta => |td| perrf("[print-tui-text] ({d}b) {s}\n", .{ td.delta.slice().len, td.delta.slice() }),
+                .thinking_delta => |td| perrf("[print-tui-think] ({d}b) {s}\n", .{ td.delta.slice().len, td.delta.slice() }),
+                .message_end => |payload| perrf("[print-tui-message-end] role={s} stop={s} is_error={any} text={s}\n", .{
+                    @tagName(payload.role),
+                    @tagName(payload.stop_reason),
+                    payload.is_error,
+                    payload.text.slice(),
+                }),
+                .turn_end => |payload| perrf("[print-tui-turn-end] stop={s}\n", .{@tagName(payload.stop_reason)}),
+                .agent_end => |payload| {
+                    perrf("[print-tui-agent-end] reason={s} events={d}\n", .{ @tagName(payload.reason), event_count });
+                    break;
+                },
+                .@"error" => |payload| perrf("[print-tui-error] {s}\n", .{payload.message.slice()}),
+                else => perrf("[print-tui-event#{d}] {s}\n", .{ event_count, @tagName(owned_event) }),
+            }
+            continue;
+        }
+
+        if (stream.getError()) |err_msg| {
+            perrf("[print-tui] stream error: {s}\n", .{err_msg});
+            break;
+        }
+        if (stream.getResult()) |result| {
+            perrf("[print-tui] COMPLETE reason={s} events={d}\n", .{ @tagName(result.reason), event_count });
+            break;
+        }
+        break;
+    }
+}
+
+/// Write directly to stderr — `std.debug.print` is unbuffered (lock-protected
+/// direct writer) so diagnostics survive even if the process is killed mid-hang.
+fn perr(msg: []const u8) void {
+    std.debug.print("{s}", .{msg});
+}
+
+/// Formatted variant of `perr`.
+fn perrf(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print(fmt, args);
 }
 
 /// Production auth-server options for the CLI wrapper. Real OAuth flows are
@@ -3656,6 +4062,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[1], "--tui")) {
         try runTui(allocator, init.io);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "-p")) {
+        try runPrintMode(allocator, args[2..]);
         return;
     }
 
