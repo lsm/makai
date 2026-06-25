@@ -528,6 +528,15 @@ pub const App = struct {
 
         try store.delete(id);
         if (std.mem.eql(u8, self.session_id, id)) {
+            if (self.session) |*session| {
+                session.cancel();
+                session.clearQueuedMessages();
+            }
+            if (self.runtime) |runtime| runtime.replaceMessages(&.{}) catch {};
+            self.discardPendingEvents();
+            self.state.resetReplayState();
+            self.state.clearQueuedPreviews();
+            self.inline_history_flushed = 0;
             if (self.session_id.len > 0) self.allocator.free(self.session_id);
             self.session_id = &.{};
             self.session_created_at = 0;
@@ -1160,6 +1169,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
             try self.state.addQueuedPreview(.steering, trimmed);
@@ -1173,6 +1183,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        try self.ensureSessionId();
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
             try self.state.addQueuedPreview(.follow_up, trimmed);
@@ -1237,6 +1248,7 @@ pub const App = struct {
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
                 self.state.session_filter.clear();
+                self.state.session_delete_confirm = false;
                 self.state.mode = .session_picker;
             },
             .open_model_picker => self.openModelPicker(),
