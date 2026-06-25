@@ -75,7 +75,6 @@ fn isAtLineStart(source: []const u8, i: usize) bool {
 // Fence + mermaid
 // ---------------------------------------------------------------------------
 
-const mermaid_fence = "```";
 const mermaid_lang = "mermaid";
 
 /// If `source[i..]` opens a fenced code block at line start (optionally
@@ -87,24 +86,33 @@ const mermaid_lang = "mermaid";
 ///
 /// Updates `*i` past the consumed block and returns true. Returns false
 /// (without modifying `*i`) if `i` is not at a fence opener.
+///
+/// Supports CommonMark-style long fences (4+ backticks) so a block opened
+/// with ```` ```` ```` is only closed by a line whose leading backtick run
+/// is at least as long — this lets users embed ``` ```` ``` fences inside
+/// without breaking the outer block.
 fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const start = i.*;
     // Allow leading space indentation (a line of spaces followed by ```).
     var indent_end = start;
     while (indent_end < source.len and source[indent_end] == ' ') indent_end += 1;
-    if (indent_end + mermaid_fence.len > source.len) return false;
-    if (!std.mem.eql(u8, source[indent_end .. indent_end + mermaid_fence.len], mermaid_fence)) return false;
-    // The fence opener must sit at the start of the line — we've already
-    // returned false above if `i` is not at a line start.
+    if (indent_end >= source.len or source[indent_end] != '`') return false;
+
+    // Count the opening backtick run. CommonMark requires >=3 to open a
+    // fence; we accept any length and require a closer with at least as
+    // many backticks so users can use ```` to wrap content containing ```.
+    var fence_len: usize = 0;
+    while (indent_end + fence_len < source.len and source[indent_end + fence_len] == '`') fence_len += 1;
+    if (fence_len < 3) return false;
 
     // Lang tag occupies the rest of the opener line.
-    const fence_end = indent_end + mermaid_fence.len;
+    const fence_end = indent_end + fence_len;
     const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
     const tag = std.mem.trim(u8, source[fence_end..line_end], " \t\r");
 
     // Body starts on the line after the opener.
     const body_start = if (line_end < source.len) line_end + 1 else source.len;
-    const close_line_start = findCodeBlockCloseLine(source, body_start);
+    const close_line_start = findCodeBlockCloseLine(source, body_start, fence_len);
     const body_end = if (close_line_start) |cls| cls else source.len;
     const body = source[body_start..body_end];
 
@@ -119,6 +127,10 @@ fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
             try writer.writeAll("**Mermaid diagram**\n\n");
         }
         try writeQuotedLines(writer, body);
+        // Trailing newline separates the mermaid region from whatever
+        // follows; without it the next paragraph would concatenate onto
+        // the last `> ...` line.
+        try writer.writeByte('\n');
     } else {
         // Non-mermaid fenced code block — copy opener, body, and closer
         // verbatim so any literal ```mermaid lines or `$` shell vars inside
@@ -154,20 +166,35 @@ fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     return true;
 }
 
-/// Locate the first line at or after `body_start` whose content (after
-/// trimming whitespace) is exactly ```` ``` ````. Returns the absolute index
-/// of that closer line's first byte, or null if none is found.
-fn findCodeBlockCloseLine(source: []const u8, body_start: usize) ?usize {
+/// Locate the first line at or after `body_start` that closes a fenced
+/// code block opened with `fence_len` backticks. A closing line is one
+/// whose leading backtick run (after optional whitespace) is at least
+/// `fence_len` ticks long and contains nothing else but whitespace.
+///
+/// Returns the absolute index of that closer line's first byte, or null if
+/// none is found.
+fn findCodeBlockCloseLine(source: []const u8, body_start: usize, fence_len: usize) ?usize {
     var i = body_start;
     while (i < source.len) {
         const line_start = i;
         const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
         const line = source[line_start..line_end];
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (std.mem.eql(u8, trimmed, mermaid_fence)) return line_start;
+        if (countLeadingBackticks(trimmed) >= fence_len) {
+            // Reject lines that have non-tick content after the run, e.g.
+            // an opener ```text. A valid closer is all backticks (possibly
+            // followed by trailing whitespace, already trimmed off).
+            if (std.mem.allEqual(u8, trimmed, '`')) return line_start;
+        }
         i = if (line_end < source.len) line_end + 1 else source.len;
     }
     return null;
+}
+
+fn countLeadingBackticks(s: []const u8) usize {
+    var n: usize = 0;
+    while (n < s.len and s[n] == '`') n += 1;
+    return n;
 }
 
 /// Inspect the first non-blank line of a Mermaid block to classify the
@@ -444,17 +471,21 @@ fn writeScript(writer: *std.Io.Writer, body: []const u8, i: *usize) !void {
     var token_end: usize = undefined;
     var had_braces = false;
     if (body[i.*] == '{') {
-        had_braces = true;
-        token_start = i.* + 1;
-        const close = std.mem.indexOfScalarPos(u8, body, token_start, '}') orelse {
-            // No closing brace — emit marker + rest verbatim.
+        // Use readGroup so nested braces like `^{\frac{1}{2}}` parse
+        // correctly — a scalar search for `}` would stop at the first
+        // inner closer and corrupt the rest.
+        if (readGroup(body, i.*)) |grp| {
+            had_braces = true;
+            token_start = i.* + 1;
+            token_end = grp.end - 1;
+            i.* = grp.end;
+        } else {
+            // Unterminated brace group — emit marker + rest verbatim.
             try writer.writeByte(marker);
             try writer.writeAll(body[i.*..]);
             i.* = body.len;
             return;
-        };
-        token_end = close;
-        i.* = close + 1;
+        }
     } else {
         // Only consume a single ASCII alphanumeric or operator punctuation as
         // the script token. Anything else (notably `\`, which starts a LaTeX
@@ -1103,4 +1134,50 @@ test "sqrt emits radical sign" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "√x+1") != null);
+}
+
+test "mermaid block separates from following paragraph with newline" {
+    // Without a trailing newline after the quoted source, the next paragraph
+    // would concatenate onto the last `> ...` line.
+    const src = "```mermaid\nflowchart TD\n  A --> B\n```\noutro";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // "outro" must land on its own line, not glued to the last quoted line.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Boutro") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ">   A --> B\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\noutro") != null);
+}
+
+test "four-backtick fenced code block is recognized and closed" {
+    // CommonMark allows longer fences so users can wrap content containing
+    // triple backticks. A 4-tick fence must be matched by a 4+ tick closer
+    // and must protect its interior from math preprocessing.
+    const src = "````text\n$\\alpha$\n````\nthen $\\beta$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Interior of the 4-tick block is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, out, "$\\alpha$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "α") == null);
+    // Math after the block still renders.
+    try std.testing.expect(std.mem.indexOf(u8, out, "β") != null);
+}
+
+test "four-backtick mermaid block is detected and labeled" {
+    const src = "````mermaid\nflowchart TD\n  A --> B\n````";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "**Mermaid diagram: flowchart**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ">   A --> B") != null);
+}
+
+test "nested script braces preserve inner group" {
+    // Grouped superscript with nested braces — the scalar `}` search used to
+    // truncate at the first inner closer. readGroup handles the nesting.
+    const src = "deep $x^{\\frac{1}{2}}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The full `\frac{1}{2}` survives inside the script fallback rather than
+    // being truncated to `\frac{1}2`.
+    try std.testing.expect(std.mem.indexOf(u8, out, "^{\\frac{1}{2}}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac{1}2") == null);
 }
