@@ -2958,6 +2958,16 @@ test "TuiModel Shift Tab cycles thinking level" {
     try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
 }
 
+test "TuiModel Ctrl D cycles timestamp display" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
+    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.TimestampDisplay.full, model.app.?.state.timestamp_display);
+}
+
 test "setting pickers apply selected values" {
     const runtime_ptr = try std.testing.allocator.create(tui_runtime.TuiRuntime);
     runtime_ptr.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
