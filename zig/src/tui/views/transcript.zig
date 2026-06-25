@@ -21,9 +21,10 @@ const DisplayEntry = struct {
     timestamp_ms: i64,
     tool_name: []const u8 = "",
     title: []const u8 = "",
+    transcript_index: ?usize = null,
 };
 
-pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Options) ![]const u8 {
+pub fn render(allocator: std.mem.Allocator, state: *AppState, options: Options) ![]const u8 {
     if (options.height == 0) return allocator.dupe(u8, "");
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -42,19 +43,61 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
         return padTopToHeight(allocator, ready_line, options.height);
     }
 
+    const selected_visible_index: ?usize = if (state.focus_pane == .transcript) blk: {
+        const sel = state.selected_message_index orelse break :blk null;
+        if (sel >= state.transcript.items.len) break :blk null;
+        for (visible_entries.items, 0..) |entry, i| {
+            if (entry.transcript_index == sel) break :blk i;
+        }
+        break :blk null;
+    } else null;
+
     var all_rows: std.Io.Writer.Allocating = .init(allocator);
     defer all_rows.deinit();
     const all_writer = &all_rows.writer;
+    var selected_start_line: ?usize = null;
+    var selected_end_line: ?usize = null;
+    var current_line: usize = 0;
     for (visible_entries.items, 0..) |*entry, i| {
-        if (i > 0) try all_writer.writeAll("\n\n"); // blank-line spacer between entries
-        const row = try renderEntry(allocator, entry, options.width, state.timestamp_display);
+        if (i > 0) {
+            // The "\n\n" separator ends the previous entry and inserts one
+            // blank spacer line; the previous entry's lines are already
+            // accounted for, so only the single blank spacer advances the
+            // row counter.
+            try all_writer.writeAll("\n\n");
+            current_line += 1;
+        }
+        const row_start = current_line;
+        const selected = selected_visible_index == i;
+        const row = try renderEntry(allocator, entry, options.width, state.timestamp_display, selected);
         defer allocator.free(row);
         try all_writer.writeAll(row);
+        current_line += tui_text.lineCount(row);
+        if (selected) {
+            selected_start_line = row_start;
+            selected_end_line = current_line;
+        }
     }
 
     const all_text = all_rows.written();
-    const total_lines = tui_text.lineCount(all_text);
-    // Reserve one line for scroll indicator when scrolled and enough space exists; use full height otherwise.
+    const total_lines = current_line;
+
+    if (state.focus_pane == .transcript and state.follow_selection) {
+        state.follow_selection = false;
+        if (selected_start_line) |sel_start| {
+            const sel_end = selected_end_line.?;
+            const reserve_indicator = total_lines > options.height and options.height >= 2;
+            const view_height = if (reserve_indicator) options.height - 1 else options.height;
+            const max_scroll = if (total_lines > view_height) total_lines - view_height else 0;
+            var desired_start = sel_start;
+            if (sel_end > desired_start + view_height) {
+                desired_start = sel_end -| view_height;
+            }
+            if (desired_start > max_scroll) desired_start = max_scroll;
+            state.transcript_scroll = max_scroll - desired_start;
+        }
+    }
+
     const show_indicator = state.transcript_scroll > 0 and total_lines > options.height and options.height >= 2;
     const view_height = if (show_indicator) options.height - 1 else options.height;
     const windowed = try lineWindow(allocator, all_text, view_height, state.transcript_scroll);
@@ -62,7 +105,6 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
 
     if (!show_indicator) return padTopToHeight(allocator, windowed, options.height);
 
-    // Prepend a scroll indicator line: "↑ SCROLL N%"
     const pct = scrollPercent(total_lines, view_height, state.transcript_scroll);
     const raw_indicator = try std.fmt.allocPrint(allocator, "\u{2191} SCROLL {d}%", .{pct});
     defer allocator.free(raw_indicator);
@@ -88,22 +130,22 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     };
-    return renderEntry(allocator, &display, width, ts_mode);
+    return renderEntry(allocator, &display, width, ts_mode, false);
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
     switch (state.transcript_mode) {
         .everything => {
             for (state.protocol_events.items) |*entry| try appendProtocolEvent(allocator, entries, entry);
-            for (state.transcript.items) |*entry| try appendOriginal(allocator, entries, entry);
+            for (state.transcript.items, 0..) |*entry, idx| try appendOriginal(allocator, entries, entry, idx);
             try appendDebugToolState(allocator, arena, state, entries, true);
             try appendTelemetryState(allocator, arena, state, entries);
         },
         .verbose => {
-            for (state.transcript.items) |*entry| {
+            for (state.transcript.items, 0..) |*entry, idx| {
                 if (entry.kind == .thinking and !state.show_thinking) continue;
                 if (isLowValueSystem(entry)) continue;
-                try appendOriginal(allocator, entries, entry);
+                try appendOriginal(allocator, entries, entry, idx);
             }
             try appendDebugToolState(allocator, arena, state, entries, false);
         },
@@ -126,7 +168,7 @@ fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, s
                     tool_index = try appendBalancedToolCluster(allocator, arena, entries, state, cluster_start, i, tool_index);
                     continue;
                 }
-                try appendOriginal(allocator, entries, entry);
+                try appendOriginal(allocator, entries, entry, i);
                 i += 1;
             }
         },
@@ -145,8 +187,8 @@ fn appendBalancedToolCluster(
 ) !usize {
     var tool_index = initial_tool_index;
     if (state.tools.items.len == 0 or tool_index >= state.tools.items.len) {
-        for (state.transcript.items[start..end]) |*entry| {
-            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry);
+        for (state.transcript.items[start..end], start..) |*entry, idx| {
+            if (!isRawToolArgs(entry.text.items)) try appendOriginal(allocator, entries, entry, idx);
         }
         return tool_index;
     }
@@ -179,13 +221,14 @@ fn isToolStartSummary(text: []const u8) bool {
     return quote < @min(ok, failed);
 }
 
-fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry) !void {
+fn appendOriginal(allocator: std.mem.Allocator, entries: *std.ArrayList(DisplayEntry), entry: *const TranscriptEntry, transcript_index: usize) !void {
     try entries.append(allocator, .{
         .kind = entry.kind,
         .text = entry.text.items,
         .timestamp_ms = entry.timestamp_ms,
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
+        .transcript_index = transcript_index,
     });
 }
 
@@ -198,7 +241,7 @@ fn appendProtocolEvent(allocator: std.mem.Allocator, entries: *std.ArrayList(Dis
 }
 
 fn isLowValueSystem(entry: *const TranscriptEntry) bool {
-    return entry.kind == .system and std.mem.eql(u8, entry.text.items, "agent started");
+    return tui_state.isLowValueSystem(entry);
 }
 
 fn appendDebugToolState(
@@ -382,15 +425,15 @@ const ConversationStats = struct {
 
 fn appendConversationEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
     var stats: ConversationStats = .{};
-    for (state.transcript.items) |*entry| {
+    for (state.transcript.items, 0..) |*entry, idx| {
         switch (entry.kind) {
             .user, .assistant => {
                 try flushConversationStats(allocator, arena, entries, &stats);
-                try appendOriginal(allocator, entries, entry);
+                try appendOriginal(allocator, entries, entry, idx);
             },
             .@"error" => {
                 try flushConversationStats(allocator, arena, entries, &stats);
-                try appendOriginal(allocator, entries, entry);
+                try appendOriginal(allocator, entries, entry, idx);
             },
             .thinking, .tool, .system => stats.add(entry),
         }
@@ -480,8 +523,10 @@ const EntryLayout = struct {
 };
 
 /// Render one transcript entry as a header line (role + time) followed by a
-/// bubble, plain tool row, or bordered card.
-fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, ts_mode: TimestampDisplay) ![]u8 {
+/// bubble, plain tool row, or bordered card. When `selected` is true, the
+/// normal render is produced first and then a selection background is overlaid
+/// so assistant markdown and role colors stay intact.
+fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: usize, ts_mode: TimestampDisplay, selected: bool) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -525,6 +570,29 @@ fn renderEntry(allocator: std.mem.Allocator, entry: *const DisplayEntry, width: 
     if (body.len > 0) {
         try writer.writeByte('\n');
         try writer.writeAll(body);
+    }
+    const composed = try out.toOwnedSlice();
+    if (!selected) return composed;
+    const highlighted = try applySelectionToLines(allocator, composed, width);
+    allocator.free(composed);
+    return highlighted;
+}
+
+/// Wrap each line of an already-rendered entry in the selection style so the
+/// entire selected row is highlighted without discarding the original content.
+fn applySelectionToLines(allocator: std.mem.Allocator, text: []const u8, width: usize) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    const w: u16 = @intCast(@min(width, std.math.maxInt(u16)));
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try writer.writeByte('\n');
+        first = false;
+        const highlighted = try tui_theme.selection().width(w).render(allocator, line);
+        defer allocator.free(highlighted);
+        try writer.writeAll(highlighted);
     }
     return out.toOwnedSlice();
 }
@@ -1309,6 +1377,57 @@ test "transcript keeps one-line viewport within height when scrolled" {
 
     try std.testing.expectEqual(@as(usize, 1), tui_text.lineCount(text));
     try std.testing.expect(std.mem.indexOf(u8, text, "SCROLL") == null);
+}
+
+test "transcript highlights selected message block" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendUserMessage("hello");
+    try state.appendTranscript(.assistant, "world");
+
+    state.focus_pane = .transcript;
+    state.selected_message_index = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 10 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") != null);
+}
+
+test "transcript scroll follows selected message" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    for (0..20) |i| {
+        const msg = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
+        defer std.testing.allocator.free(msg);
+        try state.appendTranscript(.assistant, msg);
+    }
+
+    state.focus_pane = .transcript;
+    state.selected_message_index = 0;
+    state.transcript_scroll = 0;
+    state.follow_selection = true;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    // Scrolled up so the first (selected) entry is visible.
+    try std.testing.expect(state.transcript_scroll > 0);
+}
+
+test "transcript keeps selection visible when focus is not transcript" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.appendTranscript(.system, "only one");
+    state.focus_pane = .composer;
+    state.selected_message_index = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    // No highlight style applied when composer is focused.
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") == null);
 }
 
 test "transcript renders heading bold without markdown marker" {
