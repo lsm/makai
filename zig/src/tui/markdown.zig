@@ -573,12 +573,20 @@ const BraceGroup = struct {
 
 /// Read a `{...}` group starting at `i`. Returns null if `i` doesn't point
 /// at a `{`. Handles nested braces via a depth counter so
-/// `\frac{\frac{a}{b}}{c}` renders as `((a)/(b))/(c)`.
+/// `\frac{\frac{a}{b}}{c}` renders as `((a)/(b))/(c)`. Skipped over escape
+/// pairs (`\{`, `\}`, etc.) so escaped LaTeX braces don't affect depth —
+/// otherwise unbalanced escapes like `\boxed{\{1,2}` corrupt grouping and
+/// drop content.
 fn readGroup(body: []const u8, i: usize) ?BraceGroup {
     if (i >= body.len or body[i] != '{') return null;
     var depth: usize = 1;
     var j = i + 1;
     while (j < body.len) : (j += 1) {
+        if (body[j] == '\\' and j + 1 < body.len) {
+            // Skip the escaped char so it can't affect brace depth.
+            j += 1;
+            continue;
+        }
         if (body[j] == '{') depth += 1;
         if (body[j] == '}') {
             depth -= 1;
@@ -994,6 +1002,20 @@ test "unknown LaTeX command with brace argument preserves group" {
     // the raw fallback stays copyable (NOT `\boxedx+1`).
     try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed{x+1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\boxedx") == null);
+}
+
+test "escaped braces inside group do not corrupt depth" {
+    // `\{` and `\}` are literal brace chars in LaTeX math, not grouping
+    // braces. readGroup must skip the escaped pair so unbalanced escaped
+    // braces don't drop content. Repro from review: `\boxed{\{1,2}` should
+    // preserve the `\boxed{` opener.
+    const src = "set $\\boxed{\\{1,2}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The `\boxed{` opener must survive — without the escape-skip fix the
+    // depth counter matched `\}` against the inner `\boxed{` and lost it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed{\\{1,2}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed\\{1,2") == null);
 }
 
 test "mermaid block replaced with labeled summary" {
