@@ -832,6 +832,7 @@ pub const TuiRuntime = struct {
                 if (self.remote_turn_in_flight) return error.AgentAlreadyStreaming;
                 self.clearRemoteQueues();
                 self.clearRemoteMessages();
+                self.resetBackpressureState();
                 errdefer self.clearRemoteMessages();
                 for (messages) |message| try self.remote_messages.append(self.allocator, try ai_types.cloneMessage(self.allocator, message));
             },
@@ -840,6 +841,7 @@ pub const TuiRuntime = struct {
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 if (self.run_async) local.waitForIdle();
                 local.clearAllQueues();
+                self.resetBackpressureState();
                 try local.replaceMessages(messages);
             },
         }
@@ -940,17 +942,28 @@ pub const TuiRuntime = struct {
     pub fn backpressureState(self: *TuiRuntime) struct { active: bool, dropped_count: u64 } {
         while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.backpressure_mutex.unlock();
-        // Auto-clear the internal flag when the ring has recovered so the
-        // status bar stops showing the active indicator without waiting for
-        // the next event push.
-        if (self.backpressure_active.load(.acquire) and !self.event_stream.isFull()) {
+        const active = self.backpressure_active.load(.acquire);
+        const dropped_count = self.dropped_event_count;
+        // Auto-clear the internal flag when the ring has recovered, but return
+        // the pre-clear snapshot once so AppState can render the active
+        // backpressure frame before settling to drops-only on the next poll.
+        if (active and !self.event_stream.isFull()) {
             self.backpressure_active.store(false, .release);
             self.backpressure_status_active_emitted.store(false, .release);
         }
         return .{
-            .active = self.backpressure_active.load(.acquire),
-            .dropped_count = self.dropped_event_count,
+            .active = active,
+            .dropped_count = dropped_count,
         };
+    }
+
+    fn resetBackpressureState(self: *TuiRuntime) void {
+        while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.dropped_event_count = 0;
+        self.dropped_since_warning = 0;
+        self.backpressure_active.store(false, .release);
+        self.backpressure_status_active_emitted.store(false, .release);
+        self.backpressure_mutex.unlock();
     }
 
     pub fn decideToolApproval(self: *TuiRuntime, tool_call_id: []const u8, decision: ToolApprovalDecision) !void {
@@ -997,12 +1010,7 @@ pub const TuiRuntime = struct {
             self.event_stream = TuiEventStream.init(self.allocator);
             // The fresh stream belongs to a new turn/session; backpressure
             // counters from the previous stream no longer apply to it.
-            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
-            self.dropped_event_count = 0;
-            self.dropped_since_warning = 0;
-            self.backpressure_active.store(false, .release);
-            self.backpressure_status_active_emitted.store(false, .release);
-            self.backpressure_mutex.unlock();
+            self.resetBackpressureState();
         }
         self.stream_active = true;
     }
@@ -5126,11 +5134,30 @@ test "TuiRuntime counts dropped events and emits warning" {
     }
     try std.testing.expect(saw_warning);
 
-    // The status bar reads state via backpressureState(), which auto-clears
-    // the active flag once the ring recovers.
+    // The status bar reads state via backpressureState(), which returns one
+    // active frame after recovery before clearing the runtime flag.
+    const bp_recovered = runtime.backpressureState();
+    try std.testing.expect(bp_recovered.active);
+    try std.testing.expectEqual(@as(u64, 1), bp_recovered.dropped_count);
     const bp_cleared = runtime.backpressureState();
     try std.testing.expect(!bp_cleared.active);
     try std.testing.expectEqual(@as(u64, 1), bp_cleared.dropped_count);
+}
+
+test "TuiRuntime replaceMessages clears stale backpressure counters" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+    runtime.started = true;
+
+    runtime.dropped_event_count = 9;
+    runtime.dropped_since_warning = 2;
+    runtime.backpressure_active.store(true, .release);
+
+    try runtime.replaceMessages(&.{});
+
+    const bp = runtime.backpressureState();
+    try std.testing.expect(!bp.active);
+    try std.testing.expectEqual(@as(u64, 0), bp.dropped_count);
 }
 
 fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
