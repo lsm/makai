@@ -31,6 +31,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         try writeSep(writer, allocator);
         try writeOwnedSegment(writer, allocator, "queue", try std.fmt.allocPrint(allocator, "{d}", .{state.queue.total()}));
     }
+    if (state.backpressure_active or state.dropped_event_count > 0) {
+        try writeSep(writer, allocator);
+        const label: []const u8 = if (state.backpressure_active) "backpressure" else "drops";
+        const value = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ label, state.dropped_event_count });
+        if (state.backpressure_active) {
+            try writeOwnedValue(writer, allocator, value, tui_theme.warningText());
+        } else {
+            try writeOwnedSegment(writer, allocator, "drops", value);
+        }
+    }
     try writeSep(writer, allocator);
     if (state.mode == .approval) {
         try writeStyledValue(writer, allocator, "perm", "pending", tui_theme.warningText());
@@ -197,6 +207,32 @@ test "status bar renders bypass permission mode" {
 
     try std.testing.expect(std.mem.indexOf(u8, text, "perm") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "bypass") != null);
+}
+
+test "status bar renders backpressure indicator when active" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.backpressure_active = true;
+    state.dropped_event_count = 5;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "backpressure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ":5") != null);
+}
+
+test "status bar renders drop count after backpressure clears" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.dropped_event_count = 12;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 160 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "drops") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, ":12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "backpressure") == null);
 }
 
 test "status bar does not render last error" {

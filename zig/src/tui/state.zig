@@ -530,6 +530,8 @@ pub const AppState = struct {
     /// cancelled turn that are drained afterwards must not flip the status bar
     /// back to streaming.
     stream_aborted: bool = false,
+    dropped_event_count: u64 = 0,
+    backpressure_active: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) AppState {
         return .{ .allocator = allocator };
@@ -636,6 +638,8 @@ pub const AppState = struct {
             self.allocator.free(self.status.last_error);
             self.status.last_error = &.{};
         }
+        self.dropped_event_count = 0;
+        self.backpressure_active = false;
     }
 
     pub fn appendUserMessage(self: *AppState, text: []const u8) !void {
@@ -782,7 +786,7 @@ pub const AppState = struct {
     pub fn applyEvent(self: *AppState, event: tui_runtime.TuiEvent) !void {
         try self.appendProtocolEvent(event);
         if (self.stream_aborted) switch (event) {
-            .turn_end, .agent_end, .@"error" => {},
+            .turn_end, .agent_end, .@"error", .system_warning, .backpressure_status => {},
             else => return,
         };
         switch (event) {
@@ -845,6 +849,11 @@ pub const AppState = struct {
             },
             .context_usage => |payload| self.applyContextUsage(payload),
             .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
+            .system_warning => |payload| try self.appendTranscript(.system, payload.message.slice()),
+            .backpressure_status => |payload| {
+                self.backpressure_active = payload.active;
+                self.dropped_event_count = payload.dropped_count;
+            },
             .turn_end => {
                 self.status.streaming = false;
                 self.stream_aborted = false;
@@ -1286,6 +1295,15 @@ fn formatProtocolEvent(allocator: std.mem.Allocator, event: tui_runtime.TuiEvent
         .agent_end => |payload| {
             try writer.writeAll("protocol event: agent_end");
             try writeEnumProtocolField(writer, "reason", payload.reason);
+        },
+        .system_warning => |payload| {
+            try writer.writeAll("protocol event: system_warning");
+            try writeStringProtocolField(writer, "message", payload.message.slice());
+        },
+        .backpressure_status => |payload| {
+            try writer.writeAll("protocol event: backpressure_status");
+            try writeBoolProtocolField(writer, "active", payload.active);
+            try writeU64ProtocolField(writer, "dropped_count", payload.dropped_count);
         },
         .@"error" => |payload| {
             try writer.writeAll("protocol event: error");
@@ -2234,6 +2252,35 @@ test "AppState prunes stale queued previews to authoritative counts" {
     try std.testing.expectEqualStrings("remaining follow", state.queued_previews.items[1].text);
 }
 
+test "AppState reset replay clears backpressure state" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.dropped_event_count = 5;
+    state.backpressure_active = true;
+
+    state.resetReplayState();
+
+    try std.testing.expectEqual(@as(u64, 0), state.dropped_event_count);
+    try std.testing.expect(!state.backpressure_active);
+}
+
+test "AppState stream_aborted still applies backpressure status and warning" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.stream_aborted = true;
+
+    try state.applyEvent(.{ .backpressure_status = .{ .active = true, .dropped_count = 4 } });
+    try std.testing.expect(state.backpressure_active);
+    try std.testing.expectEqual(@as(u64, 4), state.dropped_event_count);
+
+    var warning = tui_runtime.TuiEvent{ .system_warning = .{ .message = try ownedText("warn") } };
+    defer warning.deinit(std.testing.allocator);
+    try state.applyEvent(warning);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqualStrings("warn", state.transcript.items[0].text.items);
+}
+
 test "AppState applies thinking tool call and lifecycle events" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
@@ -2417,4 +2464,47 @@ test "AppState stream_aborted ignores stale lifecycle events" {
     try state.applyEvent(.{ .agent_end = .{ .reason = .cancelled } });
     try std.testing.expect(!state.status.streaming);
     try std.testing.expect(!state.stream_aborted);
+}
+
+test "AppState surfaces system_warning as transcript entry" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var warning = tui_runtime.TuiEvent{ .system_warning = .{ .message = try ownedText("Warning: 5 events dropped due to backpressure") } };
+    defer warning.deinit(std.testing.allocator);
+    try state.applyEvent(warning);
+
+    try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
+    try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("Warning: 5 events dropped due to backpressure", state.transcript.items[0].text.items);
+}
+
+test "AppState updates backpressure status fields" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    try state.applyEvent(.{ .backpressure_status = .{ .active = true, .dropped_count = 3 } });
+    try std.testing.expect(state.backpressure_active);
+    try std.testing.expectEqual(@as(u64, 3), state.dropped_event_count);
+
+    try state.applyEvent(.{ .backpressure_status = .{ .active = false, .dropped_count = 3 } });
+    try std.testing.expect(!state.backpressure_active);
+    try std.testing.expectEqual(@as(u64, 3), state.dropped_event_count);
+}
+
+test "AppState protocol log formats warning and backpressure events" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var warning = tui_runtime.TuiEvent{ .system_warning = .{ .message = try ownedText("drops happened") } };
+    defer warning.deinit(std.testing.allocator);
+    try state.applyEvent(warning);
+    try state.applyEvent(.{ .backpressure_status = .{ .active = true, .dropped_count = 7 } });
+
+    const text = try protocolLogText(std.testing.allocator, &state);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "protocol event: system_warning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "drops happened") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "protocol event: backpressure_status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "dropped_count=7") != null);
 }

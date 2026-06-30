@@ -379,6 +379,25 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return self.head.load(.acquire) != self.tail.load(.acquire);
         }
 
+        pub fn isFull(self: *Self) bool {
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
+            const current_head = self.head.load(.acquire);
+            const current_tail = self.tail.load(.acquire);
+            return ((current_head + 1) & RING_BUFFER_MASK) == current_tail;
+        }
+
+        pub fn freeSlots(self: *Self) usize {
+            self.mutex.lockUncancelable(defaultIo());
+            defer self.mutex.unlock(defaultIo());
+            const current_head = self.head.load(.acquire);
+            const current_tail = self.tail.load(.acquire);
+            // Wrapping subtraction is required: head can be less than tail once
+            // the ring has wrapped, which would underflow checked usize math.
+            const used = (current_head -% current_tail) & RING_BUFFER_MASK;
+            return (RING_BUFFER_SIZE - 1) - used;
+        }
+
         pub fn getResult(self: *Self) ?R {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
@@ -550,7 +569,10 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
     for (0..TestStream.usable_capacity) |i| {
         try stream.push(@intCast(i));
     }
+    try std.testing.expect(stream.isFull());
     try std.testing.expectError(error.QueueFull, stream.push(TestStream.usable_capacity));
+    _ = stream.poll().?;
+    try std.testing.expect(!stream.isFull());
 }
 
 test "EventStream pushBlocking reports completed full stream" {
@@ -629,6 +651,24 @@ test "EventStream ring buffer wrap-around preserves order" {
     }
 
     try std.testing.expect(stream.poll() == null);
+}
+
+test "EventStream freeSlots stays correct after ring wrap-around" {
+    const TestStream = EventStream(u32, bool);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // Cycle more than a full ring so head wraps past tail.
+    for (0..TestStream.usable_capacity + 145) |i| {
+        try stream.push(@intCast(i));
+        _ = stream.poll().?;
+        // freeSlots must remain full capacity after every push/poll pair.
+        try std.testing.expectEqual(@as(usize, TestStream.usable_capacity), stream.freeSlots());
+    }
+
+    // Now leave a few in flight and re-check to exercise head < tail.
+    for (0..10) |_| try stream.push(0);
+    try std.testing.expectEqual(@as(usize, TestStream.usable_capacity - 10), stream.freeSlots());
 }
 
 const WaitPushCtx = struct {

@@ -886,6 +886,10 @@ pub const App = struct {
             .tool_execution_end => |payload| {
                 if (toolExecutionEndPayloadSize(payload) > max_session_event_payload_bytes) return;
             },
+            .system_warning => |payload| {
+                if (jsonStringBudget(payload.message.slice()) > max_session_event_payload_bytes) return;
+            },
+            .backpressure_status => {},
             .@"error" => |payload| {
                 if (jsonStringBudget(payload.message.slice()) > max_session_event_payload_bytes) return;
             },
@@ -975,6 +979,7 @@ pub const App = struct {
             };
             self.refreshQueuedCounts();
         }
+        self.syncBackpressureState();
     }
 
     fn applyRuntimeEvent(self: *App, event: tui_runtime.TuiEvent) !void {
@@ -1002,6 +1007,13 @@ pub const App = struct {
             if (last.kind == .user and std.mem.eql(u8, last.text.items, trimmed)) return;
         }
         try self.state.appendUserMessage(trimmed);
+    }
+
+    fn syncBackpressureState(self: *App) void {
+        const runtime = self.runtime orelse return;
+        const bp = runtime.backpressureState();
+        self.state.backpressure_active = bp.active;
+        self.state.dropped_event_count = bp.dropped_count;
     }
 
     fn refreshQueuedCounts(self: *App) void {
