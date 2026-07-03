@@ -481,6 +481,7 @@ fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg
             // stdin/stdout. Until subprocess spawning is wired up, persist the
             // transport preference but do not enable remote mode.
             cfg.remote.enabled = false;
+            restart_notice = true;
             try replaceRemoteString(allocator, &cfg.remote.transport, "stdio");
             try replaceRemoteString(allocator, &cfg.remote.command, "");
             try replaceRemoteString(allocator, &cfg.remote.endpoint, "");
@@ -1191,6 +1192,7 @@ test "remote command sets stdio transport without enabling remote" {
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: stdio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
 
     var loaded = try store.load();
     defer loaded.deinit(std.testing.allocator);

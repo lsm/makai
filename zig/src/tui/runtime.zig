@@ -127,6 +127,21 @@ pub fn parseRemoteTransport(value: []const u8) ?TuiRemoteTransport {
     return null;
 }
 
+fn hasWhitespaceOrControl(value: []const u8) bool {
+    for (value) |ch| {
+        if (std.ascii.isWhitespace(ch) or ch < 0x20 or ch == 0x7f) return true;
+    }
+    return false;
+}
+
+fn isValidSavedSseEndpoint(endpoint: []const u8) bool {
+    if (endpoint.len == 0) return false;
+    if (hasWhitespaceOrControl(endpoint)) return false;
+    if (std.mem.indexOfScalar(u8, endpoint, '#') != null) return false;
+    const parsed = sse_transport.parseHttpUrl(endpoint) catch return false;
+    return parsed.scheme == .http;
+}
+
 pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Config) !TuiRemoteConfig {
     var result = TuiRemoteConfig{
         .mode = if (cfg.remote.enabled) .remote else .local,
@@ -154,6 +169,9 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
     // local mode so the TUI launches instead of binding protocol I/O to the
     // TUI's own stdio or aborting on an unsupported backend.
     if (result.transport == .stdio or result.transport == .websocket) {
+        result.mode = .local;
+    }
+    if (result.transport == .sse and !isValidSavedSseEndpoint(result.endpoint)) {
         result.mode = .local;
     }
 
@@ -4104,6 +4122,47 @@ test "remoteConfigFromConfig falls back to local for invalid transport" {
     var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
     defer rc.deinit(std.testing.allocator);
     try std.testing.expectEqual(TuiRemoteTransport.stdio, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig keeps valid saved sse remote" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.remote, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for saved sse without endpoint" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for invalid saved sse endpoint" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost/events extra");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
     try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
 }
 
