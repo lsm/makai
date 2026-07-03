@@ -1963,7 +1963,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (indices[0..len], 0..) |idx, i| {
             if (i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width, state.timestamp_display);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2066,7 +2066,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
             if (rel_i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
+            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20), app.state.timestamp_display);
             defer ctx.allocator.free(rendered);
             try writer.writeAll(rendered);
         }

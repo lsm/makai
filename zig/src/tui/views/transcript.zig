@@ -80,7 +80,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const AppState, options: Opt
     return padTopToHeight(allocator, composed, options.height);
 }
 
-pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize) ![]u8 {
+pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const TranscriptEntry, width: usize, ts_mode: TimestampDisplay) ![]u8 {
     var display = DisplayEntry{
         .kind = entry.kind,
         .text = entry.text.items,
@@ -88,7 +88,7 @@ pub fn renderTranscriptEntry(allocator: std.mem.Allocator, entry: *const Transcr
         .tool_name = if (entry.kind == .tool) inferredToolName(entry.text.items) else "",
         .title = if (entry.kind == .tool) inferredToolTitle(entry.text.items) else "",
     };
-    return renderEntry(allocator, &display, width, .clock);
+    return renderEntry(allocator, &display, width, ts_mode);
 }
 
 fn buildVisibleEntries(allocator: std.mem.Allocator, arena: std.mem.Allocator, state: *const AppState, entries: *std.ArrayList(DisplayEntry)) !void {
@@ -916,6 +916,20 @@ test "transcript timestamp hidden in off mode" {
     defer std.testing.allocator.free(text);
 
     try std.testing.expect(std.mem.indexOf(u8, text, "01:02") == null);
+}
+
+test "single entry helper honors timestamp display mode" {
+    var entry = try TranscriptEntry.init(std.testing.allocator, .assistant, "hello");
+    defer entry.deinit(std.testing.allocator);
+    entry.timestamp_ms = 1779978720 * 1000;
+
+    const full = try renderTranscriptEntry(std.testing.allocator, &entry, 80, .full);
+    defer std.testing.allocator.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "2026-05-28 14:32:00") != null);
+
+    const off = try renderTranscriptEntry(std.testing.allocator, &entry, 80, .off);
+    defer std.testing.allocator.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "14:32") == null);
 }
 
 test "transcript full timestamp drops year on narrow terminals" {
