@@ -2363,10 +2363,11 @@ fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store
     return a.last_active > b.last_active;
 }
 
-/// Build the default export filename, e.g. "transcript-20260615-120000.md".
+/// Build the default export filename, e.g. "transcript-20260615-120000-123.md".
 fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
     const millis = compat.time.nowMillis();
     const secs: i64 = @divFloor(millis, 1000);
+    const ms: i64 = @mod(millis, 1000);
     const epoch = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(secs, 0))) };
     const day = epoch.getEpochDay();
     const year_day = day.calculateYearDay();
@@ -2374,7 +2375,7 @@ fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
     const day_secs = epoch.getDaySeconds();
     return std.fmt.allocPrint(
         allocator,
-        "transcript-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.md",
+        "transcript-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}.md",
         .{
             year_day.year,
             month_day.month.numeric(),
@@ -2382,6 +2383,7 @@ fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
             day_secs.getHoursIntoDay(),
             day_secs.getMinutesIntoHour(),
             day_secs.getSecondsIntoMinute(),
+            ms,
         },
     );
 }
