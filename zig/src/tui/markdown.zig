@@ -47,18 +47,24 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
-        // 2. Block math `$$...$$`. Checked before inline `$` so the leading
+        // 2. Inline code spans must stay raw. Protect them before math checks
+        //    so snippets like `echo $x$` remain copyable.
+        if (source[i] == '`') {
+            if (try consumeInlineCode(writer, source, &i)) continue;
+        }
+
+        // 3. Block math `$$...$$`. Checked before inline `$` so the leading
         //    `$$` isn't mis-parsed as two adjacent single-dollar spans.
         if (i + 1 < source.len and source[i] == '$' and source[i + 1] == '$') {
             if (try consumeBlockMath(allocator, writer, source, &i)) continue;
         }
 
-        // 3. Inline math `$...$`.
+        // 4. Inline math `$...$`.
         if (source[i] == '$') {
             if (try consumeInlineMath(writer, source, &i)) continue;
         }
 
-        // 4. Plain byte.
+        // 5. Plain byte.
         try writer.writeByte(source[i]);
         i += 1;
     }
@@ -69,6 +75,18 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 fn isAtLineStart(source: []const u8, i: usize) bool {
     if (i == 0) return true;
     return source[i - 1] == '\n';
+}
+
+/// Consume a single-backtick inline code span verbatim. Returns false for
+/// triple-backtick fences (handled by consumeFenceBlock) and unterminated
+/// spans so the default byte path preserves source.
+fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    const start = i.*;
+    if (start + 2 < source.len and source[start + 1] == '`' and source[start + 2] == '`') return false;
+    const close = std.mem.indexOfScalarPos(u8, source, start + 1, '`') orelse return false;
+    try writer.writeAll(source[start .. close + 1]);
+    i.* = close + 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +286,6 @@ fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source
     const open = i.*;
     // Reject `$$$` — ambiguous with inline math like `$$$x$$`.
     if (open + 2 < source.len and source[open + 2] == '$') return false;
-    // Reject `$$<digit>` — currency like "$$5" is not block math.
-    if (open + 2 < source.len and std.ascii.isDigit(source[open + 2])) return false;
-
     const body_start = open + 2;
     const close = std.mem.indexOfPos(u8, source, body_start, "$$") orelse {
         // Unterminated — let the caller emit `$$` verbatim via the default
@@ -309,39 +324,37 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// advances `*i` past the closing `$` on success. Returns false (leaving
 /// `*i` unmodified) when the bytes don't form a real inline-math span.
 ///
-/// Common currency patterns are explicitly rejected by the open/close guards
-/// so they pass through verbatim:
-/// - `$5` — opening `$` followed by a digit.
-/// - `5$` — opening `$` preceded by a non-space char.
-/// - `$5-$10`, `$5/$10` — the second `$` is preceded or followed by a digit.
+/// Common non-math dollar patterns are explicitly rejected by the
+/// open/close guards so they pass through verbatim:
+/// - `5$` — opening `$` preceded by a digit.
+/// - `$5-$10`, `$5/$10` — the closer is followed by a digit.
+/// - `$HOME/$PATH` — the closer is followed by an identifier char.
+/// Digit-led formulas such as `$2^n$` still render because the closer is not
+/// identifier/digit-adjacent.
 fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
 
-    // Opening `$` must be preceded by whitespace, start-of-text, or an
-    // opening bracket — anything else (e.g. `5$`) is currency.
-    if (open > 0) {
-        const prev = source[open - 1];
-        if (prev != ' ' and prev != '\t' and prev != '\n' and prev != '(' and prev != '[') return false;
-    }
-    // Body must start with a non-space, non-`$`, non-digit char. Digit
-    // adjacency (`$5`) indicates currency, not math.
+    // Opening `$` immediately after a digit is a price suffix, not math
+    // (`5$`). Other punctuation/operators like `=` or `:` are allowed so
+    // common forms such as `f(x)=$x^2$` and `value:$v$` render.
+    if (open > 0 and std.ascii.isDigit(source[open - 1])) return false;
+    // Body must start with a non-space and non-`$` char.
     if (open + 1 >= source.len) return false;
     {
         const next = source[open + 1];
-        if (next == ' ' or next == '$' or std.ascii.isDigit(next)) return false;
+        if (next == ' ' or next == '$') return false;
     }
 
     const body_start = open + 1;
     const close = std.mem.indexOfScalarPos(u8, source, body_start, '$') orelse return false;
 
-    // Closing `$` must not be preceded by whitespace, must not be followed
-    // by another `$`, and must not be followed by a digit (the second `$`
-    // in `$5-$10` is currency). Preceded-by-digit is fine — `$x^2$` is real
-    // math where the closer abuts a superscript digit.
+    // Closing `$` must not be preceded by whitespace, followed by another
+    // `$`, followed by a digit (currency ranges), or followed by an
+    // identifier char (adjacent shell vars like `$HOME/$PATH`).
     if (source[close - 1] == ' ') return false;
     if (close + 1 < source.len) {
         const after = source[close + 1];
-        if (after == '$' or std.ascii.isDigit(after)) return false;
+        if (after == '$' or std.ascii.isDigit(after) or isIdentifierChar(after)) return false;
     }
 
     const body = source[body_start..close];
@@ -519,6 +532,10 @@ fn writeScript(writer: *std.Io.Writer, body: []const u8, i: *usize) !void {
 
 fn isScriptTokenChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '+' or c == '-' or c == '=' or c == '(' or c == ')';
+}
+
+fn isIdentifierChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 /// Render `\frac{A}{B}` as `(A)/(B)`. Returns the new cursor position past
@@ -935,6 +952,15 @@ test "block math on same line renders as blockquote" {
     try std.testing.expect(std.mem.indexOf(u8, out, "$$") == null);
 }
 
+test "numeric display math renders as blockquote" {
+    const src = "$$2^n$$\n$$100\\%$$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> 2ⁿ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> 100\\%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$$") == null);
+}
+
 test "multi-line block math collapses to quoted lines" {
     const src = "$$\n\\sum_{i=1}^n x_i\n$$";
     const out = try preprocess(std.testing.allocator, src);
@@ -969,6 +995,39 @@ test "currency slash range preserves both dollar signs" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
+}
+
+test "inline math after operators renders" {
+    const src = "f(x)=$x^2$ and value:$v$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "f(x)=x²") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "value:v") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$x^2$") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$v$") == null);
+}
+
+test "inline math starting with digits renders" {
+    const src = "count $2^n$ and percent $100\\%$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2ⁿ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "100\\%") != null);
+}
+
+test "adjacent shell variables are not parsed as math" {
+    const src = "use $HOME/$PATH and $FOO-$BAR";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "inline code span is not parsed as math" {
+    const src = "Use `echo $x$` then $\\alpha$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`echo $x$`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
 }
 
 test "unterminated block math passes through verbatim per doc" {
