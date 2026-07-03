@@ -435,7 +435,7 @@ pub const App = struct {
         for (metas.items) |meta| {
             const label = try formatSessionLabel(self.allocator, meta);
             defer self.allocator.free(label);
-            try self.state.addSession(meta.session_id, label);
+            try self.state.addSessionWithDetails(meta.session_id, label, meta.model, meta.provider);
         }
     }
 
@@ -443,11 +443,9 @@ pub const App = struct {
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
         const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
-        const sessions = self.state.sessions.items;
-        if (sessions.len == 0) return;
-        const idx = self.state.session_index;
-        if (idx >= sessions.len) return;
-        const id = sessions[idx].id;
+        self.state.clampSessionSelectionToFilter();
+        const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        const id = selected.id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
@@ -1122,6 +1120,7 @@ pub const App = struct {
                 try self.loadSessions();
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
+                self.state.session_filter.clear();
                 self.state.mode = .session_picker;
             },
             .open_model_picker => self.openModelPicker(),
@@ -1634,16 +1633,19 @@ pub const TuiModel = struct {
                         return .none;
                     }
                 }
-                // Session picker navigation (T10).
+                // Session picker navigation and filtering.
                 if (app.state.mode == .session_picker) {
                     switch (key.key) {
                         .up => moveSessionSelection(app, -1),
                         .down => moveSessionSelection(app, 1),
-                        .char => |c| switch (c) {
-                            'k' => moveSessionSelection(app, -1),
-                            'j' => moveSessionSelection(app, 1),
-                            else => {},
-                        },
+                        .backspace => updateSessionFilter(app, .backspace, null),
+                        .delete => updateSessionFilter(app, .delete, null),
+                        .char => |c| updateSessionFilter(app, .char, c),
+                        .space => updateSessionFilter(app, .char, ' '),
+                        .left => _ = app.state.session_filter.moveCursorPrev(),
+                        .right => _ = app.state.session_filter.moveCursorNext(),
+                        .home => app.state.session_filter.moveCursorHome(),
+                        .end => app.state.session_filter.moveCursorEnd(),
                         .enter => {
                             app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
                         },
@@ -2104,6 +2106,34 @@ pub const TuiModel = struct {
         try term.flush();
     }
 
+    const SessionFilterEdit = enum { backspace, delete, char };
+
+    fn updateSessionFilter(app: *App, edit: SessionFilterEdit, c: ?u21) void {
+        const selected_raw_index = app.state.sessionRawIndexAtFilteredIndex(app.state.session_index);
+        switch (edit) {
+            .backspace => _ = app.state.session_filter.deleteBeforeCursor(),
+            .delete => _ = app.state.session_filter.deleteAfterCursor(),
+            .char => {
+                var buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(c.?, &buf) catch return;
+                app.state.session_filter.insertSlice(app.allocator, buf[0..len]) catch |err| {
+                    app.recordError(@errorName(err)) catch {};
+                    return;
+                };
+            },
+        }
+        if (selected_raw_index) |raw_index| {
+            if (app.state.sessionFilteredIndexForRawIndex(raw_index)) |filtered_index| {
+                app.state.session_index = filtered_index;
+            } else {
+                app.state.clampSessionSelectionToFilter();
+            }
+        } else {
+            app.state.clampSessionSelectionToFilter();
+        }
+        ensureSessionSelectionVisible(app);
+    }
+
     fn handleMouse(app: *App, mouse: zz.MouseEvent) void {
         if (mouse.event_type != .press) return;
         switch (mouse.button) {
@@ -2156,7 +2186,7 @@ pub const TuiModel = struct {
     }
 
     fn moveSessionSelection(app: *App, delta: isize) void {
-        const n = app.state.sessions.items.len;
+        const n = app.state.filteredSessionCount();
         if (n == 0) {
             app.state.session_index = 0;
             app.state.session_scroll = 0;
@@ -2171,6 +2201,7 @@ pub const TuiModel = struct {
     }
 
     fn ensureSessionSelectionVisible(app: *App) void {
+        app.state.clampSessionSelectionToFilter();
         const height = sessionPickerHeight(app);
         if (app.state.session_index < app.state.session_scroll) {
             app.state.session_scroll = app.state.session_index;
@@ -2180,7 +2211,7 @@ pub const TuiModel = struct {
     }
 
     fn visibleSessionCount(app: *const App) usize {
-        return @min(app.state.sessions.items.len -| app.state.session_scroll, sessionPickerHeight(app));
+        return @min(app.state.filteredSessionCount() -| app.state.session_scroll, sessionPickerHeight(app));
     }
 
     fn sessionPickerHeight(app: *const App) usize {
@@ -3270,6 +3301,43 @@ test "session picker navigation pages through hidden rows" {
     try std.testing.expectEqual(@as(usize, 4), app.state.session_index);
     try std.testing.expectEqual(@as(usize, 1), app.state.session_scroll);
     try std.testing.expectEqual(@as(usize, 4), TuiModel.visibleSessionCount(&app));
+}
+
+test "session picker typing filters without moving navigation" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
+    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'g' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'p' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 't' } } }, undefined);
+
+    try std.testing.expectEqualStrings("gpt", model.app.?.state.sessionFilterText());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.filteredSessionCount());
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessionRawIndexAtFilteredIndex(0).?);
+
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    try std.testing.expectEqualStrings("gp", model.app.?.state.sessionFilterText());
+}
+
+test "session picker keeps selected session when still matched after filter" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    try app.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
+    try app.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+    try app.state.addSessionWithDetails("s3", "Gamma", "gpt-4.1", "openai");
+    app.state.session_index = 2;
+
+    TuiModel.updateSessionFilter(&app, .char, 'g');
+    TuiModel.updateSessionFilter(&app, .char, 'p');
+    TuiModel.updateSessionFilter(&app, .char, 't');
+
+    try std.testing.expectEqual(@as(usize, 2), app.state.filteredSessionCount());
+    try std.testing.expectEqual(@as(usize, 1), app.state.session_index);
+    try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
 }
 
 fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {

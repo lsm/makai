@@ -315,17 +315,51 @@ pub const PreviewState = struct {
 pub const SessionEntry = struct {
     id: []u8,
     label: []u8,
+    model: []u8 = &.{},
+    provider: []u8 = &.{},
 
     pub fn init(allocator: std.mem.Allocator, id: []const u8, label: []const u8) !SessionEntry {
-        return .{ .id = try allocator.dupe(u8, id), .label = try allocator.dupe(u8, label) };
+        return initWithDetails(allocator, id, label, "", "");
+    }
+
+    pub fn initWithDetails(allocator: std.mem.Allocator, id: []const u8, label: []const u8, model: []const u8, provider: []const u8) !SessionEntry {
+        const owned_id = try allocator.dupe(u8, id);
+        errdefer allocator.free(owned_id);
+        const owned_label = try allocator.dupe(u8, label);
+        errdefer allocator.free(owned_label);
+        const owned_model = try dupOrEmpty(allocator, model);
+        errdefer if (owned_model.len > 0) allocator.free(owned_model);
+        const owned_provider = try dupOrEmpty(allocator, provider);
+        errdefer if (owned_provider.len > 0) allocator.free(owned_provider);
+        return .{
+            .id = owned_id,
+            .label = owned_label,
+            .model = owned_model,
+            .provider = owned_provider,
+        };
+    }
+
+    pub fn matchesQuery(self: SessionEntry, query: []const u8) bool {
+        if (query.len == 0) return true;
+        return std.ascii.indexOfIgnoreCase(self.label, query) != null or
+            std.ascii.indexOfIgnoreCase(self.id, query) != null or
+            std.ascii.indexOfIgnoreCase(self.model, query) != null or
+            std.ascii.indexOfIgnoreCase(self.provider, query) != null;
     }
 
     pub fn deinit(self: *SessionEntry, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
         allocator.free(self.label);
+        if (self.model.len > 0) allocator.free(self.model);
+        if (self.provider.len > 0) allocator.free(self.provider);
         self.* = undefined;
     }
 };
+
+fn dupOrEmpty(allocator: std.mem.Allocator, value: []const u8) ![]u8 {
+    if (value.len == 0) return &.{};
+    return allocator.dupe(u8, value);
+}
 
 pub const ComposerState = struct {
     buffer: std.ArrayList(u8) = .empty,
@@ -371,6 +405,16 @@ pub const ComposerState = struct {
         std.mem.copyForwards(u8, self.buffer.items[start..], self.buffer.items[self.cursor..]);
         self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
         self.cursor = start;
+        return true;
+    }
+
+    pub fn deleteAfterCursor(self: *ComposerState) bool {
+        self.normalizeCursor();
+        if (self.cursor >= self.buffer.items.len) return false;
+        const end = nextCodepointEnd(self.buffer.items, self.cursor);
+        const removed = end - self.cursor;
+        std.mem.copyForwards(u8, self.buffer.items[self.cursor..], self.buffer.items[end..]);
+        self.buffer.shrinkRetainingCapacity(self.buffer.items.len - removed);
         return true;
     }
 
@@ -448,6 +492,7 @@ pub const AppState = struct {
     tool_scroll: usize = 0,
     session_index: usize = 0,
     session_scroll: usize = 0,
+    session_filter: ComposerState = .{},
     menu_index: usize = 0,
     menu_scroll: usize = 0,
     active_user_entry: ?usize = null,
@@ -473,6 +518,7 @@ pub const AppState = struct {
         self.tools.deinit(self.allocator);
         for (self.sessions.items) |*session| session.deinit(self.allocator);
         self.sessions.deinit(self.allocator);
+        self.session_filter.deinit(self.allocator);
         self.composer.deinit(self.allocator);
         self.approval.deinit(self.allocator);
         self.clearQueuedPreviews();
@@ -817,7 +863,62 @@ pub const AppState = struct {
     }
 
     pub fn addSession(self: *AppState, id: []const u8, label: []const u8) !void {
-        try self.sessions.append(self.allocator, try SessionEntry.init(self.allocator, id, label));
+        try self.addSessionWithDetails(id, label, "", "");
+    }
+
+    pub fn addSessionWithDetails(self: *AppState, id: []const u8, label: []const u8, model: []const u8, provider: []const u8) !void {
+        try self.sessions.append(self.allocator, try SessionEntry.initWithDetails(self.allocator, id, label, model, provider));
+    }
+
+    pub fn sessionFilterText(self: *const AppState) []const u8 {
+        return self.session_filter.text();
+    }
+
+    pub fn filteredSessionCount(self: *const AppState) usize {
+        const query = self.sessionFilterText();
+        var count: usize = 0;
+        for (self.sessions.items) |session| {
+            if (session.matchesQuery(query)) count += 1;
+        }
+        return count;
+    }
+
+    pub fn sessionRawIndexAtFilteredIndex(self: *const AppState, filtered_index: usize) ?usize {
+        const query = self.sessionFilterText();
+        var matched: usize = 0;
+        for (self.sessions.items, 0..) |session, raw_index| {
+            if (!session.matchesQuery(query)) continue;
+            if (matched == filtered_index) return raw_index;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn sessionFilteredIndexForRawIndex(self: *const AppState, target_raw_index: usize) ?usize {
+        const query = self.sessionFilterText();
+        var matched: usize = 0;
+        for (self.sessions.items, 0..) |session, raw_index| {
+            if (!session.matchesQuery(query)) continue;
+            if (raw_index == target_raw_index) return matched;
+            matched += 1;
+        }
+        return null;
+    }
+
+    pub fn sessionAtFilteredIndex(self: *const AppState, filtered_index: usize) ?*const SessionEntry {
+        const raw_index = self.sessionRawIndexAtFilteredIndex(filtered_index) orelse return null;
+        return &self.sessions.items[raw_index];
+    }
+
+    pub fn clampSessionSelectionToFilter(self: *AppState) void {
+        const count = self.filteredSessionCount();
+        if (count == 0) {
+            self.session_index = 0;
+            self.session_scroll = 0;
+            return;
+        }
+        if (self.session_index >= count) self.session_index = count - 1;
+        if (self.session_scroll > self.session_index) self.session_scroll = self.session_index;
     }
 
     fn setHashlinePreview(self: *AppState, args_json: []const u8) !void {
