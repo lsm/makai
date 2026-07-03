@@ -528,6 +528,10 @@ pub const App = struct {
 
         try store.delete(id);
         if (std.mem.eql(u8, self.session_id, id)) {
+            if (self.session_id.len > 0) self.allocator.free(self.session_id);
+            self.session_id = &.{};
+            self.session_created_at = 0;
+            try self.state.status.setSessionId(self.allocator, "");
             if (self.session) |*session| {
                 session.cancel();
                 session.clearQueuedMessages();
@@ -537,12 +541,9 @@ pub const App = struct {
             self.state.resetReplayState();
             self.state.clearQueuedPreviews();
             self.inline_history_flushed = 0;
-            if (self.session_id.len > 0) self.allocator.free(self.session_id);
-            self.session_id = &.{};
-            self.session_created_at = 0;
-            try self.state.status.setSessionId(self.allocator, "");
         }
 
+        try store.delete(id);
         try self.loadSessions();
         self.state.session_delete_confirm = false;
         if (self.state.sessions.items.len == 0) {
@@ -3714,6 +3715,8 @@ test "session picker keeps selected session when still matched after filter" {
     try std.testing.expectEqual(@as(usize, 2), app.state.filteredSessionCount());
     try std.testing.expectEqual(@as(usize, 1), app.state.session_index);
     try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
+}
+
 fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
     errdefer allocator.free(base);
