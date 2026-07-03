@@ -519,11 +519,9 @@ pub const App = struct {
 
     pub fn deleteSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        const sessions = self.state.sessions.items;
-        if (sessions.len == 0) return;
-        const idx = self.state.session_index;
-        if (idx >= sessions.len) return;
-        const id = try self.allocator.dupe(u8, sessions[idx].id);
+        self.state.clampSessionSelectionToFilter();
+        const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        const id = try self.allocator.dupe(u8, selected.id);
         defer self.allocator.free(id);
 
         try store.delete(id);
@@ -3786,6 +3784,33 @@ test "session picker confirm deletes selected session and clamps selection" {
     try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessions.items.len);
     try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
     try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
+}
+
+test "session picker delete respects active filter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try saveTestSession(model.app.?.store.?, "s2", 2);
+    try saveTestSession(model.app.?.store.?, "s3", 3);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.session_filter.insertSlice(std.testing.allocator, "s1");
+    model.app.?.state.clampSessionSelectionToFilter();
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .enter } }, undefined);
+
+    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
+    var s2 = try model.app.?.store.?.load("s2");
+    s2.deinit(std.testing.allocator);
+    var s3 = try model.app.?.store.?.load("s3");
+    s3.deinit(std.testing.allocator);
 }
 
 test "deleting current session clears active session id" {
