@@ -1062,10 +1062,12 @@ pub const TuiRuntime = struct {
     }
 
     fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
-        // Terminal events use the same preserve-newest path; they must not be
-        // dropped just because the projection queue is saturated.
+        // Terminal events must not be dropped just because the projection queue
+        // is saturated. After queuing the terminal event, force any warning from
+        // terminal-path evictions into the stream too; there may be no later push
+        // before the stream completes.
         self.pushDroppingOldestCounted(event);
-        self.flushDroppedWarning();
+        self.flushDroppedWarningDroppingOldest();
     }
 
     fn pushDroppingOldestCounted(self: *TuiRuntime, event: TuiEvent) void {
@@ -1119,6 +1121,41 @@ pub const TuiRuntime = struct {
             return;
         };
         self.dropped_since_warning = 0;
+    }
+
+    fn flushDroppedWarningDroppingOldest(self: *TuiRuntime) void {
+        while (true) {
+            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            const count = self.dropped_since_warning;
+            self.backpressure_mutex.unlock();
+            if (count == 0) return;
+
+            const message = std.fmt.allocPrint(self.allocator, "Warning: {d} event{s} dropped due to backpressure", .{
+                count,
+                if (count == 1) "" else "s",
+            }) catch return;
+            const warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+            if (self.pushUncounted(warning)) {
+                while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+                self.dropped_since_warning -|= count;
+                self.backpressure_mutex.unlock();
+                return;
+            }
+            var mutable = warning;
+            mutable.deinit(self.allocator);
+
+            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.event_stream.poll()) |dropped| {
+                self.dropped_event_count += 1;
+                self.dropped_since_warning += 1;
+                self.backpressure_active.store(true, .release);
+                var dropped_mutable = dropped;
+                dropped_mutable.deinit(self.allocator);
+            } else {
+                std.Thread.yield() catch {};
+            }
+            self.backpressure_mutex.unlock();
+        }
     }
 
     fn dupeOwned(self: *TuiRuntime, value: []const u8) !OwnedSlice(u8) {
@@ -3224,7 +3261,7 @@ test "event stream resets between turns" {
 }
 
 test "terminal events survive full TUI queue" {
-    var mock = MockProtocolCtx{ .flood_count = 300 };
+    var mock = MockProtocolCtx{ .flood_count = TuiEventStream.usable_capacity + 45 };
     const models = [_]ai_types.Model{test_model_a};
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
     defer runtime.deinit();
@@ -3240,10 +3277,7 @@ test "terminal events survive full TUI queue" {
         defer ev.deinit(std.testing.allocator);
         switch (ev) {
             .turn_end => saw_turn_end = true,
-            .agent_end => {
-                saw_agent_end = true;
-                break;
-            },
+            .agent_end => saw_agent_end = true,
             else => {},
         }
     }
@@ -5091,6 +5125,32 @@ test "remote runtime integrates with in-process agent protocol server" {
         if (ev == .turn_start) return;
     }
     return error.NoRemoteEvent;
+}
+
+test "TuiRuntime terminal event emits warning after terminal eviction" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+
+    for (0..TuiEventStream.usable_capacity) |_| {
+        runtime.push(.turn_start);
+    }
+    try std.testing.expect(runtime.event_stream.isFull());
+
+    runtime.pushTerminal(.{ .agent_end = .{ .reason = .completed } });
+
+    var saw_agent_end = false;
+    var saw_warning = false;
+    while (runtime.event_stream.poll()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .agent_end => saw_agent_end = true,
+            .system_warning => saw_warning = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_agent_end);
+    try std.testing.expect(saw_warning);
 }
 
 test "TuiRuntime counts dropped events and emits warning" {

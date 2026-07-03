@@ -1035,6 +1035,18 @@ test "transcript chat mode consolidates thinking and tool details" {
     try std.testing.expect(std.mem.indexOf(u8, text, "shell_execute") == null);
 }
 
+test "transcript chat mode renders backpressure warning" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    state.transcript_mode = .chat;
+    try state.appendTranscript(.@"error", "Warning: 2 events dropped due to backpressure");
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 100, .height = 20 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Warning: 2 events dropped due to backpressure") != null);
+}
+
 test "transcript balanced mode collapses tool events into intent row without card" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();

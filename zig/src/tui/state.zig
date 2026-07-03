@@ -849,7 +849,7 @@ pub const AppState = struct {
             },
             .context_usage => |payload| self.applyContextUsage(payload),
             .prompt_segment_usage => |payload| self.applyPromptSegmentUsage(payload),
-            .system_warning => |payload| try self.appendTranscript(.system, payload.message.slice()),
+            .system_warning => |payload| try self.appendTranscript(.@"error", payload.message.slice()),
             .backpressure_status => |payload| {
                 self.backpressure_active = payload.active;
                 self.dropped_event_count = payload.dropped_count;
@@ -2466,7 +2466,7 @@ test "AppState stream_aborted ignores stale lifecycle events" {
     try std.testing.expect(!state.stream_aborted);
 }
 
-test "AppState surfaces system_warning as transcript entry" {
+test "AppState surfaces system_warning as visible warning transcript entry" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
@@ -2475,7 +2475,7 @@ test "AppState surfaces system_warning as transcript entry" {
     try state.applyEvent(warning);
 
     try std.testing.expectEqual(@as(usize, 1), state.transcript.items.len);
-    try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[0].kind);
+    try std.testing.expectEqual(TranscriptKind.@"error", state.transcript.items[0].kind);
     try std.testing.expectEqualStrings("Warning: 5 events dropped due to backpressure", state.transcript.items[0].text.items);
 }
 
