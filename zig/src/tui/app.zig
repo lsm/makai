@@ -1279,9 +1279,9 @@ pub const App = struct {
             const provider = if (self.state.status.provider.len > 0) self.state.status.provider else "local";
             const cwd = if (self.working_dir.len > 0) self.working_dir else ".";
             const tips = if (self.steeringAvailable())
-                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands"
+                "Enter submit • Enter while streaming steers • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • Ctrl+D timestamp • /help commands"
             else
-                "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • /help commands";
+                "Enter submit • Alt+Enter queues follow-up • /sessions resumes • Ctrl+G editor • Shift+Tab thinking level • Ctrl+Y copy reply • Ctrl+D timestamp • /help commands";
             const welcome = try std.fmt.allocPrint(self.allocator,
                 \\Makai TUI
                 \\model: {s}/{s}
@@ -1583,6 +1583,12 @@ pub const TuiModel = struct {
                         'y' => {
                             if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
                             app.flushClipboard(ctx);
+                            return .none;
+                        },
+                        'd' => {
+                            // Issue #137: cycle time → date+time → off for
+                            // transcript message timestamps.
+                            _ = app.state.cycleTimestampDisplay();
                             return .none;
                         },
                         'p' => {
@@ -1957,7 +1963,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (indices[0..len], 0..) |idx, i| {
             if (i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width);
+            const rendered = try transcript_view.renderTranscriptEntry(allocator, &state.transcript.items[idx], width, state.timestamp_display);
             defer allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2060,7 +2066,7 @@ pub const TuiModel = struct {
         const writer = &out.writer;
         for (app.state.transcript.items[app.inline_history_flushed..stop], 0..) |*entry, rel_i| {
             if (rel_i > 0) try writer.writeAll("\n\n");
-            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20));
+            const rendered = try transcript_view.renderTranscriptEntry(ctx.allocator, entry, @max(ctx.width, 20), app.state.timestamp_display);
             defer ctx.allocator.free(rendered);
             try writer.writeAll(rendered);
         }
@@ -2950,6 +2956,16 @@ test "TuiModel Shift Tab cycles thinking level" {
     const cmd = model.update(.{ .key = .{ .key = .tab, .modifiers = .{ .shift = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(ai_types.ThinkingLevel.medium, model.app.?.state.thinking_level);
+}
+
+test "TuiModel Ctrl D cycles timestamp display" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+
+    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
+    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expectEqual(tui_state.TimestampDisplay.full, model.app.?.state.timestamp_display);
 }
 
 test "setting pickers apply selected values" {

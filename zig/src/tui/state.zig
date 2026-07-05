@@ -42,6 +42,31 @@ pub const TranscriptVisibilityMode = enum {
     }
 };
 
+/// How (or whether) message timestamps appear in the transcript header.
+/// Off hides the clock entirely; clock renders `HH:MM`; full renders the
+/// date alongside the time, scaling down on narrow terminals.
+pub const TimestampDisplay = enum {
+    off,
+    clock,
+    full,
+
+    pub fn next(self: TimestampDisplay) TimestampDisplay {
+        return switch (self) {
+            .off => .clock,
+            .clock => .full,
+            .full => .off,
+        };
+    }
+
+    pub fn label(self: TimestampDisplay) []const u8 {
+        return switch (self) {
+            .off => "off",
+            .clock => "time",
+            .full => "date+time",
+        };
+    }
+};
+
 pub const ToolStatus = enum {
     pending,
     running,
@@ -482,6 +507,9 @@ pub const AppState = struct {
     preview: PreviewState = .{},
     transcript_mode: TranscriptVisibilityMode = .balanced,
     show_thinking: bool = true,
+    /// Controls whether message timestamps render in the transcript header
+    /// (off / time / date+time). Default matches the original `HH:MM` behavior.
+    timestamp_display: TimestampDisplay = .clock,
     thinking_level: ai_types.ThinkingLevel = .low,
     login_input_secret: bool = false,
     /// Monotonic animation counter bumped once per UI tick (~50ms). Views derive
@@ -696,6 +724,11 @@ pub const AppState = struct {
             .xhigh => .off,
         };
         return self.thinking_level;
+    }
+
+    pub fn cycleTimestampDisplay(self: *AppState) TimestampDisplay {
+        self.timestamp_display = self.timestamp_display.next();
+        return self.timestamp_display;
     }
 
     pub fn setQueuedCounts(self: *AppState, counts: tui_runtime.QueuedCounts) void {
@@ -2139,6 +2172,15 @@ test "AppState cycles thinking levels for TUI shortcut" {
     try std.testing.expectEqual(ai_types.ThinkingLevel.xhigh, state.cycleThinkingLevel());
     try std.testing.expectEqual(ai_types.ThinkingLevel.off, state.cycleThinkingLevel());
     try std.testing.expectEqual(ai_types.ThinkingLevel.low, state.cycleThinkingLevel());
+}
+
+test "AppState cycles timestamp display modes" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try std.testing.expectEqual(TimestampDisplay.clock, state.timestamp_display);
+    try std.testing.expectEqual(TimestampDisplay.full, state.cycleTimestampDisplay());
+    try std.testing.expectEqual(TimestampDisplay.off, state.cycleTimestampDisplay());
+    try std.testing.expectEqual(TimestampDisplay.clock, state.cycleTimestampDisplay());
 }
 
 test "AppState reset replay clears stale queue counts" {
