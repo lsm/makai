@@ -491,18 +491,33 @@ test "e2e: /export picker saves transcript to default file" {
     try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
     try std.testing.expect(d.frameContains("exported transcript to transcript-"));
 
-    var found = false;
-    var dir = try std.Io.Dir.openDir(.cwd(), std.testing.io, ".", .{ .iterate = true });
-    defer dir.close(std.testing.io);
-    var it = dir.iterate();
-    while (try it.next(std.testing.io)) |entry| {
-        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "transcript-") and std.mem.endsWith(u8, entry.name, ".md")) {
-            found = true;
-            try std.Io.Dir.deleteFile(.cwd(), std.testing.io, entry.name);
-            break;
+    const path = exportedTranscriptPath(d.app()) orelse return error.MissingExportPath;
+    try std.testing.expect(std.mem.startsWith(u8, path, "transcript-"));
+    try std.testing.expect(std.mem.endsWith(u8, path, ".md"));
+
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## User\n\n> question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Assistant\n\nanswer") != null);
+
+    try std.Io.Dir.deleteFile(.cwd(), std.testing.io, path);
+}
+
+/// Returns the path from the most recent system transcript entry that reports a
+/// successful transcript export (e.g. "exported transcript to <path>").
+fn exportedTranscriptPath(app: *App) ?[]const u8 {
+    const prefix = "exported transcript to ";
+    var i = app.state.transcript.items.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = app.state.transcript.items[i];
+        if (entry.kind != .system) continue;
+        const text = entry.text.items;
+        if (std.mem.startsWith(u8, text, prefix)) {
+            return text[prefix.len..];
         }
     }
-    try std.testing.expect(found);
+    return null;
 }
 
 test "e2e: /export writes explicit file and reports file errors" {
