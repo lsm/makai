@@ -20,6 +20,7 @@ const local_tools = @import("tools/registry");
 const tool_local_runtime = @import("tool_local_runtime");
 const permission = @import("permission");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
+const tui_config = @import("tui_config");
 
 pub const TuiSession = session.TuiSession;
 pub const TuiEvent = session.TuiEvent;
@@ -101,8 +102,121 @@ pub const TuiRemoteConfig = struct {
     mode: TuiBackendMode = .local,
     transport: TuiRemoteTransport = .stdio,
     endpoint: []const u8 = "",
+    command: []const u8 = "",
+    auth_token: []const u8 = "",
     auth_headers: []const ai_types.HeaderPair = &.{},
+
+    pub fn deinit(self: *TuiRemoteConfig, allocator: std.mem.Allocator) void {
+        if (self.endpoint.len > 0) allocator.free(self.endpoint);
+        if (self.command.len > 0) allocator.free(self.command);
+        if (self.auth_token.len > 0) allocator.free(self.auth_token);
+        for (self.auth_headers) |header| {
+            var h = header;
+            h.deinit(allocator);
+        }
+        if (self.auth_headers.len > 0) allocator.free(self.auth_headers);
+        self.* = .{};
+    }
 };
+
+pub fn parseRemoteTransport(value: []const u8) ?TuiRemoteTransport {
+    if (std.mem.eql(u8, value, "stdio")) return .stdio;
+    if (std.mem.eql(u8, value, "sse")) return .sse;
+    if (std.mem.eql(u8, value, "ws")) return .websocket;
+    if (std.mem.eql(u8, value, "websocket")) return .websocket;
+    return null;
+}
+
+fn hasWhitespaceOrControl(value: []const u8) bool {
+    for (value) |ch| {
+        if (std.ascii.isWhitespace(ch) or ch < 0x20 or ch == 0x7f) return true;
+    }
+    return false;
+}
+
+fn hasCrLf(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") != null;
+}
+
+fn isTchar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn isValidHeaderName(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| if (!isTchar(ch)) return false;
+    return true;
+}
+
+fn isValidSavedSseEndpoint(endpoint: []const u8) bool {
+    if (endpoint.len == 0) return false;
+    if (hasWhitespaceOrControl(endpoint)) return false;
+    if (std.mem.indexOfScalar(u8, endpoint, '#') != null) return false;
+    const scheme_end = std.mem.indexOf(u8, endpoint, "://") orelse return false;
+    const after_scheme = endpoint[scheme_end + 3 ..];
+    var authority_end: usize = 0;
+    while (authority_end < after_scheme.len and after_scheme[authority_end] != '/' and after_scheme[authority_end] != '?' and after_scheme[authority_end] != '#') : (authority_end += 1) {}
+    if (std.mem.indexOfScalar(u8, after_scheme[0..authority_end], '@') != null) return false;
+    const parsed = sse_transport.parseHttpUrl(endpoint) catch return false;
+    return parsed.scheme == .http;
+}
+
+pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Config) !TuiRemoteConfig {
+    var result = TuiRemoteConfig{
+        .mode = if (cfg.remote.enabled) .remote else .local,
+        .transport = .stdio,
+        .endpoint = if (cfg.remote.endpoint.len > 0) try allocator.dupe(u8, cfg.remote.endpoint) else &.{},
+        .command = if (cfg.remote.command.len > 0) try allocator.dupe(u8, cfg.remote.command) else &.{},
+        .auth_token = if (cfg.remote.auth_token.len > 0) try allocator.dupe(u8, cfg.remote.auth_token) else &.{},
+        .auth_headers = &.{},
+    };
+    errdefer result.deinit(allocator);
+
+    const transport_name = if (cfg.remote.transport.len > 0) cfg.remote.transport else "stdio";
+    if (parseRemoteTransport(transport_name)) |remote_transport| {
+        result.transport = remote_transport;
+    } else {
+        // Invalid hand-edited transport values must not fall back to stdio while
+        // remote remains enabled; that would bind the protocol to the TUI's own
+        // stdin/stdout. Fall back to local mode instead.
+        result.transport = .stdio;
+        result.mode = .local;
+    }
+
+    // Stdio subprocess spawning and WebSocket are not wired up yet. If a
+    // hand-edited/legacy config enables either transport, gracefully fall back to
+    // local mode so the TUI launches instead of binding protocol I/O to the
+    // TUI's own stdio or aborting on an unsupported backend.
+    if (result.transport == .stdio or result.transport == .websocket) {
+        result.mode = .local;
+    }
+    if (result.transport == .sse and !isValidSavedSseEndpoint(result.endpoint)) {
+        result.mode = .local;
+    }
+
+    var headers: std.ArrayList(ai_types.HeaderPair) = .empty;
+    errdefer {
+        for (headers.items) |*header| header.deinit(allocator);
+        headers.deinit(allocator);
+    }
+    if (cfg.remote.auth_token.len > 0 and !hasCrLf(cfg.remote.auth_token)) {
+        const value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{cfg.remote.auth_token});
+        errdefer allocator.free(value);
+        try headers.append(allocator, .{ .name = try allocator.dupe(u8, "Authorization"), .value = value });
+    } else if (cfg.remote.auth_header_value.len > 0 and !hasCrLf(cfg.remote.auth_header_value)) {
+        const name = if (cfg.remote.auth_header_name.len > 0) cfg.remote.auth_header_name else "Authorization";
+        if (isValidHeaderName(name)) {
+            try headers.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, cfg.remote.auth_header_value) });
+        }
+    }
+    if (headers.items.len > 0) {
+        result.auth_headers = try headers.toOwnedSlice(allocator);
+    }
+    return result;
+}
 
 pub const TuiRuntimeOptions = struct {
     backend: TuiBackendMode = .local,
@@ -3995,6 +4109,174 @@ test "remote config rejects unsupported endpoint" {
 
 test "remote config rejects unsupported transport" {
     try std.testing.expectError(error.UnsupportedRemoteTransport, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "ws://localhost:1" } }));
+}
+
+test "remoteConfigFromConfig falls back to local for saved stdio" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.stdio, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for websocket" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "websocket");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "ws://localhost:1");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.websocket, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for invalid transport" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "stido");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.stdio, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig keeps valid saved sse remote" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.remote, rc.mode);
+}
+
+test "remoteConfigFromConfig allows at-sign outside sse authority" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events?user=a@b");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.remote, rc.mode);
+}
+
+test "remoteConfigFromConfig rejects at-sign in saved sse authority" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://token@localhost:8080/events");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for saved sse without endpoint" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig falls back to local for invalid saved sse endpoint" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost/events extra");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
+    try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig drops saved auth token with CRLF" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_token = try std.testing.allocator.dupe(u8, "secret\r\nInjected: yes");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "remoteConfigFromConfig drops invalid saved custom auth header" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_header_name = try std.testing.allocator.dupe(u8, "Bad:Name");
+    cfg.remote.auth_header_value = try std.testing.allocator.dupe(u8, "value");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "remoteConfigFromConfig drops saved custom auth header with CRLF" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_header_name = try std.testing.allocator.dupe(u8, "X-Api-Key");
+    cfg.remote.auth_header_value = try std.testing.allocator.dupe(u8, "value\r\nInjected: yes");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "remoteConfigFromConfig skips empty allocations" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", rc.endpoint);
+    try std.testing.expectEqualStrings("", rc.command);
+    try std.testing.expectEqualStrings("", rc.auth_token);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "default TuiRemoteConfig deinit is safe" {
+    var rc: TuiRemoteConfig = .{};
+    rc.deinit(std.testing.allocator);
 }
 
 test "remote start resets state after pump error" {

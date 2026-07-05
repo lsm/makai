@@ -229,6 +229,7 @@ pub const ProductionRuntime = struct {
     permission_engine: permission.PermissionEngine,
     models: []ai_types.Model,
     initial_model: ?SavedModelRef = null,
+    remote_config: tui_runtime.TuiRemoteConfig = .{},
 
     pub fn init(allocator: std.mem.Allocator) !ProductionRuntime {
         var registry = api_registry.ApiRegistry.init(allocator);
@@ -245,11 +246,40 @@ pub const ProductionRuntime = struct {
         const models = try loadRuntimeModels(allocator);
         errdefer tui_model_catalog.deinitModels(allocator, models);
 
-        var initial_model = loadSavedModelRef(allocator) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => null,
+        var saved_config: ?tui_config.Config = null;
+        var maybe_store: ?tui_config.Store = tui_config.Store.initDefault(allocator) catch |err| switch (err) {
+            error.HomeNotFound => null,
+            else => return err,
         };
+        if (maybe_store) |*store| {
+            defer store.deinit();
+            // A malformed or unreadable config file must not brick TUI startup;
+            // fall back to defaults on non-OOM load errors (matching the
+            // previous saved-model loader behavior).
+            saved_config = store.loadIfExists() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => null,
+            };
+        }
+        errdefer if (saved_config) |*cfg| cfg.deinit(allocator);
+
+        var initial_model: ?SavedModelRef = null;
+        if (saved_config) |cfg| {
+            if (cfg.model.len > 0) {
+                initial_model = SavedModelRef{
+                    .id = try allocator.dupe(u8, cfg.model),
+                    .provider = try allocator.dupe(u8, cfg.provider),
+                    .api = try allocator.dupe(u8, cfg.api),
+                };
+            }
+        }
         errdefer if (initial_model) |*model| model.deinit(allocator);
+
+        var remote_config: tui_runtime.TuiRemoteConfig = .{};
+        if (saved_config) |cfg| {
+            remote_config = try tui_runtime.remoteConfigFromConfig(allocator, cfg);
+        }
+        errdefer remote_config.deinit(allocator);
 
         const runtime = ProductionRuntime{
             .allocator = allocator,
@@ -258,8 +288,12 @@ pub const ProductionRuntime = struct {
             .permission_engine = permission_engine,
             .models = models,
             .initial_model = initial_model,
+            .remote_config = remote_config,
         };
         initial_model = null;
+        remote_config = .{};
+        if (saved_config) |*cfg| cfg.deinit(allocator);
+        saved_config = null;
         return runtime;
     }
 
@@ -280,12 +314,14 @@ pub const ProductionRuntime = struct {
             .workspace_root = self.permission_engine.workspace_root,
             .run_async = true,
             .compact_output = true,
+            .remote_config = self.remote_config,
         };
     }
 
     pub fn deinit(self: *ProductionRuntime) void {
         tui_model_catalog.deinitModels(self.allocator, self.models);
         if (self.initial_model) |*model| model.deinit(self.allocator);
+        self.remote_config.deinit(self.allocator);
         self.permission_engine.deinit();
         self.registry.deinit();
         self.* = undefined;

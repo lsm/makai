@@ -1,7 +1,10 @@
 const std = @import("std");
 const ai_types = @import("ai_types");
+const compat = @import("compat");
 const tui_runtime = @import("tui_runtime");
 const tui_state = @import("tui_state");
+const tui_config = @import("tui_config");
+const sse_transport = @import("transports/sse");
 
 pub const CommandKind = enum {
     help,
@@ -22,6 +25,7 @@ pub const CommandKind = enum {
     diff,
     abort,
     quit,
+    remote,
 };
 
 pub const Command = struct {
@@ -101,6 +105,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
+    .{ .name = "remote", .kind = .remote, .usage = "/remote [stdio|sse <url>|ws <url>|auth <token>|header <name> <value>|off]", .description = "Configure remote transport", .handler = handleRemote },
 };
 
 pub fn parse(input: []const u8) ParseError!Command {
@@ -450,6 +455,175 @@ fn handleQuit(ctx: CommandContext, command: Command) !CommandResult {
     _ = ctx;
     _ = command;
     return .{ .action = .quit };
+}
+
+fn handleRemote(ctx: CommandContext, command: Command) !CommandResult {
+    var store = try tui_config.Store.initDefault(ctx.allocator);
+    defer store.deinit();
+    return try applyRemoteCommand(ctx.allocator, store, command.arg);
+}
+
+fn applyRemoteCommand(allocator: std.mem.Allocator, store: tui_config.Store, arg: ?[]const u8) !CommandResult {
+    var cfg = try store.load();
+    defer cfg.deinit(allocator);
+
+    var restart_notice = false;
+    if (arg) |value| {
+        var iter = std.mem.splitScalar(u8, value, ' ');
+        const sub = iter.first();
+        const rest = std.mem.trim(u8, iter.rest(), " \t");
+
+        if (std.mem.eql(u8, sub, "stdio")) {
+            if (rest.len > 0) {
+                return .{ .output = try allocator.dupe(u8, "stdio transport uses the current process; no command argument is supported"), .is_error = true };
+            }
+            // stdio remote would bind the agent protocol to the TUI's own
+            // stdin/stdout. Until subprocess spawning is wired up, persist the
+            // transport preference but do not enable remote mode.
+            cfg.remote.enabled = false;
+            restart_notice = true;
+            try replaceRemoteString(allocator, &cfg.remote.transport, "stdio");
+            try replaceRemoteString(allocator, &cfg.remote.command, "");
+            try replaceRemoteString(allocator, &cfg.remote.endpoint, "");
+        } else if (std.mem.eql(u8, sub, "sse")) {
+            if (rest.len == 0) {
+                return .{ .output = try allocator.dupe(u8, "usage: /remote sse <url>"), .is_error = true };
+            }
+            validateUrlScheme(rest, &.{"http"}) catch {
+                return .{ .output = try allocator.dupe(u8, "SSE endpoint must use http scheme (TLS not yet supported)"), .is_error = true };
+            };
+            cfg.remote.enabled = true;
+            restart_notice = true;
+            try replaceRemoteString(allocator, &cfg.remote.transport, "sse");
+            try replaceRemoteString(allocator, &cfg.remote.endpoint, rest);
+            try replaceRemoteString(allocator, &cfg.remote.command, "");
+        } else if (std.mem.eql(u8, sub, "ws") or std.mem.eql(u8, sub, "websocket")) {
+            if (rest.len == 0) {
+                return .{ .output = try allocator.dupe(u8, "usage: /remote ws <url>"), .is_error = true };
+            }
+            validateUrlScheme(rest, &.{ "ws", "wss" }) catch {
+                return .{ .output = try allocator.dupe(u8, "WebSocket endpoint must use ws or wss scheme"), .is_error = true };
+            };
+            return .{ .output = try allocator.dupe(u8, "WebSocket remote transport is not yet supported"), .is_error = true };
+        } else if (std.mem.eql(u8, sub, "auth")) {
+            if (rest.len == 0) {
+                return .{ .output = try allocator.dupe(u8, "usage: /remote auth <token>"), .is_error = true };
+            }
+            if (hasCrLf(rest)) {
+                return .{ .output = try allocator.dupe(u8, "remote auth token must not contain CR/LF"), .is_error = true };
+            }
+            restart_notice = true;
+            try replaceRemoteString(allocator, &cfg.remote.auth_token, rest);
+            try replaceRemoteString(allocator, &cfg.remote.auth_header_value, "");
+        } else if (std.mem.eql(u8, sub, "header")) {
+            const trimmed = std.mem.trim(u8, rest, " \t");
+            var hiter = std.mem.splitScalar(u8, trimmed, ' ');
+            const name = hiter.first();
+            const header_value = std.mem.trim(u8, hiter.rest(), " \t");
+            if (name.len == 0 or header_value.len == 0) {
+                return .{ .output = try allocator.dupe(u8, "usage: /remote header <name> <value>"), .is_error = true };
+            }
+            if (!isValidHeaderName(name) or hasCrLf(header_value)) {
+                return .{ .output = try allocator.dupe(u8, "remote header name/value must not contain CR/LF; name must be a valid HTTP token"), .is_error = true };
+            }
+            restart_notice = true;
+            try replaceRemoteString(allocator, &cfg.remote.auth_token, "");
+            try replaceRemoteString(allocator, &cfg.remote.auth_header_name, name);
+            try replaceRemoteString(allocator, &cfg.remote.auth_header_value, header_value);
+        } else if (std.mem.eql(u8, sub, "off")) {
+            cfg.remote.enabled = false;
+            restart_notice = true;
+        } else {
+            return .{ .output = try std.fmt.allocPrint(allocator, "unknown remote subcommand: {s}", .{sub}), .is_error = true };
+        }
+        try store.save(cfg);
+    }
+
+    if (restart_notice) {
+        const status = try formatRemoteStatus(allocator, cfg.remote);
+        defer allocator.free(status);
+        return .{ .output = try std.fmt.allocPrint(allocator, "{s}\nNote: change applies on next TUI start; active remote sessions keep using the current runtime.", .{status}) };
+    }
+
+    return .{ .output = try formatRemoteStatus(allocator, cfg.remote) };
+}
+
+fn replaceRemoteString(allocator: std.mem.Allocator, field: *[]u8, value: []const u8) !void {
+    const next = try allocator.dupe(u8, value);
+    if (field.len > 0) allocator.free(field.*);
+    field.* = next;
+}
+
+fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
+    if (hasWhitespaceOrControl(url)) return error.InvalidUrl;
+    if (std.mem.indexOfScalar(u8, url, '#') != null) return error.InvalidUrl;
+    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+    const scheme = url[0..scheme_end];
+    var matched = false;
+    for (schemes) |allowed| {
+        if (std.mem.eql(u8, scheme, allowed)) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched) return error.InvalidUrl;
+
+    const after_scheme = url[scheme_end + 3 ..];
+    var authority_end: usize = 0;
+    while (authority_end < after_scheme.len and after_scheme[authority_end] != '/' and after_scheme[authority_end] != '?' and after_scheme[authority_end] != '#') : (authority_end += 1) {}
+    const authority = after_scheme[0..authority_end];
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.InvalidUrl;
+
+    if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) {
+        _ = sse_transport.parseHttpUrl(url) catch return error.InvalidUrl;
+        return;
+    }
+
+    const after = url[scheme_end + 3 ..];
+    var auth_end: usize = 0;
+    while (auth_end < after.len and after[auth_end] != '/' and after[auth_end] != '?' and after[auth_end] != '#') : (auth_end += 1) {}
+    const ws_authority = after[0..auth_end];
+    if (ws_authority.len == 0) return error.InvalidUrl;
+    var host = ws_authority;
+    if (std.mem.lastIndexOfScalar(u8, ws_authority, '@')) |at| host = ws_authority[at + 1 ..];
+    if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
+    if (host.len == 0) return error.InvalidUrl;
+}
+
+fn hasWhitespaceOrControl(value: []const u8) bool {
+    for (value) |ch| {
+        if (std.ascii.isWhitespace(ch) or ch < 0x20 or ch == 0x7f) return true;
+    }
+    return false;
+}
+
+fn hasCrLf(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") != null;
+}
+
+fn isTchar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn isValidHeaderName(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| if (!isTchar(ch)) return false;
+    return true;
+}
+
+fn formatRemoteStatus(allocator: std.mem.Allocator, remote: tui_config.RemoteConfig) ![]u8 {
+    const status = if (remote.enabled) "enabled" else "disabled";
+    const auth = if (remote.auth_token.len > 0 or remote.auth_header_value.len > 0) "yes" else "no";
+    return try std.fmt.allocPrint(allocator, "remote {s}\ntransport: {s}\nendpoint: {s}\ncommand: {s}\nauth: {s}", .{
+        status,
+        remote.transport,
+        remote.endpoint,
+        remote.command,
+        auth,
+    });
 }
 
 fn currentModel(ctx: CommandContext) ?ai_types.Model {
@@ -889,3 +1063,364 @@ const MockAbortSession = struct {
         if (self.events_initialized) self.events.deinit();
     }
 };
+
+fn remoteTestStore(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) !tui_config.Store {
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "makai" });
+    defer allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+    return try tui_config.Store.init(allocator, base);
+}
+
+test "remote command sets sse transport and persists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: sse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(loaded.remote.enabled);
+    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
+    try std.testing.expectEqualStrings("http://localhost:8080", loaded.remote.endpoint);
+}
+
+test "remote command rejects invalid sse endpoint scheme" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse ftp://localhost:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
+}
+
+test "remote command rejects https sse endpoint until TLS supported" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse https://localhost:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "TLS not yet supported") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects unsupported websocket transport" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "ws ws://localhost:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "WebSocket remote transport is not yet supported") != null);
+}
+
+test "remote command rejects invalid websocket endpoint scheme" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "ws http://localhost:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "WebSocket endpoint must use ws or wss scheme") != null);
+}
+
+test "remote command sets auth token and persists" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "auth secret-token");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("secret-token", loaded.remote.auth_token);
+}
+
+test "remote command rejects auth token injection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "auth secret\r\nInjected: yes");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "must not contain CR/LF") != null);
+}
+
+test "remote command shows current config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, null);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "remote") != null);
+}
+
+test "remote command parses as slash command" {
+    const command = try parse("/remote sse http://localhost:8080");
+    try std.testing.expectEqual(CommandKind.remote, command.kind);
+    try std.testing.expectEqualStrings("sse http://localhost:8080", command.arg.?);
+}
+
+test "remote command sets stdio transport without enabling remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "stdio");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "transport: stdio") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "applies on next TUI start") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    // stdio remote would hijack the TUI's own stdio; keep it disabled until
+    // subprocess spawning is implemented.
+    try std.testing.expect(!loaded.remote.enabled);
+    try std.testing.expectEqualStrings("stdio", loaded.remote.transport);
+    try std.testing.expectEqualStrings("", loaded.remote.command);
+    try std.testing.expectEqualStrings("", loaded.remote.endpoint);
+}
+
+test "remote command stdio rejects command argument" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "stdio /bin/foo");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "no command argument is supported") != null);
+}
+
+test "remote command off disables remote" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var sse_result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:8080");
+    defer sse_result.deinit(std.testing.allocator);
+    try std.testing.expect(!sse_result.is_error);
+
+    var off_result = try applyRemoteCommand(std.testing.allocator, store, "off");
+    defer off_result.deinit(std.testing.allocator);
+    try std.testing.expect(!off_result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "disabled") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off_result.output, "applies on next TUI start") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
+}
+
+test "remote command header sets header and clears auth token" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var auth_result = try applyRemoteCommand(std.testing.allocator, store, "auth secret-token");
+    defer auth_result.deinit(std.testing.allocator);
+    try std.testing.expect(!auth_result.is_error);
+
+    var header_result = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc123");
+    defer header_result.deinit(std.testing.allocator);
+    try std.testing.expect(!header_result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, header_result.output, "applies on next TUI start") != null);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", loaded.remote.auth_token);
+    try std.testing.expectEqualStrings("X-Api-Key", loaded.remote.auth_header_name);
+    try std.testing.expectEqualStrings("abc123", loaded.remote.auth_header_value);
+}
+
+test "remote command rejects header injection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var bad_name = try applyRemoteCommand(std.testing.allocator, store, "header X-Bad\r\nInjected value");
+    defer bad_name.deinit(std.testing.allocator);
+    try std.testing.expect(bad_name.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, bad_name.output, "must not contain CR/LF") != null);
+
+    var bad_value = try applyRemoteCommand(std.testing.allocator, store, "header X-Api-Key abc\r\nInjected: yes");
+    defer bad_value.deinit(std.testing.allocator);
+    try std.testing.expect(bad_value.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, bad_value.output, "must not contain CR/LF") != null);
+}
+
+test "remote command rejects invalid header name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "header Bad:Name value");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "valid HTTP token") != null);
+}
+
+test "remote command rejects unknown subcommand" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "bogus");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "unknown remote subcommand: bogus") != null);
+}
+
+test "remote command rejects sse endpoint with empty host" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "SSE endpoint must use http scheme") != null);
+}
+
+test "remote command rejects sse endpoint with fragment" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost#events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with userinfo" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://token@localhost:8080/events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with whitespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost/events extra");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with path-only authority" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http:///events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with port-only authority" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://:8080");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with malformed port" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:abc");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with out-of-range port" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost:70000");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+

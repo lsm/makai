@@ -37,6 +37,32 @@ pub const UiSettings = struct {
     }
 };
 
+pub const RemoteConfig = struct {
+    enabled: bool = false,
+    transport: []u8 = &.{},
+    endpoint: []u8 = &.{},
+    command: []u8 = &.{},
+    auth_token: []u8 = &.{},
+    auth_header_name: []u8 = &.{},
+    auth_header_value: []u8 = &.{},
+
+    pub fn defaults(allocator: std.mem.Allocator) !RemoteConfig {
+        return .{
+            .transport = try allocator.dupe(u8, "stdio"),
+        };
+    }
+
+    pub fn deinit(self: *RemoteConfig, allocator: std.mem.Allocator) void {
+        if (self.transport.len > 0) allocator.free(self.transport);
+        if (self.endpoint.len > 0) allocator.free(self.endpoint);
+        if (self.command.len > 0) allocator.free(self.command);
+        if (self.auth_token.len > 0) allocator.free(self.auth_token);
+        if (self.auth_header_name.len > 0) allocator.free(self.auth_header_name);
+        if (self.auth_header_value.len > 0) allocator.free(self.auth_header_value);
+        self.* = .{};
+    }
+};
+
 pub const Config = struct {
     model: []u8,
     provider: []u8,
@@ -45,6 +71,7 @@ pub const Config = struct {
     permissions: std.ArrayList(ToolPermission) = .empty,
     mode: ModeSettings = .{},
     ui: UiSettings = .{},
+    remote: RemoteConfig = .{},
 
     pub fn defaults(allocator: std.mem.Allocator) !Config {
         return .{
@@ -53,6 +80,7 @@ pub const Config = struct {
             .api = try allocator.dupe(u8, "anthropic-messages"),
             .workspace = try allocator.dupe(u8, "."),
             .ui = .{ .theme = try allocator.dupe(u8, "default") },
+            .remote = try RemoteConfig.defaults(allocator),
         };
     }
 
@@ -64,6 +92,7 @@ pub const Config = struct {
         for (self.permissions.items) |*permission| permission.deinit(allocator);
         self.permissions.deinit(allocator);
         self.ui.deinit(allocator);
+        self.remote.deinit(allocator);
         self.* = undefined;
     }
 };
@@ -146,6 +175,7 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
         .api = try dupStringField(allocator, obj, "api", ""),
         .workspace = try dupStringField(allocator, obj, "workspace", ""),
         .ui = .{ .theme = try allocator.dupe(u8, "default") },
+        .remote = try RemoteConfig.defaults(allocator),
     };
     errdefer cfg.deinit(allocator);
 
@@ -188,6 +218,39 @@ fn parseConfig(allocator: std.mem.Allocator, data: []const u8) !Config {
         else => {},
     };
 
+    if (obj.get("remote")) |value| switch (value) {
+        .object => |remote_obj| {
+            cfg.remote.enabled = boolField(remote_obj, "enabled", cfg.remote.enabled);
+            if (stringField(remote_obj, "transport")) |transport| {
+                if (cfg.remote.transport.len > 0) allocator.free(cfg.remote.transport);
+                cfg.remote.transport = try allocator.dupe(u8, transport);
+            } else if (cfg.remote.transport.len == 0) {
+                cfg.remote.transport = try allocator.dupe(u8, "stdio");
+            }
+            if (stringField(remote_obj, "endpoint")) |endpoint| {
+                if (cfg.remote.endpoint.len > 0) allocator.free(cfg.remote.endpoint);
+                cfg.remote.endpoint = try allocator.dupe(u8, endpoint);
+            }
+            if (stringField(remote_obj, "command")) |command| {
+                if (cfg.remote.command.len > 0) allocator.free(cfg.remote.command);
+                cfg.remote.command = try allocator.dupe(u8, command);
+            }
+            if (stringField(remote_obj, "auth_token")) |auth_token| {
+                if (cfg.remote.auth_token.len > 0) allocator.free(cfg.remote.auth_token);
+                cfg.remote.auth_token = try allocator.dupe(u8, auth_token);
+            }
+            if (stringField(remote_obj, "auth_header_name")) |name| {
+                if (cfg.remote.auth_header_name.len > 0) allocator.free(cfg.remote.auth_header_name);
+                cfg.remote.auth_header_name = try allocator.dupe(u8, name);
+            }
+            if (stringField(remote_obj, "auth_header_value")) |val| {
+                if (cfg.remote.auth_header_value.len > 0) allocator.free(cfg.remote.auth_header_value);
+                cfg.remote.auth_header_value = try allocator.dupe(u8, val);
+            }
+        },
+        else => {},
+    };
+
     return cfg;
 }
 
@@ -217,6 +280,16 @@ fn serializeConfig(allocator: std.mem.Allocator, cfg: Config) ![]u8 {
     try w.beginObject();
     try w.writeStringField("theme", cfg.ui.theme);
     try w.writeBoolField("show_tool_panel", cfg.ui.show_tool_panel);
+    try w.endObject();
+    try w.writeKey("remote");
+    try w.beginObject();
+    try w.writeBoolField("enabled", cfg.remote.enabled);
+    try w.writeStringField("transport", cfg.remote.transport);
+    try w.writeStringField("endpoint", cfg.remote.endpoint);
+    try w.writeStringField("command", cfg.remote.command);
+    try w.writeStringField("auth_token", cfg.remote.auth_token);
+    try w.writeStringField("auth_header_name", cfg.remote.auth_header_name);
+    try w.writeStringField("auth_header_value", cfg.remote.auth_header_value);
     try w.endObject();
     try w.endObject();
     try buf.append(allocator, '\n');
@@ -297,7 +370,7 @@ test "missing config creates defaults" {
     try std.testing.expect(std.mem.indexOf(u8, data, "claude-sonnet-4-5") != null);
 }
 
-test "loadIfExists returns null without creating defaults" {
+test "save config preserves remote transport settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmpBase(std.testing.allocator, &tmp);
@@ -306,6 +379,68 @@ test "loadIfExists returns null without creating defaults" {
     var store = try Store.init(std.testing.allocator, base);
     defer store.deinit();
 
+    var cfg = try Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080");
+    cfg.remote.auth_token = try std.testing.allocator.dupe(u8, "secret");
+    cfg.remote.auth_header_name = try std.testing.allocator.dupe(u8, "Authorization");
+    cfg.remote.auth_header_value = try std.testing.allocator.dupe(u8, "Bearer secret");
+    try store.save(cfg);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(loaded.remote.enabled);
+    try std.testing.expectEqualStrings("sse", loaded.remote.transport);
+    try std.testing.expectEqualStrings("http://localhost:8080", loaded.remote.endpoint);
+    try std.testing.expectEqualStrings("secret", loaded.remote.auth_token);
+    try std.testing.expectEqualStrings("Authorization", loaded.remote.auth_header_name);
+    try std.testing.expectEqualStrings("Bearer secret", loaded.remote.auth_header_value);
+}
+
+test "remote config defaults when missing from file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
+
+    var cfg = try Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    try store.save(cfg);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("stdio", loaded.remote.transport);
+    try std.testing.expectEqualStrings("", loaded.remote.endpoint);
+    try std.testing.expectEqualStrings("", loaded.remote.command);
+    try std.testing.expectEqualStrings("", loaded.remote.auth_token);
+}
+
+test "parse remote config from json" {
+    const data = "{\"model\":\"m\",\"provider\":\"p\",\"api\":\"a\",\"workspace\":\".\",\"remote\":{\"enabled\":true,\"transport\":\"sse\",\"endpoint\":\"http://x\",\"command\":\"\",\"auth_token\":\"t\",\"auth_header_name\":\"X-Auth\",\"auth_header_value\":\"v\"}}";
+    var cfg = try parseConfig(std.testing.allocator, data);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.remote.enabled);
+    try std.testing.expectEqualStrings("sse", cfg.remote.transport);
+    try std.testing.expectEqualStrings("http://x", cfg.remote.endpoint);
+    try std.testing.expectEqualStrings("t", cfg.remote.auth_token);
+    try std.testing.expectEqualStrings("X-Auth", cfg.remote.auth_header_name);
+    try std.testing.expectEqualStrings("v", cfg.remote.auth_header_value);
+}
+
+test "loadIfExists returns null without creating defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmpBase(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var store = try Store.init(std.testing.allocator, base);
+    defer store.deinit();
     const missing = try store.loadIfExists();
     try std.testing.expect(missing == null);
 
