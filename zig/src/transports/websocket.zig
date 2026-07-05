@@ -299,12 +299,22 @@ pub const WebSocketClient = struct {
     /// Close the connection
     pub fn close(self: *Self) void {
         _ = defaultIo();
+
+        // Capture the socket under the state mutex, then drop the mutex before
+        // performing I/O. This prevents a blocked writer from pinning the state
+        // mutex and stalling cancellation paths that need to shut the socket down.
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.mutex.unlock();
-        if (self.tcp_stream) |stream| {
+        const maybe_stream = self.tcp_stream;
+        const send_close_frame = self.state == .connected;
+        self.tcp_stream = null;
+        self.state = .closing;
+        self.mutex.unlock();
+
+        if (maybe_stream) |stream| {
             var closable = stream;
-            // Send close frame if connected
-            if (self.state == .connected) {
+            // Hold the write mutex around the close-frame write and socket close
+            // so they cannot interleave with an in-flight message/pong frame.
+            if (send_close_frame) {
                 const close_frame = Frame{
                     .opcode = .close,
                     .payload = &.{},
@@ -313,12 +323,17 @@ pub const WebSocketClient = struct {
                 };
                 if (encodeFrame(close_frame, self.allocator)) |encoded| {
                     defer self.allocator.free(encoded);
+                    while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+                    defer self.write_mutex.unlock();
                     closable.writeAll(encoded) catch {}; // Ignore errors on close
                 } else |_| {}
             }
             closable.close();
-            self.tcp_stream = null;
         }
+
+        // Re-acquire the state mutex to clear buffers and finalize state.
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         self.send_buffer.clearRetainingCapacity();
         self.recv_buffer.clearRetainingCapacity();
         self.fragment_buffer.clearRetainingCapacity();

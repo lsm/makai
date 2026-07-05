@@ -672,8 +672,11 @@ pub const TuiRuntime = struct {
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
                 self.pumpRemoteIncoming() catch |err| {
+                    // Cancel the WebSocket reader before closing the sender so the
+                    // close path cannot clear buffers while receive() is using them.
+                    if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
                     if (self.remote_sender) |remote_sender| remote_sender.close();
-                    if (self.remote_config_stream_handle == null and self.websocket_handle == null) {
+                    if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
                         if (self.remote_receiver) |*remote_receiver| remote_receiver.close();
                     }
                     self.clearWebSocketRemote();
@@ -728,8 +731,11 @@ pub const TuiRuntime = struct {
                 _ = client.sendAgentStop(sid, "client disconnect") catch {};
                 client.removeSessionState(sid);
             }
+            // Cancel and join the WebSocket reader before closing the sender so
+            // the close path cannot clear buffers while receive() is using them.
+            if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
             if (self.remote_sender) |sender| sender.close();
-            if (self.remote_config_stream_handle == null and self.websocket_handle == null) {
+            if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
                 if (self.remote_receiver) |*receiver| receiver.close();
             }
             self.clearWebSocketRemote();
@@ -1458,8 +1464,10 @@ pub const TuiRuntime = struct {
 
     fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message, emit_tail_prompt: bool) !void {
         try self.ensureRemoteSession();
+        if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection();
+        try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
-        const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+        var sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
         const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), messages, self.remoteSerializableTools());
         defer self.allocator.free(message_json);
         self.resetEventStreamForTurn();
@@ -1475,7 +1483,23 @@ pub const TuiRuntime = struct {
         defer self.allocator.free(options_json);
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
-        _ = try client.sendAgentMessage(sid, message_json, options_json);
+
+        var reconnected_once = false;
+        while (true) {
+            const result = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
+                if (self.remote_config_websocket_owned and err == error.NotConnected and !reconnected_once) {
+                    reconnected_once = true;
+                    try self.ensureRemoteWebSocketConnection();
+                    try self.ensureRemoteSession();
+                    sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+                    continue;
+                }
+                return err;
+            };
+            _ = result;
+            break;
+        }
+
         if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
@@ -1641,6 +1665,51 @@ pub const TuiRuntime = struct {
         if (self.remote_config_websocket_owned) {
             self.remote_sender = null;
             self.remote_receiver = null;
+        }
+    }
+
+    /// Cancel and join the WebSocket reader thread, returning true if the thread
+    /// exited cleanly. On a timeout/detach the client reference is dropped to
+    /// avoid use-after-free by any dangling sender/receiver handles.
+    fn shutdownWebSocketReader(self: *TuiRuntime) bool {
+        if (self.websocket_handle) |handle| {
+            self.websocket_handle = null;
+            if (!handle.deinit(5_000)) {
+                self.websocket_client = null;
+                if (self.remote_config_websocket_owned) {
+                    self.remote_sender = null;
+                    self.remote_receiver = null;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Detect an idle WebSocket disconnect before writing a turn. If the reader
+    /// thread has finished the byte stream, clear the stale session and reconnect
+    /// so the next send goes through a live socket.
+    fn ensureRemoteWebSocketConnection(self: *TuiRuntime) !void {
+        if (!self.remote_config_websocket_owned) return;
+        const disconnected = blk: {
+            if (self.websocket_client == null) break :blk true;
+            if (self.websocket_handle) |handle| if (handle.stream.isDone()) break :blk true;
+            break :blk false;
+        };
+        if (!disconnected) return;
+
+        if (self.remote_session_id) |sid| {
+            if (self.remote_client) |*client| client.removeSessionState(sid);
+            self.remote_session_id = null;
+        }
+        self.remote_pending_session_id = null;
+        self.clearWebSocketRemote();
+        if (self.remote_config_sse_endpoint.len == 0) return error.NoRemoteTransportConfigured;
+        try self.reconnectWebSocketRemote();
+        if (self.remote_client) |*client| {
+            client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
+        } else {
+            return error.RuntimeNotStarted;
         }
     }
 
