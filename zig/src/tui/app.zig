@@ -1849,7 +1849,7 @@ pub const TuiModel = struct {
                 if (app.state.mode == .session_picker) {
                     if (app.state.session_delete_confirm) {
                         switch (key.key) {
-                            .char => |c| switch (std.ascii.toLower(c)) {
+                            .char => |c| switch (if (c <= std.math.maxInt(u8)) std.ascii.toLower(@as(u8, @intCast(c))) else c) {
                                 'y' => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
                                 'n' => app.state.session_delete_confirm = false,
                                 else => {},
