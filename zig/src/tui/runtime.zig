@@ -1073,9 +1073,25 @@ pub const TuiRuntime = struct {
     fn pushDroppingOldestCounted(self: *TuiRuntime, event: TuiEvent) void {
         while (true) {
             if (self.pushUncounted(event)) return;
-            // Stream is full. Evict the oldest pending event to make room for
-            // this event, counting only the confirmed eviction as a drop.
+            // Stream was full when we attempted to enqueue. The UI consumer does
+            // not take backpressure_mutex while draining, so retry after taking
+            // the lock before evicting: a consumer may have freed a slot between
+            // the failed push and this point.
             while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.event_stream.push(event)) {
+                self.backpressure_mutex.unlock();
+                return;
+            } else |err| switch (err) {
+                error.QueueFull => {},
+                error.StreamCompleted => {
+                    self.backpressure_mutex.unlock();
+                    var mutable = event;
+                    mutable.deinit(self.allocator);
+                    return;
+                },
+            }
+            // Stream is still full. Evict the oldest pending event to make room
+            // for this event, counting only the confirmed eviction as a drop.
             if (self.event_stream.poll()) |dropped| {
                 self.dropped_event_count += 1;
                 self.dropped_since_warning += 1;
