@@ -491,9 +491,13 @@ pub const App = struct {
     /// Resume the session currently selected in the session picker.
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         self.state.clampSessionSelectionToFilter();
         const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        // Any pending reset/quarantine from an active-session delete is no longer
+        // relevant once the user explicitly chooses a session to resume.
+        self.pending_session_reset = false;
+        self.quarantine_events = false;
+        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         const id = selected.id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
@@ -501,8 +505,6 @@ pub const App = struct {
         self.discardPendingEvents();
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
-        self.pending_session_reset = false;
-        self.quarantine_events = false;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
         self.session_created_at = loaded.metadata.created_at;
@@ -1115,15 +1117,19 @@ pub const App = struct {
         self.refreshQueuedCounts();
         self.syncBackpressureState();
         if (self.pending_session_reset and !self.state.status.streaming) {
-            self.pending_session_reset = false;
             if (self.runtime) |runtime| {
                 switch (runtime.backend) {
                     .local => if (runtime.local_agent) |*local| {
-                        local.clearAllQueues();
-                        local.replaceMessages(&.{}) catch {};
+                        if (local.isIdle()) {
+                            local.clearAllQueues();
+                            local.replaceMessages(&.{}) catch {};
+                            self.pending_session_reset = false;
+                        }
                     },
-                    else => {},
+                    else => self.pending_session_reset = false,
                 }
+            } else {
+                self.pending_session_reset = false;
             }
         }
         if (completed_agent_end and self.state.queue.total() > 0) {
@@ -1919,14 +1925,8 @@ pub const TuiModel = struct {
                         .backspace => updateSessionFilter(app, .backspace, null),
                         .delete => updateSessionFilter(app, .delete, null),
                         .char => |c| switch (c) {
-                            'k' => if (app.state.sessionFilterText().len == 0)
-                                moveSessionSelection(app, -1)
-                            else
-                                updateSessionFilter(app, .char, c),
-                            'j' => if (app.state.sessionFilterText().len == 0)
-                                moveSessionSelection(app, 1)
-                            else
-                                updateSessionFilter(app, .char, c),
+                            'k' => updateSessionFilter(app, .char, c),
+                            'j' => updateSessionFilter(app, .char, c),
                             'd' => {
                                 if (key.modifiers.ctrl and
                                     app.state.session_index < app.state.filteredSessionCount())
@@ -3408,7 +3408,6 @@ test "App drain quarantines late events until the next turn starts" {
     defer mock.deinit();
     app.session = mock.session();
     app.session_id = try std.testing.allocator.dupe(u8, "deleted");
-    defer std.testing.allocator.free(app.session_id);
     app.quarantine_events = true;
 
     try mock.eventStream().push(.{ .text_delta = .{
@@ -3436,7 +3435,6 @@ test "App drain exits quarantine on turn_start for remote-style streams" {
     defer mock.deinit();
     app.session = mock.session();
     app.session_id = try std.testing.allocator.dupe(u8, "deleted");
-    defer std.testing.allocator.free(app.session_id);
     app.quarantine_events = true;
 
     try mock.eventStream().push(.{ .text_delta = .{
@@ -3848,44 +3846,35 @@ test "session picker keeps selected session when still matched after filter" {
     try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
 }
 
-test "session picker delete and nav keys fall back to filter input when filter is non-empty" {
+test "session picker delete and nav keys fall back to filter input" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
     model.app.?.state.mode = .session_picker;
     try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
     try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
 
-    // With an active filter, the literal keys used for delete/navigation become
-    // ordinary filter input.
+    // The literal keys used for delete/navigation become ordinary filter input.
     _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
     try std.testing.expectEqualStrings("d", model.app.?.state.sessionFilterText());
     try std.testing.expect(!model.app.?.state.session_delete_confirm);
 
     _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
     try std.testing.expectEqualStrings("dj", model.app.?.state.sessionFilterText());
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
 
     _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
     try std.testing.expectEqualStrings("djk", model.app.?.state.sessionFilterText());
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
 
-    // Ctrl+d still triggers delete confirmation independently of the filter.
+    // Clear the filter and search for a real row; Ctrl+d should then confirm.
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 's' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = '1' } } }, undefined);
+    try std.testing.expectEqualStrings("s1", model.app.?.state.sessionFilterText());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.filteredSessionCount());
+
     _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     try std.testing.expect(model.app.?.state.session_delete_confirm);
-}
-
-test "session picker navigation keys work when filter is empty" {
-    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
-    defer model.deinit();
-    model.app.?.state.mode = .session_picker;
-    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
-    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
-
-    try std.testing.expectEqualStrings("", model.app.?.state.sessionFilterText());
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
-    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.session_index);
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
-    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
 }
 
 fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
@@ -4147,6 +4136,7 @@ test "TuiModel Ctrl+G editor shortcut returns focus to composer" {
     _ = model.update(.{ .key = ctrl_g }, undefined);
 
     try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
+}
 
 test "resume selected session clears delete reset flags" {
     var tmp = std.testing.tmpDir(.{});
@@ -4154,19 +4144,17 @@ test "resume selected session clears delete reset flags" {
     const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
     defer std.testing.allocator.free(base);
 
-    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
     var app = App.initWithoutRuntime(std.testing.allocator);
     defer app.deinit();
-    app.runtime = runtime;
-    runtime = undefined;
     app.store = try session_store.Store.init(std.testing.allocator, base);
     try saveTestSession(app.store.?, "s1", 1);
     try app.loadSessions();
     app.pending_session_reset = true;
     app.quarantine_events = true;
 
-    try app.resumeSelectedSession();
-
+    // Without a runtime configured, resume returns an error, but it must still
+    // clear the stale delete-state flags before doing so.
+    try std.testing.expectError(error.NoRuntimeConfigured, app.resumeSelectedSession());
     try std.testing.expect(!app.pending_session_reset);
     try std.testing.expect(!app.quarantine_events);
 }
