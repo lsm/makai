@@ -382,6 +382,13 @@ pub const App = struct {
     last_view_height: usize = 8,
     inline_history_flushed: usize = 0,
     last_inline_view_lines: usize = 4,
+    /// When an active session is deleted, the local/runtime message history is
+    /// cleared once the cancelled run becomes idle.
+    pending_session_reset: bool = false,
+    /// Drop late events from a deleted run until a new turn signals itself via
+    /// agent_start, preventing deleted-run leftovers from being saved/applied to
+    /// the next session.
+    quarantine_events: bool = false,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -530,6 +537,7 @@ pub const App = struct {
             self.session_id = &.{};
             self.session_created_at = 0;
             try self.state.status.setSessionId(self.allocator, "");
+            if (self.approval_waiter) |waiter| waiter.rejectPending();
             if (self.session) |*session| {
                 session.cancel();
                 session.clearQueuedMessages();
@@ -554,6 +562,8 @@ pub const App = struct {
             self.state.resetReplayState();
             self.state.clearQueuedPreviews();
             self.inline_history_flushed = 0;
+            self.pending_session_reset = true;
+            self.quarantine_events = true;
         }
 
         try store.delete(id);
@@ -1087,6 +1097,14 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
+            if (self.quarantine_events) {
+                if (ev == .agent_start) {
+                    self.quarantine_events = false;
+                } else {
+                    // Drop late events from a run whose session was deleted.
+                    continue;
+                }
+            }
             if (ev == .agent_end and ev.agent_end.reason == .completed) completed_agent_end = true;
             self.saveEvent(ev);
             try self.applyRuntimeEvent(ev);
@@ -1094,6 +1112,18 @@ pub const App = struct {
         }
         self.refreshQueuedCounts();
         self.syncBackpressureState();
+        if (self.pending_session_reset and !self.state.status.streaming) {
+            self.pending_session_reset = false;
+            if (self.runtime) |runtime| {
+                switch (runtime.backend) {
+                    .local => if (runtime.local_agent) |*local| {
+                        local.clearAllQueues();
+                        local.replaceMessages(&.{}) catch {};
+                    },
+                    else => {},
+                }
+            }
+        }
         if (completed_agent_end and self.state.queue.total() > 0) {
             session.resumeSession() catch |err| {
                 try self.state.status.setError(self.allocator, @errorName(err));
@@ -1808,9 +1838,15 @@ pub const TuiModel = struct {
                         },
                         'd' => {
                             // Issue #137: cycle time → date+time → off for
-                            // transcript message timestamps.
-                            _ = app.state.cycleTimestampDisplay();
-                            return .none;
+                            // transcript message timestamps.  When the session
+                            // picker is open, Ctrl+D is handled there as the
+                            // delete shortcut instead.
+                            if (app.state.mode == .session_picker) {
+                                // fall through to session picker handling below
+                            } else {
+                                _ = app.state.cycleTimestampDisplay();
+                                return .none;
+                            }
                         },
                         'p' => {
                             if (app.state.mode == .normal and app.state.focus_pane == .composer) _ = app.state.composerHistoryPrev() catch false;
@@ -3349,6 +3385,46 @@ test "TuiModel Ctrl D cycles timestamp display" {
     const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
     try std.testing.expectEqual(tui_state.TimestampDisplay.full, model.app.?.state.timestamp_display);
+}
+
+test "TuiModel Ctrl D enters delete confirmation in session picker" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    try model.app.?.state.addSession("s1", "Session One");
+    model.app.?.state.mode = .session_picker;
+
+    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
+}
+
+test "App drain quarantines late events until the next turn starts" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    defer std.testing.allocator.free(app.session_id);
+    app.quarantine_events = true;
+
+    try mock.eventStream().push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    try mock.eventStream().push(.{ .agent_start = .{} });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+    try std.testing.expect(!app.quarantine_events);
 }
 
 test "setting pickers apply selected values" {
