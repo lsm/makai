@@ -47,10 +47,14 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
-        // 2. Markdown inline links must stay raw. Protect their destinations
-        //    before math checks so URLs like `/users/$user_id$` survive.
+        // 2. Markdown inline links and bare URLs must stay raw. Protect their
+        //    destinations before math checks so URLs like
+        //    `/users/$user_id$` survive.
         if (source[i] == '[') {
             if (try consumeMarkdownLink(writer, source, &i)) continue;
+        }
+        if (isBareUrlPrefix(source, i)) {
+            if (try consumeBareUrl(writer, source, &i)) continue;
         }
 
         // 3. Inline code spans must stay raw. Protect them before math checks
@@ -160,6 +164,31 @@ fn consumeMarkdownLink(writer: *std.Io.Writer, source: []const u8, i: *usize) !b
 
     try writer.writeAll(source[start .. url_end + 1]);
     i.* = url_end + 1;
+    return true;
+}
+
+/// Returns true when `source[i..]` begins with a common bare URL scheme
+/// (`http://` or `https://`).
+fn isBareUrlPrefix(source: []const u8, i: usize) bool {
+    if (i + 7 <= source.len and std.mem.eql(u8, source[i .. i + 7], "http://")) return true;
+    if (i + 8 <= source.len and std.mem.eql(u8, source[i .. i + 8], "https://")) return true;
+    return false;
+}
+
+/// Consume a bare URL (`http://...` or `https://...`) verbatim. Returns false
+/// when `*i` is not at a URL prefix so the default path preserves the source.
+fn consumeBareUrl(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    if (!isBareUrlPrefix(source, i.*)) return false;
+    const start = i.*;
+    var end = start;
+    while (end < source.len) {
+        const c = source[end];
+        // Stop at whitespace or common delimiters that terminate URLs in prose.
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '<' or c == '>') break;
+        end += 1;
+    }
+    try writer.writeAll(source[start..end]);
+    i.* = end;
     return true;
 }
 
@@ -436,6 +465,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// - `$HOME/$PATH` — the closer is followed by an identifier char.
 /// - `${HOME}/${XDG_CONFIG_HOME}` — the opener or closer is followed by `{`
 ///   (braced shell/config variables), so both dollar signs survive.
+/// - `\$FOO\$` — the opener/closer is escaped by a backslash.
 /// Digit-led formulas such as `$2^n$` still render because the closer is not
 /// identifier/digit-adjacent.
 fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
@@ -443,9 +473,11 @@ fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !boo
 
     // Opening `$` immediately after a digit is a price suffix, not math
     // (`5$`). A `$` followed by `{` is a braced shell/config variable, not
-    // math. Other punctuation/operators like `=` or `:` are allowed so
-    // common forms such as `f(x)=$x^2$` and `value:$v$` render.
+    // math. A `$` preceded by an unescaped backslash is an escaped literal
+    // dollar, not math. Other punctuation/operators like `=` or `:` are
+    // allowed so common forms such as `f(x)=$x^2$` and `value:$v$` render.
     if (open > 0 and std.ascii.isDigit(source[open - 1])) return false;
+    if (open > 0 and isEscaped(source, open)) return false;
     // Body must start with a non-space and non-`$` char.
     if (open + 1 >= source.len) return false;
     {
@@ -671,9 +703,11 @@ fn writeFrac(writer: *std.Io.Writer, body: []const u8, start: usize) anyerror!us
         try writer.writeByte(')');
         return i;
     }
-    // Fallback: emit literal so the user sees the source structure.
+    // Fallback: preserve the raw operand text so formulas like \frac{10}2 stay
+    // copyable instead of collapsing to \frac102.
     try writer.writeAll("\\frac");
-    return start;
+    try writer.writeAll(body[start..i]);
+    return i;
 }
 
 /// Render `\sqrt{X}` as `√X` (with braces stripped). If there's no brace
@@ -1181,6 +1215,20 @@ test "plain brackets still allow inline math" {
     try std.testing.expect(std.mem.indexOf(u8, out, "[x] = x ok") != null);
 }
 
+test "bare url with dollar variables stays verbatim" {
+    const src = "see https://api.example.com/users/$user_id$ here";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "escaped dollar delimiters in prose stay verbatim" {
+    const src = "Use \\$FOO\\$ in docs and write \\$x\\$ to show the delimiter";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
 test "inline code span is not parsed as math" {
     const src = "Use `echo $x$` then $\\alpha$";
     const out = try preprocess(std.testing.allocator, src);
@@ -1376,6 +1424,16 @@ test "nested fraction renders fully" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "((a)/(b))/(c)") != null);
+}
+
+test "fraction with non-braced operand preserves raw fallback" {
+    const src = "ratio $\\frac{10}2$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // When \frac doesn't have two brace groups, the raw operands must survive
+    // so the fallback stays copyable (NOT \frac102).
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac{10}2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac102") == null);
 }
 
 test "style modifiers are silently dropped" {
