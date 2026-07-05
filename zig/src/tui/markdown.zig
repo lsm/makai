@@ -47,19 +47,25 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
-        // 2. Inline code spans must stay raw. Protect them before math checks
+        // 2. Markdown inline links must stay raw. Protect their destinations
+        //    before math checks so URLs like `/users/$user_id$` survive.
+        if (source[i] == '[') {
+            if (try consumeMarkdownLink(writer, source, &i)) continue;
+        }
+
+        // 3. Inline code spans must stay raw. Protect them before math checks
         //    so snippets like `echo $x$` remain copyable.
         if (source[i] == '`') {
             if (try consumeInlineCode(writer, source, &i)) continue;
         }
 
-        // 3. Block math `$$...$$`. Checked before inline `$` so the leading
+        // 4. Block math `$$...$$`. Checked before inline `$` so the leading
         //    `$$` isn't mis-parsed as two adjacent single-dollar spans.
         if (i + 1 < source.len and source[i] == '$' and source[i + 1] == '$') {
             if (try consumeBlockMath(allocator, writer, source, &i)) continue;
         }
 
-        // 4. Inline math `$...$`.
+        // 5. Inline math `$...$`.
         if (source[i] == '$') {
             if (try consumeInlineMath(writer, source, &i)) continue;
         }
@@ -99,6 +105,62 @@ fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) !boo
         scan += close_count - 1;
     }
     return false;
+}
+
+/// Consume a Markdown inline link `[text](url)` verbatim. Returns false when
+/// the bytes at `*i` don't form a complete link so the default byte path
+/// preserves the source. Link destinations may contain `$` chars that must not
+/// be interpreted as inline math, so the whole link is copied unchanged.
+fn consumeMarkdownLink(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    const start = i.*;
+    if (start >= source.len or source[start] != '[') return false;
+
+    // Find the matching `]` for link text, respecting nested brackets and
+    // escaped brackets (e.g. `\]`).
+    var text_end = start + 1;
+    var bracket_depth: usize = 1;
+    while (text_end < source.len) {
+        const c = source[text_end];
+        if (c == '\\' and text_end + 1 < source.len) {
+            text_end += 2;
+            continue;
+        }
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') {
+            bracket_depth -= 1;
+            if (bracket_depth == 0) break;
+        }
+        text_end += 1;
+    }
+    if (bracket_depth != 0 or text_end >= source.len) return false;
+
+    // Inline links are followed by `(`; reference-style `[text][ref]` is left
+    // for the default path (it has no URL destination to protect).
+    const url_start = text_end + 1;
+    if (url_start >= source.len or source[url_start] != '(') return false;
+
+    // Find the matching `)` for the URL, respecting balanced nested parens and
+    // escaped parens.
+    var url_end = url_start + 1;
+    var paren_depth: usize = 1;
+    while (url_end < source.len) {
+        const c = source[url_end];
+        if (c == '\\' and url_end + 1 < source.len) {
+            url_end += 2;
+            continue;
+        }
+        if (c == '(') paren_depth += 1;
+        if (c == ')') {
+            paren_depth -= 1;
+            if (paren_depth == 0) break;
+        }
+        url_end += 1;
+    }
+    if (paren_depth != 0 or url_end >= source.len) return false;
+
+    try writer.writeAll(source[start .. url_end + 1]);
+    i.* = url_end + 1;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -341,32 +403,36 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// - `5$` — opening `$` preceded by a digit.
 /// - `$5-$10`, `$5/$10` — the closer is followed by a digit.
 /// - `$HOME/$PATH` — the closer is followed by an identifier char.
+/// - `${HOME}/${XDG_CONFIG_HOME}` — the opener or closer is followed by `{`
+///   (braced shell/config variables), so both dollar signs survive.
 /// Digit-led formulas such as `$2^n$` still render because the closer is not
 /// identifier/digit-adjacent.
 fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
 
     // Opening `$` immediately after a digit is a price suffix, not math
-    // (`5$`). Other punctuation/operators like `=` or `:` are allowed so
+    // (`5$`). A `$` followed by `{` is a braced shell/config variable, not
+    // math. Other punctuation/operators like `=` or `:` are allowed so
     // common forms such as `f(x)=$x^2$` and `value:$v$` render.
     if (open > 0 and std.ascii.isDigit(source[open - 1])) return false;
     // Body must start with a non-space and non-`$` char.
     if (open + 1 >= source.len) return false;
     {
         const next = source[open + 1];
-        if (next == ' ' or next == '$') return false;
+        if (next == ' ' or next == '$' or next == '{') return false;
     }
 
     const body_start = open + 1;
     const close = std.mem.indexOfScalarPos(u8, source, body_start, '$') orelse return false;
 
     // Closing `$` must not be preceded by whitespace, followed by another
-    // `$`, followed by a digit (currency ranges), or followed by an
-    // identifier char (adjacent shell vars like `$HOME/$PATH`).
+    // `$`, followed by a digit (currency ranges), followed by an identifier
+    // char (adjacent shell vars like `$HOME/$PATH`), or followed by `{`
+    // (braced shell variables like `${HOME}`).
     if (source[close - 1] == ' ') return false;
     if (close + 1 < source.len) {
         const after = source[close + 1];
-        if (after == '$' or std.ascii.isDigit(after) or isIdentifierChar(after)) return false;
+        if (after == '$' or after == '{' or std.ascii.isDigit(after) or isIdentifierChar(after)) return false;
     }
 
     const body = source[body_start..close];
@@ -1031,6 +1097,34 @@ test "adjacent shell variables are not parsed as math" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
+}
+
+test "braced shell variables are not parsed as math" {
+    const src = "use ${HOME}/${XDG_CONFIG_HOME} here";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "markdown link destination with dollar variables stays verbatim" {
+    const src = "[API](https://api.example.com/users/$user_id$)";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "markdown link with nested parens in destination stays verbatim" {
+    const src = "[link](https://example.com/a(b)c)";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "plain brackets still allow inline math" {
+    const src = "value is [x] = $x$ ok";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[x] = x ok") != null);
 }
 
 test "inline code span is not parsed as math" {
