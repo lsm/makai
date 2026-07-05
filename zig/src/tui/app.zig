@@ -534,7 +534,22 @@ pub const App = struct {
                 session.cancel();
                 session.clearQueuedMessages();
             }
-            if (self.runtime) |runtime| runtime.replaceMessages(&.{}) catch {};
+            if (self.runtime) |runtime| {
+                // Cancel any in-flight work first.  Only reset the runtime message
+                // context when it is safe to do so without blocking the UI.  For the
+                // remote backend replaceMessages is non-blocking; for the local backend
+                // we avoid waiting on a cancelled worker and only clear when idle.
+                runtime.cancel();
+                switch (runtime.backend) {
+                    .remote => runtime.replaceMessages(&.{}) catch {},
+                    .local => if (runtime.local_agent) |*local| {
+                        if (local.isIdle()) {
+                            local.clearAllQueues();
+                            local.replaceMessages(&.{}) catch {};
+                        }
+                    },
+                }
+            }
             self.discardPendingEvents();
             self.state.resetReplayState();
             self.state.clearQueuedPreviews();
@@ -1866,10 +1881,22 @@ pub const TuiModel = struct {
                         .backspace => updateSessionFilter(app, .backspace, null),
                         .delete => updateSessionFilter(app, .delete, null),
                         .char => |c| switch (c) {
-                            'k' => moveSessionSelection(app, -1),
-                            'j' => moveSessionSelection(app, 1),
+                            'k' => if (app.state.sessionFilterText().len == 0)
+                                moveSessionSelection(app, -1)
+                            else
+                                updateSessionFilter(app, .char, c),
+                            'j' => if (app.state.sessionFilterText().len == 0)
+                                moveSessionSelection(app, 1)
+                            else
+                                updateSessionFilter(app, .char, c),
                             'd' => {
-                                if (app.state.session_index < app.state.filteredSessionCount()) app.state.session_delete_confirm = true;
+                                if (key.modifiers.ctrl and
+                                    app.state.session_index < app.state.filteredSessionCount())
+                                {
+                                    app.state.session_delete_confirm = true;
+                                } else {
+                                    updateSessionFilter(app, .char, c);
+                                }
                             },
                             else => updateSessionFilter(app, .char, c),
                         },
@@ -3715,6 +3742,46 @@ test "session picker keeps selected session when still matched after filter" {
     try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
 }
 
+test "session picker delete and nav keys fall back to filter input when filter is non-empty" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
+    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+
+    // With an active filter, the literal keys used for delete/navigation become
+    // ordinary filter input.
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    try std.testing.expectEqualStrings("d", model.app.?.state.sessionFilterText());
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
+    try std.testing.expectEqualStrings("dj", model.app.?.state.sessionFilterText());
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
+    try std.testing.expectEqualStrings("djk", model.app.?.state.sessionFilterText());
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+
+    // Ctrl+d still triggers delete confirmation independently of the filter.
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+}
+
+test "session picker navigation keys work when filter is empty" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
+    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+
+    try std.testing.expectEqualStrings("", model.app.?.state.sessionFilterText());
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.session_index);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+}
+
 fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
     errdefer allocator.free(base);
@@ -3749,7 +3816,7 @@ test "session picker delete confirmation can be cancelled" {
     try model.app.?.loadSessions();
     model.app.?.state.mode = .session_picker;
 
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     try std.testing.expect(model.app.?.state.session_delete_confirm);
     _ = model.update(.{ .key = .{ .key = .{ .char = 'n' } } }, undefined);
     try std.testing.expect(!model.app.?.state.session_delete_confirm);
@@ -3777,7 +3844,7 @@ test "session picker confirm deletes selected session and clamps selection" {
     model.app.?.state.mode = .session_picker;
     model.app.?.state.session_index = 1;
 
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     _ = model.update(.{ .key = .{ .key = .{ .char = 'y' } } }, undefined);
 
     try std.testing.expect(!model.app.?.state.session_delete_confirm);
@@ -3803,7 +3870,7 @@ test "session picker delete respects active filter" {
     try model.app.?.state.session_filter.insertSlice(std.testing.allocator, "s1");
     model.app.?.state.clampSessionSelectionToFilter();
 
-    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
     _ = model.update(.{ .key = .{ .key = .enter } }, undefined);
 
     try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
