@@ -1463,7 +1463,6 @@ pub const TuiRuntime = struct {
     }
 
     fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message, emit_tail_prompt: bool) !void {
-        try self.ensureRemoteSession();
         if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection();
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
