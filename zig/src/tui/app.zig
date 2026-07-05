@@ -519,6 +519,13 @@ pub const App = struct {
 
     const thinking_levels = [_]ai_types.ThinkingLevel{ .off, .low, .medium, .high, .xhigh };
 
+    const export_methods = [_]ExportMethod{ .clipboard, .file };
+
+    const ExportMethod = enum {
+        clipboard,
+        file,
+    };
+
     fn loginProviderEnum(idx: usize) tui_login.Provider {
         return switch (idx) {
             0 => .anthropic,
@@ -594,6 +601,12 @@ pub const App = struct {
         self.enterMenu(.thinking_picker);
     }
 
+    fn openExportPicker(self: *App) void {
+        self.state.menu_scroll = 0;
+        self.state.menu_index = 0;
+        self.enterMenu(.export_picker);
+    }
+
     fn enterMenu(self: *App, mode: tui_state.AppMode) void {
         self.state.mode = mode;
         self.ensureMenuSelectionVisible();
@@ -606,6 +619,7 @@ pub const App = struct {
             .permission_picker => permission_modes.len,
             .view_picker => view_modes.len,
             .thinking_picker => thinking_levels.len,
+            .export_picker => export_methods.len,
             else => 0,
         };
     }
@@ -703,6 +717,16 @@ pub const App = struct {
         const msg = try std.fmt.allocPrint(self.allocator, "thinking level set to {s}", .{@tagName(level)});
         defer self.allocator.free(msg);
         try self.state.appendTranscript(.system, msg);
+    }
+
+    fn applySelectedExport(self: *App) !void {
+        const idx = @min(self.state.menu_index, export_methods.len - 1);
+        const method = export_methods[idx];
+        self.state.mode = .normal;
+        switch (method) {
+            .clipboard => self.exportTranscriptToClipboard(),
+            .file => try self.exportTranscriptToFile(null),
+        }
     }
 
     /// Drive the active login session forward. Called each tick; surfaces the
@@ -1180,10 +1204,12 @@ pub const App = struct {
             .open_permission_picker => self.openPermissionPicker(),
             .open_view_picker => self.openViewPicker(),
             .open_thinking_picker => self.openThinkingPicker(),
+            .open_export_picker => self.openExportPicker(),
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
             .open_artifact_viewer => try self.openLatestArtifact(),
+            .export_file => try self.exportTranscriptToFile(if (result.export_path.len > 0) result.export_path else null),
             .none => {},
         }
         if ((command.kind == .model or command.kind == .provider) and command.arg != null) self.persistCurrentModel();
@@ -1314,6 +1340,56 @@ pub const App = struct {
             },
             else => {},
         }
+    }
+
+    fn exportTranscriptToClipboard(self: *App) void {
+        const text = self.state.transcriptToMarkdown(self.allocator) catch |err| {
+            self.recordExportError("clipboard", err) catch {};
+            return;
+        };
+        defer self.allocator.free(text);
+        if (text.len == 0) {
+            self.state.appendTranscript(.system, "nothing to export yet") catch {};
+            return;
+        }
+        self.stageClipboard(text);
+        self.state.appendTranscript(.system, "exported transcript to clipboard") catch {};
+    }
+
+    fn exportTranscriptToFile(self: *App, maybe_path: ?[]const u8) !void {
+        const text = self.state.transcriptToMarkdown(self.allocator) catch |err| {
+            try self.recordExportError("file", err);
+            return;
+        };
+        defer self.allocator.free(text);
+        if (text.len == 0) {
+            try self.state.appendTranscript(.system, "nothing to export yet");
+            return;
+        }
+
+        const owned_default = if (maybe_path == null) try defaultExportPath(self.allocator) else null;
+        defer if (owned_default) |path| self.allocator.free(path);
+        const path = maybe_path orelse owned_default.?;
+
+        var file = std.Io.Dir.createFile(.cwd(), defaultIo(), path, .{ .truncate = true }) catch |err| {
+            try self.recordExportError(path, err);
+            return;
+        };
+        defer file.close(defaultIo());
+        file.writeStreamingAll(defaultIo(), text) catch |err| {
+            try self.recordExportError(path, err);
+            return;
+        };
+
+        const msg = try std.fmt.allocPrint(self.allocator, "exported transcript to {s}", .{path});
+        defer self.allocator.free(msg);
+        try self.state.appendTranscript(.system, msg);
+    }
+
+    fn recordExportError(self: *App, target: []const u8, err: anyerror) !void {
+        const msg = try std.fmt.allocPrint(self.allocator, "export failed for {s}: {s}", .{ target, @errorName(err) });
+        defer self.allocator.free(msg);
+        try self.recordError(msg);
     }
 
     fn cycleThinkingLevel(self: *App) void {
@@ -1750,6 +1826,8 @@ pub const TuiModel = struct {
                                 app.applySelectedView() catch |err| app.recordError(@errorName(err)) catch {};
                             } else if (app.state.mode == .thinking_picker) {
                                 app.applySelectedThinking() catch |err| app.recordError(@errorName(err)) catch {};
+                            } else if (app.state.mode == .export_picker) {
+                                app.applySelectedExport() catch |err| app.recordError(@errorName(err)) catch {};
                             }
                         },
                         .escape => app.state.mode = .normal,
@@ -1959,6 +2037,22 @@ pub const TuiModel = struct {
                 }
                 break :blk menu_picker_view.render(ctx.allocator, .{
                     .title = "Thinking level",
+                    .items = &items,
+                    .selected = app.state.menu_index,
+                    .width = width,
+                    .height = sessionPickerHeight(app),
+                    .offset = app.state.menu_scroll,
+                }) catch "";
+            },
+            .export_picker => blk: {
+                var items: [App.export_methods.len]menu_picker_view.Item = undefined;
+                for (App.export_methods, 0..) |method, i| {
+                    items[i] = .{ .label = exportMethodLabel(method), .detail = exportMethodDetail(method) };
+                }
+                break :blk menu_picker_view.render(ctx.allocator, .{
+                    .title = "Export conversation",
+                    .subtitle = "Select export method",
+                    .footer = "Esc to cancel",
                     .items = &items,
                     .selected = app.state.menu_index,
                     .width = width,
@@ -2199,7 +2293,7 @@ pub const TuiModel = struct {
 
     fn isMenuMode(mode: tui_state.AppMode) bool {
         return switch (mode) {
-            .model_picker, .login_picker, .permission_picker, .view_picker, .thinking_picker => true,
+            .model_picker, .login_picker, .permission_picker, .view_picker, .thinking_picker, .export_picker => true,
             else => false,
         };
     }
@@ -2227,6 +2321,20 @@ pub const TuiModel = struct {
             .medium => "balanced reasoning",
             .high => "deeper reasoning",
             .xhigh => "maximum reasoning",
+        };
+    }
+
+    fn exportMethodLabel(method: App.ExportMethod) []const u8 {
+        return switch (method) {
+            .clipboard => "Copy to clipboard",
+            .file => "Save to file",
+        };
+    }
+
+    fn exportMethodDetail(method: App.ExportMethod) []const u8 {
+        return switch (method) {
+            .clipboard => "Copy the conversation to your system clipboard",
+            .file => "Save the conversation to a file in the current directory",
         };
     }
 
@@ -2291,7 +2399,31 @@ fn newerSessionFirst(_: void, a: session_store.SessionMetadata, b: session_store
     return a.last_active > b.last_active;
 }
 
-/// Generate a collision-resistant session ID, e.g. "20260523-150405-123-a1b2c3d4e5f60708".
+/// Build the default export filename, e.g. "transcript-20260615-120000-123.md".
+fn defaultExportPath(allocator: std.mem.Allocator) ![]u8 {
+    const millis = compat.time.nowMillis();
+    const secs: i64 = @divFloor(millis, 1000);
+    const ms: i64 = @mod(millis, 1000);
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(secs, 0))) };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_secs = epoch.getDaySeconds();
+    return std.fmt.allocPrint(
+        allocator,
+        "transcript-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}-{d:0>3}.md",
+        .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_secs.getHoursIntoDay(),
+            day_secs.getMinutesIntoHour(),
+            day_secs.getSecondsIntoMinute(),
+            ms,
+        },
+    );
+}
+
 fn generateSessionId(allocator: std.mem.Allocator) ![]u8 {
     const millis = compat.time.nowMillis();
     const secs: i64 = @divFloor(millis, 1000);

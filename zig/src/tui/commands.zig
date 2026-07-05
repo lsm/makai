@@ -22,6 +22,7 @@ pub const CommandKind = enum {
     clear,
     copy,
     artifact,
+    @"export",
     diff,
     abort,
     quit,
@@ -53,17 +54,21 @@ pub const CommandAction = enum {
     copy_last,
     copy_all,
     open_artifact_viewer,
+    open_export_picker,
+    export_file,
 };
 
 pub const CommandResult = struct {
     action: CommandAction = .none,
     output: []u8 = &.{},
     login_provider: []u8 = &.{},
+    export_path: []u8 = &.{},
     is_error: bool = false,
 
     pub fn deinit(self: *CommandResult, allocator: std.mem.Allocator) void {
         if (self.output.len > 0) allocator.free(self.output);
         if (self.login_provider.len > 0) allocator.free(self.login_provider);
+        if (self.export_path.len > 0) allocator.free(self.export_path);
         self.* = undefined;
     }
 };
@@ -102,6 +107,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
     .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
     .{ .name = "artifact", .kind = .artifact, .usage = "/artifact", .description = "Open the latest artifact in a local viewer", .handler = handleArtifact },
+    .{ .name = "export", .kind = .@"export", .usage = "/export [path.md]", .description = "Export transcript to clipboard or file", .handler = handleExport },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
     .{ .name = "abort", .kind = .abort, .usage = "/abort", .description = "Cancel the active streaming turn", .handler = handleAbort },
     .{ .name = "quit", .kind = .quit, .usage = "/quit", .description = "Exit TUI", .handler = handleQuit },
@@ -412,6 +418,13 @@ fn handleArtifact(ctx: CommandContext, command: Command) !CommandResult {
     return .{ .action = .open_artifact_viewer };
 }
 
+fn handleExport(ctx: CommandContext, command: Command) !CommandResult {
+    if (command.arg) |path| {
+        return .{ .action = .export_file, .export_path = try ctx.allocator.dupe(u8, path) };
+    }
+    return .{ .action = .open_export_picker };
+}
+
 fn handleDiff(ctx: CommandContext, command: Command) !CommandResult {
     _ = command;
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
@@ -668,7 +681,7 @@ test "dispatch reaches command handlers" {
     _ = try state.upsertToolForTest("t1", "file_write", "{}", .done);
 
     const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
-    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .diff, .abort, .quit };
+    const kinds = [_]CommandKind{ .help, .status, .sessions, .permissions, .think, .view, .clear, .@"export", .diff, .abort, .quit };
     for (kinds) |kind| {
         var result = try dispatch(ctx, .{ .kind = kind });
         defer result.deinit(std.testing.allocator);
@@ -684,6 +697,8 @@ test "dispatch reaches command handlers" {
             try std.testing.expectEqual(CommandAction.open_thinking_picker, result.action);
         } else if (kind == .view) {
             try std.testing.expectEqual(CommandAction.open_view_picker, result.action);
+        } else if (kind == .@"export") {
+            try std.testing.expectEqual(CommandAction.open_export_picker, result.action);
         } else {
             try std.testing.expect(result.output.len > 0);
         }
@@ -872,6 +887,28 @@ test "copy command selects last reply or whole transcript" {
     var all = try dispatch(ctx, .{ .kind = .copy, .arg = "all" });
     defer all.deinit(std.testing.allocator);
     try std.testing.expectEqual(CommandAction.copy_all, all.action);
+}
+
+test "export command opens picker or targets file" {
+    const picker_command = try parse("/export");
+    try std.testing.expectEqual(CommandKind.@"export", picker_command.kind);
+
+    const file_command = try parse("/export custom.md");
+    try std.testing.expectEqual(CommandKind.@"export", file_command.kind);
+    try std.testing.expectEqualStrings("custom.md", file_command.arg.?);
+
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    const ctx = CommandContext{ .allocator = std.testing.allocator, .state = &state };
+
+    var picker = try dispatch(ctx, .{ .kind = .@"export" });
+    defer picker.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.open_export_picker, picker.action);
+
+    var file = try dispatch(ctx, .{ .kind = .@"export", .arg = "custom.md" });
+    defer file.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.export_file, file.action);
+    try std.testing.expectEqualStrings("custom.md", file.export_path);
 }
 
 test "abort when idle reports idle" {

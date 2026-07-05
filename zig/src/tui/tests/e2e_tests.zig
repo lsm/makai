@@ -446,6 +446,111 @@ test "e2e: /copy reports when there is a reply to copy" {
     try std.testing.expect(d.frameContains("copied last reply to clipboard"));
 }
 
+test "e2e: /export opens picker and copies transcript" {
+    const models = [_]ai_types.Model{mock_provider.test_model};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
+    var d = try Driver.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    }, .{});
+    defer d.deinit();
+
+    try d.app().state.appendUserMessage("question");
+    try d.app().state.appendTranscript(.assistant, "answer");
+    d.typeText("/export");
+    d.pressEnter();
+
+    try std.testing.expectEqual(tui_state.AppMode.export_picker, d.app().state.mode);
+    try std.testing.expect(d.frameContains("Export conversation"));
+    try std.testing.expect(d.frameContains("Copy to clipboard"));
+    try std.testing.expect(d.frameContains("Save to file"));
+
+    d.sendKey(.enter);
+    try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
+    try std.testing.expect(d.frameContains("exported transcript to clipboard"));
+}
+
+test "e2e: /export picker saves transcript to default file" {
+    const models = [_]ai_types.Model{mock_provider.test_model};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
+    var d = try Driver.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    }, .{});
+    defer d.deinit();
+
+    try d.app().state.appendUserMessage("question");
+    try d.app().state.appendTranscript(.assistant, "answer");
+    d.typeText("/export");
+    d.pressEnter();
+    d.sendKey(.down);
+    d.sendKey(.enter);
+
+    try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);
+    try std.testing.expect(d.frameContains("exported transcript to transcript-"));
+
+    const path = exportedTranscriptPath(d.app()) orelse return error.MissingExportPath;
+    try std.testing.expect(std.mem.startsWith(u8, path, "transcript-"));
+    try std.testing.expect(std.mem.endsWith(u8, path, ".md"));
+
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## User\n\n> question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Assistant\n\nanswer") != null);
+
+    try std.Io.Dir.deleteFile(.cwd(), std.testing.io, path);
+}
+
+/// Returns the path from the most recent system transcript entry that reports a
+/// successful transcript export (e.g. "exported transcript to <path>").
+fn exportedTranscriptPath(app: *App) ?[]const u8 {
+    const prefix = "exported transcript to ";
+    var i = app.state.transcript.items.len;
+    while (i > 0) {
+        i -= 1;
+        const entry = app.state.transcript.items[i];
+        if (entry.kind != .system) continue;
+        const text = entry.text.items;
+        if (std.mem.startsWith(u8, text, prefix)) {
+            return text[prefix.len..];
+        }
+    }
+    return null;
+}
+
+test "e2e: /export writes explicit file and reports file errors" {
+    const models = [_]ai_types.Model{mock_provider.test_model};
+    var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
+    var d = try Driver.init(std.testing.allocator, .{
+        .protocol = provider.protocolClient(),
+        .models = &models,
+        .run_async = false,
+    }, .{});
+    defer d.deinit();
+
+    try d.app().state.appendUserMessage("question");
+    try d.app().state.appendTranscript(.assistant, "answer");
+
+    const export_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/explicit.md", .{d.tmp.sub_path[0..]});
+    defer std.testing.allocator.free(export_path);
+    const command = try std.fmt.allocPrint(std.testing.allocator, "/export {s}", .{export_path});
+    defer std.testing.allocator.free(command);
+    d.typeText(command);
+    d.pressEnter();
+    try std.testing.expect(d.frameContains("exported transcript to"));
+
+    const content = try std.Io.Dir.readFileAlloc(.cwd(), std.testing.io, export_path, std.testing.allocator, .limited(1024 * 1024));
+    defer std.testing.allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## User\n\n> question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "## Assistant\n\nanswer") != null);
+
+    d.typeText("/export missing-dir/export.md");
+    d.pressEnter();
+    try std.testing.expect(d.frameContains("export failed for missing-dir/export.md"));
+}
+
 test "e2e: /sessions opens the picker and resuming replays the saved transcript" {
     const models = [_]ai_types.Model{mock_provider.test_model};
     var provider = mock_provider.MockProvider.init(.{ .steps = &.{} });
