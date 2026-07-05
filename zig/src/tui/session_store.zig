@@ -553,6 +553,15 @@ fn writeEvent(w: *json_writer.JsonWriter, event: tui_session.TuiEvent) !void {
             try w.writeStringField("type", "agent_end");
             try w.writeStringField("reason", @tagName(p.reason));
         },
+        .system_warning => |p| {
+            try w.writeStringField("type", "system_warning");
+            try w.writeStringField("message", p.message.slice());
+        },
+        .backpressure_status => |p| {
+            try w.writeStringField("type", "backpressure_status");
+            try w.writeBoolField("active", p.active);
+            try w.writeIntField("dropped_count", p.dropped_count);
+        },
         .@"error" => |p| {
             try w.writeStringField("type", "error");
             try w.writeStringField("message", p.message.slice());
@@ -625,6 +634,11 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
     } };
     if (std.mem.eql(u8, kind, "turn_end")) return .{ .turn_end = .{ .stop_reason = parseStopReason(stringField(obj, "stop_reason") orelse "stop") } };
     if (std.mem.eql(u8, kind, "agent_end")) return .{ .agent_end = .{ .reason = parseEndReason(stringField(obj, "reason") orelse "completed") } };
+    if (std.mem.eql(u8, kind, "system_warning")) return .{ .system_warning = .{ .message = try owned(allocator, stringField(obj, "message") orelse "") } };
+    if (std.mem.eql(u8, kind, "backpressure_status")) return .{ .backpressure_status = .{
+        .active = boolField(obj, "active", false),
+        .dropped_count = uint64Field(obj, "dropped_count") orelse 0,
+    } };
     if (std.mem.eql(u8, kind, "error")) return .{ .@"error" = .{ .message = try owned(allocator, stringField(obj, "message") orelse "") } };
     return error.InvalidEvent;
 }

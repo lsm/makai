@@ -96,6 +96,8 @@ pub const TuiEvent = union(enum) {
     },
     turn_end: struct { stop_reason: ai_types.StopReason },
     agent_end: struct { reason: TuiEndReason },
+    system_warning: struct { message: OwnedSlice(u8) },
+    backpressure_status: struct { active: bool, dropped_count: u64 },
     @"error": struct { message: OwnedSlice(u8) },
 
     pub const MessageRole = enum {
@@ -153,6 +155,7 @@ pub const TuiEvent = union(enum) {
                 p.result_json.deinit(allocator);
                 p.artifact_refs.deinit(allocator);
             },
+            .system_warning => |*p| p.message.deinit(allocator),
             .@"error" => |*p| p.message.deinit(allocator),
             else => {},
         }

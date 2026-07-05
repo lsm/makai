@@ -210,6 +210,11 @@ pub const TuiRuntime = struct {
     last_turn_stop_reason: ?ai_types.StopReason = null,
     compact_output: bool = false,
     run_async: bool = true,
+    dropped_event_count: u64 = 0,
+    dropped_since_warning: u64 = 0,
+    backpressure_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    backpressure_status_active_emitted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    backpressure_mutex: std.atomic.Mutex = .unlocked,
 
     pub fn init(allocator: std.mem.Allocator, options: TuiRuntimeOptions) !TuiRuntime {
         var models = try cloneModels(allocator, options.models);
@@ -827,6 +832,7 @@ pub const TuiRuntime = struct {
                 if (self.remote_turn_in_flight) return error.AgentAlreadyStreaming;
                 self.clearRemoteQueues();
                 self.clearRemoteMessages();
+                self.resetBackpressureState();
                 errdefer self.clearRemoteMessages();
                 for (messages) |message| try self.remote_messages.append(self.allocator, try ai_types.cloneMessage(self.allocator, message));
             },
@@ -835,6 +841,7 @@ pub const TuiRuntime = struct {
                 const local = &(self.local_agent orelse return error.RuntimeNotStarted);
                 if (self.run_async) local.waitForIdle();
                 local.clearAllQueues();
+                self.resetBackpressureState();
                 try local.replaceMessages(messages);
             },
         }
@@ -929,6 +936,36 @@ pub const TuiRuntime = struct {
         return &self.event_stream;
     }
 
+    /// Snapshot of backpressure state for UI polling. The UI calls this once
+    /// per frame after draining events so the status bar always reflects the
+    /// current runtime state without depending on event drain ordering.
+    pub fn backpressureState(self: *TuiRuntime) struct { active: bool, dropped_count: u64 } {
+        while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.backpressure_mutex.unlock();
+        const active = self.backpressure_active.load(.acquire);
+        const dropped_count = self.dropped_event_count;
+        // Auto-clear the internal flag when the ring has recovered, but return
+        // the pre-clear snapshot once so AppState can render the active
+        // backpressure frame before settling to drops-only on the next poll.
+        if (active and !self.event_stream.isFull()) {
+            self.backpressure_active.store(false, .release);
+            self.backpressure_status_active_emitted.store(false, .release);
+        }
+        return .{
+            .active = active,
+            .dropped_count = dropped_count,
+        };
+    }
+
+    fn resetBackpressureState(self: *TuiRuntime) void {
+        while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+        self.dropped_event_count = 0;
+        self.dropped_since_warning = 0;
+        self.backpressure_active.store(false, .release);
+        self.backpressure_status_active_emitted.store(false, .release);
+        self.backpressure_mutex.unlock();
+    }
+
     pub fn decideToolApproval(self: *TuiRuntime, tool_call_id: []const u8, decision: ToolApprovalDecision) !void {
         while (!self.approval_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.approval_mutex.unlock();
@@ -971,6 +1008,9 @@ pub const TuiRuntime = struct {
         if (!self.stream_active or self.event_stream.isDone()) {
             self.event_stream.deinit();
             self.event_stream = TuiEventStream.init(self.allocator);
+            // The fresh stream belongs to a new turn/session; backpressure
+            // counters from the previous stream no longer apply to it.
+            self.resetBackpressureState();
         }
         self.stream_active = true;
     }
@@ -1014,33 +1054,124 @@ pub const TuiRuntime = struct {
     }
 
     fn push(self: *TuiRuntime, event: TuiEvent) void {
-        self.pushDroppingOldest(event);
+        // Preserve the newest event (mainline TUI behavior) and count the
+        // evicted oldest event as the drop. Flush the warning after the real
+        // event so a pending warning cannot steal the only free slot.
+        self.pushDroppingOldestCounted(event);
+        self.flushDroppedWarning();
     }
 
-    fn pushDroppingOldest(self: *TuiRuntime, event: TuiEvent) void {
+    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
+        // Terminal events must not be dropped just because the projection queue
+        // is saturated. After queuing the terminal event, force any warning from
+        // terminal-path evictions into the stream too; there may be no later push
+        // before the stream completes.
+        self.pushDroppingOldestCounted(event);
+        self.flushDroppedWarningDroppingOldest();
+    }
+
+    fn pushDroppingOldestCounted(self: *TuiRuntime, event: TuiEvent) void {
         while (true) {
-            self.event_stream.push(event) catch |err| switch (err) {
-                error.QueueFull => {
-                    if (self.event_stream.poll()) |dropped| {
-                        var mutable = dropped;
-                        mutable.deinit(self.allocator);
-                    } else {
-                        std.Thread.yield() catch {};
-                    }
-                    continue;
-                },
+            if (self.pushUncounted(event)) return;
+            // Stream was full when we attempted to enqueue. The UI consumer does
+            // not take backpressure_mutex while draining, so retry after taking
+            // the lock before evicting: a consumer may have freed a slot between
+            // the failed push and this point.
+            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.event_stream.push(event)) {
+                self.backpressure_mutex.unlock();
+                return;
+            } else |err| switch (err) {
+                error.QueueFull => {},
                 error.StreamCompleted => {
+                    self.backpressure_mutex.unlock();
                     var mutable = event;
                     mutable.deinit(self.allocator);
                     return;
                 },
-            };
-            return;
+            }
+            // Stream is still full. Evict the oldest pending event to make room
+            // for this event, counting only the confirmed eviction as a drop.
+            if (self.event_stream.poll()) |dropped| {
+                self.dropped_event_count += 1;
+                self.dropped_since_warning += 1;
+                self.backpressure_active.store(true, .release);
+                var mutable = dropped;
+                mutable.deinit(self.allocator);
+            } else {
+                std.Thread.yield() catch {};
+            }
+            self.backpressure_mutex.unlock();
         }
     }
 
-    fn pushTerminal(self: *TuiRuntime, event: TuiEvent) void {
-        self.pushDroppingOldest(event);
+    fn pushUncounted(self: *TuiRuntime, event: TuiEvent) bool {
+        while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.backpressure_mutex.unlock();
+        self.event_stream.push(event) catch |err| switch (err) {
+            error.QueueFull => return false,
+            error.StreamCompleted => {
+                var mutable = event;
+                mutable.deinit(self.allocator);
+                return true;
+            },
+        };
+        return true;
+    }
+
+    fn flushDroppedWarning(self: *TuiRuntime) void {
+        while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.backpressure_mutex.unlock();
+        if (self.dropped_since_warning == 0) return;
+        const message = std.fmt.allocPrint(self.allocator, "Warning: {d} event{s} dropped due to backpressure", .{
+            self.dropped_since_warning,
+            if (self.dropped_since_warning == 1) "" else "s",
+        }) catch |err| {
+            self.event_stream.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } }) catch {};
+            return;
+        };
+        const warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+        self.event_stream.push(warning) catch {
+            var mutable = warning;
+            mutable.deinit(self.allocator);
+            return;
+        };
+        self.dropped_since_warning = 0;
+    }
+
+    fn flushDroppedWarningDroppingOldest(self: *TuiRuntime) void {
+        while (true) {
+            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            const count = self.dropped_since_warning;
+            self.backpressure_mutex.unlock();
+            if (count == 0) return;
+
+            const message = std.fmt.allocPrint(self.allocator, "Warning: {d} event{s} dropped due to backpressure", .{
+                count,
+                if (count == 1) "" else "s",
+            }) catch return;
+            const warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+            if (self.pushUncounted(warning)) {
+                while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+                self.dropped_since_warning -|= count;
+                self.backpressure_mutex.unlock();
+                return;
+            }
+            var mutable = warning;
+            mutable.deinit(self.allocator);
+
+            while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (self.event_stream.poll()) |dropped| {
+                self.dropped_event_count += 1;
+                self.dropped_since_warning += 1;
+                self.backpressure_active.store(true, .release);
+                var dropped_mutable = dropped;
+                dropped_mutable.deinit(self.allocator);
+            } else {
+                std.Thread.yield() catch {};
+            }
+            self.backpressure_mutex.unlock();
+        }
     }
 
     fn dupeOwned(self: *TuiRuntime, value: []const u8) !OwnedSlice(u8) {
@@ -3146,7 +3277,7 @@ test "event stream resets between turns" {
 }
 
 test "terminal events survive full TUI queue" {
-    var mock = MockProtocolCtx{ .flood_count = 300 };
+    var mock = MockProtocolCtx{ .flood_count = TuiEventStream.usable_capacity + 45 };
     const models = [_]ai_types.Model{test_model_a};
     var runtime = try TuiRuntime.init(std.testing.allocator, .{ .protocol = makeProtocol(&mock), .models = &models, .run_async = false });
     defer runtime.deinit();
@@ -3162,10 +3293,7 @@ test "terminal events survive full TUI queue" {
         defer ev.deinit(std.testing.allocator);
         switch (ev) {
             .turn_end => saw_turn_end = true,
-            .agent_end => {
-                saw_agent_end = true;
-                break;
-            },
+            .agent_end => saw_agent_end = true,
             else => {},
         }
     }
@@ -5013,6 +5141,99 @@ test "remote runtime integrates with in-process agent protocol server" {
         if (ev == .turn_start) return;
     }
     return error.NoRemoteEvent;
+}
+
+test "TuiRuntime terminal event emits warning after terminal eviction" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+
+    for (0..TuiEventStream.usable_capacity) |_| {
+        runtime.push(.turn_start);
+    }
+    try std.testing.expect(runtime.event_stream.isFull());
+
+    runtime.pushTerminal(.{ .agent_end = .{ .reason = .completed } });
+
+    var saw_agent_end = false;
+    var saw_warning = false;
+    while (runtime.event_stream.poll()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        switch (ev) {
+            .agent_end => saw_agent_end = true,
+            .system_warning => saw_warning = true,
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_agent_end);
+    try std.testing.expect(saw_warning);
+}
+
+test "TuiRuntime counts dropped events and emits warning" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .models = &[_]ai_types.Model{test_model_a} });
+    defer runtime.deinit();
+    var tui_session = runtime.createSession();
+
+    // Fill the ring buffer to capacity.
+    var i: usize = 0;
+    while (i < TuiEventStream.usable_capacity) : (i += 1) {
+        runtime.push(.{ .text_delta = .{ .content_index = i, .delta = OwnedSlice(u8).initBorrowed("x") } });
+    }
+    try std.testing.expect(runtime.event_stream.isFull());
+
+    // The next push must evict one queued event and count that eviction.
+    runtime.push(.{ .text_delta = .{ .content_index = TuiEventStream.usable_capacity, .delta = OwnedSlice(u8).initBorrowed("after-full") } });
+    try std.testing.expectEqual(@as(u64, 1), runtime.dropped_event_count);
+    try std.testing.expect(runtime.backpressure_active.load(.acquire));
+
+    // While backpressure is active, polling backpressureState reports active=true.
+    const bp_active = runtime.backpressureState();
+    try std.testing.expect(bp_active.active);
+    try std.testing.expectEqual(@as(u64, 1), bp_active.dropped_count);
+
+    // Make room so the warning and a subsequent event can both be emitted.
+    for (0..2) |_| {
+        var ev = runtime.event_stream.poll().?;
+        defer ev.deinit(std.testing.allocator);
+    }
+    runtime.push(.{ .text_delta = .{ .content_index = 256, .delta = OwnedSlice(u8).initBorrowed("after") } });
+
+    // Drain events via the session to consume the warning.
+    var saw_warning = false;
+    while (tui_session.popEvent()) |event| {
+        var ev = event;
+        defer ev.deinit(std.testing.allocator);
+        if (ev == .system_warning) {
+            saw_warning = true;
+            try std.testing.expect(std.mem.indexOf(u8, ev.system_warning.message.slice(), "1 event dropped due to backpressure") != null);
+        }
+    }
+    try std.testing.expect(saw_warning);
+
+    // The status bar reads state via backpressureState(), which returns one
+    // active frame after recovery before clearing the runtime flag.
+    const bp_recovered = runtime.backpressureState();
+    try std.testing.expect(bp_recovered.active);
+    try std.testing.expectEqual(@as(u64, 1), bp_recovered.dropped_count);
+    const bp_cleared = runtime.backpressureState();
+    try std.testing.expect(!bp_cleared.active);
+    try std.testing.expectEqual(@as(u64, 1), bp_cleared.dropped_count);
+}
+
+test "TuiRuntime replaceMessages clears stale backpressure counters" {
+    var runtime = try TuiRuntime.init(std.testing.allocator, .{ .backend = .remote, .models = &[_]ai_types.Model{test_model_a}, .run_async = false });
+    defer runtime.deinit();
+    runtime.started = true;
+
+    runtime.dropped_event_count = 9;
+    runtime.dropped_since_warning = 2;
+    runtime.backpressure_active.store(true, .release);
+
+    try runtime.replaceMessages(&.{});
+
+    const bp = runtime.backpressureState();
+    try std.testing.expect(!bp.active);
+    try std.testing.expectEqual(@as(u64, 0), bp.dropped_count);
 }
 
 fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
