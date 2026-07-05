@@ -1463,7 +1463,7 @@ pub const TuiRuntime = struct {
     }
 
     fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message, emit_tail_prompt: bool) !void {
-        if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection();
+        if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection(false);
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
         var sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
@@ -1486,9 +1486,10 @@ pub const TuiRuntime = struct {
         var reconnected_once = false;
         while (true) {
             const result = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
-                if (self.remote_config_websocket_owned and err == error.NotConnected and !reconnected_once) {
+                const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
+                if (self.remote_config_websocket_owned and reconnectable and !reconnected_once) {
                     reconnected_once = true;
-                    try self.ensureRemoteWebSocketConnection();
+                    try self.ensureRemoteWebSocketConnection(true);
                     try self.ensureRemoteSession();
                     sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
                     continue;
@@ -1687,10 +1688,11 @@ pub const TuiRuntime = struct {
 
     /// Detect an idle WebSocket disconnect before writing a turn. If the reader
     /// thread has finished the byte stream, clear the stale session and reconnect
-    /// so the next send goes through a live socket.
-    fn ensureRemoteWebSocketConnection(self: *TuiRuntime) !void {
+    /// so the next send goes through a live socket. When `force` is true, reconnect
+    /// regardless of the current liveness heuristic (used after a write-side error).
+    fn ensureRemoteWebSocketConnection(self: *TuiRuntime, force: bool) !void {
         if (!self.remote_config_websocket_owned) return;
-        const disconnected = blk: {
+        const disconnected = force or blk: {
             if (self.websocket_client == null) break :blk true;
             if (self.websocket_handle) |handle| if (handle.stream.isDone()) break :blk true;
             break :blk false;
