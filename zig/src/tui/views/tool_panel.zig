@@ -8,7 +8,9 @@ pub const Options = struct {
     height: usize = 8,
 };
 
-pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, options: Options) ![]const u8 {
+pub fn render(allocator: std.mem.Allocator, state: *tui_state.AppState, options: Options) ![]const u8 {
+    const inner_width = options.width -| 4;
+
     var out: std.Io.Writer.Allocating = .init(allocator);
     const writer = &out.writer;
     const title = try std.fmt.allocPrint(allocator, "Tools ({d} registered)", .{state.registered_tools.items.len});
@@ -24,7 +26,7 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
             try writer.writeAll(none);
             const body = try out.toOwnedSlice();
             defer allocator.free(body);
-            return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+            return tui_theme.panel().width(@intCast(@min(inner_width, std.math.maxInt(u16)))).render(allocator, body);
         }
         var rows: usize = 1;
         for (state.registered_tools.items) |tool| {
@@ -43,56 +45,110 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         }
         const body = try out.toOwnedSlice();
         defer allocator.free(body);
-        return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+        return tui_theme.panel().width(@intCast(@min(inner_width, std.math.maxInt(u16)))).render(allocator, body);
     }
 
+    const max_header_rows = if (options.height > 1) options.height - 1 else 0;
+    if (state.focus_pane == .tools) {
+        if (state.selected_tool_index) |sel| {
+            if (state.tools.items.len > 0 and max_header_rows > 0) {
+                const content_width = inner_width -| 6;
+                const view_rows = max_header_rows;
+                var rows_before_sel: usize = 0;
+                var new_scroll = sel;
+                var i = sel;
+                while (i > 0) {
+                    i -= 1;
+                    const tool_rows = 1 + expandedOutputRowCount(state.tools.items[i], content_width);
+                    if (rows_before_sel + tool_rows >= view_rows) break;
+                    rows_before_sel += tool_rows;
+                    new_scroll = i;
+                }
+                state.tool_scroll = new_scroll;
+            }
+        }
+    }
+    const max_scroll = state.tools.items.len -| 1;
+    if (state.tool_scroll > max_scroll) state.tool_scroll = max_scroll;
+
     var rows: usize = 1;
-    for (state.tools.items) |tool| {
+    for (state.tools.items, 0..) |tool, i| {
+        if (i < state.tool_scroll) continue;
         if (rows >= options.height) break;
         try writer.writeByte('\n');
-        try writer.writeAll("  ");
-        const status = try tui_theme.toolStatus(tool.status).render(allocator, statusText(tool.status));
-        defer allocator.free(status);
-        try writer.print("[{s}] {s}", .{ status, tool.label });
-        var meta_out: std.Io.Writer.Allocating = .init(allocator);
-        defer meta_out.deinit();
-        const meta_writer = &meta_out.writer;
-        const intent = try invocationDescription(allocator, tool.args_json);
-        defer if (intent) |value| allocator.free(value);
-        if (intent) |value| if (value.len > 0) try meta_writer.print(" - {s}", .{value});
-        if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
-            const raw = try formatBytes(allocator, tool.raw_total_bytes);
-            defer allocator.free(raw);
-            const returned = try formatBytes(allocator, tool.returned_total_bytes);
-            defer allocator.free(returned);
-            try meta_writer.print(" ({s}->{s}", .{ raw, returned });
-            if (tool.estimated_returned_tokens > 0) try meta_writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
-            try meta_writer.writeByte(')');
-        }
-        if (tool.artifact_count > 0) {
-            const raw = try formatBytes(allocator, tool.raw_total_bytes);
-            defer allocator.free(raw);
-            try meta_writer.print(" · {s} artifact · open/view/filter", .{raw});
-        } else if (tool.truncated) {
-            try meta_writer.writeAll(" · preview capped");
-        }
-        if (tool.expanded) try meta_writer.writeAll(" · expanded");
-        const prefix_visible = 5 + tui_text.visibleWidth(status) + tui_text.visibleWidth(tool.label);
-        const remaining = (options.width -| 4) -| prefix_visible;
-        const meta_str = meta_out.written();
-        if (meta_str.len > 0 and remaining > 0) {
-            const meta_truncated = try tui_text.truncateToWidth(allocator, meta_str, remaining);
-            defer allocator.free(meta_truncated);
-            try writer.writeAll(meta_truncated);
+        const selected = state.focus_pane == .tools and state.selected_tool_index == i;
+        if (selected) {
+            const line = try renderSelectedToolLine(allocator, &tool, inner_width);
+            defer allocator.free(line);
+            try writer.writeAll(line);
+        } else {
+            try writer.writeAll("  ");
+            const status = try tui_theme.toolStatus(tool.status).render(allocator, statusText(tool.status));
+            defer allocator.free(status);
+            try writer.print("[{s}] {s}", .{ status, tool.label });
+            const meta = try toolMetaText(allocator, &tool);
+            defer allocator.free(meta);
+            const prefix_visible = 5 + tui_text.visibleWidth(status) + tui_text.visibleWidth(tool.label);
+            const remaining = inner_width -| prefix_visible;
+            if (meta.len > 0 and remaining > 0) {
+                const meta_truncated = try tui_text.truncateToWidth(allocator, meta, remaining);
+                defer allocator.free(meta_truncated);
+                try writer.writeAll(meta_truncated);
+            }
         }
         rows += 1;
         if (tool.expanded and rows < options.height) {
-            rows = try renderExpandedOutput(allocator, writer, tool, options.width -| 4, options.height, rows);
+            rows = try renderExpandedOutput(allocator, writer, tool, inner_width, options.height, rows);
         }
     }
     const body = try out.toOwnedSlice();
     defer allocator.free(body);
-    return tui_theme.panel().width(@intCast(@min(options.width -| 4, std.math.maxInt(u16)))).render(allocator, body);
+    return tui_theme.panel().width(@intCast(@min(inner_width, std.math.maxInt(u16)))).render(allocator, body);
+}
+
+fn toolMetaText(allocator: std.mem.Allocator, tool: *const tui_state.ToolEntry) ![]const u8 {
+    var meta_out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer meta_out.deinit();
+    const meta_writer = &meta_out.writer;
+    const intent = try invocationDescription(allocator, tool.args_json);
+    defer if (intent) |value| allocator.free(value);
+    if (intent) |value| if (value.len > 0) try meta_writer.print(" - {s}", .{value});
+    if (tool.raw_total_bytes > 0 or tool.returned_total_bytes > 0) {
+        const raw = try formatBytes(allocator, tool.raw_total_bytes);
+        defer allocator.free(raw);
+        const returned = try formatBytes(allocator, tool.returned_total_bytes);
+        defer allocator.free(returned);
+        try meta_writer.print(" ({s}->{s}", .{ raw, returned });
+        if (tool.estimated_returned_tokens > 0) try meta_writer.print(", ~{d} tok", .{tool.estimated_returned_tokens});
+        try meta_writer.writeByte(')');
+    }
+    if (tool.artifact_count > 0) {
+        const raw = try formatBytes(allocator, tool.raw_total_bytes);
+        defer allocator.free(raw);
+        try meta_writer.print(" · {s} artifact · open/view/filter", .{raw});
+    } else if (tool.truncated) {
+        try meta_writer.writeAll(" · preview capped");
+    }
+    if (tool.expanded) try meta_writer.writeAll(" · expanded");
+    return meta_out.toOwnedSlice();
+}
+
+fn renderSelectedToolLine(allocator: std.mem.Allocator, tool: *const tui_state.ToolEntry, inner_width: usize) ![]const u8 {
+    var line_out: std.Io.Writer.Allocating = .init(allocator);
+    defer line_out.deinit();
+    const line_writer = &line_out.writer;
+    try line_writer.writeAll("  [");
+    try line_writer.writeAll(statusText(tool.status));
+    try line_writer.writeAll("] ");
+    try line_writer.writeAll(tool.label);
+    const meta = try toolMetaText(allocator, tool);
+    defer allocator.free(meta);
+    try line_writer.writeAll(meta);
+    const line_text = line_out.written();
+    const truncated = try tui_text.truncateToWidth(allocator, line_text, inner_width);
+    defer allocator.free(truncated);
+    const w: u16 = @intCast(@min(inner_width, std.math.maxInt(u16)));
+    return tui_theme.selection().width(w).render(allocator, truncated);
 }
 
 fn formatBytes(allocator: std.mem.Allocator, bytes: u64) ![]u8 {
@@ -162,13 +218,17 @@ fn statusText(status: tui_state.ToolStatus) []const u8 {
     };
 }
 
-fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, tool: tui_state.ToolEntry, width: usize, height: usize, rows: usize) !usize {
-    const source = if (tool.display_preview.len > 0)
+fn expandedSource(tool: tui_state.ToolEntry) []const u8 {
+    return if (tool.display_preview.len > 0)
         tool.display_preview
     else if (tool.output.items.len > 0)
         tool.output.items
     else
         tool.args_json;
+}
+
+fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, tool: tui_state.ToolEntry, width: usize, height: usize, rows: usize) !usize {
+    const source = expandedSource(tool);
     if (source.len == 0) return rows;
     const available_lines = height - rows;
     if (available_lines == 0) return rows;
@@ -194,6 +254,31 @@ fn renderExpandedOutput(allocator: std.mem.Allocator, writer: *std.Io.Writer, to
         }
     }
     return next_rows;
+}
+
+fn expandedOutputRowCount(tool: tui_state.ToolEntry, content_width: usize) usize {
+    if (!tool.expanded) return 0;
+    const source = expandedSource(tool);
+    if (source.len == 0 or content_width == 0) return 0;
+    var count: usize = 0;
+    var line_iter = std.mem.splitScalar(u8, source, '\n');
+    while (line_iter.next()) |logical_line| {
+        if (logical_line.len == 0) {
+            count += 1;
+            continue;
+        }
+        var remaining = logical_line;
+        while (remaining.len > 0) {
+            const take = takeDisplayWidth(remaining, content_width);
+            if (take.bytes == 0) {
+                remaining = remaining[1..];
+                continue;
+            }
+            count += 1;
+            remaining = remaining[take.bytes..];
+        }
+    }
+    return count;
 }
 
 const DisplayTake = struct {
@@ -398,4 +483,114 @@ test "tool panel keeps diff styling across wrapped segments and errors win" {
     try std.testing.expect(std.mem.indexOf(u8, text, "ghijklmnop") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "+ cmd fail") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "ed") != null);
+}
+
+test "tool panel highlights selected tool" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{}", .done));
+
+    state.focus_pane = .tools;
+    state.selected_tool_index = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Shell Command") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") != null);
+}
+
+test "tool panel scroll follows selected tool" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    for (0..5) |i| {
+        const id = try std.fmt.allocPrint(std.testing.allocator, "call-{d}", .{i});
+        defer std.testing.allocator.free(id);
+        try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, id, id, id, "{}", .done));
+    }
+
+    state.focus_pane = .tools;
+    state.selected_tool_index = 4;
+    state.tool_scroll = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqual(@as(usize, 2), state.tool_scroll);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call-4") != null);
+}
+
+test "tool panel scroll follows selected tool past expanded output" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-0", "call-0", "call-0", "{}", .done));
+    state.tools.items[0].expanded = true;
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "one\ntwo\nthree\nfour\nfive");
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "call-1", "call-1", "{}", .done));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "call-2", "call-2", "{}", .done));
+
+    state.focus_pane = .tools;
+    state.selected_tool_index = 2;
+    state.tool_scroll = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(state.tool_scroll > 0);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") != null);
+}
+
+test "tool panel scroll counts expanded display preview rows" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-0", "call-0", "call-0", "{}", .done));
+    state.tools.items[0].expanded = true;
+    state.tools.items[0].display_preview = try std.testing.allocator.dupe(u8, "preview one\npreview two\npreview three\npreview four\npreview five");
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "call-1", "call-1", "{}", .done));
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-2", "call-2", "call-2", "{}", .done));
+
+    state.focus_pane = .tools;
+    state.selected_tool_index = 2;
+    state.tool_scroll = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expectEqual(@as(usize, 1), state.tool_scroll);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "preview one") == null);
+}
+
+test "tool panel scroll counts blank expanded rows" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-0", "call-0", "call-0", "{}", .done));
+    state.tools.items[0].expanded = true;
+    try state.tools.items[0].output.appendSlice(std.testing.allocator, "\n\n\n\n\n");
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "call-1", "call-1", "{}", .done));
+
+    state.focus_pane = .tools;
+    state.selected_tool_index = 1;
+    state.tool_scroll = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(state.tool_scroll > 0);
+    try std.testing.expect(std.mem.indexOf(u8, text, "call-1") != null);
+}
+
+test "tool panel does not highlight when composer is focused" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.tools.append(std.testing.allocator, try tui_state.ToolEntry.init(std.testing.allocator, "call-1", "shell_command", "Shell Command", "{}", .done));
+
+    state.focus_pane = .composer;
+    state.selected_tool_index = 0;
+
+    const text = try render(std.testing.allocator, &state, .{ .width = 80, .height = 5 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "\x1b[48;2;") == null);
 }

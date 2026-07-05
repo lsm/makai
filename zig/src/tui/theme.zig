@@ -222,6 +222,10 @@ pub fn composerCursor() zz.Style {
     return (zz.Style{}).fg(palette.surface).bg(palette.text).bold(true).inline_style(true);
 }
 
+pub fn selection() zz.Style {
+    return (zz.Style{}).fg(palette.text).bg(palette.surface_alt).inline_style(true);
+}
+
 pub fn statusSegment() zz.Style {
     return (zz.Style{}).fg(palette.text).inline_style(true);
 }
