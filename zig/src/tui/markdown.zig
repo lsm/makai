@@ -349,6 +349,37 @@ fn writeQuotedLines(writer: *std.Io.Writer, body: []const u8) !void {
 // Math
 // ---------------------------------------------------------------------------
 
+/// Returns true if `source[i]` is preceded by an odd number of consecutive
+/// backslashes, i.e. it is LaTeX-escaped.
+fn isEscaped(source: []const u8, i: usize) bool {
+    if (i == 0) return false;
+    var backslashes: usize = 0;
+    var j = i;
+    while (j > 0 and source[j - 1] == '\\') {
+        backslashes += 1;
+        j -= 1;
+    }
+    return backslashes % 2 == 1;
+}
+
+/// Find the next unescaped `$` at or after `start`.
+fn findUnescapedDollar(source: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < source.len) : (i += 1) {
+        if (source[i] == '$' and !isEscaped(source, i)) return i;
+    }
+    return null;
+}
+
+/// Find the next unescaped `$$` at or after `start`.
+fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i + 1 < source.len) : (i += 1) {
+        if (source[i] == '$' and source[i + 1] == '$' and !isEscaped(source, i)) return i;
+    }
+    return null;
+}
+
 /// Try to consume a `$$...$$` block math span at `*i`. Returns true and
 /// advances `*i` past the closing `$$` on success. Returns false (without
 /// modifying `*i`) when the bytes at `*i` aren't a real block-math opener —
@@ -361,7 +392,7 @@ fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source
     // Reject `$$$` — ambiguous with inline math like `$$$x$$`.
     if (open + 2 < source.len and source[open + 2] == '$') return false;
     const body_start = open + 2;
-    const close = std.mem.indexOfPos(u8, source, body_start, "$$") orelse {
+    const close = findUnescapedDoubleDollar(source, body_start) orelse {
         // Unterminated — let the caller emit `$$` verbatim via the default
         // byte-by-byte path. We must NOT swallow the remainder.
         return false;
@@ -423,7 +454,7 @@ fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !boo
     }
 
     const body_start = open + 1;
-    const close = std.mem.indexOfScalarPos(u8, source, body_start, '$') orelse return false;
+    const close = findUnescapedDollar(source, body_start) orelse return false;
 
     // Closing `$` must not be preceded by whitespace, followed by another
     // `$`, followed by a digit (currency ranges), followed by an identifier
@@ -477,6 +508,12 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
                 }
                 if (next == '\\') {
                     try writer.writeByte('\n');
+                    i = j + 1;
+                    continue;
+                }
+                // Escaped literal characters render as themselves.
+                if (next == '$' or next == '%' or next == '&' or next == '#' or next == '_' or next == '{' or next == '}') {
+                    try writer.writeByte(next);
                     i = j + 1;
                     continue;
                 }
@@ -1034,7 +1071,7 @@ test "numeric display math renders as blockquote" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "> 2ⁿ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "> 100\\%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> 100%") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$$") == null);
 }
 
@@ -1089,7 +1126,24 @@ test "inline math starting with digits renders" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "2ⁿ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "100\\%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "100%") != null);
+}
+
+test "escaped dollar inside inline math is not treated as closer" {
+    const src = "price $x = \\$5$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The escaped \$ should render as a literal $ and the real closing $ should
+    // terminate the math span, so the whole formula renders as "x = $5".
+    try std.testing.expect(std.mem.indexOf(u8, out, "price x = $5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "price $x = \\5") == null);
+}
+
+test "escaped dollar inside block math is not treated as closer" {
+    const src = "$$x = \\$5$$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x = $5") != null);
 }
 
 test "adjacent shell variables are not parsed as math" {
