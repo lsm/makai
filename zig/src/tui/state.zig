@@ -668,6 +668,20 @@ pub const AppState = struct {
         self.selected_tool_index = null;
     }
 
+    pub fn selectedTool(self: *const AppState) ?*const ToolEntry {
+        if (self.tools.items.len == 0) return null;
+        const index = self.selected_tool_index orelse self.tools.items.len - 1;
+        if (index >= self.tools.items.len) return null;
+        return &self.tools.items[index];
+    }
+
+    pub fn selectedToolOutputText(self: *const AppState) ?[]const u8 {
+        const tool = self.selectedTool() orelse return null;
+        if (tool.display_preview.len > 0) return tool.display_preview;
+        if (tool.output.items.len > 0) return tool.output.items;
+        return null;
+    }
+
     pub fn resetReplayState(self: *AppState) void {
         self.clearTranscript();
         self.clearTools();
@@ -2326,6 +2340,29 @@ test "AppState clones registered tool metadata" {
     try state.setRegisteredTools(&replacement);
     try std.testing.expectEqual(@as(usize, 1), state.registered_tools.items.len);
     try std.testing.expectEqualStrings("file_read", state.registered_tools.items[0].name);
+}
+
+test "AppState tracks selected tool output" {
+    var state = AppState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const first = try state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
+    try first.output.appendSlice(std.testing.allocator, "first output");
+    const second = try state.upsertToolForTest("call-2", "shell_execute", "{}", .done);
+    try second.output.appendSlice(std.testing.allocator, "second output");
+
+    try std.testing.expectEqual(@as(?usize, null), state.selected_tool_index);
+    try std.testing.expectEqualStrings("second output", state.selectedToolOutputText().?);
+    state.focus_pane = .tools;
+    state.selected_tool_index = 1;
+    state.moveSelection(-1);
+    try std.testing.expectEqualStrings("first output", state.selectedToolOutputText().?);
+    const third = try state.upsertToolForTest("call-3", "shell_execute", "{}", .done);
+    try third.output.appendSlice(std.testing.allocator, "third output");
+    try std.testing.expectEqual(@as(?usize, 0), state.selected_tool_index);
+    try std.testing.expectEqualStrings("first output", state.selectedToolOutputText().?);
+    state.clearTools();
+    try std.testing.expect(state.selectedToolOutputText() == null);
 }
 
 test "AppState tool_result message_end updates active tool entry only" {

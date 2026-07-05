@@ -53,6 +53,7 @@ pub const CommandAction = enum {
     start_login_provider,
     copy_last,
     copy_all,
+    copy_tool,
     open_artifact_viewer,
     open_export_picker,
     export_file,
@@ -105,7 +106,7 @@ pub const commands = [_]CommandInfo{
     .{ .name = "view", .kind = .view, .usage = "/view [everything|verbose|balanced|chat]", .description = "Show or set transcript detail level", .handler = handleView },
     .{ .name = "compact", .kind = .compact, .usage = "/compact", .description = "Compact conversation context", .handler = handleCompact },
     .{ .name = "clear", .kind = .clear, .usage = "/clear", .description = "Clear transcript display", .handler = handleClear },
-    .{ .name = "copy", .kind = .copy, .usage = "/copy [all]", .description = "Copy last reply (or whole transcript) to clipboard", .handler = handleCopy },
+    .{ .name = "copy", .kind = .copy, .usage = "/copy [all|tool]", .description = "Copy last reply, transcript, or selected tool output", .handler = handleCopy },
     .{ .name = "artifact", .kind = .artifact, .usage = "/artifact", .description = "Open the latest artifact in a local viewer", .handler = handleArtifact },
     .{ .name = "export", .kind = .@"export", .usage = "/export [path.md]", .description = "Export transcript to clipboard or file", .handler = handleExport },
     .{ .name = "diff", .kind = .diff, .usage = "/diff", .description = "Show pending file changes", .handler = handleDiff },
@@ -405,8 +406,12 @@ fn handleCopy(ctx: CommandContext, command: Command) !CommandResult {
     _ = ctx;
     // The app stages the clipboard write and reports status itself, so no output.
     if (command.arg) |arg| {
-        if (std.mem.eql(u8, std.mem.trim(u8, arg, " \t"), "all")) {
+        const trimmed = std.mem.trim(u8, arg, " \t");
+        if (std.mem.eql(u8, trimmed, "all")) {
             return .{ .action = .copy_all };
+        }
+        if (std.mem.eql(u8, trimmed, "tool")) {
+            return .{ .action = .copy_tool };
         }
     }
     return .{ .action = .copy_last };
@@ -887,6 +892,10 @@ test "copy command selects last reply or whole transcript" {
     var all = try dispatch(ctx, .{ .kind = .copy, .arg = "all" });
     defer all.deinit(std.testing.allocator);
     try std.testing.expectEqual(CommandAction.copy_all, all.action);
+
+    var tool = try dispatch(ctx, .{ .kind = .copy, .arg = "tool" });
+    defer tool.deinit(std.testing.allocator);
+    try std.testing.expectEqual(CommandAction.copy_tool, tool.action);
 }
 
 test "export command opens picker or targets file" {
