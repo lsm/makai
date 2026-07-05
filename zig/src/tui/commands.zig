@@ -568,6 +568,12 @@ fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     }
     if (!matched) return error.InvalidUrl;
 
+    const after_scheme = url[scheme_end + 3 ..];
+    var authority_end: usize = 0;
+    while (authority_end < after_scheme.len and after_scheme[authority_end] != '/' and after_scheme[authority_end] != '?' and after_scheme[authority_end] != '#') : (authority_end += 1) {}
+    const authority = after_scheme[0..authority_end];
+    if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.InvalidUrl;
+
     if (std.mem.eql(u8, scheme, "http") or std.mem.eql(u8, scheme, "https")) {
         _ = sse_transport.parseHttpUrl(url) catch return error.InvalidUrl;
         return;
@@ -576,10 +582,10 @@ fn validateUrlScheme(url: []const u8, schemes: []const []const u8) !void {
     const after = url[scheme_end + 3 ..];
     var auth_end: usize = 0;
     while (auth_end < after.len and after[auth_end] != '/' and after[auth_end] != '?' and after[auth_end] != '#') : (auth_end += 1) {}
-    const authority = after[0..auth_end];
-    if (authority.len == 0) return error.InvalidUrl;
-    var host = authority;
-    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| host = authority[at + 1 ..];
+    const ws_authority = after[0..auth_end];
+    if (ws_authority.len == 0) return error.InvalidUrl;
+    var host = ws_authority;
+    if (std.mem.lastIndexOfScalar(u8, ws_authority, '@')) |at| host = ws_authority[at + 1 ..];
     if (std.mem.indexOfScalar(u8, host, ':')) |colon| host = host[0..colon];
     if (host.len == 0) return error.InvalidUrl;
 }
@@ -1320,6 +1326,21 @@ test "remote command rejects sse endpoint with fragment" {
     defer store.deinit();
 
     var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://localhost#events");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.is_error);
+
+    var loaded = try store.load();
+    defer loaded.deinit(std.testing.allocator);
+    try std.testing.expect(!loaded.remote.enabled);
+}
+
+test "remote command rejects sse endpoint with userinfo" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var store = try remoteTestStore(std.testing.allocator, &tmp);
+    defer store.deinit();
+
+    var result = try applyRemoteCommand(std.testing.allocator, store, "sse http://token@localhost:8080/events");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(result.is_error);
 

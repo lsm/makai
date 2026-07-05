@@ -134,10 +134,28 @@ fn hasWhitespaceOrControl(value: []const u8) bool {
     return false;
 }
 
+fn hasCrLf(value: []const u8) bool {
+    return std.mem.indexOfAny(u8, value, "\r\n") != null;
+}
+
+fn isTchar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or switch (ch) {
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
+fn isValidHeaderName(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |ch| if (!isTchar(ch)) return false;
+    return true;
+}
+
 fn isValidSavedSseEndpoint(endpoint: []const u8) bool {
     if (endpoint.len == 0) return false;
     if (hasWhitespaceOrControl(endpoint)) return false;
     if (std.mem.indexOfScalar(u8, endpoint, '#') != null) return false;
+    if (std.mem.indexOfScalar(u8, endpoint, '@') != null) return false;
     const parsed = sse_transport.parseHttpUrl(endpoint) catch return false;
     return parsed.scheme == .http;
 }
@@ -180,13 +198,15 @@ pub fn remoteConfigFromConfig(allocator: std.mem.Allocator, cfg: tui_config.Conf
         for (headers.items) |*header| header.deinit(allocator);
         headers.deinit(allocator);
     }
-    if (cfg.remote.auth_token.len > 0) {
+    if (cfg.remote.auth_token.len > 0 and !hasCrLf(cfg.remote.auth_token)) {
         const value = try std.fmt.allocPrint(allocator, "Bearer {s}", .{cfg.remote.auth_token});
         errdefer allocator.free(value);
         try headers.append(allocator, .{ .name = try allocator.dupe(u8, "Authorization"), .value = value });
-    } else if (cfg.remote.auth_header_value.len > 0) {
+    } else if (cfg.remote.auth_header_value.len > 0 and !hasCrLf(cfg.remote.auth_header_value)) {
         const name = if (cfg.remote.auth_header_name.len > 0) cfg.remote.auth_header_name else "Authorization";
-        try headers.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, cfg.remote.auth_header_value) });
+        if (isValidHeaderName(name)) {
+            try headers.append(allocator, .{ .name = try allocator.dupe(u8, name), .value = try allocator.dupe(u8, cfg.remote.auth_header_value) });
+        }
     }
     if (headers.items.len > 0) {
         result.auth_headers = try headers.toOwnedSlice(allocator);
@@ -4164,6 +4184,50 @@ test "remoteConfigFromConfig falls back to local for invalid saved sse endpoint"
     defer rc.deinit(std.testing.allocator);
     try std.testing.expectEqual(TuiRemoteTransport.sse, rc.transport);
     try std.testing.expectEqual(TuiBackendMode.local, rc.mode);
+}
+
+test "remoteConfigFromConfig drops saved auth token with CRLF" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_token = try std.testing.allocator.dupe(u8, "secret\r\nInjected: yes");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "remoteConfigFromConfig drops invalid saved custom auth header" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_header_name = try std.testing.allocator.dupe(u8, "Bad:Name");
+    cfg.remote.auth_header_value = try std.testing.allocator.dupe(u8, "value");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
+}
+
+test "remoteConfigFromConfig drops saved custom auth header with CRLF" {
+    var cfg = try tui_config.Config.defaults(std.testing.allocator);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.remote.deinit(std.testing.allocator);
+    cfg.remote.enabled = true;
+    cfg.remote.transport = try std.testing.allocator.dupe(u8, "sse");
+    cfg.remote.endpoint = try std.testing.allocator.dupe(u8, "http://localhost:8080/events");
+    cfg.remote.auth_header_name = try std.testing.allocator.dupe(u8, "X-Api-Key");
+    cfg.remote.auth_header_value = try std.testing.allocator.dupe(u8, "value\r\nInjected: yes");
+
+    var rc = try remoteConfigFromConfig(std.testing.allocator, cfg);
+    defer rc.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), rc.auth_headers.len);
 }
 
 test "remoteConfigFromConfig skips empty allocations" {
