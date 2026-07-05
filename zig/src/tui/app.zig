@@ -971,6 +971,7 @@ pub const App = struct {
             try self.hydrateToolDisplayPreview(ev);
         }
         self.refreshQueuedCounts();
+        self.syncBackpressureState();
         if (completed_agent_end and self.state.queue.total() > 0) {
             session.resumeSession() catch |err| {
                 try self.state.status.setError(self.allocator, @errorName(err));
@@ -979,7 +980,6 @@ pub const App = struct {
             };
             self.refreshQueuedCounts();
         }
-        self.syncBackpressureState();
     }
 
     fn applyRuntimeEvent(self: *App, event: tui_runtime.TuiEvent) !void {
