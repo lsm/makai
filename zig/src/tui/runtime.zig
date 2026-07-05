@@ -13,6 +13,7 @@ const transport = @import("transport");
 const in_process = @import("transports/in_process");
 const stdio_transport = @import("transports/stdio");
 const sse_transport = @import("transports/sse");
+const websocket_transport = @import("transports/websocket");
 const json_writer = @import("json_writer");
 const model_ref = @import("model_ref");
 const session = @import("tui_session");
@@ -105,6 +106,7 @@ pub const TuiRemoteConfig = struct {
     command: []const u8 = "",
     auth_token: []const u8 = "",
     auth_headers: []const ai_types.HeaderPair = &.{},
+    subprotocol: ?[]const u8 = "makai.v1",
 
     pub fn deinit(self: *TuiRemoteConfig, allocator: std.mem.Allocator) void {
         if (self.endpoint.len > 0) allocator.free(self.endpoint);
@@ -272,6 +274,16 @@ fn deinitModels(allocator: std.mem.Allocator, models: []ai_types.Model) void {
     allocator.free(models);
 }
 
+fn mapWebSocketConnectError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InvalidUrl, error.InvalidScheme, error.MissingHost, error.InvalidPort => error.InvalidRemoteUrl,
+        error.TlsNotSupported => error.RemoteTlsNotSupported,
+        error.ConnectionFailed, error.ConnectionRefused, error.NetworkUnreachable, error.HostLacksNetworkAddresses, error.TemporaryNameServerFailure, error.NameServerFailure, error.UnknownHostName => error.RemoteConnectionFailed,
+        error.HandshakeFailed, error.NotConnected, error.EndOfStream, error.ConnectionResetByPeer, error.BrokenPipe, error.UnexpectedReadFailure, error.UnexpectedWriteFailure => error.RemoteHandshakeFailed,
+        else => err,
+    };
+}
+
 pub const TuiRuntime = struct {
     allocator: std.mem.Allocator,
     backend: TuiBackendMode,
@@ -286,6 +298,10 @@ pub const TuiRuntime = struct {
     remote_config_sse_client: ?*sse_transport.SseHttpClient = null,
     remote_config_sse_endpoint: []u8 = &.{},
     remote_config_sse_headers: []ai_types.HeaderPair = &.{},
+    websocket_client: ?*websocket_transport.WebSocketClient = null,
+    websocket_handle: ?*websocket_transport.AsyncStreamHandle = null,
+    websocket_subprotocol: ?[]u8 = null,
+    remote_config_websocket_owned: bool = false,
     remote_sender: ?transport.AsyncSender = null,
     remote_receiver: ?RemoteLineReceiver = null,
     remote_session_id: ?agent_protocol_types.SessionId = null,
@@ -376,6 +392,10 @@ pub const TuiRuntime = struct {
         var remote_config_sse_client: ?*sse_transport.SseHttpClient = null;
         var remote_config_sse_endpoint: []u8 = &.{};
         var remote_config_sse_headers: []ai_types.HeaderPair = &.{};
+        var websocket_client: ?*websocket_transport.WebSocketClient = null;
+        var websocket_handle: ?*websocket_transport.AsyncStreamHandle = null;
+        var websocket_subprotocol: ?[]u8 = null;
+        var remote_config_websocket_owned = false;
         var remote_sender = options.remote_sender;
         var remote_receiver = options.remote_receiver;
         errdefer if (remote_config_stream_handle) |handle| {
@@ -393,6 +413,13 @@ pub const TuiRuntime = struct {
             for (remote_config_sse_headers) |*header| header.deinit(allocator);
             if (remote_config_sse_headers.len > 0) allocator.free(remote_config_sse_headers);
         }
+        errdefer if (websocket_client) |client| { client.deinit(); allocator.destroy(client); };
+        errdefer if (websocket_subprotocol) |sp| allocator.free(sp);
+        errdefer if (websocket_handle) |handle| {
+            if (!handle.deinit(5_000)) {
+                websocket_client = null;
+            }
+        };
         if (resolved_backend == .remote and remote_sender == null and remote_receiver == null and options.remote_config.mode == .remote) {
             switch (options.remote_config.transport) {
                 .stdio => {
@@ -446,7 +473,37 @@ pub const TuiRuntime = struct {
                     remote_sender = client.asyncSender();
                     remote_receiver = .{ .ctx = client, .read_line_fn = remoteConfigSseReadLine, .read_result_fn = remoteConfigSseReadResult, .close_fn = remoteConfigSseClose };
                 },
-                .websocket => return error.UnsupportedRemoteTransport,
+                .websocket => {
+                    if (options.remote_config.endpoint.len == 0) return error.UnsupportedRemoteEndpoint;
+                    const client = try allocator.create(websocket_transport.WebSocketClient);
+                    client.* = websocket_transport.WebSocketClient.init(allocator);
+                    errdefer { client.deinit(); allocator.destroy(client); }
+                    client.connectWithSubprotocol(options.remote_config.endpoint, options.remote_config.auth_headers, options.remote_config.subprotocol) catch |err| return mapWebSocketConnectError(err);
+                    const handle = try client.receiveStreamWithHandle(allocator);
+                    var handle_moved = false;
+                    errdefer if (!handle_moved) { _ = handle.deinit(5_000); };
+                    remote_config_sse_endpoint = try allocator.dupe(u8, options.remote_config.endpoint);
+                    const cloned_headers = try allocator.alloc(ai_types.HeaderPair, options.remote_config.auth_headers.len);
+                    var cloned_header_count: usize = 0;
+                    var cloned_headers_moved = false;
+                    errdefer if (!cloned_headers_moved) {
+                        for (cloned_headers[0..cloned_header_count]) |*header| header.deinit(allocator);
+                        allocator.free(cloned_headers);
+                    };
+                    for (options.remote_config.auth_headers, 0..) |header, i| {
+                        cloned_headers[i] = .{ .name = try allocator.dupe(u8, header.name), .value = try allocator.dupe(u8, header.value) };
+                        cloned_header_count += 1;
+                    }
+                    remote_config_sse_headers = cloned_headers;
+                    cloned_headers_moved = true;
+                    if (options.remote_config.subprotocol) |sp| websocket_subprotocol = try allocator.dupe(u8, sp);
+                    websocket_client = client;
+                    websocket_handle = handle;
+                    handle_moved = true;
+                    remote_config_websocket_owned = true;
+                    remote_sender = client.asyncSender();
+                    remote_receiver = .{ .ctx = handle, .read_line_fn = websocketReadLine, .read_result_fn = websocketReadResult, .close_fn = websocketClose };
+                },
             }
         }
 
@@ -466,6 +523,10 @@ pub const TuiRuntime = struct {
             .remote_config_sse_client = remote_config_sse_client,
             .remote_config_sse_endpoint = remote_config_sse_endpoint,
             .remote_config_sse_headers = remote_config_sse_headers,
+            .websocket_client = websocket_client,
+            .websocket_handle = websocket_handle,
+            .websocket_subprotocol = websocket_subprotocol,
+            .remote_config_websocket_owned = remote_config_websocket_owned,
             .remote_sender = remote_sender,
             .remote_receiver = remote_receiver,
             .remote_session_timeout_ms = options.remote_session_timeout_ms,
@@ -493,6 +554,9 @@ pub const TuiRuntime = struct {
         remote_config_sse_client = null;
         remote_config_sse_endpoint = &.{};
         remote_config_sse_headers = &.{};
+        websocket_client = null;
+        websocket_handle = null;
+        websocket_subprotocol = null;
         original_tools = &.{};
         wrapped_tools = &.{};
         models = &.{};
@@ -557,6 +621,12 @@ pub const TuiRuntime = struct {
         if (self.remote_config_sse_endpoint.len > 0) self.allocator.free(self.remote_config_sse_endpoint);
         for (self.remote_config_sse_headers) |*header| header.deinit(self.allocator);
         if (self.remote_config_sse_headers.len > 0) self.allocator.free(self.remote_config_sse_headers);
+        var websocket_handle_exited = true;
+        if (self.websocket_handle) |handle| websocket_handle_exited = handle.deinit(5_000);
+        if (websocket_handle_exited) {
+            if (self.websocket_client) |client| { client.deinit(); self.allocator.destroy(client); }
+        }
+        if (self.websocket_subprotocol) |sp| self.allocator.free(sp);
         self.clearPendingApproval();
         self.tool_protocol.deinit();
         self.allocator.free(self.workspace_root);
@@ -579,8 +649,12 @@ pub const TuiRuntime = struct {
                 var client = agent_protocol_client.AgentProtocolClient.init(self.allocator);
                 var client_moved = false;
                 errdefer if (!client_moved) client.deinit();
+                errdefer if (!client_moved and self.remote_config_websocket_owned) self.clearWebSocketRemote();
                 if (self.remote_config_sse_client) |sse_client| {
                     if (!sse_client.connected) try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+                }
+                if (self.remote_config_sse_client == null and self.websocket_client == null and self.remote_config_sse_endpoint.len > 0) {
+                    try self.reconnectWebSocketRemote();
                 }
                 const sender = self.remote_sender orelse return error.NoRemoteTransportConfigured;
                 _ = self.remote_receiver orelse return error.NoRemoteTransportConfigured;
@@ -598,10 +672,14 @@ pub const TuiRuntime = struct {
                 self.remote_error_emitted = false;
                 self.remote_reconnect_attempted = false;
                 self.pumpRemoteIncoming() catch |err| {
+                    // Cancel the WebSocket reader before closing the sender so the
+                    // close path cannot clear buffers while receive() is using them.
+                    if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
                     if (self.remote_sender) |remote_sender| remote_sender.close();
-                    if (self.remote_config_stream_handle == null) {
+                    if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
                         if (self.remote_receiver) |*remote_receiver| remote_receiver.close();
                     }
+                    self.clearWebSocketRemote();
                     if (self.remote_client) |*remote_client| remote_client.deinit();
                     self.remote_client = null;
                     self.remote_session_id = null;
@@ -653,10 +731,14 @@ pub const TuiRuntime = struct {
                 _ = client.sendAgentStop(sid, "client disconnect") catch {};
                 client.removeSessionState(sid);
             }
+            // Cancel and join the WebSocket reader before closing the sender so
+            // the close path cannot clear buffers while receive() is using them.
+            if (self.remote_config_websocket_owned) _ = self.shutdownWebSocketReader();
             if (self.remote_sender) |sender| sender.close();
-            if (self.remote_config_stream_handle == null) {
+            if (self.remote_config_stream_handle == null and self.websocket_handle == null and !self.remote_config_websocket_owned) {
                 if (self.remote_receiver) |*receiver| receiver.close();
             }
+            self.clearWebSocketRemote();
             client.deinit();
             self.remote_client = null;
             self.remote_session_id = null;
@@ -1381,9 +1463,10 @@ pub const TuiRuntime = struct {
     }
 
     fn sendRemoteMessages(self: *TuiRuntime, messages: []const ai_types.Message, emit_tail_prompt: bool) !void {
+        if (self.remote_config_websocket_owned) try self.ensureRemoteWebSocketConnection(false);
         try self.ensureRemoteSession();
         const client = &(self.remote_client orelse return error.RuntimeNotStarted);
-        const sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+        var sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
         const message_json = try makeRemoteMessageJson(self.allocator, self.currentModel(), messages, self.remoteSerializableTools());
         defer self.allocator.free(message_json);
         self.resetEventStreamForTurn();
@@ -1399,7 +1482,24 @@ pub const TuiRuntime = struct {
         defer self.allocator.free(options_json);
         self.remote_echo_suppression_remaining = messages.len;
         self.remote_current_message_role = null;
-        _ = try client.sendAgentMessage(sid, message_json, options_json);
+
+        var reconnected_once = false;
+        while (true) {
+            const result = client.sendAgentMessage(sid, message_json, options_json) catch |err| {
+                const reconnectable = err == error.NotConnected or err == error.BrokenPipe or err == error.ConnectionResetByPeer;
+                if (self.remote_config_websocket_owned and reconnectable and !reconnected_once) {
+                    reconnected_once = true;
+                    try self.ensureRemoteWebSocketConnection(true);
+                    try self.ensureRemoteSession();
+                    sid = self.remote_session_id orelse return error.RemoteAgentStartFailed;
+                    continue;
+                }
+                return err;
+            };
+            _ = result;
+            break;
+        }
+
         if (emit_tail_prompt) try self.pushRemoteTailPromptEvent(messages);
         self.pumpRemoteIncoming() catch |err| {
             try self.completeRemoteWithError(@errorName(err));
@@ -1545,6 +1645,93 @@ pub const TuiRuntime = struct {
         self.stream_active = false;
     }
 
+    fn clearWebSocketRemote(self: *TuiRuntime) void {
+        if (self.websocket_handle) |handle| {
+            self.websocket_handle = null;
+            if (!handle.deinit(5_000)) {
+                self.websocket_client = null;
+                if (self.remote_config_websocket_owned) {
+                    self.remote_sender = null;
+                    self.remote_receiver = null;
+                }
+                return;
+            }
+        }
+        if (self.websocket_client) |ws_client| {
+            ws_client.deinit();
+            self.allocator.destroy(ws_client);
+            self.websocket_client = null;
+        }
+        if (self.remote_config_websocket_owned) {
+            self.remote_sender = null;
+            self.remote_receiver = null;
+        }
+    }
+
+    /// Cancel and join the WebSocket reader thread, returning true if the thread
+    /// exited cleanly. On a timeout/detach the client reference is dropped to
+    /// avoid use-after-free by any dangling sender/receiver handles.
+    fn shutdownWebSocketReader(self: *TuiRuntime) bool {
+        if (self.websocket_handle) |handle| {
+            self.websocket_handle = null;
+            if (!handle.deinit(5_000)) {
+                self.websocket_client = null;
+                if (self.remote_config_websocket_owned) {
+                    self.remote_sender = null;
+                    self.remote_receiver = null;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Detect an idle WebSocket disconnect before writing a turn. If the reader
+    /// thread has finished the byte stream, clear the stale session and reconnect
+    /// so the next send goes through a live socket. When `force` is true, reconnect
+    /// regardless of the current liveness heuristic (used after a write-side error).
+    fn ensureRemoteWebSocketConnection(self: *TuiRuntime, force: bool) !void {
+        if (!self.remote_config_websocket_owned) return;
+        const disconnected = force or blk: {
+            if (self.websocket_client == null) break :blk true;
+            if (self.websocket_handle) |handle| if (handle.stream.isDone()) break :blk true;
+            break :blk false;
+        };
+        if (!disconnected) return;
+
+        if (self.remote_session_id) |sid| {
+            if (self.remote_client) |*client| client.removeSessionState(sid);
+            self.remote_session_id = null;
+        }
+        self.remote_pending_session_id = null;
+        self.clearWebSocketRemote();
+        if (self.remote_config_sse_endpoint.len == 0) return error.NoRemoteTransportConfigured;
+        try self.reconnectWebSocketRemote();
+        if (self.remote_client) |*client| {
+            client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
+        } else {
+            return error.RuntimeNotStarted;
+        }
+    }
+
+    fn reconnectWebSocketRemote(self: *TuiRuntime) !void {
+        const client = try self.allocator.create(websocket_transport.WebSocketClient);
+        client.* = websocket_transport.WebSocketClient.init(self.allocator);
+        errdefer {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+
+        client.connectWithSubprotocol(self.remote_config_sse_endpoint, self.remote_config_sse_headers, self.websocket_subprotocol) catch |err| return mapWebSocketConnectError(err);
+        const handle = try client.receiveStreamWithHandle(self.allocator);
+        errdefer { _ = handle.deinit(5_000); }
+
+        self.websocket_client = client;
+        self.websocket_handle = handle;
+        self.remote_sender = client.asyncSender();
+        self.remote_receiver = .{ .ctx = handle, .read_line_fn = websocketReadLine, .read_result_fn = websocketReadResult, .close_fn = websocketClose };
+    }
+
     fn handleRemoteDisconnect(self: *TuiRuntime) !void {
         if (!self.started) return error.ConnectionRefused;
         if (!self.remote_reconnect_attempted) {
@@ -1555,6 +1742,11 @@ pub const TuiRuntime = struct {
             self.remote_session_id = null;
             if (self.remote_config_sse_client) |sse_client| {
                 try sse_client.connect(self.remote_config_sse_endpoint, self.remote_config_sse_headers);
+            }
+            self.clearWebSocketRemote();
+            if (self.remote_config_sse_client == null and self.remote_config_sse_endpoint.len > 0) {
+                try self.reconnectWebSocketRemote();
+                client.setSender(self.remote_sender orelse return error.NoRemoteTransportConfigured);
             }
             if (was_stream_active) {
                 try self.completeRemoteWithError("remote connection disconnected");
@@ -4107,8 +4299,20 @@ test "remote config rejects unsupported endpoint" {
     try std.testing.expectError(error.UnsupportedRemoteEndpoint, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .stdio, .endpoint = "remote" } }));
 }
 
-test "remote config rejects unsupported transport" {
-    try std.testing.expectError(error.UnsupportedRemoteTransport, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "ws://localhost:1" } }));
+test "remote config websocket rejects empty endpoint" {
+    try std.testing.expectError(error.UnsupportedRemoteEndpoint, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "" } }));
+}
+
+test "remote config websocket maps invalid url to InvalidRemoteUrl" {
+    try std.testing.expectError(error.InvalidRemoteUrl, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "not-a-url" } }));
+}
+
+test "remote config websocket maps wss to RemoteTlsNotSupported" {
+    try std.testing.expectError(error.RemoteTlsNotSupported, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "wss://localhost:1/" } }));
+}
+
+test "remote config websocket maps refused connection to RemoteConnectionFailed" {
+    try std.testing.expectError(error.RemoteConnectionFailed, TuiRuntime.init(std.testing.allocator, .{ .remote_config = .{ .mode = .remote, .transport = .websocket, .endpoint = "ws://127.0.0.1:1/" } }));
 }
 
 test "remoteConfigFromConfig falls back to local for saved stdio" {
@@ -5526,4 +5730,36 @@ fn remotePipeReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u
 
 fn remotePipeReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
     return if (try remotePipeReadLine(ctx, allocator)) |line| .{ .line = line } else .pending;
+}
+
+fn byteStreamReadResult(stream: *transport.ByteStream, allocator: std.mem.Allocator) !RemoteReadResult {
+    if (stream.poll()) |chunk| {
+        var owned_chunk = chunk;
+        const line = try allocator.dupe(u8, owned_chunk.data);
+        owned_chunk.deinit(allocator);
+        return .{ .line = line };
+    }
+    if (stream.isDone()) {
+        if (stream.getError()) |_| return error.RemoteTransportError;
+        return .disconnected;
+    }
+    return .pending;
+}
+
+fn websocketReadLine(ctx: *anyopaque, allocator: std.mem.Allocator) !?[]const u8 {
+    const handle: *websocket_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
+    return switch (try byteStreamReadResult(handle.stream, allocator)) {
+        .line => |line| line,
+        .pending, .disconnected => null,
+    };
+}
+
+fn websocketReadResult(ctx: *anyopaque, allocator: std.mem.Allocator) !RemoteReadResult {
+    const handle: *websocket_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
+    return byteStreamReadResult(handle.stream, allocator);
+}
+
+fn websocketClose(ctx: *anyopaque) void {
+    const handle: *websocket_transport.AsyncStreamHandle = @ptrCast(@alignCast(ctx));
+    handle.cancel();
 }
