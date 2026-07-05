@@ -77,16 +77,28 @@ fn isAtLineStart(source: []const u8, i: usize) bool {
     return source[i - 1] == '\n';
 }
 
-/// Consume a single-backtick inline code span verbatim. Returns false for
-/// triple-backtick fences (handled by consumeFenceBlock) and unterminated
-/// spans so the default byte path preserves source.
+/// Consume an inline code span verbatim. Returns false for fenced code block
+/// runs (handled by consumeFenceBlock) and unterminated spans so the default
+/// byte path preserves source.
 fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const start = i.*;
-    if (start + 2 < source.len and source[start + 1] == '`' and source[start + 2] == '`') return false;
-    const close = std.mem.indexOfScalarPos(u8, source, start + 1, '`') orelse return false;
-    try writer.writeAll(source[start .. close + 1]);
-    i.* = close + 1;
-    return true;
+    var tick_count: usize = 0;
+    while (start + tick_count < source.len and source[start + tick_count] == '`') tick_count += 1;
+    if (tick_count >= 3) return false;
+
+    var scan = start + tick_count;
+    while (scan < source.len) : (scan += 1) {
+        if (source[scan] != '`') continue;
+        var close_count: usize = 0;
+        while (scan + close_count < source.len and source[scan + close_count] == '`') close_count += 1;
+        if (close_count == tick_count) {
+            try writer.writeAll(source[start .. scan + close_count]);
+            i.* = scan + close_count;
+            return true;
+        }
+        scan += close_count - 1;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -436,11 +448,10 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
             try writer.writeByte('\\');
             try writer.writeAll(name);
             var after = j;
-            if (after < body.len and body[after] == '{') {
-                if (readGroup(body, after)) |grp| {
-                    try writer.writeAll(body[after..grp.end]);
-                    after = grp.end;
-                }
+            while (after < body.len and body[after] == '{') {
+                const grp = readGroup(body, after) orelse break;
+                try writer.writeAll(body[after..grp.end]);
+                after = grp.end;
             }
             i = after;
             continue;
@@ -1030,6 +1041,15 @@ test "inline code span is not parsed as math" {
     try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
 }
 
+test "multi-backtick inline code span is not parsed as math" {
+    const src = "Use ``echo $x$`` then $\\alpha$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "``echo $x$``") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "echo x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
+}
+
 test "unterminated block math passes through verbatim per doc" {
     const src = "text $$\\alpha no closer";
     const out = try preprocess(std.testing.allocator, src);
@@ -1061,6 +1081,14 @@ test "unknown LaTeX command with brace argument preserves group" {
     // the raw fallback stays copyable (NOT `\boxedx+1`).
     try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed{x+1}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\boxedx") == null);
+}
+
+test "unknown LaTeX command with multiple brace arguments preserves groups" {
+    const src = "choose $\\binom{n}{k}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\binom{n}{k}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\binom{n}k") == null);
 }
 
 test "escaped braces inside group do not corrupt depth" {
