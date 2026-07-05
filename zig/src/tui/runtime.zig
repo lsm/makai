@@ -342,6 +342,10 @@ pub const TuiRuntime = struct {
     run_async: bool = true,
     dropped_event_count: u64 = 0,
     dropped_since_warning: u64 = 0,
+    /// Monotonic generation counter incremented at the start of each turn. Events
+    /// are stamped with the current generation so the TUI can distinguish stale
+    /// events from a cancelled run from fresh events belonging to a new turn.
+    current_generation: u32 = 0,
     backpressure_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     backpressure_status_active_emitted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     backpressure_mutex: std.atomic.Mutex = .unlocked,
@@ -1201,6 +1205,7 @@ pub const TuiRuntime = struct {
     }
 
     fn resetEventStreamForTurn(self: *TuiRuntime) void {
+        self.current_generation +%= 1;
         if (!self.stream_active or self.event_stream.isDone()) {
             self.event_stream.deinit();
             self.event_stream = TuiEventStream.init(self.allocator);
@@ -1253,7 +1258,9 @@ pub const TuiRuntime = struct {
         // Preserve the newest event (mainline TUI behavior) and count the
         // evicted oldest event as the drop. Flush the warning after the real
         // event so a pending warning cannot steal the only free slot.
-        self.pushDroppingOldestCounted(event);
+        var mutable = event;
+        mutable.setGeneration(self.current_generation);
+        self.pushDroppingOldestCounted(mutable);
         self.flushDroppedWarning();
     }
 
@@ -1262,7 +1269,9 @@ pub const TuiRuntime = struct {
         // is saturated. After queuing the terminal event, force any warning from
         // terminal-path evictions into the stream too; there may be no later push
         // before the stream completes.
-        self.pushDroppingOldestCounted(event);
+        var mutable = event;
+        mutable.setGeneration(self.current_generation);
+        self.pushDroppingOldestCounted(mutable);
         self.flushDroppedWarningDroppingOldest();
     }
 
@@ -2001,8 +2010,8 @@ pub const TuiRuntime = struct {
         const obj = parsed.value.object;
         const type_name = getJsonString(obj, "type") orelse return error.InvalidRemoteEvent;
 
-        if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.agent_start);
-        if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.turn_start);
+        if (std.mem.eql(u8, type_name, "agent_start")) return self.push(.{ .agent_start = .{} });
+        if (std.mem.eql(u8, type_name, "turn_start")) return self.push(.{ .turn_start = .{} });
         if (std.mem.eql(u8, type_name, "message_start")) {
             if (self.remote_echo_suppression_remaining > 0) return;
             const role = parseRemoteMessageRole(getJsonString(obj, "role"));
@@ -2111,8 +2120,8 @@ pub const TuiRuntime = struct {
 
     fn handleAgentEvent(self: *TuiRuntime, event: agent.AgentEvent) !void {
         switch (event) {
-            .agent_start => self.push(.agent_start),
-            .turn_start => self.push(.turn_start),
+            .agent_start => self.push(.{ .agent_start = .{} }),
+            .turn_start => self.push(.{ .turn_start = .{} }),
             .message_start => |payload| {
                 if (self.remote_echo_suppression_remaining == 0) self.push(.{ .message_start = .{ .role = messageRole(payload.message) } });
             },
@@ -3972,7 +3981,7 @@ test "runtime push preserves newest event when event stream is full" {
     defer runtime.deinit();
 
     for (0..TuiEventStream.usable_capacity) |_| {
-        runtime.push(.turn_start);
+        runtime.push(.{ .turn_start = .{} });
     }
     runtime.push(.{ .@"error" = .{ .message = try runtime.dupeOwned("latest error") } });
 
@@ -5634,7 +5643,7 @@ test "TuiRuntime terminal event emits warning after terminal eviction" {
     defer runtime.deinit();
 
     for (0..TuiEventStream.usable_capacity) |_| {
-        runtime.push(.turn_start);
+        runtime.push(.{ .turn_start = .{} });
     }
     try std.testing.expect(runtime.event_stream.isFull());
 

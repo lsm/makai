@@ -389,6 +389,10 @@ pub const App = struct {
     /// agent_start, preventing deleted-run leftovers from being saved/applied to
     /// the next session.
     quarantine_events: bool = false,
+    /// The runtime generation at the time the active session was deleted. Events
+    /// stamped with a generation less than or equal to this value are treated as
+    /// stale and dropped while quarantine is active.
+    quarantine_generation: u32 = 0,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -493,16 +497,19 @@ pub const App = struct {
         const store = self.store orelse return error.NoStoreConfigured;
         self.state.clampSessionSelectionToFilter();
         const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
-        // Any pending reset/quarantine from an active-session delete is no longer
-        // relevant once the user explicitly chooses a session to resume.
-        self.pending_session_reset = false;
-        self.quarantine_events = false;
         const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         const id = selected.id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
+        // Drain any events that were queued before the resume completed while the
+        // old delete-state flags are still active, so stale events are dropped
+        // rather than saved under the resumed session.
         self.discardPendingEvents();
+        // Only clear the active-session delete state once the resume has
+        // successfully installed the loaded session.
+        self.pending_session_reset = false;
+        self.quarantine_events = false;
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
@@ -568,6 +575,7 @@ pub const App = struct {
             self.inline_history_flushed = 0;
             self.pending_session_reset = true;
             self.quarantine_events = true;
+            self.quarantine_generation = if (self.runtime) |r| r.current_generation else 0;
         }
 
         try store.delete(id);
@@ -1102,7 +1110,7 @@ pub const App = struct {
             var ev = event;
             defer ev.deinit(self.allocator);
             if (self.quarantine_events) {
-                if (ev == .agent_start or ev == .turn_start) {
+                if ((ev == .agent_start or ev == .turn_start) and ev.generation() > self.quarantine_generation) {
                     self.quarantine_events = false;
                 } else {
                     // Drop late events from a run whose session was deleted.
@@ -1195,7 +1203,9 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
-            self.saveEvent(ev);
+            // While quarantine is active all queued events are treated as stale;
+            // do not save them under the current (possibly new/resumed) session.
+            if (!self.quarantine_events) self.saveEvent(ev);
         }
     }
 
@@ -3417,14 +3427,21 @@ test "App drain quarantines late events until the next turn starts" {
     try app.drainEvents();
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
 
-    try mock.eventStream().push(.{ .agent_start = .{} });
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 1 } });
     try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
     } });
     try app.drainEvents();
-    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
-    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+    var found_fresh = false;
+    var found_stale = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "fresh")) found_fresh = true;
+        if (std.mem.eql(u8, entry.text.items, "stale")) found_stale = true;
+    }
+    try std.testing.expect(found_fresh);
+    try std.testing.expect(!found_stale);
     try std.testing.expect(!app.quarantine_events);
 }
 
@@ -3444,8 +3461,9 @@ test "App drain exits quarantine on turn_start for remote-style streams" {
     try app.drainEvents();
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
 
-    try mock.eventStream().push(.{ .turn_start = .{} });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 1 } });
     try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
     } });
@@ -3453,6 +3471,43 @@ test "App drain exits quarantine on turn_start for remote-style streams" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
     try std.testing.expect(!app.quarantine_events);
+}
+
+test "App drain ignores stale lifecycle events while quarantined" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Events from the cancelled run carry the same generation as the deleted
+    // turn and must not end quarantine, even if they are lifecycle events.
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    // Only a lifecycle event from a newer turn (higher generation) ends
+    // quarantine and allows its following deltas through.
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
 }
 
 test "setting pickers apply selected values" {
@@ -3895,7 +3950,7 @@ fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64)
         .working_dir = try std.testing.allocator.dupe(u8, ""),
     };
     defer meta.deinit(std.testing.allocator);
-    try store.save(meta, tui_runtime.TuiEvent.turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
 }
 
 test "session picker delete confirmation can be cancelled" {
@@ -4152,11 +4207,12 @@ test "resume selected session clears delete reset flags" {
     app.pending_session_reset = true;
     app.quarantine_events = true;
 
-    // Without a runtime configured, resume returns an error, but it must still
-    // clear the stale delete-state flags before doing so.
+    // Without a runtime configured, resume fails and the stale delete-state flags
+    // must stay active so a subsequent drain can still clear the deleted history
+    // and quarantine late events.
     try std.testing.expectError(error.NoRuntimeConfigured, app.resumeSelectedSession());
-    try std.testing.expect(!app.pending_session_reset);
-    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expect(app.pending_session_reset);
+    try std.testing.expect(app.quarantine_events);
 }
 
 fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
@@ -4180,6 +4236,47 @@ test "resume selected session allows remote runtime" {
     app.store = try session_store.Store.init(std.testing.allocator, ".");
 
     try app.resumeSelectedSession();
+}
+
+test "resume selected session clears delete reset flags on success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var production = try ProductionRuntime.init(std.testing.allocator);
+    defer production.deinit();
+    production.initBridge();
+
+    var app = try App.init(std.testing.allocator, production.options());
+    defer app.deinit();
+    app.runtime.?.run_async = false;
+
+    if (app.store) |*store| store.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+
+    const model = app.runtime.?.currentModel() orelse return error.NoModelConfigured;
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "s1"),
+        .model = try std.testing.allocator.dupe(u8, model.id),
+        .provider = try std.testing.allocator.dupe(u8, model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, ""),
+    };
+    defer meta.deinit(std.testing.allocator);
+    try app.store.?.save(meta, .{ .turn_start = .{} });
+
+    try app.loadSessions();
+    app.pending_session_reset = true;
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    try app.resumeSelectedSession();
+    try std.testing.expect(!app.pending_session_reset);
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqualStrings("s1", app.session_id);
 }
 
 // =====================================================================// Mock provider for ProductionRuntime lifetime regression tests

@@ -1865,8 +1865,8 @@ test "AppState protocol log captures every supported TUI event variant" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
-    try state.applyEvent(.agent_start);
-    try state.applyEvent(.turn_start);
+    try state.applyEvent(.{ .agent_start = .{} });
+    try state.applyEvent(.{ .turn_start = .{} });
     try state.applyEvent(.{ .message_start = .{ .role = .assistant } });
 
     var text_delta = tui_runtime.TuiEvent{ .text_delta = .{ .content_index = 0, .delta = try ownedText("hello") } };
@@ -2591,7 +2591,7 @@ test "AppState applies thinking tool call and lifecycle events" {
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
 
-    try state.applyEvent(.agent_start);
+    try state.applyEvent(.{ .agent_start = .{} });
     try std.testing.expect(state.status.streaming);
     try std.testing.expectEqual(TranscriptKind.system, state.transcript.items[0].kind);
 
@@ -2989,10 +2989,10 @@ test "AppState stream_aborted ignores stale lifecycle events" {
     defer state.deinit();
 
     state.stream_aborted = true;
-    try state.applyEvent(.agent_start);
+    try state.applyEvent(.{ .agent_start = .{} });
     try std.testing.expect(!state.status.streaming);
 
-    try state.applyEvent(.turn_start);
+    try state.applyEvent(.{ .turn_start = .{} });
     try std.testing.expect(!state.status.streaming);
 
     try state.applyEvent(.{ .agent_end = .{ .reason = .cancelled } });

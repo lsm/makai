@@ -29,16 +29,18 @@ pub const ToolApprovalCallback = *const fn (
 ) ToolApprovalDecision;
 
 pub const TuiEvent = union(enum) {
-    agent_start: void,
-    turn_start: void,
-    message_start: struct { role: MessageRole },
-    text_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
-    thinking_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
-    tool_call_delta: struct { content_index: usize, delta: OwnedSlice(u8) },
+    agent_start: struct { generation: u32 = 0 },
+    turn_start: struct { generation: u32 = 0 },
+    message_start: struct { generation: u32 = 0, role: MessageRole },
+    text_delta: struct { generation: u32 = 0, content_index: usize, delta: OwnedSlice(u8) },
+    thinking_delta: struct { generation: u32 = 0, content_index: usize, delta: OwnedSlice(u8) },
+    tool_call_delta: struct { generation: u32 = 0, content_index: usize, delta: OwnedSlice(u8) },
     provider_event: struct {
+        generation: u32 = 0,
         event_json: OwnedSlice(u8),
     },
     message_end: struct {
+        generation: u32 = 0,
         role: MessageRole,
         text: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
         content_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
@@ -52,22 +54,26 @@ pub const TuiEvent = union(enum) {
         is_error: bool = false,
     },
     tool_approval_requested: struct {
+        generation: u32 = 0,
         tool_call_id: OwnedSlice(u8),
         tool_name: OwnedSlice(u8),
         args_json: OwnedSlice(u8),
     },
     tool_execution_start: struct {
+        generation: u32 = 0,
         tool_call_id: OwnedSlice(u8),
         tool_name: OwnedSlice(u8),
         args_json: OwnedSlice(u8),
     },
     tool_execution_update: struct {
+        generation: u32 = 0,
         tool_call_id: OwnedSlice(u8),
         tool_name: OwnedSlice(u8),
         args_json: OwnedSlice(u8),
         partial_result_json: OwnedSlice(u8),
     },
     tool_execution_end: struct {
+        generation: u32 = 0,
         tool_call_id: OwnedSlice(u8),
         tool_name: OwnedSlice(u8),
         result_json: OwnedSlice(u8),
@@ -79,6 +85,7 @@ pub const TuiEvent = union(enum) {
         artifact_refs: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     },
     context_usage: struct {
+        generation: u32 = 0,
         system_prompt_bytes: u64 = 0,
         message_bytes: u64 = 0,
         tool_definition_bytes: u64 = 0,
@@ -88,17 +95,18 @@ pub const TuiEvent = union(enum) {
         tool_count: u32 = 0,
     },
     prompt_segment_usage: struct {
+        generation: u32 = 0,
         segment: PromptSegmentKind,
         cache_role: PromptSegmentCacheRole,
         bytes: u64 = 0,
         estimated_tokens: u64 = 0,
         item_count: u32 = 0,
     },
-    turn_end: struct { stop_reason: ai_types.StopReason },
-    agent_end: struct { reason: TuiEndReason },
-    system_warning: struct { message: OwnedSlice(u8) },
-    backpressure_status: struct { active: bool, dropped_count: u64 },
-    @"error": struct { message: OwnedSlice(u8) },
+    turn_end: struct { generation: u32 = 0, stop_reason: ai_types.StopReason },
+    agent_end: struct { generation: u32 = 0, reason: TuiEndReason },
+    system_warning: struct { generation: u32 = 0, message: OwnedSlice(u8) },
+    backpressure_status: struct { generation: u32 = 0, active: bool, dropped_count: u64 },
+    @"error": struct { generation: u32 = 0, message: OwnedSlice(u8) },
 
     pub const MessageRole = enum {
         user,
@@ -116,6 +124,54 @@ pub const TuiEvent = union(enum) {
         stable,
         dynamic,
     };
+
+    pub fn generation(self: TuiEvent) u32 {
+        return switch (self) {
+            .agent_start => |p| p.generation,
+            .turn_start => |p| p.generation,
+            .message_start => |p| p.generation,
+            .text_delta => |p| p.generation,
+            .thinking_delta => |p| p.generation,
+            .tool_call_delta => |p| p.generation,
+            .provider_event => |p| p.generation,
+            .message_end => |p| p.generation,
+            .tool_approval_requested => |p| p.generation,
+            .tool_execution_start => |p| p.generation,
+            .tool_execution_update => |p| p.generation,
+            .tool_execution_end => |p| p.generation,
+            .context_usage => |p| p.generation,
+            .prompt_segment_usage => |p| p.generation,
+            .turn_end => |p| p.generation,
+            .agent_end => |p| p.generation,
+            .system_warning => |p| p.generation,
+            .backpressure_status => |p| p.generation,
+            .@"error" => |p| p.generation,
+        };
+    }
+
+    pub fn setGeneration(self: *TuiEvent, gen: u32) void {
+        switch (self.*) {
+            .agent_start => |*p| p.generation = gen,
+            .turn_start => |*p| p.generation = gen,
+            .message_start => |*p| p.generation = gen,
+            .text_delta => |*p| p.generation = gen,
+            .thinking_delta => |*p| p.generation = gen,
+            .tool_call_delta => |*p| p.generation = gen,
+            .provider_event => |*p| p.generation = gen,
+            .message_end => |*p| p.generation = gen,
+            .tool_approval_requested => |*p| p.generation = gen,
+            .tool_execution_start => |*p| p.generation = gen,
+            .tool_execution_update => |*p| p.generation = gen,
+            .tool_execution_end => |*p| p.generation = gen,
+            .context_usage => |*p| p.generation = gen,
+            .prompt_segment_usage => |*p| p.generation = gen,
+            .turn_end => |*p| p.generation = gen,
+            .agent_end => |*p| p.generation = gen,
+            .system_warning => |*p| p.generation = gen,
+            .backpressure_status => |*p| p.generation = gen,
+            .@"error" => |*p| p.generation = gen,
+        }
+    }
 
     pub fn deinit(self: *TuiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {

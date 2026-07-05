@@ -591,8 +591,8 @@ fn parseEvent(allocator: std.mem.Allocator, value: std.json.Value) !tui_session.
         else => return error.InvalidEvent,
     };
     const kind = stringField(obj, "type") orelse return error.InvalidEvent;
-    if (std.mem.eql(u8, kind, "agent_start")) return .agent_start;
-    if (std.mem.eql(u8, kind, "turn_start")) return .turn_start;
+    if (std.mem.eql(u8, kind, "agent_start")) return .{ .agent_start = .{} };
+    if (std.mem.eql(u8, kind, "turn_start")) return .{ .turn_start = .{} };
     if (std.mem.eql(u8, kind, "message_start")) return .{ .message_start = .{ .role = parseRole(stringField(obj, "role") orelse "assistant") } };
     if (std.mem.eql(u8, kind, "text_delta")) return .{ .text_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
     if (std.mem.eql(u8, kind, "thinking_delta")) return .{ .thinking_delta = .{ .content_index = uintField(obj, "content_index") orelse 0, .delta = try owned(allocator, stringField(obj, "delta") orelse "") } };
@@ -1087,7 +1087,7 @@ test "corrupted JSONL line is skipped" {
     defer store.deinit();
     var meta = try defaultMetadata(std.testing.allocator, "s2");
     defer meta.deinit(std.testing.allocator);
-    try store.save(meta, .turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
     const path = try sessionPath(std.testing.allocator, base, "s2");
     defer std.testing.allocator.free(path);
     try appendFile(path, "{bad json}\n");
@@ -1120,10 +1120,10 @@ test "session metadata updates from last valid line" {
     meta.created_at = 10;
     meta.last_active = 20;
     meta.turn_count = 1;
-    try store.save(meta, tui_session.TuiEvent.turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
     meta.last_active = 30;
     meta.turn_count = 2;
-    try store.save(meta, tui_session.TuiEvent.turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
     var list = try store.list();
     defer {
         for (list.items) |*item| item.deinit(std.testing.allocator);
@@ -1143,7 +1143,7 @@ test "delete removes session from store list" {
     defer store.deinit();
     var meta = try defaultMetadata(std.testing.allocator, "delete-me");
     defer meta.deinit(std.testing.allocator);
-    try store.save(meta, tui_session.TuiEvent.turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
 
     var before = try store.list();
     defer {
@@ -1185,7 +1185,7 @@ test "metadata loads from tail of large session file" {
     @memset(padding, ' ');
     try appendFile(path, padding);
     try appendFile(path, "\n");
-    try store.save(meta, tui_session.TuiEvent.turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
 
     var list = try store.list();
     defer {
@@ -1293,7 +1293,7 @@ test "load skips malformed json but propagates replay errors" {
     defer store.deinit();
     var meta = try testMeta("bad-replay");
     defer meta.deinit(std.testing.allocator);
-    try store.save(meta, .turn_start);
+    try store.save(meta, .{ .turn_start = .{} });
     const path = try sessionPath(std.testing.allocator, base, "bad-replay");
     defer std.testing.allocator.free(path);
     try appendFile(path, "{bad json}\n");
