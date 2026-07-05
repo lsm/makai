@@ -170,8 +170,8 @@ fn consumeMarkdownLink(writer: *std.Io.Writer, source: []const u8, i: *usize) !b
 /// Returns true when `source[i..]` begins with a common bare URL scheme
 /// (`http://` or `https://`).
 fn isBareUrlPrefix(source: []const u8, i: usize) bool {
-    if (i + 7 <= source.len and std.mem.eql(u8, source[i .. i + 7], "http://")) return true;
-    if (i + 8 <= source.len and std.mem.eql(u8, source[i .. i + 8], "https://")) return true;
+    if (i + 7 <= source.len and std.ascii.eqlIgnoreCase(source[i .. i + 7], "http://")) return true;
+    if (i + 8 <= source.len and std.ascii.eqlIgnoreCase(source[i .. i + 8], "https://")) return true;
     return false;
 }
 
@@ -418,6 +418,8 @@ fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
 /// survives unchanged.
 fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
+    // Reject an escaped opener (`\$$...`) so the backslash survives verbatim.
+    if (open > 0 and isEscaped(source, open)) return false;
     // Reject `$$$` — ambiguous with inline math like `$$$x$$`.
     if (open + 2 < source.len and source[open + 2] == '$') return false;
     const body_start = open + 2;
@@ -684,30 +686,59 @@ fn isIdentifierChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// Render `\frac{A}{B}` as `(A)/(B)`. Returns the new cursor position past
-/// both groups. If the next non-whitespace tokens aren't brace groups, emit
-/// the operands inline as a graceful fallback.
-fn writeFrac(writer: *std.Io.Writer, body: []const u8, start: usize) anyerror!usize {
-    var i = skipSpace(body, start);
-    const a_group = readGroup(body, i);
-    if (a_group) |g| i = g.end;
-    i = skipSpace(body, i);
-    const b_group = readGroup(body, i);
-    if (b_group) |g| i = g.end;
+const FracOperand = struct {
+    raw: []const u8,
+    end: usize,
+};
 
-    if (a_group != null and b_group != null) {
+/// Read one fraction operand starting at `i`: either a `{...}` brace group,
+/// a command token (`\alpha`), or a single non-whitespace character. Returns
+/// the raw source span (including braces) and the cursor past the operand.
+fn readFracOperand(body: []const u8, i: usize) ?FracOperand {
+    const j = skipSpace(body, i);
+    if (j >= body.len) return null;
+    if (body[j] == '{') {
+        const g = readGroup(body, j) orelse return null;
+        return .{ .raw = body[j..g.end], .end = g.end };
+    }
+    if (body[j] == '\\' and j + 1 < body.len) {
+        var k = j + 2;
+        if (std.ascii.isAlphabetic(body[j + 1])) {
+            while (k < body.len and std.ascii.isAlphabetic(body[k])) k += 1;
+        }
+        return .{ .raw = body[j..k], .end = k };
+    }
+    return .{ .raw = body[j..j + 1], .end = j + 1 };
+}
+
+fn isBraceGroup(raw: []const u8) bool {
+    return raw.len >= 2 and raw[0] == '{' and raw[raw.len - 1] == '}';
+}
+
+/// Render `\frac{A}{B}` as `(A)/(B)`. Returns the new cursor position past
+/// both groups. If the operands aren't both brace groups, preserve the raw
+/// operand text as a graceful fallback so formulas stay copyable.
+fn writeFrac(writer: *std.Io.Writer, body: []const u8, start: usize) anyerror!usize {
+    const a = readFracOperand(body, start);
+    const b = if (a) |op| readFracOperand(body, op.end) else null;
+    if (a != null and b != null and isBraceGroup(a.?.raw) and isBraceGroup(b.?.raw)) {
         try writer.writeByte('(');
-        try renderMathBody(writer, a_group.?.inner);
+        try renderMathBody(writer, a.?.raw[1..a.?.raw.len - 1]);
         try writer.writeAll(")/(");
-        try renderMathBody(writer, b_group.?.inner);
+        try renderMathBody(writer, b.?.raw[1..b.?.raw.len - 1]);
         try writer.writeByte(')');
-        return i;
+        return b.?.end;
     }
     // Fallback: preserve the raw operand text so formulas like \frac{10}2 stay
-    // copyable instead of collapsing to \frac102.
+    // copyable instead of collapsing to \frac102. Include any leading
+    // whitespace so space-separated operands such as \frac a{b} survive.
     try writer.writeAll("\\frac");
-    try writer.writeAll(body[start..i]);
-    return i;
+    if (a) |op| {
+        const end = if (b) |op2| op2.end else op.end;
+        try writer.writeAll(body[start..end]);
+        return end;
+    }
+    return start;
 }
 
 /// Render `\sqrt{X}` as `√X` (with braces stripped). If there's no brace
@@ -727,7 +758,7 @@ fn writeSqrt(writer: *std.Io.Writer, body: []const u8, start: usize) anyerror!us
 
 fn skipSpace(body: []const u8, i: usize) usize {
     var j = i;
-    while (j < body.len and (body[j] == ' ' or body[j] == '\t')) j += 1;
+    while (j < body.len and (body[j] == ' ' or body[j] == '\t' or body[j] == '\n' or body[j] == '\r')) j += 1;
     return j;
 }
 
@@ -1180,6 +1211,14 @@ test "escaped dollar inside block math is not treated as closer" {
     try std.testing.expect(std.mem.indexOf(u8, out, "x = $5") != null);
 }
 
+test "escaped double dollar opener stays verbatim" {
+    const src = "\\$$x$$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The leading \\$ must survive and the unescaped $$x$$ should not be eaten.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\$$x$$") != null);
+}
+
 test "adjacent shell variables are not parsed as math" {
     const src = "use $HOME/$PATH and $FOO-$BAR";
     const out = try preprocess(std.testing.allocator, src);
@@ -1217,6 +1256,13 @@ test "plain brackets still allow inline math" {
 
 test "bare url with dollar variables stays verbatim" {
     const src = "see https://api.example.com/users/$user_id$ here";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "uppercase bare url scheme is protected from math parsing" {
+    const src = "see HTTPS://example.com/$x$ here";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
@@ -1435,6 +1481,31 @@ test "fraction with non-braced operand preserves raw fallback" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\\frac{10}2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\frac102") == null);
 }
+test "fraction with space separated single token operands preserves braces" {
+    const src = "ratio $\\frac a{b}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The brace around the second operand must survive the fallback.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac a{b}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac ab") == null);
+}
+
+test "fraction with space separated token operands preserves source" {
+    const src = "ratio $\\frac a b$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\frac a b") != null);
+}
+
+test "fraction with newline separated brace operands renders" {
+    const src = "$$\\frac\n{a}\n{b}$$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Newlines between \\frac and its brace groups should be treated as
+    // whitespace and the fraction should still render as (a)/(b).
+    try std.testing.expect(std.mem.indexOf(u8, out, "(a)/(b)") != null);
+}
+
 
 test "style modifiers are silently dropped" {
     const src = "math $\\mathrm{sin} + x$";
