@@ -1013,6 +1013,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/tui/app.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "zigzag", .module = zigzag_mod },

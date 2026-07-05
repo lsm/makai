@@ -1217,6 +1217,7 @@ pub const App = struct {
             .start_login_provider => try self.startLoginProviderName(result.login_provider),
             .copy_last => self.copyLastAssistant(),
             .copy_all => self.copyTranscript(),
+            .copy_tool => self.copySelectedToolOutput(),
             .open_artifact_viewer => try self.openLatestArtifact(),
             .export_file => try self.exportTranscriptToFile(if (result.export_path.len > 0) result.export_path else null),
             .none => {},
@@ -1274,7 +1275,11 @@ pub const App = struct {
         const text = self.pending_clipboard orelse return;
         self.pending_clipboard = null;
         defer self.allocator.free(text);
-        _ = ctx.setClipboard(text) catch {};
+        const copied = ctx.setClipboard(text) catch |err| {
+            self.recordError(@errorName(err)) catch {};
+            return;
+        };
+        if (!copied) self.recordError("clipboard unavailable") catch {};
     }
 
     /// Copy the most recent assistant reply to the system clipboard.
@@ -1309,6 +1314,19 @@ pub const App = struct {
         }
         self.stageClipboard(self.state.preview.content);
         self.state.appendTranscript(.system, "copied preview to clipboard") catch {};
+    }
+
+    fn copySelectedToolOutput(self: *App) void {
+        const text = self.state.selectedToolOutputText() orelse {
+            self.state.appendTranscript(.system, "selected tool has no output to copy") catch {};
+            return;
+        };
+        self.stageClipboard(text);
+        if (text.len > 256 * 1024) {
+            self.state.appendTranscript(.system, "copied tool output to clipboard (large output)") catch {};
+        } else {
+            self.state.appendTranscript(.system, "copied tool output to clipboard") catch {};
+        }
     }
 
     fn openLatestArtifact(self: *App) !void {
@@ -1742,6 +1760,11 @@ pub const TuiModel = struct {
                         },
                         'y' => {
                             if (app.state.mode == .preview) app.copyPreview() else app.copyLastAssistant();
+                            app.flushClipboard(ctx);
+                            return .none;
+                        },
+                        'x' => {
+                            app.copySelectedToolOutput();
                             app.flushClipboard(ctx);
                             return .none;
                         },
@@ -2802,6 +2825,54 @@ test "App submit routes help command to system transcript" {
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
     try std.testing.expect(std.mem.indexOf(u8, app.state.transcript.items[0].text.items, "/model") != null);
+}
+
+test "App copies selected tool output" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const tool = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
+    try tool.output.appendSlice(std.testing.allocator, "tool stdout");
+
+    app.copySelectedToolOutput();
+
+    defer if (app.pending_clipboard) |text| {
+        std.testing.allocator.free(text);
+        app.pending_clipboard = null;
+    };
+    try std.testing.expect(app.pending_clipboard != null);
+    try std.testing.expectEqualStrings("tool stdout", app.pending_clipboard.?);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("copied tool output to clipboard", app.state.transcript.items[0].text.items);
+}
+
+test "App reports empty selected tool output" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    _ = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
+
+    app.copySelectedToolOutput();
+
+    try std.testing.expect(app.pending_clipboard == null);
+    try std.testing.expectEqual(tui_state.TranscriptKind.system, app.state.transcript.items[0].kind);
+    try std.testing.expectEqualStrings("selected tool has no output to copy", app.state.transcript.items[0].text.items);
+}
+
+test "App warns when copying large selected tool output" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    const tool = try app.state.upsertToolForTest("call-1", "shell_execute", "{}", .done);
+    try tool.output.resize(std.testing.allocator, 256 * 1024 + 1);
+    @memset(tool.output.items, 'x');
+
+    app.copySelectedToolOutput();
+
+    defer if (app.pending_clipboard) |text| {
+        std.testing.allocator.free(text);
+        app.pending_clipboard = null;
+    };
+    try std.testing.expect(app.pending_clipboard != null);
+    try std.testing.expectEqual(@as(usize, 256 * 1024 + 1), app.pending_clipboard.?.len);
+    try std.testing.expectEqualStrings("copied tool output to clipboard (large output)", app.state.transcript.items[0].text.items);
 }
 
 test "App submit starts direct OpenAI Codex login command" {

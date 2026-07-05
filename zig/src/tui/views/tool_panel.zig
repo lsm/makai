@@ -76,7 +76,7 @@ pub fn render(allocator: std.mem.Allocator, state: *tui_state.AppState, options:
         if (i < state.tool_scroll) continue;
         if (rows >= options.height) break;
         try writer.writeByte('\n');
-        const selected = state.focus_pane == .tools and state.selected_tool_index == i;
+        const selected = state.focus_pane == .tools and state.selected_tool_index != null and state.selected_tool_index.? == i;
         if (selected) {
             const line = try renderSelectedToolLine(allocator, &tool, inner_width);
             defer allocator.free(line);
