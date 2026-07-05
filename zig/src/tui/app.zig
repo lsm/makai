@@ -501,6 +501,8 @@ pub const App = struct {
         self.discardPendingEvents();
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
+        self.pending_session_reset = false;
+        self.quarantine_events = false;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         self.session_id = new_session_id;
         self.session_created_at = loaded.metadata.created_at;
@@ -1098,7 +1100,7 @@ pub const App = struct {
             var ev = event;
             defer ev.deinit(self.allocator);
             if (self.quarantine_events) {
-                if (ev == .agent_start) {
+                if (ev == .agent_start or ev == .turn_start) {
                     self.quarantine_events = false;
                 } else {
                     // Drop late events from a run whose session was deleted.
@@ -3427,6 +3429,34 @@ test "App drain quarantines late events until the next turn starts" {
     try std.testing.expect(!app.quarantine_events);
 }
 
+test "App drain exits quarantine on turn_start for remote-style streams" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    defer std.testing.allocator.free(app.session_id);
+    app.quarantine_events = true;
+
+    try mock.eventStream().push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    try mock.eventStream().push(.{ .turn_start = .{} });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+    try std.testing.expect(!app.quarantine_events);
+}
+
 test "setting pickers apply selected values" {
     const runtime_ptr = try std.testing.allocator.create(tui_runtime.TuiRuntime);
     runtime_ptr.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
@@ -4117,6 +4147,28 @@ test "TuiModel Ctrl+G editor shortcut returns focus to composer" {
     _ = model.update(.{ .key = ctrl_g }, undefined);
 
     try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
+
+test "resume selected session clears delete reset flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var runtime = try initRemoteRuntimeForTest(std.testing.allocator);
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.runtime = runtime;
+    runtime = undefined;
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(app.store.?, "s1", 1);
+    try app.loadSessions();
+    app.pending_session_reset = true;
+    app.quarantine_events = true;
+
+    try app.resumeSelectedSession();
+
+    try std.testing.expect(!app.pending_session_reset);
+    try std.testing.expect(!app.quarantine_events);
 }
 
 fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
