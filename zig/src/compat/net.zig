@@ -50,6 +50,10 @@ pub const Stream = struct {
         }
     }
 
+    pub fn shutdown(self: *Stream) void {
+        self.inner.shutdown(defaultIo(), .both) catch {};
+    }
+
     pub fn close(self: *Stream) void {
         self.inner.close(defaultIo());
     }
