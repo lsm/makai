@@ -1119,31 +1119,45 @@ pub const App = struct {
         var completed_agent_end = false;
         while (session.popEvent()) |event| {
             var ev = event;
+            defer ev.deinit(self.allocator);
+
             if (self.quarantine_events) {
                 const gen = ev.generation();
                 if (gen <= self.quarantine_generation) {
-                    // Stale event from the deleted run.
-                    ev.deinit(self.allocator);
+                    // Stale event from the deleted run; defer will clean it up.
                     continue;
                 }
                 if (ev == .agent_start or ev == .turn_start) {
                     // Lifecycle marker for the new turn: replay buffered fresh
                     // events in order, then process the marker itself.
                     self.quarantine_events = false;
-                    for (self.quarantine_buffer.items) |*buf_ev| {
-                        var mutable = buf_ev.*;
-                        if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
-                        self.saveEvent(mutable);
-                        try self.applyRuntimeEvent(mutable);
-                        try self.hydrateToolDisplayPreview(mutable);
-                        mutable.deinit(self.allocator);
+                    {
+                        errdefer {
+                            for (self.quarantine_buffer.items) |*remaining| {
+                                var mutable = remaining.*;
+                                mutable.deinit(self.allocator);
+                            }
+                            self.quarantine_buffer.clearRetainingCapacity();
+                        }
+                        for (self.quarantine_buffer.items) |*buf_ev| {
+                            var mutable = buf_ev.*;
+                            defer mutable.deinit(self.allocator);
+                            if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
+                            self.saveEvent(mutable);
+                            try self.applyRuntimeEvent(mutable);
+                            try self.hydrateToolDisplayPreview(mutable);
+                        }
+                        self.quarantine_buffer.clearRetainingCapacity();
                     }
-                    self.quarantine_buffer.clearRetainingCapacity();
                 } else {
                     // Fresh event that arrived before its lifecycle marker;
                     // buffer it so the prompt/deltas are not lost.
-                    try self.quarantine_buffer.append(self.allocator, try ev.clone(self.allocator));
-                    ev.deinit(self.allocator);
+                    const cloned = try ev.clone(self.allocator);
+                    self.quarantine_buffer.append(self.allocator, cloned) catch |err| {
+                        var to_free = cloned;
+                        to_free.deinit(self.allocator);
+                        return err;
+                    };
                     continue;
                 }
             }
@@ -1151,7 +1165,6 @@ pub const App = struct {
             self.saveEvent(ev);
             try self.applyRuntimeEvent(ev);
             try self.hydrateToolDisplayPreview(ev);
-            ev.deinit(self.allocator);
         }
         self.refreshQueuedCounts();
         self.syncBackpressureState();
