@@ -591,6 +591,13 @@ pub const App = struct {
             self.state.clearQueuedPreviews();
             self.inline_history_flushed = 0;
             self.pending_session_reset = true;
+            // Drop any buffered events from a previous active-delete quarantine
+            // so they cannot replay into a newer session.
+            for (self.quarantine_buffer.items) |*buf_ev| {
+                var mutable = buf_ev.*;
+                mutable.deinit(self.allocator);
+            }
+            self.quarantine_buffer.clearRetainingCapacity();
             self.quarantine_events = true;
             self.quarantine_generation = if (self.runtime) |r| r.current_generation else 0;
         }
@@ -1264,7 +1271,11 @@ pub const App = struct {
             defer ev.deinit(self.allocator);
             // While quarantine is active all queued events are treated as stale;
             // do not save them under the current (possibly new/resumed) session.
-            if (!self.quarantine_events) self.saveEvent(ev);
+            // Also drop events stamped with a generation at or before the last
+            // active-delete quarantine so they cannot leak into a resumed session.
+            if (!self.quarantine_events and ev.generation() > self.quarantine_generation) {
+                self.saveEvent(ev);
+            }
         }
     }
 
@@ -1295,7 +1306,7 @@ pub const App = struct {
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
                 try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
-                return;
+                return err;
             }
             return err;
         };
@@ -1320,7 +1331,7 @@ pub const App = struct {
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
                 try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
-                return;
+                return err;
             }
             return err;
         };
@@ -1341,7 +1352,7 @@ pub const App = struct {
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
                 try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
-                return;
+                return err;
             }
             return err;
         };
@@ -2182,7 +2193,8 @@ pub const TuiModel = struct {
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
-                                if (err == error.QueueFull) consumed = false;
+                                if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
@@ -2190,13 +2202,15 @@ pub const TuiModel = struct {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull) consumed = false;
+                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                    if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull) consumed = false;
+                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                    if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
@@ -2207,7 +2221,8 @@ pub const TuiModel = struct {
                                 if (std.mem.startsWith(u8, trimmed, "/")) {
                                     app.submit(text) catch |err| {
                                         if (err == error.QuitRequested) return .quit;
-                                        if (err == error.QueueFull) consumed = false;
+                                        if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                        if (err == error.PendingSessionReset) return .none;
                                         app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                         if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                                     };
@@ -2218,7 +2233,8 @@ pub const TuiModel = struct {
                         } else {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
-                                if (err == error.QueueFull) consumed = false;
+                                if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
