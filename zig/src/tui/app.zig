@@ -1143,22 +1143,27 @@ pub const App = struct {
                     // buffered fresh events in order, then process the marker/event.
                     self.quarantine_events = false;
                     {
-                        errdefer {
+                        defer {
+                            // On any exit (success or error), clean up buffered
+                            // events that have not yet been replayed.
                             for (self.quarantine_buffer.items) |*remaining| {
                                 var mutable = remaining.*;
                                 mutable.deinit(self.allocator);
                             }
                             self.quarantine_buffer.clearRetainingCapacity();
                         }
-                        for (self.quarantine_buffer.items) |*buf_ev| {
-                            var mutable = buf_ev.*;
+                        while (self.quarantine_buffer.items.len > 0) {
+                            // Extract each item before processing so the buffer
+                            // only holds unprocessed events; this prevents a
+                            // mid-replay error from double-freeing already-deinited
+                            // slots via the outer defer.
+                            var mutable = self.quarantine_buffer.orderedRemove(0);
                             defer mutable.deinit(self.allocator);
                             if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
                             self.saveEvent(mutable);
                             try self.applyRuntimeEvent(mutable);
                             try self.hydrateToolDisplayPreview(mutable);
                         }
-                        self.quarantine_buffer.clearRetainingCapacity();
                     }
                 } else {
                     // Fresh event that arrived before its lifecycle marker;
