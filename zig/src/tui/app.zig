@@ -393,6 +393,10 @@ pub const App = struct {
     /// stamped with a generation less than or equal to this value are treated as
     /// stale and dropped while quarantine is active.
     quarantine_generation: u32 = 0,
+    /// Events from a new turn that arrive before their lifecycle marker
+    /// (agent_start/turn_start) are buffered here so they are not dropped while
+    /// quarantine is still active.
+    quarantine_buffer: std.ArrayList(tui_runtime.TuiEvent) = .empty,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -421,6 +425,7 @@ pub const App = struct {
             .state = tui_state.AppState.init(allocator),
             .runtime = runtime_ptr,
             .approval_waiter = approval_waiter,
+            .quarantine_buffer = std.ArrayList(tui_runtime.TuiEvent).empty,
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
@@ -442,7 +447,11 @@ pub const App = struct {
     }
 
     pub fn initWithoutRuntime(allocator: std.mem.Allocator) App {
-        return .{ .allocator = allocator, .state = tui_state.AppState.init(allocator) };
+        return .{
+            .allocator = allocator,
+            .state = tui_state.AppState.init(allocator),
+            .quarantine_buffer = std.ArrayList(tui_runtime.TuiEvent).empty,
+        };
     }
 
     pub fn deinit(self: *App) void {
@@ -463,6 +472,8 @@ pub const App = struct {
         if (self.pending_clipboard) |c| self.allocator.free(c);
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
+        for (self.quarantine_buffer.items) |*event| event.deinit(self.allocator);
+        self.quarantine_buffer.deinit(self.allocator);
         self.state.deinit();
         self.* = undefined;
     }
@@ -1108,12 +1119,31 @@ pub const App = struct {
         var completed_agent_end = false;
         while (session.popEvent()) |event| {
             var ev = event;
-            defer ev.deinit(self.allocator);
             if (self.quarantine_events) {
-                if ((ev == .agent_start or ev == .turn_start) and ev.generation() > self.quarantine_generation) {
+                const gen = ev.generation();
+                if (gen <= self.quarantine_generation) {
+                    // Stale event from the deleted run.
+                    ev.deinit(self.allocator);
+                    continue;
+                }
+                if (ev == .agent_start or ev == .turn_start) {
+                    // Lifecycle marker for the new turn: replay buffered fresh
+                    // events in order, then process the marker itself.
                     self.quarantine_events = false;
+                    for (self.quarantine_buffer.items) |*buf_ev| {
+                        var mutable = buf_ev.*;
+                        if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
+                        self.saveEvent(mutable);
+                        try self.applyRuntimeEvent(mutable);
+                        try self.hydrateToolDisplayPreview(mutable);
+                        mutable.deinit(self.allocator);
+                    }
+                    self.quarantine_buffer.clearRetainingCapacity();
                 } else {
-                    // Drop late events from a run whose session was deleted.
+                    // Fresh event that arrived before its lifecycle marker;
+                    // buffer it so the prompt/deltas are not lost.
+                    try self.quarantine_buffer.append(self.allocator, try ev.clone(self.allocator));
+                    ev.deinit(self.allocator);
                     continue;
                 }
             }
@@ -1121,6 +1151,7 @@ pub const App = struct {
             self.saveEvent(ev);
             try self.applyRuntimeEvent(ev);
             try self.hydrateToolDisplayPreview(ev);
+            ev.deinit(self.allocator);
         }
         self.refreshQueuedCounts();
         self.syncBackpressureState();
@@ -3508,6 +3539,43 @@ test "App drain ignores stale lifecycle events while quarantined" {
     try std.testing.expect(!app.quarantine_events);
     try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
     try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+}
+
+test "App drain buffers fresh user message_end during quarantine until lifecycle marker" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Remote runs enqueue the synthetic user message_end before the remote
+    // turn_start arrives. It belongs to the new turn (generation 2) and must
+    // be preserved, not dropped.
+    try mock.eventStream().push(.{ .message_end = .{
+        .generation = 2,
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "next prompt")),
+    } });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "reply")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expect(!app.quarantine_events);
+    var found_prompt = false;
+    var found_reply = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "next prompt")) found_prompt = true;
+        if (std.mem.eql(u8, entry.text.items, "reply")) found_reply = true;
+    }
+    try std.testing.expect(found_prompt);
+    try std.testing.expect(found_reply);
 }
 
 test "setting pickers apply selected values" {

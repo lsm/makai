@@ -173,6 +173,52 @@ pub const TuiEvent = union(enum) {
         }
     }
 
+    pub fn clone(self: TuiEvent, allocator: std.mem.Allocator) !TuiEvent {
+        var copy = self;
+        switch (copy) {
+            .text_delta => |*p| p.delta = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.delta.slice())),
+            .thinking_delta => |*p| p.delta = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.delta.slice())),
+            .tool_call_delta => |*p| p.delta = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.delta.slice())),
+            .provider_event => |*p| p.event_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.event_json.slice())),
+            .message_end => |*p| {
+                p.text = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.text.slice()));
+                p.content_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.content_json.slice()));
+                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
+                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
+                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+                p.tool_calls_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_calls_json.slice()));
+                p.details_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.details_json.slice()));
+                p.artifacts_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.artifacts_json.slice()));
+            },
+            .tool_approval_requested => |*p| {
+                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
+                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
+                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+            },
+            .tool_execution_start => |*p| {
+                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
+                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
+                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+            },
+            .tool_execution_update => |*p| {
+                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
+                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
+                p.args_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.args_json.slice()));
+                p.partial_result_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.partial_result_json.slice()));
+            },
+            .tool_execution_end => |*p| {
+                p.tool_call_id = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_call_id.slice()));
+                p.tool_name = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.tool_name.slice()));
+                p.result_json = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.result_json.slice()));
+                p.artifact_refs = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.artifact_refs.slice()));
+            },
+            .system_warning => |*p| p.message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.message.slice())),
+            .@"error" => |*p| p.message = OwnedSlice(u8).initOwned(try allocator.dupe(u8, p.message.slice())),
+            else => {},
+        }
+        return copy;
+    }
+
     pub fn deinit(self: *TuiEvent, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .text_delta => |*p| p.delta.deinit(allocator),
