@@ -518,9 +518,15 @@ pub const App = struct {
         // rather than saved under the resumed session.
         self.discardPendingEvents();
         // Only clear the active-session delete state once the resume has
-        // successfully installed the loaded session.
+        // successfully installed the loaded session. Also discard any buffered
+        // quarantine events so they cannot be replayed into an unrelated session.
         self.pending_session_reset = false;
         self.quarantine_events = false;
+        for (self.quarantine_buffer.items) |*buf_ev| {
+            var mutable = buf_ev.*;
+            mutable.deinit(self.allocator);
+        }
+        self.quarantine_buffer.clearRetainingCapacity();
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
@@ -1121,15 +1127,20 @@ pub const App = struct {
             var ev = event;
             defer ev.deinit(self.allocator);
 
+            const gen = ev.generation();
+            if (self.quarantine_generation > 0 and gen <= self.quarantine_generation) {
+                // Stale event from the deleted run; keep dropping it even after
+                // quarantine ends so late deltas/terminal events cannot reach the
+                // new session.
+                continue;
+            }
+
             if (self.quarantine_events) {
-                const gen = ev.generation();
-                if (gen <= self.quarantine_generation) {
-                    // Stale event from the deleted run; defer will clean it up.
-                    continue;
-                }
-                if (ev == .agent_start or ev == .turn_start) {
-                    // Lifecycle marker for the new turn: replay buffered fresh
-                    // events in order, then process the marker itself.
+                const is_lifecycle = ev == .agent_start or ev == .turn_start;
+                const is_terminal = ev == .agent_end or ev == .@"error";
+                if (is_lifecycle or is_terminal) {
+                    // Lifecycle marker or terminal event for the new turn: replay
+                    // buffered fresh events in order, then process the marker/event.
                     self.quarantine_events = false;
                     {
                         errdefer {
@@ -1253,10 +1264,30 @@ pub const App = struct {
         }
     }
 
+    /// If an active-session delete left local history cleanup pending because
+    /// the local agent was not yet idle, wait for it now and clear the local
+    /// message context before accepting a new turn. This prevents a freshly
+    /// submitted prompt from seeing the deleted conversation.
+    fn applyPendingSessionResetSync(self: *App) void {
+        if (!self.pending_session_reset) return;
+        if (self.runtime) |runtime| {
+            switch (runtime.backend) {
+                .local => if (runtime.local_agent) |*local| {
+                    local.waitForIdle();
+                    local.clearAllQueues();
+                    local.replaceMessages(&.{}) catch {};
+                },
+                else => {},
+            }
+        }
+        self.pending_session_reset = false;
+    }
+
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync();
         try self.ensureSessionId();
         self.state.stream_aborted = false;
         if (self.session) |*session| {
@@ -1275,6 +1306,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync();
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
@@ -1289,6 +1321,7 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync();
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
@@ -3463,17 +3496,21 @@ test "App drain quarantines late events until the next turn starts" {
     app.session = mock.session();
     app.session_id = try std.testing.allocator.dupe(u8, "deleted");
     app.quarantine_events = true;
+    app.quarantine_generation = 1;
 
+    // Stale event from the deleted turn (generation <= quarantine_generation)
+    // is dropped rather than buffered or applied.
     try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
     } });
     try app.drainEvents();
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
 
-    try mock.eventStream().push(.{ .agent_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 2 } });
     try mock.eventStream().push(.{ .text_delta = .{
-        .generation = 1,
+        .generation = 2,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
     } });
@@ -3497,17 +3534,21 @@ test "App drain exits quarantine on turn_start for remote-style streams" {
     app.session = mock.session();
     app.session_id = try std.testing.allocator.dupe(u8, "deleted");
     app.quarantine_events = true;
+    app.quarantine_generation = 1;
 
+    // Stale event from the deleted turn (generation <= quarantine_generation)
+    // is dropped rather than buffered or applied.
     try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
     } });
     try app.drainEvents();
     try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
 
-    try mock.eventStream().push(.{ .turn_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
     try mock.eventStream().push(.{ .text_delta = .{
-        .generation = 1,
+        .generation = 2,
         .content_index = 0,
         .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
     } });
@@ -3589,6 +3630,88 @@ test "App drain buffers fresh user message_end during quarantine until lifecycle
     }
     try std.testing.expect(found_prompt);
     try std.testing.expect(found_reply);
+}
+
+test "App drain ends quarantine on fresh terminal error and surfaces it" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // A fresh user message_end arrives before the lifecycle marker, followed by
+    // a terminal error before any agent_start/turn_start. The error must end
+    // quarantine, flush the buffer, and be surfaced instead of being buffered
+    // forever.
+    try mock.eventStream().push(.{ .message_end = .{
+        .generation = 2,
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "next prompt")),
+    } });
+    try mock.eventStream().push(.{ .@"error" = .{
+        .generation = 2,
+        .message = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "remote failed")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.quarantine_buffer.items.len);
+    var found_error = false;
+    for (app.state.transcript.items) |entry| {
+        if (entry.kind == .@"error" and std.mem.eql(u8, entry.text.items, "remote failed")) found_error = true;
+    }
+    try std.testing.expect(found_error);
+}
+
+test "App drain keeps filtering stale generations after quarantine ends" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Lifecycle marker from the new turn ends quarantine.
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(!app.quarantine_events);
+
+    // A late stale delta from the deleted run arrives afterwards and must still
+    // be dropped, not applied to the new session.
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "late stale")),
+    } });
+    try app.drainEvents();
+    var found_stale = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "late stale")) found_stale = true;
+    }
+    try std.testing.expect(!found_stale);
+}
+
+test "App submit clears pending session reset flag" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.pending_session_reset = true;
+
+    try app.submit("hello");
+    try std.testing.expect(!app.pending_session_reset);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
 }
 
 test "setting pickers apply selected values" {
@@ -4357,6 +4480,7 @@ test "resume selected session clears delete reset flags on success" {
     try app.resumeSelectedSession();
     try std.testing.expect(!app.pending_session_reset);
     try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.quarantine_buffer.items.len);
     try std.testing.expectEqualStrings("s1", app.session_id);
 }
 
