@@ -1332,10 +1332,16 @@ pub const TuiRuntime = struct {
             self.dropped_since_warning,
             if (self.dropped_since_warning == 1) "" else "s",
         }) catch |err| {
-            self.event_stream.push(.{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } }) catch {};
+            var err_event = TuiEvent{ .@"error" = .{ .message = self.dupeOwned(@errorName(err)) catch OwnedSlice(u8).initBorrowed("") } };
+            err_event.setGeneration(self.current_generation);
+            self.event_stream.push(err_event) catch {
+                var mutable = err_event;
+                mutable.deinit(self.allocator);
+            };
             return;
         };
-        const warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+        var warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+        warning.setGeneration(self.current_generation);
         self.event_stream.push(warning) catch {
             var mutable = warning;
             mutable.deinit(self.allocator);
@@ -1355,7 +1361,8 @@ pub const TuiRuntime = struct {
                 count,
                 if (count == 1) "" else "s",
             }) catch return;
-            const warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+            var warning = TuiEvent{ .system_warning = .{ .message = OwnedSlice(u8).initOwned(message) } };
+            warning.setGeneration(self.current_generation);
             if (self.pushUncounted(warning)) {
                 while (!self.backpressure_mutex.tryLock()) std.atomic.spinLoopHint();
                 self.dropped_since_warning -|= count;

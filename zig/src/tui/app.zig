@@ -1270,15 +1270,16 @@ pub const App = struct {
     }
 
     /// If an active-session delete left local history cleanup pending because
-    /// the local agent was not yet idle, wait for it now and clear the local
-    /// message context before accepting a new turn. This prevents a freshly
-    /// submitted prompt from seeing the deleted conversation.
-    fn applyPendingSessionResetSync(self: *App) void {
+    /// the local agent was not yet idle, clear it now if the agent is idle.
+    /// Returns error.PendingSessionReset when the local agent is still finishing
+    /// the cancelled run, so the caller can reject/defer the new turn instead of
+    /// blocking the UI thread waiting for idle.
+    fn applyPendingSessionResetSync(self: *App) !void {
         if (!self.pending_session_reset) return;
         if (self.runtime) |runtime| {
             switch (runtime.backend) {
                 .local => if (runtime.local_agent) |*local| {
-                    local.waitForIdle();
+                    if (!local.isIdle()) return error.PendingSessionReset;
                     local.clearAllQueues();
                     local.replaceMessages(&.{}) catch {};
                 },
@@ -1292,7 +1293,13 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
-        self.applyPendingSessionResetSync();
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                return;
+            }
+            return err;
+        };
         try self.ensureSessionId();
         self.state.stream_aborted = false;
         if (self.session) |*session| {
@@ -1311,7 +1318,13 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
-        self.applyPendingSessionResetSync();
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                return;
+            }
+            return err;
+        };
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
@@ -1326,7 +1339,13 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
-        self.applyPendingSessionResetSync();
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                return;
+            }
+            return err;
+        };
         try self.ensureSessionId();
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
