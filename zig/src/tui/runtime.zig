@@ -1778,10 +1778,19 @@ pub const TuiRuntime = struct {
     }
 
     fn drainRemoteClientEvents(self: *TuiRuntime, client: *agent_protocol_client.AgentProtocolClient) !void {
-        while (client.popEvent()) |owned_json| {
-            var json = owned_json;
-            defer json.deinit(self.allocator);
-            try self.handleRemoteAgentEventJson(json.slice());
+        const expected_sid = self.remote_session_id orelse self.remote_pending_session_id;
+        while (client.popEvent()) |queued| {
+            var q = queued;
+            defer q.deinit(self.allocator);
+            // Drop events that belong to a different remote session. This prevents
+            // late deltas from a cancelled/deleted remote run from being stamped
+            // with the current turn's generation and leaking into the new session.
+            if (expected_sid) |sid| {
+                if (!std.mem.eql(u8, q.session_id[0..], sid[0..])) continue;
+            } else {
+                continue;
+            }
+            try self.handleRemoteAgentEventJson(q.json.slice());
         }
         const sid = self.remote_session_id orelse self.remote_pending_session_id;
         if (sid) |session_id| {
