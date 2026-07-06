@@ -595,7 +595,6 @@ pub const App = struct {
             self.quarantine_generation = if (self.runtime) |r| r.current_generation else 0;
         }
 
-        try store.delete(id);
         try self.loadSessions();
         self.state.session_delete_confirm = false;
         if (self.state.sessions.items.len == 0) {
@@ -1295,7 +1294,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
-                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
                 return;
             }
             return err;
@@ -1320,7 +1319,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
-                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
                 return;
             }
             return err;
@@ -1341,7 +1340,7 @@ pub const App = struct {
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
         self.applyPendingSessionResetSync() catch |err| {
             if (err == error.PendingSessionReset) {
-                try self.state.status.setError(self.allocator, "Session reset pending; wait for the current run to finish.");
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
                 return;
             }
             return err;
