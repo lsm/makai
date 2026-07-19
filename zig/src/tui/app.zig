@@ -382,6 +382,21 @@ pub const App = struct {
     last_view_height: usize = 8,
     inline_history_flushed: usize = 0,
     last_inline_view_lines: usize = 4,
+    /// When an active session is deleted, the local/runtime message history is
+    /// cleared once the cancelled run becomes idle.
+    pending_session_reset: bool = false,
+    /// Drop late events from a deleted run until a new turn signals itself via
+    /// agent_start, preventing deleted-run leftovers from being saved/applied to
+    /// the next session.
+    quarantine_events: bool = false,
+    /// The runtime generation at the time the active session was deleted. Events
+    /// stamped with a generation less than or equal to this value are treated as
+    /// stale and dropped while quarantine is active.
+    quarantine_generation: u32 = 0,
+    /// Events from a new turn that arrive before their lifecycle marker
+    /// (agent_start/turn_start) are buffered here so they are not dropped while
+    /// quarantine is still active.
+    quarantine_buffer: std.ArrayList(tui_runtime.TuiEvent) = .empty,
     /// Text staged for the system clipboard, flushed to the terminal via OSC 52
     /// on the next `update` (where a mutable `Context` is available). Owned.
     ///
@@ -410,6 +425,7 @@ pub const App = struct {
             .state = tui_state.AppState.init(allocator),
             .runtime = runtime_ptr,
             .approval_waiter = approval_waiter,
+            .quarantine_buffer = std.ArrayList(tui_runtime.TuiEvent).empty,
         };
         errdefer app.deinit();
         app.session = app.runtime.?.createSession();
@@ -422,10 +438,8 @@ pub const App = struct {
         }
         // Initialize session store and generate a session ID.
         app.store = session_store.Store.initDefault(allocator) catch null;
-        app.session_id = generateSessionId(allocator) catch try allocator.dupe(u8, "default");
-        app.session_created_at = compat.time.nowMillis();
+        try app.ensureSessionId();
         app.working_dir = currentPathOwned(allocator) catch try allocator.dupe(u8, "");
-        try app.state.status.setSessionId(allocator, app.session_id);
         // Pre-populate sessions list on a best-effort basis. Startup should not
         // lose the interactive runtime just because saved-session discovery fails.
         app.loadSessions() catch |err| try app.recordError(@errorName(err));
@@ -433,7 +447,11 @@ pub const App = struct {
     }
 
     pub fn initWithoutRuntime(allocator: std.mem.Allocator) App {
-        return .{ .allocator = allocator, .state = tui_state.AppState.init(allocator) };
+        return .{
+            .allocator = allocator,
+            .state = tui_state.AppState.init(allocator),
+            .quarantine_buffer = std.ArrayList(tui_runtime.TuiEvent).empty,
+        };
     }
 
     pub fn deinit(self: *App) void {
@@ -454,8 +472,17 @@ pub const App = struct {
         if (self.pending_clipboard) |c| self.allocator.free(c);
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
         if (self.working_dir.len > 0) self.allocator.free(self.working_dir);
+        for (self.quarantine_buffer.items) |*event| event.deinit(self.allocator);
+        self.quarantine_buffer.deinit(self.allocator);
         self.state.deinit();
         self.* = undefined;
+    }
+
+    fn ensureSessionId(self: *App) !void {
+        if (self.session_id.len > 0) return;
+        self.session_id = generateSessionId(self.allocator) catch try self.allocator.dupe(u8, "default");
+        self.session_created_at = compat.time.nowMillis();
+        try self.state.status.setSessionId(self.allocator, self.session_id);
     }
 
     /// Load sessions from the store into state.sessions.
@@ -479,14 +506,27 @@ pub const App = struct {
     /// Resume the session currently selected in the session picker.
     pub fn resumeSelectedSession(self: *App) !void {
         const store = self.store orelse return error.NoStoreConfigured;
-        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         self.state.clampSessionSelectionToFilter();
         const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        const runtime = if (self.runtime) |r| r else return error.NoRuntimeConfigured;
         const id = selected.id;
         var loaded = try store.resumeSession(id, runtime);
         defer loaded.deinit(self.allocator);
         const new_session_id = try self.allocator.dupe(u8, loaded.metadata.session_id);
+        // Drain any events that were queued before the resume completed while the
+        // old delete-state flags are still active, so stale events are dropped
+        // rather than saved under the resumed session.
         self.discardPendingEvents();
+        // Only clear the active-session delete state once the resume has
+        // successfully installed the loaded session. Also discard any buffered
+        // quarantine events so they cannot be replayed into an unrelated session.
+        self.pending_session_reset = false;
+        self.quarantine_events = false;
+        for (self.quarantine_buffer.items) |*buf_ev| {
+            var mutable = buf_ev.*;
+            mutable.deinit(self.allocator);
+        }
+        self.quarantine_buffer.clearRetainingCapacity();
         self.state.resetReplayState();
         self.inline_history_flushed = 0;
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
@@ -508,7 +548,69 @@ pub const App = struct {
         self.state.clearQueuedPreviews();
         self.refreshQueuedCounts();
         self.state.status.streaming = false;
+        self.state.session_delete_confirm = false;
         self.state.mode = .normal;
+    }
+
+    pub fn deleteSelectedSession(self: *App) !void {
+        const store = self.store orelse return error.NoStoreConfigured;
+        self.state.clampSessionSelectionToFilter();
+        const selected = self.state.sessionAtFilteredIndex(self.state.session_index) orelse return;
+        const id = try self.allocator.dupe(u8, selected.id);
+        defer self.allocator.free(id);
+
+        try store.delete(id);
+        if (std.mem.eql(u8, self.session_id, id)) {
+            if (self.session_id.len > 0) self.allocator.free(self.session_id);
+            self.session_id = &.{};
+            self.session_created_at = 0;
+            try self.state.status.setSessionId(self.allocator, "");
+            if (self.approval_waiter) |waiter| waiter.rejectPending();
+            if (self.session) |*session| {
+                session.cancel();
+                session.clearQueuedMessages();
+            }
+            if (self.runtime) |runtime| {
+                // Cancel any in-flight work first.  Only reset the runtime message
+                // context when it is safe to do so without blocking the UI.  For the
+                // remote backend replaceMessages is non-blocking; for the local backend
+                // we avoid waiting on a cancelled worker and only clear when idle.
+                runtime.cancel();
+                switch (runtime.backend) {
+                    .remote => runtime.replaceMessages(&.{}) catch {},
+                    .local => if (runtime.local_agent) |*local| {
+                        if (local.isIdle()) {
+                            local.clearAllQueues();
+                            local.replaceMessages(&.{}) catch {};
+                        }
+                    },
+                }
+            }
+            self.discardPendingEvents();
+            self.state.resetReplayState();
+            self.state.clearQueuedPreviews();
+            self.inline_history_flushed = 0;
+            self.pending_session_reset = true;
+            // Drop any buffered events from a previous active-delete quarantine
+            // so they cannot replay into a newer session.
+            for (self.quarantine_buffer.items) |*buf_ev| {
+                var mutable = buf_ev.*;
+                mutable.deinit(self.allocator);
+            }
+            self.quarantine_buffer.clearRetainingCapacity();
+            self.quarantine_events = true;
+            self.quarantine_generation = if (self.runtime) |r| r.current_generation else 0;
+        }
+
+        try self.loadSessions();
+        self.state.session_delete_confirm = false;
+        if (self.state.sessions.items.len == 0) {
+            self.state.session_index = 0;
+            self.state.session_scroll = 0;
+        } else if (self.state.session_index >= self.state.sessions.items.len) {
+            self.state.session_index = self.state.sessions.items.len - 1;
+        }
+        TuiModel.ensureSessionSelectionVisible(self);
     }
 
     /// Providers that expose an interactive login or API-key setup flow.
@@ -1030,6 +1132,57 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
+
+            const gen = ev.generation();
+            if (self.quarantine_generation > 0 and gen <= self.quarantine_generation) {
+                // Stale event from the deleted run; keep dropping it even after
+                // quarantine ends so late deltas/terminal events cannot reach the
+                // new session.
+                continue;
+            }
+
+            if (self.quarantine_events) {
+                const is_lifecycle = ev == .agent_start or ev == .turn_start;
+                const is_terminal = ev == .agent_end or ev == .@"error";
+                if (is_lifecycle or is_terminal) {
+                    // Lifecycle marker or terminal event for the new turn: replay
+                    // buffered fresh events in order, then process the marker/event.
+                    self.quarantine_events = false;
+                    {
+                        defer {
+                            // On any exit (success or error), clean up buffered
+                            // events that have not yet been replayed.
+                            for (self.quarantine_buffer.items) |*remaining| {
+                                var mutable = remaining.*;
+                                mutable.deinit(self.allocator);
+                            }
+                            self.quarantine_buffer.clearRetainingCapacity();
+                        }
+                        while (self.quarantine_buffer.items.len > 0) {
+                            // Extract each item before processing so the buffer
+                            // only holds unprocessed events; this prevents a
+                            // mid-replay error from double-freeing already-deinited
+                            // slots via the outer defer.
+                            var mutable = self.quarantine_buffer.orderedRemove(0);
+                            defer mutable.deinit(self.allocator);
+                            if (mutable == .agent_end and mutable.agent_end.reason == .completed) completed_agent_end = true;
+                            self.saveEvent(mutable);
+                            try self.applyRuntimeEvent(mutable);
+                            try self.hydrateToolDisplayPreview(mutable);
+                        }
+                    }
+                } else {
+                    // Fresh event that arrived before its lifecycle marker;
+                    // buffer it so the prompt/deltas are not lost.
+                    const cloned = try ev.clone(self.allocator);
+                    self.quarantine_buffer.append(self.allocator, cloned) catch |err| {
+                        var to_free = cloned;
+                        to_free.deinit(self.allocator);
+                        return err;
+                    };
+                    continue;
+                }
+            }
             if (ev == .agent_end and ev.agent_end.reason == .completed) completed_agent_end = true;
             self.saveEvent(ev);
             try self.applyRuntimeEvent(ev);
@@ -1037,6 +1190,22 @@ pub const App = struct {
         }
         self.refreshQueuedCounts();
         self.syncBackpressureState();
+        if (self.pending_session_reset and !self.state.status.streaming) {
+            if (self.runtime) |runtime| {
+                switch (runtime.backend) {
+                    .local => if (runtime.local_agent) |*local| {
+                        if (local.isIdle()) {
+                            local.clearAllQueues();
+                            local.replaceMessages(&.{}) catch {};
+                            self.pending_session_reset = false;
+                        }
+                    },
+                    else => self.pending_session_reset = false,
+                }
+            } else {
+                self.pending_session_reset = false;
+            }
+        }
         if (completed_agent_end and self.state.queue.total() > 0) {
             session.resumeSession() catch |err| {
                 try self.state.status.setError(self.allocator, @errorName(err));
@@ -1100,14 +1269,48 @@ pub const App = struct {
         while (session.popEvent()) |event| {
             var ev = event;
             defer ev.deinit(self.allocator);
-            self.saveEvent(ev);
+            // While quarantine is active all queued events are treated as stale;
+            // do not save them under the current (possibly new/resumed) session.
+            // Also drop events stamped with a generation at or before the last
+            // active-delete quarantine so they cannot leak into a resumed session.
+            if (!self.quarantine_events and ev.generation() > self.quarantine_generation) {
+                self.saveEvent(ev);
+            }
         }
+    }
+
+    /// If an active-session delete left local history cleanup pending because
+    /// the local agent was not yet idle, clear it now if the agent is idle.
+    /// Returns error.PendingSessionReset when the local agent is still finishing
+    /// the cancelled run, so the caller can reject/defer the new turn instead of
+    /// blocking the UI thread waiting for idle.
+    fn applyPendingSessionResetSync(self: *App) !void {
+        if (!self.pending_session_reset) return;
+        if (self.runtime) |runtime| {
+            switch (runtime.backend) {
+                .local => if (runtime.local_agent) |*local| {
+                    if (!local.isIdle()) return error.PendingSessionReset;
+                    local.clearAllQueues();
+                    local.replaceMessages(&.{}) catch {};
+                },
+                else => {},
+            }
+        }
+        self.pending_session_reset = false;
     }
 
     pub fn submit(self: *App, text: []const u8) !void {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
+                return err;
+            }
+            return err;
+        };
+        try self.ensureSessionId();
         self.state.stream_aborted = false;
         if (self.session) |*session| {
             session.submitTurn(trimmed) catch |err| {
@@ -1125,6 +1328,14 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
+                return err;
+            }
+            return err;
+        };
+        try self.ensureSessionId();
         if (self.session) |*session| {
             try session.steer(trimmed);
             try self.state.addQueuedPreview(.steering, trimmed);
@@ -1138,6 +1349,14 @@ pub const App = struct {
         const trimmed = std.mem.trim(u8, text, " \t\r\n");
         if (trimmed.len == 0) return;
         if (trimmed[0] == '/') return try self.submitCommand(trimmed);
+        self.applyPendingSessionResetSync() catch |err| {
+            if (err == error.PendingSessionReset) {
+                try self.state.appendTranscript(.@"error", "Session reset pending; wait for the current run to finish.");
+                return err;
+            }
+            return err;
+        };
+        try self.ensureSessionId();
         if (self.session) |*session| {
             try session.queueFollowUp(trimmed);
             try self.state.addQueuedPreview(.follow_up, trimmed);
@@ -1202,6 +1421,7 @@ pub const App = struct {
                 self.state.session_index = 0;
                 self.state.session_scroll = 0;
                 self.state.session_filter.clear();
+                self.state.session_delete_confirm = false;
                 self.state.mode = .session_picker;
             },
             .open_model_picker => self.openModelPicker(),
@@ -1770,9 +1990,15 @@ pub const TuiModel = struct {
                         },
                         'd' => {
                             // Issue #137: cycle time → date+time → off for
-                            // transcript message timestamps.
-                            _ = app.state.cycleTimestampDisplay();
-                            return .none;
+                            // transcript message timestamps.  When the session
+                            // picker is open, Ctrl+D is handled there as the
+                            // delete shortcut instead.
+                            if (app.state.mode == .session_picker) {
+                                // fall through to session picker handling below
+                            } else {
+                                _ = app.state.cycleTimestampDisplay();
+                                return .none;
+                            }
                         },
                         'p' => {
                             if (app.state.mode == .normal and app.state.focus_pane == .composer) _ = app.state.composerHistoryPrev() catch false;
@@ -1824,12 +2050,38 @@ pub const TuiModel = struct {
                 }
                 // Session picker navigation and filtering.
                 if (app.state.mode == .session_picker) {
+                    if (app.state.session_delete_confirm) {
+                        switch (key.key) {
+                            .char => |c| switch (if (c <= std.math.maxInt(u8)) std.ascii.toLower(@as(u8, @intCast(c))) else c) {
+                                'y' => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
+                                'n' => app.state.session_delete_confirm = false,
+                                else => {},
+                            },
+                            .enter => app.deleteSelectedSession() catch |err| app.recordError(@errorName(err)) catch {},
+                            .escape => app.state.session_delete_confirm = false,
+                            else => {},
+                        }
+                        return .none;
+                    }
                     switch (key.key) {
                         .up => moveSessionSelection(app, -1),
                         .down => moveSessionSelection(app, 1),
                         .backspace => updateSessionFilter(app, .backspace, null),
                         .delete => updateSessionFilter(app, .delete, null),
-                        .char => |c| updateSessionFilter(app, .char, c),
+                        .char => |c| switch (c) {
+                            'k' => updateSessionFilter(app, .char, c),
+                            'j' => updateSessionFilter(app, .char, c),
+                            'd' => {
+                                if (key.modifiers.ctrl and
+                                    app.state.session_index < app.state.filteredSessionCount())
+                                {
+                                    app.state.session_delete_confirm = true;
+                                } else {
+                                    updateSessionFilter(app, .char, c);
+                                }
+                            },
+                            else => updateSessionFilter(app, .char, c),
+                        },
                         .space => updateSessionFilter(app, .char, ' '),
                         .left => _ = app.state.session_filter.moveCursorPrev(),
                         .right => _ = app.state.session_filter.moveCursorNext(),
@@ -1838,7 +2090,10 @@ pub const TuiModel = struct {
                         .enter => {
                             app.resumeSelectedSession() catch |err| app.recordError(@errorName(err)) catch {};
                         },
-                        .escape => app.state.mode = .normal,
+                        .escape => {
+                            app.state.session_delete_confirm = false;
+                            app.state.mode = .normal;
+                        },
                         else => {},
                     }
                     return .none;
@@ -1961,7 +2216,8 @@ pub const TuiModel = struct {
                         if (app.state.mode == .approval) {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
-                                if (err == error.QueueFull) consumed = false;
+                                if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
@@ -1969,13 +2225,15 @@ pub const TuiModel = struct {
                             if (key.modifiers.alt) {
                                 app.queueFollowUp(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull) consumed = false;
+                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                    if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else if (app.steeringAvailable()) {
                                 app.steer(text) catch |err| {
                                     if (err == error.QuitRequested) return .quit;
-                                    if (err == error.QueueFull) consumed = false;
+                                    if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                    if (err == error.PendingSessionReset) return .none;
                                     app.recordError(@errorName(err)) catch {};
                                 };
                             } else {
@@ -1986,7 +2244,8 @@ pub const TuiModel = struct {
                                 if (std.mem.startsWith(u8, trimmed, "/")) {
                                     app.submit(text) catch |err| {
                                         if (err == error.QuitRequested) return .quit;
-                                        if (err == error.QueueFull) consumed = false;
+                                        if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                        if (err == error.PendingSessionReset) return .none;
                                         app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                         if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                                     };
@@ -1997,7 +2256,8 @@ pub const TuiModel = struct {
                         } else {
                             app.submit(text) catch |err| {
                                 if (err == error.QuitRequested) return .quit;
-                                if (err == error.QueueFull) consumed = false;
+                                if (err == error.QueueFull or err == error.PendingSessionReset) consumed = false;
+                                if (err == error.PendingSessionReset) return .none;
                                 app.state.status.setError(app.allocator, @errorName(err)) catch {};
                                 if (err != error.QueueFull) app.state.appendTranscript(.@"error", @errorName(err)) catch {};
                             };
@@ -3326,6 +3586,244 @@ test "TuiModel Ctrl D cycles timestamp display" {
     try std.testing.expectEqual(tui_state.TimestampDisplay.full, model.app.?.state.timestamp_display);
 }
 
+test "TuiModel Ctrl D enters delete confirmation in session picker" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    try model.app.?.state.addSession("s1", "Session One");
+    model.app.?.state.mode = .session_picker;
+
+    const cmd = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expectEqual(zz.Cmd(TuiModel.Msg).none, cmd);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+    try std.testing.expectEqual(tui_state.TimestampDisplay.clock, model.app.?.state.timestamp_display);
+}
+
+test "App drain quarantines late events until the next turn starts" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Stale event from the deleted turn (generation <= quarantine_generation)
+    // is dropped rather than buffered or applied.
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    var found_fresh = false;
+    var found_stale = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "fresh")) found_fresh = true;
+        if (std.mem.eql(u8, entry.text.items, "stale")) found_stale = true;
+    }
+    try std.testing.expect(found_fresh);
+    try std.testing.expect(!found_stale);
+    try std.testing.expect(!app.quarantine_events);
+}
+
+test "App drain exits quarantine on turn_start for remote-style streams" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Stale event from the deleted turn (generation <= quarantine_generation)
+    // is dropped rather than buffered or applied.
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+    try std.testing.expect(!app.quarantine_events);
+}
+
+test "App drain ignores stale lifecycle events while quarantined" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Events from the cancelled run carry the same generation as the deleted
+    // turn and must not end quarantine, even if they are lifecycle events.
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 1 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "stale")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.state.transcript.items.len);
+
+    // Only a lifecycle event from a newer turn (higher generation) ends
+    // quarantine and allows its following deltas through.
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 1), app.state.transcript.items.len);
+    try std.testing.expectEqualStrings("fresh", app.state.transcript.items[0].text.items);
+}
+
+test "App drain buffers fresh user message_end during quarantine until lifecycle marker" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Remote runs enqueue the synthetic user message_end before the remote
+    // turn_start arrives. It belongs to the new turn (generation 2) and must
+    // be preserved, not dropped.
+    try mock.eventStream().push(.{ .message_end = .{
+        .generation = 2,
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "next prompt")),
+    } });
+    try mock.eventStream().push(.{ .turn_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "reply")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expect(!app.quarantine_events);
+    var found_prompt = false;
+    var found_reply = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "next prompt")) found_prompt = true;
+        if (std.mem.eql(u8, entry.text.items, "reply")) found_reply = true;
+    }
+    try std.testing.expect(found_prompt);
+    try std.testing.expect(found_reply);
+}
+
+test "App drain ends quarantine on fresh terminal error and surfaces it" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // A fresh user message_end arrives before the lifecycle marker, followed by
+    // a terminal error before any agent_start/turn_start. The error must end
+    // quarantine, flush the buffer, and be surfaced instead of being buffered
+    // forever.
+    try mock.eventStream().push(.{ .message_end = .{
+        .generation = 2,
+        .role = .user,
+        .text = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "next prompt")),
+    } });
+    try mock.eventStream().push(.{ .@"error" = .{
+        .generation = 2,
+        .message = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "remote failed")),
+    } });
+    try app.drainEvents();
+
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.quarantine_buffer.items.len);
+    var found_error = false;
+    for (app.state.transcript.items) |entry| {
+        if (entry.kind == .@"error" and std.mem.eql(u8, entry.text.items, "remote failed")) found_error = true;
+    }
+    try std.testing.expect(found_error);
+}
+
+test "App drain keeps filtering stale generations after quarantine ends" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.session_id = try std.testing.allocator.dupe(u8, "deleted");
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    // Lifecycle marker from the new turn ends quarantine.
+    try mock.eventStream().push(.{ .agent_start = .{ .generation = 2 } });
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 2,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "fresh")),
+    } });
+    try app.drainEvents();
+    try std.testing.expect(!app.quarantine_events);
+
+    // A late stale delta from the deleted run arrives afterwards and must still
+    // be dropped, not applied to the new session.
+    try mock.eventStream().push(.{ .text_delta = .{
+        .generation = 1,
+        .content_index = 0,
+        .delta = OwnedSlice(u8).initOwned(try std.testing.allocator.dupe(u8, "late stale")),
+    } });
+    try app.drainEvents();
+    var found_stale = false;
+    for (app.state.transcript.items) |entry| {
+        if (std.mem.eql(u8, entry.text.items, "late stale")) found_stale = true;
+    }
+    try std.testing.expect(!found_stale);
+}
+
+test "App submit clears pending session reset flag" {
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    var mock = MockAppSession{};
+    defer mock.deinit();
+    app.session = mock.session();
+    app.pending_session_reset = true;
+
+    try app.submit("hello");
+    try std.testing.expect(!app.pending_session_reset);
+    try std.testing.expectEqual(@as(usize, 1), mock.submit_count);
+}
+
 test "setting pickers apply selected values" {
     const runtime_ptr = try std.testing.allocator.create(tui_runtime.TuiRuntime);
     runtime_ptr.* = try tui_runtime.TuiRuntime.init(std.testing.allocator, .{});
@@ -3717,6 +4215,158 @@ test "session picker keeps selected session when still matched after filter" {
     try std.testing.expectEqual(@as(usize, 2), app.state.sessionRawIndexAtFilteredIndex(app.state.session_index).?);
 }
 
+test "session picker delete and nav keys fall back to filter input" {
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.addSessionWithDetails("s1", "Alpha", "claude-sonnet", "anthropic");
+    try model.app.?.state.addSessionWithDetails("s2", "Beta", "gpt-4o", "openai");
+
+    // The literal keys used for delete/navigation become ordinary filter input.
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' } } }, undefined);
+    try std.testing.expectEqualStrings("d", model.app.?.state.sessionFilterText());
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'j' } } }, undefined);
+    try std.testing.expectEqualStrings("dj", model.app.?.state.sessionFilterText());
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'k' } } }, undefined);
+    try std.testing.expectEqualStrings("djk", model.app.?.state.sessionFilterText());
+
+    // Clear the filter and search for a real row; Ctrl+d should then confirm.
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .backspace } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 's' } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = '1' } } }, undefined);
+    try std.testing.expectEqualStrings("s1", model.app.?.state.sessionFilterText());
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.filteredSessionCount());
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+}
+
+fn sessionStoreBaseForAppTest(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    const base = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "sessions" });
+    errdefer allocator.free(base);
+    try compat.fs.createDir(compat.fs.getCwd(), base);
+    return base;
+}
+
+fn saveTestSession(store: session_store.Store, id: []const u8, last_active: i64) !void {
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, id),
+        .model = try std.testing.allocator.dupe(u8, "model-a"),
+        .provider = try std.testing.allocator.dupe(u8, "provider-a"),
+        .created_at = last_active,
+        .last_active = last_active,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, ""),
+    };
+    defer meta.deinit(std.testing.allocator);
+    try store.save(meta, .{ .turn_start = .{} });
+}
+
+test "session picker delete confirmation can be cancelled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    try std.testing.expect(model.app.?.state.session_delete_confirm);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'n' } } }, undefined);
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+
+    var list = try model.app.?.store.?.list();
+    defer {
+        for (list.items) |*item| item.deinit(std.testing.allocator);
+        list.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.items.len);
+}
+
+test "session picker confirm deletes selected session and clamps selection" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try saveTestSession(model.app.?.store.?, "s2", 2);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+    model.app.?.state.session_index = 1;
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'y' } } }, undefined);
+
+    try std.testing.expect(!model.app.?.state.session_delete_confirm);
+    try std.testing.expectEqual(@as(usize, 1), model.app.?.state.sessions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), model.app.?.state.session_index);
+    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
+}
+
+test "session picker delete respects active filter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
+    defer model.deinit();
+    model.app.?.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(model.app.?.store.?, "s1", 1);
+    try saveTestSession(model.app.?.store.?, "s2", 2);
+    try saveTestSession(model.app.?.store.?, "s3", 3);
+    try model.app.?.loadSessions();
+    model.app.?.state.mode = .session_picker;
+    try model.app.?.state.session_filter.insertSlice(std.testing.allocator, "s1");
+    model.app.?.state.clampSessionSelectionToFilter();
+
+    _ = model.update(.{ .key = .{ .key = .{ .char = 'd' }, .modifiers = .{ .ctrl = true } } }, undefined);
+    _ = model.update(.{ .key = .{ .key = .enter } }, undefined);
+
+    try std.testing.expectError(error.FileNotFound, model.app.?.store.?.load("s1"));
+    var s2 = try model.app.?.store.?.load("s2");
+    s2.deinit(std.testing.allocator);
+    var s3 = try model.app.?.store.?.load("s3");
+    s3.deinit(std.testing.allocator);
+}
+
+test "deleting current session clears active session id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(app.store.?, "current", 1);
+    try app.loadSessions();
+    app.session_id = try std.testing.allocator.dupe(u8, "current");
+    try app.state.status.setSessionId(std.testing.allocator, "current");
+
+    try app.deleteSelectedSession();
+    try std.testing.expectEqual(@as(usize, 0), app.session_id.len);
+    try std.testing.expectEqual(@as(usize, 0), app.state.status.session_id.len);
+
+    try app.submit("next turn");
+    try std.testing.expect(app.session_id.len > 0);
+    try std.testing.expect(app.state.status.session_id.len > 0);
+}
+
 test "TuiModel Tab cycles focus through panes" {
     var model = TuiModel{ .app = App.initWithoutRuntime(std.testing.allocator) };
     defer model.deinit();
@@ -3857,6 +4507,28 @@ test "TuiModel Ctrl+G editor shortcut returns focus to composer" {
     try std.testing.expectEqual(tui_state.FocusPane.composer, model.app.?.state.focus_pane);
 }
 
+test "resume selected session clears delete reset flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
+
+    var app = App.initWithoutRuntime(std.testing.allocator);
+    defer app.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+    try saveTestSession(app.store.?, "s1", 1);
+    try app.loadSessions();
+    app.pending_session_reset = true;
+    app.quarantine_events = true;
+
+    // Without a runtime configured, resume fails and the stale delete-state flags
+    // must stay active so a subsequent drain can still clear the deleted history
+    // and quarantine late events.
+    try std.testing.expectError(error.NoRuntimeConfigured, app.resumeSelectedSession());
+    try std.testing.expect(app.pending_session_reset);
+    try std.testing.expect(app.quarantine_events);
+}
+
 fn initRemoteRuntimeForTest(allocator: std.mem.Allocator) !*tui_runtime.TuiRuntime {
     const runtime = try allocator.create(tui_runtime.TuiRuntime);
     runtime.* = tui_runtime.TuiRuntime.init(allocator, .{ .backend = .remote }) catch |err| {
@@ -3880,10 +4552,50 @@ test "resume selected session allows remote runtime" {
     try app.resumeSelectedSession();
 }
 
-// ============================================================================
-// Mock provider for ProductionRuntime lifetime regression tests
-// ============================================================================
+test "resume selected session clears delete reset flags on success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try sessionStoreBaseForAppTest(std.testing.allocator, &tmp);
+    defer std.testing.allocator.free(base);
 
+    var production = try ProductionRuntime.init(std.testing.allocator);
+    defer production.deinit();
+    production.initBridge();
+
+    var app = try App.init(std.testing.allocator, production.options());
+    defer app.deinit();
+    app.runtime.?.run_async = false;
+
+    if (app.store) |*store| store.deinit();
+    app.store = try session_store.Store.init(std.testing.allocator, base);
+
+    const model = app.runtime.?.currentModel() orelse return error.NoModelConfigured;
+    var meta = session_store.SessionMetadata{
+        .session_id = try std.testing.allocator.dupe(u8, "s1"),
+        .model = try std.testing.allocator.dupe(u8, model.id),
+        .provider = try std.testing.allocator.dupe(u8, model.provider),
+        .created_at = 1,
+        .last_active = 1,
+        .turn_count = 1,
+        .working_dir = try std.testing.allocator.dupe(u8, ""),
+    };
+    defer meta.deinit(std.testing.allocator);
+    try app.store.?.save(meta, .{ .turn_start = .{} });
+
+    try app.loadSessions();
+    app.pending_session_reset = true;
+    app.quarantine_events = true;
+    app.quarantine_generation = 1;
+
+    try app.resumeSelectedSession();
+    try std.testing.expect(!app.pending_session_reset);
+    try std.testing.expect(!app.quarantine_events);
+    try std.testing.expectEqual(@as(usize, 0), app.quarantine_buffer.items.len);
+    try std.testing.expectEqualStrings("s1", app.session_id);
+}
+
+// =====================================================================// Mock provider for ProductionRuntime lifetime regression tests
+// =====================================================================
 const MockProvider = struct {
     fn stream(
         model: ai_types.Model,

@@ -55,6 +55,16 @@ pub fn render(allocator: std.mem.Allocator, state: *const tui_state.AppState, op
         defer allocator.free(styled);
         try writer.writeAll(styled);
     }
+    if (state.session_delete_confirm and state.session_index < filtered_count) {
+        if (state.sessionAtFilteredIndex(state.session_index)) |selected| {
+            try writer.writeByte('\n');
+            const prompt = try std.fmt.allocPrint(allocator, "Delete session '{s}'? (y/n)", .{selected.label});
+            defer allocator.free(prompt);
+            const styled = try tui_theme.errorText().render(allocator, prompt);
+            defer allocator.free(styled);
+            try writer.writeAll(styled);
+        }
+    }
     return renderPanel(allocator, &out, options.width);
 }
 
@@ -182,4 +192,16 @@ test "session picker clamps selection after filter changes" {
     try std.testing.expectEqual(@as(usize, 0), state.session_index);
     try std.testing.expectEqual(@as(usize, 0), state.session_scroll);
     try std.testing.expectEqual(@as(usize, 1), state.sessionRawIndexAtFilteredIndex(state.session_index).?);
+}
+
+test "session picker renders delete confirmation prompt" {
+    var state = tui_state.AppState.init(std.testing.allocator);
+    defer state.deinit();
+    try state.addSession("s1", "First");
+    state.session_delete_confirm = true;
+
+    const text = try render(std.testing.allocator, &state, .{ .height = 4 });
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "Delete session 'First'? (y/n)") != null);
 }

@@ -139,6 +139,6 @@ test "distributed chain: protocol/agent -> agent_loop -> protocol/provider" {
 
     var ev = client.popEvent().?;
     defer ev.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"type\":\"turn_end\"}", ev.slice());
+    try std.testing.expectEqualStrings("{\"type\":\"turn_end\"}", ev.json.slice());
     try std.testing.expectEqualStrings("{\"ok\":true}", client.getLastResultJson().?);
 }

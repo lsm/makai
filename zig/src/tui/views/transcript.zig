@@ -1249,7 +1249,7 @@ test "transcript everything mode includes low value system and full tool state" 
     var state = AppState.init(std.testing.allocator);
     defer state.deinit();
     state.transcript_mode = .everything;
-    try state.applyEvent(.agent_start);
+    try state.applyEvent(.{ .agent_start = .{} });
     const tool = try state.upsertToolForTest("call-1", "shell_execute", "{\"command\":\"ls\"}", .done);
     try tool.output.appendSlice(std.testing.allocator, "full output line");
     state.telemetry.total_bytes = 42;
