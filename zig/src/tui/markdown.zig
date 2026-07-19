@@ -47,14 +47,18 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
-        // 2. Markdown inline links and bare URLs must stay raw. Protect their
-        //    destinations before math checks so URLs like
-        //    `/users/$user_id$` survive.
+        // 2. Markdown inline links, bare URLs, and relative path/URL
+        //    placeholders must stay raw. Protect their destinations before
+        //    math checks so URLs like `/users/$user_id$` and routes like
+        //    `/api/v1/$id` survive.
         if (source[i] == '[') {
-            if (try consumeMarkdownLink(writer, source, &i)) continue;
+            if (try consumeMarkdownLink(allocator, writer, source, &i)) continue;
         }
         if (isBareUrlPrefix(source, i)) {
             if (try consumeBareUrl(writer, source, &i)) continue;
+        }
+        if (source[i] == '/') {
+            if (try consumeRelativePath(writer, source, &i)) continue;
         }
 
         // 3. Inline code spans must stay raw. Protect them before math checks
@@ -71,7 +75,7 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
         // 5. Inline math `$...$`.
         if (source[i] == '$') {
-            if (try consumeInlineMath(writer, source, &i)) continue;
+            if (try consumeInlineMath(allocator, writer, source, &i)) continue;
         }
 
         // 5. Plain byte.
@@ -111,11 +115,12 @@ fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) !boo
     return false;
 }
 
-/// Consume a Markdown inline link `[text](url)` verbatim. Returns false when
-/// the bytes at `*i` don't form a complete link so the default byte path
-/// preserves the source. Link destinations may contain `$` chars that must not
-/// be interpreted as inline math, so the whole link is copied unchanged.
-fn consumeMarkdownLink(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+/// Consume a Markdown inline link `[text](url)`. Preprocesses the visible
+/// label text so math like `[loss $L_2$](...)` renders, while copying the
+/// URL destination verbatim so any `$`variables in the URL stay copyable.
+/// Returns false when the bytes at `*i` don't form a complete link so the
+/// default byte path preserves the source.
+fn consumeMarkdownLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
     const start = i.*;
     if (start >= source.len or source[start] != '[') return false;
 
@@ -162,7 +167,17 @@ fn consumeMarkdownLink(writer: *std.Io.Writer, source: []const u8, i: *usize) !b
     }
     if (paren_depth != 0 or url_end >= source.len) return false;
 
-    try writer.writeAll(source[start .. url_end + 1]);
+    // Preprocess the label so math inside link labels is rendered, while the
+    // URL stays verbatim.
+    const label_text = source[start + 1 .. text_end];
+    const processed_label = try preprocess(allocator, label_text);
+    defer allocator.free(processed_label);
+
+    try writer.writeByte('[');
+    try writer.writeAll(processed_label);
+    try writer.writeAll("](");
+    try writer.writeAll(source[url_start + 1 .. url_end]);
+    try writer.writeByte(')');
     i.* = url_end + 1;
     return true;
 }
@@ -187,6 +202,30 @@ fn consumeBareUrl(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
         if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '<' or c == '>') break;
         end += 1;
     }
+    try writer.writeAll(source[start..end]);
+    i.* = end;
+    return true;
+}
+
+/// Consume a relative path or route span (`/users/$user_id$/orders`) verbatim
+/// so dollar placeholders inside it are not interpreted as inline math.
+/// Returns false when the bytes don't look like a path.
+fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    if (source[i.*] != '/') return false;
+    const start = i.*;
+    var end = start;
+    var slash_count: usize = 0;
+    var has_dollar = false;
+    while (end < source.len) {
+        const c = source[end];
+        if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == '<' or c == '>') break;
+        if (c == '/') slash_count += 1;
+        if (c == '$') has_dollar = true;
+        end += 1;
+    }
+    // Require at least two path segments (leading slash + another slash) or
+    // a dollar placeholder so we don't swallow ordinary `/` punctuation.
+    if (slash_count < 2 and !has_dollar) return false;
     try writer.writeAll(source[start..end]);
     i.* = end;
     return true;
@@ -409,6 +448,19 @@ fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
     return null;
 }
 
+/// Write `text` to `writer` with Markdown inline metacharacters escaped so
+/// that rendered math (e.g. `a*b*c`) is not reinterpreted as emphasis, code,
+/// links, or escapes by the downstream Markdown pass.
+fn writeMarkdownEscaped(writer: *std.Io.Writer, text: []const u8) anyerror!void {
+    for (text) |c| {
+        switch (c) {
+            '*', '_', '`', '[', ']', '<', '>' => try writer.writeByte('\\'),
+            else => {},
+        }
+        try writer.writeByte(c);
+    }
+}
+
 /// Try to consume a `$$...$$` block math span at `*i`. Returns true and
 /// advances `*i` past the closing `$$` on success. Returns false (without
 /// modifying `*i`) when the bytes at `*i` aren't a real block-math opener —
@@ -429,9 +481,20 @@ fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source
         return false;
     };
 
+    // Force line boundaries so block math doesn't run into surrounding prose
+    // like `before $$x$$ after`.
+    if (open > 0 and source[open - 1] != '\n') try writer.writeByte('\n');
     const body = source[body_start..close];
     try writeBlockMath(allocator, writer, body);
-    i.* = close + 2;
+    const after_close = close + 2;
+    if (after_close < source.len and source[after_close] != '\n') {
+        try writer.writeByte('\n');
+        // Skip a single separating space so `$$x$$ after` becomes a clean line
+        // break rather than `> x\n after`.
+        i.* = if (source[after_close] == ' ') after_close + 1 else after_close;
+    } else {
+        i.* = after_close;
+    }
     return true;
 }
 
@@ -441,8 +504,8 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
     try renderMathBody(&rendered.writer, body);
 
     // Emit as a Markdown blockquote — one quote line per source line, with
-    // blank lines collapsed. This visually sets math apart from prose and
-    // survives the downstream markdown pass cleanly.
+    // blank lines collapsed. Escape Markdown metacharacters in the rendered
+    // math so stars/brackets/etc. are not reinterpreted by the downstream pass.
     var lines = std.mem.splitScalar(u8, rendered.written(), '\n');
     var wrote_any = false;
     while (lines.next()) |raw_line| {
@@ -450,7 +513,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
         if (line.len == 0) continue;
         if (wrote_any) try writer.writeByte('\n');
         try writer.writeAll("> ");
-        try writer.writeAll(line);
+        try writeMarkdownEscaped(writer, line);
         wrote_any = true;
     }
     if (!wrote_any) try writer.writeAll("> ");
@@ -470,7 +533,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// - `\$FOO\$` — the opener/closer is escaped by a backslash.
 /// Digit-led formulas such as `$2^n$` still render because the closer is not
 /// identifier/digit-adjacent.
-fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
 
     // Opening `$` immediately after a digit is a price suffix, not math
@@ -504,7 +567,12 @@ fn consumeInlineMath(writer: *std.Io.Writer, source: []const u8, i: *usize) !boo
     // Reject newlines — inline math is a single line.
     if (std.mem.indexOfScalar(u8, body, '\n') != null) return false;
 
-    try renderMathBody(writer, body);
+    // Render to a temporary buffer so we can escape Markdown metacharacters
+    // before inserting the result into the prose stream.
+    var rendered: std.Io.Writer.Allocating = .init(allocator);
+    defer rendered.deinit();
+    try renderMathBody(&rendered.writer, body);
+    try writeMarkdownEscaped(writer, rendered.written());
     i.* = close + 1;
     return true;
 }
@@ -581,12 +649,17 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
             // Preserve any immediate `{...}` argument verbatim so users can
             // still read / copy unsupported LaTeX like `\boxed{x+1}` instead
             // of having the brace-stripping pass run the operand into the
-            // command name (e.g. `\boxedx+1`).
+            // command name (e.g. `\boxedx+1`). If a brace group is incomplete,
+            // copy the rest of the body verbatim rather than leaving the `{`
+            // to be stripped by the main loop.
             try writer.writeByte('\\');
             try writer.writeAll(name);
             var after = j;
             while (after < body.len and body[after] == '{') {
-                const grp = readGroup(body, after) orelse break;
+                const grp = readGroup(body, after) orelse {
+                    try writer.writeAll(body[after..]);
+                    return;
+                };
                 try writer.writeAll(body[after..grp.end]);
                 after = grp.end;
             }
@@ -1566,4 +1639,60 @@ test "nested script braces preserve inner group" {
     // being truncated to `\frac{1}2`.
     try std.testing.expect(std.mem.indexOf(u8, out, "^{\\frac{1}{2}}") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\\frac{1}2") == null);
+}
+
+test "inline math escapes markdown metacharacters" {
+    const src = "product $a*b*c$ and sum $x[y](z)$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Stars and brackets inside rendered math must be escaped so they are not
+    // reinterpreted as emphasis or links by the downstream Markdown pass.
+    try std.testing.expect(std.mem.indexOf(u8, out, "a\\*b\\*c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x\\[y\\](z)") != null);
+}
+
+test "block math forces line boundaries around prose" {
+    const src = "before$$x$$after";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Block math must be on its own line, not embedded as `before > x after`.
+    try std.testing.expect(std.mem.indexOf(u8, out, "before\n> x\nafter") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "before > x after") == null);
+}
+
+test "block math with spaces around delimiters separates from prose" {
+    const src = "before $$x$$ after";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The inline-embedded block math should be separated onto its own quote line.
+    try std.testing.expect(std.mem.indexOf(u8, out, "> x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "before > x after") == null);
+    // 'after' should land on its own line rather than being concatenated.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\nafter") != null);
+}
+
+test "link label math is rendered while url stays verbatim" {
+    const src = "[loss $L_2$](https://example.com/$id)";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Label math should render (L_2 -> L with subscript 2), URL should stay raw.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[loss L₂](https://example.com/$id)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$L_2$") == null);
+}
+
+test "incomplete unknown command group is preserved verbatim" {
+    const src = "set $\\boxed{\\{1,2$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The unclosed brace group and escaped brace should survive the fallback
+    // instead of having the opening `{` stripped.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed{\\{1,2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\boxed\\{1,2") == null);
+}
+
+test "relative path with dollar placeholders stays verbatim" {
+    const src = "GET /users/$user_id$/orders";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
 }
