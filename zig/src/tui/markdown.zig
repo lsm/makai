@@ -30,6 +30,10 @@ const std = @import("std");
 /// math spans and Mermaid blocks rewritten. The caller owns the returned
 /// slice.
 pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    return preprocessWithOptions(allocator, source, true);
+}
+
+fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, protect_math: bool) anyerror![]u8 {
     if (source.len == 0) return allocator.dupe(u8, source);
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -75,7 +79,7 @@ pub fn preprocess(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
 
         // 5. Inline math `$...$`.
         if (source[i] == '$') {
-            if (try consumeInlineMath(allocator, writer, source, &i)) continue;
+            if (try consumeInlineMath(allocator, writer, source, &i, protect_math)) continue;
         }
 
         // 5. Plain byte.
@@ -94,11 +98,14 @@ fn isAtLineStart(source: []const u8, i: usize) bool {
 /// Consume an inline code span verbatim. Returns false for fenced code block
 /// runs (handled by consumeFenceBlock) and unterminated spans so the default
 /// byte path preserves source.
-fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
     const start = i.*;
     var tick_count: usize = 0;
     while (start + tick_count < source.len and source[start + tick_count] == '`') tick_count += 1;
-    if (tick_count >= 3) return false;
+
+    // A run of three or more backticks at the start of a line is a fenced code
+    // block opener (handled by consumeFenceBlock), not an inline code span.
+    if (tick_count >= 3 and isAtLineStart(source, start)) return false;
 
     var scan = start + tick_count;
     while (scan < source.len) : (scan += 1) {
@@ -168,9 +175,10 @@ fn consumeMarkdownLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, sou
     if (paren_depth != 0 or url_end >= source.len) return false;
 
     // Preprocess the label so math inside link labels is rendered, while the
-    // URL stays verbatim.
+    // URL stays verbatim. The label is already inside a link, so it does not
+    // need the inline-code protection we use for normal prose math.
     const label_text = source[start + 1 .. text_end];
-    const processed_label = try preprocess(allocator, label_text);
+    const processed_label = try preprocessWithOptions(allocator, label_text, false);
     defer allocator.free(processed_label);
 
     try writer.writeByte('[');
@@ -448,17 +456,21 @@ fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Write `text` to `writer` with Markdown inline metacharacters escaped so
-/// that rendered math (e.g. `a*b*c`) is not reinterpreted as emphasis, code,
-/// links, or escapes by the downstream Markdown pass.
-fn writeMarkdownEscaped(writer: *std.Io.Writer, text: []const u8) anyerror!void {
-    for (text) |c| {
-        switch (c) {
-            '*', '_', '`', '[', ']', '<', '>' => try writer.writeByte('\\'),
-            else => {},
-        }
-        try writer.writeByte(c);
+/// Wrap a rendered math span in a single-backtick inline code span so that
+/// ZigZag's renderInline treats the content as verbatim and does not reinterpret
+/// `*`, `_`, `[`, `]`, or backticks as Markdown emphasis, links, or code spans.
+/// Backslash escapes are not honored by ZigZag's parser, so this inline-code
+/// boundary is the only protection it actually respects.
+fn writeProtectedMathSpan(writer: *std.Io.Writer, text: []const u8) anyerror!void {
+    if (std.mem.indexOfScalar(u8, text, '`') != null) {
+        // ZigZag does not support multi-backtick code delimiters, so if the
+        // rendered math somehow contains a backtick, fall back to the raw text.
+        try writer.writeAll(text);
+        return;
     }
+    try writer.writeByte('`');
+    try writer.writeAll(text);
+    try writer.writeByte('`');
 }
 
 /// Try to consume a `$$...$$` block math span at `*i`. Returns true and
@@ -504,8 +516,9 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
     try renderMathBody(&rendered.writer, body);
 
     // Emit as a Markdown blockquote — one quote line per source line, with
-    // blank lines collapsed. Escape Markdown metacharacters in the rendered
-    // math so stars/brackets/etc. are not reinterpreted by the downstream pass.
+    // blank lines collapsed. Blockquote content is rendered as a single styled
+    // span by ZigZag and is not run through its inline formatter, so Markdown
+    // metacharacters in the rendered math do not need additional escaping.
     var lines = std.mem.splitScalar(u8, rendered.written(), '\n');
     var wrote_any = false;
     while (lines.next()) |raw_line| {
@@ -513,7 +526,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
         if (line.len == 0) continue;
         if (wrote_any) try writer.writeByte('\n');
         try writer.writeAll("> ");
-        try writeMarkdownEscaped(writer, line);
+        try writer.writeAll(line);
         wrote_any = true;
     }
     if (!wrote_any) try writer.writeAll("> ");
@@ -533,7 +546,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// - `\$FOO\$` — the opener/closer is escaped by a backslash.
 /// Digit-led formulas such as `$2^n$` still render because the closer is not
 /// identifier/digit-adjacent.
-fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize, protect_math: bool) anyerror!bool {
     const open = i.*;
 
     // Opening `$` immediately after a digit is a price suffix, not math
@@ -567,12 +580,19 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // Reject newlines — inline math is a single line.
     if (std.mem.indexOfScalar(u8, body, '\n') != null) return false;
 
-    // Render to a temporary buffer so we can escape Markdown metacharacters
-    // before inserting the result into the prose stream.
+    // Render to a temporary buffer. When inserted into normal prose, wrap the
+    // result in inline-code backticks so ZigZag's renderInline treats the whole
+    // span as verbatim and does not reinterpret * / _ / [ ] / ` etc. Link labels
+    // and other contexts that are already protected by a structural delimiter
+    // skip the wrapper.
     var rendered: std.Io.Writer.Allocating = .init(allocator);
     defer rendered.deinit();
     try renderMathBody(&rendered.writer, body);
-    try writeMarkdownEscaped(writer, rendered.written());
+    if (protect_math) {
+        try writeProtectedMathSpan(writer, rendered.written());
+    } else {
+        try writer.writeAll(rendered.written());
+    }
     i.* = close + 1;
     return true;
 }
@@ -1253,8 +1273,8 @@ test "inline math after operators renders" {
     const src = "f(x)=$x^2$ and value:$v$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "f(x)=x²") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "value:v") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "f(x)=`x²`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "value:`v`") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$x^2$") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$v$") == null);
 }
@@ -1272,8 +1292,8 @@ test "escaped dollar inside inline math is not treated as closer" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     // The escaped \$ should render as a literal $ and the real closing $ should
-    // terminate the math span, so the whole formula renders as "x = $5".
-    try std.testing.expect(std.mem.indexOf(u8, out, "price x = $5") != null);
+    // terminate the math span, so the whole formula renders as "`x = $5`".
+    try std.testing.expect(std.mem.indexOf(u8, out, "price `x = $5`") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "price $x = \\5") == null);
 }
 
@@ -1324,7 +1344,7 @@ test "plain brackets still allow inline math" {
     const src = "value is [x] = $x$ ok";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "[x] = x ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[x] = `x` ok") != null);
 }
 
 test "bare url with dollar variables stays verbatim" {
@@ -1361,6 +1381,15 @@ test "multi-backtick inline code span is not parsed as math" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "``echo $x$``") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "echo x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
+}
+
+test "triple-backtick inline code span is not parsed as math" {
+    const src = "Use ```echo $x$``` then $\\alpha$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "```echo $x$```") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "echo x") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "α") != null);
 }
@@ -1641,14 +1670,14 @@ test "nested script braces preserve inner group" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\\frac{1}2") == null);
 }
 
-test "inline math escapes markdown metacharacters" {
+test "inline math protects markdown metacharacters with inline code" {
     const src = "product $a*b*c$ and sum $x[y](z)$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    // Stars and brackets inside rendered math must be escaped so they are not
-    // reinterpreted as emphasis or links by the downstream Markdown pass.
-    try std.testing.expect(std.mem.indexOf(u8, out, "a\\*b\\*c") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "x\\[y\\](z)") != null);
+    // Rendered math is wrapped in backticks so ZigZag's renderInline treats
+    // the span as verbatim and does not reinterpret * / _ / [ ] as Markdown.
+    try std.testing.expect(std.mem.indexOf(u8, out, "`a*b*c`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`x[y](z)`") != null);
 }
 
 test "block math forces line boundaries around prose" {
