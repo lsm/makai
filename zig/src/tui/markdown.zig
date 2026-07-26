@@ -492,6 +492,62 @@ fn findUnescapedDollar(source: []const u8, start: usize) ?usize {
     return null;
 }
 
+/// Find the closing `$` for an inline math span, skipping over structural
+/// spans that the outer walker protects: inline code (`` `...` ``) and bare
+/// URLs (`http://...`, `https://...`). Without this, a literal dollar in
+/// prose like `Pay $5; details: https://example.com/$id$` would pair with
+/// the URL's placeholder `$` and swallow the entire URL as a math body.
+fn findInlineMathClose(source: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < source.len) {
+        // Skip inline code spans — their `$` chars are not math delimiters.
+        if (source[i] == '`') {
+            const tick_count = countLeadingChar(source[i..], '`');
+            if (tick_count < 3) {
+                var scan = i + tick_count;
+                var found_close = false;
+                while (scan < source.len) {
+                    if (source[scan] == '`') {
+                        const close_count = countLeadingChar(source[scan..], '`');
+                        if (close_count == tick_count) {
+                            i = scan + close_count;
+                            found_close = true;
+                            break;
+                        }
+                        scan += close_count;
+                        continue;
+                    }
+                    scan += 1;
+                }
+                if (!found_close) return null;
+                continue;
+            }
+            // 3+ backticks — unusual inline; skip past the run and let the
+            // outer walker handle it.
+            i += tick_count;
+            continue;
+        }
+        // Skip bare URLs — their `$` placeholders are not math delimiters.
+        if (isBareUrlPrefix(source, i)) {
+            var url_end = i;
+            while (url_end < source.len) {
+                const c = source[url_end];
+                if (c == ' ' or c == '\t' or c == '\n' or c == '\r' or
+                    c == '<' or c == '>')
+                {
+                    break;
+                }
+                url_end += 1;
+            }
+            i = url_end;
+            continue;
+        }
+        if (source[i] == '$' and !isEscaped(source, i)) return i;
+        i += 1;
+    }
+    return null;
+}
+
 /// Find the next unescaped `$$` at or after `start`.
 fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
     var i = start;
@@ -506,7 +562,17 @@ fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
 /// `*`, `_`, `[`, `]`, or backticks as Markdown emphasis, links, or code spans.
 /// Backslash escapes are not honored by ZigZag's parser, so this inline-code
 /// boundary is the only protection it actually respects.
+///
+/// The wrapper is only emitted when the rendered math actually contains a
+/// Markdown metacharacter. This avoids leaking literal backticks inside styled
+/// contexts that ZigZag renders without recursing into `renderInline` (bold,
+/// italic, headings, blockquotes), where the wrapper would be displayed as a
+/// visible character rather than acting as a code-span boundary.
 fn writeProtectedMathSpan(writer: *std.Io.Writer, text: []const u8) anyerror!void {
+    if (!needsMathProtection(text)) {
+        try writer.writeAll(text);
+        return;
+    }
     if (std.mem.indexOfScalar(u8, text, '`') != null) {
         // ZigZag does not support multi-backtick code delimiters, so if the
         // rendered math somehow contains a backtick, fall back to the raw text.
@@ -611,23 +677,37 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     }
 
     const body_start = open + 1;
-    const close = findUnescapedDollar(source, body_start) orelse return false;
+    const close = findInlineMathClose(source, body_start) orelse return false;
 
     const body = source[body_start..close];
+
+    // Reject bodies that look like they swallowed a URL — a `$` before a
+    // bare URL can pair with a `$` inside the URL destination (e.g. a
+    // placeholder) even though the closer search skips URLs, because the
+    // URL may have already been consumed as part of the body when the
+    // opener was at a position where the URL check hadn't fired yet.
+    if (std.mem.indexOf(u8, body, "://") != null) return false;
 
     // Closing `$` must not be preceded by whitespace, followed by another
     // `$`, followed by a digit (currency ranges), or followed by `{`
     // (braced shell variables like `${HOME}`).
-    // An identifier suffix is allowed for prose like `$n$th`. Uppercase-only
-    // bodies are treated as shell-variable names; reject them when the closer
-    // is followed by a path continuation (`/`, `-`) or another identifier.
+    // An identifier suffix is allowed for prose like `$n$th`. Shell-variable
+    // adjacency is detected in two shapes:
+    //   - `$HOME/$PATH`, `$foo/$bar` — closer followed by `/` or `-` and body
+    //     is a shell-name token (alphanumeric + underscore).
+    //   - `$foo/$bar`, `$prefix-$suffix` — body ends with `/` or `-` and the
+    //     closer is followed by an identifier char (the next variable name).
+    // Uppercase-only bodies are additionally rejected when followed by any
+    // identifier (`$HOME$var`).
     if (source[close - 1] == ' ') return false;
+    if (body.len > 0 and (body[body.len - 1] == '/' or body[body.len - 1] == '-')) {
+        if (close + 1 < source.len and isIdentifierChar(source[close + 1])) return false;
+    }
     if (close + 1 < source.len) {
         const after = source[close + 1];
         if (after == '$' or after == '{' or std.ascii.isDigit(after)) return false;
-        if (isUppercaseShellName(body) and (after == '/' or after == '-' or isIdentifierChar(after))) {
-            return false;
-        }
+        if ((after == '/' or after == '-') and isShellNameLike(body)) return false;
+        if (isUppercaseShellName(body) and isIdentifierChar(after)) return false;
         if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
             return false;
         }
@@ -718,6 +798,19 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
             if (std.mem.eql(u8, name, "sqrt")) {
                 i = try writeSqrt(writer, body, j);
                 continue;
+            }
+
+            // Text-mode commands (\text, \textbf, \mathrm, ...) typeset their
+            // operand in literal text mode — the content must NOT be re-parsed
+            // as math. Emit the brace-group operand verbatim so characters
+            // like `_` and `^` stay literal (e.g. `\text{user_id}` becomes
+            // `user_id`, not `userᵢd`).
+            if (isTextModeCommand(name) and j < body.len and body[j] == '{') {
+                if (readGroup(body, j)) |grp| {
+                    try writer.writeAll(body[j + 1 .. grp.end - 1]);
+                    i = grp.end;
+                    continue;
+                }
             }
 
             if (lookupCommand(name)) |sym| {
@@ -846,6 +939,51 @@ fn isUppercaseShellName(s: []const u8) bool {
         if (!(std.ascii.isUpper(c) or c == '_')) return false;
     }
     return true;
+}
+
+/// Returns true when `s` is all ASCII alphanumeric or underscore — the shape
+/// of a shell variable name like `foo`, `HOME`, or `user_id`. Used to detect
+/// adjacent shell-variable path patterns like `$foo/$bar` without rejecting
+/// real math like `$a/b$` (which contains `/` inside the body).
+fn isShellNameLike(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Returns true when the rendered math text contains a character that
+/// ZigZag's `renderInline` would reinterpret (`*`, `_`, backtick, `[`, `]`,
+/// `<`, `>`). When false, the span needs no inline-code wrapper and can be
+/// emitted raw — this avoids leaking literal backticks inside styled contexts
+/// (bold, italic, headings, blockquotes) that bypass `renderInline`.
+fn needsMathProtection(text: []const u8) bool {
+    for (text) |c| {
+        if (c == '*' or c == '_' or c == '`' or c == '[' or c == ']' or
+            c == '<' or c == '>')
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns true for LaTeX commands that typeset their `{...}` operand in
+/// literal text mode, meaning the operand must be emitted verbatim without
+/// being re-parsed as math (so `_`, `^`, etc. inside the operand stay literal
+/// rather than being converted to sub/superscripts).
+fn isTextModeCommand(name: []const u8) bool {
+    const text_cmds = [_][]const u8{
+        "text",    "textbf",  "textit",  "textrm",  "texttt", "textsf",
+        "emph",    "underline", "mathrm", "mathit", "mathbf", "mathsf",
+        "mathtt",  "mathcal", "mathbb",  "boldsymbol", "pmb",
+        "operatorname",
+    };
+    for (text_cmds) |cmd| {
+        if (std.mem.eql(u8, name, cmd)) return true;
+    }
+    return false;
 }
 
 const FracOperand = struct {
@@ -1342,8 +1480,10 @@ test "inline math after operators renders" {
     const src = "f(x)=$x^2$ and value:$v$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "f(x)=`x²`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "value:`v`") != null);
+    // Rendered math contains no Markdown metacharacters, so no inline-code
+    // wrapper is emitted — the formulas integrate directly into prose.
+    try std.testing.expect(std.mem.indexOf(u8, out, "f(x)=x²") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "value:v") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$x^2$") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$v$") == null);
 }
@@ -1361,8 +1501,9 @@ test "escaped dollar inside inline math is not treated as closer" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     // The escaped \$ should render as a literal $ and the real closing $ should
-    // terminate the math span, so the whole formula renders as "`x = $5`".
-    try std.testing.expect(std.mem.indexOf(u8, out, "price `x = $5`") != null);
+    // terminate the math span. Rendered text "x = $5" has no Markdown
+    // metacharacters, so no inline-code wrapper is emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out, "price x = $5") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "price $x = \\5") == null);
 }
 
@@ -1413,7 +1554,8 @@ test "plain brackets still allow inline math" {
     const src = "value is [x] = $x$ ok";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "[x] = `x` ok") != null);
+    // Rendered "x" has no metacharacters — no wrapper needed.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[x] = x ok") != null);
 }
 
 test "bare url with dollar variables stays verbatim" {
@@ -1799,14 +1941,16 @@ test "inline math allows lowercase prose suffixes" {
     const src = "the $n$th term";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`n`th") != null);
+    // Rendered "n" has no metacharacters — no wrapper, integrates with "th".
+    try std.testing.expect(std.mem.indexOf(u8, out, "the nth term") != null);
 }
 
 test "division before inline math is not treated as a route" {
     const src = "the rate is 1/$n$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "1/`n`") != null);
+    // Rendered "n" has no metacharacters — no wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, out, "1/n") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "1/$n$") == null);
 }
 
@@ -1837,15 +1981,17 @@ test "positive latex spacing commands produce a space" {
     const src = "$a\\;b$ and $x\\:y$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`a b`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`x y`") != null);
+    // "a b" / "x y" have no metacharacters — no wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, out, "a b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x y") != null);
 }
 
 test "negative latex spacing command is dropped" {
     const src = "$a\\!b$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`ab`") != null);
+    // "ab" has no metacharacters — no wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, out, "ab") != null);
 }
 
 test "uppercase math with slash or minus renders" {
@@ -1854,8 +2000,9 @@ test "uppercase math with slash or minus renders" {
     const src = "$A/B$ and $X - Y$";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`A/B`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`X - Y`") != null);
+    // Rendered forms have no Markdown metacharacters — no wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, out, "A/B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "X - Y") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$A/B$") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$X - Y$") == null);
 }
@@ -1877,8 +2024,8 @@ test "parenthesized math is not swallowed as a route" {
     const src = "value ($A/B$)";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`A/B`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "$/A/B$") == null);
+    // "A/B" has no metacharacters — no wrapper.
+    try std.testing.expect(std.mem.indexOf(u8, out, "(A/B)") != null);
 }
 
 test "uppercase shell variable suffix stays raw" {
@@ -1893,9 +2040,78 @@ test "uppercase shell variable suffix stays raw" {
 
 test "lowercase prose suffix after math renders" {
     // Document intended behavior: lowercase suffixes like `$x$_tmp` are
-    // treated as prose and render the math.
+    // treated as prose and render the math. "x" has no metacharacters —
+    // no wrapper, integrates directly with "_tmp".
     const src = "file $x$_tmp";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "`x`_tmp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "file x_tmp") != null);
+}
+
+test "math wrapper omitted inside styled markdown contexts" {
+    // Regression for P2: when rendered math has no Markdown metacharacters,
+    // no inline-code wrapper is emitted — this prevents literal backticks
+    // from leaking inside **bold**, # headings, and > blockquotes (contexts
+    // ZigZag renders without recursing into renderInline).
+    const src = "**Energy: $E=mc^2$**";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // "E=mc²" has no metacharacters: no wrapper, integrates cleanly into bold.
+    try std.testing.expect(std.mem.indexOf(u8, out, "**Energy: E=mc²**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`E=mc²`") == null);
+}
+
+test "math wrapper still applied when metacharacters present" {
+    // When rendered math DOES contain a Markdown metacharacter, the inline-code
+    // wrapper is still emitted so ZigZag's inline parser doesn't reinterpret it.
+    const src = "formula $a*b*c$ here";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`a*b*c`") != null);
+}
+
+test "lowercase shell variables with path separators stay raw" {
+    // Regression for P2: $foo/$bar and $prefix-$suffix are shell-variable
+    // paths, not math formulas.
+    const src = "vars $foo/$bar and $prefix-$suffix";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$foo/$bar") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$prefix-$suffix") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`foo`") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`prefix`") == null);
+}
+
+test "inline math closer skips bare url placeholders" {
+    // Regression for P2: a literal dollar in prose must not pair with a
+    // dollar inside a later bare URL.
+    const src = "Pay $5; details: https://example.com/$id$ here";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The URL must survive verbatim with its $id$ placeholder intact.
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://example.com/$id$") != null);
+    // The prose dollar must not swallow the URL as a math body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "`5; details:") == null);
+}
+
+test "text command preserves literal operand" {
+    // Regression for P2: \text{...} must emit its operand verbatim so
+    // characters like _ and ^ stay literal (LaTeX text mode), not parsed
+    // as sub/superscripts.
+    const src = "label $\\text{user_id}$ end";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "user_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "userᵢd") == null);
+}
+
+test "styled text commands preserve literal operand" {
+    // \textbf, \textit, \mathrm, etc. also operate in text mode — their
+    // operands must not have _ or ^ reparsed as math.
+    const src = "vars $\\textbf{x_id}$ and $\\mathrm{a^b}$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a^b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "xᵢ") == null);
 }
