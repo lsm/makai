@@ -98,8 +98,11 @@ fn isAtLineStart(source: []const u8, i: usize) bool {
 }
 
 /// Consume an inline code span verbatim. Returns false for fenced code block
-/// runs (handled by consumeFenceBlock) and unterminated spans so the default
-/// byte path preserves source.
+/// runs (handled by consumeFenceBlock) at line start. When the span has no
+/// closing backtick (e.g. streaming partial input like `` Run `echo $HOME$ ``),
+/// the rest of the line is copied verbatim so any `$` chars in the unfinished
+/// code are not rewritten as math — this prevents generated wrappers from
+/// pairing with the opening backtick and corrupting the displayed command.
 fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
     const start = i.*;
     var tick_count: usize = 0;
@@ -121,7 +124,12 @@ fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) anye
         }
         scan += close_count - 1;
     }
-    return false;
+    // Unterminated inline code span — copy the rest of the line verbatim so
+    // any `$` / `*` / `_` chars in the unfinished code don't get rewritten.
+    const line_end = std.mem.indexOfScalarPos(u8, source, start, '\n') orelse source.len;
+    try writer.writeAll(source[start..line_end]);
+    i.* = line_end;
+    return true;
 }
 
 /// Consume a Markdown inline link `[text](url)`. Preprocesses the visible
@@ -183,8 +191,19 @@ fn consumeMarkdownLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, sou
     const processed_label = try preprocessWithOptions(allocator, label_text, false);
     defer allocator.free(processed_label);
 
+    // If preprocessing introduced new `]` characters (e.g. from math commands
+    // like \rbrack or rendered [\text{...}]), ZigZag's link parser would stop
+    // at the first `]` and fail to recognize the link. Fall back to the raw
+    // label text so the link survives intact.
+    const raw_close_count = std.mem.count(u8, label_text, "]");
+    const processed_close_count = std.mem.count(u8, processed_label, "]");
+    const effective_label = if (processed_close_count > raw_close_count)
+        label_text
+    else
+        processed_label;
+
     try writer.writeByte('[');
-    try writer.writeAll(processed_label);
+    try writer.writeAll(effective_label);
     try writer.writeAll("](");
     try writer.writeAll(source[url_start + 1 .. url_end]);
     try writer.writeByte(')');
@@ -591,6 +610,11 @@ fn writeProtectedMathSpan(writer: *std.Io.Writer, text: []const u8) anyerror!voi
 /// currency (`$$$` or `$$<digit>`). In the false cases the caller emits the
 /// `$` byte by byte via the default path so prose like "cost $$5 total"
 /// survives unchanged.
+///
+/// When a `$$` opener is detected but no closing `$$` exists (e.g. streaming
+/// partial input like `$$x$`), the opening `$$` is written verbatim and `*i`
+/// advances past both dollars. This prevents the second `$` from being
+/// reinterpreted as inline math and corrupting the display.
 fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
     // Reject an escaped opener (`\$$...`) so the backslash survives verbatim.
@@ -599,9 +623,13 @@ fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source
     if (open + 2 < source.len and source[open + 2] == '$') return false;
     const body_start = open + 2;
     const close = findUnescapedDoubleDollar(source, body_start) orelse {
-        // Unterminated — let the caller emit `$$` verbatim via the default
-        // byte-by-byte path. We must NOT swallow the remainder.
-        return false;
+        // Unterminated — write the opening `$$` verbatim so the second `$`
+        // is not reinterpreted as inline math (which would corrupt streaming
+        // partials like `$$x$`). Advance past both dollars; the caller's
+        // main loop handles the remainder byte-by-byte.
+        try writer.writeAll("$$");
+        i.* = body_start;
+        return true;
     };
 
     // Force line boundaries so block math doesn't run into surrounding prose
@@ -1193,7 +1221,7 @@ fn lookupCommand(name: []const u8) ?[]const u8 {
             .{ .name = "beta", .sym = "β" },
             .{ .name = "gamma", .sym = "γ" },
             .{ .name = "delta", .sym = "δ" },
-            .{ .name = "epsilon", .sym = "ε" },
+            .{ .name = "epsilon", .sym = "ϵ" },
             .{ .name = "varepsilon", .sym = "ε" },
             .{ .name = "zeta", .sym = "ζ" },
             .{ .name = "eta", .sym = "η" },
@@ -2114,4 +2142,65 @@ test "styled text commands preserve literal operand" {
     try std.testing.expect(std.mem.indexOf(u8, out, "x_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "a^b") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "xᵢ") == null);
+}
+
+test "epsilon and varepsilon render distinctly" {
+    // \epsilon → ϵ (U+03F5), \varepsilon → ε (U+03B5). They are different
+    // symbols and authors use them to distinguish variables.
+    const src = "vars $\\epsilon$ vs $\\varepsilon$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ϵ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "ε") != null);
+}
+
+test "link label with bracketed math falls back to raw" {
+    // Regression for P2: when preprocessing a link label would introduce new
+    // `]` chars (via \rbrack, [\text{...}], etc.), fall back to the raw label
+    // so ZigZag's link parser still recognizes the link.
+    const src = "[set $\\lbrack 0, 1 \\rbrack$](https://example.com)";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The link destination must survive — no corruption from introduced ].
+    try std.testing.expect(std.mem.indexOf(u8, out, "](https://example.com)") != null);
+}
+
+test "unterminated inline code preserves rest of line" {
+    // Regression for P2: while streaming, an inline code span may not yet
+    // have its closing backtick. Copy the rest of the line verbatim so `$`
+    // placeholders inside the unfinished code don't get rewritten as math.
+    const src = "Run `echo $HOME$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "unterminated inline code with newline preserves next line" {
+    // After the newline, processing resumes normally.
+    const src = "Run `echo $HOME$\nthen $x$ math";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // First line verbatim, second line math rendered.
+    try std.testing.expect(std.mem.indexOf(u8, out, "`echo $HOME$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "then x math") != null);
+}
+
+test "unterminated block math preserves opening dollars" {
+    // Regression for P2: `$$x$` (streaming partial) — the opening `$$` must
+    // be preserved verbatim, not split into individual `$` chars that get
+    // reinterpreted as inline math.
+    const src = "$$x$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Source must survive unchanged — no `$$` swallowed, no inline math.
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "unterminated block math in prose preserves dollars" {
+    const src = "intro $$x$ trailing";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // The `$$` must survive, not be eaten or reparsed.
+    try std.testing.expect(std.mem.indexOf(u8, out, "$$x$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`x`") == null);
 }
