@@ -1361,6 +1361,9 @@ fn lookupCommand(name: []const u8) ?[]const u8 {
             .{ .name = "degree", .sym = "°" },
             .{ .name = "prime", .sym = "′" },
             .{ .name = "dprime", .sym = "″" },
+            // Bracket delimiters — standard LaTeX names for [ and ].
+            .{ .name = "lbrack", .sym = "[" },
+            .{ .name = "rbrack", .sym = "]" },
             // Style modifiers — silently dropped (no semantic loss in plain text).
             .{ .name = "mathrm", .sym = "" },
             .{ .name = "mathit", .sym = "" },
@@ -2156,13 +2159,17 @@ test "epsilon and varepsilon render distinctly" {
 
 test "link label with bracketed math falls back to raw" {
     // Regression for P2: when preprocessing a link label would introduce new
-    // `]` chars (via \rbrack, [\text{...}], etc.), fall back to the raw label
-    // so ZigZag's link parser still recognizes the link.
-    const src = "[set $\\lbrack 0, 1 \\rbrack$](https://example.com)";
+    // `]` chars (here \rbrack renders to ]), fall back to the raw label so
+    // ZigZag's link parser still recognizes the link. Without the fallback,
+    // the introduced ] would terminate the label prematurely.
+    const src = "[range $\\lbrack 0, 1 \\rbrack$](https://example.com)";
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
-    // The link destination must survive — no corruption from introduced ].
-    try std.testing.expect(std.mem.indexOf(u8, out, "](https://example.com)") != null);
+    // The raw label is used, so \lbrack/\rbrack survive unrendered and the
+    // link destination stays attached: ](https://example.com) must appear.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\rbrack$](https://example.com)") != null);
+    // The rendered ] must NOT appear inside the label.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[range [0, 1]]") == null);
 }
 
 test "unterminated inline code preserves rest of line" {
