@@ -50,7 +50,7 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
         //    the interior.
         if (isAtLineStart(source, i)) {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
-            if (try consumeTildeFenceBlock(writer, source, &i)) continue;
+            if (try consumeTildeFenceBlock(allocator, writer, source, &i)) continue;
         }
 
         // 2. Markdown inline links, bare URLs, and relative path/URL
@@ -224,9 +224,21 @@ fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) an
     if (source[i.*] != '/') return false;
     const start = i.*;
     // Only treat this slash as the start of a route when it begins at a path
-    // boundary (start of source or after whitespace). This prevents ordinary
-    // prose such as `1/$n$` from having its math delimiter swallowed.
-    if (start > 0 and !std.ascii.isWhitespace(source[start - 1])) return false;
+    // boundary (start of source, after whitespace, or after an opening
+    // delimiter such as `(`, `[`, `{`, `"`, `'`, or `<`). This prevents
+    // ordinary prose such as `1/$n$` from having its math delimiter swallowed.
+    // When the boundary is an opening delimiter we additionally require a dollar
+    // placeholder inside the token so that parenthesized math like `($A/B$)`
+    // is not misclassified as a route.
+    var requires_dollar_placeholder = false;
+    if (start > 0) {
+        const prev = source[start - 1];
+        const is_whitespace_boundary = std.ascii.isWhitespace(prev);
+        const is_opener_boundary = prev == '(' or prev == '[' or prev == '{' or
+            prev == '"' or prev == '\'' or prev == '<';
+        if (!is_whitespace_boundary and !is_opener_boundary) return false;
+        requires_dollar_placeholder = is_opener_boundary;
+    }
     var end = start;
     var slash_count: usize = 0;
     var has_dollar = false;
@@ -238,8 +250,11 @@ fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) an
         end += 1;
     }
     // Require at least two path segments (leading slash + another slash) or
-    // a dollar placeholder so we don't swallow ordinary `/` punctuation.
+    // a dollar placeholder. When the boundary was an opening delimiter we must
+    // see a dollar placeholder so parenthesized math like `($A/B$)` isn't
+    // swallowed as a route.
     if (slash_count < 2 and !has_dollar) return false;
+    if (requires_dollar_placeholder and !has_dollar) return false;
     try writer.writeAll(source[start..end]);
     i.* = end;
     return true;
@@ -251,46 +266,67 @@ fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) an
 
 const mermaid_lang = "mermaid";
 
-/// If `source[i..]` opens a fenced code block at line start (optionally
-/// indented), consume the whole block in place:
-///
-/// - mermaid blocks become the labeled summary + quoted source;
-/// - any other language is copied verbatim, including any literal
-///   ```` ```mermaid ```` lines or `$` chars inside.
-///
-/// Updates `*i` past the consumed block and returns true. Returns false
-/// (without modifying `*i`) if `i` is not at a fence opener.
-///
-/// Supports CommonMark-style long fences (4+ backticks) so a block opened
-/// with ```` ```` ```` is only closed by a line whose leading backtick run
-/// is at least as long — this lets users embed ``` ```` ``` fences inside
-/// without breaking the outer block.
+/// If `source[i..]` opens a backtick-fenced code block at line start
+/// (optionally indented), consume the whole block in place.
 fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+    return try consumeFenceGeneric(allocator, writer, source, i, '`', true);
+}
+
+/// Consume a CommonMark tilde-fenced code block (`~~~ ... ~~~`) at line start.
+/// Unlike backtick fences, these are always copied verbatim because the
+/// downstream renderer displays them as plain text rather than bordered code.
+fn consumeTildeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
+    return try consumeFenceGeneric(allocator, writer, source, i, '~', false);
+}
+
+/// Generic fenced code block consumer.
+///
+/// - If `may_be_mermaid` is true and the language tag is `mermaid`, the block
+///   body is transformed into a labeled summary plus quoted source.
+/// - Otherwise the opener, body, and closer are copied verbatim so their
+///   contents (including literal ```` ```mermaid ```` lines and `$` shell
+///   variables) survive unchanged.
+///
+/// Supports CommonMark-style long fences (4+ chars) so a block opened with
+/// ```` ```` ```` is only closed by a line whose leading run is at least as
+/// long — this lets users embed ``` ```` ``` fences inside without breaking
+/// the outer block.
+fn consumeFenceGeneric(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    source: []const u8,
+    i: *usize,
+    fence_char: u8,
+    may_be_mermaid: bool,
+) !bool {
     const start = i.*;
-    // Allow leading space indentation (a line of spaces followed by ```).
+    // Allow leading space indentation (a line of spaces followed by the fence).
     var indent_end = start;
     while (indent_end < source.len and source[indent_end] == ' ') indent_end += 1;
-    if (indent_end >= source.len or source[indent_end] != '`') return false;
+    if (indent_end >= source.len or source[indent_end] != fence_char) return false;
 
-    // Count the opening backtick run. CommonMark requires >=3 to open a
-    // fence; we accept any length and require a closer with at least as
-    // many backticks so users can use ```` to wrap content containing ```.
+    // Count the opening fence run. CommonMark requires >=3 to open a fence;
+    // we accept any length and require a closer with at least as many chars.
     var fence_len: usize = 0;
-    while (indent_end + fence_len < source.len and source[indent_end + fence_len] == '`') fence_len += 1;
+    while (indent_end + fence_len < source.len and source[indent_end + fence_len] == fence_char) fence_len += 1;
     if (fence_len < 3) return false;
 
-    // Lang tag occupies the rest of the opener line.
+    // For backtick fences the rest of the opener line is the language tag;
+    // tilde fences have no meaningful tag.
     const fence_end = indent_end + fence_len;
     const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
-    const tag = std.mem.trim(u8, source[fence_end..line_end], " \t\r");
+    const tag = if (may_be_mermaid)
+        std.mem.trim(u8, source[fence_end..line_end], " \t\r")
+    else
+        "";
 
     // Body starts on the line after the opener.
     const body_start = if (line_end < source.len) line_end + 1 else source.len;
-    const close_line_start = findCodeBlockCloseLine(source, body_start, fence_len);
+    const close_line_start = findFenceCloseLine(source, body_start, fence_len, fence_char);
     const body_end = if (close_line_start) |cls| cls else source.len;
     const body = source[body_start..body_end];
 
-    if (std.mem.eql(u8, tag, mermaid_lang)) {
+    if (may_be_mermaid and std.mem.eql(u8, tag, mermaid_lang)) {
         // Mermaid block — emit the label + quoted source directly to the
         // writer. The caller never sees these bytes again so a later math
         // step can't mutate the quoted diagram source.
@@ -307,7 +343,7 @@ fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
         try writer.writeByte('\n');
     } else {
         // Non-mermaid fenced code block — copy opener, body, and closer
-        // verbatim so any literal ```mermaid lines or `$` shell vars inside
+        // verbatim so any literal fence lines or `$` shell vars inside
         // survive unchanged.
         try writer.writeAll(source[start..body_end]);
         if (close_line_start) |cls| {
@@ -341,89 +377,33 @@ fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
 }
 
 /// Locate the first line at or after `body_start` that closes a fenced
-/// code block opened with `fence_len` backticks. A closing line is one
-/// whose leading backtick run (after optional whitespace) is at least
-/// `fence_len` ticks long and contains nothing else but whitespace.
+/// code block opened with `fence_len` `fence_char`s. A closing line is one
+/// whose leading run (after optional whitespace) is at least `fence_len`
+/// chars long and contains nothing else but whitespace.
 ///
 /// Returns the absolute index of that closer line's first byte, or null if
 /// none is found.
-fn findCodeBlockCloseLine(source: []const u8, body_start: usize, fence_len: usize) ?usize {
-    var i = body_start;
-    while (i < source.len) {
-        const line_start = i;
+fn findFenceCloseLine(source: []const u8, body_start: usize, fence_len: usize, fence_char: u8) ?usize {
+    var j = body_start;
+    while (j < source.len) {
+        const line_start = j;
         const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
         const line = source[line_start..line_end];
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (countLeadingBackticks(trimmed) >= fence_len) {
-            // Reject lines that have non-tick content after the run, e.g.
-            // an opener ```text. A valid closer is all backticks (possibly
+        if (countLeadingChar(trimmed, fence_char) >= fence_len) {
+            // Reject lines that have non-fence content after the run, e.g.
+            // an opener ```text. A valid closer is all fence chars (possibly
             // followed by trailing whitespace, already trimmed off).
-            if (std.mem.allEqual(u8, trimmed, '`')) return line_start;
+            if (std.mem.allEqual(u8, trimmed, fence_char)) return line_start;
         }
-        i = if (line_end < source.len) line_end + 1 else source.len;
+        j = if (line_end < source.len) line_end + 1 else source.len;
     }
     return null;
 }
 
-fn countLeadingBackticks(s: []const u8) usize {
+fn countLeadingChar(s: []const u8, c: u8) usize {
     var n: usize = 0;
-    while (n < s.len and s[n] == '`') n += 1;
-    return n;
-}
-
-/// Consume a CommonMark tilde-fenced code block (`~~~ ... ~~~`) at line start.
-/// Unlike backtick fences, these are always copied verbatim because the
-/// downstream renderer displays them as plain text rather than bordered code.
-fn consumeTildeFenceBlock(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
-    const start = i.*;
-    var indent_end = start;
-    while (indent_end < source.len and source[indent_end] == ' ') indent_end += 1;
-    if (indent_end >= source.len or source[indent_end] != '~') return false;
-
-    var fence_len: usize = 0;
-    while (indent_end + fence_len < source.len and source[indent_end + fence_len] == '~') fence_len += 1;
-    if (fence_len < 3) return false;
-
-    const fence_end = indent_end + fence_len;
-    const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
-    const body_start = if (line_end < source.len) line_end + 1 else source.len;
-    const close_line_start = findTildeBlockCloseLine(source, body_start, fence_len);
-    const body_end = if (close_line_start) |cls| cls else source.len;
-
-    try writer.writeAll(source[start..body_end]);
-    if (close_line_start) |cls| {
-        const close_line_end = std.mem.indexOfScalarPos(u8, source, cls, '\n') orelse source.len;
-        const emit_end = if (close_line_end < source.len) close_line_end + 1 else source.len;
-        try writer.writeAll(source[cls..emit_end]);
-        i.* = emit_end;
-    } else {
-        i.* = body_end;
-        if (body_end < source.len and source[body_end] == '\n') {
-            try writer.writeByte('\n');
-            i.* = body_end + 1;
-        }
-    }
-    return true;
-}
-
-fn findTildeBlockCloseLine(source: []const u8, body_start: usize, fence_len: usize) ?usize {
-    var i = body_start;
-    while (i < source.len) {
-        const line_start = i;
-        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
-        const line = source[line_start..line_end];
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (countLeadingTildes(trimmed) >= fence_len) {
-            if (std.mem.allEqual(u8, trimmed, '~')) return line_start;
-        }
-        i = if (line_end < source.len) line_end + 1 else source.len;
-    }
-    return null;
-}
-
-fn countLeadingTildes(s: []const u8) usize {
-    var n: usize = 0;
-    while (n < s.len and s[n] == '~') n += 1;
+    while (n < s.len and s[n] == c) n += 1;
     return n;
 }
 
@@ -605,8 +585,9 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// open/close guards so they pass through verbatim:
 /// - `5$` — opening `$` preceded by a digit.
 /// - `$5-$10`, `$5/$10` — the closer is followed by a digit.
-/// - `$HOME/$PATH`, `$FOO-$BAR` — the body is an uppercase shell-variable
-///   path/dash fragment, or the closer is followed by an uppercase identifier.
+/// - `$HOME/$PATH`, `$FOO-$BAR`, `$HOME$var` — the body is an uppercase-only
+///   shell-variable name and the closer is followed by a path continuation
+///   (`/`, `-`) or another identifier.
 /// - `${HOME}/${XDG_CONFIG_HOME}` — the opener or closer is followed by `{`
 ///   (braced shell/config variables), so both dollar signs survive.
 /// - `\$FOO\$` — the opener/closer is escaped by a backslash.
@@ -637,21 +618,18 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // Closing `$` must not be preceded by whitespace, followed by another
     // `$`, followed by a digit (currency ranges), or followed by `{`
     // (braced shell variables like `${HOME}`).
-    // An identifier suffix is allowed for prose like `$n$th`, but uppercase
-    // identifiers are treated as adjacent shell variables/path components and
-    // rejected. Likewise, a body that is an uppercase identifier followed by a
-    // `/` or `-` path fragment (e.g. `$HOME/` in `$HOME/$PATH`) is rejected.
+    // An identifier suffix is allowed for prose like `$n$th`. Uppercase-only
+    // bodies are treated as shell-variable names; reject them when the closer
+    // is followed by a path continuation (`/`, `-`) or another identifier.
     if (source[close - 1] == ' ') return false;
     if (close + 1 < source.len) {
         const after = source[close + 1];
         if (after == '$' or after == '{' or std.ascii.isDigit(after)) return false;
-        if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
+        if (isUppercaseShellName(body) and (after == '/' or after == '-' or isIdentifierChar(after))) {
             return false;
         }
-    }
-    if (body.len > 0 and std.ascii.isAlphabetic(body[0]) and std.ascii.isUpper(body[0])) {
-        for (body) |bc| {
-            if (bc == '/' or bc == '-') return false;
+        if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
+            return false;
         }
     }
 
@@ -860,6 +838,14 @@ fn isScriptTokenChar(c: u8) bool {
 
 fn isIdentifierChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn isUppercaseShellName(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        if (!(std.ascii.isUpper(c) or c == '_')) return false;
+    }
+    return true;
 }
 
 const FracOperand = struct {
@@ -1860,4 +1846,56 @@ test "negative latex spacing command is dropped" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "`ab`") != null);
+}
+
+test "uppercase math with slash or minus renders" {
+    // Regression for P1: formulas like $A/B$ and $X - Y$ should not be
+    // rejected as shell-variable path fragments.
+    const src = "$A/B$ and $X - Y$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`A/B`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`X - Y`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$A/B$") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$X - Y$") == null);
+}
+
+test "route after opening delimiter is protected when it has dollar placeholders" {
+    // Regression for P2: routes like `call (/api/v1/$id$) now` must keep
+    // the `$id$` placeholder verbatim, not render it as math.
+    const src = "call (/api/v1/$id$) now";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/api/v1/$id$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`/api/v1/`)") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`id`") == null);
+}
+
+test "parenthesized math is not swallowed as a route" {
+    // A slash token after `(` should only be treated as a route if it contains
+    // a dollar placeholder; otherwise inline math like `($A/B$)` must render.
+    const src = "value ($A/B$)";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`A/B`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$/A/B$") == null);
+}
+
+test "uppercase shell variable suffix stays raw" {
+    // Uppercase-only bodies followed by an identifier are shell-variable
+    // adjacencies, not math suffixes.
+    const src = "path is $HOME$var today";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$HOME$var") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`HOME`var") == null);
+}
+
+test "lowercase prose suffix after math renders" {
+    // Document intended behavior: lowercase suffixes like `$x$_tmp` are
+    // treated as prose and render the math.
+    const src = "file $x$_tmp";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`x`_tmp") != null);
 }
