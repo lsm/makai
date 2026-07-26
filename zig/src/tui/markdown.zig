@@ -43,12 +43,14 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
     var i: usize = 0;
     while (i < source.len) {
         // 1. Fenced code block opener at line start. Consumed whole: mermaid
-        //    blocks are transformed in place, every other language is copied
-        //    verbatim (including any literal ```mermaid lines or `$` chars
-        //    inside). Emits directly to the writer so the math steps below
-        //    never re-process the interior.
+        //    (backtick) blocks are transformed in place, every other language
+        //    is copied verbatim (including any literal ```mermaid lines or `$`
+        //    chars inside). Tilde fences are also copied verbatim. Emits
+        //    directly to the writer so the math steps below never re-process
+        //    the interior.
         if (isAtLineStart(source, i)) {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
+            if (try consumeTildeFenceBlock(writer, source, &i)) continue;
         }
 
         // 2. Markdown inline links, bare URLs, and relative path/URL
@@ -218,9 +220,13 @@ fn consumeBareUrl(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
 /// Consume a relative path or route span (`/users/$user_id$/orders`) verbatim
 /// so dollar placeholders inside it are not interpreted as inline math.
 /// Returns false when the bytes don't look like a path.
-fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
+fn consumeRelativePath(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
     if (source[i.*] != '/') return false;
     const start = i.*;
+    // Only treat this slash as the start of a route when it begins at a path
+    // boundary (start of source or after whitespace). This prevents ordinary
+    // prose such as `1/$n$` from having its math delimiter swallowed.
+    if (start > 0 and !std.ascii.isWhitespace(source[start - 1])) return false;
     var end = start;
     var slash_count: usize = 0;
     var has_dollar = false;
@@ -365,6 +371,62 @@ fn countLeadingBackticks(s: []const u8) usize {
     return n;
 }
 
+/// Consume a CommonMark tilde-fenced code block (`~~~ ... ~~~`) at line start.
+/// Unlike backtick fences, these are always copied verbatim because the
+/// downstream renderer displays them as plain text rather than bordered code.
+fn consumeTildeFenceBlock(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
+    const start = i.*;
+    var indent_end = start;
+    while (indent_end < source.len and source[indent_end] == ' ') indent_end += 1;
+    if (indent_end >= source.len or source[indent_end] != '~') return false;
+
+    var fence_len: usize = 0;
+    while (indent_end + fence_len < source.len and source[indent_end + fence_len] == '~') fence_len += 1;
+    if (fence_len < 3) return false;
+
+    const fence_end = indent_end + fence_len;
+    const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
+    const body_start = if (line_end < source.len) line_end + 1 else source.len;
+    const close_line_start = findTildeBlockCloseLine(source, body_start, fence_len);
+    const body_end = if (close_line_start) |cls| cls else source.len;
+
+    try writer.writeAll(source[start..body_end]);
+    if (close_line_start) |cls| {
+        const close_line_end = std.mem.indexOfScalarPos(u8, source, cls, '\n') orelse source.len;
+        const emit_end = if (close_line_end < source.len) close_line_end + 1 else source.len;
+        try writer.writeAll(source[cls..emit_end]);
+        i.* = emit_end;
+    } else {
+        i.* = body_end;
+        if (body_end < source.len and source[body_end] == '\n') {
+            try writer.writeByte('\n');
+            i.* = body_end + 1;
+        }
+    }
+    return true;
+}
+
+fn findTildeBlockCloseLine(source: []const u8, body_start: usize, fence_len: usize) ?usize {
+    var i = body_start;
+    while (i < source.len) {
+        const line_start = i;
+        const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+        const line = source[line_start..line_end];
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (countLeadingTildes(trimmed) >= fence_len) {
+            if (std.mem.allEqual(u8, trimmed, '~')) return line_start;
+        }
+        i = if (line_end < source.len) line_end + 1 else source.len;
+    }
+    return null;
+}
+
+fn countLeadingTildes(s: []const u8) usize {
+    var n: usize = 0;
+    while (n < s.len and s[n] == '~') n += 1;
+    return n;
+}
+
 /// Inspect the first non-blank line of a Mermaid block to classify the
 /// diagram type (flowchart, sequenceDiagram, etc.). Returns an empty string
 /// when no recognized type is found.
@@ -373,6 +435,9 @@ fn detectMermaidType(body: []const u8) []const u8 {
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
+        // Skip Mermaid directive/comment lines (%%) so %%{init: ...}%% doesn't
+        // get misclassified as the diagram type.
+        if (std.mem.startsWith(u8, line, "%%")) continue;
         // Take the first whitespace-separated token. Mermaid's grammar uses
         // a fixed keyword (flowchart, graph, sequenceDiagram, ...) here.
         var tok_end: usize = 0;
@@ -540,12 +605,13 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// open/close guards so they pass through verbatim:
 /// - `5$` — opening `$` preceded by a digit.
 /// - `$5-$10`, `$5/$10` — the closer is followed by a digit.
-/// - `$HOME/$PATH` — the closer is followed by an identifier char.
+/// - `$HOME/$PATH`, `$FOO-$BAR` — the body is an uppercase shell-variable
+///   path/dash fragment, or the closer is followed by an uppercase identifier.
 /// - `${HOME}/${XDG_CONFIG_HOME}` — the opener or closer is followed by `{`
 ///   (braced shell/config variables), so both dollar signs survive.
 /// - `\$FOO\$` — the opener/closer is escaped by a backslash.
-/// Digit-led formulas such as `$2^n$` still render because the closer is not
-/// identifier/digit-adjacent.
+/// Prose suffixes such as `$n$th` are allowed because they use lowercase
+/// identifiers and do not look like adjacent shell variables.
 fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize, protect_math: bool) anyerror!bool {
     const open = i.*;
 
@@ -566,17 +632,29 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     const body_start = open + 1;
     const close = findUnescapedDollar(source, body_start) orelse return false;
 
+    const body = source[body_start..close];
+
     // Closing `$` must not be preceded by whitespace, followed by another
-    // `$`, followed by a digit (currency ranges), followed by an identifier
-    // char (adjacent shell vars like `$HOME/$PATH`), or followed by `{`
+    // `$`, followed by a digit (currency ranges), or followed by `{`
     // (braced shell variables like `${HOME}`).
+    // An identifier suffix is allowed for prose like `$n$th`, but uppercase
+    // identifiers are treated as adjacent shell variables/path components and
+    // rejected. Likewise, a body that is an uppercase identifier followed by a
+    // `/` or `-` path fragment (e.g. `$HOME/` in `$HOME/$PATH`) is rejected.
     if (source[close - 1] == ' ') return false;
     if (close + 1 < source.len) {
         const after = source[close + 1];
-        if (after == '$' or after == '{' or std.ascii.isDigit(after) or isIdentifierChar(after)) return false;
+        if (after == '$' or after == '{' or std.ascii.isDigit(after)) return false;
+        if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
+            return false;
+        }
+    }
+    if (body.len > 0 and std.ascii.isAlphabetic(body[0]) and std.ascii.isUpper(body[0])) {
+        for (body) |bc| {
+            if (bc == '/' or bc == '-') return false;
+        }
     }
 
-    const body = source[body_start..close];
     // Reject newlines — inline math is a single line.
     if (std.mem.indexOfScalar(u8, body, '\n') != null) return false;
 
@@ -624,7 +702,12 @@ fn renderMathBody(writer: *std.Io.Writer, body: []const u8) anyerror!void {
                     i = j + 1;
                     continue;
                 }
-                if (next == ';' or next == ':' or next == '!') {
+                if (next == ';' or next == ':') {
+                    try writer.writeAll(" ");
+                    i = j + 1;
+                    continue;
+                }
+                if (next == '!') {
                     i = j + 1;
                     continue;
                 }
@@ -1068,7 +1151,7 @@ fn lookupCommand(name: []const u8) ?[]const u8 {
             .{ .name = "approx", .sym = "≈" },
             .{ .name = "equiv", .sym = "≡" },
             .{ .name = "sim", .sym = "∼" },
-            .{ .name = "simeq", .sym = "≅" },
+            .{ .name = "simeq", .sym = "≃" },
             .{ .name = "cong", .sym = "≅" },
             .{ .name = "propto", .sym = "∝" },
             .{ .name = "in", .sym = "∈" },
@@ -1724,4 +1807,57 @@ test "relative path with dollar placeholders stays verbatim" {
     const out = try preprocess(std.testing.allocator, src);
     defer std.testing.allocator.free(out);
     try std.testing.expectEqualStrings(src, out);
+}
+
+test "inline math allows lowercase prose suffixes" {
+    const src = "the $n$th term";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`n`th") != null);
+}
+
+test "division before inline math is not treated as a route" {
+    const src = "the rate is 1/$n$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1/`n`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1/$n$") == null);
+}
+
+test "tilde fenced code block is preserved verbatim" {
+    const src = "~~~sh\necho $x$\n~~~\n";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "mermaid type detection skips directive lines" {
+    const src = "```mermaid\n%%{init: {'theme': 'dark'}}%%\nflowchart TD\n  A --> B\n```";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "**Mermaid diagram: flowchart**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Mermaid diagram: %%{init") == null);
+}
+
+test "simeq maps to the correct relation" {
+    const src = "$a \\simeq b$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "≃") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "≅") == null);
+}
+
+test "positive latex spacing commands produce a space" {
+    const src = "$a\\;b$ and $x\\:y$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`a b`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`x y`") != null);
+}
+
+test "negative latex spacing command is dropped" {
+    const src = "$a\\!b$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`ab`") != null);
 }
