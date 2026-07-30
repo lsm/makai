@@ -51,6 +51,7 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
         if (isAtLineStart(source, i)) {
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
             if (try consumeTildeFenceBlock(allocator, writer, source, &i)) continue;
+            if (try consumeIndentedCodeBlock(writer, source, &i)) continue;
         }
 
         // 2. Markdown inline links, bare URLs, and relative path/URL
@@ -130,6 +131,68 @@ fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) anye
     try writer.writeAll(source[start..line_end]);
     i.* = line_end;
     return true;
+}
+
+/// Consume a contiguous Markdown indented code block (four spaces or one tab)
+/// verbatim. These blocks are not fenced, but their contents are still literal
+/// code and must not be preprocessed as math.
+fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
+    const start = i.*;
+    if (!isIndentedCodeLine(source, start)) return false;
+
+    var end = start;
+    while (end < source.len) {
+        if (!isAtLineStart(source, end) or !isIndentedCodeLine(source, end)) break;
+        const line_end = std.mem.indexOfScalarPos(u8, source, end, '\n') orelse source.len;
+        end = if (line_end < source.len) line_end + 1 else source.len;
+    }
+
+    try writer.writeAll(source[start..end]);
+    i.* = end;
+    return true;
+}
+
+fn isIndentedCodeLine(source: []const u8, line_start: usize) bool {
+    if (line_start >= source.len) return false;
+    if (source[line_start] == '\t') return true;
+    return line_start + 4 <= source.len and std.mem.eql(u8, source[line_start .. line_start + 4], "    ");
+}
+
+fn lineBounds(source: []const u8, pos: usize) struct { start: usize, end: usize } {
+    var start = pos;
+    while (start > 0 and source[start - 1] != '\n') start -= 1;
+    const end = std.mem.indexOfScalarPos(u8, source, pos, '\n') orelse source.len;
+    return .{ .start = start, .end = end };
+}
+
+/// ZigZag styles headings, blockquotes, bold, and italic directly without
+/// recursively invoking `renderInline`. Inside those contexts, an inline-code
+/// wrapper would be displayed literally, so protection must be skipped.
+fn isInsideNonRecursiveMarkdownStyle(source: []const u8, open: usize, close: usize) bool {
+    const bounds = lineBounds(source, open);
+    const line = source[bounds.start..bounds.end];
+    const rel_open = open - bounds.start;
+    const rel_close = close - bounds.start;
+    const trimmed_start = std.mem.indexOfNonePos(u8, line, 0, " ") orelse line.len;
+    const trimmed = line[trimmed_start..];
+
+    if (std.mem.startsWith(u8, trimmed, "# ") or
+        std.mem.startsWith(u8, trimmed, "## ") or
+        std.mem.startsWith(u8, trimmed, "### ") or
+        std.mem.startsWith(u8, trimmed, "> "))
+    {
+        return true;
+    }
+
+    if (isBetweenDelimiters(line, rel_open, rel_close, "**")) return true;
+    if (isBetweenDelimiters(line, rel_open, rel_close, "*")) return true;
+    return false;
+}
+
+fn isBetweenDelimiters(line: []const u8, rel_open: usize, rel_close: usize, delim: []const u8) bool {
+    const before = line[0..rel_open];
+    const after = line[rel_close + 1 ..];
+    return std.mem.lastIndexOf(u8, before, delim) != null and std.mem.indexOf(u8, after, delim) != null;
 }
 
 /// Consume a Markdown inline link `[text](url)`. Preprocesses the visible
@@ -522,28 +585,22 @@ fn findInlineMathClose(source: []const u8, start: usize) ?usize {
         // Skip inline code spans — their `$` chars are not math delimiters.
         if (source[i] == '`') {
             const tick_count = countLeadingChar(source[i..], '`');
-            if (tick_count < 3) {
-                var scan = i + tick_count;
-                var found_close = false;
-                while (scan < source.len) {
-                    if (source[scan] == '`') {
-                        const close_count = countLeadingChar(source[scan..], '`');
-                        if (close_count == tick_count) {
-                            i = scan + close_count;
-                            found_close = true;
-                            break;
-                        }
-                        scan += close_count;
-                        continue;
+            var scan = i + tick_count;
+            var found_close = false;
+            while (scan < source.len) {
+                if (source[scan] == '`') {
+                    const close_count = countLeadingChar(source[scan..], '`');
+                    if (close_count == tick_count) {
+                        i = scan + close_count;
+                        found_close = true;
+                        break;
                     }
-                    scan += 1;
+                    scan += close_count;
+                    continue;
                 }
-                if (!found_close) return null;
-                continue;
+                scan += 1;
             }
-            // 3+ backticks — unusual inline; skip past the run and let the
-            // outer walker handle it.
-            i += tick_count;
+            if (!found_close) return null;
             continue;
         }
         // Skip bare URLs — their `$` placeholders are not math delimiters.
@@ -752,7 +809,7 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     var rendered: std.Io.Writer.Allocating = .init(allocator);
     defer rendered.deinit();
     try renderMathBody(&rendered.writer, body);
-    if (protect_math) {
+    if (protect_math and !isInsideNonRecursiveMarkdownStyle(source, open, close)) {
         try writeProtectedMathSpan(writer, rendered.written());
     } else {
         try writer.writeAll(rendered.written());
@@ -2210,4 +2267,44 @@ test "unterminated block math in prose preserves dollars" {
     // The `$$` must survive, not be eaten or reparsed.
     try std.testing.expect(std.mem.indexOf(u8, out, "$$x$") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "`x`") == null);
+}
+
+
+test "inline closer skips triple-backtick code spans" {
+    // Regression for P2: a literal dollar before a mid-line triple-backtick
+    // span must not pair with dollars inside that protected code span.
+    const src = "Pay $5; run ```echo $x$``` now";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "protection wrapper omitted in non-recursive markdown styles" {
+    // ZigZag styles bold/headings/blockquotes without recursively parsing
+    // inline spans. A backtick wrapper would therefore show literally there.
+    const bold_src = "**Index $x_j$**";
+    const bold = try preprocess(std.testing.allocator, bold_src);
+    defer std.testing.allocator.free(bold);
+    try std.testing.expect(std.mem.indexOf(u8, bold, "**Index x_j**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bold, "`x_j`") == null);
+
+    const heading_src = "# $x_j$";
+    const heading = try preprocess(std.testing.allocator, heading_src);
+    defer std.testing.allocator.free(heading);
+    try std.testing.expect(std.mem.indexOf(u8, heading, "# x_j") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heading, "`x_j`") == null);
+
+    const quote_src = "> $x_j$";
+    const quote = try preprocess(std.testing.allocator, quote_src);
+    defer std.testing.allocator.free(quote);
+    try std.testing.expect(std.mem.indexOf(u8, quote, "> x_j") != null);
+    try std.testing.expect(std.mem.indexOf(u8, quote, "`x_j`") == null);
+}
+
+test "indented code block is preserved verbatim" {
+    const src = "intro\n\n    const formula = \"$x^2$\";\n\noutro $y$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    const formula = \"$x^2$\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "outro y") != null);
 }
