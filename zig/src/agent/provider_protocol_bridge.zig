@@ -272,10 +272,15 @@ test "InProcessProviderProtocolBridge smoke test" {
         ) anyerror!*event_stream.AssistantMessageEventStream {
             _ = model;
             _ = context;
-            _ = options;
 
             const s = try a.create(event_stream.AssistantMessageEventStream);
             s.* = event_stream.AssistantMessageEventStream.init(a);
+            if (options) |o| {
+                if (o.requires_owned_stream_events) {
+                    s.owns_events = true;
+                    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+                }
+            }
 
             s.push(.{ .start = .{ .partial = .{
                 .content = &.{},

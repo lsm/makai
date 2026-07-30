@@ -2419,6 +2419,8 @@ fn makeFixtureStream(
 ) !*event_stream.AssistantMessageEventStream {
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     if (fail_with_error) {
         s.completeWithError("fixture stream failure");

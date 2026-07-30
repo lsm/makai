@@ -1353,6 +1353,8 @@ fn mockStream(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -1381,6 +1383,8 @@ fn mockStreamSimple(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     const result = ai_types.AssistantMessage{
         .content = &.{},
@@ -1484,6 +1488,8 @@ fn authTestStream(
     }
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     if (state.auth_fail_all_calls or (state.auth_fail_first_call and state.stream_calls == 1)) {
         s.completeWithError("401 unauthorized");
     } else {
@@ -2691,6 +2697,8 @@ fn cancelCapturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -2789,6 +2797,8 @@ fn cancelCapturingStreamSimple(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     s.complete(.{
         .content = &.{},
         .api = "test-api",
@@ -3097,6 +3107,8 @@ fn capturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
