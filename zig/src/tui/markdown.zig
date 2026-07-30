@@ -220,17 +220,13 @@ fn updateListContext(source: []const u8, line_start: usize, in_list_item: *bool)
     const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
     const line = source[line_start..line_end];
     const trimmed = std.mem.trimStart(u8, line, " \t");
-    if (trimmed.len == 0) {
-        in_list_item.* = false;
-        return;
-    }
+    if (trimmed.len == 0) return;
     if (isListMarkerLine(trimmed)) {
         in_list_item.* = true;
         return;
     }
-    if (!isIndentedCodeLine(source, line_start)) {
-        in_list_item.* = false;
-    }
+    const indent = line.len - trimmed.len;
+    if (indent == 0) in_list_item.* = false;
 }
 
 fn isListMarkerLine(trimmed: []const u8) bool {
@@ -1221,10 +1217,19 @@ fn isShellVarSeparator(c: u8) bool {
 
 fn isCurrencyLikeMathBody(body: []const u8) bool {
     if (body.len == 0 or !std.ascii.isDigit(body[0])) return false;
+    var saw_space = false;
+    var saw_alpha = false;
     for (body[1..]) |c| {
-        if (std.ascii.isWhitespace(c) or c == ';' or c == ':' or c == ',') return true;
+        if (c == ';') return true;
+        if (c == '\\' or c == '^' or c == '_' or c == '+' or c == '-' or
+            c == '*' or c == '/' or c == '=' or c == '<' or c == '>')
+        {
+            return false;
+        }
+        if (std.ascii.isAlphabetic(c)) saw_alpha = true;
+        if (std.ascii.isWhitespace(c)) saw_space = true;
     }
-    return false;
+    return saw_alpha;
 }
 
 /// Returns true when the rendered math text contains a character that
@@ -2637,4 +2642,25 @@ test "long list continuations avoid quadratic backscan and render math" {
     try std.testing.expect(std.mem.indexOf(u8, out, "    a") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    d") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$d$") == null);
+}
+
+
+test "digit-prefixed formulas with math separators render" {
+    const src = "$2 + 3$ and $$10 \\times 4$$ and $2,000$ and $1:2$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2 + 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> 10 × 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2,000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "1:2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$2 + 3$") == null);
+}
+
+
+test "list context survives ordinary continuation lines" {
+    const src = "- Formula:\n  explanation\n    $x^2$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    x²") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    $x^2$") == null);
 }
