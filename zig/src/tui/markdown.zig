@@ -357,9 +357,10 @@ fn consumeMarkdownLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, sou
 }
 
 /// Return the end offset (exclusive) of a complete Markdown inline link
-/// `[text](url)` starting at `start`, or null when the bytes do not form a
-/// complete link. Used by the inline-math closer scan to skip protected link
-/// spans before `$` inside a label or destination can close an earlier dollar.
+/// `[text](url)` or reference-style link `[text][ref]` starting at `start`, or
+/// null when the bytes do not form a complete link. Used by the inline-math
+/// closer scan to skip protected link spans before `$` inside a label or
+/// destination/reference can close an earlier dollar.
 fn findMarkdownLinkEnd(source: []const u8, start: usize) ?usize {
     if (start >= source.len or source[start] != '[') return null;
 
@@ -380,26 +381,44 @@ fn findMarkdownLinkEnd(source: []const u8, start: usize) ?usize {
     }
     if (bracket_depth != 0 or text_end >= source.len) return null;
 
-    const url_start = text_end + 1;
-    if (url_start >= source.len or source[url_start] != '(') return null;
+    const dest_start = text_end + 1;
+    if (dest_start >= source.len) return null;
 
-    var url_end = url_start + 1;
-    var paren_depth: usize = 1;
-    while (url_end < source.len) {
-        const c = source[url_end];
-        if (c == '\\' and url_end + 1 < source.len) {
-            url_end += 2;
-            continue;
+    if (source[dest_start] == '(') {
+        var url_end = dest_start + 1;
+        var paren_depth: usize = 1;
+        while (url_end < source.len) {
+            const c = source[url_end];
+            if (c == '\\' and url_end + 1 < source.len) {
+                url_end += 2;
+                continue;
+            }
+            if (c == '(') paren_depth += 1;
+            if (c == ')') {
+                paren_depth -= 1;
+                if (paren_depth == 0) break;
+            }
+            url_end += 1;
         }
-        if (c == '(') paren_depth += 1;
-        if (c == ')') {
-            paren_depth -= 1;
-            if (paren_depth == 0) break;
-        }
-        url_end += 1;
+        if (paren_depth != 0 or url_end >= source.len) return null;
+        return url_end + 1;
     }
-    if (paren_depth != 0 or url_end >= source.len) return null;
-    return url_end + 1;
+
+    if (source[dest_start] == '[') {
+        var ref_end = dest_start + 1;
+        while (ref_end < source.len) {
+            const c = source[ref_end];
+            if (c == '\\' and ref_end + 1 < source.len) {
+                ref_end += 2;
+                continue;
+            }
+            if (c == ']') return ref_end + 1;
+            if (c == '\n' or c == '\r') return null;
+            ref_end += 1;
+        }
+    }
+
+    return null;
 }
 
 /// Returns true when `source[i..]` begins with a common bare URL scheme
@@ -811,10 +830,22 @@ fn writeProtectedMathSpan(writer: *std.Io.Writer, source: []const u8, open: usiz
 /// reinterpreted as inline math and corrupting the display.
 fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) !bool {
     const open = i.*;
-    // Reject an escaped opener (`\$$...`) so the backslash survives verbatim.
-    if (open > 0 and isEscaped(source, open)) return false;
-    // Reject `$$$` — ambiguous with inline math like `$$$x$$`.
-    if (open + 2 < source.len and source[open + 2] == '$') return false;
+    // Reject an escaped opener (`\$$...`) so the backslash survives verbatim,
+    // but consume the pair atomically so the second `$` is not reconsidered as
+    // a new overlapping opener.
+    if (open > 0 and isEscaped(source, open)) {
+        try writer.writeAll("$$");
+        i.* = open + 2;
+        return true;
+    }
+    // Reject `$$$` — ambiguous with inline math like `$$$x$$`. Consume the
+    // rejected pair verbatim so the trailing `$$x$$` cannot be reinterpreted as
+    // display math after the first `$` is emitted.
+    if (open + 2 < source.len and source[open + 2] == '$') {
+        try writer.writeAll("$$");
+        i.* = open + 2;
+        return true;
+    }
     const body_start = open + 2;
     const close = findUnescapedDoubleDollar(source, body_start) orelse {
         // Unterminated — write the opening `$$` verbatim so the second `$`
@@ -2502,6 +2533,29 @@ test "inline closer skips complete markdown links" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Pay $5; see [x](https://example.com) now") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "`5; see [") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "x$](https://example.com)") == null);
+}
+
+
+test "inline closer skips reference markdown links" {
+    const src = "Pay $5; see [$x$][ref] now";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Pay $5; see [x][ref] now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`5; see [") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x$][ref]") == null);
+}
+
+
+test "rejected double dollar openers are consumed atomically" {
+    const escaped = "\\$$x$$";
+    const escaped_out = try preprocess(std.testing.allocator, escaped);
+    defer std.testing.allocator.free(escaped_out);
+    try std.testing.expectEqualStrings(escaped, escaped_out);
+
+    const triple = "$$$x$$";
+    const triple_out = try preprocess(std.testing.allocator, triple);
+    defer std.testing.allocator.free(triple_out);
+    try std.testing.expectEqualStrings(triple, triple_out);
 }
 
 

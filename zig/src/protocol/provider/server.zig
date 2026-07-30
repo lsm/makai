@@ -820,7 +820,20 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // before deinit/destroy during abort and cleanup paths. Providers must honor
     // `requires_owned_stream_events` in their stream init by setting owns_events and
     // clone_event_fn before spawning the producer, so no post-creation mutation is
-    // needed here.
+    // needed here. Extension providers are validated at the protocol boundary so
+    // borrowed events cannot outlive producer-owned temporary buffers while the
+    // server forwards queued events.
+    if (!stream.owns_events or stream.clone_event_fn == null) {
+        stream.deinit();
+        server.allocator.destroy(stream);
+        server.allocator.destroy(cancelled);
+        return try envelope.createNack(
+            nackTemplate(stream_id, in_reply_to),
+            "Provider returned borrowed events for protocol streaming",
+            .provider_error,
+            server.allocator,
+        );
+    }
     stream.wait_for_thread_on_deinit = true;
 
     // Create ActiveStream entry
