@@ -41,6 +41,7 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
     const writer = &out.writer;
 
     var i: usize = 0;
+    var in_list_item = false;
     while (i < source.len) {
         // 1. Fenced code block opener at line start. Consumed whole: mermaid
         //    (backtick) blocks are transformed in place, every other language
@@ -49,9 +50,11 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
         //    directly to the writer so the math steps below never re-process
         //    the interior.
         if (isAtLineStart(source, i)) {
+            updateListContext(source, i, &in_list_item);
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
             if (try consumeTildeFenceBlock(allocator, writer, source, &i)) continue;
-            if (try consumeIndentedCodeBlock(writer, source, &i)) continue;
+            if (try consumeBlockquoteFenceBlock(writer, source, &i)) continue;
+            if (try consumeIndentedCodeBlock(writer, source, &i, in_list_item)) continue;
         }
 
         // 2. Markdown inline links, bare URLs, and relative path/URL
@@ -133,16 +136,67 @@ fn consumeInlineCode(writer: *std.Io.Writer, source: []const u8, i: *usize) anye
     return true;
 }
 
+/// Consume a fenced code block nested in Markdown blockquote markers (`> ```sh`).
+/// These fences are not at the physical line start, but their quoted contents
+/// are still literal code and must be copied verbatim, including unfinished
+/// streaming partials.
+fn consumeBlockquoteFenceBlock(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
+    const start = i.*;
+    const opener = parseBlockquoteFenceLine(source, start) orelse return false;
+    var end = if (opener.line_end < source.len) opener.line_end + 1 else source.len;
+    while (end < source.len) {
+        if (parseBlockquoteFenceLine(source, end)) |candidate| {
+            if (candidate.fence_char == opener.fence_char and candidate.fence_len >= opener.fence_len and candidate.is_closer) {
+                end = if (candidate.line_end < source.len) candidate.line_end + 1 else source.len;
+                break;
+            }
+        }
+        const line_end = std.mem.indexOfScalarPos(u8, source, end, '\n') orelse source.len;
+        end = if (line_end < source.len) line_end + 1 else source.len;
+    }
+    try writer.writeAll(source[start..end]);
+    i.* = end;
+    return true;
+}
+
+const BlockquoteFence = struct {
+    fence_char: u8,
+    fence_len: usize,
+    line_end: usize,
+    is_closer: bool,
+};
+
+fn parseBlockquoteFenceLine(source: []const u8, line_start: usize) ?BlockquoteFence {
+    var pos = line_start;
+    while (pos < source.len and source[pos] == ' ') pos += 1;
+    if (pos >= source.len or source[pos] != '>') return null;
+    pos += 1;
+    if (pos < source.len and source[pos] == ' ') pos += 1;
+    while (pos < source.len and source[pos] == ' ') pos += 1;
+    if (pos >= source.len or (source[pos] != '`' and source[pos] != '~')) return null;
+    const fence_char = source[pos];
+    const fence_len = countLeadingChar(source[pos..], fence_char);
+    if (fence_len < 3) return null;
+    const after_fence = pos + fence_len;
+    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+    const rest = std.mem.trim(u8, source[after_fence..line_end], " \t\r");
+    return .{
+        .fence_char = fence_char,
+        .fence_len = fence_len,
+        .line_end = line_end,
+        .is_closer = rest.len == 0,
+    };
+}
+
 /// Consume a contiguous Markdown indented code block (four spaces or one tab)
 /// verbatim. These blocks are not fenced, but their contents are still literal
 /// code and must not be preprocessed as math.
-fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
+fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize, in_list_item: bool) anyerror!bool {
     const start = i.*;
     if (!isIndentedCodeLine(source, start)) return false;
-    // Four-space indentation immediately under an open list item is a list
-    // continuation, not a top-level indented code block; allow normal math
-    // preprocessing there.
-    if (isInsideListContinuation(source, start)) return false;
+    // Four-space indentation under an open list item is a list continuation,
+    // not a top-level indented code block; allow normal math preprocessing.
+    if (in_list_item) return false;
 
     var end = start;
     while (end < source.len) {
@@ -162,18 +216,20 @@ fn isIndentedCodeLine(source: []const u8, line_start: usize) bool {
     return line_start + 4 <= source.len and std.mem.eql(u8, source[line_start .. line_start + 4], "    ");
 }
 
-fn isInsideListContinuation(source: []const u8, line_start: usize) bool {
-    if (line_start <= 1) return false;
-    var scan_end = line_start - 2; // skip the newline immediately before this line
-    while (true) {
-        var scan_start = scan_end;
-        while (scan_start > 0 and source[scan_start - 1] != '\n') scan_start -= 1;
-        const line = source[scan_start .. scan_end + 1];
-        const trimmed = std.mem.trimStart(u8, line, " \t");
-        if (trimmed.len == 0) return false;
-        if (isListMarkerLine(trimmed)) return true;
-        if (scan_start <= 1) return false;
-        scan_end = scan_start - 2;
+fn updateListContext(source: []const u8, line_start: usize, in_list_item: *bool) void {
+    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+    const line = source[line_start..line_end];
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    if (trimmed.len == 0) {
+        in_list_item.* = false;
+        return;
+    }
+    if (isListMarkerLine(trimmed)) {
+        in_list_item.* = true;
+        return;
+    }
+    if (!isIndentedCodeLine(source, line_start)) {
+        in_list_item.* = false;
     }
 }
 
@@ -772,8 +828,12 @@ fn consumeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source
 
     // Force line boundaries so block math doesn't run into surrounding prose
     // like `before $$x$$ after`.
-    if (open > 0 and source[open - 1] != '\n') try writer.writeByte('\n');
     const body = source[body_start..close];
+    // Digit-prefixed display math like `$$2^n$$` is valid, but prose/currency
+    // tokens like `$$5 total$$` are not. Reject the latter before emitting any
+    // synthetic line boundary so the source remains byte-for-byte intact.
+    if (isCurrencyLikeMathBody(body)) return false;
+    if (open > 0 and source[open - 1] != '\n') try writer.writeByte('\n');
     try writeBlockMath(allocator, writer, body);
     const after_close = close + 2;
     if (after_close < source.len and source[after_close] != '\n') {
@@ -853,6 +913,11 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // URL may have already been consumed as part of the body when the
     // opener was at a position where the URL check hadn't fired yet.
     if (std.mem.indexOf(u8, body, "://") != null) return false;
+    // Digit-started formulas like `$2^n$` are valid, but currency/prose bodies
+    // like `$5; x=` are not and must not steal the next formula opener. A
+    // digit-started body that would become a Markdown ordered-list marker at
+    // line start is kept and protected instead.
+    if (isCurrencyLikeMathBody(body) and !startsBlockMarkdownAtSourcePosition(source, open, body)) return false;
 
     // Closing `$` must not be preceded by whitespace, followed by another
     // `$`, followed by a digit (currency ranges), or followed by `{`
@@ -872,7 +937,7 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     if (close + 1 < source.len) {
         const after = source[close + 1];
         if (after == '$' or after == '{' or std.ascii.isDigit(after)) return false;
-        if (isShellVarSeparator(after) and isShellNameLike(body)) return false;
+        if ((after == '/' or after == '-') and isShellNameLike(body)) return false;
         if (isUppercaseShellName(body) and isIdentifierChar(after)) return false;
         if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
             return false;
@@ -1121,6 +1186,14 @@ fn isShellNameLike(s: []const u8) bool {
 
 fn isShellVarSeparator(c: u8) bool {
     return c == '/' or c == '-' or c == ':' or c == '@' or c == '.';
+}
+
+fn isCurrencyLikeMathBody(body: []const u8) bool {
+    if (body.len == 0 or !std.ascii.isDigit(body[0])) return false;
+    for (body[1..]) |c| {
+        if (std.ascii.isWhitespace(c) or c == ';' or c == ':' or c == ',') return true;
+    }
+    return false;
 }
 
 /// Returns true when the rendered math text contains a character that
@@ -2470,4 +2543,44 @@ test "indented list continuation math is rendered" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "    x²") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    $x^2$") == null);
+}
+
+
+test "digit-prefixed double dollars stay prose" {
+    const src = "cost $$5 total$$ today";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "unfinished blockquoted code fence preserves quoted lines" {
+    const src = "> ```sh\n> echo $HOME$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "blockquoted code fence preserves quoted shell variables through close" {
+    const src = "> ```sh\n> echo $HOME$\n> ```\nthen $x$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> echo $HOME$") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "then x") != null);
+}
+
+test "currency dollar does not pair with following formula opener" {
+    const src = "Costs $5; x=$x$.";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Costs $5; x=x.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Costs 5; x=x$.") == null);
+}
+
+test "long list continuations avoid quadratic backscan and render math" {
+    const src = "- Item:\n    $a$\n    $b$\n    $c$\n    $d$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "    d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$d$") == null);
 }
