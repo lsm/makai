@@ -191,25 +191,36 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     return error.QueueFull;
                 }
 
+                // If the stream owns events and has a clone function, deep-copy the event
+                // before claiming a slot. Doing this before the CAS ensures that an
+                // OutOfMemory error does not leave a reserved but unpublished slot,
+                // which would wedge consumers waiting at that tail position. The clone
+                // is reused on subsequent loop iterations if the CAS fails.
+                if (self.owns_events) {
+                    if (self.clone_event_fn) |clone_fn| {
+                        if (owned_event == null) {
+                            owned_event = try clone_fn(self.allocator, event);
+                        }
+                    }
+                }
+
                 // Try to claim this slot
                 if (self.head.cmpxchgWeak(current_head, next_head, .acquire, .acquire)) |_| {
                     continue;
                 }
 
                 // We claimed slot at current_head - now write the data.
-                // If the stream owns events and has a clone function, use a deep copy
-                // so the producer can free its temporary buffers.
                 var event_to_store = event;
                 if (self.owns_events) {
                     if (self.clone_event_fn) |clone_fn| {
-                        if (owned_event == null) {
-                            owned_event = try clone_fn(self.allocator, event);
+                        _ = clone_fn;
+                        if (owned_event) |*owned| {
+                            event_to_store = owned.*;
+                            owned_event = null; // ownership transferred to the ring buffer
                         }
-                        event_to_store = owned_event.?;
                     }
                 }
                 self.ring_buffer[current_head] = event_to_store;
-                owned_event = null; // ownership transferred to the ring buffer
 
                 // Mark the slot as published with release semantics
                 // This ensures the write above is visible before the flag

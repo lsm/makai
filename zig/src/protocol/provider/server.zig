@@ -817,17 +817,11 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
     // Provider streams are produced by background threads; wait for producer completion
-    // before deinit/destroy during abort and cleanup paths.
+    // before deinit/destroy during abort and cleanup paths. Providers must honor
+    // `requires_owned_stream_events` in their stream init by setting owns_events and
+    // clone_event_fn before spawning the producer, so no post-creation mutation is
+    // needed here.
     stream.wait_for_thread_on_deinit = true;
-    // Providers that push borrowed slices (Ollama, Anthropic, Google, etc.) free their
-    // temporary buffers when the producer thread exits, but the protocol runtime may
-    // still serialize unconsumed events. Make such streams own deep copies. Providers
-    // that already push owned events (OpenAI completions/responses) set owns_events
-    // themselves; leave them unchanged to avoid double-cloning.
-    if (!stream.owns_events) {
-        stream.owns_events = true;
-        stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
-    }
 
     // Create ActiveStream entry
     const active_stream = ProtocolServer.ActiveStream{
