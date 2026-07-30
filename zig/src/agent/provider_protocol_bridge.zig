@@ -60,6 +60,7 @@ fn streamViaProtocol(
     const out_stream = try allocator.create(event_stream.AssistantMessageEventStream);
     out_stream.* = event_stream.AssistantMessageEventStream.init(allocator);
     out_stream.owns_events = true;
+    out_stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     out_stream.wait_for_thread_on_deinit = true;
 
     const thread_ctx = try allocator.create(StreamThreadContext);
@@ -82,20 +83,15 @@ fn streamViaProtocol(
     return out_stream;
 }
 
-fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
-    const cloned = try ai_types.cloneAssistantMessageEvent(allocator, ev);
-    errdefer {
-        var cleanup = cloned;
-        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
-    }
-
+fn pushEventBlocking(stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
     while (true) {
-        stream.push(cloned) catch |err| switch (err) {
+        stream.push(ev) catch |err| switch (err) {
             error.QueueFull => {
                 compat.time.sleepNs(1 * std.time.ns_per_ms);
                 continue;
             },
             error.StreamCompleted => return error.StreamCompleted,
+            error.OutOfMemory => return error.OutOfMemory,
         };
         return;
     }
@@ -105,7 +101,7 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
     while (client.getEventStream().poll()) |ev| {
         var owned_ev = ev;
         defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
-        try pushEventBlocking(allocator, out_stream, ev);
+        try pushEventBlocking(out_stream, ev);
     }
 }
 
@@ -423,10 +419,14 @@ test "InProcessProviderProtocolBridge preserves streamed tool call terminal resu
             a: std.mem.Allocator,
         ) anyerror!*event_stream.AssistantMessageEventStream {
             _ = context;
-            _ = options;
+            const o = options orelse ai_types.StreamOptions{};
 
             const s = try a.create(event_stream.AssistantMessageEventStream);
             s.* = event_stream.AssistantMessageEventStream.init(a);
+            if (o.requires_owned_stream_events) {
+                s.owns_events = true;
+                s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+            }
             const p = partial(model);
 
             s.push(.{ .start = .{ .partial = p } }) catch {};

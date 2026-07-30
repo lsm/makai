@@ -555,14 +555,17 @@ fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.Stream
     injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
 }
 
-/// Merge a server-side CancelToken into the caller's StreamOptions.
-/// Preserves any existing fields; only sets cancel_token.
-fn injectCancelToken(
+/// Merge server-side options into the caller's StreamOptions.
+/// Preserves all existing fields; only sets cancel_token and marks the stream
+/// as requiring owned events so the producer thread can exit while the protocol
+/// runtime is still forwarding unconsumed events.
+fn injectServerOptions(
     options: ?ai_types.StreamOptions,
     cancel_token: ai_types.CancelToken,
 ) ai_types.StreamOptions {
     var resolved = options orelse ai_types.StreamOptions{};
     resolved.cancel_token = cancel_token;
+    resolved.requires_owned_stream_events = true;
     return resolved;
 }
 
@@ -801,7 +804,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
     // Inject cancel token into options so the provider can observe it.
-    const options_with_cancel = injectCancelToken(request.options, cancel_token);
+    const options_with_cancel = injectServerOptions(request.options, cancel_token);
 
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
     const stream = streamWithRefresh(server, provider, request.model, request.context, options_with_cancel) catch |err| {
@@ -816,6 +819,15 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Provider streams are produced by background threads; wait for producer completion
     // before deinit/destroy during abort and cleanup paths.
     stream.wait_for_thread_on_deinit = true;
+    // Providers that push borrowed slices (Ollama, Anthropic, Google, etc.) free their
+    // temporary buffers when the producer thread exits, but the protocol runtime may
+    // still serialize unconsumed events. Make such streams own deep copies. Providers
+    // that already push owned events (OpenAI completions/responses) set owns_events
+    // themselves; leave them unchanged to avoid double-cloning.
+    if (!stream.owns_events) {
+        stream.owns_events = true;
+        stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    }
 
     // Create ActiveStream entry
     const active_stream = ProtocolServer.ActiveStream{

@@ -84,12 +84,6 @@ fn distributedMockProviderStream(
     else
         try makeToolUseMessage(allocator);
 
-    try stream.push(.{
-        .done = .{
-            .reason = response.stop_reason,
-            .message = response,
-        },
-    });
     stream.complete(response);
     stream.markThreadDone();
     return stream;
