@@ -274,6 +274,52 @@ fn consumeMarkdownLink(allocator: std.mem.Allocator, writer: *std.Io.Writer, sou
     return true;
 }
 
+/// Return the end offset (exclusive) of a complete Markdown inline link
+/// `[text](url)` starting at `start`, or null when the bytes do not form a
+/// complete link. Used by the inline-math closer scan to skip protected link
+/// spans before `$` inside a label or destination can close an earlier dollar.
+fn findMarkdownLinkEnd(source: []const u8, start: usize) ?usize {
+    if (start >= source.len or source[start] != '[') return null;
+
+    var text_end = start + 1;
+    var bracket_depth: usize = 1;
+    while (text_end < source.len) {
+        const c = source[text_end];
+        if (c == '\\' and text_end + 1 < source.len) {
+            text_end += 2;
+            continue;
+        }
+        if (c == '[') bracket_depth += 1;
+        if (c == ']') {
+            bracket_depth -= 1;
+            if (bracket_depth == 0) break;
+        }
+        text_end += 1;
+    }
+    if (bracket_depth != 0 or text_end >= source.len) return null;
+
+    const url_start = text_end + 1;
+    if (url_start >= source.len or source[url_start] != '(') return null;
+
+    var url_end = url_start + 1;
+    var paren_depth: usize = 1;
+    while (url_end < source.len) {
+        const c = source[url_end];
+        if (c == '\\' and url_end + 1 < source.len) {
+            url_end += 2;
+            continue;
+        }
+        if (c == '(') paren_depth += 1;
+        if (c == ')') {
+            paren_depth -= 1;
+            if (paren_depth == 0) break;
+        }
+        url_end += 1;
+    }
+    if (paren_depth != 0 or url_end >= source.len) return null;
+    return url_end + 1;
+}
+
 /// Returns true when `source[i..]` begins with a common bare URL scheme
 /// (`http://` or `https://`).
 fn isBareUrlPrefix(source: []const u8, i: usize) bool {
@@ -617,6 +663,15 @@ fn findInlineMathClose(source: []const u8, start: usize) ?usize {
             }
             i = url_end;
             continue;
+        }
+        // Skip complete Markdown links — their label and destination are
+        // protected by the outer walker, and `$` chars inside the label or URL
+        // must not close an earlier prose/currency dollar.
+        if (source[i] == '[') {
+            if (findMarkdownLinkEnd(source, i)) |link_end| {
+                i = link_end;
+                continue;
+            }
         }
         if (source[i] == '$' and !isEscaped(source, i)) return i;
         i += 1;
@@ -2307,4 +2362,17 @@ test "indented code block is preserved verbatim" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "    const formula = \"$x^2$\";") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "outro y") != null);
+}
+
+
+test "inline closer skips complete markdown links" {
+    // Regression for P2: a literal/currency dollar before a Markdown link must
+    // not pair with `$` inside the link label before consumeMarkdownLink can
+    // protect the link.
+    const src = "Pay $5; see [$x$](https://example.com) now";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Pay $5; see [x](https://example.com) now") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "`5; see [") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x$](https://example.com)") == null);
 }
