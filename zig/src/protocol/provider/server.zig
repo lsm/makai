@@ -823,7 +823,13 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // needed here. Extension providers are validated at the protocol boundary so
     // borrowed events cannot outlive producer-owned temporary buffers while the
     // server forwards queued events.
-    if (!stream.owns_events or stream.clone_event_fn == null) {
+    if (!stream.owns_events) {
+        // Extension providers must return owned events so the server can forward
+        // queued events after the producer thread exits. Cancel the in-flight
+        // producer and wait for it to finish before freeing the stream, otherwise
+        // a background thread could still be writing to the freed ring buffer.
+        cancelled.store(true, .release);
+        stream.wait_for_thread_on_deinit = true;
         stream.deinit();
         server.allocator.destroy(stream);
         server.allocator.destroy(cancelled);

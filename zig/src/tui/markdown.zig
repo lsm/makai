@@ -40,8 +40,18 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
     errdefer out.deinit();
     const writer = &out.writer;
 
+    var line_style = LineStyle{
+        .line_start = 0,
+        .line_end = 0,
+        .in_style = false,
+        .star1_first = null,
+        .star1_last = null,
+        .star2_first = null,
+        .star2_last = null,
+    };
+
     var i: usize = 0;
-    var in_list_item = false;
+    var list_ctx = ListContext{};
     while (i < source.len) {
         // 1. Fenced code block opener at line start. Consumed whole: mermaid
         //    (backtick) blocks are transformed in place, every other language
@@ -50,11 +60,12 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
         //    directly to the writer so the math steps below never re-process
         //    the interior.
         if (isAtLineStart(source, i)) {
-            updateListContext(source, i, &in_list_item);
+            line_style = computeLineStyle(source, i);
+            updateListContext(source, i, &list_ctx);
             if (try consumeFenceBlock(allocator, writer, source, &i)) continue;
             if (try consumeTildeFenceBlock(allocator, writer, source, &i)) continue;
             if (try consumeBlockquoteFenceBlock(writer, source, &i)) continue;
-            if (try consumeIndentedCodeBlock(writer, source, &i, in_list_item)) continue;
+            if (try consumeIndentedCodeBlock(writer, source, &i, list_ctx)) continue;
         }
 
         // 2. Markdown inline links, bare URLs, and relative path/URL
@@ -85,7 +96,7 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
 
         // 5. Inline math `$...$`.
         if (source[i] == '$') {
-            if (try consumeInlineMath(allocator, writer, source, &i, protect_math)) continue;
+            if (try consumeInlineMath(allocator, writer, source, &i, protect_math, line_style)) continue;
         }
 
         // 5. Plain byte.
@@ -191,16 +202,26 @@ fn parseBlockquoteFenceLine(source: []const u8, line_start: usize) ?BlockquoteFe
 /// Consume a contiguous Markdown indented code block (four spaces or one tab)
 /// verbatim. These blocks are not fenced, but their contents are still literal
 /// code and must not be preprocessed as math.
-fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize, in_list_item: bool) anyerror!bool {
+fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize, list_ctx: ListContext) anyerror!bool {
     const start = i.*;
     if (!isIndentedCodeLine(source, start)) return false;
-    // Four-space indentation under an open list item is a list continuation,
-    // not a top-level indented code block; allow normal math preprocessing.
-    if (in_list_item) return false;
+
+    // In a list item, only lines indented at least four spaces past the
+    // content column are nested indented code blocks. Lines indented fewer
+    // than that are list continuations and should be processed normally
+    // (e.g., so `$x^2$` on a four-space continuation still renders).
+    if (list_ctx.active) {
+        const indent = lineIndent(source, start);
+        if (indent < list_ctx.content_indent + 4) return false;
+    }
 
     var end = start;
     while (end < source.len) {
         if (!isAtLineStart(source, end) or !isIndentedCodeLine(source, end)) break;
+        if (list_ctx.active) {
+            const indent = lineIndent(source, end);
+            if (indent < list_ctx.content_indent + 4) break;
+        }
         const line_end = std.mem.indexOfScalarPos(u8, source, end, '\n') orelse source.len;
         end = if (line_end < source.len) line_end + 1 else source.len;
     }
@@ -216,17 +237,53 @@ fn isIndentedCodeLine(source: []const u8, line_start: usize) bool {
     return line_start + 4 <= source.len and std.mem.eql(u8, source[line_start .. line_start + 4], "    ");
 }
 
-fn updateListContext(source: []const u8, line_start: usize, in_list_item: *bool) void {
+/// Tracks an open list item and the column where its content begins.
+/// Used to distinguish true indented code blocks nested inside a list from
+/// ordinary list continuation lines.
+const ListContext = struct {
+    active: bool = false,
+    content_indent: usize = 0,
+};
+
+fn updateListContext(source: []const u8, line_start: usize, ctx: *ListContext) void {
     const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
     const line = source[line_start..line_end];
     const trimmed = std.mem.trimStart(u8, line, " \t");
     if (trimmed.len == 0) return;
+    const indent = line.len - trimmed.len;
+
+    // A new list marker (possibly at column 0) opens a list item. A line at
+    // column 0 that is not a list marker closes any open list.
     if (isListMarkerLine(trimmed)) {
-        in_list_item.* = true;
+        ctx.active = true;
+        // Content starts after the marker and its required separating space.
+        if (trimmed[0] == '-' or trimmed[0] == '*') {
+            ctx.content_indent = indent + 2;
+        } else {
+            // Ordered marker: "1. ".
+            var marker_width: usize = 0;
+            while (marker_width < trimmed.len and std.ascii.isDigit(trimmed[marker_width])) marker_width += 1;
+            if (marker_width < trimmed.len and trimmed[marker_width] == '.') marker_width += 1;
+            if (marker_width < trimmed.len and trimmed[marker_width] == ' ') marker_width += 1;
+            ctx.content_indent = indent + marker_width;
+        }
         return;
     }
-    const indent = line.len - trimmed.len;
-    if (indent == 0) in_list_item.* = false;
+    if (indent == 0) ctx.active = false;
+}
+
+fn lineIndent(source: []const u8, line_start: usize) usize {
+    var width: usize = 0;
+    var i = line_start;
+    while (i < source.len) {
+        switch (source[i]) {
+            ' ' => width += 1,
+            '\t' => width += 4,
+            else => break,
+        }
+        i += 1;
+    }
+    return width;
 }
 
 fn isListMarkerLine(trimmed: []const u8) bool {
@@ -236,41 +293,72 @@ fn isListMarkerLine(trimmed: []const u8) bool {
     return i > 0 and i + 1 < trimmed.len and trimmed[i] == '.' and trimmed[i + 1] == ' ';
 }
 
-fn lineBounds(source: []const u8, pos: usize) struct { start: usize, end: usize } {
-    var start = pos;
-    while (start > 0 and source[start - 1] != '\n') start -= 1;
-    const end = std.mem.indexOfScalarPos(u8, source, pos, '\n') orelse source.len;
-    return .{ .start = start, .end = end };
+const LineStyle = struct {
+    line_start: usize,
+    line_end: usize,
+    in_style: bool,
+    star1_first: ?usize,
+    star1_last: ?usize,
+    star2_first: ?usize,
+    star2_last: ?usize,
+};
+
+fn computeLineStyle(source: []const u8, line_start: usize) LineStyle {
+    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+    const line = source[line_start..line_end];
+    const trimmed_start = std.mem.indexOfNonePos(u8, line, 0, " ") orelse line.len;
+    const trimmed = line[trimmed_start..];
+
+    var star1_first: ?usize = null;
+    var star1_last: ?usize = null;
+    var star2_first: ?usize = null;
+    var star2_last: ?usize = null;
+
+    var pos: usize = 0;
+    while (pos < line.len) {
+        if (line[pos] != '*') {
+            pos += 1;
+            continue;
+        }
+        const run_start = pos;
+        while (pos < line.len and line[pos] == '*') pos += 1;
+        const abs_start = line_start + run_start;
+        if (star1_first == null) star1_first = abs_start;
+        star1_last = abs_start;
+        if (pos - run_start >= 2) {
+            if (star2_first == null) star2_first = abs_start;
+            star2_last = abs_start;
+        }
+    }
+
+    return .{
+        .line_start = line_start,
+        .line_end = line_end,
+        .in_style = std.mem.startsWith(u8, trimmed, "# ") or
+            std.mem.startsWith(u8, trimmed, "## ") or
+            std.mem.startsWith(u8, trimmed, "### ") or
+            std.mem.startsWith(u8, trimmed, "> "),
+        .star1_first = star1_first,
+        .star1_last = star1_last,
+        .star2_first = star2_first,
+        .star2_last = star2_last,
+    };
+}
+
+fn hasDelimiterBeforeAfter(open: usize, close: usize, first: ?usize, last: ?usize) bool {
+    const f = first orelse return false;
+    const l = last orelse return false;
+    return f < open and l > close;
 }
 
 /// ZigZag styles headings, blockquotes, bold, and italic directly without
 /// recursively invoking `renderInline`. Inside those contexts, an inline-code
 /// wrapper would be displayed literally, so protection must be skipped.
-fn isInsideNonRecursiveMarkdownStyle(source: []const u8, open: usize, close: usize) bool {
-    const bounds = lineBounds(source, open);
-    const line = source[bounds.start..bounds.end];
-    const rel_open = open - bounds.start;
-    const rel_close = close - bounds.start;
-    const trimmed_start = std.mem.indexOfNonePos(u8, line, 0, " ") orelse line.len;
-    const trimmed = line[trimmed_start..];
-
-    if (std.mem.startsWith(u8, trimmed, "# ") or
-        std.mem.startsWith(u8, trimmed, "## ") or
-        std.mem.startsWith(u8, trimmed, "### ") or
-        std.mem.startsWith(u8, trimmed, "> "))
-    {
-        return true;
-    }
-
-    if (isBetweenDelimiters(line, rel_open, rel_close, "**")) return true;
-    if (isBetweenDelimiters(line, rel_open, rel_close, "*")) return true;
+fn isInsideNonRecursiveMarkdownStyle(open: usize, close: usize, style: LineStyle) bool {
+    if (style.in_style) return true;
+    if (hasDelimiterBeforeAfter(open, close, style.star2_first, style.star2_last)) return true;
+    if (hasDelimiterBeforeAfter(open, close, style.star1_first, style.star1_last)) return true;
     return false;
-}
-
-fn isBetweenDelimiters(line: []const u8, rel_open: usize, rel_close: usize, delim: []const u8) bool {
-    const before = line[0..rel_open];
-    const after = line[rel_close + 1 ..];
-    return std.mem.lastIndexOf(u8, before, delim) != null and std.mem.indexOf(u8, after, delim) != null;
 }
 
 /// Consume a Markdown inline link `[text](url)`. Preprocesses the visible
@@ -796,8 +884,8 @@ fn findUnescapedDoubleDollar(source: []const u8, start: usize) ?usize {
 /// contexts that ZigZag renders without recursing into `renderInline` (bold,
 /// italic, headings, blockquotes), where the wrapper would be displayed as a
 /// visible character rather than acting as a code-span boundary.
-fn writeProtectedMathSpan(writer: *std.Io.Writer, source: []const u8, open: usize, text: []const u8) anyerror!void {
-    if (!needsMathProtection(source, open, text)) {
+fn writeProtectedMathSpan(writer: *std.Io.Writer, source: []const u8, open: usize, text: []const u8, line_start: usize) anyerror!void {
+    if (!needsMathProtection(source, open, text, line_start)) {
         try writer.writeAll(text);
         return;
     }
@@ -912,7 +1000,7 @@ fn writeBlockMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, body: []
 /// - `\$FOO\$` — the opener/closer is escaped by a backslash.
 /// Prose suffixes such as `$n$th` are allowed because they use lowercase
 /// identifiers and do not look like adjacent shell variables.
-fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize, protect_math: bool) anyerror!bool {
+fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize, protect_math: bool, line_style: LineStyle) anyerror!bool {
     const open = i.*;
 
     // Opening `$` immediately after a digit is a price suffix, not math
@@ -944,7 +1032,7 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // like `$5; x=` are not and must not steal the next formula opener. A
     // digit-started body that would become a Markdown ordered-list marker at
     // line start is kept and protected instead.
-    if (isCurrencyLikeMathBody(body) and !startsBlockMarkdownAtSourcePosition(source, open, body)) return false;
+    if (isCurrencyLikeMathBody(body) and !startsBlockMarkdownAtSourcePosition(source, open, body, line_style.line_start)) return false;
 
     // Closing `$` must not be preceded by whitespace, followed by another
     // `$`, followed by a digit (currency ranges), or followed by `{`
@@ -982,8 +1070,8 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     var rendered: std.Io.Writer.Allocating = .init(allocator);
     defer rendered.deinit();
     try renderMathBody(&rendered.writer, body);
-    if (protect_math and !isInsideNonRecursiveMarkdownStyle(source, open, close)) {
-        try writeProtectedMathSpan(writer, source, open, rendered.written());
+    if (protect_math and !isInsideNonRecursiveMarkdownStyle(open, close, line_style)) {
+        try writeProtectedMathSpan(writer, source, open, rendered.written(), line_style.line_start);
     } else {
         try writer.writeAll(rendered.written());
     }
@@ -1239,7 +1327,7 @@ fn isCurrencyLikeMathBody(body: []const u8) bool {
 /// wrapper and can be emitted raw — this avoids leaking literal backticks
 /// inside styled contexts (bold, italic, headings, blockquotes) that bypass
 /// `renderInline`.
-fn needsMathProtection(source: []const u8, open: usize, text: []const u8) bool {
+fn needsMathProtection(source: []const u8, open: usize, text: []const u8, line_start: usize) bool {
     for (text) |c| {
         if (c == '*' or c == '_' or c == '`' or c == '[' or c == ']' or
             c == '<' or c == '>')
@@ -1247,12 +1335,11 @@ fn needsMathProtection(source: []const u8, open: usize, text: []const u8) bool {
             return true;
         }
     }
-    return startsBlockMarkdownAtSourcePosition(source, open, text);
+    return startsBlockMarkdownAtSourcePosition(source, open, text, line_start);
 }
 
-fn startsBlockMarkdownAtSourcePosition(source: []const u8, open: usize, text: []const u8) bool {
-    const bounds = lineBounds(source, open);
-    const before = source[bounds.start..open];
+fn startsBlockMarkdownAtSourcePosition(source: []const u8, open: usize, text: []const u8, line_start: usize) bool {
+    const before = source[line_start..open];
     if (std.mem.indexOfNone(u8, before, " \t") != null) return false;
 
     if (std.mem.startsWith(u8, text, "# ")) return true;
@@ -1278,10 +1365,9 @@ fn isAllMarkdownRuleChar(text: []const u8, c: u8) bool {
 /// rather than being converted to sub/superscripts).
 fn isTextModeCommand(name: []const u8) bool {
     const text_cmds = [_][]const u8{
-        "text",    "textbf",  "textit",  "textrm",  "texttt", "textsf",
-        "emph",    "underline", "mathrm", "mathit", "mathbf", "mathsf",
-        "mathtt",  "mathcal", "mathbb",  "boldsymbol", "pmb",
-        "operatorname",
+        "text",   "textbf",    "textit", "textrm",     "texttt", "textsf",
+        "emph",   "underline", "mathrm", "mathit",     "mathbf", "mathsf",
+        "mathtt", "mathcal",   "mathbb", "boldsymbol", "pmb",    "operatorname",
     };
     for (text_cmds) |cmd| {
         if (std.mem.eql(u8, name, cmd)) return true;
@@ -1311,7 +1397,7 @@ fn readFracOperand(body: []const u8, i: usize) ?FracOperand {
         }
         return .{ .raw = body[j..k], .end = k };
     }
-    return .{ .raw = body[j..j + 1], .end = j + 1 };
+    return .{ .raw = body[j .. j + 1], .end = j + 1 };
 }
 
 fn isBraceGroup(raw: []const u8) bool {
@@ -1326,9 +1412,9 @@ fn writeFrac(writer: *std.Io.Writer, body: []const u8, start: usize) anyerror!us
     const b = if (a) |op| readFracOperand(body, op.end) else null;
     if (a != null and b != null and isBraceGroup(a.?.raw) and isBraceGroup(b.?.raw)) {
         try writer.writeByte('(');
-        try renderMathBody(writer, a.?.raw[1..a.?.raw.len - 1]);
+        try renderMathBody(writer, a.?.raw[1 .. a.?.raw.len - 1]);
         try writer.writeAll(")/(");
-        try renderMathBody(writer, b.?.raw[1..b.?.raw.len - 1]);
+        try renderMathBody(writer, b.?.raw[1 .. b.?.raw.len - 1]);
         try writer.writeByte(')');
         return b.?.end;
     }
@@ -2125,7 +2211,6 @@ test "fraction with newline separated brace operands renders" {
     try std.testing.expect(std.mem.indexOf(u8, out, "(a)/(b)") != null);
 }
 
-
 test "style modifiers are silently dropped" {
     const src = "math $\\mathrm{sin} + x$";
     const out = try preprocess(std.testing.allocator, src);
@@ -2487,7 +2572,6 @@ test "unterminated block math in prose preserves dollars" {
     try std.testing.expect(std.mem.indexOf(u8, out, "`x`") == null);
 }
 
-
 test "inline closer skips triple-backtick code spans" {
     // Regression for P2: a literal dollar before a mid-line triple-backtick
     // span must not pair with dollars inside that protected code span.
@@ -2527,7 +2611,6 @@ test "indented code block is preserved verbatim" {
     try std.testing.expect(std.mem.indexOf(u8, out, "outro y") != null);
 }
 
-
 test "inline closer skips complete markdown links" {
     // Regression for P2: a literal/currency dollar before a Markdown link must
     // not pair with `$` inside the link label before consumeMarkdownLink can
@@ -2540,7 +2623,6 @@ test "inline closer skips complete markdown links" {
     try std.testing.expect(std.mem.indexOf(u8, out, "x$](https://example.com)") == null);
 }
 
-
 test "inline closer skips reference markdown links" {
     const src = "Pay $5; see [$x$][ref] now";
     const out = try preprocess(std.testing.allocator, src);
@@ -2549,7 +2631,6 @@ test "inline closer skips reference markdown links" {
     try std.testing.expect(std.mem.indexOf(u8, out, "`5; see [") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "x$][ref]") == null);
 }
-
 
 test "rejected double dollar openers are consumed atomically" {
     const escaped = "\\$$x$$";
@@ -2562,7 +2643,6 @@ test "rejected double dollar openers are consumed atomically" {
     defer std.testing.allocator.free(triple_out);
     try std.testing.expectEqualStrings(triple, triple_out);
 }
-
 
 test "lowercase shell variables separated by punctuation stay raw" {
     const src = "connect $host:$port as $user@$host via $name.$domain";
@@ -2596,6 +2676,22 @@ test "line-start inline math that renders block marker is protected" {
     try std.testing.expect(std.mem.indexOf(u8, ordered, "`1. item`") != null);
 }
 
+test "indented code nested inside unordered list item is preserved verbatim" {
+    const src = "- Example:\n\n        const formula = \"$x^2$\";";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        const formula = \"$x^2$\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x²") == null);
+}
+
+test "indented code nested inside ordered list item is preserved verbatim" {
+    const src = "1. Example:\n\n        const formula = \"$x^2$\";";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "        const formula = \"$x^2$\";") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "x²") == null);
+}
+
 test "indented list continuation math is rendered" {
     const src = "- Formula:\n    $x^2$";
     const out = try preprocess(std.testing.allocator, src);
@@ -2603,7 +2699,6 @@ test "indented list continuation math is rendered" {
     try std.testing.expect(std.mem.indexOf(u8, out, "    x²") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    $x^2$") == null);
 }
-
 
 test "digit-prefixed double dollars stay prose" {
     const src = "cost $$5 total$$ today";
@@ -2644,7 +2739,6 @@ test "long list continuations avoid quadratic backscan and render math" {
     try std.testing.expect(std.mem.indexOf(u8, out, "$d$") == null);
 }
 
-
 test "digit-prefixed formulas with math separators render" {
     const src = "$2 + 3$ and $$10 \\times 4$$ and $2,000$ and $1:2$";
     const out = try preprocess(std.testing.allocator, src);
@@ -2655,7 +2749,6 @@ test "digit-prefixed formulas with math separators render" {
     try std.testing.expect(std.mem.indexOf(u8, out, "1:2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$2 + 3$") == null);
 }
-
 
 test "list context survives ordinary continuation lines" {
     const src = "- Formula:\n  explanation\n    $x^2$";
