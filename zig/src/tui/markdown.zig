@@ -44,10 +44,11 @@ fn preprocessWithOptions(allocator: std.mem.Allocator, source: []const u8, prote
         .line_start = 0,
         .line_end = 0,
         .in_style = false,
-        .star1_first = null,
-        .star1_last = null,
-        .star2_first = null,
-        .star2_last = null,
+        .star2_starts = undefined,
+        .star2_count = 0,
+        .star1_starts = undefined,
+        .star1_count = 0,
+        .overflow = false,
     };
 
     var i: usize = 0;
@@ -325,14 +326,21 @@ fn isListMarkerLine(trimmed: []const u8) bool {
     return i > 0 and i + 1 < trimmed.len and trimmed[i] == '.' and trimmed[i + 1] == ' ';
 }
 
+const MAX_STAR_RUNS = 32;
+
 const LineStyle = struct {
     line_start: usize,
     line_end: usize,
     in_style: bool,
-    star1_first: ?usize,
-    star1_last: ?usize,
-    star2_first: ?usize,
-    star2_last: ?usize,
+    /// Start offsets of `**` (bold) delimiter runs on the line (sorted ascending).
+    star2_starts: [MAX_STAR_RUNS]usize,
+    star2_count: usize,
+    /// Start offsets of single-`*` (italic) delimiter runs on the line.
+    star1_starts: [MAX_STAR_RUNS]usize,
+    star1_count: usize,
+    /// Set when the line has more emphasis runs than the fixed arrays can hold;
+    /// callers fall back to the safe "protect math" behavior.
+    overflow: bool,
 };
 
 fn computeLineStyle(source: []const u8, line_start: usize) LineStyle {
@@ -341,10 +349,11 @@ fn computeLineStyle(source: []const u8, line_start: usize) LineStyle {
     const trimmed_start = std.mem.indexOfNonePos(u8, line, 0, " ") orelse line.len;
     const trimmed = line[trimmed_start..];
 
-    var star1_first: ?usize = null;
-    var star1_last: ?usize = null;
-    var star2_first: ?usize = null;
-    var star2_last: ?usize = null;
+    var star2_starts: [MAX_STAR_RUNS]usize = undefined;
+    var star2_count: usize = 0;
+    var star1_starts: [MAX_STAR_RUNS]usize = undefined;
+    var star1_count: usize = 0;
+    var overflow = false;
 
     var pos: usize = 0;
     while (pos < line.len) {
@@ -355,11 +364,17 @@ fn computeLineStyle(source: []const u8, line_start: usize) LineStyle {
         const run_start = pos;
         while (pos < line.len and line[pos] == '*') pos += 1;
         const abs_start = line_start + run_start;
-        if (star1_first == null) star1_first = abs_start;
-        star1_last = abs_start;
-        if (pos - run_start >= 2) {
-            if (star2_first == null) star2_first = abs_start;
-            star2_last = abs_start;
+        const run_len = pos - run_start;
+        if (run_len >= 2) {
+            if (star2_count < MAX_STAR_RUNS) {
+                star2_starts[star2_count] = abs_start;
+                star2_count += 1;
+            } else overflow = true;
+        } else {
+            if (star1_count < MAX_STAR_RUNS) {
+                star1_starts[star1_count] = abs_start;
+                star1_count += 1;
+            } else overflow = true;
         }
     }
 
@@ -370,26 +385,51 @@ fn computeLineStyle(source: []const u8, line_start: usize) LineStyle {
             std.mem.startsWith(u8, trimmed, "## ") or
             std.mem.startsWith(u8, trimmed, "### ") or
             std.mem.startsWith(u8, trimmed, "> "),
-        .star1_first = star1_first,
-        .star1_last = star1_last,
-        .star2_first = star2_first,
-        .star2_last = star2_last,
+        .star2_starts = star2_starts,
+        .star2_count = star2_count,
+        .star1_starts = star1_starts,
+        .star1_count = star1_count,
+        .overflow = overflow,
     };
 }
 
-fn hasDelimiterBeforeAfter(open: usize, close: usize, first: ?usize, last: ?usize) bool {
-    const f = first orelse return false;
-    const l = last orelse return false;
-    return f < open and l > close;
+/// Returns true when `count` of the sorted run-starts in `starts[0..len]` are
+/// strictly less than `pos`, i.e. the number of delimiter runs preceding `pos`.
+fn runsBefore(starts: []const usize, len: usize, pos: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (starts[i] < pos) n += 1;
+    }
+    return n;
+}
+
+/// Returns true when any run-start in `starts[0..len]` is at or after `pos`.
+fn runAtOrAfter(starts: []const usize, len: usize, pos: usize) bool {
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (starts[i] >= pos) return true;
+    }
+    return false;
 }
 
 /// ZigZag styles headings, blockquotes, bold, and italic directly without
 /// recursively invoking `renderInline`. Inside those contexts, an inline-code
 /// wrapper would be displayed literally, so protection must be skipped.
+///
+/// Emphasis enclosure is decided by matching delimiter pairs: a math span is
+/// inside an emphasis span only when an odd number of same-type delimiter runs
+/// precede it (an unmatched opener) and at least one matching run follows the
+/// closer. This avoids treating `**left** $a*b$ **right**` as enclosed (where
+/// the bold runs flank but do not enclose the math) while still recognizing a
+/// genuinely wrapped span like `**Energy: $E=mc^2$**`.
 fn isInsideNonRecursiveMarkdownStyle(open: usize, close: usize, style: LineStyle) bool {
     if (style.in_style) return true;
-    if (hasDelimiterBeforeAfter(open, close, style.star2_first, style.star2_last)) return true;
-    if (hasDelimiterBeforeAfter(open, close, style.star1_first, style.star1_last)) return true;
+    if (style.overflow) return false;
+    if (runsBefore(style.star2_starts[0..], style.star2_count, open) % 2 == 1 and
+        runAtOrAfter(style.star2_starts[0..], style.star2_count, close)) return true;
+    if (runsBefore(style.star1_starts[0..], style.star1_count, open) % 2 == 1 and
+        runAtOrAfter(style.star1_starts[0..], style.star1_count, close)) return true;
     return false;
 }
 
@@ -2848,3 +2888,48 @@ test "digit-prefixed algebraic coefficients render" {
     try std.testing.expect(std.mem.indexOf(u8, display_out, "> 10xy") != null);
     try std.testing.expect(std.mem.indexOf(u8, display_out, "$$10xy$$") == null);
 }
+
+test "emphasis-delimited math is protected only when truly enclosed" {
+    // Regression for P2: `**left** $a*b$ **right**` has bold runs flanking the
+    // math but not enclosing it. The math contains a `*`, so it MUST get the
+    // inline-code wrapper; otherwise ZigZag reinterprets the `*` as emphasis.
+    const flanking = "**left** $a*b$ **right**";
+    const flanking_out = try preprocess(std.testing.allocator, flanking);
+    defer std.testing.allocator.free(flanking_out);
+    try std.testing.expect(std.mem.indexOf(u8, flanking_out, "`a*b`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flanking_out, "$a*b$") == null);
+
+    // A genuinely enclosed span still skips the wrapper so no literal backticks
+    // leak inside the bold run.
+    const enclosed = "**Energy: $E=mc^2$**";
+    const enclosed_out = try preprocess(std.testing.allocator, enclosed);
+    defer std.testing.allocator.free(enclosed_out);
+    try std.testing.expect(std.mem.indexOf(u8, enclosed_out, "**Energy: E=mc²**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enclosed_out, "`E=mc²`") == null);
+
+    // Italic-delimited math follows the same matching rule.
+    const italic_flanking = "*left* $a*b$ *right*";
+    const italic_out = try preprocess(std.testing.allocator, italic_flanking);
+    defer std.testing.allocator.free(italic_out);
+    try std.testing.expect(std.mem.indexOf(u8, italic_out, "`a*b`") != null);
+}
+
+test "many inline formulas on one line do not rescans quadratically" {
+    // Regression for P2: emphasis/style enclosure is decided from precomputed
+    // per-line run positions, so a long line with many formulas stays linear.
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    const part = "$a_i$ ";
+    var k: usize = 0;
+    while (k < 200) : (k += 1) {
+        std.mem.copyForwards(u8, buf[len..], part);
+        len += part.len;
+    }
+    const src = buf[0..len];
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    // Every formula rendered; none left raw.
+    try std.testing.expect(std.mem.indexOf(u8, out, "$a_i$") == null);
+    try std.testing.expect(std.mem.count(u8, out, "aᵢ") == 200);
+}
+
