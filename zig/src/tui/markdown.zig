@@ -178,11 +178,11 @@ const BlockquoteFence = struct {
 };
 
 fn parseBlockquoteFenceLine(source: []const u8, line_start: usize) ?BlockquoteFence {
-    var pos = line_start;
-    while (pos < source.len and source[pos] == ' ') pos += 1;
-    if (pos >= source.len or source[pos] != '>') return null;
-    pos += 1;
-    if (pos < source.len and source[pos] == ' ') pos += 1;
+    // Consume the complete blockquote-marker prefix: nested quotes like
+    // `> > ```sh` repeat `>` markers separated by optional spaces.
+    const prefix = skipBlockquoteMarkers(source, line_start);
+    if (!prefix.has_marker) return null;
+    var pos = prefix.content_start;
     while (pos < source.len and source[pos] == ' ') pos += 1;
     if (pos >= source.len or (source[pos] != '`' and source[pos] != '~')) return null;
     const fence_char = source[pos];
@@ -201,24 +201,33 @@ fn parseBlockquoteFenceLine(source: []const u8, line_start: usize) ?BlockquoteFe
 
 /// Consume a contiguous Markdown indented code block (four spaces or one tab)
 /// verbatim. These blocks are not fenced, but their contents are still literal
-/// code and must not be preprocessed as math.
+/// code and must not be preprocessed as math. Also recognizes indented code
+/// nested inside blockquote markers (`>     code`), where the four-space
+/// indent follows the `>` prefix rather than the physical line start.
 fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usize, list_ctx: ListContext) anyerror!bool {
     const start = i.*;
-    if (!isIndentedCodeLine(source, start)) return false;
+    const bq = skipBlockquoteMarkers(source, start);
+    if (!isIndentedCodeLine(source, bq.content_start)) return false;
 
     // In a list item, only lines indented at least four spaces past the
     // content column are nested indented code blocks. Lines indented fewer
     // than that are list continuations and should be processed normally
     // (e.g., so `$x^2$` on a four-space continuation still renders).
-    if (list_ctx.active) {
+    // Blockquote-nested code is always literal regardless of list context.
+    if (list_ctx.active and !bq.has_marker) {
         const indent = lineIndent(source, start);
         if (indent < list_ctx.content_indent + 4) return false;
     }
 
     var end = start;
     while (end < source.len) {
-        if (!isAtLineStart(source, end) or !isIndentedCodeLine(source, end)) break;
-        if (list_ctx.active) {
+        if (!isAtLineStart(source, end)) break;
+        const line_bq = skipBlockquoteMarkers(source, end);
+        // Require the same blockquote shape across the block (quoted code
+        // lines all carry the `>` prefix; unquoted blocks never gain one).
+        if (line_bq.has_marker != bq.has_marker) break;
+        if (!isIndentedCodeLine(source, line_bq.content_start)) break;
+        if (list_ctx.active and !line_bq.has_marker) {
             const indent = lineIndent(source, end);
             if (indent < list_ctx.content_indent + 4) break;
         }
@@ -229,6 +238,29 @@ fn consumeIndentedCodeBlock(writer: *std.Io.Writer, source: []const u8, i: *usiz
     try writer.writeAll(source[start..end]);
     i.* = end;
     return true;
+}
+
+const BlockquotePrefix = struct {
+    has_marker: bool,
+    content_start: usize,
+};
+
+/// Skip a blockquote-marker prefix (`>`, `> >`, …) at the start of a line,
+/// returning the offset where the quoted content begins. CommonMark allows up
+/// to three spaces before each `>` marker and one optional space after it.
+fn skipBlockquoteMarkers(source: []const u8, line_start: usize) BlockquotePrefix {
+    var pos = line_start;
+    var saw_marker = false;
+    while (true) {
+        var spaces: usize = 0;
+        while (pos + spaces < source.len and source[pos + spaces] == ' ' and spaces < 3) spaces += 1;
+        const after_spaces = pos + spaces;
+        if (after_spaces >= source.len or source[after_spaces] != '>') break;
+        saw_marker = true;
+        pos = after_spaces + 1;
+        if (pos < source.len and source[pos] == ' ') pos += 1;
+    }
+    return .{ .has_marker = saw_marker, .content_start = pos };
 }
 
 fn isIndentedCodeLine(source: []const u8, line_start: usize) bool {
@@ -586,10 +618,10 @@ fn consumeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
 }
 
 /// Consume a CommonMark tilde-fenced code block (`~~~ ... ~~~`) at line start.
-/// Unlike backtick fences, these are always copied verbatim because the
-/// downstream renderer displays them as plain text rather than bordered code.
+/// Mermaid blocks get the same labeled/quoted transformation as backtick
+/// fences; other tilde-fenced languages are copied verbatim.
 fn consumeTildeFenceBlock(allocator: std.mem.Allocator, writer: *std.Io.Writer, source: []const u8, i: *usize) anyerror!bool {
-    return try consumeFenceGeneric(allocator, writer, source, i, '~', false);
+    return try consumeFenceGeneric(allocator, writer, source, i, '~', true);
 }
 
 /// Generic fenced code block consumer.
@@ -624,8 +656,8 @@ fn consumeFenceGeneric(
     while (indent_end + fence_len < source.len and source[indent_end + fence_len] == fence_char) fence_len += 1;
     if (fence_len < 3) return false;
 
-    // For backtick fences the rest of the opener line is the language tag;
-    // tilde fences have no meaningful tag.
+    // Both backtick and tilde fences carry an optional language tag on the
+    // opener line.
     const fence_end = indent_end + fence_len;
     const line_end = std.mem.indexOfScalarPos(u8, source, fence_end, '\n') orelse source.len;
     const tag = if (may_be_mermaid)
@@ -1052,7 +1084,14 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     if (close + 1 < source.len) {
         const after = source[close + 1];
         if (after == '$' or after == '{' or std.ascii.isDigit(after)) return false;
-        if ((after == '/' or after == '-') and isShellNameLike(body)) return false;
+        // `$foo/$bar` / `$prefix-$suffix` look like adjacent shell-variable
+        // paths. Only reject when the separator actually leads into another
+        // `$` variable; hyphenated prose like `$x$-axis` must still render.
+        if ((after == '/' or after == '-') and isShellNameLike(body)) {
+            var scan = close + 2;
+            while (scan < source.len and (std.ascii.isAlphanumeric(source[scan]) or source[scan] == '_')) scan += 1;
+            if (scan < source.len and source[scan] == '$') return false;
+        }
         if (isUppercaseShellName(body) and isIdentifierChar(after)) return false;
         if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
             return false;
@@ -1317,7 +1356,7 @@ fn isCurrencyLikeMathBody(body: []const u8) bool {
         if (std.ascii.isAlphabetic(c)) saw_alpha = true;
         if (std.ascii.isWhitespace(c)) saw_space = true;
     }
-    return saw_alpha;
+    return saw_alpha and saw_space;
 }
 
 /// Returns true when the rendered math text contains a character that
@@ -2756,4 +2795,56 @@ test "list context survives ordinary continuation lines" {
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "    x²") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "    $x^2$") == null);
+}
+
+
+test "nested blockquote code fence preserves quoted lines" {
+    const src = "> > ```sh\n> > echo $HOME$";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "blockquote-indented code is preserved verbatim" {
+    const src = ">     const formula = \"$x^2$\";";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "tilde-fenced mermaid block renders like backtick mermaid" {
+    const src = "~~~mermaid\nflowchart TD\n  A --> B\n~~~";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "**Mermaid diagram: flowchart**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "> flowchart TD") != null);
+}
+
+test "tilde-fenced non-mermaid block stays verbatim" {
+    const src = "~~~sh\necho $x$\n~~~";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
+}
+
+test "hyphenated prose after math renders" {
+    const src = "the $x$-axis";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "the x-axis") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$x$") == null);
+}
+
+test "digit-prefixed algebraic coefficients render" {
+    const inline_src = "scale by $2x$";
+    const inline_out = try preprocess(std.testing.allocator, inline_src);
+    defer std.testing.allocator.free(inline_out);
+    try std.testing.expect(std.mem.indexOf(u8, inline_out, "scale by 2x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, inline_out, "$2x$") == null);
+
+    const display_src = "$$10xy$$";
+    const display_out = try preprocess(std.testing.allocator, display_src);
+    defer std.testing.allocator.free(display_out);
+    try std.testing.expect(std.mem.indexOf(u8, display_out, "> 10xy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, display_out, "$$10xy$$") == null);
 }
