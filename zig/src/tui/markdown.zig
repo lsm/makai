@@ -1082,33 +1082,46 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // allowed so common forms such as `f(x)=$x^2$` and `value:$v$` render.
     if (open > 0 and std.ascii.isDigit(source[open - 1])) return false;
     if (open > 0 and isEscaped(source, open)) return false;
-    // Body must start with a non-space and non-`$` char.
+    // Body must start with a non-`$`, non-`{` char. Leading inner whitespace
+    // (e.g. conventionally padded TeX like `$ x + y $`) is allowed and trimmed
+    // below before classification/rendering.
     if (open + 1 >= source.len) return false;
     {
         const next = source[open + 1];
-        if (next == ' ' or next == '$' or next == '{') return false;
+        if (next == '$' or next == '{') return false;
     }
 
     const body_start = open + 1;
     const close = findInlineMathClose(source, body_start) orelse return false;
 
     const body = source[body_start..close];
+    // Allow conventionally padded TeX (`$ x + y $`), but require the padding to
+    // be leading-anchored: a trailing space with no leading space is prose like
+    // `$bar and $baz`, where the second dollar is another shell variable's
+    // opener rather than a math closer. Symmetric padding is trimmed below.
+    const has_leading_ws = body.len > 0 and (body[0] == ' ' or body[0] == '\t');
+    const has_trailing_ws = body.len > 0 and (body[body.len - 1] == ' ' or body[body.len - 1] == '\t');
+    if (has_trailing_ws and !has_leading_ws) return false;
+    // Trim optional inner padding so `$ x + y $` renders like `$x + y$`. The
+    // trimmed body is used for all classification and rendering below.
+    const math_body = std.mem.trim(u8, body, " \t\r");
+    if (math_body.len == 0) return false; // `$ $` / `$  $` is not a formula
 
     // Reject bodies that look like they swallowed a URL — a `$` before a
     // bare URL can pair with a `$` inside the URL destination (e.g. a
     // placeholder) even though the closer search skips URLs, because the
     // URL may have already been consumed as part of the body when the
     // opener was at a position where the URL check hadn't fired yet.
-    if (std.mem.indexOf(u8, body, "://") != null) return false;
+    if (std.mem.indexOf(u8, math_body, "://") != null) return false;
     // Digit-started formulas like `$2^n$` are valid, but currency/prose bodies
     // like `$5; x=` are not and must not steal the next formula opener. A
     // digit-started body that would become a Markdown ordered-list marker at
     // line start is kept and protected instead.
-    if (isCurrencyLikeMathBody(body) and !startsBlockMarkdownAtSourcePosition(source, open, body, line_style.line_start)) return false;
+    if (isCurrencyLikeMathBody(math_body) and !startsBlockMarkdownAtSourcePosition(source, open, math_body, line_style.line_start)) return false;
 
-    // Closing `$` must not be preceded by whitespace, followed by another
-    // `$`, followed by a digit (currency ranges), or followed by `{`
-    // (braced shell variables like `${HOME}`).
+    // Closing `$` must not be followed by another `$`, a digit (currency
+    // ranges), or `{` (braced shell variables like `${HOME}`). Trailing inner
+    // whitespace is allowed (already trimmed into `math_body`).
     // An identifier suffix is allowed for prose like `$n$th`. Shell-variable
     // adjacency is detected in two shapes:
     //   - `$HOME/$PATH`, `$foo/$bar` — closer followed by `/` or `-` and body
@@ -1117,9 +1130,8 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     //     closer is followed by an identifier char (the next variable name).
     // Uppercase-only bodies are additionally rejected when followed by any
     // identifier (`$HOME$var`).
-    if (source[close - 1] == ' ') return false;
-    if (body.len > 0 and isShellVarSeparator(body[body.len - 1])) {
-        if (close + 1 < source.len and isIdentifierChar(source[close + 1]) and isShellNameLike(body[0 .. body.len - 1])) return false;
+    if (math_body.len > 0 and isShellVarSeparator(math_body[math_body.len - 1])) {
+        if (close + 1 < source.len and isIdentifierChar(source[close + 1]) and isShellNameLike(math_body[0 .. math_body.len - 1])) return false;
     }
     if (close + 1 < source.len) {
         const after = source[close + 1];
@@ -1127,19 +1139,19 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
         // `$foo/$bar` / `$prefix-$suffix` look like adjacent shell-variable
         // paths. Only reject when the separator actually leads into another
         // `$` variable; hyphenated prose like `$x$-axis` must still render.
-        if ((after == '/' or after == '-') and isShellNameLike(body)) {
+        if ((after == '/' or after == '-') and isShellNameLike(math_body)) {
             var scan = close + 2;
             while (scan < source.len and (std.ascii.isAlphanumeric(source[scan]) or source[scan] == '_')) scan += 1;
             if (scan < source.len and source[scan] == '$') return false;
         }
-        if (isUppercaseShellName(body) and isIdentifierChar(after)) return false;
+        if (isUppercaseShellName(math_body) and isIdentifierChar(after)) return false;
         if (std.ascii.isAlphabetic(after) and std.ascii.isUpper(after)) {
             return false;
         }
     }
 
     // Reject newlines — inline math is a single line.
-    if (std.mem.indexOfScalar(u8, body, '\n') != null) return false;
+    if (std.mem.indexOfScalar(u8, math_body, '\n') != null) return false;
 
     // Render to a temporary buffer. When inserted into normal prose, wrap the
     // result in inline-code backticks so ZigZag's renderInline treats the whole
@@ -1148,7 +1160,7 @@ fn consumeInlineMath(allocator: std.mem.Allocator, writer: *std.Io.Writer, sourc
     // skip the wrapper.
     var rendered: std.Io.Writer.Allocating = .init(allocator);
     defer rendered.deinit();
-    try renderMathBody(&rendered.writer, body);
+    try renderMathBody(&rendered.writer, math_body);
     if (protect_math and !isInsideNonRecursiveMarkdownStyle(open, close, line_style)) {
         try writeProtectedMathSpan(writer, source, open, rendered.written(), line_style.line_start);
     } else {
@@ -1386,16 +1398,36 @@ fn isCurrencyLikeMathBody(body: []const u8) bool {
     if (body.len == 0 or !std.ascii.isDigit(body[0])) return false;
     var saw_space = false;
     var saw_alpha = false;
-    for (body[1..]) |c| {
+    var i: usize = 1;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        // A semicolon (e.g. `5; x=`) is a strong prose/currency indicator.
         if (c == ';') return true;
-        if (c == '\\' or c == '^' or c == '_' or c == '+' or c == '-' or
+        // A backslash introduces a LaTeX command (`\times`, `\cdot`, `\frac`);
+        // skip its command-name letters so they are not mistaken for prose
+        // alpha. This keeps real digit-prefixed math like `10 \times 4`
+        // rendering.
+        if (c == '\\') {
+            var j = i + 1;
+            while (j < body.len and std.ascii.isAlphabetic(body[j])) j += 1;
+            i = j - 1; // the loop's `i += 1` then advances past the name
+            continue;
+        }
+        // Math operators do not by themselves prove the body is math, but they
+        // do not prove it is currency either. Keep scanning so a later `;`,
+        // alphabetic word, or space can still classify currency/prose shapes
+        // like `5+tax; x=` without bailing on the `+`.
+        if (c == '^' or c == '_' or c == '+' or c == '-' or
             c == '*' or c == '/' or c == '=' or c == '<' or c == '>')
         {
-            return false;
+            continue;
         }
         if (std.ascii.isAlphabetic(c)) saw_alpha = true;
         if (std.ascii.isWhitespace(c)) saw_space = true;
     }
+    // Require both an alphabetic word and prose spacing so pure arithmetic
+    // (`2^n`, `5+3`, `2 + 3`, `10 \times 4`) still renders while prose/currency
+    // shapes (`5 total`, `5+tax; x=`) are rejected.
     return saw_alpha and saw_space;
 }
 
@@ -2731,6 +2763,59 @@ test "lowercase shell variables separated by punctuation stay raw" {
     try std.testing.expect(std.mem.indexOf(u8, out, "$user@$host") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "$name.$domain") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "host:port") == null);
+}
+
+test "currency dollar with operator does not steal formula opener" {
+    // Regression for P2: the `+` must not make isCurrencyLikeMathBody bail
+    // before seeing the `;` prose indicator. The price dollar stays literal
+    // and the real formula renders.
+    const src = "Costs $5+tax; x=$x$.";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Costs $5+tax; x=x.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Costs 5+tax; x=x$.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$x$") == null);
+}
+
+test "pure digit-prefixed arithmetic still renders after currency widening" {
+    // After widening the currency scan to continue past operators, genuine
+    // arithmetic must still render.
+    const a = try preprocess(std.testing.allocator, "$5+3$");
+    defer std.testing.allocator.free(a);
+    try std.testing.expect(std.mem.indexOf(u8, a, "5+3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, a, "$5+3$") == null);
+
+    const b = try preprocess(std.testing.allocator, "$2^n$");
+    defer std.testing.allocator.free(b);
+    try std.testing.expect(std.mem.indexOf(u8, b, "2ⁿ") != null);
+
+    const c = try preprocess(std.testing.allocator, "$$10 \\times 4$$");
+    defer std.testing.allocator.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "> 10 × 4") != null);
+}
+
+test "whitespace-padded inline math renders" {
+    // Regression for P2: conventionally padded TeX like `$ x + y $` must
+    // render, with the inner padding trimmed before the math renderer.
+    const src = "Sum $ x + y $ done";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Sum x + y done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "$ x + y $") == null);
+
+    // Tab padding is also accepted.
+    const tab_src = "Sum $\tx + y\t$ done";
+    const tab_out = try preprocess(std.testing.allocator, tab_src);
+    defer std.testing.allocator.free(tab_out);
+    try std.testing.expect(std.mem.indexOf(u8, tab_out, "Sum x + y done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tab_out, "$\tx + y\t$") == null);
+}
+
+test "empty padded dollars are not a formula" {
+    const src = "cost $ $ today";
+    const out = try preprocess(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(src, out);
 }
 
 test "line-start inline math that renders block marker is protected" {
