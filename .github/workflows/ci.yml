@@ -226,7 +226,7 @@ jobs:
         run: zig build test-e2e-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: ministral-3:3b
+          OLLAMA_MODEL: gemma4:31b
 
   e2e-github-copilot:
     name: E2E - GitHub Copilot
@@ -293,7 +293,7 @@ jobs:
         run: zig build test-e2e-provider-protocol-fullstack-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: ministral-3:3b
+          OLLAMA_MODEL: gemma4:31b
 
   e2e-protocol-fullstack-github:
     name: E2E - Provider Protocol Fullstack (GitHub Copilot)

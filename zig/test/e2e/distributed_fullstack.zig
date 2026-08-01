@@ -74,22 +74,21 @@ fn distributedMockProviderStream(
     allocator: std.mem.Allocator,
 ) !*event_stream.AssistantMessageEventStream {
     _ = model;
-    _ = options;
 
     const stream = try allocator.create(event_stream.AssistantMessageEventStream);
     stream.* = event_stream.AssistantMessageEventStream.init(allocator);
+    if (options) |o| {
+        if (o.requires_owned_stream_events) {
+            stream.owns_events = true;
+            stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+        }
+    }
 
     const response = if (contextHasToolResult(context))
         try makeFinalMessage(allocator)
     else
         try makeToolUseMessage(allocator);
 
-    try stream.push(.{
-        .done = .{
-            .reason = response.stop_reason,
-            .message = response,
-        },
-    });
     stream.complete(response);
     stream.markThreadDone();
     return stream;

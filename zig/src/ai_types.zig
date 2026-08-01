@@ -129,6 +129,10 @@ pub const StreamOptions = struct {
     ping_interval_ms: ?u64 = null,
     /// Owned storage for headers when deserialized/cloned.
     owned_headers: ?OwnedSlice(HeaderPair) = null,
+    /// When true, the provider should configure its returned stream to own deep
+    /// copies of every event. The protocol server sets this because the consumer
+    /// may outlive the producer thread, so borrowed slices would dangle.
+    requires_owned_stream_events: bool = false,
 
     pub fn getApiKey(self: *const StreamOptions) ?[]const u8 {
         const key = self.api_key.slice();

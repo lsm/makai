@@ -1288,7 +1288,7 @@ pub const TuiRuntime = struct {
                 return;
             } else |err| switch (err) {
                 error.QueueFull => {},
-                error.StreamCompleted => {
+                error.StreamCompleted, error.OutOfMemory => {
                     self.backpressure_mutex.unlock();
                     var mutable = event;
                     mutable.deinit(self.allocator);
@@ -1315,7 +1315,7 @@ pub const TuiRuntime = struct {
         defer self.backpressure_mutex.unlock();
         self.event_stream.push(event) catch |err| switch (err) {
             error.QueueFull => return false,
-            error.StreamCompleted => {
+            error.StreamCompleted, error.OutOfMemory => {
                 var mutable = event;
                 mutable.deinit(self.allocator);
                 return true;

@@ -555,14 +555,17 @@ fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.Stream
     injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
 }
 
-/// Merge a server-side CancelToken into the caller's StreamOptions.
-/// Preserves any existing fields; only sets cancel_token.
-fn injectCancelToken(
+/// Merge server-side options into the caller's StreamOptions.
+/// Preserves all existing fields; only sets cancel_token and marks the stream
+/// as requiring owned events so the producer thread can exit while the protocol
+/// runtime is still forwarding unconsumed events.
+fn injectServerOptions(
     options: ?ai_types.StreamOptions,
     cancel_token: ai_types.CancelToken,
 ) ai_types.StreamOptions {
     var resolved = options orelse ai_types.StreamOptions{};
     resolved.cancel_token = cancel_token;
+    resolved.requires_owned_stream_events = true;
     return resolved;
 }
 
@@ -801,7 +804,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
     // Inject cancel token into options so the provider can observe it.
-    const options_with_cancel = injectCancelToken(request.options, cancel_token);
+    const options_with_cancel = injectServerOptions(request.options, cancel_token);
 
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
     const stream = streamWithRefresh(server, provider, request.model, request.context, options_with_cancel) catch |err| {
@@ -814,7 +817,29 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
     // Provider streams are produced by background threads; wait for producer completion
-    // before deinit/destroy during abort and cleanup paths.
+    // before deinit/destroy during abort and cleanup paths. Providers must honor
+    // `requires_owned_stream_events` in their stream init by setting owns_events and
+    // clone_event_fn before spawning the producer, so no post-creation mutation is
+    // needed here. Extension providers are validated at the protocol boundary so
+    // borrowed events cannot outlive producer-owned temporary buffers while the
+    // server forwards queued events.
+    if (!stream.owns_events) {
+        // Extension providers must return owned events so the server can forward
+        // queued events after the producer thread exits. Cancel the in-flight
+        // producer and wait for it to finish before freeing the stream, otherwise
+        // a background thread could still be writing to the freed ring buffer.
+        cancelled.store(true, .release);
+        stream.wait_for_thread_on_deinit = true;
+        stream.deinit();
+        server.allocator.destroy(stream);
+        server.allocator.destroy(cancelled);
+        return try envelope.createNack(
+            nackTemplate(stream_id, in_reply_to),
+            "Provider returned borrowed events for protocol streaming",
+            .provider_error,
+            server.allocator,
+        );
+    }
     stream.wait_for_thread_on_deinit = true;
 
     // Create ActiveStream entry
@@ -1334,6 +1359,8 @@ fn mockStream(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -1362,6 +1389,8 @@ fn mockStreamSimple(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     const result = ai_types.AssistantMessage{
         .content = &.{},
@@ -1465,6 +1494,8 @@ fn authTestStream(
     }
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     if (state.auth_fail_all_calls or (state.auth_fail_first_call and state.stream_calls == 1)) {
         s.completeWithError("401 unauthorized");
     } else {
@@ -2672,6 +2703,8 @@ fn cancelCapturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -2770,6 +2803,8 @@ fn cancelCapturingStreamSimple(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     s.complete(.{
         .content = &.{},
         .api = "test-api",
@@ -3078,6 +3113,8 @@ fn capturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",

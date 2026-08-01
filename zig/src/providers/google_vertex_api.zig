@@ -1376,6 +1376,10 @@ pub fn streamGoogleVertex(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    if (o.requires_owned_stream_events) {
+        s.owns_events = true;
+        s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    }
 
     const ctx = allocator.create(ThreadCtx) catch return error.InvalidConfiguration;
     errdefer allocator.destroy(ctx);

@@ -23,10 +23,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         allocator: std.mem.Allocator,
         /// When true, deinit waits for markThreadDone() from a producer thread.
         wait_for_thread_on_deinit: bool = false,
-        /// When true, events in this stream were deep-copied via cloneAssistantMessageEvent()
-        /// and should be freed in deinit(). When false (default), events contain borrowed
-        /// string slices and must NOT be freed by the stream.
+        /// When true, events in this stream are (or will be) deep-copied before being
+        /// stored and should be freed in deinit(). When false (default), events contain
+        /// borrowed string slices and must NOT be freed by the stream.
         owns_events: bool = false,
+        /// Optional clone function used when owns_events is true. When set, push() will
+        /// deep-copy the event before storing it, so a producer thread may free its
+        /// temporary buffers immediately after pushing. This makes the stream safe for
+        /// protocol-server forwarding where the producer thread may exit before the
+        /// consumer has drained all events.
+        clone_event_fn: ?*const fn (std.mem.Allocator, T) error{OutOfMemory}!T = null,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             var published: [RING_BUFFER_SIZE]std.atomic.Value(bool) = undefined;
@@ -43,6 +49,33 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 .thread_done = std.atomic.Value(bool).init(false),
                 .allocator = allocator,
             };
+        }
+
+
+        /// Deinitialize a single generic event value. Used both for events that were
+        /// cloned but never stored in the ring buffer and for draining remaining events
+        /// during deinit().
+        fn deinitGenericEvent(self: *Self, event: *T) void {
+            const is_assistant_message_event = comptime blk: {
+                if (@hasDecl(ai_types, "AssistantMessageEvent")) {
+                    break :blk T == ai_types.AssistantMessageEvent;
+                }
+                break :blk false;
+            };
+            const event_has_deinit = comptime blk: {
+                const info = @typeInfo(T);
+                switch (info) {
+                    .@"struct", .@"union", .@"enum", .@"opaque" => break :blk @hasDecl(T, "deinit"),
+                    else => break :blk false,
+                }
+            };
+            if (comptime is_assistant_message_event) {
+                if (self.owns_events) {
+                    ai_types.deinitAssistantMessageEvent(self.allocator, event);
+                }
+            } else if (comptime event_has_deinit) {
+                event.deinit(self.allocator);
+            }
         }
 
         fn defaultIo() std.Io {
@@ -93,41 +126,14 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                 _ = self.waitForThread(120_000);
             }
 
-            // Drain any remaining events in the ring buffer.
-            // IMPORTANT: By default (owns_events=false), events contain BORROWED string slices
-            // that point into provider-managed temporary buffers (SSE parser buffers, JSON buffers).
-            // The stream does NOT own these strings, so freeing them would cause double-free panics.
-            //
-            // Memory ownership model:
-            // - Providers: Push events with borrowed strings; provider manages buffer lifetimes (owns_events=false)
-            // - ProtocolClient: Deep-copies via cloneAssistantMessageEvent() before push (owns_events=true)
-            //
-            // DO NOT change the default behavior - see CI failures from 2026-02-19.
-            const is_assistant_message_event = comptime blk: {
-                if (@hasDecl(ai_types, "AssistantMessageEvent")) {
-                    break :blk T == ai_types.AssistantMessageEvent;
-                }
-                break :blk false;
-            };
-
-            const event_has_deinit = comptime blk: {
-                const info = @typeInfo(T);
-                switch (info) {
-                    .@"struct", .@"union", .@"enum", .@"opaque" => break :blk @hasDecl(T, "deinit"),
-                    else => break :blk false,
-                }
-            };
-
+            // Drain any remaining events in the ring buffer. The helper respects
+            // the `owns_events` flag: borrowed events (default) are not freed,
+            // while owned events are deep-copied on push and freed here. This matches
+            // the protocol-server path where the producer thread may exit before the
+            // consumer has drained all events.
             while (self.poll()) |event| {
-                if (comptime is_assistant_message_event) {
-                    if (self.owns_events) {
-                        var ev = event;
-                        ai_types.deinitAssistantMessageEvent(self.allocator, &ev);
-                    }
-                } else if (comptime event_has_deinit) {
-                    var ev = event;
-                    ev.deinit(self.allocator);
-                }
+                var ev = event;
+                self.deinitGenericEvent(&ev);
             }
 
             if (self.result) |*result| {
@@ -158,15 +164,22 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
 
         /// Push an event to the stream.
         ///
-        /// IMPORTANT: The event's string fields (delta, content, id, name, etc.) are
+        /// By default the event's string fields (delta, content, id, name, etc.) are
         /// treated as BORROWED references. The stream does NOT take ownership and will
         /// NOT free them in deinit(). The caller must ensure the backing memory outlives
         /// the event's consumption from the stream (typically by managing buffer lifetimes
         /// in the producer thread).
         ///
-        /// If you need the stream to own event memory, deep-copy via cloneAssistantMessageEvent()
-        /// before calling push(), and manage cleanup separately.
+        /// When `owns_events` is true and `clone_event_fn` is set, push() will deep-copy
+        /// the event before storing it. The copy is owned by the stream and freed in
+        /// deinit() (or by the consumer that polls it). This lets producer threads free
+        /// their temporary buffers immediately after pushing, which is required for
+        /// protocol-server forwarding where the producer may exit before the consumer
+        /// has drained all events.
         pub fn push(self: *Self, event: T) !void {
+            var owned_event: ?T = null;
+            defer if (owned_event) |*e| self.deinitGenericEvent(e);
+
             while (true) {
                 if (self.completed.load(.acquire)) return error.StreamCompleted;
                 const current_head = self.head.load(.acquire);
@@ -178,13 +191,36 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                     return error.QueueFull;
                 }
 
+                // If the stream owns events and has a clone function, deep-copy the event
+                // before claiming a slot. Doing this before the CAS ensures that an
+                // OutOfMemory error does not leave a reserved but unpublished slot,
+                // which would wedge consumers waiting at that tail position. The clone
+                // is reused on subsequent loop iterations if the CAS fails.
+                if (self.owns_events) {
+                    if (self.clone_event_fn) |clone_fn| {
+                        if (owned_event == null) {
+                            owned_event = try clone_fn(self.allocator, event);
+                        }
+                    }
+                }
+
                 // Try to claim this slot
                 if (self.head.cmpxchgWeak(current_head, next_head, .acquire, .acquire)) |_| {
                     continue;
                 }
 
-                // We claimed slot at current_head - now write the data
-                self.ring_buffer[current_head] = event;
+                // We claimed slot at current_head - now write the data.
+                var event_to_store = event;
+                if (self.owns_events) {
+                    if (self.clone_event_fn) |clone_fn| {
+                        _ = clone_fn;
+                        if (owned_event) |*owned| {
+                            event_to_store = owned.*;
+                            owned_event = null; // ownership transferred to the ring buffer
+                        }
+                    }
+                }
+                self.ring_buffer[current_head] = event_to_store;
 
                 // Mark the slot as published with release semantics
                 // This ensures the write above is visible before the flag
@@ -210,7 +246,7 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
                         waitTimeoutMs(self, self.futex.load(.acquire), 1);
                         continue;
                     },
-                    error.StreamCompleted => return false,
+                    error.StreamCompleted, error.OutOfMemory => return false,
                 };
                 return true;
             }
@@ -788,7 +824,7 @@ const MultiProducerStressCtx = struct {
                         std.Thread.yield() catch {};
                         continue;
                     },
-                    error.StreamCompleted => return,
+                    error.StreamCompleted, error.OutOfMemory => return,
                 };
                 break;
             }

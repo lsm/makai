@@ -138,16 +138,22 @@ pub const Markdown = struct {
 
         var lines_iter = std.mem.splitScalar(u8, source, '\n');
         var in_code_block = false;
+        var code_fence_len: usize = 0;
         var first_line = true;
 
         while (lines_iter.next()) |line| {
             if (!first_line) try writer.writeByte('\n');
             first_line = false;
 
-            // Code block toggle
-            if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "```")) {
+            // Code block toggle. Track the opener length so a four-backtick
+            // block can safely contain literal triple-backtick examples without
+            // prematurely closing the displayed block.
+            const trimmed_for_fence = std.mem.trimStart(u8, line, " ");
+            const fence_len = countLeadingChar(trimmed_for_fence, '`');
+            if (fence_len >= 3 and (!in_code_block or isCodeFenceClose(trimmed_for_fence, code_fence_len))) {
                 in_code_block = !in_code_block;
                 if (in_code_block) {
+                    code_fence_len = fence_len;
                     // Opening fence
                     const bar = try self.code_block_border.render(tmp, "┌");
                     try writer.writeAll(bar);
@@ -159,6 +165,7 @@ pub const Markdown = struct {
                     const end = try self.code_block_border.render(tmp, "┐");
                     try writer.writeAll(end);
                 } else {
+                    code_fence_len = 0;
                     // Closing fence
                     const bar = try self.code_block_border.render(tmp, "└");
                     try writer.writeAll(bar);
@@ -359,4 +366,32 @@ pub const Markdown = struct {
         }
         return true;
     }
+
+    fn countLeadingChar(s: []const u8, c: u8) usize {
+        var n: usize = 0;
+        while (n < s.len and s[n] == c) n += 1;
+        return n;
+    }
+
+    fn isCodeFenceClose(trimmed: []const u8, opener_len: usize) bool {
+        if (countLeadingChar(trimmed, '`') < opener_len) return false;
+        for (trimmed) |c| {
+            if (c != '`' and c != ' ' and c != '\t' and c != '\r') return false;
+        }
+        return true;
+    }
 };
+
+
+test "markdown renderer respects long backtick fence length" {
+    const src = "````text\n```mermaid\nflowchart TD\n```\n````";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // One outer opener and one outer closer; inner triple-backtick lines should
+    // render as code content, not toggle the code-block state.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "┌"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "└"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") != null);
+}
