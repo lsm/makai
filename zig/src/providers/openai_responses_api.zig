@@ -213,7 +213,10 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             compat_options.supports_reasoning_effort == true
         else
             false;
-    if (std.mem.find(u8, model.base_url, "openai.com") != null or is_openai_proxy or is_codex_model) {
+    const supports_store = std.mem.find(u8, model.base_url, "openai.com") != null or
+        (if (model.compat) |compat_options| compat_options.supports_store == true else false) or
+        is_codex_model;
+    if (supports_store) {
         try w.writeBoolField("store", false);
     }
 
