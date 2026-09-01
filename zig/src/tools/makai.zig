@@ -916,8 +916,14 @@ fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
     }
     if (std.mem.eql(u8, provider_id, "anthropic")) {
         // Thinking arrived with Claude 3.7 Sonnet; every 4.x+ model has it.
-        // Pre-3.7 3.x models (claude-3, claude-3-5-*) do not.
+        // Pre-3.7 3.x models (claude-3, claude-3-5-*) and the legacy 1/2/v1/
+        // instant families do not; unknown future identifiers default to
+        // capable so a selected thinking level is never silently dropped.
         if (!std.mem.startsWith(u8, model_id, "claude-")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-1")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-2")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-v")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-instant")) return false;
         if (std.mem.startsWith(u8, model_id, "claude-3-7")) return true;
         return !std.mem.startsWith(u8, model_id, "claude-3");
     }
@@ -4360,4 +4366,14 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     var sonnet37 = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-3-7-sonnet-latest");
     defer sonnet37.deinit(allocator);
     try std.testing.expect(sonnet37.reasoning);
+
+    // Legacy families never support thinking; the adapter must not emit a
+    // thinking object for them.
+    for ([_][]const u8{ "claude-2.0", "claude-1.2", "claude-v1", "claude-instant" }) |legacy_id| {
+        const ref = try std.fmt.allocPrint(allocator, "anthropic/anthropic-messages@{s}", .{legacy_id});
+        defer allocator.free(ref);
+        var legacy_model = try modelFromCanonicalRef(allocator, ref);
+        defer legacy_model.deinit(allocator);
+        try std.testing.expect(!legacy_model.reasoning);
+    }
 }
