@@ -842,7 +842,14 @@ fn prepareAgentRun(
     const system_prompt = try allocator.dupe(u8, system_prompt_builder.items);
     errdefer allocator.free(system_prompt);
 
-    const options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
+    var options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
+    if (std.mem.eql(u8, model.provider, "openai") and std.mem.startsWith(u8, model.id, "gpt-5-pro") and
+        std.mem.indexOf(u8, pending.message_json, "\"thinking_level\"") == null and
+        std.mem.indexOf(u8, pending.options_json, "\"thinking_level\"") == null and
+        std.mem.indexOf(u8, pending.config_json, "\"thinking_level\"") == null)
+    {
+        options.thinking_level = .high;
+    }
 
     return .{
         .model = model,
@@ -1001,7 +1008,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
         .input = input,
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 200_000,
-        .max_tokens = if (std.mem.eql(u8, parsed.provider_id, "anthropic")) 32_000 else 4_096,
+        .max_tokens = 4_096,
         .compat = compat_options,
         .is_owned = true,
     };
@@ -4321,7 +4328,4 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     defer chat.deinit(allocator);
     try std.testing.expect(!chat.reasoning);
 
-    var anthropic = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-reasoning");
-    defer anthropic.deinit(allocator);
-    try std.testing.expectEqual(@as(u32, 32_000), anthropic.max_tokens);
 }
