@@ -885,7 +885,7 @@ const BaseUrlOverrides = struct {
 
 /// Provider routes append `/v1/...`; accept the common versioned override
 /// form without producing a duplicate `/v1/v1/...` path.
-fn normalizeOpenAIBaseUrl(url: []const u8) []const u8 {
+fn normalizeVersionedBaseUrl(url: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, url, "/");
     if (std.mem.endsWith(u8, trimmed, "/v1")) return trimmed[0 .. trimmed.len - 3];
     return trimmed;
@@ -895,6 +895,16 @@ fn usesOpenAIVersionedRoute(api: []const u8) bool {
     return std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses");
 }
 
+fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return std.mem.startsWith(u8, model_id, "o1") or
+            std.mem.startsWith(u8, model_id, "o3") or
+            std.mem.startsWith(u8, model_id, "o4") or
+            std.mem.startsWith(u8, model_id, "gpt-5");
+    }
+    return std.mem.eql(u8, provider_id, "deepseek") and std.mem.startsWith(u8, model_id, "deepseek-reasoner");
+}
+
 /// Pure base-URL resolution: known providers map to their vendor endpoints
 /// (overridable); unknown providers get "" — an empty base means "no
 /// endpoint" and the request fails before the network, rather than deriving
@@ -902,16 +912,16 @@ fn usesOpenAIVersionedRoute(api: []const u8) bool {
 /// credentials to an unrelated vendor. Always returns owned memory.
 fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
     if (ov.global.len > 0) {
-        const global = if (usesOpenAIVersionedRoute(api)) normalizeOpenAIBaseUrl(ov.global) else ov.global;
+        const global = if (usesOpenAIVersionedRoute(api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
         return try allocator.dupe(u8, global);
     }
 
     const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic") and std.mem.eql(u8, api, "anthropic-messages"))
-        if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
+        if (ov.anthropic.len > 0) normalizeVersionedBaseUrl(ov.anthropic) else "https://api.anthropic.com"
     else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
-        if (ov.openai.len > 0) normalizeOpenAIBaseUrl(ov.openai) else "https://api.openai.com"
+        if (ov.openai.len > 0) normalizeVersionedBaseUrl(ov.openai) else "https://api.openai.com"
     else if (std.mem.eql(u8, provider_id, "deepseek") and std.mem.eql(u8, api, "openai-completions"))
-        if (ov.deepseek.len > 0) normalizeOpenAIBaseUrl(ov.deepseek) else "https://api.deepseek.com"
+        if (ov.deepseek.len > 0) normalizeVersionedBaseUrl(ov.deepseek) else "https://api.deepseek.com"
     else
         null;
     if (by_provider) |url| return try allocator.dupe(u8, url);
@@ -954,7 +964,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
         .api = parsed.api,
         .provider = parsed.provider_id,
         .base_url = base_url,
-        .reasoning = false,
+        .reasoning = isReasoningModelRef(parsed.provider_id, parsed.model_id),
         .input = input,
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 200_000,
@@ -4193,6 +4203,12 @@ test "baseUrlWithOverrides prefers env overrides and global override" {
     defer allocator.free(proxied);
     try std.testing.expectEqualStrings("https://proxy.example.com", proxied);
 
+    const versioned_anthropic = try baseUrlWithOverrides(allocator, "anthropic", "anthropic-messages", .{
+        .anthropic = "https://proxy.example.com/anthropic/v1/",
+    });
+    defer allocator.free(versioned_anthropic);
+    try std.testing.expectEqualStrings("https://proxy.example.com/anthropic", versioned_anthropic);
+
     const versioned_openai = try baseUrlWithOverrides(allocator, "openai", "openai-completions", .{
         .openai = "https://proxy.example.com/openai/v1/",
     });
@@ -4262,4 +4278,8 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     // Env ANTHROPIC_BASE_URL may override in the test environment; either way
     // the base URL must no longer be empty.
     try std.testing.expect(model.base_url.len > 0);
+
+    var reasoning = try modelFromCanonicalRef(allocator, "openai/openai-responses@o3-custom");
+    defer reasoning.deinit(allocator);
+    try std.testing.expect(reasoning.reasoning);
 }
