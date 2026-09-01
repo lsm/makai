@@ -857,7 +857,7 @@ fn prepareAgentRun(
 /// only covers Codex OAuth + Kimi). Env overrides follow the common
 /// <PROVIDER>_BASE_URL conventions so proxies and custom endpoints work;
 /// MAKAI_BASE_URL overrides everything.
-fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u8) ![]const u8 {
+fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8) ![]const u8 {
     const global = try envOrEmpty(allocator, "MAKAI_BASE_URL");
     defer if (global) |g| allocator.free(g);
     const anthropic = try envOrEmpty(allocator, "ANTHROPIC_BASE_URL");
@@ -867,7 +867,7 @@ fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u8) !
     const deepseek = try envOrEmpty(allocator, "DEEPSEEK_BASE_URL");
     defer if (deepseek) |v| allocator.free(v);
 
-    return baseUrlWithOverrides(allocator, provider_id, .{
+    return baseUrlWithOverrides(allocator, provider_id, api, .{
         .global = global orelse "",
         .anthropic = anthropic orelse "",
         .openai = openai orelse "",
@@ -888,15 +888,14 @@ const BaseUrlOverrides = struct {
 /// endpoint" and the request fails before the network, rather than deriving
 /// an endpoint from the wire-protocol API type and sending the caller's
 /// credentials to an unrelated vendor. Always returns owned memory.
-fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, ov: BaseUrlOverrides) ![]const u8 {
+fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
     if (ov.global.len > 0) return try allocator.dupe(u8, ov.global);
 
-    const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic"))
+    const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic") and std.mem.eql(u8, api, "anthropic-messages"))
         if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
-    else if (std.mem.eql(u8, provider_id, "openai"))
-        // Providers append /v1/chat/completions (or /v1/responses) themselves.
+    else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses") or std.mem.eql(u8, api, "openai-codex-responses")))
         if (ov.openai.len > 0) ov.openai else "https://api.openai.com"
-    else if (std.mem.eql(u8, provider_id, "deepseek"))
+    else if (std.mem.eql(u8, provider_id, "deepseek") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
         if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
     else
         null;
@@ -928,7 +927,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     const name = try allocator.dupe(u8, parsed.model_id);
     errdefer allocator.free(name);
 
-    const base_url = try defaultBaseUrlForRef(allocator, parsed.provider_id);
+    const base_url = try defaultBaseUrlForRef(allocator, parsed.provider_id, parsed.api);
     errdefer allocator.free(base_url);
 
     const input = try allocator.alloc([]const u8, 0);
@@ -4155,17 +4154,17 @@ pub fn main(init: std.process.Init) !void {
 test "baseUrlWithOverrides resolves canonical provider defaults" {
     const allocator = std.testing.allocator;
 
-    const anthropic = try baseUrlWithOverrides(allocator, "anthropic", .{});
+    const anthropic = try baseUrlWithOverrides(allocator, "anthropic", "anthropic-messages", .{});
     defer allocator.free(anthropic);
     try std.testing.expectEqualStrings("https://api.anthropic.com", anthropic);
 
-    const openai = try baseUrlWithOverrides(allocator, "openai", .{});
+    const openai = try baseUrlWithOverrides(allocator, "openai", "openai-completions", .{});
     defer allocator.free(openai);
     // Providers append /v1/chat/completions themselves — the base must NOT
     // include /v1 or requests would target /v1/v1/...
     try std.testing.expectEqualStrings("https://api.openai.com", openai);
 
-    const deepseek = try baseUrlWithOverrides(allocator, "deepseek", .{});
+    const deepseek = try baseUrlWithOverrides(allocator, "deepseek", "openai-completions", .{});
     defer allocator.free(deepseek);
     try std.testing.expectEqualStrings("https://api.deepseek.com", deepseek);
 }
@@ -4173,13 +4172,13 @@ test "baseUrlWithOverrides resolves canonical provider defaults" {
 test "baseUrlWithOverrides prefers env overrides and global override" {
     const allocator = std.testing.allocator;
 
-    const proxied = try baseUrlWithOverrides(allocator, "anthropic", .{
+    const proxied = try baseUrlWithOverrides(allocator, "anthropic", "anthropic-messages", .{
         .anthropic = "https://proxy.example.com",
     });
     defer allocator.free(proxied);
     try std.testing.expectEqualStrings("https://proxy.example.com", proxied);
 
-    const global = try baseUrlWithOverrides(allocator, "kimi", .{
+    const global = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{
         .global = "https://everywhere.example.com",
     });
     defer allocator.free(global);
@@ -4192,15 +4191,27 @@ test "baseUrlWithOverrides requires explicit endpoint for unknown providers" {
     // No endpoint derived from the API type: an unknown provider without an
     // override must fail before the network rather than send credentials to
     // the API vendor's endpoint.
-    const unknown = try baseUrlWithOverrides(allocator, "openrouter", .{});
+    const unknown = try baseUrlWithOverrides(allocator, "openrouter", "openai-completions", .{});
     defer allocator.free(unknown);
     try std.testing.expectEqualStrings("", unknown);
 
-    const explicit = try baseUrlWithOverrides(allocator, "openrouter", .{
+    const explicit = try baseUrlWithOverrides(allocator, "openrouter", "openai-completions", .{
         .global = "https://openrouter.example.com/api",
     });
     defer allocator.free(explicit);
     try std.testing.expectEqualStrings("https://openrouter.example.com/api", explicit);
+}
+
+test "baseUrlWithOverrides rejects provider/API mismatches" {
+    const allocator = std.testing.allocator;
+
+    const anthropic_openai = try baseUrlWithOverrides(allocator, "anthropic", "openai-completions", .{});
+    defer allocator.free(anthropic_openai);
+    try std.testing.expectEqualStrings("", anthropic_openai);
+
+    const openai_anthropic = try baseUrlWithOverrides(allocator, "openai", "anthropic-messages", .{});
+    defer allocator.free(openai_anthropic);
+    try std.testing.expectEqualStrings("", openai_anthropic);
 }
 
 test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
