@@ -86,7 +86,10 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
     map.deinit();
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
+fn envApiKey(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "deepseek")) {
+        return compat.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
+    }
     return compat.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
 
@@ -1596,7 +1599,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const env = envApiKey(allocator);
+        const env = envApiKey(allocator, model.provider);
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
     };
