@@ -1185,12 +1185,23 @@ pub fn parseAssistantMessage(
     errdefer allocator.free(result.api);
 
     result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
-    // No errdefer needed - this is the last allocation
+    errdefer allocator.free(result.provider);
+
+    // Parse optional error_message (emitted by serializeResult when the run
+    // failed; absent for successful results)
+    if (obj.get("error_message")) |em| {
+        if (em == .string and em.string.len > 0) {
+            result.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
+        } else {
+            result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
+        }
+    } else {
+        result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
+    }
 
     result.timestamp = obj.get("timestamp").?.integer;
     result.usage = usage;
     result.is_owned = true;
-    result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
 
     return result;
 }
@@ -2129,4 +2140,51 @@ test "serializeResult omits error_message when unset" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "error_message") == null);
+}
+
+test "serializeResult error_message round-trips through deserialize" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("QueueFull"),
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .result);
+    var round = msg.result;
+    defer round.deinit(allocator);
+    try std.testing.expectEqualStrings("QueueFull", round.getErrorMessage().?);
+}
+
+test "parseAssistantMessage without error_message keeps it unset" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .result);
+    var round = msg.result;
+    defer round.deinit(allocator);
+    try std.testing.expect(round.getErrorMessage() == null);
 }
