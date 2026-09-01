@@ -893,7 +893,7 @@ fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, a
 
     const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic") and std.mem.eql(u8, api, "anthropic-messages"))
         if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
-    else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses") or std.mem.eql(u8, api, "openai-codex-responses")))
+    else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
         if (ov.openai.len > 0) ov.openai else "https://api.openai.com"
     else if (std.mem.eql(u8, provider_id, "deepseek") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
         if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
@@ -4212,6 +4212,10 @@ test "baseUrlWithOverrides rejects provider/API mismatches" {
     const openai_anthropic = try baseUrlWithOverrides(allocator, "openai", "anthropic-messages", .{});
     defer allocator.free(openai_anthropic);
     try std.testing.expectEqualStrings("", openai_anthropic);
+
+    const openai_codex_responses = try baseUrlWithOverrides(allocator, "openai", "openai-codex-responses", .{});
+    defer allocator.free(openai_codex_responses);
+    try std.testing.expectEqualStrings("", openai_codex_responses);
 }
 
 test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
