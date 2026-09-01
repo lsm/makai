@@ -393,7 +393,6 @@ class StdioAgentApi implements MakaiAgentApi {
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
-    const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
     try {
@@ -424,8 +423,6 @@ class StdioAgentApi implements MakaiAgentApi {
         }
         for (const event of normalized) {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
-          events.push(event);
-          if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
         }
       }
     } catch (error) {

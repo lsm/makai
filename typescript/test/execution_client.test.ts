@@ -229,6 +229,43 @@ test("client.agent.run resolves with correct AgentRunResponse", async () => {
   }
 });
 
+test("client.agent.run waits for agent_result after agent_end", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      { type: "agent_event", payload: { type: "agent_end", stop_reason: "end_turn" } },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            messages: [{
+              role: "assistant",
+              content: "",
+              provider: "anthropic",
+              api: "anthropic-messages",
+              model: "claude-sonnet-4-5",
+              stop_reason: "error",
+              error_message: "QueueFull",
+            }],
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+
+  const result = await createMakaiAgentApi(transport as unknown as MakaiStdioClient).run(request());
+
+  assert.equal(result.error_message, "QueueFull");
+  assert.equal(result.stop_reason, "error");
+});
+
 test("client.agent.run executes tool_execute frames and continues awaiting result", async () => {
   const transport = {
     sent: [] as StdioFrame[],
