@@ -1720,3 +1720,28 @@ test("provider.complete accepts canonical model_ref with max valid segment sizes
     await harness.cleanup();
   }
 });
+
+test("client.provider.complete surfaces error_message from error results", async () => {
+  const errorResult = {
+    role: "assistant",
+    content: [{ type: "text", text: "" }],
+    usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+    provider_id: "anthropic",
+    api: "anthropic-messages",
+    model_id: "claude-sonnet-4-5",
+    stop_reason: "error",
+    error_message: "QueueFull",
+  };
+  const resultPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "makai-err-result-")), "result.json");
+  fs.writeFileSync(resultPath, JSON.stringify(errorResult));
+
+  const harness = await setupHarness({ MAKAI_TEST_PROVIDER_RESULT_PATH: resultPath });
+  try {
+    const provider = createMakaiProviderApi(harness.client);
+    const result = await provider.complete(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "QueueFull");
+  } finally {
+    await harness.cleanup();
+  }
+});
