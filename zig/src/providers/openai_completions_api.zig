@@ -31,9 +31,9 @@ const MergedCompat = struct {
 /// Merge model-level compat options with detected provider capabilities
 /// Model-level options take precedence over detected capabilities
 fn mergeCompat(model: ai_types.Model) MergedCompat {
-    const caps = provider_caps.detectCapabilitiesForProvider(model.provider, model.base_url);
+    const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
@@ -643,7 +643,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .max_tool_id_len = if (merged.supports_developer_role) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,
@@ -2530,6 +2530,27 @@ test "mergeCompat falls back to detected capabilities when model compat is null"
     try std.testing.expect(merged.supports_developer_role);
     try std.testing.expect(merged.supports_reasoning_effort);
     try std.testing.expectEqualStrings("max_completion_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps custom OpenAI endpoints generic" {
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
 }
 
 test "buildRequestBody uses max_tokens field from compat options" {

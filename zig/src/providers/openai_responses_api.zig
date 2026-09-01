@@ -207,7 +207,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    if (std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null or is_codex_model) {
+    const is_openai_proxy = if (model.compat) |compat| compat.supports_store == true else false;
+    if (std.mem.find(u8, model.base_url, "openai.com") != null or is_openai_proxy or is_codex_model) {
         try w.writeBoolField("store", false);
     }
 
@@ -232,7 +233,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // Cache retention for OpenAI API
     if (options.cache_retention) |retention| {
-        if (retention == .long and (std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null)) {
+        if (retention == .long and (std.mem.find(u8, model.base_url, "openai.com") != null or is_openai_proxy)) {
             try w.writeStringField("prompt_cache_retention", "24h");
         }
     }

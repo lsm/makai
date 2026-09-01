@@ -905,6 +905,25 @@ fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
     return std.mem.eql(u8, provider_id, "deepseek") and std.mem.startsWith(u8, model_id, "deepseek-reasoner");
 }
 
+/// A custom base URL is OpenAI-compatible by default. Set
+/// `<PROVIDER>_BASE_URL_IS_PROXY=true` (or `MAKAI_BASE_URL_IS_PROXY=true`)
+/// only when it transparently preserves the canonical vendor API.
+fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8) !?ai_types.OpenAICompatOptions {
+    const global_proxy = try envFlag(allocator, "MAKAI_BASE_URL_IS_PROXY");
+    if (std.mem.eql(u8, provider_id, "openai") and (global_proxy or try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"))) {
+        return .{
+            .supports_store = true,
+            .supports_developer_role = true,
+            .supports_reasoning_effort = true,
+            .max_tokens_field = .max_completion_tokens,
+        };
+    }
+    if (std.mem.eql(u8, provider_id, "deepseek") and (global_proxy or try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"))) {
+        return .{ .requires_thinking_as_text = true };
+    }
+    return null;
+}
+
 /// Pure base-URL resolution: known providers map to their vendor endpoints
 /// (overridable); unknown providers get "" — an empty base means "no
 /// endpoint" and the request fails before the network, rather than deriving
@@ -940,6 +959,12 @@ fn envOrEmpty(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
     return value;
 }
 
+fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
+    const value = try envOrEmpty(allocator, key) orelse return false;
+    defer allocator.free(value);
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
 fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_types.Model {
     var parsed = model_ref.parseModelRef(allocator, ref) catch return error.InvalidModelRef;
     errdefer parsed.deinit(allocator);
@@ -958,6 +983,8 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     const input = try allocator.alloc([]const u8, 0);
     errdefer allocator.free(input);
 
+    const compat_options = try transparentProxyCompat(allocator, parsed.provider_id);
+
     const model = ai_types.Model{
         .id = parsed.model_id,
         .name = name,
@@ -969,6 +996,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 200_000,
         .max_tokens = 4_096,
+        .compat = compat_options,
         .is_owned = true,
     };
     parsed.provider_id = &.{};
