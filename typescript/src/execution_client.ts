@@ -1117,6 +1117,7 @@ function parseCompletionResponse(raw: unknown): CompletionResponse {
     api: stringValue(message.api ?? data.api),
     model_id: stringValue(message.model_id ?? message.model ?? data.model_id ?? data.model),
     stop_reason: optionalString(message.stop_reason ?? data.stop_reason ?? data.reason),
+    error_message: optionalString(message.error_message ?? data.error_message),
   };
 }
 
@@ -1166,6 +1167,7 @@ function buildCompletionResponseFromMessage(
     api: stringValue(message.api ?? terminal.api),
     model_id: stringValue(message.model_id ?? message.model ?? terminal.model_id ?? terminal.model),
     stop_reason: optionalString(message.stop_reason ?? terminal.stop_reason ?? terminal.reason),
+    error_message: optionalString(message.error_message ?? terminal.error_message),
   };
 }
 

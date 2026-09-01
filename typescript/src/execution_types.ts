@@ -126,6 +126,11 @@ export interface CompletionResponse {
   api: ApiId;
   model_id: string;
   stop_reason?: StopReason;
+  /**
+   * Failure cause when stop_reason is "error" (e.g. a Zig error name from the
+   * server-side stream such as "QueueFull"); absent for successful results.
+   */
+  error_message?: string;
 }
 
 /** Final response returned by {@link MakaiAgentApi.run}. */

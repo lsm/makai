@@ -634,6 +634,12 @@ pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.All
     }
     try w.endArray();
 
+    // Errors otherwise leave the process invisibly: the catch path in the
+    // agent loop stores the Zig error name here with empty content.
+    if (result.error_message.slice().len > 0) {
+        try w.writeStringField("error_message", result.error_message.slice());
+    }
+
     try w.endObject();
 
     const out = try allocator.dupe(u8, buffer.items);
@@ -1179,12 +1185,23 @@ pub fn parseAssistantMessage(
     errdefer allocator.free(result.api);
 
     result.provider = try allocator.dupe(u8, obj.get("provider").?.string);
-    // No errdefer needed - this is the last allocation
+    errdefer allocator.free(result.provider);
+
+    // Parse optional error_message (emitted by serializeResult when the run
+    // failed; absent for successful results)
+    if (obj.get("error_message")) |em| {
+        if (em == .string and em.string.len > 0) {
+            result.error_message = ai_types.OwnedSlice(u8).initOwned(try allocator.dupe(u8, em.string));
+        } else {
+            result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
+        }
+    } else {
+        result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
+    }
 
     result.timestamp = obj.get("timestamp").?.integer;
     result.usage = usage;
     result.is_owned = true;
-    result.error_message = ai_types.OwnedSlice(u8).initBorrowed("");
 
     return result;
 }
@@ -2084,4 +2101,90 @@ test "Receiver.setControlCallback stores callback" {
 
     try std.testing.expect(receiver.control_callback != null);
     try std.testing.expect(receiver.control_callback_ctx != null);
+}
+
+test "serializeResult includes error_message when set" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("QueueFull"),
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_message\":\"QueueFull\"") != null);
+}
+
+test "serializeResult omits error_message when unset" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "error_message") == null);
+}
+
+test "serializeResult error_message round-trips through deserialize" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("QueueFull"),
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .result);
+    var round = msg.result;
+    defer round.deinit(allocator);
+    try std.testing.expectEqualStrings("QueueFull", round.getErrorMessage().?);
+}
+
+test "parseAssistantMessage without error_message keeps it unset" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    const msg = try deserialize(json, allocator);
+    try std.testing.expect(msg == .result);
+    var round = msg.result;
+    defer round.deinit(allocator);
+    try std.testing.expect(round.getErrorMessage() == null);
 }
