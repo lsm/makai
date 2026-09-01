@@ -393,7 +393,6 @@ class StdioAgentApi implements MakaiAgentApi {
     this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
-    const resultGraceContext = { ...timeoutContext, timeout_ms: Math.min(timeoutContext.timeout_ms, 50) };
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
@@ -426,20 +425,7 @@ class StdioAgentApi implements MakaiAgentApi {
         for (const event of normalized) {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
           events.push(event);
-          if (event.type === "agent_end") {
-            try {
-              const resultFrame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, resultGraceContext), signal, "agent.run aborted");
-              if (resultFrame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(resultFrame, "result_json"));
-              if (resultFrame.type === "result" || resultFrame.type === "complete_response") return parseCompletionResponse(resultFrame.payload ?? resultFrame);
-              if (resultFrame.type === "agent_error") throw streamErrorFrameToError(resultFrame);
-              throw new MakaiStreamError(`unexpected frame type after agent_end: ${String(resultFrame.type)}`, { kind: "transport_error" });
-            } catch (error) {
-              if (error instanceof MakaiStreamError && error.diagnostics?.timeout_ms === resultGraceContext.timeout_ms) {
-                return buildAgentRunResponseFromEvents(events);
-              }
-              throw error;
-            }
-          }
+          if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
         }
       }
     } catch (error) {
