@@ -54,7 +54,10 @@ not log credentials or payload bodies.
 
 **Acceptance:** written decisions, plus a baseline of test runtime and a small benchmark or
 instrumented test for normal SSE throughput/allocation count. This makes a later regression
-detectable.
+detectable. The implementation and rollout of that baseline are specified in
+[Performance and Memory Baseline Plan](performance-memory-baseline-plan.md); if it has not landed,
+record the temporary test-runtime baseline and schedule that plan before any pooling or zero-copy
+work.
 
 ### Step 1 — Harden `SSEParser`
 
