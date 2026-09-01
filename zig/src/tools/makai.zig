@@ -891,8 +891,10 @@ fn normalizeVersionedBaseUrl(url: []const u8) []const u8 {
     return trimmed;
 }
 
-fn usesOpenAIVersionedRoute(api: []const u8) bool {
-    return std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses");
+fn usesVersionedRoute(api: []const u8) bool {
+    return std.mem.eql(u8, api, "anthropic-messages") or
+        std.mem.eql(u8, api, "openai-completions") or
+        std.mem.eql(u8, api, "openai-responses");
 }
 
 fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
@@ -910,7 +912,11 @@ fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
 /// only when it transparently preserves the canonical vendor API.
 fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8) !?ai_types.OpenAICompatOptions {
     const global_proxy = try envFlag(allocator, "MAKAI_BASE_URL_IS_PROXY");
-    if (std.mem.eql(u8, provider_id, "openai") and (global_proxy or try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"))) {
+    const global_base = try envOrEmpty(allocator, "MAKAI_BASE_URL");
+    defer if (global_base) |value| allocator.free(value);
+    const use_global_base = global_base != null;
+
+    if (std.mem.eql(u8, provider_id, "openai") and (if (use_global_base) global_proxy else try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"))) {
         return .{
             .supports_store = true,
             .supports_developer_role = true,
@@ -918,7 +924,7 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
             .max_tokens_field = .max_completion_tokens,
         };
     }
-    if (std.mem.eql(u8, provider_id, "deepseek") and (global_proxy or try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"))) {
+    if (std.mem.eql(u8, provider_id, "deepseek") and (if (use_global_base) global_proxy else try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"))) {
         return .{ .requires_thinking_as_text = true };
     }
     return null;
@@ -931,7 +937,7 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
 /// credentials to an unrelated vendor. Always returns owned memory.
 fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
     if (ov.global.len > 0) {
-        const global = if (usesOpenAIVersionedRoute(api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
+        const global = if (usesVersionedRoute(api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
         return try allocator.dupe(u8, global);
     }
 
@@ -995,7 +1001,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
         .input = input,
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 200_000,
-        .max_tokens = 4_096,
+        .max_tokens = if (std.mem.eql(u8, parsed.provider_id, "anthropic")) 32_000 else 4_096,
         .compat = compat_options,
         .is_owned = true,
     };
@@ -4310,4 +4316,8 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     var reasoning = try modelFromCanonicalRef(allocator, "openai/openai-responses@o3-custom");
     defer reasoning.deinit(allocator);
     try std.testing.expect(reasoning.reasoning);
+
+    var anthropic = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-reasoning");
+    defer anthropic.deinit(allocator);
+    try std.testing.expectEqual(@as(u32, 32_000), anthropic.max_tokens);
 }
