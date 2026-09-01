@@ -850,8 +850,6 @@ fn prepareAgentRun(
         options.thinking_level = .high;
     }
 
-    const thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level");
-
     return .{
         .model = model,
         .prompts = prompts,
@@ -1053,6 +1051,8 @@ fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.Obje
         parsed = try std.json.parseFromSlice(std.json.Value, allocator, options_json, .{});
         if (parsed.?.value == .object) envelope_options = parsed.?.value.object;
     }
+
+    const thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level");
 
     return .{
         .temperature = optionF32(envelope_options, message_options, "temperature"),
