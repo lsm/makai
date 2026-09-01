@@ -328,6 +328,7 @@ const ActiveAgentRun = struct {
     tools: []agent_loop.AgentTool,
     cancel_flag: *std.atomic.Value(bool),
     tool_executor: *StdioAgentToolExecutor,
+    terminal_event_json: ?[]u8 = null,
 
     fn cancel(self: *ActiveAgentRun) void {
         self.cancel_flag.store(true, .release);
@@ -344,6 +345,7 @@ const ActiveAgentRun = struct {
         deinitAgentTools(allocator, self.tools);
         allocator.destroy(self.cancel_flag);
         allocator.destroy(self.tool_executor);
+        if (self.terminal_event_json) |event_json| allocator.free(event_json);
         self.* = undefined;
     }
 };
@@ -653,6 +655,12 @@ const StdioProtocolLoop = struct {
                 var owned_event = event;
                 errdefer deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
 
+                if (std.meta.activeTag(event) == .agent_end) {
+                    run.terminal_event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
+                    deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
+                    continue;
+                }
+
                 const event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
                 defer self.allocator.free(event_json);
                 self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
@@ -673,6 +681,13 @@ const StdioProtocolLoop = struct {
                 const result_json = try transport.serializeResult(result.final_message, self.allocator);
                 defer self.allocator.free(result_json);
                 self.agent_server.publishAgentResult(run.session_id, result_json) catch {};
+                forwarded += 1;
+            }
+
+            if (run.terminal_event_json) |event_json| {
+                self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
+                self.allocator.free(event_json);
+                run.terminal_event_json = null;
                 forwarded += 1;
             }
 
@@ -3547,14 +3562,18 @@ test "stdio protocol loop executes agent messages through real agent loop" {
         compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
     }
 
-    var saw_agent_event = false;
+    var agent_end_index: ?usize = null;
+    var agent_result_index: ?usize = null;
     var saw_agent_result = false;
-    for (outbound.items) |line| {
+    for (outbound.items, 0..) |line, index| {
         var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
         defer env.deinit(allocator);
         switch (env.payload) {
-            .agent_event => saw_agent_event = true,
+            .agent_event => {
+                if (std.mem.find(u8, env.payload.agent_event, "\"type\":\"agent_end\"") != null) agent_end_index = index;
+            },
             .agent_result => {
+                agent_result_index = index;
                 saw_agent_result = true;
                 try std.testing.expect(std.mem.find(u8, env.payload.agent_result, "\"type\":\"result\"") != null);
                 try std.testing.expect(std.mem.find(u8, env.payload.agent_result, "\"model\":\"fixture-model\"") != null);
@@ -3563,8 +3582,9 @@ test "stdio protocol loop executes agent messages through real agent loop" {
         }
     }
 
-    try std.testing.expect(saw_agent_event);
+    try std.testing.expect(agent_end_index != null);
     try std.testing.expect(saw_agent_result);
+    try std.testing.expect(agent_result_index.? < agent_end_index.?);
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
 }
 
