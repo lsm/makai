@@ -207,7 +207,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    const is_openai_proxy = if (model.compat) |compat| compat.supports_store == true else false;
+    const is_openai_proxy = if (model.compat) |compat_options| compat_options.supports_store == true else false;
     if (std.mem.find(u8, model.base_url, "openai.com") != null or is_openai_proxy or is_codex_model) {
         try w.writeBoolField("store", false);
     }
