@@ -883,6 +883,14 @@ const BaseUrlOverrides = struct {
     deepseek: []const u8 = "",
 };
 
+/// Provider routes append `/v1/...`; accept the common versioned override
+/// form without producing a duplicate `/v1/v1/...` path.
+fn normalizeOpenAIBaseUrl(url: []const u8) []const u8 {
+    const trimmed = std.mem.trimRight(u8, url, "/");
+    if (std.mem.endsWith(u8, trimmed, "/v1")) return trimmed[0 .. trimmed.len - 3];
+    return trimmed;
+}
+
 /// Pure base-URL resolution: known providers map to their vendor endpoints
 /// (overridable); unknown providers get "" — an empty base means "no
 /// endpoint" and the request fails before the network, rather than deriving
@@ -894,7 +902,7 @@ fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, a
     const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic") and std.mem.eql(u8, api, "anthropic-messages"))
         if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
     else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
-        if (ov.openai.len > 0) ov.openai else "https://api.openai.com"
+        if (ov.openai.len > 0) normalizeOpenAIBaseUrl(ov.openai) else "https://api.openai.com"
     else if (std.mem.eql(u8, provider_id, "deepseek") and std.mem.eql(u8, api, "openai-completions"))
         if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
     else
@@ -4177,6 +4185,12 @@ test "baseUrlWithOverrides prefers env overrides and global override" {
     });
     defer allocator.free(proxied);
     try std.testing.expectEqualStrings("https://proxy.example.com", proxied);
+
+    const versioned_openai = try baseUrlWithOverrides(allocator, "openai", "openai-completions", .{
+        .openai = "https://proxy.example.com/openai/v1/",
+    });
+    defer allocator.free(versioned_openai);
+    try std.testing.expectEqualStrings("https://proxy.example.com/openai", versioned_openai);
 
     const global = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{
         .global = "https://everywhere.example.com",
