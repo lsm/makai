@@ -295,7 +295,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.beginObject();
     try w.writeStringField("model", model.id);
     const default_max = @min(model.max_tokens / 3, 32000);
-    try w.writeIntField("max_tokens", options.max_tokens orelse default_max);
+    const requested_max = options.max_tokens orelse default_max;
+    try w.writeIntField("max_tokens", requested_max);
     try w.writeBoolField("stream", true);
 
     if (options.temperature) |t| {
@@ -808,7 +809,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
-    if (options.thinking_enabled) {
+    if (options.thinking_enabled and model.reasoning) {
         if (supportsAdaptiveThinking(model.id)) {
             // Adaptive thinking: Claude decides when and how much to think
             try w.writeKey("thinking");
@@ -827,7 +828,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.writeKey("thinking");
             try w.beginObject();
             try w.writeStringField("type", "enabled");
-            try w.writeIntField("budget_tokens", options.thinking_budget_tokens orelse 1024);
+            try w.writeIntField("budget_tokens", @min(options.thinking_budget_tokens orelse 1024, requested_max - 1));
             try w.endObject();
         }
     }

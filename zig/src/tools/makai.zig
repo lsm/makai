@@ -99,6 +99,7 @@ const AgentRunOptions = struct {
     max_tokens: ?u32 = null,
     max_iterations: ?u32 = null,
     thinking_level: ai_types.ThinkingLevel = .low,
+    has_explicit_thinking_level: bool = false,
     api_key: ?[]u8 = null,
 
     fn deinit(self: *AgentRunOptions, allocator: std.mem.Allocator) void {
@@ -844,12 +845,12 @@ fn prepareAgentRun(
 
     var options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
     if (std.mem.eql(u8, model.provider, "openai") and std.mem.startsWith(u8, model.id, "gpt-5-pro") and
-        std.mem.indexOf(u8, pending.message_json, "\"thinking_level\"") == null and
-        std.mem.indexOf(u8, pending.options_json, "\"thinking_level\"") == null and
-        std.mem.indexOf(u8, pending.config_json, "\"thinking_level\"") == null)
+        !options.has_explicit_thinking_level)
     {
         options.thinking_level = .high;
     }
+
+    const thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level");
 
     return .{
         .model = model,
@@ -898,7 +899,8 @@ fn normalizeVersionedBaseUrl(url: []const u8) []const u8 {
     return trimmed;
 }
 
-fn usesVersionedRoute(api: []const u8) bool {
+fn usesVersionedRoute(provider_id: []const u8, api: []const u8) bool {
+    if (std.mem.eql(u8, provider_id, "github-copilot")) return false;
     return std.mem.eql(u8, api, "anthropic-messages") or
         std.mem.eql(u8, api, "openai-completions") or
         std.mem.eql(u8, api, "openai-responses");
@@ -944,7 +946,7 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
 /// credentials to an unrelated vendor. Always returns owned memory.
 fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
     if (ov.global.len > 0) {
-        const global = if (usesVersionedRoute(api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
+        const global = if (usesVersionedRoute(provider_id, api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
         return try allocator.dupe(u8, global);
     }
 
@@ -1056,7 +1058,8 @@ fn parseAgentRunOptions(allocator: std.mem.Allocator, message_obj: std.json.Obje
         .temperature = optionF32(envelope_options, message_options, "temperature"),
         .max_tokens = optionU32(envelope_options, message_options, "max_tokens"),
         .max_iterations = optionU32(envelope_options, message_options, "max_iterations"),
-        .thinking_level = optionThinkingLevel(envelope_options, message_options, config_obj, "thinking_level") orelse .low,
+        .thinking_level = thinking_level orelse .low,
+        .has_explicit_thinking_level = thinking_level != null,
         .api_key = if (optionString(envelope_options, message_options, "api_key")) |key| try allocator.dupe(u8, key) else null,
     };
 }
@@ -4267,6 +4270,12 @@ test "baseUrlWithOverrides prefers env overrides and global override" {
     });
     defer allocator.free(versioned_global);
     try std.testing.expectEqualStrings("https://proxy.example.com", versioned_global);
+
+    const copilot_global = try baseUrlWithOverrides(allocator, "github-copilot", "openai-completions", .{
+        .global = "https://proxy.example.com/v1",
+    });
+    defer allocator.free(copilot_global);
+    try std.testing.expectEqualStrings("https://proxy.example.com/v1", copilot_global);
 
     const versioned_deepseek = try baseUrlWithOverrides(allocator, "deepseek", "openai-completions", .{
         .deepseek = "https://proxy.example.com/v1/",
