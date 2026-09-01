@@ -905,10 +905,14 @@ fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, o
     return try allocator.dupe(u8, "");
 }
 
-/// Owned env value, null when unset or empty.
+/// Owned env value, null when unset or empty (the allocation is freed when
+/// the value is empty — callers only own the returned slice).
 fn envOrEmpty(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
     const value = compat.getEnvVarOwned(allocator, key) catch return null;
-    if (value.len == 0) return null;
+    if (value.len == 0) {
+        allocator.free(value);
+        return null;
+    }
     return value;
 }
 

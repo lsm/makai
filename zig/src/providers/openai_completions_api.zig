@@ -61,7 +61,13 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
     };
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
+fn envApiKey(allocator: std.mem.Allocator, model: ai_types.Model) ?[]const u8 {
+    // Key the env credential by vendor: this API backs several OpenAI-compatible
+    // providers, and one vendor's credential must never be sent to another
+    // vendor's endpoint (e.g. OPENAI_API_KEY to api.deepseek.com).
+    if (std.mem.eql(u8, model.provider, "deepseek")) {
+        return compat_mod.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
+    }
     return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
 }
 
@@ -1804,7 +1810,7 @@ pub fn streamOpenAICompletions(
     var key_owned: ?[]const u8 = null;
     const api_key = blk: {
         if (resolved.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        key_owned = envApiKey(allocator);
+        key_owned = envApiKey(allocator, model);
         if (key_owned) |k| break :blk k;
         return error.MissingApiKey;
     };
