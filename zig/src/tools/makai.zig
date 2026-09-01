@@ -902,7 +902,7 @@ fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
         return std.mem.startsWith(u8, model_id, "o1") or
             std.mem.startsWith(u8, model_id, "o3") or
             std.mem.startsWith(u8, model_id, "o4") or
-            std.mem.startsWith(u8, model_id, "gpt-5");
+            (std.mem.startsWith(u8, model_id, "gpt-5") and std.mem.indexOf(u8, model_id, "-chat") == null);
     }
     return std.mem.eql(u8, provider_id, "deepseek") and std.mem.startsWith(u8, model_id, "deepseek-reasoner");
 }
@@ -4316,6 +4316,10 @@ test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
     var reasoning = try modelFromCanonicalRef(allocator, "openai/openai-responses@o3-custom");
     defer reasoning.deinit(allocator);
     try std.testing.expect(reasoning.reasoning);
+
+    var chat = try modelFromCanonicalRef(allocator, "openai/openai-responses@gpt-5-chat-latest");
+    defer chat.deinit(allocator);
+    try std.testing.expect(!chat.reasoning);
 
     var anthropic = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-reasoning");
     defer anthropic.deinit(allocator);
