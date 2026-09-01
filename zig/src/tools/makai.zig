@@ -886,7 +886,7 @@ const BaseUrlOverrides = struct {
 /// Provider routes append `/v1/...`; accept the common versioned override
 /// form without producing a duplicate `/v1/v1/...` path.
 fn normalizeOpenAIBaseUrl(url: []const u8) []const u8 {
-    const trimmed = std.mem.trimRight(u8, url, "/");
+    const trimmed = std.mem.trimEnd(u8, url, "/");
     if (std.mem.endsWith(u8, trimmed, "/v1")) return trimmed[0 .. trimmed.len - 3];
     return trimmed;
 }
