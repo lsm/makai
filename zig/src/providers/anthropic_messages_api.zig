@@ -828,7 +828,8 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             try w.writeKey("thinking");
             try w.beginObject();
             try w.writeStringField("type", "enabled");
-            try w.writeIntField("budget_tokens", @min(options.thinking_budget_tokens orelse 1024, requested_max - 1));
+            const max_thinking_budget = if (requested_max > 0) requested_max - 1 else 0;
+            try w.writeIntField("budget_tokens", @min(options.thinking_budget_tokens orelse 1024, max_thinking_budget));
             try w.endObject();
         }
     }
