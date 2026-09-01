@@ -1861,15 +1861,17 @@ pub fn streamSimpleAnthropicMessages(
     var thinking_budget_tokens: ?u32 = null;
     var thinking_effort: ?[]const u8 = null;
 
-    if (model.reasoning) if (o.reasoning) |level| {
-        thinking_enabled = true;
-        if (supportsAdaptiveThinking(model.id)) {
-            // Adaptive thinking: use effort level
-            thinking_effort = mapThinkingLevelToEffort(level);
-        } else {
-            // Budget-based thinking for older models
-            const max_tokens = o.max_tokens orelse model.max_tokens;
-            thinking_budget_tokens = @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1);
+    if (model.reasoning) {
+        if (o.reasoning) |level| {
+            thinking_enabled = true;
+            if (supportsAdaptiveThinking(model.id)) {
+                // Adaptive thinking: use effort level
+                thinking_effort = mapThinkingLevelToEffort(level);
+            } else {
+                // Budget-based thinking for older models
+                const max_tokens = o.max_tokens orelse model.max_tokens;
+                thinking_budget_tokens = @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1);
+            }
         }
     }
 
