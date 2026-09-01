@@ -57,7 +57,6 @@ assertion count:
 fn invariants(self: *const SSEParser) void {
     assert(self.line_buffer.items.len <= self.limits.line_bytes_max);
     assert(self.current_data.items.len <= self.limits.event_bytes_max);
-    assert(self.pending_events.items.len <= self.limits.pending_events_max);
 }
 ```
 
@@ -80,14 +79,18 @@ the owning component rather than a global collection of unrelated constants:
 pub const Limits = struct {
     line_bytes_max: usize = 64 * 1024,
     event_bytes_max: usize = 4 * 1024 * 1024,
-    pending_events_max: usize = 64,
 };
 ```
 
 Every append must check the *prospective* length with overflow-safe arithmetic and return a named
-error such as `error{SSELineTooLarge, SSEEventTooLarge, TooManyPendingEvents}`. The exact defaults
+error such as `error{SSELineTooLarge, SSEEventTooLarge}`. The exact defaults
 need product input: choose them from real provider payloads, document the unit and owner, and make
 SDK/CLI callers able to override them where a large payload is legitimate.
+
+Do not cap completed events merely because they were coalesced into one `feed()` call: provider
+read boundaries are arbitrary, so identical wire bytes must not succeed or fail based on chunking.
+If the returned batch itself needs a bound, redesign the parser/consumer boundary to drain or emit
+batches independently of read calls.
 
 This is a direct application of TigerBeetle's "put a limit on everything" rule, adapted to
 Makai's public API instead of a fixed database message size.
@@ -106,8 +109,9 @@ Rules for new code:
 * Give cloning a precise name: `clone`/`dupe` allocates an independent value; `borrow` never does.
 * Pair each ownership-changing path with a test under `std.testing.allocator`.
 
-The current [ownership convention](../CLAUDE.md) correctly warns not to make `EventStream.deinit()`
-free event strings. TigerBeetle's message pool offers the relevant conceptual model—ownership is
+The current [ownership convention](../CLAUDE.md) correctly warns not to make a *borrowed*
+`EventStream` free event strings. The supported owned mode must still free cloned queued events in
+`EventStream.deinit()`. TigerBeetle's message pool offers the relevant conceptual model—ownership is
 explicit at the hand-off—but its intrusive reference-counted fixed pool is not a suitable drop-in
 for Makai yet.
 

@@ -18,7 +18,7 @@ common exposure is instead externally controlled growth in framing/parsing buffe
 
 | Priority | Boundary | Evidence | Failure mode addressed |
 |---|---|---|---|
-| P0 | SSE parser | `line_buffer`, `current_data`, and `pending_events` are `ArrayList`s with no per-parser input budget. | A peer can make a request retain unbounded bytes/events before a delimiter arrives. |
+| P0 | SSE parser | `line_buffer` and `current_data` are `ArrayList`s with no per-parser input budget. | A peer can make a request retain unbounded bytes before a delimiter arrives. |
 | P1 | stdio receiver | `leftover` accumulates bytes until a newline or EOF. | A malformed or hostile line can consume unbounded CLI-server memory. |
 | P1 | WebSocket receiver | `recv_buffer` and `fragment_buffer` grow as frames/fragments arrive. | An oversized or indefinitely fragmented peer can grow connection memory. |
 | P2 | Async event ownership | Some producer/consumer paths require cloned events while others borrow them. | A later performance rewrite can introduce a lifetime bug unless each hand-off is explicit. |
@@ -63,13 +63,16 @@ work.
 
 **Scope:** `zig/src/providers/sse_parser.zig` only, plus its build/test wiring only if required.
 
-1. Add a `Limits` configuration with separate maximums for line bytes, event bytes, and pending
-   events. `init()` keeps sensible compatibility defaults; a second initializer may take limits.
+1. Add a `Limits` configuration with separate maximums for line and complete-event bytes. `init()`
+   keeps sensible compatibility defaults; a second initializer may take limits. Do not limit
+   completed events based on one `feed()` call: read chunking is arbitrary. A bounded output batch
+   requires a separately designed drain/emit API.
 2. Centralize checked growth in helpers such as `append_line_byte`, `append_event_data`, and
    `append_pending_event`. Check the prospective length before appending and use overflow-safe
    arithmetic.
-3. Return precise errors (`LineTooLarge`, `EventTooLarge`, `TooManyPendingEvents`) rather than
-   silently truncating or relying on allocator failure.
+3. Return precise errors (`LineTooLarge`, `EventTooLarge`) rather than silently truncating or
+   relying on allocator failure. Propagate them through every provider call site with useful
+   context; do not collapse them to the current generic parse-error text.
 4. Add an `invariants()` helper for relationships that are *internal facts*—for example every
    retained buffer is within its configured limit. Call it after state transitions, not on
    unvalidated peer bytes.
@@ -77,12 +80,14 @@ work.
    event type or event payload leaks.
 
 **Tests:** one-byte feeds, splits at every delimiter of a small fixture, CRLF/LF handling,
-multi-line events, each limit exactly at and one byte over, repeated feeds after an error/reset,
-and `std.testing.allocator` leak coverage.
+multi-line events, many completed events coalesced in one feed, each byte limit exactly at and one
+byte over, repeated feeds after an error/reset, provider-level propagation, and
+`std.testing.allocator` leak coverage.
 
 **Acceptance:** `zig build test-unit-providers` passes; existing valid-parser tests are unchanged
 or improved; a test proves each bound returns the intended error before allocation growth beyond
-the bound.
+the bound. Wire `sse_parser.zig` itself into the provider test step so its inline limit/chunk/leak
+tests execute under this command.
 
 ### Step 2 — Generalize only the tested pattern
 
