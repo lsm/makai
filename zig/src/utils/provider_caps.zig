@@ -231,7 +231,25 @@ pub fn detectCapabilities(base_url: ?[]const u8) ProviderCapabilities {
     };
 }
 
+/// Preserve canonical vendor behavior when an explicit proxy base URL hides
+/// the vendor hostname.
+pub fn detectCapabilitiesForProvider(provider_id: []const u8, base_url: ?[]const u8) ProviderCapabilities {
+    if (std.mem.eql(u8, provider_id, "openai")) return detectCapabilities("https://api.openai.com");
+    if (std.mem.eql(u8, provider_id, "deepseek")) return detectCapabilities("https://api.deepseek.com");
+    return detectCapabilities(base_url);
+}
+
 // Tests
+test "declared provider retains capabilities behind proxy base URLs" {
+    const openai = detectCapabilitiesForProvider("openai", "https://proxy.example.com");
+    try std.testing.expect(openai.supports_developer_role);
+    try std.testing.expect(openai.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_completion_tokens", openai.max_tokens_field);
+
+    const deepseek = detectCapabilitiesForProvider("deepseek", "https://proxy.example.com");
+    try std.testing.expect(deepseek.requires_thinking_as_text);
+}
+
 test "isGitHubCopilot detection" {
     try std.testing.expect(isGitHubCopilot("https://api.githubcopilot.com/v1/chat"));
     try std.testing.expect(!isGitHubCopilot("https://api.openai.com/v1/chat"));

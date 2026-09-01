@@ -891,20 +891,27 @@ fn normalizeOpenAIBaseUrl(url: []const u8) []const u8 {
     return trimmed;
 }
 
+fn usesOpenAIVersionedRoute(api: []const u8) bool {
+    return std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses");
+}
+
 /// Pure base-URL resolution: known providers map to their vendor endpoints
 /// (overridable); unknown providers get "" — an empty base means "no
 /// endpoint" and the request fails before the network, rather than deriving
 /// an endpoint from the wire-protocol API type and sending the caller's
 /// credentials to an unrelated vendor. Always returns owned memory.
 fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
-    if (ov.global.len > 0) return try allocator.dupe(u8, ov.global);
+    if (ov.global.len > 0) {
+        const global = if (usesOpenAIVersionedRoute(api)) normalizeOpenAIBaseUrl(ov.global) else ov.global;
+        return try allocator.dupe(u8, global);
+    }
 
     const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic") and std.mem.eql(u8, api, "anthropic-messages"))
         if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
     else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
         if (ov.openai.len > 0) normalizeOpenAIBaseUrl(ov.openai) else "https://api.openai.com"
     else if (std.mem.eql(u8, provider_id, "deepseek") and std.mem.eql(u8, api, "openai-completions"))
-        if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
+        if (ov.deepseek.len > 0) normalizeOpenAIBaseUrl(ov.deepseek) else "https://api.deepseek.com"
     else
         null;
     if (by_provider) |url| return try allocator.dupe(u8, url);
@@ -4197,6 +4204,18 @@ test "baseUrlWithOverrides prefers env overrides and global override" {
     });
     defer allocator.free(global);
     try std.testing.expectEqualStrings("https://everywhere.example.com", global);
+
+    const versioned_global = try baseUrlWithOverrides(allocator, "openai", "openai-completions", .{
+        .global = "https://proxy.example.com/v1",
+    });
+    defer allocator.free(versioned_global);
+    try std.testing.expectEqualStrings("https://proxy.example.com", versioned_global);
+
+    const versioned_deepseek = try baseUrlWithOverrides(allocator, "deepseek", "openai-completions", .{
+        .deepseek = "https://proxy.example.com/v1/",
+    });
+    defer allocator.free(versioned_deepseek);
+    try std.testing.expectEqualStrings("https://proxy.example.com", versioned_deepseek);
 }
 
 test "baseUrlWithOverrides requires explicit endpoint for unknown providers" {

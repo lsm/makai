@@ -31,9 +31,9 @@ const MergedCompat = struct {
 /// Merge model-level compat options with detected provider capabilities
 /// Model-level options take precedence over detected capabilities
 fn mergeCompat(model: ai_types.Model) MergedCompat {
-    const caps = provider_caps.detectCapabilities(model.base_url);
+    const caps = provider_caps.detectCapabilitiesForProvider(model.provider, model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null;
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
@@ -643,7 +643,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .max_tool_id_len = if (std.mem.eql(u8, model.provider, "openai") or std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,
