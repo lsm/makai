@@ -1745,3 +1745,30 @@ test("client.provider.complete surfaces error_message from error results", async
     await harness.cleanup();
   }
 });
+
+test("client.agent.run surfaces error_message from error agent results", async () => {
+  const errorResult = {
+    messages: [{
+      role: "assistant",
+      content: [{ type: "text", text: "" }],
+      usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "error",
+      error_message: "QueueFull",
+    }],
+  };
+  const resultPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-err-result-")), "result.json");
+  fs.writeFileSync(resultPath, JSON.stringify(errorResult));
+
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "QueueFull");
+  } finally {
+    await harness.cleanup();
+  }
+});

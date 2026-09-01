@@ -1167,6 +1167,7 @@ function buildCompletionResponseFromMessage(
     api: stringValue(message.api ?? terminal.api),
     model_id: stringValue(message.model_id ?? message.model ?? terminal.model_id ?? terminal.model),
     stop_reason: optionalString(message.stop_reason ?? terminal.stop_reason ?? terminal.reason),
+    error_message: optionalString(message.error_message ?? terminal.error_message),
   };
 }
 
