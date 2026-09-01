@@ -895,7 +895,7 @@ fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, a
         if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
     else if (std.mem.eql(u8, provider_id, "openai") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
         if (ov.openai.len > 0) ov.openai else "https://api.openai.com"
-    else if (std.mem.eql(u8, provider_id, "deepseek") and (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")))
+    else if (std.mem.eql(u8, provider_id, "deepseek") and std.mem.eql(u8, api, "openai-completions"))
         if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
     else
         null;
@@ -4216,6 +4216,10 @@ test "baseUrlWithOverrides rejects provider/API mismatches" {
     const openai_codex_responses = try baseUrlWithOverrides(allocator, "openai", "openai-codex-responses", .{});
     defer allocator.free(openai_codex_responses);
     try std.testing.expectEqualStrings("", openai_codex_responses);
+
+    const deepseek_responses = try baseUrlWithOverrides(allocator, "deepseek", "openai-responses", .{});
+    defer allocator.free(deepseek_responses);
+    try std.testing.expectEqualStrings("", deepseek_responses);
 }
 
 test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
