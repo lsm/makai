@@ -328,6 +328,7 @@ const ActiveAgentRun = struct {
     tools: []agent_loop.AgentTool,
     cancel_flag: *std.atomic.Value(bool),
     tool_executor: *StdioAgentToolExecutor,
+    terminal_event_json: ?[]u8 = null,
 
     fn cancel(self: *ActiveAgentRun) void {
         self.cancel_flag.store(true, .release);
@@ -344,6 +345,7 @@ const ActiveAgentRun = struct {
         deinitAgentTools(allocator, self.tools);
         allocator.destroy(self.cancel_flag);
         allocator.destroy(self.tool_executor);
+        if (self.terminal_event_json) |event_json| allocator.free(event_json);
         self.* = undefined;
     }
 };
@@ -644,8 +646,6 @@ const StdioProtocolLoop = struct {
         var idx: usize = 0;
         while (idx < self.active_agent_runs.items.len) {
             var run = &self.active_agent_runs.items[idx];
-            var terminal_event_json: ?[]u8 = null;
-            errdefer if (terminal_event_json) |event_json| self.allocator.free(event_json);
 
             if (!self.agent_server.hasSession(run.session_id)) {
                 run.cancel();
@@ -655,8 +655,8 @@ const StdioProtocolLoop = struct {
                 var owned_event = event;
                 errdefer deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
 
-                if (std.meta.activeTag(event) == .agent_end and run.stream.isDone()) {
-                    terminal_event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
+                if (std.meta.activeTag(event) == .agent_end) {
+                    run.terminal_event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
                     deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
                     continue;
                 }
@@ -684,10 +684,10 @@ const StdioProtocolLoop = struct {
                 forwarded += 1;
             }
 
-            if (terminal_event_json) |event_json| {
+            if (run.terminal_event_json) |event_json| {
                 self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
                 self.allocator.free(event_json);
-                terminal_event_json = null;
+                run.terminal_event_json = null;
                 forwarded += 1;
             }
 
