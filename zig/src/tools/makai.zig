@@ -853,6 +853,71 @@ fn prepareAgentRun(
     };
 }
 
+/// Base URL for canonical refs outside the production catalog (the catalog
+/// only covers Codex OAuth + Kimi). Env overrides follow the common
+/// <PROVIDER>_BASE_URL conventions so proxies and custom endpoints work;
+/// MAKAI_BASE_URL overrides everything.
+fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8) ![]const u8 {
+    const global = try envOrEmpty(allocator, "MAKAI_BASE_URL");
+    defer if (global) |g| allocator.free(g);
+    const anthropic = try envOrEmpty(allocator, "ANTHROPIC_BASE_URL");
+    defer if (anthropic) |v| allocator.free(v);
+    const openai = try envOrEmpty(allocator, "OPENAI_BASE_URL");
+    defer if (openai) |v| allocator.free(v);
+    const deepseek = try envOrEmpty(allocator, "DEEPSEEK_BASE_URL");
+    defer if (deepseek) |v| allocator.free(v);
+
+    return baseUrlWithOverrides(allocator, provider_id, api, .{
+        .global = global orelse "",
+        .anthropic = anthropic orelse "",
+        .openai = openai orelse "",
+        .deepseek = deepseek orelse "",
+    });
+}
+
+/// Explicit URL overrides for baseUrlForRef (empty = use canonical default).
+const BaseUrlOverrides = struct {
+    global: []const u8 = "",
+    anthropic: []const u8 = "",
+    openai: []const u8 = "",
+    deepseek: []const u8 = "",
+};
+
+/// Pure base-URL resolution: provider first, then API, then empty (caller
+/// decides what an empty base means). Always returns owned memory.
+fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
+    if (ov.global.len > 0) return try allocator.dupe(u8, ov.global);
+
+    const by_provider: ?[]const u8 = if (std.mem.eql(u8, provider_id, "anthropic"))
+        if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com"
+    else if (std.mem.eql(u8, provider_id, "openai"))
+        if (ov.openai.len > 0) ov.openai else "https://api.openai.com/v1"
+    else if (std.mem.eql(u8, provider_id, "deepseek"))
+        if (ov.deepseek.len > 0) ov.deepseek else "https://api.deepseek.com"
+    else
+        null;
+    if (by_provider) |url| return try allocator.dupe(u8, url);
+
+    // Unknown provider: fall back to the API's canonical default.
+    if (std.mem.eql(u8, api, "anthropic-messages")) {
+        const url = if (ov.anthropic.len > 0) ov.anthropic else "https://api.anthropic.com";
+        return try allocator.dupe(u8, url);
+    }
+    if (std.mem.eql(u8, api, "openai-completions") or std.mem.eql(u8, api, "openai-responses")) {
+        const url = if (ov.openai.len > 0) ov.openai else "https://api.openai.com/v1";
+        return try allocator.dupe(u8, url);
+    }
+
+    return try allocator.dupe(u8, "");
+}
+
+/// Owned env value, null when unset or empty.
+fn envOrEmpty(allocator: std.mem.Allocator, key: []const u8) !?[]const u8 {
+    const value = compat.getEnvVarOwned(allocator, key) catch return null;
+    if (value.len == 0) return null;
+    return value;
+}
+
 fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_types.Model {
     var parsed = model_ref.parseModelRef(allocator, ref) catch return error.InvalidModelRef;
     errdefer parsed.deinit(allocator);
@@ -865,7 +930,7 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     const name = try allocator.dupe(u8, parsed.model_id);
     errdefer allocator.free(name);
 
-    const base_url = try allocator.dupe(u8, "");
+    const base_url = try defaultBaseUrlForRef(allocator, parsed.provider_id, parsed.api);
     errdefer allocator.free(base_url);
 
     const input = try allocator.alloc([]const u8, 0);
@@ -4087,4 +4152,57 @@ pub fn main(init: std.process.Init) !void {
     try compat.stdio.writeAll(stderr, msg);
     try printUsage(stderr);
     return error.InvalidArgument;
+}
+
+test "baseUrlWithOverrides resolves canonical provider defaults" {
+    const allocator = std.testing.allocator;
+
+    const anthropic = try baseUrlWithOverrides(allocator, "anthropic", "anthropic-messages", .{});
+    defer allocator.free(anthropic);
+    try std.testing.expectEqualStrings("https://api.anthropic.com", anthropic);
+
+    const openai = try baseUrlWithOverrides(allocator, "openai", "openai-completions", .{});
+    defer allocator.free(openai);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", openai);
+
+    const deepseek = try baseUrlWithOverrides(allocator, "deepseek", "openai-completions", .{});
+    defer allocator.free(deepseek);
+    try std.testing.expectEqualStrings("https://api.deepseek.com", deepseek);
+}
+
+test "baseUrlWithOverrides prefers env overrides and global override" {
+    const allocator = std.testing.allocator;
+
+    const proxied = try baseUrlWithOverrides(allocator, "anthropic", "anthropic-messages", .{
+        .anthropic = "https://proxy.example.com",
+    });
+    defer allocator.free(proxied);
+    try std.testing.expectEqualStrings("https://proxy.example.com", proxied);
+
+    const global = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{
+        .global = "https://everywhere.example.com",
+    });
+    defer allocator.free(global);
+    try std.testing.expectEqualStrings("https://everywhere.example.com", global);
+}
+
+test "baseUrlWithOverrides falls back by api for unknown providers" {
+    const allocator = std.testing.allocator;
+
+    const by_api = try baseUrlWithOverrides(allocator, "custom-host", "anthropic-messages", .{});
+    defer allocator.free(by_api);
+    try std.testing.expectEqualStrings("https://api.anthropic.com", by_api);
+
+    const unknown = try baseUrlWithOverrides(allocator, "custom-host", "custom-api", .{});
+    defer allocator.free(unknown);
+    try std.testing.expectEqualStrings("", unknown);
+}
+
+test "modelFromCanonicalRef applies default base URL for non-catalog refs" {
+    const allocator = std.testing.allocator;
+    var model = try modelFromCanonicalRef(allocator, "anthropic/anthropic-messages@claude-test-model");
+    defer model.deinit(allocator);
+    // Env ANTHROPIC_BASE_URL may override in the test environment; either way
+    // the base URL must no longer be empty.
+    try std.testing.expect(model.base_url.len > 0);
 }
