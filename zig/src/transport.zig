@@ -634,6 +634,12 @@ pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.All
     }
     try w.endArray();
 
+    // Errors otherwise leave the process invisibly: the catch path in the
+    // agent loop stores the Zig error name here with empty content.
+    if (result.error_message.slice().len > 0) {
+        try w.writeStringField("error_message", result.error_message.slice());
+    }
+
     try w.endObject();
 
     const out = try allocator.dupe(u8, buffer.items);
@@ -2084,4 +2090,43 @@ test "Receiver.setControlCallback stores callback" {
 
     try std.testing.expect(receiver.control_callback != null);
     try std.testing.expect(receiver.control_callback_ctx != null);
+}
+
+test "serializeResult includes error_message when set" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .@"error",
+        .error_message = ai_types.OwnedSlice(u8).initBorrowed("QueueFull"),
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"error_message\":\"QueueFull\"") != null);
+}
+
+test "serializeResult omits error_message when unset" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "anthropic-messages",
+        .provider = "anthropic",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResult(message, allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "error_message") == null);
 }
