@@ -30,8 +30,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          candidate_identity=$(head -n 1 artifacts/candidate/latency.jsonl | \
-            jq -r '[.host_class,.target,.cpu_model,.cpu_features_hash,.zig_version,.optimize] | @tsv')
+          candidate_identity=$(jq -cs 'map(del(
+            .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
+            .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
+            .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
+            .peak_live_bytes, .leak_bytes
+          ))' artifacts/candidate/latency.jsonl artifacts/candidate/allocation.jsonl)
           if ! run_ids_text=$(gh api --method GET --paginate --slurp \
             "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
             -f branch=main -f event=workflow_dispatch -f status=success -F per_page=100 | \
@@ -46,19 +50,36 @@ jobs:
 
           found=false
           for run_id in "${run_ids[@]}"; do
+            if ! artifacts_json=$(gh api --method GET --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" -F per_page=100); then
+              echo "The Actions API artifact lookup failed for canonical run $run_id." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            artifact_name=$(jq -r '[.[].artifacts[] | select(
+              .expired == false and (.name | test("^benchmark-baseline-.*-ubuntu-24\\.04-x86_64$"))
+            )][0].name // empty' <<< "$artifacts_json")
+            [[ -n "$artifact_name" ]] || continue
+
             download_dir="$RUNNER_TEMP/benchmark-baseline-$run_id"
             mkdir -p "$download_dir"
             if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-              --pattern 'benchmark-baseline-*-ubuntu-24.04-x86_64' --dir "$download_dir"; then
-              continue
+              --name "$artifact_name" --dir "$download_dir"; then
+              echo "Downloading retained canonical artifact $artifact_name from run $run_id failed." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
             fi
             baseline_file=$(find "$download_dir" -type f -name latency.jsonl -print -quit)
             [[ -n "$baseline_file" ]] || continue
-            baseline_identity=$(head -n 1 "$baseline_file" | \
-              jq -r '[.host_class,.target,.cpu_model,.cpu_features_hash,.zig_version,.optimize] | @tsv')
+            baseline_directory=$(dirname "$baseline_file")
+            [[ -f "$baseline_directory/allocation.jsonl" ]] || continue
+            baseline_identity=$(jq -cs 'map(del(
+              .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
+              .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
+              .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
+              .peak_live_bytes, .leak_bytes
+            ))' "$baseline_file" "$baseline_directory/allocation.jsonl")
             if [[ "$baseline_identity" == "$candidate_identity" ]]; then
               mkdir -p artifacts/baseline
-              cp "$(dirname "$baseline_file")"/* artifacts/baseline/
+              cp "$baseline_directory"/* artifacts/baseline/
               found=true
               echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
               echo "Using CPU-compatible canonical baseline run $run_id." >> "$GITHUB_STEP_SUMMARY"
