@@ -61,9 +61,9 @@ pub fn serializeEnvelope(
 
     try w.endObject();
 
-    const result = try allocator.dupe(u8, buffer.items);
-    buffer.deinit(allocator);
-    return result;
+    // Transfer the completed buffer to the caller; serializeEnvelope's contract
+    // already requires the caller to free the returned slice with `allocator`.
+    return buffer.toOwnedSlice(allocator);
 }
 
 /// Serialize payload based on its type
