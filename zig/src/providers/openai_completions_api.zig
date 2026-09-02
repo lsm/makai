@@ -33,7 +33,7 @@ const MergedCompat = struct {
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = isOpenAIHost(model.base_url);
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
@@ -67,6 +67,14 @@ fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
     return compat.supports_store == true and
         compat.supports_developer_role == true and
         compat.supports_reasoning_effort == true;
+}
+
+fn isOpenAIHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "openai.com") or
+        (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
 }
 
 fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
@@ -654,7 +662,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null or isTransparentOpenAIProxy(model)) 40 else 0,
+        .max_tool_id_len = if (isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model)) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,

@@ -379,7 +379,7 @@ test "provider protocol bridge maps thinking level to stream options" {
         .session_id = "sid",
         .thinking_level = .xhigh,
         .thinking_budgets = .{ .xhigh = 8192 },
-    }, "key", "sid");
+    }, "gpt-5.1", "key", "sid");
 
     try std.testing.expect(opts.thinking_enabled);
     try std.testing.expect(opts.reasoning_enabled);
@@ -387,7 +387,7 @@ test "provider protocol bridge maps thinking level to stream options" {
     try std.testing.expectEqualStrings("max", opts.getThinkingEffort().?);
     try std.testing.expectEqualStrings("xhigh", opts.getReasoningEffort().?);
 
-    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, null, null);
+    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.1", null, null);
     try std.testing.expect(!off.thinking_enabled);
     try std.testing.expect(!off.reasoning_enabled);
     try std.testing.expect(off.getThinkingEffort() == null);

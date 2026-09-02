@@ -973,7 +973,7 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
 /// credentials to an unrelated vendor. Always returns owned memory.
 fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8, ov: BaseUrlOverrides) ![]const u8 {
     if (ov.global.len > 0) {
-        const global = if (usesVersionedRoute(provider_id, api)) normalizeVersionedBaseUrl(ov.global) else ov.global;
+        const global = if (usesVersionedRoute(provider_id, api)) normalizeVersionedBaseUrl(ov.global) else std.mem.trimEnd(u8, ov.global, "/");
         return try allocator.dupe(u8, global);
     }
 

@@ -107,12 +107,19 @@ fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetenti
     if (retention == .none) return null;
 
     // Only add ttl for "long" retention on api.anthropic.com
-    const has_ttl = retention == .long and (std.mem.find(u8, base_url, "api.anthropic.com") != null or supports_long_ttl);
+    const has_ttl = retention == .long and (isAnthropicHost(base_url) or supports_long_ttl);
 
     return .{
         .retention = retention,
         .has_ttl = has_ttl,
     };
+}
+
+fn isAnthropicHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "api.anthropic.com");
 }
 
 /// Check if a model supports adaptive thinking (Opus 4.6+)
