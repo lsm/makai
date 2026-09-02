@@ -2,6 +2,55 @@ const std = @import("std");
 const compat = @import("compat");
 const transport = @import("transport");
 
+pub const default_line_bytes: usize = 1024 * 1024;
+
+const LineFramer = struct {
+    buffer: std.ArrayList(u8) = .empty,
+    allocator: std.mem.Allocator,
+    limit: usize,
+
+    fn init(allocator: std.mem.Allocator, limit: usize) LineFramer {
+        return .{ .allocator = allocator, .limit = limit };
+    }
+
+    fn deinit(self: *LineFramer) void {
+        self.buffer.deinit(self.allocator);
+    }
+
+    fn append(self: *LineFramer, bytes: []const u8) !void {
+        var logical_len = if (std.mem.lastIndexOfScalar(u8, self.buffer.items, '\n')) |nl_pos|
+            self.buffer.items.len - nl_pos - 1
+        else
+            self.buffer.items.len;
+
+        for (bytes) |byte| {
+            if (byte == '\n') {
+                logical_len = 0;
+            } else {
+                if (logical_len >= self.limit) return error.LineTooLarge;
+                logical_len += 1;
+            }
+        }
+        try self.buffer.appendSlice(self.allocator, bytes);
+    }
+
+    fn takeLine(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
+        const nl_pos = std.mem.findScalar(u8, self.buffer.items, '\n') orelse return null;
+        const line = try allocator.dupe(u8, self.buffer.items[0..nl_pos]);
+        const remaining = self.buffer.items[nl_pos + 1 ..];
+        std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
+        self.buffer.shrinkRetainingCapacity(remaining.len);
+        return line;
+    }
+
+    fn takeEof(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.buffer.items.len == 0) return null;
+        const line = try allocator.dupe(u8, self.buffer.items);
+        self.buffer.clearRetainingCapacity();
+        return line;
+    }
+};
+
 pub const StdioSender = struct {
     file: compat.stdio.File,
 
@@ -30,7 +79,7 @@ pub const StdioReceiver = struct {
     file: compat.stdio.File,
     read_buf: [4096]u8 = undefined,
     /// Unprocessed data carried over from previous read
-    leftover: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    framer: LineFramer,
     allocator: std.mem.Allocator,
     cancel_token: ?*std.atomic.Value(bool) = null,
     last_status: ReadStatus = .pending,
@@ -44,19 +93,23 @@ pub const StdioReceiver = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) StdioReceiver {
-        return .{ .file = compat.stdio.stdin(), .allocator = allocator };
+        return initWithFileAndLimit(compat.stdio.stdin(), allocator, default_line_bytes);
     }
 
     pub fn initWithFile(file: compat.stdio.File, allocator: std.mem.Allocator) StdioReceiver {
-        return .{ .file = file, .allocator = allocator };
+        return initWithFileAndLimit(file, allocator, default_line_bytes);
+    }
+
+    pub fn initWithFileAndLimit(file: compat.stdio.File, allocator: std.mem.Allocator, line_bytes: usize) StdioReceiver {
+        return .{ .file = file, .framer = LineFramer.init(allocator, line_bytes), .allocator = allocator };
     }
 
     pub fn initWithFileAndCancelToken(file: compat.stdio.File, allocator: std.mem.Allocator, cancel_token: *std.atomic.Value(bool)) StdioReceiver {
-        return .{ .file = file, .allocator = allocator, .cancel_token = cancel_token };
+        return .{ .file = file, .framer = LineFramer.init(allocator, default_line_bytes), .allocator = allocator, .cancel_token = cancel_token };
     }
 
     pub fn deinit(self: *StdioReceiver) void {
-        self.leftover.deinit(self.allocator);
+        self.framer.deinit();
     }
 
     pub fn receiver(self: *StdioReceiver) transport.Receiver {
@@ -71,14 +124,7 @@ pub const StdioReceiver = struct {
 
         while (true) {
             // Check leftover buffer for a complete line
-            if (std.mem.findScalar(u8, self.leftover.items, '\n')) |nl_pos| {
-                const line = try allocator.dupe(u8, self.leftover.items[0..nl_pos]);
-                // Remove consumed bytes including the newline
-                const remaining = self.leftover.items[nl_pos + 1 ..];
-                std.mem.copyForwards(u8, self.leftover.items[0..remaining.len], remaining);
-                self.leftover.shrinkRetainingCapacity(remaining.len);
-                return line;
-            }
+            if (try self.framer.takeLine(allocator)) |line| return line;
 
             // Read more data
             if (self.cancel_token) |token| {
@@ -90,7 +136,7 @@ pub const StdioReceiver = struct {
             const bytes_read = compat.stdio.read(self.file, &self.read_buf) catch |err| {
                 if (err == error.EndOfStream) {
                     self.last_status = .eof;
-                    return null;
+                    return try self.framer.takeEof(allocator);
                 }
                 if (err == error.WouldBlock) {
                     self.last_status = .would_block;
@@ -101,9 +147,7 @@ pub const StdioReceiver = struct {
             };
             if (bytes_read == 0) {
                 // EOF - return remaining data as last line if any
-                if (self.leftover.items.len > 0) {
-                    const line = try allocator.dupe(u8, self.leftover.items);
-                    self.leftover.clearRetainingCapacity();
+                if (try self.framer.takeEof(allocator)) |line| {
                     self.last_status = .eof;
                     return line;
                 }
@@ -112,7 +156,7 @@ pub const StdioReceiver = struct {
             }
             self.last_status = .pending;
 
-            try self.leftover.appendSlice(self.allocator, self.read_buf[0..bytes_read]);
+            try self.framer.append(self.read_buf[0..bytes_read]);
         }
     }
 };
@@ -206,15 +250,20 @@ pub const AsyncStdioSender = struct {
 
 pub const AsyncStdioReceiver = struct {
     file: compat.stdio.File,
+    line_limit: usize,
 
     const Self = @This();
 
     pub fn init() Self {
-        return .{ .file = compat.stdio.stdin() };
+        return .{ .file = compat.stdio.stdin(), .line_limit = default_line_bytes };
     }
 
     pub fn initWithFile(file: compat.stdio.File) Self {
-        return .{ .file = file };
+        return initWithFileAndLimit(file, default_line_bytes);
+    }
+
+    pub fn initWithFileAndLimit(file: compat.stdio.File, line_bytes: usize) Self {
+        return .{ .file = file, .line_limit = line_bytes };
     }
 
     pub fn receiver(self: *Self) transport.AsyncReceiver {
@@ -229,7 +278,7 @@ pub const AsyncStdioReceiver = struct {
         stream: *transport.ByteStream,
         file: compat.stdio.File,
         allocator: std.mem.Allocator,
-        leftover: std.ArrayList(u8),
+        framer: LineFramer,
         read_buf: [4096]u8 = undefined,
         cancel_token: *std.atomic.Value(bool),
         /// If true, thread owns cancel_token and should free it on exit.
@@ -251,7 +300,7 @@ pub const AsyncStdioReceiver = struct {
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
-            .leftover = std.ArrayList(u8).empty,
+            .framer = LineFramer.init(allocator, self.line_limit),
             .cancel_token = cancel_token,
             .owns_cancel_token = true, // Thread owns it in legacy mode
         };
@@ -281,7 +330,7 @@ pub const AsyncStdioReceiver = struct {
             .stream = stream,
             .file = self.file,
             .allocator = allocator,
-            .leftover = std.ArrayList(u8).empty,
+            .framer = LineFramer.init(allocator, self.line_limit),
             .cancel_token = cancel_token,
             .owns_cancel_token = false, // Handle owns it
         };
@@ -306,7 +355,7 @@ pub const AsyncStdioReceiver = struct {
         const cancel_token = ctx.cancel_token;
 
         defer {
-            ctx.leftover.deinit(allocator);
+            ctx.framer.deinit();
             if (owns_cancel_token) {
                 allocator.destroy(cancel_token);
             }
@@ -317,23 +366,17 @@ pub const AsyncStdioReceiver = struct {
 
         while (!ctx.cancel_token.load(.acquire)) {
             // Check for complete line in leftover
-            if (std.mem.findScalar(u8, ctx.leftover.items, '\n')) |nl_pos| {
-                const line = ctx.leftover.items[0..nl_pos];
-                const chunk = transport.ByteChunk{
-                    .data = ctx.allocator.dupe(u8, line) catch {
-                        ctx.stream.completeWithError("Out of memory");
-                        return;
-                    },
-                    .owned = true,
-                };
+            if (ctx.framer.takeLine(ctx.allocator) catch {
+                ctx.stream.completeWithError("Out of memory");
+                return;
+            }) |line| {
+                const chunk = transport.ByteChunk{ .data = line, .owned = true };
                 ctx.stream.push(chunk) catch {
+                    var owned_chunk = chunk;
+                    owned_chunk.deinit(ctx.allocator);
                     ctx.stream.completeWithError("Stream queue full");
                     return;
                 };
-                // Remove consumed bytes
-                const remaining = ctx.leftover.items[nl_pos + 1 ..];
-                std.mem.copyForwards(u8, ctx.leftover.items[0..remaining.len], remaining);
-                ctx.leftover.shrinkRetainingCapacity(remaining.len);
                 continue;
             }
 
@@ -344,6 +387,18 @@ pub const AsyncStdioReceiver = struct {
                     continue;
                 }
                 if (err == error.EndOfStream) {
+                    if (ctx.framer.takeEof(ctx.allocator) catch {
+                        ctx.stream.completeWithError("Out of memory");
+                        return;
+                    }) |line| {
+                        const chunk = transport.ByteChunk{ .data = line, .owned = true };
+                        ctx.stream.push(chunk) catch {
+                            var owned_chunk = chunk;
+                            owned_chunk.deinit(ctx.allocator);
+                            ctx.stream.completeWithError("Stream queue full");
+                            return;
+                        };
+                    }
                     ctx.stream.complete({});
                     return;
                 }
@@ -353,22 +408,24 @@ pub const AsyncStdioReceiver = struct {
 
             if (bytes_read == 0) {
                 // EOF - send any remaining data
-                if (ctx.leftover.items.len > 0) {
-                    const chunk = transport.ByteChunk{
-                        .data = ctx.allocator.dupe(u8, ctx.leftover.items) catch {
-                            ctx.stream.completeWithError("Out of memory");
-                            return;
-                        },
-                        .owned = true,
+                if (ctx.framer.takeEof(ctx.allocator) catch {
+                    ctx.stream.completeWithError("Out of memory");
+                    return;
+                }) |line| {
+                    const chunk = transport.ByteChunk{ .data = line, .owned = true };
+                    ctx.stream.push(chunk) catch {
+                        var owned_chunk = chunk;
+                        owned_chunk.deinit(ctx.allocator);
+                        ctx.stream.completeWithError("Stream queue full");
+                        return;
                     };
-                    ctx.stream.push(chunk) catch {};
                 }
                 ctx.stream.complete({});
                 return;
             }
 
-            ctx.leftover.appendSlice(ctx.allocator, ctx.read_buf[0..bytes_read]) catch {
-                ctx.stream.completeWithError("Out of memory");
+            ctx.framer.append(ctx.read_buf[0..bytes_read]) catch |err| {
+                ctx.stream.completeWithError(if (err == error.LineTooLarge) "stdio line too large" else "Out of memory");
                 return;
             };
         }
@@ -380,33 +437,108 @@ pub const AsyncStdioReceiver = struct {
     // Keep backward-compatible blocking read
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        var leftover = std.ArrayList(u8).empty;
-        defer leftover.deinit(allocator);
-        var read_buf: [4096]u8 = undefined;
+        var framer = LineFramer.init(allocator, self.line_limit);
+        defer framer.deinit();
+        // This compatibility callback has no persistent state between calls, so
+        // read one byte at a time to avoid consuming bytes from the next line.
+        var read_buf: [1]u8 = undefined;
 
         while (true) {
             // Check for complete line
-            if (std.mem.findScalar(u8, leftover.items, '\n')) |nl_pos| {
-                const line = try allocator.dupe(u8, leftover.items[0..nl_pos]);
-                return line;
-            }
+            if (try framer.takeLine(allocator)) |line| return line;
 
             // Read more data
-            const bytes_read = compat.stdio.read(self.file, &read_buf) catch return null;
+            const bytes_read = compat.stdio.read(self.file, &read_buf) catch |err| {
+                if (err == error.EndOfStream) return try framer.takeEof(allocator);
+                return null;
+            };
             if (bytes_read == 0) {
                 // EOF - return remaining data if any
-                if (leftover.items.len > 0) {
-                    return try allocator.dupe(u8, leftover.items);
-                }
-                return null;
+                return try framer.takeEof(allocator);
             }
 
-            try leftover.appendSlice(allocator, read_buf[0..bytes_read]);
+            try framer.append(read_buf[0..bytes_read]);
         }
     }
 };
 
 // Tests
+
+test "LineFramer bounds logical lines independent of chunking" {
+    const allocator = std.testing.allocator;
+    var framer = LineFramer.init(allocator, 4);
+    defer framer.deinit();
+
+    try framer.append("ab");
+    try framer.append("cd\n");
+    const exact = (try framer.takeLine(allocator)).?;
+    defer allocator.free(exact);
+    try std.testing.expectEqualStrings("abcd", exact);
+
+    try framer.append("a\nbb\nccc\n");
+    const first = (try framer.takeLine(allocator)).?;
+    defer allocator.free(first);
+    const second = (try framer.takeLine(allocator)).?;
+    defer allocator.free(second);
+    const third = (try framer.takeLine(allocator)).?;
+    defer allocator.free(third);
+    try std.testing.expectEqualStrings("a", first);
+    try std.testing.expectEqualStrings("bb", second);
+    try std.testing.expectEqualStrings("ccc", third);
+
+    try framer.append("tail");
+    const eof_line = (try framer.takeEof(allocator)).?;
+    defer allocator.free(eof_line);
+    try std.testing.expectEqualStrings("tail", eof_line);
+}
+
+test "LineFramer rejects one byte over without consuming it" {
+    const allocator = std.testing.allocator;
+    var framer = LineFramer.init(allocator, 4);
+    defer framer.deinit();
+
+    try framer.append("abcd");
+    try std.testing.expectError(error.LineTooLarge, framer.append("e"));
+    const retained = (try framer.takeEof(allocator)).?;
+    defer allocator.free(retained);
+    try std.testing.expectEqualStrings("abcd", retained);
+}
+
+test "StdioReceiver surfaces a recoverable logical line limit" {
+    const allocator = std.testing.allocator;
+    const pipe = try compat.stdio.pipe();
+    defer compat.stdio.close(pipe[0]);
+
+    var receiver_impl = StdioReceiver.initWithFileAndLimit(pipe[0], allocator, 4);
+    defer receiver_impl.deinit();
+    var receiver = receiver_impl.receiver();
+
+    try compat.stdio.writeAll(pipe[1], "abcde\n");
+    compat.stdio.close(pipe[1]);
+    try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
+}
+
+test "AsyncStdioReceiver compatibility read preserves coalesced lines" {
+    const allocator = std.testing.allocator;
+    const pipe = try compat.stdio.pipe();
+    defer compat.stdio.close(pipe[0]);
+
+    var receiver_impl = AsyncStdioReceiver.initWithFileAndLimit(pipe[0], 4);
+    var receiver = receiver_impl.receiver();
+    try compat.stdio.writeAll(pipe[1], "a\nbb\ntail");
+    compat.stdio.close(pipe[1]);
+
+    const first = (try receiver.read(allocator)).?;
+    defer allocator.free(first);
+    const second = (try receiver.read(allocator)).?;
+    defer allocator.free(second);
+    const eof_line = (try receiver.read(allocator)).?;
+    defer allocator.free(eof_line);
+    try std.testing.expectEqualStrings("a", first);
+    try std.testing.expectEqualStrings("bb", second);
+    try std.testing.expectEqualStrings("tail", eof_line);
+    try std.testing.expect((try receiver.read(allocator)) == null);
+}
 
 test "StdioSender and StdioReceiver round-trip via pipe" {
     const allocator = std.testing.allocator;
