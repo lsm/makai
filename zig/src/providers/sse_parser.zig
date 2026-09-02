@@ -149,7 +149,9 @@ pub const SSEParser = struct {
 
     fn appendLineByte(self: *SSEParser, byte: u8) !void {
         if (self.line_buffer.items.len >= self.limits.line_bytes) return error.LineTooLarge;
-        try self.line_buffer.append(self.allocator, byte);
+        const new_len = std.math.add(usize, self.line_buffer.items.len, 1) catch return error.LineTooLarge;
+        try self.line_buffer.ensureTotalCapacityPrecise(self.allocator, new_len);
+        self.line_buffer.appendAssumeCapacity(byte);
     }
 
     fn setEventType(self: *SSEParser, event_type: []const u8) !void {
@@ -171,8 +173,11 @@ pub const SSEParser = struct {
             return error.EventTooLarge;
         }
 
-        if (separator_len != 0) try self.current_data.append(self.allocator, '\n');
-        try self.current_data.appendSlice(self.allocator, value);
+        const with_separator = std.math.add(usize, data_len, separator_len) catch return error.EventTooLarge;
+        const new_len = std.math.add(usize, with_separator, value.len) catch return error.EventTooLarge;
+        try self.current_data.ensureTotalCapacityPrecise(self.allocator, new_len);
+        if (separator_len != 0) self.current_data.appendAssumeCapacity('\n');
+        self.current_data.appendSliceAssumeCapacity(value);
     }
 };
 
