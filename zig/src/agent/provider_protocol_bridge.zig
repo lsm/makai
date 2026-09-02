@@ -107,7 +107,7 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
 
 fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const u8 {
     return switch (level) {
-        .off => if (std.mem.startsWith(u8, model_id, "gpt-5.1")) "none" else "low",
+        .off => if (isGpt51OrLater(model_id)) "none" else "low",
         .minimal => "low",
         .low => "low",
         .medium => "medium",
@@ -116,6 +116,18 @@ fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const 
         // families reject the request outright, so clamp to high.
         .xhigh => if (supportsXhighReasoning(model_id)) "xhigh" else "high",
     };
+}
+
+/// Whether the model supports the `none` reasoning effort: per the bundled
+/// OpenAI specification (docs/openai/responses.md), `none` is available on
+/// GPT models from gpt-5.1 onward; earlier families only take low/medium/
+/// high and default to medium.
+fn isGpt51OrLater(model_id: []const u8) bool {
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '1';
 }
 
 /// Whether the model family accepts the `xhigh` reasoning effort. Per the
@@ -400,6 +412,12 @@ test "provider protocol bridge maps thinking level to stream options" {
 
     const codex_max = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.1-codex-max", null, null);
     try std.testing.expectEqualStrings("xhigh", codex_max.getReasoningEffort().?);
+
+    // Post-5.1 families accept none; pre-5.1 families do not.
+    const gpt52_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("none", gpt52_off.getReasoningEffort().?);
+    const gpt5_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5", null, null);
+    try std.testing.expectEqualStrings("low", gpt5_off.getReasoningEffort().?);
 
     const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.1", null, null);
     try std.testing.expect(!off.thinking_enabled);

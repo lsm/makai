@@ -977,12 +977,14 @@ fn transparentProxyCompatForFlags(provider_id: []const u8, flags: ProxyCompatFla
         };
     }
     if (std.mem.eql(u8, provider_id, "deepseek") and (if (flags.global_base_set) flags.global_proxy else flags.deepseek_proxy)) {
-        // A transparent DeepSeek proxy preserves the canonical DeepSeek API,
-        // which takes token limits via max_tokens (not OpenAI's
-        // max_completion_tokens default inherited by a partial compat value).
+        // A transparent DeepSeek proxy preserves the canonical DeepSeek API:
+        // token limits via max_tokens (not OpenAI's max_completion_tokens
+        // default inherited by a partial compat value) and no tool strict
+        // mode, matching the detected-capability path for api.deepseek.com.
         return .{
             .requires_thinking_as_text = true,
             .max_tokens_field = .max_tokens,
+            .supports_strict_mode = false,
         };
     }
     if (std.mem.eql(u8, provider_id, "anthropic") and (if (flags.global_base_set) flags.global_proxy else flags.anthropic_proxy)) {
@@ -4351,6 +4353,7 @@ test "transparent proxy compat preserves vendor token-limit fields" {
     try std.testing.expect(deepseek != null);
     try std.testing.expectEqual(@as(?bool, true), deepseek.?.requires_thinking_as_text);
     try std.testing.expectEqual(@as(@TypeOf(deepseek.?.max_tokens_field), .max_tokens), deepseek.?.max_tokens_field);
+    try std.testing.expectEqual(@as(?bool, false), deepseek.?.supports_strict_mode);
 
     // The global proxy flag governs when MAKAI_BASE_URL supplies the endpoint.
     const deepseek_global = transparentProxyCompatForFlags("deepseek", .{
