@@ -5,11 +5,15 @@ const transport = @import("transport");
 pub const default_line_bytes: usize = 1024 * 1024;
 
 const LineFramer = struct {
+    const Outcome = union(enum) {
+        line: []u8,
+        line_too_large,
+    };
+
     buffer: std.ArrayList(u8) = .empty,
+    outcomes: std.ArrayList(Outcome) = .empty,
     allocator: std.mem.Allocator,
     limit: usize,
-    current_line_start: usize = 0,
-    current_line_len: usize = 0,
     discarding_line: bool = false,
 
     fn init(allocator: std.mem.Allocator, limit: usize) LineFramer {
@@ -18,55 +22,62 @@ const LineFramer = struct {
 
     fn deinit(self: *LineFramer) void {
         self.buffer.deinit(self.allocator);
+        for (self.outcomes.items) |outcome| switch (outcome) {
+            .line => |line| self.allocator.free(line),
+            .line_too_large => {},
+        };
+        self.outcomes.deinit(self.allocator);
     }
 
     fn append(self: *LineFramer, bytes: []const u8) !void {
-        var line_too_large = false;
         for (bytes) |byte| {
             if (self.discarding_line) {
                 if (byte == '\n') {
                     self.discarding_line = false;
-                    self.current_line_start = self.buffer.items.len;
-                    self.current_line_len = 0;
+                    try self.outcomes.append(self.allocator, .line_too_large);
                 }
                 continue;
             }
 
             if (byte == '\n') {
-                try self.buffer.append(self.allocator, byte);
-                self.current_line_start = self.buffer.items.len;
-                self.current_line_len = 0;
+                try self.queueCurrentLine();
             } else {
-                if (self.current_line_len >= self.limit) {
-                    self.buffer.shrinkRetainingCapacity(self.current_line_start);
+                if (self.buffer.items.len >= self.limit) {
+                    self.buffer.clearRetainingCapacity();
                     self.discarding_line = true;
-                    line_too_large = true;
                     continue;
                 }
                 try self.buffer.append(self.allocator, byte);
-                self.current_line_len += 1;
             }
         }
-        if (line_too_large) return error.LineTooLarge;
     }
 
     fn takeLine(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
-        const nl_pos = std.mem.findScalar(u8, self.buffer.items, '\n') orelse return null;
-        const line = try allocator.dupe(u8, self.buffer.items[0..nl_pos]);
-        const remaining = self.buffer.items[nl_pos + 1 ..];
-        std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
-        self.buffer.shrinkRetainingCapacity(remaining.len);
-        self.current_line_start -= nl_pos + 1;
-        return line;
+        if (self.outcomes.items.len == 0) return null;
+        return switch (self.outcomes.orderedRemove(0)) {
+            .line => |line| blk: {
+                defer self.allocator.free(line);
+                break :blk try allocator.dupe(u8, line);
+            },
+            .line_too_large => error.LineTooLarge,
+        };
     }
 
     fn takeEof(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
-        if (self.buffer.items.len == 0) return null;
-        const line = try allocator.dupe(u8, self.buffer.items);
+        if (self.discarding_line) {
+            self.discarding_line = false;
+            try self.outcomes.append(self.allocator, .line_too_large);
+        } else if (self.buffer.items.len > 0) {
+            try self.queueCurrentLine();
+        }
+        return self.takeLine(allocator);
+    }
+
+    fn queueCurrentLine(self: *LineFramer) !void {
+        const line = try self.allocator.dupe(u8, self.buffer.items);
+        errdefer self.allocator.free(line);
+        try self.outcomes.append(self.allocator, .{ .line = line });
         self.buffer.clearRetainingCapacity();
-        self.current_line_start = 0;
-        self.current_line_len = 0;
-        return line;
     }
 };
 
@@ -385,8 +396,8 @@ pub const AsyncStdioReceiver = struct {
 
         while (!ctx.cancel_token.load(.acquire)) {
             // Check for complete line in leftover
-            if (ctx.framer.takeLine(ctx.allocator) catch {
-                ctx.stream.completeWithError("Out of memory");
+            if (ctx.framer.takeLine(ctx.allocator) catch |err| {
+                ctx.stream.completeWithError(if (err == error.LineTooLarge) "stdio line too large" else "Out of memory");
                 return;
             }) |line| {
                 const chunk = transport.ByteChunk{ .data = line, .owned = true };
@@ -406,8 +417,8 @@ pub const AsyncStdioReceiver = struct {
                     continue;
                 }
                 if (err == error.EndOfStream) {
-                    if (ctx.framer.takeEof(ctx.allocator) catch {
-                        ctx.stream.completeWithError("Out of memory");
+                    if (ctx.framer.takeEof(ctx.allocator) catch |framing_err| {
+                        ctx.stream.completeWithError(if (framing_err == error.LineTooLarge) "stdio line too large" else "Out of memory");
                         return;
                     }) |line| {
                         const chunk = transport.ByteChunk{ .data = line, .owned = true };
@@ -427,8 +438,8 @@ pub const AsyncStdioReceiver = struct {
 
             if (bytes_read == 0) {
                 // EOF - send any remaining data
-                if (ctx.framer.takeEof(ctx.allocator) catch {
-                    ctx.stream.completeWithError("Out of memory");
+                if (ctx.framer.takeEof(ctx.allocator) catch |framing_err| {
+                    ctx.stream.completeWithError(if (framing_err == error.LineTooLarge) "stdio line too large" else "Out of memory");
                     return;
                 }) |line| {
                     const chunk = transport.ByteChunk{ .data = line, .owned = true };
@@ -443,33 +454,14 @@ pub const AsyncStdioReceiver = struct {
                 return;
             }
 
-            ctx.framer.append(ctx.read_buf[0..bytes_read]) catch |err| {
-                if (err == error.LineTooLarge) {
-                    pushAvailableLines(ctx) catch |push_err| {
-                        ctx.stream.completeWithError(if (push_err == error.OutOfMemory) "Out of memory" else "Stream queue full");
-                        return;
-                    };
-                    ctx.stream.completeWithError("stdio line too large");
-                } else {
-                    ctx.stream.completeWithError("Out of memory");
-                }
+            ctx.framer.append(ctx.read_buf[0..bytes_read]) catch {
+                ctx.stream.completeWithError("Out of memory");
                 return;
             };
         }
 
         // Cancelled - complete the stream with an error
         ctx.stream.completeWithError("Cancelled");
-    }
-
-    fn pushAvailableLines(ctx: *ProducerContext) !void {
-        while (try ctx.framer.takeLine(ctx.allocator)) |line| {
-            const chunk = transport.ByteChunk{ .data = line, .owned = true };
-            ctx.stream.push(chunk) catch {
-                var owned_chunk = chunk;
-                owned_chunk.deinit(ctx.allocator);
-                return error.QueueFull;
-            };
-        }
     }
 
     // Keep backward-compatible blocking read
@@ -535,9 +527,11 @@ test "LineFramer discards an oversized line and preserves neighbors" {
     var framer = LineFramer.init(allocator, 4);
     defer framer.deinit();
 
-    try std.testing.expectError(error.LineTooLarge, framer.append("ok\nabcde\nnext\n"));
+    try framer.append("ok\nabcde\nbadbad\nnext\n");
     const before = (try framer.takeLine(allocator)).?;
     defer allocator.free(before);
+    try std.testing.expectError(error.LineTooLarge, framer.takeLine(allocator));
+    try std.testing.expectError(error.LineTooLarge, framer.takeLine(allocator));
     const after = (try framer.takeLine(allocator)).?;
     defer allocator.free(after);
     try std.testing.expectEqualStrings("ok", before);
@@ -545,8 +539,8 @@ test "LineFramer discards an oversized line and preserves neighbors" {
     try std.testing.expect((try framer.takeEof(allocator)) == null);
 
     try framer.append("abcd");
-    try std.testing.expectError(error.LineTooLarge, framer.append("e"));
-    try std.testing.expect((try framer.takeEof(allocator)) == null);
+    try framer.append("e");
+    try std.testing.expectError(error.LineTooLarge, framer.takeEof(allocator));
 }
 
 test "StdioReceiver surfaces a recoverable logical line limit" {
@@ -558,11 +552,12 @@ test "StdioReceiver surfaces a recoverable logical line limit" {
     defer receiver_impl.deinit();
     var receiver = receiver_impl.receiver();
 
-    try compat.stdio.writeAll(pipe[1], "ok\nabcde\nnext\n");
+    try compat.stdio.writeAll(pipe[1], "ok\nabcde\nbadbad\nnext\n");
     compat.stdio.close(pipe[1]);
-    try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
     const before = (try receiver.read(allocator)).?;
     defer allocator.free(before);
+    try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
+    try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
     const after = (try receiver.read(allocator)).?;
     defer allocator.free(after);
     try std.testing.expectEqualStrings("ok", before);
@@ -576,11 +571,12 @@ test "AsyncStdioReceiver compatibility read preserves coalesced lines" {
 
     var receiver_impl = AsyncStdioReceiver.initWithFileAndLimit(pipe[0], 4);
     var receiver = receiver_impl.receiver();
-    try compat.stdio.writeAll(pipe[1], "a\nbb\ntail");
+    try compat.stdio.writeAll(pipe[1], "a\nabcdeFG\nbb\ntail");
     compat.stdio.close(pipe[1]);
 
     const first = (try receiver.read(allocator)).?;
     defer allocator.free(first);
+    try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
     const second = (try receiver.read(allocator)).?;
     defer allocator.free(second);
     const eof_line = (try receiver.read(allocator)).?;
