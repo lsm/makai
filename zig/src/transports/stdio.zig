@@ -8,6 +8,9 @@ const LineFramer = struct {
     buffer: std.ArrayList(u8) = .empty,
     allocator: std.mem.Allocator,
     limit: usize,
+    current_line_start: usize = 0,
+    current_line_len: usize = 0,
+    discarding_line: bool = false,
 
     fn init(allocator: std.mem.Allocator, limit: usize) LineFramer {
         return .{ .allocator = allocator, .limit = limit };
@@ -18,20 +21,33 @@ const LineFramer = struct {
     }
 
     fn append(self: *LineFramer, bytes: []const u8) !void {
-        var logical_len = if (std.mem.lastIndexOfScalar(u8, self.buffer.items, '\n')) |nl_pos|
-            self.buffer.items.len - nl_pos - 1
-        else
-            self.buffer.items.len;
-
+        var line_too_large = false;
         for (bytes) |byte| {
+            if (self.discarding_line) {
+                if (byte == '\n') {
+                    self.discarding_line = false;
+                    self.current_line_start = self.buffer.items.len;
+                    self.current_line_len = 0;
+                }
+                continue;
+            }
+
             if (byte == '\n') {
-                logical_len = 0;
+                try self.buffer.append(self.allocator, byte);
+                self.current_line_start = self.buffer.items.len;
+                self.current_line_len = 0;
             } else {
-                if (logical_len >= self.limit) return error.LineTooLarge;
-                logical_len += 1;
+                if (self.current_line_len >= self.limit) {
+                    self.buffer.shrinkRetainingCapacity(self.current_line_start);
+                    self.discarding_line = true;
+                    line_too_large = true;
+                    continue;
+                }
+                try self.buffer.append(self.allocator, byte);
+                self.current_line_len += 1;
             }
         }
-        try self.buffer.appendSlice(self.allocator, bytes);
+        if (line_too_large) return error.LineTooLarge;
     }
 
     fn takeLine(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
@@ -40,6 +56,7 @@ const LineFramer = struct {
         const remaining = self.buffer.items[nl_pos + 1 ..];
         std.mem.copyForwards(u8, self.buffer.items[0..remaining.len], remaining);
         self.buffer.shrinkRetainingCapacity(remaining.len);
+        self.current_line_start -= nl_pos + 1;
         return line;
     }
 
@@ -47,6 +64,8 @@ const LineFramer = struct {
         if (self.buffer.items.len == 0) return null;
         const line = try allocator.dupe(u8, self.buffer.items);
         self.buffer.clearRetainingCapacity();
+        self.current_line_start = 0;
+        self.current_line_len = 0;
         return line;
     }
 };
@@ -425,13 +444,32 @@ pub const AsyncStdioReceiver = struct {
             }
 
             ctx.framer.append(ctx.read_buf[0..bytes_read]) catch |err| {
-                ctx.stream.completeWithError(if (err == error.LineTooLarge) "stdio line too large" else "Out of memory");
+                if (err == error.LineTooLarge) {
+                    pushAvailableLines(ctx) catch |push_err| {
+                        ctx.stream.completeWithError(if (push_err == error.OutOfMemory) "Out of memory" else "Stream queue full");
+                        return;
+                    };
+                    ctx.stream.completeWithError("stdio line too large");
+                } else {
+                    ctx.stream.completeWithError("Out of memory");
+                }
                 return;
             };
         }
 
         // Cancelled - complete the stream with an error
         ctx.stream.completeWithError("Cancelled");
+    }
+
+    fn pushAvailableLines(ctx: *ProducerContext) !void {
+        while (try ctx.framer.takeLine(ctx.allocator)) |line| {
+            const chunk = transport.ByteChunk{ .data = line, .owned = true };
+            ctx.stream.push(chunk) catch {
+                var owned_chunk = chunk;
+                owned_chunk.deinit(ctx.allocator);
+                return error.QueueFull;
+            };
+        }
     }
 
     // Keep backward-compatible blocking read
@@ -492,16 +530,23 @@ test "LineFramer bounds logical lines independent of chunking" {
     try std.testing.expectEqualStrings("tail", eof_line);
 }
 
-test "LineFramer rejects one byte over without consuming it" {
+test "LineFramer discards an oversized line and preserves neighbors" {
     const allocator = std.testing.allocator;
     var framer = LineFramer.init(allocator, 4);
     defer framer.deinit();
 
+    try std.testing.expectError(error.LineTooLarge, framer.append("ok\nabcde\nnext\n"));
+    const before = (try framer.takeLine(allocator)).?;
+    defer allocator.free(before);
+    const after = (try framer.takeLine(allocator)).?;
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("ok", before);
+    try std.testing.expectEqualStrings("next", after);
+    try std.testing.expect((try framer.takeEof(allocator)) == null);
+
     try framer.append("abcd");
     try std.testing.expectError(error.LineTooLarge, framer.append("e"));
-    const retained = (try framer.takeEof(allocator)).?;
-    defer allocator.free(retained);
-    try std.testing.expectEqualStrings("abcd", retained);
+    try std.testing.expect((try framer.takeEof(allocator)) == null);
 }
 
 test "StdioReceiver surfaces a recoverable logical line limit" {
@@ -513,9 +558,15 @@ test "StdioReceiver surfaces a recoverable logical line limit" {
     defer receiver_impl.deinit();
     var receiver = receiver_impl.receiver();
 
-    try compat.stdio.writeAll(pipe[1], "abcde\n");
+    try compat.stdio.writeAll(pipe[1], "ok\nabcde\nnext\n");
     compat.stdio.close(pipe[1]);
     try std.testing.expectError(error.LineTooLarge, receiver.read(allocator));
+    const before = (try receiver.read(allocator)).?;
+    defer allocator.free(before);
+    const after = (try receiver.read(allocator)).?;
+    defer allocator.free(after);
+    try std.testing.expectEqualStrings("ok", before);
+    try std.testing.expectEqualStrings("next", after);
 }
 
 test "AsyncStdioReceiver compatibility read preserves coalesced lines" {
