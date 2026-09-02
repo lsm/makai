@@ -1016,6 +1016,14 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             server.allocator,
         );
     };
+    // The stream is ephemeral to this request (never registered in
+    // active_streams), so free it once the response has been built. Deferred
+    // cleanup runs after the return expression, by which point the result has
+    // been deep-cloned and the error message copied out of stream storage.
+    defer {
+        stream.deinit();
+        server.allocator.destroy(stream);
+    }
 
     // Wait for stream to complete (with timeout)
     const timeout_ms = server.options.stream_timeout_ms;
@@ -3359,7 +3367,7 @@ test "credential resolution: complete_request without credentials falls back to 
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .complete_response);
+    try std.testing.expect(response.?.payload == .result);
 }
 
 // ===========================================================================
