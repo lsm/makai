@@ -191,6 +191,9 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
+        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.write_mutex.unlock();
+
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         const stream = self.tcp_stream orelse {
             self.mutex.unlock();
@@ -199,8 +202,6 @@ pub const WebSocketClient = struct {
         var writable = stream;
         self.mutex.unlock();
 
-        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.write_mutex.unlock();
         try writable.writeAll(encoded);
     }
 
@@ -385,6 +386,8 @@ pub const WebSocketClient = struct {
             var closable = stream;
             // Hold the write mutex around the close-frame write and socket close
             // so they cannot interleave with an in-flight message/pong frame.
+            while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.write_mutex.unlock();
             if (send_close_frame) {
                 const close_frame = Frame{
                     .opcode = .close,
@@ -394,8 +397,6 @@ pub const WebSocketClient = struct {
                 };
                 if (encodeFrame(close_frame, self.allocator)) |encoded| {
                     defer self.allocator.free(encoded);
-                    while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
-                    defer self.write_mutex.unlock();
                     closable.writeAll(encoded) catch {}; // Ignore errors on close
                 } else |_| {}
             }
@@ -458,6 +459,9 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
+        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.write_mutex.unlock();
+
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         const stream = self.tcp_stream orelse {
             self.mutex.unlock();
@@ -466,8 +470,6 @@ pub const WebSocketClient = struct {
         var writable = stream;
         self.mutex.unlock();
 
-        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
-        defer self.write_mutex.unlock();
         try writable.writeAll(encoded);
     }
 
