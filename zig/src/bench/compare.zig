@@ -5,6 +5,8 @@ const Report = struct {
     schema_version: u32,
     host_class: []const u8,
     target: []const u8,
+    cpu_model: []const u8,
+    cpu_features_hash: u64,
     zig_version: []const u8,
     optimize: []const u8,
     mode: []const u8,
@@ -25,7 +27,7 @@ const Report = struct {
 };
 
 fn validate(report: Report) !void {
-    if (report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
+    if (report.schema_version != 1 or report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
     const metrics = [_]?usize{ report.allocation_count, report.free_count, report.allocated_bytes, report.freed_bytes, report.peak_live_bytes, report.leak_bytes };
     if (std.mem.eql(u8, report.mode, "allocation")) {
         for (metrics) |metric| if (metric == null) return error.InvalidReport;
@@ -45,6 +47,8 @@ fn expectCompatible(baseline: Report, candidate: Report) !void {
         baseline.completed_per_iteration != candidate.completed_per_iteration or
         !std.mem.eql(u8, baseline.host_class, candidate.host_class) or
         !std.mem.eql(u8, baseline.target, candidate.target) or
+        !std.mem.eql(u8, baseline.cpu_model, candidate.cpu_model) or
+        baseline.cpu_features_hash != candidate.cpu_features_hash or
         !std.mem.eql(u8, baseline.zig_version, candidate.zig_version) or
         !std.mem.eql(u8, baseline.optimize, candidate.optimize) or
         !std.mem.eql(u8, baseline.mode, candidate.mode) or
@@ -53,7 +57,13 @@ fn expectCompatible(baseline: Report, candidate: Report) !void {
     if (baseline.digest != candidate.digest) return error.SemanticMismatch;
 }
 
-fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidate_line: []const u8) !void {
+fn workloadIndex(workload: []const u8) !usize {
+    if (std.mem.eql(u8, workload, "sse_parse")) return 0;
+    if (std.mem.eql(u8, workload, "transport_round_trip")) return 1;
+    return error.InvalidReport;
+}
+
+fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidate_line: []const u8) !usize {
     const baseline = try std.json.parseFromSlice(Report, allocator, baseline_line, .{ .ignore_unknown_fields = false });
     defer baseline.deinit();
     const candidate = try std.json.parseFromSlice(Report, allocator, candidate_line, .{ .ignore_unknown_fields = false });
@@ -66,19 +76,25 @@ fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidat
         if (work == 0) return error.InvalidReport;
         const baseline_per_work = @as(f64, @floatFromInt(baseline_bytes)) / @as(f64, @floatFromInt(work));
         const candidate_per_work = @as(f64, @floatFromInt(candidate_bytes)) / @as(f64, @floatFromInt(work));
-        break :blk if (baseline_per_work == 0) 0 else (candidate_per_work / baseline_per_work - 1) * 100;
+        break :blk if (baseline_per_work == 0) null else (candidate_per_work / baseline_per_work - 1) * 100;
     } else null;
 
     const latency_change = (@as(f64, @floatFromInt(candidate.value.ns_per_iteration)) /
         @as(f64, @floatFromInt(baseline.value.ns_per_iteration)) - 1) * 100;
-    const allocation_text = if (allocation_change) |change|
-        try std.fmt.allocPrint(allocator, "{d:.2}%", .{change})
+    const allocation_text = if (baseline.value.allocated_bytes) |baseline_bytes|
+        if (baseline_bytes == 0 and candidate.value.allocated_bytes.? > 0)
+            try allocator.dupe(u8, "introduced")
+        else if (allocation_change) |change|
+            try std.fmt.allocPrint(allocator, "{d:.2}%", .{change})
+        else
+            try allocator.dupe(u8, "0.00%")
     else
         try allocator.dupe(u8, "unavailable");
     defer allocator.free(allocation_text);
     const output = try std.fmt.allocPrint(allocator, "{s}: latency {d:.2}%, allocated bytes/work {s}\n", .{ baseline.value.workload, latency_change, allocation_text });
     defer allocator.free(output);
     try std.Io.File.stdout().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), output);
+    return workloadIndex(baseline.value.workload);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -93,11 +109,15 @@ pub fn main(init: std.process.Init) !void {
 
     var baseline_lines = std.mem.tokenizeScalar(u8, baseline_data, '\n');
     var candidate_lines = std.mem.tokenizeScalar(u8, candidate_data, '\n');
+    var seen = [_]bool{ false, false };
     while (baseline_lines.next()) |baseline_line| {
         const candidate_line = candidate_lines.next() orelse return error.IncompatibleReports;
-        try compareLine(allocator, baseline_line, candidate_line);
+        const workload_index = try compareLine(allocator, baseline_line, candidate_line);
+        if (seen[workload_index]) return error.InvalidReport;
+        seen[workload_index] = true;
     }
     if (candidate_lines.next() != null) return error.IncompatibleReports;
+    if (!seen[0] or !seen[1]) return error.InvalidReport;
 }
 
 test "comparison rejects incompatible identity" {
@@ -106,6 +126,8 @@ test "comparison rejects incompatible identity" {
         .schema_version = 1,
         .host_class = "ci-arm64",
         .target = "aarch64-linux",
+        .cpu_model = "generic",
+        .cpu_features_hash = 7,
         .zig_version = "0.16.0",
         .optimize = "ReleaseFast",
         .mode = "allocation",
@@ -137,5 +159,8 @@ test "comparison rejects incompatible identity" {
     try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
     candidate = baseline;
     candidate.mode = "latency";
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.schema_version = 2;
     try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
 }

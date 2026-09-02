@@ -18,6 +18,16 @@ const Result = struct {
     digest: u64,
 };
 
+fn digestField(digest: *std.hash.Wyhash, tag: u8, value: ?[]const u8) void {
+    digest.update(&.{tag});
+    if (value) |bytes| {
+        digest.update(&.{1});
+        const len: u64 = bytes.len;
+        digest.update(std.mem.asBytes(&len));
+        digest.update(bytes);
+    } else digest.update(&.{0});
+}
+
 fn runSse(allocator: std.mem.Allocator) !Result {
     var parser = sse.SSEParser.init(allocator);
     defer parser.deinit();
@@ -30,8 +40,8 @@ fn runSse(allocator: std.mem.Allocator) !Result {
         const end = @min(sse_fixture.len, offset + chunks[chunk_index % chunks.len]);
         for (try parser.feed(sse_fixture[offset..end])) |event| {
             completed += 1;
-            if (event.event_type) |event_type| digest.update(event_type);
-            digest.update(event.data);
+            digestField(&digest, 0xE0, event.event_type);
+            digestField(&digest, 0xD0, event.data);
         }
         offset = end;
     }
@@ -61,7 +71,7 @@ fn emitWorkload(
     comptime workload: fn (std.mem.Allocator) anyerror!Result,
 ) !void {
     const stdout = std.Io.File.stdout();
-    var result: Result = undefined;
+    const expected = try workload(allocator);
     var raw_samples = std.ArrayList(u8).empty;
     defer raw_samples.deinit(allocator);
     var elapsed_total: u64 = 0;
@@ -69,7 +79,11 @@ fn emitWorkload(
     while (sample_index < samples) : (sample_index += 1) {
         const start_ns = try compat.time.monotonicNanos();
         var i: usize = 0;
-        while (i < iterations) : (i += 1) result = try workload(allocator);
+        while (i < iterations) : (i += 1) {
+            const result = try workload(allocator);
+            if (result.completed != expected.completed or result.digest != expected.digest) return error.SemanticMismatch;
+            std.mem.doNotOptimizeAway(result);
+        }
         const elapsed_ns = try compat.time.monotonicNanos() - start_ns;
         elapsed_total += elapsed_ns;
         if (sample_index > 0) try raw_samples.append(allocator, ',');
@@ -82,7 +96,7 @@ fn emitWorkload(
         const copy = try counter.allocator().dupe(u8, name);
         counter.allocator().free(copy);
     }
-    if (counted_result.completed != result.completed or counted_result.digest != result.digest) return error.SemanticMismatch;
+    if (counted_result.completed != expected.completed or counted_result.digest != expected.digest) return error.SemanticMismatch;
     if (counter.metrics.leakBytes() != 0) return error.BenchmarkLeak;
 
     const allocation_json = if (std.mem.eql(u8, mode, "allocation"))
@@ -91,7 +105,8 @@ fn emitWorkload(
         try allocator.dupe(u8, ",\"allocation_count\":null,\"free_count\":null,\"allocated_bytes\":null,\"freed_bytes\":null,\"peak_live_bytes\":null,\"leak_bytes\":null");
     defer allocator.free(allocation_json);
 
-    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"host_class\":\"{s}\",\"target\":\"{s}-{s}\",\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d}{s}}}\n", .{ host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, result.completed, result.digest, raw_samples.items, elapsed_total / samples / iterations, allocation_json });
+    const cpu_features_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&builtin.target.cpu.features));
+    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"host_class\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"cpu_model\":\"{s}\",\"cpu_features_hash\":{d},\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d}{s}}}\n", .{ host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), @tagName(builtin.target.abi), builtin.target.cpu.model.name, cpu_features_hash, builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, expected.completed, expected.digest, raw_samples.items, elapsed_total / samples / iterations, allocation_json });
     defer allocator.free(line);
     try stdout.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), line);
 }
@@ -123,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
             extra_copy = true;
         } else return error.InvalidArgument;
     }
-    if (iterations == 0 or samples == 0) return error.InvalidArgument;
+    if (iterations == 0 or samples == 0 or samples > 10_000) return error.InvalidArgument;
     if (!std.mem.eql(u8, mode, "latency") and !std.mem.eql(u8, mode, "allocation")) return error.InvalidMode;
     if (host_class.len == 0) return error.InvalidHostClass;
     for (host_class) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') return error.InvalidHostClass;
