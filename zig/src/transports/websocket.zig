@@ -218,10 +218,7 @@ pub const WebSocketClient = struct {
         while (true) {
             // Try to decode a frame from existing buffer
             const decoded = decodeFrameWithLimit(self.recv_buffer.items, self.limits.frame_payload_bytes) catch |err| {
-                // Unblock any concurrent write before close takes ownership of
-                // the socket and waits for write_mutex.
-                self.abort();
-                self.close();
+                self.terminateReceive();
                 return err;
             };
             if (decoded) |result| {
@@ -255,8 +252,14 @@ pub const WebSocketClient = struct {
                         continue;
                     },
                     .text, .binary => {
-                        if (self.fragment_opcode != null) return error.ProtocolError;
-                        if (frame.fin) return try allocator.dupe(u8, owned_payload);
+                        if (self.fragment_opcode != null) {
+                            self.terminateReceive();
+                            return error.ProtocolError;
+                        }
+                        if (frame.fin) {
+                            if (owned_payload.len > self.limits.message_bytes) return error.MessageTooLarge;
+                            return try allocator.dupe(u8, owned_payload);
+                        }
                         self.fragment_buffer.clearRetainingCapacity();
                         self.appendFragment(owned_payload) catch |err| {
                             self.resetFragments();
@@ -266,7 +269,10 @@ pub const WebSocketClient = struct {
                         continue;
                     },
                     .continuation => {
-                        if (self.fragment_opcode == null) return error.ProtocolError;
+                        if (self.fragment_opcode == null) {
+                            self.terminateReceive();
+                            return error.ProtocolError;
+                        }
                         self.appendFragment(owned_payload) catch |err| {
                             self.resetFragments();
                             return err;
@@ -282,6 +288,12 @@ pub const WebSocketClient = struct {
             }
 
             // Need more data - read from stream
+            const available = self.limits.receive_buffer_bytes -| self.recv_buffer.items.len;
+            if (available == 0) {
+                self.terminateReceive();
+                return error.ReceiveBufferTooLarge;
+            }
+
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             const stream = self.tcp_stream orelse {
                 self.mutex.unlock();
@@ -291,8 +303,6 @@ pub const WebSocketClient = struct {
             self.mutex.unlock();
 
             var read_buf: [4096]u8 = undefined;
-            const available = self.limits.receive_buffer_bytes -| self.recv_buffer.items.len;
-            if (available == 0) return error.ReceiveBufferTooLarge;
             const bytes_read = readable.read(read_buf[0..@min(read_buf.len, available)]) catch |err| {
                 while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
                 defer self.mutex.unlock();
@@ -341,6 +351,13 @@ pub const WebSocketClient = struct {
     fn resetFragments(self: *Self) void {
         self.fragment_buffer.clearRetainingCapacity();
         self.fragment_opcode = null;
+    }
+
+    fn terminateReceive(self: *Self) void {
+        // Unblock any concurrent write before close takes ownership of the
+        // socket and waits for write_mutex.
+        self.abort();
+        self.close();
     }
 
     fn ensureBoundedCapacity(self: *Self, buffer: *std.ArrayList(u8), needed: usize, limit: usize) !void {
@@ -1262,6 +1279,50 @@ test "WebSocketClient closes and clears malformed receive data" {
     try client.appendReceiveBytes(&.{ 0x83, 0 });
 
     try std.testing.expectError(error.ProtocolError, client.receive(allocator));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
+}
+
+test "WebSocketClient applies message budget to complete frames" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 3,
+        .receive_buffer_bytes = 18,
+    });
+    defer client.deinit();
+    client.state = .connected;
+    try client.appendReceiveBytes(&.{ 0x81, 4, 't', 'e', 's', 't' });
+
+    try std.testing.expectError(error.MessageTooLarge, client.receive(allocator));
+}
+
+test "WebSocketClient closes on fragmented sequence protocol error" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+    client.state = .connected;
+    client.fragment_opcode = .text;
+    try client.appendFragment("old");
+    try client.appendReceiveBytes(&.{ 0x81, 3, 'n', 'e', 'w' });
+
+    try std.testing.expectError(error.ProtocolError, client.receive(allocator));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expect(client.fragment_opcode == null);
+}
+
+test "WebSocketClient closes when an incomplete frame exhausts receive budget" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 3,
+        .message_bytes = 3,
+        .receive_buffer_bytes = 3,
+    });
+    defer client.deinit();
+    client.state = .connected;
+    try client.appendReceiveBytes(&.{ 0x81, 3, 'a' });
+
+    try std.testing.expectError(error.ReceiveBufferTooLarge, client.receive(allocator));
     try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
     try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
 }
