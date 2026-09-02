@@ -19,6 +19,12 @@ const compat = @import("compat");
 
 const default_subprotocol = "makai.v1";
 
+pub const Limits = struct {
+    frame_payload_bytes: usize = 1024 * 1024,
+    message_bytes: usize = 4 * 1024 * 1024,
+    receive_buffer_bytes: usize = 1024 * 1024 + 14,
+};
+
 fn defaultIo() std.Io {
     return if (@import("builtin").is_test)
         std.testing.io
@@ -44,6 +50,7 @@ pub const WebSocketClient = struct {
     recv_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
     fragment_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
     fragment_opcode: ?Opcode = null,
+    limits: Limits = .{},
 
     // Callbacks
     on_message: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
@@ -75,12 +82,17 @@ pub const WebSocketClient = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
+        return initWithLimits(allocator, .{});
+    }
+
+    pub fn initWithLimits(allocator: std.mem.Allocator, limits: Limits) Self {
         return .{
             .allocator = allocator,
             .state = .disconnected,
             .send_buffer = std.ArrayList(u8).empty,
             .recv_buffer = std.ArrayList(u8).empty,
             .fragment_buffer = std.ArrayList(u8).empty,
+            .limits = limits,
         };
     }
 
@@ -205,7 +217,7 @@ pub const WebSocketClient = struct {
         // Read frames until we have a complete message
         while (true) {
             // Try to decode a frame from existing buffer
-            if (decodeFrame(self.recv_buffer.items)) |result| {
+            if (try decodeFrameWithLimit(self.recv_buffer.items, self.limits.frame_payload_bytes)) |result| {
                 const frame = result.frame;
                 const owned_payload = try allocator.dupe(u8, frame.payload);
                 defer allocator.free(owned_payload);
@@ -236,15 +248,16 @@ pub const WebSocketClient = struct {
                         continue;
                     },
                     .text, .binary => {
+                        if (self.fragment_opcode != null) return error.ProtocolError;
                         if (frame.fin) return try allocator.dupe(u8, owned_payload);
                         self.fragment_buffer.clearRetainingCapacity();
-                        try self.fragment_buffer.appendSlice(self.allocator, owned_payload);
+                        try self.appendFragment(owned_payload);
                         self.fragment_opcode = frame.opcode;
                         continue;
                     },
                     .continuation => {
                         if (self.fragment_opcode == null) return error.ProtocolError;
-                        try self.fragment_buffer.appendSlice(self.allocator, owned_payload);
+                        try self.appendFragment(owned_payload);
                         if (!frame.fin) continue;
                         defer {
                             self.fragment_buffer.clearRetainingCapacity();
@@ -265,7 +278,9 @@ pub const WebSocketClient = struct {
             self.mutex.unlock();
 
             var read_buf: [4096]u8 = undefined;
-            const bytes_read = readable.read(&read_buf) catch |err| {
+            const available = self.limits.receive_buffer_bytes -| self.recv_buffer.items.len;
+            if (available == 0) return error.ReceiveBufferTooLarge;
+            const bytes_read = readable.read(read_buf[0..@min(read_buf.len, available)]) catch |err| {
                 while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
                 defer self.mutex.unlock();
                 if (err == error.EndOfStream) {
@@ -292,8 +307,24 @@ pub const WebSocketClient = struct {
                 return null;
             }
 
-            try self.recv_buffer.appendSlice(self.allocator, read_buf[0..bytes_read]);
+            const recv_len = self.recv_buffer.items.len + bytes_read;
+            try self.ensureBoundedCapacity(&self.recv_buffer, recv_len, self.limits.receive_buffer_bytes);
+            self.recv_buffer.appendSliceAssumeCapacity(read_buf[0..bytes_read]);
         }
+    }
+
+    fn appendFragment(self: *Self, payload: []const u8) !void {
+        if (payload.len > self.limits.message_bytes -| self.fragment_buffer.items.len) return error.MessageTooLarge;
+        const new_len = self.fragment_buffer.items.len + payload.len;
+        try self.ensureBoundedCapacity(&self.fragment_buffer, new_len, self.limits.message_bytes);
+        self.fragment_buffer.appendSliceAssumeCapacity(payload);
+    }
+
+    fn ensureBoundedCapacity(self: *Self, buffer: *std.ArrayList(u8), needed: usize, limit: usize) !void {
+        if (needed <= buffer.capacity) return;
+        const doubled = std.math.mul(usize, buffer.capacity, 2) catch limit;
+        const target = @min(limit, @max(needed, @max(@as(usize, 8), doubled)));
+        try buffer.ensureTotalCapacityPrecise(self.allocator, target);
     }
 
     /// Close the connection
@@ -805,14 +836,29 @@ pub fn encodeFrame(frame: Frame, allocator: std.mem.Allocator) ![]u8 {
 
 /// Decode a WebSocket frame from buffer, returns frame and bytes consumed
 /// Note: The returned payload is a slice into the input data
-pub fn decodeFrame(data: []const u8) ?struct { frame: Frame, consumed: usize } {
+pub const DecodedFrame = struct { frame: Frame, consumed: usize };
+
+pub fn decodeFrame(data: []const u8) ?DecodedFrame {
+    return decodeFrameWithLimit(data, std.math.maxInt(usize)) catch null;
+}
+
+pub fn decodeFrameWithLimit(data: []const u8, frame_payload_bytes: usize) !?DecodedFrame {
     if (data.len < 2) return null;
 
     const first_byte = data[0];
     const second_byte = data[1];
 
+    if ((first_byte & 0x70) != 0) return error.ProtocolError;
     const fin = (first_byte & 0x80) != 0;
-    const opcode: Opcode = @enumFromInt(first_byte & 0x0F);
+    const opcode: Opcode = switch (first_byte & 0x0F) {
+        0x0 => .continuation,
+        0x1 => .text,
+        0x2 => .binary,
+        0x8 => .close,
+        0x9 => .ping,
+        0xA => .pong,
+        else => return error.ProtocolError,
+    };
     const masked = (second_byte & 0x80) != 0;
 
     var payload_len: u64 = @as(u64, second_byte) & 0x7F;
@@ -832,6 +878,9 @@ pub fn decodeFrame(data: []const u8) ?struct { frame: Frame, consumed: usize } {
         offset = 10;
     }
 
+    if (payload_len > frame_payload_bytes or payload_len > std.math.maxInt(usize)) return error.FrameTooLarge;
+    if ((opcode == .close or opcode == .ping or opcode == .pong) and (!fin or payload_len > 125)) return error.ProtocolError;
+
     // Masking key
     const mask: ?[4]u8 = if (masked) blk: {
         if (data.len < offset + 4) return null;
@@ -841,14 +890,16 @@ pub fn decodeFrame(data: []const u8) ?struct { frame: Frame, consumed: usize } {
     } else null;
 
     // Payload
-    if (data.len < offset + payload_len) return null;
+    const payload_len_usize: usize = @intCast(payload_len);
+    const frame_end = std.math.add(usize, offset, payload_len_usize) catch return error.FrameTooLarge;
+    if (data.len < frame_end) return null;
     const payload_start = offset;
-    offset += @as(usize, @intCast(payload_len));
+    offset = frame_end;
 
     // If masked, we need to unmask - but for now just return a reference
     // The caller should handle masking if needed
     // For server->client frames, masked is typically false
-    const payload = data[payload_start..][0..@as(usize, @intCast(payload_len))];
+    const payload = data[payload_start..][0..payload_len_usize];
 
     // If the frame is masked, we need to allocate and unmask
     // For simplicity, we return the raw payload and note if it was masked
@@ -1108,6 +1159,33 @@ test "decodeFrame rejects incomplete extended length and masked payloads" {
 
     // Mask + key present, but payload byte missing
     try std.testing.expect(decodeFrame(&.{ 0x81, 0x81, 1, 2, 3, 4 }) == null);
+}
+
+test "decodeFrameWithLimit validates declared payload and opcode before buffering" {
+    const exact = [_]u8{ 0x81, 4, 't', 'e', 's', 't' };
+    const decoded = (try decodeFrameWithLimit(&exact, 4)).?;
+    try std.testing.expectEqualStrings("test", decoded.frame.payload);
+    try std.testing.expectError(error.FrameTooLarge, decodeFrameWithLimit(&exact, 3));
+
+    const declared_over = [_]u8{ 0x81, 126, 0, 5 };
+    try std.testing.expectError(error.FrameTooLarge, decodeFrameWithLimit(&declared_over, 4));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0x83, 0 }, 4));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0xC1, 0 }, 4));
+}
+
+test "WebSocketClient fragmented message budget accepts exact and rejects one over" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 6,
+        .receive_buffer_bytes = 18,
+    });
+    defer client.deinit();
+
+    try client.appendFragment("abc");
+    try client.appendFragment("def");
+    try std.testing.expectEqualStrings("abcdef", client.fragment_buffer.items);
+    try std.testing.expectError(error.MessageTooLarge, client.appendFragment("g"));
 }
 
 test "decodeFrame supports partial buffering and consumed ordering" {
@@ -1458,19 +1536,16 @@ test "AsyncSender and AsyncReceiver interfaces" {
     _ = receiver.context;
 }
 
-
 test "websocket_masking_key_xor_output_byte_for_byte" {
     const payload = "Mask me";
     const mask = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
     const encoded = [_]u8{
-        0x81, 0x80 | @as(u8, @intCast(payload.len)),
-        mask[0], mask[1], mask[2], mask[3],
-        payload[0] ^ mask[0],
-        payload[1] ^ mask[1],
-        payload[2] ^ mask[2],
-        payload[3] ^ mask[3],
-        payload[4] ^ mask[0],
-        payload[5] ^ mask[1],
+        0x81,                 0x80 | @as(u8, @intCast(payload.len)),
+        mask[0],              mask[1],
+        mask[2],              mask[3],
+        payload[0] ^ mask[0], payload[1] ^ mask[1],
+        payload[2] ^ mask[2], payload[3] ^ mask[3],
+        payload[4] ^ mask[0], payload[5] ^ mask[1],
         payload[6] ^ mask[2],
     };
 
