@@ -35,3 +35,9 @@ The same capture can be reproduced locally from the repository root:
 ```
 
 Only compare artifacts whose report identities and workload parameters are compatible. Baseline capture is informational: it does not define or enforce a merge threshold.
+
+## Pull request reports
+
+The **Benchmark Report** workflow runs on pull requests using the same pinned runner class and capture parameters. It locates the latest successful manual baseline run on `main`, validates the candidate reports, adds a human-readable latency and allocation comparison to the workflow summary, and retains the raw candidate reports for 30 days.
+
+This job is intentionally non-blocking while variance is calibrated. A missing canonical baseline is reported with instructions and still produces candidate artifacts; an incompatible report identity is surfaced in the workflow rather than silently compared.

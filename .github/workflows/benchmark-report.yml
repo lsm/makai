@@ -1,0 +1,137 @@
+name: Benchmark Report
+
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    name: Informational benchmark report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Capture candidate reports
+        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
+
+      - name: Find matching retained canonical baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          candidate_identity=$(jq -Scs 'map(del(
+            .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
+            .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
+            .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
+            .peak_live_bytes, .leak_bytes
+          ))' artifacts/candidate/latency.jsonl artifacts/candidate/allocation.jsonl)
+          if ! run_ids_text=$(gh api --method GET --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
+            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=100 | \
+            jq -r '.[].workflow_runs[].id'); then
+            echo "The Actions API baseline lookup failed; candidate artifacts cannot be matched safely." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          run_ids=()
+          if [[ -n "$run_ids_text" ]]; then
+            mapfile -t run_ids <<< "$run_ids_text"
+          fi
+
+          found=false
+          for run_id in "${run_ids[@]}"; do
+            if ! artifacts_json=$(gh api --method GET --paginate --slurp \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" -F per_page=100); then
+              echo "The Actions API artifact lookup failed for canonical run $run_id." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            artifact_name=$(jq -r '[.[].artifacts[] | select(
+              .expired == false and (.name | test("^benchmark-baseline-.*-ubuntu-24\\.04-x86_64$"))
+            )][0].name // empty' <<< "$artifacts_json")
+            [[ -n "$artifact_name" ]] || continue
+
+            download_dir="$RUNNER_TEMP/benchmark-baseline-$run_id"
+            mkdir -p "$download_dir"
+            if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --name "$artifact_name" --dir "$download_dir"; then
+              echo "Downloading retained canonical artifact $artifact_name from run $run_id failed." >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            baseline_file=$(find "$download_dir" -type f -name latency.jsonl -print -quit)
+            [[ -n "$baseline_file" ]] || continue
+            baseline_directory=$(dirname "$baseline_file")
+            [[ -f "$baseline_directory/allocation.jsonl" ]] || continue
+            baseline_identity=$(jq -Scs 'map(del(
+              .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
+              .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
+              .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
+              .peak_live_bytes, .leak_bytes
+            ))' "$baseline_file" "$baseline_directory/allocation.jsonl")
+            if [[ "$baseline_identity" == "$candidate_identity" ]]; then
+              mkdir -p artifacts/baseline
+              cp "$baseline_directory"/* artifacts/baseline/
+              found=true
+              echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+              echo "Using CPU-compatible canonical baseline run $run_id." >> "$GITHUB_STEP_SUMMARY"
+              break
+            fi
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          if [[ "$found" != true ]]; then
+            echo "No retained canonical baseline matches this candidate's CPU and build identity." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Compare with canonical baseline
+        if: steps.baseline.outputs.found == 'true'
+        working-directory: zig
+        run: |
+          {
+            echo '## Benchmark comparison'
+            echo
+            echo '```text'
+            comparison_valid=true
+            for mode in latency allocation; do
+              if output=$(zig build bench-compare -Doptimize=ReleaseFast -- "../artifacts/baseline/$mode.jsonl" "../artifacts/candidate/$mode.jsonl" 2>&1); then
+                printf '%s\n' "$output"
+              else
+                comparison_valid=false
+                printf '%s\n' "$output"
+                if [[ "$output" == *SemanticMismatch* ]]; then
+                  echo "$mode comparison detected semantic drift; treat this as a correctness regression."
+                else
+                  echo "$mode comparison unavailable: the canonical or candidate report is invalid."
+                  echo "Capture a new canonical baseline only when an intentional schema, fixture, target, or parameter change lands."
+                fi
+              fi
+            done
+            echo '```'
+            if [[ "$comparison_valid" != true ]]; then
+              echo
+              echo "Canonical source: workflow run ${{ steps.baseline.outputs.run_id }}."
+            fi
+          } | tee ../artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain unavailable comparison
+        if: steps.baseline.outputs.found != 'true'
+        run: |
+          echo "Candidate reports were captured, but no retained canonical artifact matched their CPU and build identity." | tee artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "Run the Capture Benchmark Baseline workflow on main from the same runner class, then rerun this job." | tee -a artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload candidate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-candidate-${{ github.sha }}-ubuntu-24.04-x86_64
+          path: artifacts/candidate/
+          if-no-files-found: warn
+          retention-days: 30
