@@ -150,7 +150,7 @@ pub const SSEParser = struct {
     fn appendLineByte(self: *SSEParser, byte: u8) !void {
         if (self.line_buffer.items.len >= self.limits.line_bytes) return error.LineTooLarge;
         const new_len = std.math.add(usize, self.line_buffer.items.len, 1) catch return error.LineTooLarge;
-        try self.line_buffer.ensureTotalCapacityPrecise(self.allocator, new_len);
+        try self.ensureBoundedCapacity(&self.line_buffer, new_len, self.limits.line_bytes);
         self.line_buffer.appendAssumeCapacity(byte);
     }
 
@@ -175,9 +175,23 @@ pub const SSEParser = struct {
 
         const with_separator = std.math.add(usize, data_len, separator_len) catch return error.EventTooLarge;
         const new_len = std.math.add(usize, with_separator, value.len) catch return error.EventTooLarge;
-        try self.current_data.ensureTotalCapacityPrecise(self.allocator, new_len);
+        try self.ensureBoundedCapacity(&self.current_data, new_len, remaining_after_type);
         if (separator_len != 0) self.current_data.appendAssumeCapacity('\n');
         self.current_data.appendSliceAssumeCapacity(value);
+    }
+
+    fn ensureBoundedCapacity(
+        self: *SSEParser,
+        buffer: *std.ArrayList(u8),
+        needed: usize,
+        limit: usize,
+    ) !void {
+        if (needed <= buffer.capacity) return;
+
+        const doubled = std.math.mul(usize, buffer.capacity, 2) catch limit;
+        const geometric = @max(@as(usize, 8), doubled);
+        const target = @min(limit, @max(needed, geometric));
+        try buffer.ensureTotalCapacityPrecise(self.allocator, target);
     }
 };
 
@@ -386,6 +400,17 @@ test "SSEParser - complete event limit includes type and data" {
 
     _ = try parser.feed("event: type\n");
     try std.testing.expectError(error.EventTooLarge, parser.feed("data: value\n"));
+}
+
+test "SSEParser - buffer growth is amortized and bounded" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.initWithLimits(allocator, .{ .line_bytes = 64, .event_bytes = 64 });
+    defer parser.deinit();
+
+    _ = try parser.feed("data: a\ndata: b\ndata: c\n");
+    try std.testing.expect(parser.current_data.capacity > parser.current_data.items.len);
+    try std.testing.expect(parser.current_data.capacity <= parser.limits.event_bytes);
+    try std.testing.expect(parser.line_buffer.capacity <= parser.limits.line_bytes);
 }
 
 test "SSEParser - error messages preserve limit names" {
