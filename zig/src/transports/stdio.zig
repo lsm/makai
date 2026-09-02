@@ -6,11 +6,12 @@ pub const default_line_bytes: usize = 1024 * 1024;
 
 const LineFramer = struct {
     const Outcome = union(enum) {
-        line: []u8,
+        line: struct { start: usize, len: usize },
         line_too_large,
     };
 
     buffer: std.ArrayList(u8) = .empty,
+    queued_bytes: std.ArrayList(u8) = .empty,
     outcomes: std.ArrayList(Outcome) = .empty,
     outcome_head: usize = 0,
     allocator: std.mem.Allocator,
@@ -23,32 +24,36 @@ const LineFramer = struct {
 
     fn deinit(self: *LineFramer) void {
         self.buffer.deinit(self.allocator);
-        for (self.outcomes.items[self.outcome_head..]) |outcome| switch (outcome) {
-            .line => |line| self.allocator.free(line),
-            .line_too_large => {},
-        };
+        self.queued_bytes.deinit(self.allocator);
         self.outcomes.deinit(self.allocator);
     }
 
     fn append(self: *LineFramer, bytes: []const u8) !void {
+        const buffer_capacity = @min(self.limit, try std.math.add(usize, self.buffer.items.len, bytes.len));
+        const queued_capacity = try std.math.add(usize, self.queued_bytes.items.len, try std.math.add(usize, self.buffer.items.len, bytes.len));
+        const outcomes_capacity = try std.math.add(usize, self.outcomes.items.len, bytes.len +| 1);
+        try self.buffer.ensureTotalCapacity(self.allocator, buffer_capacity);
+        try self.queued_bytes.ensureTotalCapacity(self.allocator, queued_capacity);
+        try self.outcomes.ensureTotalCapacity(self.allocator, outcomes_capacity);
+
         for (bytes) |byte| {
             if (self.discarding_line) {
                 if (byte == '\n') {
                     self.discarding_line = false;
-                    try self.outcomes.append(self.allocator, .line_too_large);
+                    self.outcomes.appendAssumeCapacity(.line_too_large);
                 }
                 continue;
             }
 
             if (byte == '\n') {
-                try self.queueCurrentLine();
+                self.queueCurrentLineAssumeCapacity();
             } else {
                 if (self.buffer.items.len >= self.limit) {
                     self.buffer.clearRetainingCapacity();
                     self.discarding_line = true;
                     continue;
                 }
-                try self.buffer.append(self.allocator, byte);
+                self.buffer.appendAssumeCapacity(byte);
             }
         }
     }
@@ -57,8 +62,7 @@ const LineFramer = struct {
         if (self.outcome_head == self.outcomes.items.len) return null;
         return switch (self.outcomes.items[self.outcome_head]) {
             .line => |line| blk: {
-                const copy = try allocator.dupe(u8, line);
-                self.allocator.free(line);
+                const copy = try allocator.dupe(u8, self.queued_bytes.items[line.start..][0..line.len]);
                 self.advanceOutcome();
                 break :blk copy;
             },
@@ -79,14 +83,16 @@ const LineFramer = struct {
             try self.outcomes.append(self.allocator, .line_too_large);
             self.discarding_line = false;
         } else if (self.buffer.items.len > 0) {
-            try self.queueCurrentLine();
+            try self.queued_bytes.ensureUnusedCapacity(self.allocator, self.buffer.items.len);
+            try self.outcomes.ensureUnusedCapacity(self.allocator, 1);
+            self.queueCurrentLineAssumeCapacity();
         }
     }
 
-    fn queueCurrentLine(self: *LineFramer) !void {
-        const line = try self.allocator.dupe(u8, self.buffer.items);
-        errdefer self.allocator.free(line);
-        try self.outcomes.append(self.allocator, .{ .line = line });
+    fn queueCurrentLineAssumeCapacity(self: *LineFramer) void {
+        const start = self.queued_bytes.items.len;
+        self.queued_bytes.appendSliceAssumeCapacity(self.buffer.items);
+        self.outcomes.appendAssumeCapacity(.{ .line = .{ .start = start, .len = self.buffer.items.len } });
         self.buffer.clearRetainingCapacity();
     }
 
@@ -94,6 +100,7 @@ const LineFramer = struct {
         self.outcome_head += 1;
         if (self.outcome_head == self.outcomes.items.len) {
             self.outcomes.clearRetainingCapacity();
+            self.queued_bytes.clearRetainingCapacity();
             self.outcome_head = 0;
         }
     }
@@ -327,6 +334,7 @@ pub const AsyncStdioReceiver = struct {
             .context = @ptrCast(self),
             .receive_stream_fn = receiveStreamFn,
             .read_fn = readFn,
+            .close_fn = closeFn,
         };
     }
 
@@ -494,7 +502,7 @@ pub const AsyncStdioReceiver = struct {
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
         if (self.compatibility_framer == null) {
-            self.compatibility_framer = LineFramer.init(allocator, self.line_limit);
+            self.compatibility_framer = LineFramer.init(std.heap.page_allocator, self.line_limit);
         }
         const framer = &self.compatibility_framer.?;
         var read_buf: [4096]u8 = undefined;
@@ -526,6 +534,11 @@ pub const AsyncStdioReceiver = struct {
 
             try framer.append(read_buf[0..bytes_read]);
         }
+    }
+
+    fn closeFn(ctx: *anyopaque) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        self.deinit();
     }
 };
 
@@ -592,12 +605,15 @@ test "LineFramer allocation failures preserve pending outcomes" {
     defer allocator.free(retried);
     try std.testing.expectEqualStrings("line", retried);
 
-    var eof_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
-    var eof_framer = LineFramer.init(eof_failing.allocator(), 4);
+    var eof_framer = LineFramer.init(allocator, 4);
     defer eof_framer.deinit();
     try eof_framer.append("abcde");
+    eof_framer.outcomes.deinit(allocator);
+    eof_framer.outcomes = .empty;
+    var eof_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    eof_framer.allocator = eof_failing.allocator();
     try std.testing.expectError(error.OutOfMemory, eof_framer.takeEof(allocator));
-    eof_failing.fail_index = std.math.maxInt(usize);
+    eof_framer.allocator = allocator;
     try std.testing.expectError(error.LineTooLarge, eof_framer.takeEof(allocator));
 }
 
@@ -644,6 +660,27 @@ test "AsyncStdioReceiver compatibility read preserves coalesced lines" {
     try std.testing.expectEqualStrings("bb", second);
     try std.testing.expectEqualStrings("tail", eof_line);
     try std.testing.expect((try receiver.read(allocator)) == null);
+}
+
+test "AsyncStdioReceiver compatibility state outlives per-read allocators" {
+    const pipe = try compat.stdio.pipe();
+    defer compat.stdio.close(pipe[0]);
+
+    var receiver_impl = AsyncStdioReceiver.initWithFile(pipe[0]);
+    var receiver = receiver_impl.receiver();
+    defer receiver.close();
+    try compat.stdio.writeAll(pipe[1], "one\ntwo\n");
+    compat.stdio.close(pipe[1]);
+
+    var first_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const first = (try receiver.read(first_arena.allocator())).?;
+    try std.testing.expectEqualStrings("one", first);
+    first_arena.deinit();
+
+    var second_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer second_arena.deinit();
+    const second = (try receiver.read(second_arena.allocator())).?;
+    try std.testing.expectEqualStrings("two", second);
 }
 
 test "StdioSender and StdioReceiver round-trip via pipe" {
