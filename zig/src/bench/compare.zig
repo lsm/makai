@@ -49,7 +49,7 @@ fn latencyStats(allocator: std.mem.Allocator, report: Report) !LatencyStats {
 }
 
 fn validate(report: Report) !void {
-    if (report.schema_version != 1 or report.git_revision.len == 0 or report.iterations == 0 or report.samples == 0 or report.completed_per_iteration == 0 or report.bytes_per_iteration == 0 or report.raw_window_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
+    if (report.schema_version != 1 or report.git_revision.len == 0 or report.iterations == 0 or report.samples < 15 or report.completed_per_iteration == 0 or report.bytes_per_iteration == 0 or report.raw_window_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
     const metrics = [_]?usize{ report.allocation_count, report.free_count, report.allocated_bytes, report.freed_bytes, report.peak_live_bytes, report.leak_bytes };
     if (std.mem.eql(u8, report.mode, "allocation")) {
         for (metrics) |metric| if (metric == null) return error.InvalidReport;
@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "comparison rejects incompatible identity" {
-    const samples = [_]u64{100};
+    const samples = [_]u64{100} ** 15;
     const baseline: Report = .{
         .schema_version = 1,
         .git_revision = "abc123",
@@ -166,7 +166,7 @@ test "comparison rejects incompatible identity" {
         .fixture_version = 1,
         .workload_hash = 99,
         .iterations = 10,
-        .samples = 1,
+        .samples = 15,
         .completed_per_iteration = 3,
         .bytes_per_iteration = 128,
         .digest = 42,
@@ -208,6 +208,9 @@ test "comparison rejects incompatible identity" {
     candidate = baseline;
     candidate.bytes_per_iteration += 1;
     try std.testing.expectError(error.IncompatibleReports, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.samples = 14;
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
     candidate = baseline;
     candidate.workload_hash += 1;
     try std.testing.expectError(error.IncompatibleReports, expectCompatible(baseline, candidate));

@@ -55,8 +55,12 @@ const transport_content = [_]ai_types.AssistantContent{
     .{ .text = .{ .text = "A representative provider response with owned text content." } },
     .{ .tool_call = .{ .id = "call-baseline-1", .name = "lookup", .arguments_json = "{\"query\":\"deterministic fixture\"}" } },
 };
+const transport_large_text = "0123456789abcdef" ** 4096;
+const transport_large_content = [_]ai_types.AssistantContent{
+    .{ .text = .{ .text = transport_large_text } },
+};
 
-fn transportFixtures() [3]protocol_types.Envelope {
+fn transportFixtures() [4]protocol_types.Envelope {
     return .{ .{
         .stream_id = [_]u8{1} ** 16,
         .message_id = [_]u8{2} ** 16,
@@ -85,6 +89,21 @@ fn transportFixtures() [3]protocol_types.Envelope {
             .usage = .{ .input = 128, .output = 32 },
             .stop_reason = .stop,
             .timestamp = 1_708_234_567_892,
+        } },
+    }, .{
+        .stream_id = [_]u8{10} ** 16,
+        .message_id = [_]u8{11} ** 16,
+        .sequence = 45,
+        .timestamp = 1_708_234_567_893,
+        .in_reply_to = [_]u8{12} ** 16,
+        .payload = .{ .result = .{
+            .content = &transport_large_content,
+            .api = "openai-responses",
+            .provider = "openai",
+            .model = "gpt-baseline-large",
+            .usage = .{ .input = 16_384, .output = 16_384 },
+            .stop_reason = .stop,
+            .timestamp = 1_708_234_567_893,
         } },
     } };
 }
@@ -198,7 +217,7 @@ pub fn main(init: std.process.Init) !void {
     var host_class: []const u8 = "local";
     var extra_copy = false;
     var iterations: usize = 1000;
-    var samples: usize = 5;
+    var samples: usize = 15;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--mode") and i + 1 < args.len) {
@@ -217,7 +236,7 @@ pub fn main(init: std.process.Init) !void {
             extra_copy = true;
         } else return error.InvalidArgument;
     }
-    if (iterations == 0 or samples == 0 or samples > 10_000) return error.InvalidArgument;
+    if (iterations == 0 or samples < 15 or samples > 10_000) return error.InvalidArgument;
     if (!std.mem.eql(u8, mode, "latency") and !std.mem.eql(u8, mode, "allocation")) return error.InvalidMode;
     if (host_class.len == 0) return error.InvalidHostClass;
     for (host_class) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') return error.InvalidHostClass;

@@ -12,7 +12,7 @@ zig build bench -Doptimize=ReleaseFast -Dgit-revision=$(git rev-parse HEAD) -- -
 zig build bench -Doptimize=ReleaseFast -Dgit-revision=$(git rev-parse HEAD) -- --mode allocation --samples 100 --iterations 1000 --host-class mac-arm64
 ```
 
-Each workload emits one JSON object. Preserve the output as the baseline artifact, then compare it with a candidate collected using the same command:
+Each workload emits one JSON object. The transport workload includes small control, typical result, and deterministic 64 KiB result payload classes. Preserve the output as the baseline artifact, then compare it with a candidate collected using the same command:
 
 ```bash
 zig build bench-compare -Doptimize=ReleaseFast -- baseline.json candidate.json
