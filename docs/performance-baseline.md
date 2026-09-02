@@ -8,8 +8,8 @@ The Phase A harness measures two deterministic, offline workloads before allocat
 Run latency and allocation collection separately from `zig/` with an optimized build:
 
 ```bash
-zig build bench -Doptimize=ReleaseFast -- --mode latency --samples 10 --iterations 10000 --host-class mac-arm64
-zig build bench -Doptimize=ReleaseFast -- --mode allocation --samples 5 --iterations 1000 --host-class mac-arm64
+zig build bench -Doptimize=ReleaseFast -Dgit-revision=$(git rev-parse HEAD) -- --mode latency --samples 100 --iterations 10000 --host-class mac-arm64
+zig build bench -Doptimize=ReleaseFast -Dgit-revision=$(git rev-parse HEAD) -- --mode allocation --samples 100 --iterations 1000 --host-class mac-arm64
 ```
 
 Each workload emits one JSON object. Preserve the output as the baseline artifact, then compare it with a candidate collected using the same command:
@@ -18,7 +18,7 @@ Each workload emits one JSON object. Preserve the output as the baseline artifac
 zig build bench-compare -Doptimize=ReleaseFast -- baseline.json candidate.json
 ```
 
-The versioned report records the host class, complete target identity (architecture, OS, ABI, CPU model, and feature-set hash), Zig version, optimization mode, measurement mode, fixture version, workload parameters, raw timing samples, completed work, and a semantic digest. Latency mode reports allocation fields as `null`; it never implies that zero allocations occurred. Allocation mode uses `CountingAllocator` and fails if live bytes remain after a workload. The comparison command accepts schema version 1 only, requires both workloads exactly once, rejects differing identities or semantic results, and reports allocated bytes normalized by completed work. `--samples` is capped at 10,000 so generated reports remain within the comparator's input limit.
+The versioned report records the source revision, host class, complete target identity (architecture, OS, ABI, CPU model, and feature-set hash), Zig version, optimization mode, measurement mode, fixture version, workload parameters, raw timing samples, median/p95/p99 latency, completed work, and a semantic digest. Latency mode reports allocation fields as `null`; it never implies that zero allocations occurred. Allocation mode uses `CountingAllocator` and fails if live bytes remain after a workload. The comparison command accepts schema version 1 only, requires both workloads exactly once, rejects differing identities or semantic results, and reports robust latency statistics plus allocated bytes normalized by completed work. `--samples` is capped at 10,000 so generated reports remain within the comparator's input limit.
 
 For a harness sanity check, add `--extra-copy` to candidate allocation collection. Both workloads will report increased allocated bytes without changing their semantic digest; do not use this diagnostic flag for a real baseline.
 

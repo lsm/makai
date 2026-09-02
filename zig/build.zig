@@ -1626,15 +1626,19 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const bench_options = b.addOptions();
+    bench_options.addOption([]const u8, "git_revision", b.option([]const u8, "git-revision", "Source revision recorded in benchmark reports") orelse "unknown");
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "sse_parser", .module = sse_parser_mod },
-            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "bench_options", .module = bench_options.createModule() },
         },
     });
     const bench_exe = b.addExecutable(.{ .name = "makai-bench", .root_module = bench_mod });

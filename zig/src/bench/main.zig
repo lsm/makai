@@ -1,7 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("bench_options");
 const sse = @import("sse_parser");
-const in_process = @import("transports/in_process");
+const protocol_envelope = @import("protocol_envelope");
+const protocol_types = @import("protocol_types");
 const counting = @import("counting_allocator");
 const compat = @import("compat");
 
@@ -11,7 +13,6 @@ const sse_fixture =
     "data: {\"text\":\" world\"}\n\n" ++
     "event: done\n" ++
     "data: [DONE]\n\n";
-const transport_fixture = "{\"type\":\"ping\",\"sequence\":42}";
 
 const Result = struct {
     completed: usize,
@@ -49,15 +50,29 @@ fn runSse(allocator: std.mem.Allocator) !Result {
 }
 
 fn runTransport(allocator: std.mem.Allocator) !Result {
-    var pipe = in_process.createSerializedPipe(allocator);
-    defer pipe.deinit();
-    var sender = pipe.clientSender();
-    try sender.write(transport_fixture);
-    var receiver = pipe.serverReceiver();
-    const received = (try receiver.readLine(allocator)) orelse return error.MissingRoundTrip;
-    defer allocator.free(received);
-    if (!std.mem.eql(u8, transport_fixture, received)) return error.RoundTripMismatch;
-    return .{ .completed = 1, .digest = std.hash.Wyhash.hash(0, received) };
+    const original: protocol_types.Envelope = .{
+        .stream_id = [_]u8{1} ** 16,
+        .message_id = [_]u8{2} ** 16,
+        .sequence = 42,
+        .timestamp = 1_708_234_567_890,
+        .in_reply_to = [_]u8{3} ** 16,
+        .payload = .ping,
+    };
+    const json = try protocol_envelope.serializeEnvelope(original, allocator);
+    defer allocator.free(json);
+    var parsed = try protocol_envelope.deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    if (!std.mem.eql(u8, &original.stream_id, &parsed.stream_id) or
+        !std.mem.eql(u8, &original.message_id, &parsed.message_id) or
+        original.sequence != parsed.sequence or original.timestamp != parsed.timestamp or
+        parsed.in_reply_to == null or !std.mem.eql(u8, &original.in_reply_to.?, &parsed.in_reply_to.?) or
+        parsed.payload != .ping) return error.RoundTripMismatch;
+    return .{ .completed = 1, .digest = std.hash.Wyhash.hash(0, json) };
+}
+
+fn percentile(sorted: []const u64, numerator: usize, denominator: usize) u64 {
+    const rank = (sorted.len * numerator + denominator - 1) / denominator;
+    return sorted[@max(rank, 1) - 1];
 }
 
 fn emitWorkload(
@@ -79,12 +94,15 @@ fn emitWorkload(
     while (sample_index < samples) : (sample_index += 1) {
         const start_ns = try compat.time.monotonicNanos();
         var i: usize = 0;
+        var aggregate: u64 = 0;
         while (i < iterations) : (i += 1) {
             const result = try workload(allocator);
-            if (result.completed != expected.completed or result.digest != expected.digest) return error.SemanticMismatch;
-            std.mem.doNotOptimizeAway(result);
+            aggregate +%= result.digest +% result.completed;
         }
+        std.mem.doNotOptimizeAway(aggregate);
         const elapsed_ns = try compat.time.monotonicNanos() - start_ns;
+        const expected_aggregate = (expected.digest +% expected.completed) *% iterations;
+        if (aggregate != expected_aggregate) return error.SemanticMismatch;
         elapsed_total += elapsed_ns;
         if (sample_index > 0) try raw_samples.append(allocator, ',');
         try raw_samples.print(allocator, "{d}", .{elapsed_ns});
@@ -99,6 +117,19 @@ fn emitWorkload(
     if (counted_result.completed != expected.completed or counted_result.digest != expected.digest) return error.SemanticMismatch;
     if (counter.metrics.leakBytes() != 0) return error.BenchmarkLeak;
 
+    var sorted_samples = try allocator.alloc(u64, samples);
+    defer allocator.free(sorted_samples);
+    var sample_values = std.mem.tokenizeScalar(u8, raw_samples.items, ',');
+    var sorted_index: usize = 0;
+    while (sample_values.next()) |value| : (sorted_index += 1) {
+        const elapsed = try std.fmt.parseInt(u64, value, 10);
+        sorted_samples[sorted_index] = elapsed / iterations + @intFromBool(elapsed % iterations != 0);
+    }
+    std.mem.sort(u64, sorted_samples, {}, std.sort.asc(u64));
+    const latency_p50_ns = percentile(sorted_samples, 50, 100);
+    const latency_p95_ns = percentile(sorted_samples, 95, 100);
+    const latency_p99_ns = percentile(sorted_samples, 99, 100);
+
     const allocation_json = if (std.mem.eql(u8, mode, "allocation"))
         try std.fmt.allocPrint(allocator, ",\"allocation_count\":{d},\"free_count\":{d},\"allocated_bytes\":{d},\"freed_bytes\":{d},\"peak_live_bytes\":{d},\"leak_bytes\":{d}", .{ counter.metrics.allocation_count, counter.metrics.free_count, counter.metrics.allocated_bytes, counter.metrics.freed_bytes, counter.metrics.peak_live_bytes, counter.metrics.leakBytes() })
     else
@@ -106,7 +137,7 @@ fn emitWorkload(
     defer allocator.free(allocation_json);
 
     const cpu_features_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&builtin.target.cpu.features));
-    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"host_class\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"cpu_model\":\"{s}\",\"cpu_features_hash\":{d},\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d}{s}}}\n", .{ host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), @tagName(builtin.target.abi), builtin.target.cpu.model.name, cpu_features_hash, builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, expected.completed, expected.digest, raw_samples.items, elapsed_total / samples / iterations, allocation_json });
+    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"git_revision\":\"{s}\",\"host_class\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"cpu_model\":\"{s}\",\"cpu_features_hash\":{d},\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d}{s}}}\n", .{ build_options.git_revision, host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), @tagName(builtin.target.abi), builtin.target.cpu.model.name, cpu_features_hash, builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, expected.completed, expected.digest, raw_samples.items, elapsed_total / samples / iterations, latency_p50_ns, latency_p95_ns, latency_p99_ns, allocation_json });
     defer allocator.free(line);
     try stdout.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), line);
 }

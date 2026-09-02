@@ -3,6 +3,7 @@ const compat = @import("compat");
 
 const Report = struct {
     schema_version: u32,
+    git_revision: []const u8,
     host_class: []const u8,
     target: []const u8,
     cpu_model: []const u8,
@@ -18,6 +19,9 @@ const Report = struct {
     digest: u64,
     raw_samples_ns: []const u64,
     ns_per_iteration: u64,
+    latency_p50_ns: u64,
+    latency_p95_ns: u64,
+    latency_p99_ns: u64,
     allocation_count: ?usize,
     free_count: ?usize,
     allocated_bytes: ?usize,
@@ -26,8 +30,24 @@ const Report = struct {
     leak_bytes: ?usize,
 };
 
+const LatencyStats = struct { p50: u64, p95: u64, p99: u64 };
+
+fn latencyStats(allocator: std.mem.Allocator, report: Report) !LatencyStats {
+    var values = try allocator.alloc(u64, report.raw_samples_ns.len);
+    defer allocator.free(values);
+    for (report.raw_samples_ns, 0..) |elapsed, i| values[i] = elapsed / report.iterations + @intFromBool(elapsed % report.iterations != 0);
+    std.mem.sort(u64, values, {}, std.sort.asc(u64));
+    const at = struct {
+        fn percentile(sorted: []const u64, numerator: usize) u64 {
+            const rank = (sorted.len * numerator + 99) / 100;
+            return sorted[@max(rank, 1) - 1];
+        }
+    }.percentile;
+    return .{ .p50 = at(values, 50), .p95 = at(values, 95), .p99 = at(values, 99) };
+}
+
 fn validate(report: Report) !void {
-    if (report.schema_version != 1 or report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
+    if (report.schema_version != 1 or report.git_revision.len == 0 or report.iterations == 0 or report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
     const metrics = [_]?usize{ report.allocation_count, report.free_count, report.allocated_bytes, report.freed_bytes, report.peak_live_bytes, report.leak_bytes };
     if (std.mem.eql(u8, report.mode, "allocation")) {
         for (metrics) |metric| if (metric == null) return error.InvalidReport;
@@ -69,6 +89,10 @@ fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidat
     const candidate = try std.json.parseFromSlice(Report, allocator, candidate_line, .{ .ignore_unknown_fields = false });
     defer candidate.deinit();
     try expectCompatible(baseline.value, candidate.value);
+    const baseline_latency = try latencyStats(allocator, baseline.value);
+    const candidate_latency = try latencyStats(allocator, candidate.value);
+    if (baseline_latency.p50 != baseline.value.latency_p50_ns or baseline_latency.p95 != baseline.value.latency_p95_ns or baseline_latency.p99 != baseline.value.latency_p99_ns or
+        candidate_latency.p50 != candidate.value.latency_p50_ns or candidate_latency.p95 != candidate.value.latency_p95_ns or candidate_latency.p99 != candidate.value.latency_p99_ns) return error.InvalidReport;
 
     const allocation_change: ?f64 = if (baseline.value.allocated_bytes) |baseline_bytes| blk: {
         const candidate_bytes = candidate.value.allocated_bytes orelse return error.IncompatibleReports;
@@ -79,8 +103,9 @@ fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidat
         break :blk if (baseline_per_work == 0) null else (candidate_per_work / baseline_per_work - 1) * 100;
     } else null;
 
-    const latency_change = (@as(f64, @floatFromInt(candidate.value.ns_per_iteration)) /
-        @as(f64, @floatFromInt(baseline.value.ns_per_iteration)) - 1) * 100;
+    const p50_change = (@as(f64, @floatFromInt(candidate_latency.p50)) / @as(f64, @floatFromInt(baseline_latency.p50)) - 1) * 100;
+    const p95_change = (@as(f64, @floatFromInt(candidate_latency.p95)) / @as(f64, @floatFromInt(baseline_latency.p95)) - 1) * 100;
+    const p99_change = (@as(f64, @floatFromInt(candidate_latency.p99)) / @as(f64, @floatFromInt(baseline_latency.p99)) - 1) * 100;
     const allocation_text = if (baseline.value.allocated_bytes) |baseline_bytes|
         if (baseline_bytes == 0 and candidate.value.allocated_bytes.? > 0)
             try allocator.dupe(u8, "introduced")
@@ -91,7 +116,7 @@ fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidat
     else
         try allocator.dupe(u8, "unavailable");
     defer allocator.free(allocation_text);
-    const output = try std.fmt.allocPrint(allocator, "{s}: latency {d:.2}%, allocated bytes/work {s}\n", .{ baseline.value.workload, latency_change, allocation_text });
+    const output = try std.fmt.allocPrint(allocator, "{s}: latency p50 {d:.2}%, p95 {d:.2}%, p99 {d:.2}%; allocated bytes/work {s}\n", .{ baseline.value.workload, p50_change, p95_change, p99_change, allocation_text });
     defer allocator.free(output);
     try std.Io.File.stdout().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), output);
     return workloadIndex(baseline.value.workload);
@@ -124,6 +149,7 @@ test "comparison rejects incompatible identity" {
     const samples = [_]u64{100};
     const baseline: Report = .{
         .schema_version = 1,
+        .git_revision = "abc123",
         .host_class = "ci-arm64",
         .target = "aarch64-linux",
         .cpu_model = "generic",
@@ -139,6 +165,9 @@ test "comparison rejects incompatible identity" {
         .digest = 42,
         .raw_samples_ns = &samples,
         .ns_per_iteration = 10,
+        .latency_p50_ns = 10,
+        .latency_p95_ns = 10,
+        .latency_p99_ns = 10,
         .allocation_count = 1,
         .free_count = 1,
         .allocated_bytes = 12,
