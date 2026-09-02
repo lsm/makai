@@ -689,6 +689,8 @@ pub const OpenAICompatOptions = struct {
     thinking_format: enum { openai, zai, qwen } = .openai,
     /// Whether the provider supports the `strict` field in tool definitions
     supports_strict_mode: ?bool = true,
+    /// Whether an Anthropic-compatible endpoint supports one-hour prompt caching
+    supports_anthropic_cache_ttl: ?bool = null,
 };
 
 pub const RoutingPreferences = struct {

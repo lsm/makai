@@ -105,9 +105,9 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
     }
 }
 
-fn reasoningEffort(level: ai_types.ThinkingLevel) []const u8 {
+fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const u8 {
     return switch (level) {
-        .off => "none",
+        .off => if (std.mem.startsWith(u8, model_id, "gpt-5.1")) "none" else "low",
         .minimal => "low",
         .low => "low",
         .medium => "medium",
@@ -149,8 +149,8 @@ fn thinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudg
     };
 }
 
-fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
-    const reason_effort = reasoningEffort(options.thinking_level);
+fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, model_id: []const u8, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
+    const reason_effort = reasoningEffort(options.thinking_level, model_id);
     const think_effort = thinkingEffort(options.thinking_level);
     return .{
         .api_key = if (api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
@@ -189,7 +189,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         .allocator = ctx.allocator,
     };
 
-    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.api_key, ctx.session_id);
+    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.model.id, ctx.api_key, ctx.session_id);
 
     // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
     var request_model = ctx.model;

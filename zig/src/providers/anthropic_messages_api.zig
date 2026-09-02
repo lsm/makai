@@ -102,12 +102,12 @@ const CacheControlResult = struct {
 };
 
 /// Resolve cache retention and determine cache_control settings
-fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention) ?CacheControlResult {
+fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention, supports_long_ttl: bool) ?CacheControlResult {
     const retention = cache_retention orelse .short;
     if (retention == .none) return null;
 
     // Only add ttl for "long" retention on api.anthropic.com
-    const has_ttl = retention == .long and std.mem.find(u8, base_url, "api.anthropic.com") != null;
+    const has_ttl = retention == .long and (std.mem.find(u8, base_url, "api.anthropic.com") != null or supports_long_ttl);
 
     return .{
         .retention = retention,
@@ -289,7 +289,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     tx_context.messages = transformed.messages;
 
     // Resolve cache control settings
-    const cache_control = getCacheControl(model.base_url, options.cache_retention);
+    const supports_long_cache_ttl = if (model.compat) |compat_options|
+        compat_options.supports_anthropic_cache_ttl == true
+    else
+        false;
+    const cache_control = getCacheControl(model.base_url, options.cache_retention, supports_long_cache_ttl);
 
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
@@ -299,9 +303,15 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeIntField("max_tokens", requested_max);
     try w.writeBoolField("stream", true);
 
+    const emits_thinking = options.thinking_enabled and model.reasoning and
+        (supportsAdaptiveThinking(model.id) or requested_max > 1024);
     if (options.temperature) |t| {
+        if (emits_thinking and t != 1) {
+            // Anthropic extended thinking requires the default temperature.
+        } else {
         try w.writeKey("temperature");
         try w.writeFloat(t);
+        }
     }
 
     // System prompt as array of content blocks with cache_control
@@ -1911,26 +1921,26 @@ pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry)
 }
 
 test "getCacheControl returns null for none retention" {
-    const result = getCacheControl("https://api.anthropic.com", .none);
+    const result = getCacheControl("https://api.anthropic.com", .none, false);
     try std.testing.expect(result == null);
 }
 
 test "getCacheControl returns short retention without ttl for non-anthropic url" {
-    const result = getCacheControl("https://custom.api.com", .short);
+    const result = getCacheControl("https://custom.api.com", .short, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.short, result.?.retention);
     try std.testing.expectEqual(false, result.?.has_ttl);
 }
 
 test "getCacheControl returns long retention with ttl for anthropic url" {
-    const result = getCacheControl("https://api.anthropic.com", .long);
+    const result = getCacheControl("https://api.anthropic.com", .long, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
     try std.testing.expectEqual(true, result.?.has_ttl);
 }
 
 test "getCacheControl returns long retention without ttl for non-anthropic url" {
-    const result = getCacheControl("https://custom.api.com", .long);
+    const result = getCacheControl("https://custom.api.com", .long, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
     try std.testing.expectEqual(false, result.?.has_ttl);

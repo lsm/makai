@@ -85,6 +85,14 @@ fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
         model_compat.supports_reasoning_effort == true;
 }
 
+fn isOpenAIHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "openai.com") or
+        (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
+}
+
 /// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
@@ -147,7 +155,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null or isTransparentOpenAIProxy(model)) 40 else 0,
+        .max_tool_id_len = if (isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model)) 40 else 0,
         .insert_synthetic_results = true,
         .tools = context.tools,
     });
@@ -162,7 +170,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     const is_codex_model = isOpenAICodexResponsesModel(model);
     const supports_openai_reasoning = model.reasoning and (
-        std.mem.find(u8, model.base_url, "openai.com") != null or
+        isOpenAIHost(model.base_url) or
         is_codex_model or
         (if (model.compat) |model_compat| model_compat.supports_reasoning_effort == true else false)
     );
@@ -229,7 +237,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
             compat_options.supports_reasoning_effort == true
         else
             false;
-    const supports_store = std.mem.find(u8, model.base_url, "openai.com") != null or
+    const supports_store = isOpenAIHost(model.base_url) or
         (if (model.compat) |compat_options| compat_options.supports_store == true else false) or
         is_codex_model;
     if (supports_store) {
@@ -257,7 +265,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // Cache retention for OpenAI API
     if (options.cache_retention) |retention| {
-        if (retention == .long and (std.mem.find(u8, model.base_url, "openai.com") != null or is_openai_proxy)) {
+        if (retention == .long and (isOpenAIHost(model.base_url) or is_openai_proxy)) {
             try w.writeStringField("prompt_cache_retention", "24h");
         }
     }

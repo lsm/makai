@@ -930,6 +930,16 @@ fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
     return false;
 }
 
+fn isResponsesOnlyModel(model_id: []const u8) bool {
+    return std.mem.startsWith(u8, model_id, "o1-pro") or
+        std.mem.startsWith(u8, model_id, "o3-pro") or
+        std.mem.startsWith(u8, model_id, "gpt-5-pro") or
+        std.mem.startsWith(u8, model_id, "gpt-5-codex") or
+        std.mem.startsWith(u8, model_id, "gpt-5.1-codex-max") or
+        std.mem.indexOf(u8, model_id, "deep-research") != null or
+        std.mem.startsWith(u8, model_id, "computer-use-preview");
+}
+
 /// A custom base URL is OpenAI-compatible by default. Set
 /// `<PROVIDER>_BASE_URL_IS_PROXY=true` (or `MAKAI_BASE_URL_IS_PROXY=true`)
 /// only when it transparently preserves the canonical vendor API.
@@ -949,6 +959,9 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
     }
     if (std.mem.eql(u8, provider_id, "deepseek") and (if (use_global_base) global_proxy else try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"))) {
         return .{ .requires_thinking_as_text = true };
+    }
+    if (std.mem.eql(u8, provider_id, "anthropic") and (if (use_global_base) global_proxy else try envFlag(allocator, "ANTHROPIC_BASE_URL_IS_PROXY"))) {
+        return .{ .supports_anthropic_cache_ttl = true };
     }
     return null;
 }
@@ -1006,7 +1019,12 @@ fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_type
     const name = try allocator.dupe(u8, parsed.model_id);
     errdefer allocator.free(name);
 
-    const base_url = try defaultBaseUrlForRef(allocator, parsed.provider_id, parsed.api);
+    const base_url = if (std.mem.eql(u8, parsed.provider_id, "openai") and
+        std.mem.eql(u8, parsed.api, "openai-completions") and
+        isResponsesOnlyModel(parsed.model_id))
+        try allocator.dupe(u8, "")
+    else
+        try defaultBaseUrlForRef(allocator, parsed.provider_id, parsed.api);
     errdefer allocator.free(base_url);
 
     const input = try allocator.alloc([]const u8, 0);

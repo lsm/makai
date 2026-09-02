@@ -602,7 +602,7 @@ fn streamWithResolvedKey(
         };
 
     const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
-        error.AuthRequired => return error.AuthRequired,
+        error.AuthRequired => return provider.stream(model, context, options, server.allocator),
         error.OutOfMemory => return error.OutOfMemory,
     };
     var resolved_options = try injectApiKey(server.allocator, options, resolved.api_key);
@@ -672,7 +672,9 @@ fn streamWithRefresh(
     // model provider: a global/custom endpoint must receive an explicit key
     // instead of an ambient vendor credential.
     if (provider.auth_provider_id) |auth_provider_id| {
-        if (std.mem.eql(u8, auth_provider_id, "anthropic") and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+        const is_vendor_oauth = std.mem.eql(u8, auth_provider_id, "anthropic") or
+            std.mem.eql(u8, auth_provider_id, "openai-codex");
+        if (is_vendor_oauth and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
     }
     const provider_id = provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
