@@ -1636,6 +1636,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
             .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "counting_allocator", .module = counting_allocator_mod },
             .{ .name = "compat", .module = compat_mod },
             .{ .name = "bench_options", .module = bench_options.createModule() },
