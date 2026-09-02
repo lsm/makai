@@ -30,7 +30,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          candidate_identity=$(jq -cs 'map(del(
+          candidate_identity=$(jq -Scs 'map(del(
             .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
             .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
             .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
@@ -71,7 +71,7 @@ jobs:
             [[ -n "$baseline_file" ]] || continue
             baseline_directory=$(dirname "$baseline_file")
             [[ -f "$baseline_directory/allocation.jsonl" ]] || continue
-            baseline_identity=$(jq -cs 'map(del(
+            baseline_identity=$(jq -Scs 'map(del(
               .git_revision, .digest, .raw_window_ns, .ns_per_iteration,
               .window_avg_p50_ns, .window_avg_p95_ns, .window_avg_p99_ns,
               .allocation_count, .free_count, .allocated_bytes, .freed_bytes,
@@ -105,8 +105,13 @@ jobs:
                 printf '%s\n' "$output"
               else
                 comparison_valid=false
-                echo "$mode comparison unavailable: the canonical and candidate reports are incompatible or invalid."
-                echo "Capture a new canonical baseline on main when an intentional schema, fixture, target, or parameter change lands."
+                printf '%s\n' "$output"
+                if [[ "$output" == *SemanticMismatch* ]]; then
+                  echo "$mode comparison detected semantic drift; treat this as a correctness regression."
+                else
+                  echo "$mode comparison unavailable: the canonical or candidate report is invalid."
+                  echo "Capture a new canonical baseline only when an intentional schema, fixture, target, or parameter change lands."
+                fi
               fi
             done
             echo '```'
