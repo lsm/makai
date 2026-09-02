@@ -1186,6 +1186,7 @@ pub fn build(b: *std.Build) void {
     const google_generative_api_test = b.addTest(.{ .root_module = google_generative_api_mod });
     const google_vertex_api_test = b.addTest(.{ .root_module = google_vertex_api_mod });
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
+    const sse_parser_test = b.addTest(.{ .root_module = sse_parser_mod });
 
     const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
     const oauth_utils_pkce_test = b.addTest(.{ .root_module = oauth_utils_pkce_mod });
@@ -1784,6 +1785,7 @@ pub fn build(b: *std.Build) void {
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(sse_parser_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
 
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");

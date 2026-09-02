@@ -1117,7 +1117,6 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !Ant
     return out;
 }
 
-
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1474,10 +1473,10 @@ fn runThread(ctx: *ThreadCtx) void {
             raw_body.appendSlice(allocator, read_buf[0..@min(n, cap)]) catch {};
         }
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
             stream.markThreadDone();
-            stream.completeWithError("sse parse error");
+            stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 
@@ -1655,7 +1654,12 @@ fn runThread(ctx: *ThreadCtx) void {
     // sending the final blank line.  Only api_error is actionable here; other events
     // from a genuinely truncated stream are incomplete and best ignored.
     {
-        const tail = parser.feed("\n\n") catch &.{};
+        const tail = parser.feed("\n\n") catch |err| {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError(sse_parser.errorMessage(err));
+            return;
+        };
         for (tail) |ev| {
             const result = parseAnthropicEventType(ev.data, allocator) catch continue;
             switch (result) {
@@ -2175,7 +2179,6 @@ test "parseAnthropicEventType extracts tool_use id and name" {
     allocator.free(result.content_block_start.tool_id);
     allocator.free(result.content_block_start.tool_name);
 }
-
 
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
     return .{

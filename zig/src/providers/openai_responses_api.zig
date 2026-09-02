@@ -1160,11 +1160,11 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         if (n == 0) break;
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             allocator.free(auth);
             allocator.free(url);
             ctx.deinit();
-            stream.completeWithError("parse failed");
+            stream.completeWithError(sse_parser.errorMessage(err));
             stream.markThreadDone();
             return;
         };

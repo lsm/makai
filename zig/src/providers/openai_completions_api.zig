@@ -1491,9 +1491,9 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         if (n == 0) break;
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
-            stream.completeWithError("sse parse error");
+            stream.completeWithError(sse_parser.errorMessage(err));
             stream.markThreadDone();
             return;
         };
