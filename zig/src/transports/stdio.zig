@@ -12,6 +12,7 @@ const LineFramer = struct {
 
     buffer: std.ArrayList(u8) = .empty,
     outcomes: std.ArrayList(Outcome) = .empty,
+    outcome_head: usize = 0,
     allocator: std.mem.Allocator,
     limit: usize,
     discarding_line: bool = false,
@@ -22,7 +23,7 @@ const LineFramer = struct {
 
     fn deinit(self: *LineFramer) void {
         self.buffer.deinit(self.allocator);
-        for (self.outcomes.items) |outcome| switch (outcome) {
+        for (self.outcomes.items[self.outcome_head..]) |outcome| switch (outcome) {
             .line => |line| self.allocator.free(line),
             .line_too_large => {},
         };
@@ -53,24 +54,33 @@ const LineFramer = struct {
     }
 
     fn takeLine(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
-        if (self.outcomes.items.len == 0) return null;
-        return switch (self.outcomes.orderedRemove(0)) {
+        if (self.outcome_head == self.outcomes.items.len) return null;
+        return switch (self.outcomes.items[self.outcome_head]) {
             .line => |line| blk: {
-                defer self.allocator.free(line);
-                break :blk try allocator.dupe(u8, line);
+                const copy = try allocator.dupe(u8, line);
+                self.allocator.free(line);
+                self.advanceOutcome();
+                break :blk copy;
             },
-            .line_too_large => error.LineTooLarge,
+            .line_too_large => {
+                self.advanceOutcome();
+                return error.LineTooLarge;
+            },
         };
     }
 
     fn takeEof(self: *LineFramer, allocator: std.mem.Allocator) !?[]const u8 {
+        try self.finishEof();
+        return self.takeLine(allocator);
+    }
+
+    fn finishEof(self: *LineFramer) !void {
         if (self.discarding_line) {
-            self.discarding_line = false;
             try self.outcomes.append(self.allocator, .line_too_large);
+            self.discarding_line = false;
         } else if (self.buffer.items.len > 0) {
             try self.queueCurrentLine();
         }
-        return self.takeLine(allocator);
     }
 
     fn queueCurrentLine(self: *LineFramer) !void {
@@ -78,6 +88,14 @@ const LineFramer = struct {
         errdefer self.allocator.free(line);
         try self.outcomes.append(self.allocator, .{ .line = line });
         self.buffer.clearRetainingCapacity();
+    }
+
+    fn advanceOutcome(self: *LineFramer) void {
+        self.outcome_head += 1;
+        if (self.outcome_head == self.outcomes.items.len) {
+            self.outcomes.clearRetainingCapacity();
+            self.outcome_head = 0;
+        }
     }
 };
 
@@ -281,6 +299,8 @@ pub const AsyncStdioSender = struct {
 pub const AsyncStdioReceiver = struct {
     file: compat.stdio.File,
     line_limit: usize,
+    compatibility_framer: ?LineFramer = null,
+    compatibility_eof: bool = false,
 
     const Self = @This();
 
@@ -294,6 +314,12 @@ pub const AsyncStdioReceiver = struct {
 
     pub fn initWithFileAndLimit(file: compat.stdio.File, line_bytes: usize) Self {
         return .{ .file = file, .line_limit = line_bytes };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.compatibility_framer) |*framer| framer.deinit();
+        self.compatibility_framer = null;
+        self.compatibility_eof = false;
     }
 
     pub fn receiver(self: *Self) transport.AsyncReceiver {
@@ -467,24 +493,35 @@ pub const AsyncStdioReceiver = struct {
     // Keep backward-compatible blocking read
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ctx));
-        var framer = LineFramer.init(allocator, self.line_limit);
-        defer framer.deinit();
-        // This compatibility callback has no persistent state between calls, so
-        // read one byte at a time to avoid consuming bytes from the next line.
-        var read_buf: [1]u8 = undefined;
+        if (self.compatibility_framer == null) {
+            self.compatibility_framer = LineFramer.init(allocator, self.line_limit);
+        }
+        const framer = &self.compatibility_framer.?;
+        var read_buf: [4096]u8 = undefined;
 
         while (true) {
             // Check for complete line
             if (try framer.takeLine(allocator)) |line| return line;
 
+            if (self.compatibility_eof) {
+                self.deinit();
+                return null;
+            }
+
             // Read more data
             const bytes_read = compat.stdio.read(self.file, &read_buf) catch |err| {
-                if (err == error.EndOfStream) return try framer.takeEof(allocator);
+                if (err == error.EndOfStream) {
+                    try framer.finishEof();
+                    self.compatibility_eof = true;
+                    continue;
+                }
+                self.deinit();
                 return null;
             };
             if (bytes_read == 0) {
-                // EOF - return remaining data if any
-                return try framer.takeEof(allocator);
+                try framer.finishEof();
+                self.compatibility_eof = true;
+                continue;
             }
 
             try framer.append(read_buf[0..bytes_read]);
@@ -543,6 +580,27 @@ test "LineFramer discards an oversized line and preserves neighbors" {
     try std.testing.expectError(error.LineTooLarge, framer.takeEof(allocator));
 }
 
+test "LineFramer allocation failures preserve pending outcomes" {
+    const allocator = std.testing.allocator;
+    var framer = LineFramer.init(allocator, 8);
+    defer framer.deinit();
+    try framer.append("line\n");
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, framer.takeLine(failing.allocator()));
+    const retried = (try framer.takeLine(allocator)).?;
+    defer allocator.free(retried);
+    try std.testing.expectEqualStrings("line", retried);
+
+    var eof_failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 1 });
+    var eof_framer = LineFramer.init(eof_failing.allocator(), 4);
+    defer eof_framer.deinit();
+    try eof_framer.append("abcde");
+    try std.testing.expectError(error.OutOfMemory, eof_framer.takeEof(allocator));
+    eof_failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectError(error.LineTooLarge, eof_framer.takeEof(allocator));
+}
+
 test "StdioReceiver surfaces a recoverable logical line limit" {
     const allocator = std.testing.allocator;
     const pipe = try compat.stdio.pipe();
@@ -570,6 +628,7 @@ test "AsyncStdioReceiver compatibility read preserves coalesced lines" {
     defer compat.stdio.close(pipe[0]);
 
     var receiver_impl = AsyncStdioReceiver.initWithFileAndLimit(pipe[0], 4);
+    defer receiver_impl.deinit();
     var receiver = receiver_impl.receiver();
     try compat.stdio.writeAll(pipe[1], "a\nabcdeFG\nbb\ntail");
     compat.stdio.close(pipe[1]);
