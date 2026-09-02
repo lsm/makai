@@ -81,9 +81,10 @@ wiring.
 5. Preserve the documented lifetime of the `feed()` result. Make cleanup on error explicit so no
    event type or event payload leaks.
 
-**Tests:** one-byte feeds, splits at every delimiter of a small fixture, CRLF/LF handling,
-multi-line events, many completed events coalesced in one feed, each byte limit exactly at and one
-byte over, repeated feeds after an error/reset, provider-level propagation, and
+**Tests:** one-byte feeds, splits at every delimiter of a small fixture, CRLF/LF/bare-CR handling
+(including a CR boundary split across feeds), multi-line events, many completed events coalesced in
+one feed, each byte limit exactly at and one byte over, repeated feeds after an error/reset,
+provider-level propagation, and
 `std.testing.allocator` leak coverage.
 
 **Acceptance:** `zig build test-unit-providers` passes; existing valid-parser tests are unchanged
@@ -99,12 +100,15 @@ or commits.
 For each component, introduce one local limit type and one checked append path. Keep the semantics
 specific:
 
-* stdio: maximum retained incomplete line; breach returns a transport framing error and clears or
-  closes the affected receiver according to the Step 0 decision.
+* stdio: maximum retained incomplete line; process delimiters incrementally so several complete,
+  individually valid requests coalesced in one read do not count against that limit. A breach returns
+  a transport framing error and clears or closes the affected receiver according to the Step 0
+  decision.
 * WebSocket: maximum accepted frame payload, aggregate fragmented-message bytes, and undecoded
   receive-buffer bytes; validate declared lengths before buffering payload data.
 
-**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases;
+**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases; a
+coalesced stdio read whose total bytes exceed the line limit but whose individual lines do not;
 normal continuation/ping behavior for WebSocket; EOF/cancellation behavior for stdio.
 
 **Acceptance:** `zig build test-unit-transport` passes. The change must not alter normal

@@ -28,7 +28,7 @@ provider implementations all at once.
 
 ## What TigerBeetle does
 
-TigerBeetle's [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
+TigerBeetle's [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/47aeb22/docs/TIGER_STYLE.md)
 sets safety, performance, then developer experience as design priorities. The source reinforces
 that policy with three mutually supporting techniques:
 
@@ -42,7 +42,7 @@ that policy with three mutually supporting techniques:
 | Batching with a controlled pace | Their style distinguishes control plane from data plane and makes bounded batches a design primitive. | It limits work per scheduling turn and amortizes I/O without abandoning correctness checks. |
 
 For a primary source discussion of the testing model, see TigerBeetle's [deterministic simulation
-testing documentation](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md).
+testing documentation](https://github.com/tigerbeetle/tigerbeetle/blob/47aeb22/docs/internals/vopr.md).
 
 ## Patterns to adopt in Makai
 
