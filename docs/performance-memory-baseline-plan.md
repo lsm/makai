@@ -7,9 +7,11 @@ unit and mock-E2E coverage, and `scripts/websocket-poc-gate.sh` defines a JSON c
 WebSocket latency and throughput. That script has no benchmark producer, does not record memory,
 and is intended for a future interop POC rather than ordinary refactoring.
 
-We should establish a baseline before changing buffering, ownership, allocation, or hot streaming
-paths. The baseline must measure the same work on every revision, avoid provider/network variance,
-and make regressions explainable.
+We should establish a baseline before speculative buffering, ownership, allocation, or hot-streaming
+performance refactors. Correctness limits and their deterministic parser tests may proceed after the
+lighter Step 0 baseline in the reliability plan; the full Phase A baseline is required before using
+measurements to justify pooling, zero-copy, or similar optimization. The baseline must measure the
+same work on every revision, avoid provider/network variance, and make regressions explainable.
 
 ## What to measure
 
@@ -103,7 +105,14 @@ Store one report per execution, never overwrite a named source baseline. Minimum
   "host": { "class": "...", "os": "...", "arch": "...", "cpu_model": "..." },
   "measurement_mode": "latency",
   "workload": { "id": "sse_parse", "fixture_hash": "...", "fixture_bytes": 0, "chunk_schedule": "...", "concurrency": 1, "parameters": {} },
-  "samples": [],
+  "samples": [{
+    "iterations": 0,
+    "input_bytes": 0,
+    "elapsed_ns": 0,
+    "operation_latency_ns": [],
+    "semantic_validation": { "passed": true, "expected_output_count": 0, "output_count": 0, "output_digest": "..." },
+    "allocation": { "allocation_count": 0, "free_count": 0, "allocated_bytes": 0, "freed_bytes": 0, "live_bytes_peak": 0, "leak_bytes": 0 }
+  }],
   "summary": {
     "throughput_ops_per_sec": 0,
     "latency_ns": { "p50": 0, "p95": 0, "p99": 0 },
@@ -155,8 +164,9 @@ directly as bytes.
 5. Add a comparison script that produces a human-readable table and validates schema/leaks.
 
 **Stop gate:** the reports are reproducible, the two workloads detect an intentional extra copy,
-and a clean workload reports zero live bytes. At this point we can safely evaluate the SSE limit
-refactor. Do not expand the harness merely for completeness.
+and a clean workload reports zero live bytes. At this point we can safely evaluate allocation or
+ownership optimizations such as pooling or zero-copy. The correctness-limit work may proceed under
+the reliability plan's Step 0 baseline; do not expand this harness merely for completeness.
 
 ### Phase B — only after Phase A proves useful
 
