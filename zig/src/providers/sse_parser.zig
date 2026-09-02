@@ -27,6 +27,7 @@ pub const SSEParser = struct {
     pending_events: std.ArrayList(SSEEvent),
     allocator: std.mem.Allocator,
     limits: Limits,
+    pending_cr: bool,
 
     pub fn init(allocator: std.mem.Allocator) SSEParser {
         return .{
@@ -36,6 +37,7 @@ pub const SSEParser = struct {
             .pending_events = std.ArrayList(SSEEvent).empty,
             .allocator = allocator,
             .limits = .{},
+            .pending_cr = false,
         };
     }
 
@@ -74,19 +76,17 @@ pub const SSEParser = struct {
             const byte = chunk[i];
             i += 1;
 
-            if (byte == '\n') {
-                const line = self.line_buffer.items;
-
-                // Empty line marks end of event
-                if (line.len == 0) {
-                    try self.finalizeEvent();
-                } else {
-                    try self.processLine(line);
-                    self.line_buffer.clearRetainingCapacity();
-                }
-            } else if (byte != '\r') {
-                try self.appendLineByte(byte);
+            if (self.pending_cr) {
+                self.pending_cr = false;
+                if (byte == '\n') continue;
             }
+
+            if (byte == '\n') {
+                try self.finishLine();
+            } else if (byte == '\r') {
+                try self.finishLine();
+                self.pending_cr = true;
+            } else try self.appendLineByte(byte);
         }
 
         return self.pending_events.items;
@@ -95,6 +95,7 @@ pub const SSEParser = struct {
     /// Reset parser state
     pub fn reset(self: *SSEParser) void {
         self.line_buffer.clearRetainingCapacity();
+        self.pending_cr = false;
         if (self.current_event_type) |et| {
             self.allocator.free(et);
             self.current_event_type = null;
@@ -112,22 +113,29 @@ pub const SSEParser = struct {
         // Comments start with ":"
         if (line[0] == ':') return;
 
-        // Find the colon separator
-        if (std.mem.findScalar(u8, line, ':')) |colon_pos| {
-            const field = line[0..colon_pos];
-            var value = line[colon_pos + 1 ..];
+        const colon_pos = std.mem.findScalar(u8, line, ':');
+        const field = if (colon_pos) |pos| line[0..pos] else line;
+        var value: []const u8 = if (colon_pos) |pos| line[pos + 1 ..] else "";
 
-            // Skip leading space in value
-            if (value.len > 0 and value[0] == ' ') {
-                value = value[1..];
-            }
+        // Skip leading space in value
+        if (value.len > 0 and value[0] == ' ') {
+            value = value[1..];
+        }
 
-            if (std.mem.eql(u8, field, "event")) {
-                try self.setEventType(value);
-            } else if (std.mem.eql(u8, field, "data")) {
-                try self.appendEventData(value);
-            }
-            // Other fields are ignored
+        if (std.mem.eql(u8, field, "event")) {
+            try self.setEventType(value);
+        } else if (std.mem.eql(u8, field, "data")) {
+            try self.appendEventData(value);
+        }
+        // Other fields are ignored
+    }
+
+    fn finishLine(self: *SSEParser) !void {
+        if (self.line_buffer.items.len == 0) {
+            try self.finalizeEvent();
+        } else {
+            try self.processLine(self.line_buffer.items);
+            self.line_buffer.clearRetainingCapacity();
         }
     }
 
@@ -487,4 +495,119 @@ test "sse_parser_provider_error_body_path_surfaces_error_event" {
     try std.testing.expectEqualStrings("error", events[0].event_type.?);
     try std.testing.expect(std.mem.find(u8, events[0].data, "invalid_request_error") != null);
     try std.testing.expect(std.mem.find(u8, events[0].data, "bad input") != null);
+}
+
+fn expect_fixture_events(events: []const SSEEvent, seen: *usize) !void {
+    for (events) |event| {
+        seen.* += 1;
+        try std.testing.expectEqual(@as(usize, 1), seen.*);
+        try std.testing.expectEqualStrings("update", event.event_type.?);
+        try std.testing.expectEqualStrings("first\n\nthird", event.data);
+    }
+}
+
+fn expect_fixture_with_step(input: []const u8, step: usize) !void {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    var seen: usize = 0;
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const end = @min(input.len, offset + step);
+        try expect_fixture_events(try parser.feed(input[offset..end]), &seen);
+        offset = end;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+fn expect_fixture_at_split(input: []const u8, split: usize) !void {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    var seen: usize = 0;
+    try expect_fixture_events(try parser.feed(input[0..split]), &seen);
+    try expect_fixture_events(try parser.feed(input[split..]), &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+fn expect_fixture_with_random_chunks(input: []const u8, seed: u64) !void {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const random = prng.random();
+    var seen: usize = 0;
+    var offset: usize = 0;
+    while (offset < input.len) {
+        const max_chunk = @min(@as(usize, 11), input.len - offset);
+        const chunk_len = random.intRangeAtMost(usize, 1, max_chunk);
+        try expect_fixture_events(try parser.feed(input[offset..][0..chunk_len]), &seen);
+        offset += chunk_len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "SSEParser - valid fixture is independent of LF chunk boundaries" {
+    const fixture = "event: update\ndata: first\ndata\ndata: third\nunknown\n\n";
+
+    try expect_fixture_with_step(fixture, fixture.len);
+    try expect_fixture_with_step(fixture, 1);
+    for (0..fixture.len + 1) |split| try expect_fixture_at_split(fixture, split);
+
+    const seed: u64 = 0x5eed_fa11;
+    expect_fixture_with_random_chunks(fixture, seed) catch |err| {
+        std.debug.print("SSE randomized framing failure; replay seed={d}\n", .{seed});
+        return err;
+    };
+}
+
+test "SSEParser - CRLF and bare CR framing match LF framing" {
+    const crlf_fixture = "event: update\r\ndata: first\r\ndata\r\ndata: third\r\nunknown\r\n\r\n";
+    const cr_fixture = "event: update\rdata: first\rdata\rdata: third\runknown\r\r";
+
+    try expect_fixture_with_step(crlf_fixture, 1);
+    try expect_fixture_with_step(cr_fixture, 1);
+}
+
+test "SSEParser - CRLF boundary split across feeds is one delimiter" {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("event: update\r")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("\ndata: first\r")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("\ndata\r")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("\ndata: third\r")).len);
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("\nunknown\r")).len);
+    const events = try parser.feed("\n\r");
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("first\n\nthird", events[0].data);
+    try std.testing.expectEqual(@as(usize, 0), (try parser.feed("\n")).len);
+}
+
+test "SSEParser - recognized colonless event field has an empty value" {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    const events = try parser.feed("event: stale\nevent\ndata: value\n\n");
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("", events[0].event_type.?);
+    try std.testing.expectEqualStrings("value", events[0].data);
+}
+
+test "SSEParser - exact limits succeed and one byte over recovers after reset" {
+    var parser = SSEParser.initWithLimits(std.testing.allocator, .{ .line_bytes = 9, .event_bytes = 3 });
+    defer parser.deinit();
+
+    const exact = try parser.feed("data: xxx\n\n");
+    try std.testing.expectEqual(@as(usize, 1), exact.len);
+    try std.testing.expectEqualStrings("xxx", exact[0].data);
+
+    try std.testing.expectError(error.LineTooLarge, parser.feed("1234567890"));
+    parser.reset();
+    try std.testing.expectError(error.EventTooLarge, parser.feed("data: xx\ndata: x\n"));
+    parser.reset();
+
+    const recovered = try parser.feed("data: ok\n\n");
+    try std.testing.expectEqual(@as(usize, 1), recovered.len);
+    try std.testing.expectEqualStrings("ok", recovered[0].data);
 }
