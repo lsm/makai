@@ -406,6 +406,10 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        // Read the vendor env key only for the canonical provider so a
+        // custom or routed base URL (MAKAI_BASE_URL) cannot receive an
+        // AZURE_OPENAI_API_KEY meant for Azure's own endpoint.
+        if (!std.mem.eql(u8, model.provider, "azure")) return error.MissingApiKey;
         const e = env(allocator, "AZURE_OPENAI_API_KEY");
         if (e) |k| break :blk @constCast(k);
         return error.MissingApiKey;

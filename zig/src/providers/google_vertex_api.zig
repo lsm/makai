@@ -1348,6 +1348,13 @@ pub fn streamGoogleVertex(
     // Resolve API key (required for Vertex AI with API key auth)
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        // Read the vendor env key only for the canonical Google providers
+        // so a custom or routed base URL (MAKAI_BASE_URL) cannot receive a
+        // GOOGLE_API_KEY meant for Google's own endpoint.
+        if (!std.mem.eql(u8, model.provider, "google") and !std.mem.eql(u8, model.provider, "google-vertex")) {
+            std.log.err("Vertex AI requires an explicit api_key for non-Google providers.", .{});
+            return error.MissingApiKey;
+        }
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
         std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});

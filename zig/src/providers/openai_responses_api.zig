@@ -189,6 +189,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
+            // Generic endpoints may not implement OpenAI Structured Outputs;
+            // emit the strict field only for the native endpoint, Codex
+            // models, or an explicitly declared compat (transparent proxy),
+            // mirroring the Completions path.
+            const supports_tool_strict = is_codex_model or isOpenAIHost(model.base_url) or
+                (if (model.compat) |model_compat| model_compat.supports_strict_mode orelse false else false);
             try w.writeKey("tools");
             try w.beginArray();
             for (tools) |tool| {
@@ -196,7 +202,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "function");
                 try w.writeStringField("name", tool.name);
                 try w.writeStringField("description", tool.description);
-                try w.writeBoolField("strict", false);
+                if (supports_tool_strict) {
+                    try w.writeBoolField("strict", false);
+                }
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
                 try w.endObject();
@@ -411,6 +419,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 }
 
 fn normalizedOpenAIReasoningEffort(options: ai_types.StreamOptions) ?[]const u8 {
+    // An explicit "none" effort is the off signal for models that support it
+    // (the bridge sets it together with reasoning_enabled = false for
+    // thinking_level off); it must survive that flag, otherwise the model
+    // falls back to its default effort instead of honoring the choice.
+    if (options.getReasoningEffort()) |explicit| {
+        if (std.mem.eql(u8, explicit, "none")) return "none";
+    }
     if (!options.reasoning_enabled) return null;
     const effort = options.getReasoningEffort() orelse return "medium";
     if (std.mem.eql(u8, effort, "off")) return null;
@@ -2384,6 +2399,67 @@ test "buildRequestBody omits unsupported none reasoning effort" {
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\"") == null);
+}
+
+test "buildRequestBody preserves explicit none effort with reasoning disabled" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5.1",
+        .name = "gpt-5.1",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    // The bridge maps thinking_level off on gpt-5.1+ to effort "none" while
+    // also disabling reasoning; the explicit none must still be emitted.
+    const options: ai_types.StreamOptions = .{
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed("none"),
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") != null);
+}
+
+test "buildRequestBody omits strict tool fields on generic endpoints" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://gateway.example.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const tools = [_]ai_types.Tool{.{
+        .name = "file_read",
+        .description = "Read a file",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    }};
+    const context: ai_types.Context = .{
+        .messages = &.{},
+        .tools = &tools,
+    };
+
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"file_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\"") == null);
 }
 
 test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {
