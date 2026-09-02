@@ -159,8 +159,21 @@ pub const SSEParser = struct {
         if (event_type.len > self.limits.event_bytes -| data_len) return error.EventTooLarge;
 
         const copy = try self.allocator.dupe(u8, event_type);
+        errdefer self.allocator.free(copy);
+        try self.reboundDataCapacity(self.limits.event_bytes - event_type.len);
         if (self.current_event_type) |old| self.allocator.free(old);
         self.current_event_type = copy;
+    }
+
+    fn reboundDataCapacity(self: *SSEParser, limit: usize) !void {
+        if (self.current_data.capacity <= limit) return;
+
+        var rebound = std.ArrayList(u8).empty;
+        errdefer rebound.deinit(self.allocator);
+        try rebound.ensureTotalCapacityPrecise(self.allocator, self.current_data.items.len);
+        rebound.appendSliceAssumeCapacity(self.current_data.items);
+        self.current_data.deinit(self.allocator);
+        self.current_data = rebound;
     }
 
     fn appendEventData(self: *SSEParser, value: []const u8) !void {
@@ -411,6 +424,19 @@ test "SSEParser - buffer growth is amortized and bounded" {
     try std.testing.expect(parser.current_data.capacity > parser.current_data.items.len);
     try std.testing.expect(parser.current_data.capacity <= parser.limits.event_bytes);
     try std.testing.expect(parser.line_buffer.capacity <= parser.limits.line_bytes);
+}
+
+test "SSEParser - late event type rebinds data capacity to aggregate limit" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.initWithLimits(allocator, .{ .line_bytes = 64, .event_bytes = 64 });
+    defer parser.deinit();
+
+    _ = try parser.feed("data: 1234567\ndata: 1234567\ndata: 1234567\ndata: 1234567\ndata: 1234567\n");
+    try std.testing.expect(parser.current_data.capacity > parser.current_data.items.len);
+
+    _ = try parser.feed("event: 1234567890123456789012345\n");
+    try std.testing.expect(parser.current_data.capacity <= parser.limits.event_bytes - parser.current_event_type.?.len);
+    try std.testing.expectEqualStrings("1234567\n1234567\n1234567\n1234567\n1234567", parser.current_data.items);
 }
 
 test "SSEParser - error messages preserve limit names" {
