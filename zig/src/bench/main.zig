@@ -13,6 +13,7 @@ const sse_fixture =
     "data: {\"text\":\" world\"}\n\n" ++
     "event: done\n" ++
     "data: [DONE]\n\n";
+const sse_chunks = [_]usize{ 1, 7, 3, 19, 2, 11 };
 
 const Result = struct {
     completed: usize,
@@ -35,10 +36,9 @@ fn runSse(allocator: std.mem.Allocator) !Result {
     var completed: usize = 0;
     var digest = std.hash.Wyhash.init(0);
     var offset: usize = 0;
-    const chunks = [_]usize{ 1, 7, 3, 19, 2, 11 };
     var chunk_index: usize = 0;
     while (offset < sse_fixture.len) : (chunk_index += 1) {
-        const end = @min(sse_fixture.len, offset + chunks[chunk_index % chunks.len]);
+        const end = @min(sse_fixture.len, offset + sse_chunks[chunk_index % sse_chunks.len]);
         for (try parser.feed(sse_fixture[offset..end])) |event| {
             completed += 1;
             digestField(&digest, 0xE0, event.event_type);
@@ -50,24 +50,32 @@ fn runSse(allocator: std.mem.Allocator) !Result {
 }
 
 fn runTransport(allocator: std.mem.Allocator) !Result {
-    const original: protocol_types.Envelope = .{
+    const originals = [_]protocol_types.Envelope{ .{
         .stream_id = [_]u8{1} ** 16,
         .message_id = [_]u8{2} ** 16,
         .sequence = 42,
         .timestamp = 1_708_234_567_890,
         .in_reply_to = [_]u8{3} ** 16,
         .payload = .ping,
-    };
-    const json = try protocol_envelope.serializeEnvelope(original, allocator);
-    defer allocator.free(json);
-    var parsed = try protocol_envelope.deserializeEnvelope(json, allocator);
-    defer parsed.deinit(allocator);
-    if (!std.mem.eql(u8, &original.stream_id, &parsed.stream_id) or
-        !std.mem.eql(u8, &original.message_id, &parsed.message_id) or
-        original.sequence != parsed.sequence or original.timestamp != parsed.timestamp or
-        parsed.in_reply_to == null or !std.mem.eql(u8, &original.in_reply_to.?, &parsed.in_reply_to.?) or
-        parsed.payload != .ping) return error.RoundTripMismatch;
-    return .{ .completed = 1, .digest = std.hash.Wyhash.hash(0, json) };
+    }, .{
+        .stream_id = [_]u8{4} ** 16,
+        .message_id = [_]u8{5} ** 16,
+        .sequence = 43,
+        .timestamp = 1_708_234_567_891,
+        .in_reply_to = [_]u8{6} ** 16,
+        .payload = .{ .pong = .{ .ping_id = protocol_types.OwnedSlice(u8).initBorrowed("representative-provider-ping-id") } },
+    } };
+    var digest = std.hash.Wyhash.init(0);
+    for (originals) |original| {
+        const json = try protocol_envelope.serializeEnvelope(original, allocator);
+        defer allocator.free(json);
+        var parsed = try protocol_envelope.deserializeEnvelope(json, allocator);
+        defer parsed.deinit(allocator);
+        const parsed_json = try protocol_envelope.serializeEnvelope(parsed, allocator);
+        defer allocator.free(parsed_json);
+        digest.update(parsed_json);
+    }
+    return .{ .completed = originals.len, .digest = digest.final() };
 }
 
 fn percentile(sorted: []const u64, numerator: usize, denominator: usize) u64 {
@@ -137,7 +145,8 @@ fn emitWorkload(
     defer allocator.free(allocation_json);
 
     const cpu_features_hash = std.hash.Wyhash.hash(0, std.mem.asBytes(&builtin.target.cpu.features));
-    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"git_revision\":\"{s}\",\"host_class\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"cpu_model\":\"{s}\",\"cpu_features_hash\":{d},\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d}{s}}}\n", .{ build_options.git_revision, host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), @tagName(builtin.target.abi), builtin.target.cpu.model.name, cpu_features_hash, builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, expected.completed, expected.digest, raw_samples.items, elapsed_total / samples / iterations, latency_p50_ns, latency_p95_ns, latency_p99_ns, allocation_json });
+    const workload_hash = if (std.mem.eql(u8, name, "sse_parse")) std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, sse_fixture), std.mem.asBytes(&sse_chunks)) else std.hash.Wyhash.hash(0, "protocol-envelope-control-and-pong-v1");
+    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"git_revision\":\"{s}\",\"host_class\":\"{s}\",\"target\":\"{s}-{s}-{s}\",\"cpu_model\":\"{s}\",\"cpu_features_hash\":{d},\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"workload_hash\":{d},\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d},\"latency_p50_ns\":{d},\"latency_p95_ns\":{d},\"latency_p99_ns\":{d}{s}}}\n", .{ build_options.git_revision, host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), @tagName(builtin.target.abi), builtin.target.cpu.model.name, cpu_features_hash, builtin.zig_version_string, @tagName(builtin.mode), mode, name, workload_hash, iterations, samples, expected.completed, expected.digest, raw_samples.items, elapsed_total / samples / iterations, latency_p50_ns, latency_p95_ns, latency_p99_ns, allocation_json });
     defer allocator.free(line);
     try stdout.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), line);
 }

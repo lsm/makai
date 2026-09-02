@@ -13,6 +13,7 @@ const Report = struct {
     mode: []const u8,
     workload: []const u8,
     fixture_version: u32,
+    workload_hash: u64,
     iterations: usize,
     samples: usize,
     completed_per_iteration: usize,
@@ -47,7 +48,7 @@ fn latencyStats(allocator: std.mem.Allocator, report: Report) !LatencyStats {
 }
 
 fn validate(report: Report) !void {
-    if (report.schema_version != 1 or report.git_revision.len == 0 or report.iterations == 0 or report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
+    if (report.schema_version != 1 or report.git_revision.len == 0 or report.iterations == 0 or report.samples == 0 or report.completed_per_iteration == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
     const metrics = [_]?usize{ report.allocation_count, report.free_count, report.allocated_bytes, report.freed_bytes, report.peak_live_bytes, report.leak_bytes };
     if (std.mem.eql(u8, report.mode, "allocation")) {
         for (metrics) |metric| if (metric == null) return error.InvalidReport;
@@ -62,6 +63,7 @@ fn expectCompatible(baseline: Report, candidate: Report) !void {
     try validate(candidate);
     if (baseline.schema_version != candidate.schema_version or
         baseline.fixture_version != candidate.fixture_version or
+        baseline.workload_hash != candidate.workload_hash or
         baseline.iterations != candidate.iterations or
         baseline.samples != candidate.samples or
         baseline.completed_per_iteration != candidate.completed_per_iteration or
@@ -94,29 +96,30 @@ fn compareLine(allocator: std.mem.Allocator, baseline_line: []const u8, candidat
     if (baseline_latency.p50 != baseline.value.latency_p50_ns or baseline_latency.p95 != baseline.value.latency_p95_ns or baseline_latency.p99 != baseline.value.latency_p99_ns or
         candidate_latency.p50 != candidate.value.latency_p50_ns or candidate_latency.p95 != candidate.value.latency_p95_ns or candidate_latency.p99 != candidate.value.latency_p99_ns) return error.InvalidReport;
 
-    const allocation_change: ?f64 = if (baseline.value.allocated_bytes) |baseline_bytes| blk: {
-        const candidate_bytes = candidate.value.allocated_bytes orelse return error.IncompatibleReports;
-        const work = baseline.value.completed_per_iteration;
-        if (work == 0) return error.InvalidReport;
-        const baseline_per_work = @as(f64, @floatFromInt(baseline_bytes)) / @as(f64, @floatFromInt(work));
-        const candidate_per_work = @as(f64, @floatFromInt(candidate_bytes)) / @as(f64, @floatFromInt(work));
-        break :blk if (baseline_per_work == 0) null else (candidate_per_work / baseline_per_work - 1) * 100;
-    } else null;
-
     const p50_change = (@as(f64, @floatFromInt(candidate_latency.p50)) / @as(f64, @floatFromInt(baseline_latency.p50)) - 1) * 100;
     const p95_change = (@as(f64, @floatFromInt(candidate_latency.p95)) / @as(f64, @floatFromInt(baseline_latency.p95)) - 1) * 100;
     const p99_change = (@as(f64, @floatFromInt(candidate_latency.p99)) / @as(f64, @floatFromInt(baseline_latency.p99)) - 1) * 100;
-    const allocation_text = if (baseline.value.allocated_bytes) |baseline_bytes|
-        if (baseline_bytes == 0 and candidate.value.allocated_bytes.? > 0)
-            try allocator.dupe(u8, "introduced")
-        else if (allocation_change) |change|
-            try std.fmt.allocPrint(allocator, "{d:.2}%", .{change})
-        else
-            try allocator.dupe(u8, "0.00%")
-    else
-        try allocator.dupe(u8, "unavailable");
-    defer allocator.free(allocation_text);
-    const output = try std.fmt.allocPrint(allocator, "{s}: latency p50 {d:.2}%, p95 {d:.2}%, p99 {d:.2}%; allocated bytes/work {s}\n", .{ baseline.value.workload, p50_change, p95_change, p99_change, allocation_text });
+    const metricChange = struct {
+        fn format(a: std.mem.Allocator, base_value: ?usize, candidate_value: ?usize, work: usize) ![]u8 {
+            const base = base_value orelse return a.dupe(u8, "unavailable");
+            const next = candidate_value orelse return error.IncompatibleReports;
+            if (base == 0) return a.dupe(u8, if (next == 0) "0.00%" else "introduced");
+            const base_per_work = @as(f64, @floatFromInt(base)) / @as(f64, @floatFromInt(work));
+            const next_per_work = @as(f64, @floatFromInt(next)) / @as(f64, @floatFromInt(work));
+            return std.fmt.allocPrint(a, "{d:.2}%", .{(next_per_work / base_per_work - 1) * 100});
+        }
+    }.format;
+    const allocation_count = try metricChange(allocator, baseline.value.allocation_count, candidate.value.allocation_count, baseline.value.completed_per_iteration);
+    defer allocator.free(allocation_count);
+    const free_count = try metricChange(allocator, baseline.value.free_count, candidate.value.free_count, baseline.value.completed_per_iteration);
+    defer allocator.free(free_count);
+    const allocated_bytes = try metricChange(allocator, baseline.value.allocated_bytes, candidate.value.allocated_bytes, baseline.value.completed_per_iteration);
+    defer allocator.free(allocated_bytes);
+    const freed_bytes = try metricChange(allocator, baseline.value.freed_bytes, candidate.value.freed_bytes, baseline.value.completed_per_iteration);
+    defer allocator.free(freed_bytes);
+    const peak_live_bytes = try metricChange(allocator, baseline.value.peak_live_bytes, candidate.value.peak_live_bytes, baseline.value.completed_per_iteration);
+    defer allocator.free(peak_live_bytes);
+    const output = try std.fmt.allocPrint(allocator, "{s}: latency p50 {d:.2}%, p95 {d:.2}%, p99 {d:.2}%; allocations/work {s}, frees/work {s}, allocated bytes/work {s}, freed bytes/work {s}, peak live bytes/work {s}\n", .{ baseline.value.workload, p50_change, p95_change, p99_change, allocation_count, free_count, allocated_bytes, freed_bytes, peak_live_bytes });
     defer allocator.free(output);
     try std.Io.File.stdout().writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), output);
     return workloadIndex(baseline.value.workload);
@@ -159,6 +162,7 @@ test "comparison rejects incompatible identity" {
         .mode = "allocation",
         .workload = "sse_parse",
         .fixture_version = 1,
+        .workload_hash = 99,
         .iterations = 10,
         .samples = 1,
         .completed_per_iteration = 3,
@@ -192,4 +196,10 @@ test "comparison rejects incompatible identity" {
     candidate = baseline;
     candidate.schema_version = 2;
     try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.completed_per_iteration = 0;
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.workload_hash += 1;
+    try std.testing.expectError(error.IncompatibleReports, expectCompatible(baseline, candidate));
 }
