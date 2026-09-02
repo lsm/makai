@@ -940,16 +940,35 @@ fn isResponsesOnlyModel(model_id: []const u8) bool {
         std.mem.startsWith(u8, model_id, "computer-use-preview");
 }
 
+/// Explicit proxy flags for transparentProxyCompat (pure form, testable
+/// without mutating the process environment). When `global_base_set` is
+/// true the global flag decides; otherwise the provider-specific flag does.
+const ProxyCompatFlags = struct {
+    global_base_set: bool = false,
+    global_proxy: bool = false,
+    openai_proxy: bool = false,
+    deepseek_proxy: bool = false,
+    anthropic_proxy: bool = false,
+};
+
 /// A custom base URL is OpenAI-compatible by default. Set
 /// `<PROVIDER>_BASE_URL_IS_PROXY=true` (or `MAKAI_BASE_URL_IS_PROXY=true`)
 /// only when it transparently preserves the canonical vendor API.
 fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8) !?ai_types.OpenAICompatOptions {
-    const global_proxy = try envFlag(allocator, "MAKAI_BASE_URL_IS_PROXY");
     const global_base = try envOrEmpty(allocator, "MAKAI_BASE_URL");
     defer if (global_base) |value| allocator.free(value);
-    const use_global_base = global_base != null;
 
-    if (std.mem.eql(u8, provider_id, "openai") and (if (use_global_base) global_proxy else try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"))) {
+    return transparentProxyCompatForFlags(provider_id, .{
+        .global_base_set = global_base != null,
+        .global_proxy = try envFlag(allocator, "MAKAI_BASE_URL_IS_PROXY"),
+        .openai_proxy = try envFlag(allocator, "OPENAI_BASE_URL_IS_PROXY"),
+        .deepseek_proxy = try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"),
+        .anthropic_proxy = try envFlag(allocator, "ANTHROPIC_BASE_URL_IS_PROXY"),
+    });
+}
+
+fn transparentProxyCompatForFlags(provider_id: []const u8, flags: ProxyCompatFlags) ?ai_types.OpenAICompatOptions {
+    if (std.mem.eql(u8, provider_id, "openai") and (if (flags.global_base_set) flags.global_proxy else flags.openai_proxy)) {
         return .{
             .supports_store = true,
             .supports_developer_role = true,
@@ -957,10 +976,16 @@ fn transparentProxyCompat(allocator: std.mem.Allocator, provider_id: []const u8)
             .max_tokens_field = .max_completion_tokens,
         };
     }
-    if (std.mem.eql(u8, provider_id, "deepseek") and (if (use_global_base) global_proxy else try envFlag(allocator, "DEEPSEEK_BASE_URL_IS_PROXY"))) {
-        return .{ .requires_thinking_as_text = true };
+    if (std.mem.eql(u8, provider_id, "deepseek") and (if (flags.global_base_set) flags.global_proxy else flags.deepseek_proxy)) {
+        // A transparent DeepSeek proxy preserves the canonical DeepSeek API,
+        // which takes token limits via max_tokens (not OpenAI's
+        // max_completion_tokens default inherited by a partial compat value).
+        return .{
+            .requires_thinking_as_text = true,
+            .max_tokens_field = .max_tokens,
+        };
     }
-    if (std.mem.eql(u8, provider_id, "anthropic") and (if (use_global_base) global_proxy else try envFlag(allocator, "ANTHROPIC_BASE_URL_IS_PROXY"))) {
+    if (std.mem.eql(u8, provider_id, "anthropic") and (if (flags.global_base_set) flags.global_proxy else flags.anthropic_proxy)) {
         return .{ .supports_anthropic_cache_ttl = true };
     }
     return null;
@@ -4316,6 +4341,33 @@ test "baseUrlWithOverrides prefers env overrides and global override" {
     });
     defer allocator.free(versioned_deepseek);
     try std.testing.expectEqualStrings("https://proxy.example.com", versioned_deepseek);
+}
+
+test "transparent proxy compat preserves vendor token-limit fields" {
+    // A declared transparent DeepSeek proxy keeps the canonical DeepSeek
+    // max_tokens field; the partial compat value must not inherit OpenAI's
+    // max_completion_tokens default.
+    const deepseek = transparentProxyCompatForFlags("deepseek", .{ .deepseek_proxy = true });
+    try std.testing.expect(deepseek != null);
+    try std.testing.expectEqual(@as(?bool, true), deepseek.?.requires_thinking_as_text);
+    try std.testing.expectEqual(@as(@TypeOf(deepseek.?.max_tokens_field), .max_tokens), deepseek.?.max_tokens_field);
+
+    // The global proxy flag governs when MAKAI_BASE_URL supplies the endpoint.
+    const deepseek_global = transparentProxyCompatForFlags("deepseek", .{
+        .global_base_set = true,
+        .global_proxy = true,
+        .deepseek_proxy = false,
+    });
+    try std.testing.expect(deepseek_global != null);
+    try std.testing.expectEqual(@as(@TypeOf(deepseek_global.?.max_tokens_field), .max_tokens), deepseek_global.?.max_tokens_field);
+
+    // Without any proxy declaration there is no compat override.
+    try std.testing.expect(transparentProxyCompatForFlags("deepseek", .{}) == null);
+
+    // OpenAI transparent proxies keep the native field name.
+    const openai = transparentProxyCompatForFlags("openai", .{ .openai_proxy = true });
+    try std.testing.expect(openai != null);
+    try std.testing.expectEqual(@as(@TypeOf(openai.?.max_tokens_field), .max_completion_tokens), openai.?.max_tokens_field);
 }
 
 test "baseUrlWithOverrides requires explicit endpoint for unknown providers" {

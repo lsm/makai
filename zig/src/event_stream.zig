@@ -314,6 +314,36 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return true;
         }
 
+        /// Wait until the stream is completed (terminal result or error
+        /// published), up to timeout_ms. Returns true if completed, false on
+        /// timeout. Some producers mark their thread done immediately before
+        /// the final complete()/completeWithError() call, so waitForThread
+        /// alone does not imply the result is published; consumers that read
+        /// the result or free the stream must also gate on this.
+        pub fn waitForCompletion(self: *Self, timeout_ms: u64) bool {
+            const start_time = monotonicNanos();
+            const timeout_ns = @as(i128, timeout_ms) * 1_000_000;
+
+            var futex_value = self.futex.load(.acquire);
+
+            while (!self.completed.load(.acquire)) {
+                const elapsed = monotonicNanos() - start_time;
+                if (elapsed >= timeout_ns) {
+                    return false;
+                }
+
+                const remaining_ns = timeout_ns - elapsed;
+                const remaining_ms = @as(u64, @intCast(@divFloor(remaining_ns, 1_000_000)));
+                const remaining_max_ms = @min(remaining_ms, std.math.maxInt(u32));
+
+                self.waitTimeoutMs(futex_value, remaining_max_ms);
+
+                futex_value = self.futex.load(.acquire);
+            }
+
+            return true;
+        }
+
         pub fn poll(self: *Self) ?T {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
@@ -727,6 +757,38 @@ test "EventStream wait wakes and returns pushed event" {
 
     const got = stream.wait();
     try std.testing.expectEqual(@as(?u32, 42), got);
+}
+
+const DelayedCompleteCtx = struct {
+    stream: *EventStream(u32, u32),
+
+    fn run(self: *@This()) void {
+        // Producer ordering used by several providers: mark the thread done
+        // first, then publish the final result.
+        self.stream.markThreadDone();
+        std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .boot) catch {};
+        self.stream.complete(42);
+    }
+};
+
+test "EventStream waitForCompletion gates on result publication" {
+    const TestStream = EventStream(u32, u32);
+    var stream = TestStream.init(std.testing.allocator);
+    defer stream.deinit();
+
+    // An uncompleted stream times out.
+    try std.testing.expect(!stream.waitForCompletion(1));
+
+    var ctx = DelayedCompleteCtx{ .stream = &stream };
+    const th = try std.Thread.spawn(.{}, DelayedCompleteCtx.run, .{&ctx});
+    defer th.join();
+
+    // waitForThread returns as soon as the producer marks done, which here
+    // happens before the result is published; waitForCompletion must block
+    // until complete() has run.
+    try std.testing.expect(stream.waitForThread(2_000));
+    try std.testing.expect(stream.waitForCompletion(2_000));
+    try std.testing.expectEqual(@as(u32, 42), stream.getResult().?);
 }
 
 const CompletionAfterErrorCtx = struct {

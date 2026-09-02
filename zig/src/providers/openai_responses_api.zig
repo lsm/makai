@@ -295,10 +295,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // GPT-5 "juice" workaround: when reasoning is disabled for GPT-5 models,
-    // inject a developer message to restore model capability
+    // inject a developer message to restore model capability. Generic
+    // endpoints without OpenAI-native roles get a system message instead,
+    // mirroring the explicit system prompt above.
     if (std.mem.startsWith(u8, model.name, "gpt-5") and !options.reasoning_enabled) {
         try w.beginObject();
-        try w.writeStringField("role", "developer");
+        const juice_role: []const u8 = if (supports_openai_reasoning) "developer" else "system";
+        try w.writeStringField("role", juice_role);
         try w.writeStringField("content", "# Juice: 0 !important");
         try w.endObject();
     }
@@ -2292,6 +2295,36 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
     try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"medium\"") == null);
+}
+
+test "buildRequestBody juice workaround uses system role on generic endpoints" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5-turbo",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "# Juice: 0 !important") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") != null);
 }
 
 test "buildRequestBody normalizes minimal reasoning effort for OpenAI" {

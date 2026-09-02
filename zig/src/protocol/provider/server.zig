@@ -1025,9 +1025,19 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         server.allocator.destroy(stream);
     }
 
-    // Wait for stream to complete (with timeout)
+    // Wait for the producer to finish and publish its terminal state. Some
+    // providers mark their thread done immediately before the final
+    // complete()/completeWithError() call, while others complete first and
+    // mark done from a defer, so gate on both signals: once the thread is
+    // done AND the stream is completed, the producer no longer touches the
+    // stream, making the deferred cleanup below race-free (and its internal
+    // thread wait returns immediately). When the producer stalls past the
+    // configured timeout, skip the completion wait so the timeout NACK is
+    // not delayed by a second full timeout window.
     const timeout_ms = server.options.stream_timeout_ms;
-    _ = stream.waitForThread(timeout_ms);
+    if (stream.waitForThread(timeout_ms)) {
+        _ = stream.waitForCompletion(timeout_ms);
+    }
 
     // Get result
     if (stream.getResult()) |result| {
