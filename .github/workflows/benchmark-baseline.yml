@@ -1,0 +1,42 @@
+name: Capture Benchmark Baseline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Canonical baseline (Ubuntu 24.04 x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Capture and validate baseline
+        run: ./scripts/capture-benchmark-baseline.sh artifacts/benchmark github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
+
+      - name: Add validation summary
+        if: always()
+        run: |
+          if [[ -f artifacts/benchmark/latency-summary.txt ]]; then
+            cat artifacts/benchmark/latency-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -f artifacts/benchmark/allocation-summary.txt ]]; then
+            cat artifacts/benchmark/allocation-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload raw canonical reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-baseline-${{ github.sha }}-ubuntu-24.04-x86_64
+          path: artifacts/benchmark/
+          if-no-files-found: error
+          retention-days: 90

@@ -23,3 +23,15 @@ The versioned report records the source revision, host class, complete target id
 For a harness sanity check, add `--extra-copy` to candidate allocation collection. Both workloads will report increased allocated bytes without changing their semantic digest; do not use this diagnostic flag for a real baseline.
 
 Use a stable, explicit host class for tracked baselines. Do not compare `local` reports from unrelated machines, and avoid running latency collection alongside other CPU-heavy work. Re-run a noisy sample before drawing conclusions; this Phase A harness is a regression tripwire, not a general-purpose microbenchmark framework.
+
+## Canonical capture
+
+Run the **Capture Benchmark Baseline** workflow manually on the revision that will serve as the comparison baseline. It uses the pinned `ubuntu-24.04` x86_64 runner class, validates each JSON Lines report with `bench-compare`, and retains the raw reports, validation summaries, revision, and host class for 90 days. The artifact name includes the full source revision and runner class.
+
+The same capture can be reproduced locally from the repository root:
+
+```bash
+./scripts/capture-benchmark-baseline.sh artifacts/benchmark <stable-host-class> [git-revision]
+```
+
+Only compare artifacts whose report identities and workload parameters are compatible. Baseline capture is informational: it does not define or enforce a merge threshold.
