@@ -57,7 +57,7 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
             .zai => .zai,
             .qwen => .qwen,
         },
-        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse true else true,
+        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse (is_openai_native or isTransparentOpenAIProxy(model)) else is_openai_native,
     };
 }
 

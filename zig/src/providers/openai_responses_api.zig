@@ -77,6 +77,14 @@ fn isOpenAICodexResponsesModel(model: ai_types.Model) bool {
     return std.mem.eql(u8, model.api, openai_codex_responses_api);
 }
 
+fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
+    if (!std.mem.eql(u8, model.provider, "openai")) return false;
+    const model_compat = model.compat orelse return false;
+    return model_compat.supports_store == true and
+        model_compat.supports_developer_role == true and
+        model_compat.supports_reasoning_effort == true;
+}
+
 /// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
@@ -139,7 +147,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = 40, // OpenAI max tool call ID length
+        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null or isTransparentOpenAIProxy(model)) 40 else 0,
         .insert_synthetic_results = true,
         .tools = context.tools,
     });
