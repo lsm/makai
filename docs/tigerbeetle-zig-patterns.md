@@ -136,7 +136,7 @@ First test matrix:
 
 | Component | Valid cases | Negative cases |
 |---|---|---|
-| SSE parser | arbitrary chunks; CRLF/LF; multiple events; reset/dequeue; `id`/`retry`; unknown and colonless fields ignored | line/event/pending limits; final partial event |
+| SSE parser | arbitrary chunks; CRLF/LF; multiple events; reset/dequeue; `id`/`retry`; recognized colonless fields use an empty value and unknown fields are ignored | line/event limits; final partial event |
 | WebSocket parser | header/body splits; continuation frames; ping interleaving | declared oversized payload; bad opcode; fragmented-message limit |
 | stdio transport | every newline split; many consecutive requests | overlong line; EOF partial request; output backpressure |
 | EventStream | full/empty; completion; cancellation; producers/consumer ordering | full ring, double completion, completion-after-error, timeout boundary |

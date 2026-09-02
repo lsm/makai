@@ -123,6 +123,9 @@ Use a separate local or dedicated-host runner to execute each benchmark in a chi
 collect maximum RSS. On Linux, `/usr/bin/time -v` is a pragmatic first implementation; on macOS
 use `/usr/bin/time -l`; a future portable Zig runner can obtain child resource usage. RSS output is
 host-qualified and should not be compared across operating systems or allocator configurations.
+Each platform adapter must normalize its native result to `peak_rss_bytes` before writing JSON; GNU
+`time -v` reports maximum RSS in KiB, so its value must be multiplied by 1024 rather than emitted
+directly as bytes.
 
 ## Reproducibility rules
 

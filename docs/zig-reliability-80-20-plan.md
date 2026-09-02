@@ -61,7 +61,9 @@ work.
 
 ### Step 1 — Harden `SSEParser`
 
-**Scope:** `zig/src/providers/sse_parser.zig` only, plus its build/test wiring only if required.
+**Scope:** `zig/src/providers/sse_parser.zig`, every provider parser call site that currently
+collapses parser errors, the corresponding provider integration tests, and any required build/test
+wiring.
 
 1. Add a `Limits` configuration with separate maximums for line and complete-event bytes. `init()`
    keeps sensible compatibility defaults; a second initializer may take limits. Do not limit
