@@ -672,9 +672,9 @@ fn streamWithRefresh(
     // model provider: a global/custom endpoint must receive an explicit key
     // instead of an ambient vendor credential.
     if (provider.auth_provider_id) |auth_provider_id| {
-        if (!std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+        if (std.mem.eql(u8, auth_provider_id, "anthropic") and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
     }
-    const provider_id = model.provider;
+    const provider_id = provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
