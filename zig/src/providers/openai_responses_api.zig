@@ -161,6 +161,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeStringField("model", model.id);
 
     const is_codex_model = isOpenAICodexResponsesModel(model);
+    const supports_openai_reasoning = model.reasoning and (
+        std.mem.find(u8, model.base_url, "openai.com") != null or
+        is_codex_model or
+        (if (model.compat) |model_compat| model_compat.supports_reasoning_effort == true else false)
+    );
     const explicit_system_prompt = context.getSystemPrompt();
     if (is_codex_model) {
         const instructions = explicit_system_prompt orelse default_codex_instructions;
@@ -198,7 +203,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Add reasoning parameters for reasoning models (o1, o3, etc.)
-    if (model.reasoning) {
+    if (supports_openai_reasoning) {
         try w.writeKey("reasoning");
         try w.beginObject();
         if (normalizedOpenAIReasoningEffort(options)) |effort| {
@@ -267,7 +272,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     if (!is_codex_model) {
         if (explicit_system_prompt) |sp| {
             try w.beginObject();
-            const system_role: []const u8 = if (model.reasoning) "developer" else "system";
+            const system_role: []const u8 = if (supports_openai_reasoning) "developer" else "system";
             try w.writeStringField("role", system_role);
             // Sanitize system prompt to remove unpaired surrogates
             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
