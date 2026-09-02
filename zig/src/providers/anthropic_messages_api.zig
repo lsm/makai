@@ -1474,10 +1474,10 @@ fn runThread(ctx: *ThreadCtx) void {
             raw_body.appendSlice(allocator, read_buf[0..@min(n, cap)]) catch {};
         }
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
             stream.markThreadDone();
-            stream.completeWithError("sse parse error");
+            stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 

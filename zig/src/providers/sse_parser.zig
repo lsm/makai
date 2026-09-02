@@ -13,12 +13,20 @@ pub const SSEEvent = struct {
     }
 };
 
+pub const Limits = struct {
+    /// Largest accepted physical SSE line, excluding its line ending.
+    line_bytes: usize = 1024 * 1024,
+    /// Largest returned event, including type, data, and inserted data newlines.
+    event_bytes: usize = 4 * 1024 * 1024,
+};
+
 pub const SSEParser = struct {
     line_buffer: std.ArrayList(u8),
     current_event_type: ?[]const u8,
     current_data: std.ArrayList(u8),
     pending_events: std.ArrayList(SSEEvent),
     allocator: std.mem.Allocator,
+    limits: Limits,
 
     pub fn init(allocator: std.mem.Allocator) SSEParser {
         return .{
@@ -27,7 +35,14 @@ pub const SSEParser = struct {
             .current_data = std.ArrayList(u8).empty,
             .pending_events = std.ArrayList(SSEEvent).empty,
             .allocator = allocator,
+            .limits = .{},
         };
+    }
+
+    pub fn initWithLimits(allocator: std.mem.Allocator, limits: Limits) SSEParser {
+        var parser = init(allocator);
+        parser.limits = limits;
+        return parser;
     }
 
     pub fn deinit(self: *SSEParser) void {
@@ -70,8 +85,7 @@ pub const SSEParser = struct {
                     self.line_buffer.clearRetainingCapacity();
                 }
             } else if (byte != '\r') {
-                // Accumulate line (skip \r)
-                try self.line_buffer.append(self.allocator, byte);
+                try self.appendLineByte(byte);
             }
         }
 
@@ -109,17 +123,9 @@ pub const SSEParser = struct {
             }
 
             if (std.mem.eql(u8, field, "event")) {
-                // Set event type
-                if (self.current_event_type) |et| {
-                    self.allocator.free(et);
-                }
-                self.current_event_type = try self.allocator.dupe(u8, value);
+                try self.setEventType(value);
             } else if (std.mem.eql(u8, field, "data")) {
-                // Append data (with newline if not first)
-                if (self.current_data.items.len > 0) {
-                    try self.current_data.append(self.allocator, '\n');
-                }
-                try self.current_data.appendSlice(self.allocator, value);
+                try self.appendEventData(value);
             }
             // Other fields are ignored
         }
@@ -140,7 +146,43 @@ pub const SSEParser = struct {
         self.current_event_type = null;
         self.current_data.clearRetainingCapacity();
     }
+
+    fn appendLineByte(self: *SSEParser, byte: u8) !void {
+        if (self.line_buffer.items.len >= self.limits.line_bytes) return error.LineTooLarge;
+        try self.line_buffer.append(self.allocator, byte);
+    }
+
+    fn setEventType(self: *SSEParser, event_type: []const u8) !void {
+        const data_len = self.current_data.items.len;
+        if (event_type.len > self.limits.event_bytes -| data_len) return error.EventTooLarge;
+
+        const copy = try self.allocator.dupe(u8, event_type);
+        if (self.current_event_type) |old| self.allocator.free(old);
+        self.current_event_type = copy;
+    }
+
+    fn appendEventData(self: *SSEParser, value: []const u8) !void {
+        const type_len = if (self.current_event_type) |event_type| event_type.len else 0;
+        const separator_len: usize = if (self.current_data.items.len > 0) 1 else 0;
+        const data_len = self.current_data.items.len;
+        const remaining_after_type = self.limits.event_bytes -| type_len;
+        const remaining_after_data = remaining_after_type -| data_len;
+        if (separator_len > remaining_after_data or value.len > remaining_after_data - separator_len) {
+            return error.EventTooLarge;
+        }
+
+        if (separator_len != 0) try self.current_data.append(self.allocator, '\n');
+        try self.current_data.appendSlice(self.allocator, value);
+    }
 };
+
+pub fn errorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.LineTooLarge => "sse line too large",
+        error.EventTooLarge => "sse event too large",
+        else => "sse parse error",
+    };
+}
 
 // Tests
 test "SSEParser - basic single event" {
@@ -323,6 +365,28 @@ test "SSEParser - field without space after colon" {
     try std.testing.expectEqualStrings("no space", events[0].data);
 }
 
+test "SSEParser - rejects an overlong line before growth" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.initWithLimits(allocator, .{ .line_bytes = 4, .event_bytes = 32 });
+    defer parser.deinit();
+
+    try std.testing.expectError(error.LineTooLarge, parser.feed("abcde"));
+    try std.testing.expectEqual(@as(usize, 4), parser.line_buffer.items.len);
+}
+
+test "SSEParser - complete event limit includes type and data" {
+    const allocator = std.testing.allocator;
+    var parser = SSEParser.initWithLimits(allocator, .{ .line_bytes = 32, .event_bytes = 8 });
+    defer parser.deinit();
+
+    _ = try parser.feed("event: type\n");
+    try std.testing.expectError(error.EventTooLarge, parser.feed("data: value\n"));
+}
+
+test "SSEParser - error messages preserve limit names" {
+    try std.testing.expectEqualStrings("sse line too large", errorMessage(error.LineTooLarge));
+    try std.testing.expectEqualStrings("sse event too large", errorMessage(error.EventTooLarge));
+}
 
 test "sse_parser_one_byte_incremental_reads_preserve_events" {
     const allocator = std.testing.allocator;

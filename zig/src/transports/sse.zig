@@ -657,8 +657,8 @@ pub const AsyncSseReceiver = struct {
             }
 
             // Feed to parser
-            const events = ctx.parser.feed(ctx.read_buf[0..bytes_read]) catch {
-                ctx.stream.completeWithError("SSE parse error");
+            const events = ctx.parser.feed(ctx.read_buf[0..bytes_read]) catch |err| {
+                ctx.stream.completeWithError(sse_parser.errorMessage(err));
                 return;
             };
 
