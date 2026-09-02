@@ -39,8 +39,13 @@ jobs:
             echo "No successful canonical baseline exists. Run the Capture Benchmark Baseline workflow on main." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Capture candidate reports
+        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
+
       - name: Download canonical baseline
+        id: download
         if: steps.baseline.outputs.found == 'true'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -50,11 +55,8 @@ jobs:
           path: artifacts/baseline
           merge-multiple: true
 
-      - name: Capture candidate reports
-        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
-
       - name: Compare with canonical baseline
-        if: steps.baseline.outputs.found == 'true'
+        if: steps.download.outcome == 'success'
         working-directory: zig
         run: |
           {
@@ -79,8 +81,10 @@ jobs:
           } | tee ../artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Explain unavailable comparison
-        if: steps.baseline.outputs.found != 'true'
-        run: echo "Candidate reports were captured, but comparison requires a successful canonical baseline run on main." > artifacts/candidate/comparison.txt
+        if: steps.download.outcome != 'success'
+        run: |
+          echo "Candidate reports were captured, but no retained artifact from a successful canonical baseline run on main was available." | tee artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "Run the Capture Benchmark Baseline workflow on main, then rerun this job." | tee -a artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload candidate reports
         if: always()
