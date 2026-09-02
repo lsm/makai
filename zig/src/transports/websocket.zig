@@ -218,6 +218,9 @@ pub const WebSocketClient = struct {
         while (true) {
             // Try to decode a frame from existing buffer
             const decoded = decodeFrameWithLimit(self.recv_buffer.items, self.limits.frame_payload_bytes) catch |err| {
+                // Unblock any concurrent write before close takes ownership of
+                // the socket and waits for write_mutex.
+                self.abort();
                 self.close();
                 return err;
             };
