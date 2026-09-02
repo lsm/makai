@@ -384,11 +384,16 @@ pub const WebSocketClient = struct {
 
         if (maybe_stream) |stream| {
             var closable = stream;
-            // Hold the write mutex around the close-frame write and socket close
-            // so they cannot interleave with an in-flight message/pong frame.
-            while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+            // A graceful close is possible only when no writer is active. If a
+            // writer owns the socket, shutdown first so waiting for it cannot
+            // deadlock.
+            const writer_idle = self.write_mutex.tryLock();
+            if (!writer_idle) {
+                closable.shutdown();
+                while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+            }
             defer self.write_mutex.unlock();
-            if (send_close_frame) {
+            if (send_close_frame and writer_idle) {
                 const close_frame = Frame{
                     .opcode = .close,
                     .payload = &.{},
