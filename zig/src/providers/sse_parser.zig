@@ -24,6 +24,7 @@ pub const SSEParser = struct {
     line_buffer: std.ArrayList(u8),
     current_event_type: ?[]const u8,
     current_data: std.ArrayList(u8),
+    has_data_field: bool,
     pending_events: std.ArrayList(SSEEvent),
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -34,6 +35,7 @@ pub const SSEParser = struct {
             .line_buffer = std.ArrayList(u8).empty,
             .current_event_type = null,
             .current_data = std.ArrayList(u8).empty,
+            .has_data_field = false,
             .pending_events = std.ArrayList(SSEEvent).empty,
             .allocator = allocator,
             .limits = .{},
@@ -101,6 +103,7 @@ pub const SSEParser = struct {
             self.current_event_type = null;
         }
         self.current_data.clearRetainingCapacity();
+        self.has_data_field = false;
         for (self.pending_events.items) |*event| {
             event.deinit(self.allocator);
         }
@@ -141,7 +144,7 @@ pub const SSEParser = struct {
 
     fn finalizeEvent(self: *SSEParser) !void {
         // Only create event if we have data
-        if (self.current_data.items.len == 0) return;
+        if (!self.has_data_field) return;
 
         const event = SSEEvent{
             .event_type = self.current_event_type,
@@ -153,6 +156,7 @@ pub const SSEParser = struct {
         // Reset current state
         self.current_event_type = null;
         self.current_data.clearRetainingCapacity();
+        self.has_data_field = false;
     }
 
     fn appendLineByte(self: *SSEParser, byte: u8) !void {
@@ -186,7 +190,7 @@ pub const SSEParser = struct {
 
     fn appendEventData(self: *SSEParser, value: []const u8) !void {
         const type_len = if (self.current_event_type) |event_type| event_type.len else 0;
-        const separator_len: usize = if (self.current_data.items.len > 0) 1 else 0;
+        const separator_len: usize = if (self.has_data_field) 1 else 0;
         const data_len = self.current_data.items.len;
         const remaining_after_type = self.limits.event_bytes -| type_len;
         const remaining_after_data = remaining_after_type -| data_len;
@@ -199,6 +203,7 @@ pub const SSEParser = struct {
         try self.ensureBoundedCapacity(&self.current_data, new_len, remaining_after_type);
         if (separator_len != 0) self.current_data.appendAssumeCapacity('\n');
         self.current_data.appendSliceAssumeCapacity(value);
+        self.has_data_field = true;
     }
 
     fn ensureBoundedCapacity(
@@ -592,6 +597,23 @@ test "SSEParser - recognized colonless event field has an empty value" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("", events[0].event_type.?);
     try std.testing.expectEqualStrings("value", events[0].data);
+}
+
+test "SSEParser - leading and sole empty data fields are preserved" {
+    var parser = SSEParser.init(std.testing.allocator);
+    defer parser.deinit();
+
+    var events = try parser.feed("data\ndata: value\n\n");
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("\nvalue", events[0].data);
+
+    events = try parser.feed("data:\ndata: value\n\n");
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("\nvalue", events[0].data);
+
+    events = try parser.feed("data\n\n");
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("", events[0].data);
 }
 
 test "SSEParser - exact limits succeed and one byte over recovers after reset" {
