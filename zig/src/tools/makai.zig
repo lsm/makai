@@ -844,9 +844,11 @@ fn prepareAgentRun(
     errdefer allocator.free(system_prompt);
 
     var options = try parseAgentRunOptions(allocator, message_obj, config_obj, pending.options_json);
-    if (std.mem.eql(u8, model.provider, "openai") and std.mem.startsWith(u8, model.id, "gpt-5-pro") and
-        !options.has_explicit_thinking_level)
-    {
+    // GPT-5 Pro only supports the `high` reasoning effort (bundled OpenAI
+    // spec, docs/openai/responses.md): normalize every request, not just
+    // requests without an explicit level, since other values are rejected
+    // by the API.
+    if (std.mem.eql(u8, model.provider, "openai") and std.mem.startsWith(u8, model.id, "gpt-5-pro")) {
         options.thinking_level = .high;
     }
 
@@ -3437,6 +3439,43 @@ test "prepareAgentRun reads thinking level from stdio config and allows message 
     var prepared_xhigh = try prepareAgentRun(allocator, from_xhigh);
     defer prepared_xhigh.deinit(allocator);
     try std.testing.expectEqual(ai_types.ThinkingLevel.xhigh, prepared_xhigh.options.thinking_level);
+}
+
+test "prepareAgentRun normalizes gpt-5-pro thinking level to high" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    var explicit_low = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"openai/openai-responses@gpt-5-pro","messages":[{"role":"user","content":"hello"}],"options":{"thinking_level":"low"}}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer explicit_low.deinit(allocator);
+
+    var prepared_low = try prepareAgentRun(allocator, explicit_low);
+    defer prepared_low.deinit(allocator);
+    // GPT-5 Pro only supports the high effort; lower explicit values are
+    // normalized instead of forwarded for the API to reject.
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, prepared_low.options.thinking_level);
+
+    var unset = agent_protocol_server.PendingAgentMessage{
+        .session_id = session_id,
+        .message_json = try allocator.dupe(u8,
+            \\{"model_ref":"openai/openai-responses@gpt-5-pro","messages":[{"role":"user","content":"hello"}]}
+        ),
+        .options_json = try allocator.dupe(u8, ""),
+        .config_json = try allocator.dupe(u8, "{}"),
+        .system_prompt = try allocator.dupe(u8, ""),
+    };
+    defer unset.deinit(allocator);
+
+    var prepared_unset = try prepareAgentRun(allocator, unset);
+    defer prepared_unset.deinit(allocator);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.high, prepared_unset.options.thinking_level);
 }
 
 test "parseToolResultHistoryMessage preserves structured tool_result content" {
