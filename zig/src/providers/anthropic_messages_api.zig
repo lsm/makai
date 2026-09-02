@@ -1872,7 +1872,11 @@ pub fn streamSimpleAnthropicMessages(
             } else {
                 // Budget-based thinking for older models
                 const max_tokens = o.max_tokens orelse model.max_tokens;
-                thinking_budget_tokens = @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1);
+                if (max_tokens > 1024) {
+                    thinking_budget_tokens = @max(1024, @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1));
+                } else {
+                    thinking_enabled = false;
+                }
             }
         }
     }
