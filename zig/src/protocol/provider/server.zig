@@ -3262,7 +3262,7 @@ test "credential resolution: missing api_key loads credentials from storage by p
     try std.testing.expectEqualStrings("sk-from-storage", CapturedCreds.captured_key.?);
 }
 
-test "credential resolution: missing api_key and missing storage entry returns auth_required nack" {
+test "credential resolution: missing api_key and missing storage entry falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3311,16 +3311,13 @@ test "credential resolution: missing api_key and missing storage entry returns a
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
-    // Server must NOT have created a stream when auth fails.
+    try std.testing.expect(response.?.payload == .ack);
+    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 }
 
-test "credential resolution: complete_request without credentials returns auth_required nack" {
+test "credential resolution: complete_request without credentials falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3362,11 +3359,7 @@ test "credential resolution: complete_request without credentials returns auth_r
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
+    try std.testing.expect(response.?.payload == .complete_response);
 }
 
 // ===========================================================================

@@ -393,7 +393,7 @@ test "provider protocol bridge maps thinking level to stream options" {
     try std.testing.expect(off.getThinkingEffort() == null);
     try std.testing.expectEqualStrings("none", off.getReasoningEffort().?);
 
-    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, null, null);
+    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, "gpt-5", null, null);
     try std.testing.expectEqualStrings("low", minimal.getReasoningEffort().?);
 }
 

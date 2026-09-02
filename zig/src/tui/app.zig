@@ -4672,12 +4672,15 @@ const test_model = ai_types.Model{
     .max_tokens = 256,
 };
 
-fn testContext() ai_types.Context {
-    const user = ai_types.Message{ .user = .{
+const test_messages = [_]ai_types.Message{
+    .{ .user = .{
         .content = .{ .text = "hi" },
-        .timestamp = compat.time.nowMillis(),
-    } };
-    return .{ .messages = &[_]ai_types.Message{user} };
+        .timestamp = 0,
+    } },
+};
+
+fn testContext() ai_types.Context {
+    return .{ .messages = &test_messages };
 }
 
 fn drainStreamAndVerify(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream) !void {
