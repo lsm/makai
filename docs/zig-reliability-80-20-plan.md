@@ -94,8 +94,9 @@ tests execute under this command.
 
 ### Step 2 — Generalize only the tested pattern
 
-**Scope:** `zig/src/transports/stdio.zig` (both blocking and async receivers, preferably through one
-tested framing helper) and `zig/src/transports/websocket.zig` in separate PRs or commits.
+**Scope:** `zig/src/transports/stdio.zig` (the blocking receiver, async producer, and async
+compatibility `read()` callback, preferably through one tested framing helper) and
+`zig/src/transports/websocket.zig` in separate PRs or commits.
 
 For each component, introduce one local limit type and one checked append path. Keep the semantics
 specific:
@@ -109,9 +110,9 @@ specific:
   frames incrementally so a read coalescing several valid frames is not rejected by its aggregate
   byte count.
 
-**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases on both
-stdio receiver implementations (or one shared framing helper); a coalesced stdio read whose total
-bytes exceed the line limit but whose individual lines do not; a coalesced WebSocket read whose
+**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases on every
+public stdio framing path (or one shared framing helper); a coalesced stdio read whose total bytes
+exceed the line limit but whose individual lines do not; a coalesced WebSocket read whose
 individual frames/messages are valid but aggregate bytes exceed the receive limit; normal
 continuation/ping behavior for WebSocket; EOF/cancellation behavior for stdio.
 
