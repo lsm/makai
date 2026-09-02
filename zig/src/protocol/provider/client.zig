@@ -25,8 +25,18 @@ pub const ProtocolClient = struct {
     };
 
     pub const Options = struct {
+        pub const EventDelivery = enum {
+            global,
+            per_stream,
+            both,
+        };
+
         include_partial: bool = false,
         request_timeout_ms: u64 = 30_000,
+
+        /// Select the queue(s) that receive events. Consumers must drain every
+        /// selected queue; single-queue adapters should not use `.both`.
+        event_delivery: EventDelivery = .both,
 
         /// Retry configuration for transient transport errors.
         /// When set, the client applies retry with exponential backoff to:
@@ -221,7 +231,7 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        if (!already_complete) {
+        if (!already_complete and self.options.event_delivery != .global) {
             const ses = try self.ensureStreamEventStream(stream_id);
             ses.completeWithError(msg);
         }
@@ -238,7 +248,7 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        if (!already_complete) {
+        if (!already_complete and self.options.event_delivery != .global) {
             const ses = try self.ensureStreamEventStream(stream_id);
             ses.complete(try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(stream_id).?));
         }
@@ -328,7 +338,9 @@ pub const ProtocolClient = struct {
         });
         try self.stream_complete_flags.put(stream_id, false);
         _ = try self.ensureReconstructor(stream_id);
-        _ = try self.ensureStreamEventStream(stream_id);
+        if (self.options.event_delivery != .global) {
+            _ = try self.ensureStreamEventStream(stream_id);
+        }
 
         return .{ .stream_id = stream_id, .message_id = message_id };
     }
@@ -414,48 +426,28 @@ pub const ProtocolClient = struct {
                 try self.setLastError(nack.reason.slice());
             },
             .event => |evt| {
-                // Deep copy the event so the event stream owns its memory
-                // This is necessary because the envelope's deinit will free
-                // the original event's strings
-                const owned_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, evt);
-                var owned_evt_transferred = false;
-                errdefer {
-                    if (!owned_evt_transferred) {
-                        var cleanup = owned_evt;
-                        ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
-                    }
+                if (self.options.event_delivery != .per_stream) {
+                    try self.pushOwnedEvent(self.event_stream, evt);
                 }
 
-                // Push to global event stream for polling
-                try self.event_stream.push(owned_evt);
-                owned_evt_transferred = true;
-
-                // Push to per-stream event stream
-                const stream_es = try self.ensureStreamEventStream(env.stream_id);
-                const per_stream_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, owned_evt);
-                var per_stream_evt_transferred = false;
-                errdefer {
-                    if (!per_stream_evt_transferred) {
-                        var cleanup = per_stream_evt;
-                        ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
-                    }
+                if (self.options.event_delivery != .global) {
+                    const stream_es = try self.ensureStreamEventStream(env.stream_id);
+                    try self.pushOwnedEvent(stream_es, evt);
                 }
-                try stream_es.push(per_stream_evt);
-                per_stream_evt_transferred = true;
 
                 // Process through legacy reconstructor for compatibility
-                try self.reconstructor.processEvent(owned_evt);
+                try self.reconstructor.processEvent(evt);
 
                 // Process through per-stream reconstructor
                 const recon = try self.ensureReconstructor(env.stream_id);
-                try recon.processEvent(owned_evt);
+                try recon.processEvent(evt);
 
                 // Check for done event
-                if (owned_evt == .done) {
+                if (evt == .done) {
                     const stream_result = recon.buildMessage(
-                        owned_evt.done.reason,
-                        owned_evt.done.message.timestamp,
-                    ) catch try ai_types.cloneAssistantMessage(self.allocator, owned_evt.done.message);
+                        evt.done.reason,
+                        evt.done.message.timestamp,
+                    ) catch try ai_types.cloneAssistantMessage(self.allocator, evt.done.message);
                     try self.setStreamResult(env.stream_id, stream_result);
 
                     // Legacy fields for current stream users use the legacy reconstructor
@@ -464,8 +456,8 @@ pub const ProtocolClient = struct {
                         prev.deinit(self.allocator);
                     }
                     self.last_result = try self.reconstructor.buildMessage(
-                        owned_evt.done.reason,
-                        owned_evt.done.message.timestamp,
+                        evt.done.reason,
+                        evt.done.message.timestamp,
                     );
                 }
             },
@@ -495,6 +487,57 @@ pub const ProtocolClient = struct {
                 // Ignore other payload types
             },
         }
+    }
+
+    fn pushOwnedEvent(self: *Self, destination: *event_stream.AssistantMessageEventStream, event: ai_types.AssistantMessageEvent) !void {
+        const owned = try ai_types.cloneAssistantMessageEvent(self.allocator, event);
+        var transferred = false;
+        errdefer if (!transferred) {
+            var cleanup = owned;
+            ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
+        };
+        try destination.push(owned);
+        transferred = true;
+    }
+
+    /// Available capacity across every authoritative event destination.
+    pub fn eventDeliveryCapacity(self: *Self) usize {
+        if (self.options.event_delivery == .per_stream) {
+            var capacity: usize = 0;
+            var streams = self.stream_event_streams.valueIterator();
+            while (streams.next()) |stream| {
+                capacity = @max(capacity, stream.*.freeSlots());
+            }
+            return if (self.stream_event_streams.count() == 0)
+                @TypeOf(self.event_stream.*).usable_capacity
+            else
+                capacity;
+        }
+
+        var capacity = self.event_stream.freeSlots();
+
+        if (self.options.event_delivery != .global) {
+            var streams = self.stream_event_streams.valueIterator();
+            while (streams.next()) |stream| {
+                capacity = @min(capacity, stream.*.freeSlots());
+            }
+        }
+        return capacity;
+    }
+
+    /// Available capacity for an event belonging to one stream.
+    pub fn eventDeliveryCapacityFor(self: *Self, stream_id: protocol_types.Ulid) usize {
+        var capacity = if (self.options.event_delivery == .per_stream)
+            @TypeOf(self.event_stream.*).usable_capacity
+        else
+            self.event_stream.freeSlots();
+
+        if (self.options.event_delivery != .global) {
+            if (self.stream_event_streams.get(stream_id)) |stream| {
+                capacity = @min(capacity, stream.freeSlots());
+            }
+        }
+        return capacity;
     }
 
     /// Get the global event stream for consuming interleaved events
@@ -956,6 +999,48 @@ test "processEnvelope routes events to per-stream event stream" {
         var mutable_ev = ev;
         ai_types.deinitAssistantMessageEvent(allocator, &mutable_ev);
     }
+}
+
+test "processEnvelope can select global-only event delivery" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{ .event_delivery = .global });
+    defer client.deinit();
+
+    const stream_id = protocol_types.generateUlid();
+    const env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .keepalive = {} } },
+    };
+
+    try client.processEnvelope(env);
+    try std.testing.expect(client.getEventStreamFor(stream_id) == null);
+
+    var event = client.getEventStream().poll().?;
+    defer ai_types.deinitAssistantMessageEvent(allocator, &event);
+    try std.testing.expect(event == .keepalive);
+
+    const result_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .result = .{
+            .content = &.{},
+            .api = "test-api",
+            .provider = "test-provider",
+            .model = "test-model",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+        } },
+    };
+    try client.processEnvelope(result_env);
+    try std.testing.expect(client.getEventStreamFor(stream_id) == null);
+    try std.testing.expect(client.isCompleteFor(stream_id));
 }
 
 test "processEnvelope handles ack" {
