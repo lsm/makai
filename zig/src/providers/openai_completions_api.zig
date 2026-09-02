@@ -73,7 +73,10 @@ fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?
     if (std.mem.eql(u8, provider_id, "deepseek")) {
         return compat_mod.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
     }
-    return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    }
+    return null;
 }
 
 fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
