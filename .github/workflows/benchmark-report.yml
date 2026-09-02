@@ -32,9 +32,17 @@ jobs:
         run: |
           candidate_identity=$(head -n 1 artifacts/candidate/latency.jsonl | \
             jq -r '[.host_class,.target,.cpu_model,.cpu_features_hash,.zig_version,.optimize] | @tsv')
-          mapfile -t run_ids < <(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
-            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=20 \
-            --jq '.workflow_runs[].id')
+          if ! run_ids_text=$(gh api --method GET --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
+            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=100 | \
+            jq -r '.[].workflow_runs[].id'); then
+            echo "The Actions API baseline lookup failed; candidate artifacts cannot be matched safely." >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          run_ids=()
+          if [[ -n "$run_ids_text" ]]; then
+            mapfile -t run_ids <<< "$run_ids_text"
+          fi
 
           found=false
           for run_id in "${run_ids[@]}"; do
