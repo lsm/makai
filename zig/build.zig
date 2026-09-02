@@ -1347,7 +1347,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-
     const e2e_tui_websocket_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/e2e/tui_websocket.zig"),
@@ -1622,7 +1621,46 @@ pub fn build(b: *std.Build) void {
     const run_tui_step = b.step("run-tui", "Run the Makai TUI");
     run_tui_step.dependOn(&run_tui_cmd.step);
 
+    const counting_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/counting_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "counting_allocator", .module = counting_allocator_mod },
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+    const bench_exe = b.addExecutable(.{ .name = "makai-bench", .root_module = bench_mod });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run deterministic performance and allocation baselines");
+    bench_step.dependOn(&bench_run.step);
+
+    const bench_compare_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench/compare.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "compat", .module = compat_mod }},
+    });
+    const bench_compare_exe = b.addExecutable(.{ .name = "makai-bench-compare", .root_module = bench_compare_mod });
+    const bench_compare_run = b.addRunArtifact(bench_compare_exe);
+    if (b.args) |args| bench_compare_run.addArgs(args);
+    const bench_compare_step = b.step("bench-compare", "Compare compatible benchmark JSON reports");
+    bench_compare_step.dependOn(&bench_compare_run.step);
+
+    const counting_allocator_test = b.addTest(.{ .root_module = counting_allocator_mod });
+    const bench_compare_test = b.addTest(.{ .root_module = bench_compare_mod });
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(counting_allocator_test).step);
+    test_step.dependOn(&b.addRunArtifact(bench_compare_test).step);
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
@@ -1740,6 +1778,8 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(compat_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(counting_allocator_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(bench_compare_test).step);
 
     const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
