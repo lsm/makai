@@ -132,10 +132,16 @@ fn isGpt51OrLater(model_id: []const u8) bool {
 
 /// Whether the model family accepts the `xhigh` reasoning effort. Per the
 /// bundled OpenAI specification (docs/openai/responses.md), xhigh is
-/// supported only for models after gpt-5.1-codex-max; `high` is accepted by
+/// supported for models after gpt-5.1-codex-max — the codex-max family
+/// itself and later minor versions (gpt-5.2 onward); `high` is accepted by
 /// every reasoning-capable family.
 fn supportsXhighReasoning(model_id: []const u8) bool {
-    return std.mem.indexOf(u8, model_id, "codex-max") != null;
+    if (std.mem.indexOf(u8, model_id, "codex-max") != null) return true;
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '2';
 }
 
 fn thinkingEffort(level: ai_types.ThinkingLevel) []const u8 {
@@ -412,6 +418,10 @@ test "provider protocol bridge maps thinking level to stream options" {
 
     const codex_max = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.1-codex-max", null, null);
     try std.testing.expectEqualStrings("xhigh", codex_max.getReasoningEffort().?);
+
+    // Later families ship after gpt-5.1-codex-max and accept xhigh.
+    const gpt52_xhigh = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("xhigh", gpt52_xhigh.getReasoningEffort().?);
 
     // Post-5.1 families accept none; pre-5.1 families do not.
     const gpt52_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.2", null, null);
