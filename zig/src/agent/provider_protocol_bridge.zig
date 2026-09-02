@@ -179,7 +179,9 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
     var server = ProtocolServer.init(ctx.allocator, ctx.registry, .{});
     defer server.deinit();
 
-    var client = ProtocolClient.init(ctx.allocator, .{});
+    var client = ProtocolClient.init(ctx.allocator, .{
+        .event_delivery = .global,
+    });
     defer client.deinit();
     client.setSender(pipe.clientSender());
 
