@@ -30,13 +30,13 @@ pub fn serializeEnvelope(
     }
 
     // Write stream_id
-    const stream_id_str = try protocol_types.ulidToString(envelope.stream_id, allocator);
-    defer allocator.free(stream_id_str);
+    var stream_id_buffer: [26]u8 = undefined;
+    const stream_id_str = protocol_types.ulidToBuffer(envelope.stream_id, &stream_id_buffer);
     try w.writeStringField("stream_id", stream_id_str);
 
     // Write message_id
-    const message_id_str = try protocol_types.ulidToString(envelope.message_id, allocator);
-    defer allocator.free(message_id_str);
+    var message_id_buffer: [26]u8 = undefined;
+    const message_id_str = protocol_types.ulidToBuffer(envelope.message_id, &message_id_buffer);
     try w.writeStringField("message_id", message_id_str);
 
     // Write sequence
@@ -50,8 +50,8 @@ pub fn serializeEnvelope(
 
     // Write in_reply_to if present
     if (envelope.in_reply_to) |reply_to| {
-        const reply_to_str = try protocol_types.ulidToString(reply_to, allocator);
-        defer allocator.free(reply_to_str);
+        var reply_to_buffer: [26]u8 = undefined;
+        const reply_to_str = protocol_types.ulidToBuffer(reply_to, &reply_to_buffer);
         try w.writeStringField("in_reply_to", reply_to_str);
     }
 
@@ -87,13 +87,13 @@ fn serializePayload(
             }
         },
         .sync_request => |sync_req| {
-            const target_str = try protocol_types.ulidToString(sync_req.target_stream_id, allocator);
-            defer allocator.free(target_str);
+            var target_buffer: [26]u8 = undefined;
+            const target_str = protocol_types.ulidToBuffer(sync_req.target_stream_id, &target_buffer);
             try w.writeStringField("target_stream_id", target_str);
         },
         .sync => |sync_msg| {
-            const target_str = try protocol_types.ulidToString(sync_msg.target_stream_id, allocator);
-            defer allocator.free(target_str);
+            var target_buffer: [26]u8 = undefined;
+            const target_str = protocol_types.ulidToBuffer(sync_msg.target_stream_id, &target_buffer);
             try w.writeStringField("target_stream_id", target_str);
             if (sync_msg.partial) |partial| {
                 try w.writeKey("partial");
@@ -132,21 +132,21 @@ fn serializePayload(
             }
         },
         .abort_request => |req| {
-            const target_str = try protocol_types.ulidToString(req.target_stream_id, allocator);
-            defer allocator.free(target_str);
+            var target_buffer: [26]u8 = undefined;
+            const target_str = protocol_types.ulidToBuffer(req.target_stream_id, &target_buffer);
             try w.writeStringField("target_stream_id", target_str);
             if (req.getReason()) |reason| {
                 try w.writeStringField("reason", reason);
             }
         },
         .ack => |ack| {
-            const acknowledged_id_str = try protocol_types.ulidToString(ack.acknowledged_id, allocator);
-            defer allocator.free(acknowledged_id_str);
+            var acknowledged_id_buffer: [26]u8 = undefined;
+            const acknowledged_id_str = protocol_types.ulidToBuffer(ack.acknowledged_id, &acknowledged_id_buffer);
             try w.writeStringField("acknowledged_id", acknowledged_id_str);
         },
         .nack => |nack| {
-            const rejected_id_str = try protocol_types.ulidToString(nack.rejected_id, allocator);
-            defer allocator.free(rejected_id_str);
+            var rejected_id_buffer: [26]u8 = undefined;
+            const rejected_id_str = protocol_types.ulidToBuffer(nack.rejected_id, &rejected_id_buffer);
             try w.writeStringField("rejected_id", rejected_id_str);
             try w.writeStringField("reason", nack.reason.slice());
             if (nack.error_code) |code| {
