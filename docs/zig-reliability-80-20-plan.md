@@ -65,10 +65,11 @@ work.
 collapses parser errors, the corresponding provider integration tests, and any required build/test
 wiring.
 
-1. Add a `Limits` configuration with separate maximums for line and complete-event bytes. `init()`
-   keeps sensible compatibility defaults; a second initializer may take limits. Do not limit
-   completed events based on one `feed()` call: read chunking is arbitrary. A bounded output batch
-   requires a separately designed drain/emit API.
+1. Add a `Limits` configuration with separate maximums for line and complete-event bytes. The
+   complete-event budget covers returned `event_type`, data, and synthesized data newlines, using
+   overflow-safe combined accounting. `init()` keeps sensible compatibility defaults; a second
+   initializer may take limits. Do not limit completed events based on one `feed()` call: read
+   chunking is arbitrary. A bounded output batch requires a separately designed drain/emit API.
 2. Centralize checked growth in helpers such as `append_line_byte`, `append_event_data`, and
    `append_pending_event`. Check the prospective length before appending and use overflow-safe
    arithmetic.
@@ -110,11 +111,13 @@ specific:
   frames incrementally so a read coalescing several valid frames is not rejected by its aggregate
   byte count.
 
-**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases on every
-public stdio framing path (or one shared framing helper); a coalesced stdio read whose total bytes
-exceed the line limit but whose individual lines do not; a coalesced WebSocket read whose
-individual frames/messages are valid but aggregate bytes exceed the receive limit; normal
-continuation/ping behavior for WebSocket; EOF/cancellation behavior for stdio.
+**Tests:** all useful small-payload split positions; exact-boundary, over-boundary, and coalesced
+multi-line cases on every public stdio framing path (or one shared framing helper); exact-boundary
+and one-byte-over cases for each WebSocket budget (frame payload, fragmented-message aggregate,
+and undecoded receive buffer); a coalesced WebSocket read whose individual frames/messages are
+valid but aggregate bytes exceed the receive limit; normal continuation/ping behavior; invalid or
+reserved opcodes returning a recoverable protocol error rather than trapping; and
+EOF/cancellation behavior for stdio.
 
 **Acceptance:** `zig build test-unit-transport` passes. The change must not alter normal
 connection-state transitions or message ownership.

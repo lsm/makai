@@ -111,23 +111,28 @@ Store one report per execution, never overwrite a named source baseline. Minimum
     "elapsed_ns": 0,
     "operation_latency_ns": [],
     "semantic_validation": { "passed": true, "expected_output_count": 0, "output_count": 0, "output_digest": "..." },
-    "allocation": { "allocation_count": 0, "free_count": 0, "allocated_bytes": 0, "freed_bytes": 0, "live_bytes_peak": 0, "leak_bytes": 0 }
+    "allocation": null
   }],
   "summary": {
     "throughput_ops_per_sec": 0,
     "latency_ns": { "p50": 0, "p95": 0, "p99": 0 },
-    "allocation": { "allocation_count": 0, "free_count": 0, "allocated_bytes": 0, "freed_bytes": 0, "live_bytes_peak": 0, "leak_bytes": 0 }
+    "allocation": null
   }
 }
 ```
+
+`allocation` is `null` in latency mode, where the counting allocator is intentionally disabled;
+when `measurement_mode` is `allocation`, it contains `allocation_count`, `free_count`,
+`allocated_bytes`, `freed_bytes`, `live_bytes_peak`, and `leak_bytes`. The summary follows the same
+rule so an unmeasured memory metric is never reported as zero.
 
 Add a comparison script that rejects mismatched schema, fixture identity, workload ID/parameters,
 chunk schedule, concurrency, target, optimization, Zig version, measurement mode, or host class.
 For fixed-duration samples it compares allocation counts and bytes normalized per completed
 operation (and, where applicable, per input byte), rather than raw totals. Alternatively an
 allocation-only mode may execute the same fixed amount of work in every sample. It reports relative
-deltas and fails if `leak_bytes != 0`. It should *not* initially fail on a tiny timing delta; shared
-CI machines are noisy.
+deltas and fails if a collected `leak_bytes != 0`; it does not treat `null` allocation metrics as
+zero. It should *not* initially fail on a tiny timing delta; shared CI machines are noisy.
 
 ### 5. Optional process-RSS runner
 
