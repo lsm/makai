@@ -34,16 +34,25 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
     const is_openai_native = isOpenAIHost(model.base_url);
+    // detectCapabilities matches api.openai.com anywhere in the URL, so a
+    // generic gateway whose path merely contains that host would inherit
+    // OpenAI-native roles, reasoning effort and token fields. Honor those
+    // only on the parsed OpenAI host or an explicitly declared transparent
+    // proxy; every other endpoint keeps the compatible-endpoint defaults.
+    const honors_native_caps = is_openai_native or isTransparentOpenAIProxy(model);
+    const detected_developer_role = if (honors_native_caps) caps.supports_developer_role else false;
+    const detected_reasoning_effort = if (honors_native_caps) caps.supports_reasoning_effort else false;
+    const detected_max_tokens_field: []const u8 = if (honors_native_caps) caps.max_tokens_field else "max_tokens";
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
-        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse caps.supports_developer_role else caps.supports_developer_role,
-        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse caps.supports_reasoning_effort else caps.supports_reasoning_effort,
+        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse detected_developer_role else detected_developer_role,
+        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse detected_reasoning_effort else detected_reasoning_effort,
         .supports_usage_in_streaming = if (compat) |c| c.supports_usage_in_streaming orelse true else true,
         .max_tokens_field = if (compat) |c| switch (c.max_tokens_field) {
             .max_completion_tokens => "max_completion_tokens",
             .max_tokens => "max_tokens",
-        } else caps.max_tokens_field,
+        } else detected_max_tokens_field,
         .requires_tool_result_name = if (compat) |c| c.requires_tool_result_name orelse caps.requires_tool_result_name else caps.requires_tool_result_name,
         .requires_assistant_after_tool_result = if (compat) |c| c.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool else caps.requires_assistant_after_tool,
         .requires_thinking_as_text = if (compat) |c| c.requires_thinking_as_text orelse caps.requires_thinking_as_text else caps.requires_thinking_as_text,
@@ -57,7 +66,7 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
             .zai => .zai,
             .qwen => .qwen,
         },
-        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse (is_openai_native or isTransparentOpenAIProxy(model)) else is_openai_native,
+        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse honors_native_caps else is_openai_native,
     };
 }
 
@@ -2558,6 +2567,30 @@ test "mergeCompat keeps custom OpenAI endpoints generic" {
         .api = "openai-completions",
         .provider = "openai",
         .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
+    // detectCapabilities substring-matches api.openai.com anywhere in the
+    // URL; a gateway whose path merely contains the host must not inherit
+    // OpenAI-native capabilities.
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://gateway.example/api.openai.com",
         .reasoning = true,
         .input = &[_][]const u8{"text"},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
