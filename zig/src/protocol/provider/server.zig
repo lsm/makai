@@ -667,7 +667,14 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
-    const provider_id = provider.auth_provider_id orelse model.provider;
+    // API handlers may advertise a vendor credential source (for example,
+    // Anthropic Messages). Do not use that source for a differently named
+    // model provider: a global/custom endpoint must receive an explicit key
+    // instead of an ambient vendor credential.
+    if (provider.auth_provider_id) |auth_provider_id| {
+        if (!std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+    }
+    const provider_id = model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
 
