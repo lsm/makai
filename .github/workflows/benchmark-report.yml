@@ -22,41 +22,48 @@ jobs:
         with:
           version: 0.16.0
 
-      - name: Find latest canonical baseline
+      - name: Capture candidate reports
+        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
+
+      - name: Find matching retained canonical baseline
         id: baseline
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          run_id=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
-            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=1 \
-            --jq '.workflow_runs[0].id // empty')
-          if [[ -n "$run_id" ]]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-            echo "Using canonical baseline run $run_id." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No successful canonical baseline exists. Run the Capture Benchmark Baseline workflow on main." >> "$GITHUB_STEP_SUMMARY"
+          candidate_identity=$(head -n 1 artifacts/candidate/latency.jsonl | \
+            jq -r '[.host_class,.target,.cpu_model,.cpu_features_hash,.zig_version,.optimize] | @tsv')
+          mapfile -t run_ids < <(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
+            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=20 \
+            --jq '.workflow_runs[].id')
+
+          found=false
+          for run_id in "${run_ids[@]}"; do
+            download_dir="$RUNNER_TEMP/benchmark-baseline-$run_id"
+            mkdir -p "$download_dir"
+            if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+              --pattern 'benchmark-baseline-*-ubuntu-24.04-x86_64' --dir "$download_dir"; then
+              continue
+            fi
+            baseline_file=$(find "$download_dir" -type f -name latency.jsonl -print -quit)
+            [[ -n "$baseline_file" ]] || continue
+            baseline_identity=$(head -n 1 "$baseline_file" | \
+              jq -r '[.host_class,.target,.cpu_model,.cpu_features_hash,.zig_version,.optimize] | @tsv')
+            if [[ "$baseline_identity" == "$candidate_identity" ]]; then
+              mkdir -p artifacts/baseline
+              cp "$(dirname "$baseline_file")"/* artifacts/baseline/
+              found=true
+              echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+              echo "Using CPU-compatible canonical baseline run $run_id." >> "$GITHUB_STEP_SUMMARY"
+              break
+            fi
+          done
+          echo "found=$found" >> "$GITHUB_OUTPUT"
+          if [[ "$found" != true ]]; then
+            echo "No retained canonical baseline matches this candidate's CPU and build identity." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Capture candidate reports
-        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
-
-      - name: Download canonical baseline
-        id: download
-        if: steps.baseline.outputs.found == 'true'
-        continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.baseline.outputs.run_id }}
-          pattern: benchmark-baseline-*-ubuntu-24.04-x86_64
-          path: artifacts/baseline
-          merge-multiple: true
-
       - name: Compare with canonical baseline
-        if: steps.download.outcome == 'success'
+        if: steps.baseline.outputs.found == 'true'
         working-directory: zig
         run: |
           {
@@ -81,10 +88,10 @@ jobs:
           } | tee ../artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Explain unavailable comparison
-        if: steps.download.outcome != 'success'
+        if: steps.baseline.outputs.found != 'true'
         run: |
-          echo "Candidate reports were captured, but no retained artifact from a successful canonical baseline run on main was available." | tee artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
-          echo "Run the Capture Benchmark Baseline workflow on main, then rerun this job." | tee -a artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate reports were captured, but no retained canonical artifact matched their CPU and build identity." | tee artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+          echo "Run the Capture Benchmark Baseline workflow on main from the same runner class, then rerun this job." | tee -a artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload candidate reports
         if: always()
