@@ -1,0 +1,92 @@
+name: Benchmark Report
+
+on:
+  pull_request:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    name: Informational benchmark report
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Find latest canonical baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/benchmark-baseline.yml/runs" \
+            -f branch=main -f event=workflow_dispatch -f status=success -F per_page=1 \
+            --jq '.workflow_runs[0].id // empty')
+          if [[ -n "$run_id" ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+            echo "Using canonical baseline run $run_id." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No successful canonical baseline exists. Run the Capture Benchmark Baseline workflow on main." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download canonical baseline
+        if: steps.baseline.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.baseline.outputs.run_id }}
+          pattern: benchmark-baseline-*-ubuntu-24.04-x86_64
+          path: artifacts/baseline
+          merge-multiple: true
+
+      - name: Capture candidate reports
+        run: ./scripts/capture-benchmark-baseline.sh artifacts/candidate github-ubuntu-24.04-x86_64 "$GITHUB_SHA"
+
+      - name: Compare with canonical baseline
+        if: steps.baseline.outputs.found == 'true'
+        working-directory: zig
+        run: |
+          {
+            echo '## Benchmark comparison'
+            echo
+            echo '```text'
+            comparison_valid=true
+            for mode in latency allocation; do
+              if output=$(zig build bench-compare -Doptimize=ReleaseFast -- "../artifacts/baseline/$mode.jsonl" "../artifacts/candidate/$mode.jsonl" 2>&1); then
+                printf '%s\n' "$output"
+              else
+                comparison_valid=false
+                echo "$mode comparison unavailable: the canonical and candidate reports are incompatible or invalid."
+                echo "Capture a new canonical baseline on main when an intentional schema, fixture, target, or parameter change lands."
+              fi
+            done
+            echo '```'
+            if [[ "$comparison_valid" != true ]]; then
+              echo
+              echo "Canonical source: workflow run ${{ steps.baseline.outputs.run_id }}."
+            fi
+          } | tee ../artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Explain unavailable comparison
+        if: steps.baseline.outputs.found != 'true'
+        run: echo "Candidate reports were captured, but comparison requires a successful canonical baseline run on main." > artifacts/candidate/comparison.txt
+
+      - name: Upload candidate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-candidate-${{ github.sha }}-ubuntu-24.04-x86_64
+          path: artifacts/candidate/
+          if-no-files-found: warn
+          retention-days: 30
