@@ -148,14 +148,13 @@ const Driver = struct {
         return error.PumpTimeout;
     }
 
-    /// Tick until the rendered frame contains the expected output. This waits
-    /// for the UI to consume the terminal assistant event rather than only for
-    /// the producer thread to clear its streaming status.
-    fn pumpUntilFrameContains(self: *Driver, needle: []const u8, max_iters: usize) !void {
+    /// Tick until the rendered frame contains the expected output and the turn
+    /// is terminal. These are separate async events, so either may arrive first.
+    fn pumpUntilTurnComplete(self: *Driver, needle: []const u8, max_iters: usize) !void {
         var i: usize = 0;
         while (i < max_iters) : (i += 1) {
             self.tick();
-            if (self.frameContains(needle)) return;
+            if (self.frameContains(needle) and !self.app().state.status.streaming) return;
             compat.time.sleepMs(2);
         }
         return error.PumpTimeout;
@@ -284,7 +283,7 @@ test "e2e: tool approval prompt appears and approving runs the tool to completio
 
     // Approve: 'y' in approval mode resolves the waiter and the loop resumes.
     d.typeText("y");
-    try d.pumpUntilFrameContains(fixtures.final_text, 2000);
+    try d.pumpUntilTurnComplete(fixtures.final_text, 2000);
 
     try std.testing.expect(!d.app().state.status.streaming);
     try std.testing.expectEqual(tui_state.AppMode.normal, d.app().state.mode);

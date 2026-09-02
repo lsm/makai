@@ -80,10 +80,14 @@ is material.
 
 Use a monotonic timer. Warm up first, run a fixed number of measurement samples, and emit every
 sample in JSON; calculate median/p95/p99 only from measured samples. Record the iteration count and
-bytes processed so readers can identify a workload that accidentally did less work.
+bytes processed so readers can identify a workload that accidentally did less work. Each sample must
+also validate the workload's expected result outside the timed interval: an expected event/message
+count plus a content digest, or round-trip equality as appropriate. Reject a sample whose semantic
+result is wrong even if its iteration and byte counts look complete.
 
-The harness must pin the fixture, chunk schedule, concurrency, Zig version, optimization mode, and
-workload parameters in its output. It should reject a zero iteration count or an incomplete run.
+The harness must pin the fixture identity, chunk schedule, concurrency, Zig version, optimization
+mode, measurement mode (allocation or latency), host class, and workload parameters in its output.
+It should reject a zero iteration count, an incomplete run, or a failed semantic validation.
 
 ### 4. JSON report and comparison tool
 
@@ -96,20 +100,22 @@ Store one report per execution, never overwrite a named source baseline. Minimum
   "zig_version": "0.16.0",
   "target": "...",
   "optimization": "ReleaseFast",
-  "host": { "os": "...", "arch": "...", "cpu_model": "..." },
-  "workload": { "id": "sse_parse", "fixture_bytes": 0, "chunk_schedule": "..." },
+  "host": { "class": "...", "os": "...", "arch": "...", "cpu_model": "..." },
+  "measurement_mode": "latency",
+  "workload": { "id": "sse_parse", "fixture_hash": "...", "fixture_bytes": 0, "chunk_schedule": "...", "concurrency": 1, "parameters": {} },
   "samples": [],
   "summary": {
     "throughput_ops_per_sec": 0,
     "latency_ns": { "p50": 0, "p95": 0, "p99": 0 },
-    "allocation": { "count": 0, "bytes": 0, "live_bytes_peak": 0, "leak_bytes": 0 }
+    "allocation": { "allocation_count": 0, "free_count": 0, "allocated_bytes": 0, "freed_bytes": 0, "live_bytes_peak": 0, "leak_bytes": 0 }
   }
 }
 ```
 
-Add a comparison script that rejects mismatched schema/workload/target/optimization, reports
-relative deltas, and fails if `leak_bytes != 0`. It should *not* initially fail on a tiny timing
-delta; shared CI machines are noisy.
+Add a comparison script that rejects mismatched schema, fixture identity, workload ID/parameters,
+chunk schedule, concurrency, target, optimization, Zig version, measurement mode, or host class.
+It reports relative deltas and fails if `leak_bytes != 0`. It should *not* initially fail on a tiny
+timing delta; shared CI machines are noisy.
 
 ### 5. Optional process-RSS runner
 
@@ -123,10 +129,12 @@ host-qualified and should not be compared across operating systems or allocator 
 * Commit fixtures, workload parameters, schema, and comparison code.
 * Use `ReleaseFast` for the performance baseline and report the mode; retain a debug/test mode only
   for validating harness correctness.
-* Compare only runs made on the same dedicated host class, target, Zig version, and workload
+* Compare only runs made with the same report identity: dedicated host class, target, Zig version,
+  optimization and measurement modes, fixture hash, chunk schedule, concurrency, and workload
   parameters. Disable CPU turbo/power-saving variance where the benchmark host permits it.
-* Run at least 15 samples after warm-up; compare medians for throughput and p95/p99 only with an
-  adequate sample size.
+* Run at least 15 samples after warm-up. For p95/p99, collect at least 100 independent per-operation
+  timings in each measured sample and document the aggregation method; do not present a percentile
+  calculated from one per-window observation as a tail-latency metric.
 * Make the benchmark process single-purpose: no API calls, background model traffic, or build work
   inside the measured interval.
 * Save raw JSON artifacts for a baseline and every proposed optimization. A chart without raw data
