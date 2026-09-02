@@ -6,6 +6,7 @@ const Report = struct {
     host_class: []const u8,
     target: []const u8,
     zig_version: []const u8,
+    optimize: []const u8,
     mode: []const u8,
     workload: []const u8,
     fixture_version: u32,
@@ -23,11 +24,20 @@ const Report = struct {
     leak_bytes: ?usize,
 };
 
+fn validate(report: Report) !void {
+    if (report.samples == 0 or report.raw_samples_ns.len != report.samples or report.ns_per_iteration == 0) return error.InvalidReport;
+    const metrics = [_]?usize{ report.allocation_count, report.free_count, report.allocated_bytes, report.freed_bytes, report.peak_live_bytes, report.leak_bytes };
+    if (std.mem.eql(u8, report.mode, "allocation")) {
+        for (metrics) |metric| if (metric == null) return error.InvalidReport;
+        if (report.leak_bytes.? != 0) return error.InvalidReport;
+    } else if (std.mem.eql(u8, report.mode, "latency")) {
+        for (metrics) |metric| if (metric != null) return error.InvalidReport;
+    } else return error.InvalidReport;
+}
+
 fn expectCompatible(baseline: Report, candidate: Report) !void {
-    if (baseline.samples == 0 or candidate.samples == 0 or
-        baseline.raw_samples_ns.len != baseline.samples or
-        candidate.raw_samples_ns.len != candidate.samples or
-        baseline.ns_per_iteration == 0 or candidate.ns_per_iteration == 0) return error.InvalidReport;
+    try validate(baseline);
+    try validate(candidate);
     if (baseline.schema_version != candidate.schema_version or
         baseline.fixture_version != candidate.fixture_version or
         baseline.iterations != candidate.iterations or
@@ -36,6 +46,7 @@ fn expectCompatible(baseline: Report, candidate: Report) !void {
         !std.mem.eql(u8, baseline.host_class, candidate.host_class) or
         !std.mem.eql(u8, baseline.target, candidate.target) or
         !std.mem.eql(u8, baseline.zig_version, candidate.zig_version) or
+        !std.mem.eql(u8, baseline.optimize, candidate.optimize) or
         !std.mem.eql(u8, baseline.mode, candidate.mode) or
         !std.mem.eql(u8, baseline.workload, candidate.workload)) return error.IncompatibleReports;
     if ((baseline.allocated_bytes == null) != (candidate.allocated_bytes == null)) return error.IncompatibleReports;
@@ -96,6 +107,7 @@ test "comparison rejects incompatible identity" {
         .host_class = "ci-arm64",
         .target = "aarch64-linux",
         .zig_version = "0.16.0",
+        .optimize = "ReleaseFast",
         .mode = "allocation",
         .workload = "sse_parse",
         .fixture_version = 1,
@@ -116,4 +128,14 @@ test "comparison rejects incompatible identity" {
     try expectCompatible(baseline, candidate);
     candidate.target = "x86_64-linux";
     try std.testing.expectError(error.IncompatibleReports, expectCompatible(baseline, candidate));
+
+    candidate = baseline;
+    candidate.leak_bytes = 1;
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.leak_bytes = null;
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
+    candidate = baseline;
+    candidate.mode = "latency";
+    try std.testing.expectError(error.InvalidReport, expectCompatible(baseline, candidate));
 }

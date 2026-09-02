@@ -18,7 +18,7 @@ Each workload emits one JSON object. Preserve the output as the baseline artifac
 zig build bench-compare -Doptimize=ReleaseFast -- baseline.json candidate.json
 ```
 
-The versioned report records the host class, target, Zig version, mode, fixture version, workload parameters, raw timing samples, completed work, and a semantic digest. Latency mode reports allocation fields as `null`; it never implies that zero allocations occurred. Allocation mode uses `CountingAllocator` and fails if live bytes remain after a workload. The comparison command rejects differing identities or semantic results and reports allocated bytes normalized by completed work.
+The versioned report records the host class, target, Zig version, optimization mode, measurement mode, fixture version, workload parameters, raw timing samples, completed work, and a semantic digest. Latency mode reports allocation fields as `null`; it never implies that zero allocations occurred. Allocation mode uses `CountingAllocator` and fails if live bytes remain after a workload. The comparison command rejects differing identities or semantic results and reports allocated bytes normalized by completed work.
 
 For a harness sanity check, add `--extra-copy` to candidate allocation collection. Both workloads will report increased allocated bytes without changing their semantic digest; do not use this diagnostic flag for a real baseline.
 

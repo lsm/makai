@@ -91,7 +91,7 @@ fn emitWorkload(
         try allocator.dupe(u8, ",\"allocation_count\":null,\"free_count\":null,\"allocated_bytes\":null,\"freed_bytes\":null,\"peak_live_bytes\":null,\"leak_bytes\":null");
     defer allocator.free(allocation_json);
 
-    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"host_class\":\"{s}\",\"target\":\"{s}-{s}\",\"zig_version\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d}{s}}}\n", .{ host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), builtin.zig_version_string, mode, name, iterations, samples, result.completed, result.digest, raw_samples.items, elapsed_total / samples / iterations, allocation_json });
+    const line = try std.fmt.allocPrint(allocator, "{{\"schema_version\":1,\"host_class\":\"{s}\",\"target\":\"{s}-{s}\",\"zig_version\":\"{s}\",\"optimize\":\"{s}\",\"mode\":\"{s}\",\"workload\":\"{s}\",\"fixture_version\":1,\"iterations\":{d},\"samples\":{d},\"completed_per_iteration\":{d},\"digest\":{d},\"raw_samples_ns\":[{s}],\"ns_per_iteration\":{d}{s}}}\n", .{ host_class, @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag), builtin.zig_version_string, @tagName(builtin.mode), mode, name, iterations, samples, result.completed, result.digest, raw_samples.items, elapsed_total / samples / iterations, allocation_json });
     defer allocator.free(line);
     try stdout.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), line);
 }
