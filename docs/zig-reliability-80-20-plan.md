@@ -94,8 +94,8 @@ tests execute under this command.
 
 ### Step 2 — Generalize only the tested pattern
 
-**Scope:** `zig/src/transports/stdio.zig` and `zig/src/transports/websocket.zig` in separate PRs
-or commits.
+**Scope:** `zig/src/transports/stdio.zig` (both blocking and async receivers, preferably through one
+tested framing helper) and `zig/src/transports/websocket.zig` in separate PRs or commits.
 
 For each component, introduce one local limit type and one checked append path. Keep the semantics
 specific:
@@ -105,11 +105,15 @@ specific:
   a transport framing error and clears or closes the affected receiver according to the Step 0
   decision.
 * WebSocket: maximum accepted frame payload, aggregate fragmented-message bytes, and undecoded
-  receive-buffer bytes; validate declared lengths before buffering payload data.
+  receive-buffer bytes; validate declared lengths before buffering payload data and drain decoded
+  frames incrementally so a read coalescing several valid frames is not rejected by its aggregate
+  byte count.
 
-**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases; a
-coalesced stdio read whose total bytes exceed the line limit but whose individual lines do not;
-normal continuation/ping behavior for WebSocket; EOF/cancellation behavior for stdio.
+**Tests:** all useful small-payload split positions; exact-boundary and over-boundary cases on both
+stdio receiver implementations (or one shared framing helper); a coalesced stdio read whose total
+bytes exceed the line limit but whose individual lines do not; a coalesced WebSocket read whose
+individual frames/messages are valid but aggregate bytes exceed the receive limit; normal
+continuation/ping behavior for WebSocket; EOF/cancellation behavior for stdio.
 
 **Acceptance:** `zig build test-unit-transport` passes. The change must not alter normal
 connection-state transitions or message ownership.

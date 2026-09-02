@@ -123,8 +123,11 @@ Store one report per execution, never overwrite a named source baseline. Minimum
 
 Add a comparison script that rejects mismatched schema, fixture identity, workload ID/parameters,
 chunk schedule, concurrency, target, optimization, Zig version, measurement mode, or host class.
-It reports relative deltas and fails if `leak_bytes != 0`. It should *not* initially fail on a tiny
-timing delta; shared CI machines are noisy.
+For fixed-duration samples it compares allocation counts and bytes normalized per completed
+operation (and, where applicable, per input byte), rather than raw totals. Alternatively an
+allocation-only mode may execute the same fixed amount of work in every sample. It reports relative
+deltas and fails if `leak_bytes != 0`. It should *not* initially fail on a tiny timing delta; shared
+CI machines are noisy.
 
 ### 5. Optional process-RSS runner
 
