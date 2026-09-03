@@ -77,6 +77,22 @@ fn isOpenAICodexResponsesModel(model: ai_types.Model) bool {
     return std.mem.eql(u8, model.api, openai_codex_responses_api);
 }
 
+fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
+    if (!std.mem.eql(u8, model.provider, "openai")) return false;
+    const model_compat = model.compat orelse return false;
+    return model_compat.supports_store == true and
+        model_compat.supports_developer_role == true and
+        model_compat.supports_reasoning_effort == true;
+}
+
+fn isOpenAIHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "openai.com") or
+        (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
+}
+
 /// Free a StringHashMap's keys
 fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) void {
     var iter = map.keyIterator();
@@ -86,8 +102,14 @@ fn freeToolCallIds(allocator: std.mem.Allocator, map: *std.StringHashMap(void)) 
     map.deinit();
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    return compat.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+fn envApiKey(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "deepseek")) {
+        return compat.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return compat.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    }
+    return null;
 }
 
 fn appendMessageText(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -133,7 +155,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = 40, // OpenAI max tool call ID length
+        .max_tool_id_len = if (isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model)) 40 else 0,
         .insert_synthetic_results = true,
         .tools = context.tools,
     });
@@ -147,6 +169,11 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     try w.writeStringField("model", model.id);
 
     const is_codex_model = isOpenAICodexResponsesModel(model);
+    const supports_openai_reasoning = model.reasoning and (
+        isOpenAIHost(model.base_url) or
+        is_codex_model or
+        (if (model.compat) |model_compat| model_compat.supports_reasoning_effort == true else false)
+    );
     const explicit_system_prompt = context.getSystemPrompt();
     if (is_codex_model) {
         const instructions = explicit_system_prompt orelse default_codex_instructions;
@@ -162,6 +189,12 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     // Add tools if present
     if (context.tools) |tools| {
         if (tools.len > 0) {
+            // Generic endpoints may not implement OpenAI Structured Outputs;
+            // emit the strict field only for the native endpoint, Codex
+            // models, or an explicitly declared compat (transparent proxy),
+            // mirroring the Completions path.
+            const supports_tool_strict = is_codex_model or isOpenAIHost(model.base_url) or
+                (if (model.compat) |model_compat| model_compat.supports_strict_mode orelse false else false);
             try w.writeKey("tools");
             try w.beginArray();
             for (tools) |tool| {
@@ -169,7 +202,9 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("type", "function");
                 try w.writeStringField("name", tool.name);
                 try w.writeStringField("description", tool.description);
-                try w.writeBoolField("strict", false);
+                if (supports_tool_strict) {
+                    try w.writeBoolField("strict", false);
+                }
                 try w.writeKey("parameters");
                 try w.writeRawJson(tool.parameters_schema_json);
                 try w.endObject();
@@ -184,7 +219,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Add reasoning parameters for reasoning models (o1, o3, etc.)
-    if (model.reasoning) {
+    if (supports_openai_reasoning) {
         try w.writeKey("reasoning");
         try w.beginObject();
         if (normalizedOpenAIReasoningEffort(options)) |effort| {
@@ -204,7 +239,16 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Privacy: don't store requests for OpenAI training
-    if (std.mem.find(u8, model.base_url, "openai.com") != null or is_codex_model) {
+    const is_openai_proxy = std.mem.eql(u8, model.provider, "openai") and if (model.compat) |compat_options|
+        compat_options.supports_store == true and
+            compat_options.supports_developer_role == true and
+            compat_options.supports_reasoning_effort == true
+        else
+            false;
+    const supports_store = isOpenAIHost(model.base_url) or
+        (if (model.compat) |compat_options| compat_options.supports_store == true else false) or
+        is_codex_model;
+    if (supports_store) {
         try w.writeBoolField("store", false);
     }
 
@@ -229,7 +273,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 
     // Cache retention for OpenAI API
     if (options.cache_retention) |retention| {
-        if (retention == .long and std.mem.find(u8, model.base_url, "openai.com") != null) {
+        if (retention == .long and (isOpenAIHost(model.base_url) or is_openai_proxy)) {
             try w.writeStringField("prompt_cache_retention", "24h");
         }
     }
@@ -244,7 +288,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     if (!is_codex_model) {
         if (explicit_system_prompt) |sp| {
             try w.beginObject();
-            const system_role: []const u8 = if (model.reasoning) "developer" else "system";
+            const system_role: []const u8 = if (supports_openai_reasoning) "developer" else "system";
             try w.writeStringField("role", system_role);
             // Sanitize system prompt to remove unpaired surrogates
             const sanitized = try sanitize.sanitizeSurrogatesInPlace(allocator, sp);
@@ -259,10 +303,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // GPT-5 "juice" workaround: when reasoning is disabled for GPT-5 models,
-    // inject a developer message to restore model capability
+    // inject a developer message to restore model capability. Generic
+    // endpoints without OpenAI-native roles get a system message instead,
+    // mirroring the explicit system prompt above.
     if (std.mem.startsWith(u8, model.name, "gpt-5") and !options.reasoning_enabled) {
         try w.beginObject();
-        try w.writeStringField("role", "developer");
+        const juice_role: []const u8 = if (supports_openai_reasoning) "developer" else "system";
+        try w.writeStringField("role", juice_role);
         try w.writeStringField("content", "# Juice: 0 !important");
         try w.endObject();
     }
@@ -372,6 +419,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
 }
 
 fn normalizedOpenAIReasoningEffort(options: ai_types.StreamOptions) ?[]const u8 {
+    // An explicit "none" effort is the off signal for models that support it
+    // (the bridge sets it together with reasoning_enabled = false for
+    // thinking_level off); it must survive that flag, otherwise the model
+    // falls back to its default effort instead of honoring the choice.
+    if (options.getReasoningEffort()) |explicit| {
+        if (std.mem.eql(u8, explicit, "none")) return "none";
+    }
     if (!options.reasoning_enabled) return null;
     const effort = options.getReasoningEffort() orelse return "medium";
     if (std.mem.eql(u8, effort, "off")) return null;
@@ -1596,7 +1650,7 @@ pub fn streamOpenAIResponses(model: ai_types.Model, context: ai_types.Context, o
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        const env = envApiKey(allocator);
+        const env = envApiKey(allocator, model.provider);
         if (env) |k| break :blk @constCast(k);
         return error.MissingApiKey;
     };
@@ -2258,6 +2312,36 @@ test "buildRequestBody includes GPT-5 juice workaround when reasoning disabled" 
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"medium\"") == null);
 }
 
+test "buildRequestBody juice workaround uses system role on generic endpoints" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5-turbo",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful."),
+        .messages = &.{},
+    };
+    const options: ai_types.StreamOptions = .{
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "# Juice: 0 !important") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"developer\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"role\":\"system\"") != null);
+}
+
 test "buildRequestBody normalizes minimal reasoning effort for OpenAI" {
     const allocator = std.testing.allocator;
     const model: ai_types.Model = .{
@@ -2315,6 +2399,67 @@ test "buildRequestBody omits unsupported none reasoning effort" {
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") == null);
     try std.testing.expect(std.mem.find(u8, body, "\"effort\"") == null);
+}
+
+test "buildRequestBody preserves explicit none effort with reasoning disabled" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5.1",
+        .name = "gpt-5.1",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://api.openai.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const context: ai_types.Context = .{
+        .messages = &.{},
+    };
+    // The bridge maps thinking_level off on gpt-5.1+ to effort "none" while
+    // also disabling reasoning; the explicit none must still be emitted.
+    const options: ai_types.StreamOptions = .{
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed("none"),
+        .reasoning_enabled = false,
+    };
+
+    const body = try buildRequestBody(model, context, options, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"effort\":\"none\"") != null);
+}
+
+test "buildRequestBody omits strict tool fields on generic endpoints" {
+    const allocator = std.testing.allocator;
+    const model: ai_types.Model = .{
+        .id = "gpt-5",
+        .name = "gpt-5",
+        .api = "openai-responses",
+        .provider = "openai",
+        .base_url = "https://gateway.example.com",
+        .reasoning = true,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 200000,
+        .max_tokens = 16384,
+    };
+    const tools = [_]ai_types.Tool{.{
+        .name = "file_read",
+        .description = "Read a file",
+        .parameters_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    }};
+    const context: ai_types.Context = .{
+        .messages = &.{},
+        .tools = &tools,
+    };
+
+    const body = try buildRequestBody(model, context, .{}, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"name\":\"file_read\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"strict\"") == null);
 }
 
 test "buildRequestBody omits GPT-5 juice workaround when reasoning enabled" {

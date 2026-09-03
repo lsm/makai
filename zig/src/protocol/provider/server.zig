@@ -602,7 +602,7 @@ fn streamWithResolvedKey(
         };
 
     const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
-        error.AuthRequired => return error.AuthRequired,
+        error.AuthRequired => return provider.stream(model, context, options, server.allocator),
         error.OutOfMemory => return error.OutOfMemory,
     };
     var resolved_options = try injectApiKey(server.allocator, options, resolved.api_key);
@@ -667,6 +667,15 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
+    // API handlers may advertise a vendor credential source (for example,
+    // Anthropic Messages). Do not use that source for a differently named
+    // model provider: a global/custom endpoint must receive an explicit key
+    // instead of an ambient vendor credential.
+    if (provider.auth_provider_id) |auth_provider_id| {
+        const is_vendor_oauth = std.mem.eql(u8, auth_provider_id, "anthropic") or
+            std.mem.eql(u8, auth_provider_id, "openai-codex");
+        if (is_vendor_oauth and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+    }
     const provider_id = provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
@@ -1007,10 +1016,28 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             server.allocator,
         );
     };
+    // The stream is ephemeral to this request (never registered in
+    // active_streams), so free it once the response has been built. Deferred
+    // cleanup runs after the return expression, by which point the result has
+    // been deep-cloned and the error message copied out of stream storage.
+    defer {
+        stream.deinit();
+        server.allocator.destroy(stream);
+    }
 
-    // Wait for stream to complete (with timeout)
+    // Wait for the producer to finish and publish its terminal state. Some
+    // providers mark their thread done immediately before the final
+    // complete()/completeWithError() call, while others complete first and
+    // mark done from a defer, so gate on both signals: once the thread is
+    // done AND the stream is completed, the producer no longer touches the
+    // stream, making the deferred cleanup below race-free (and its internal
+    // thread wait returns immediately). When the producer stalls past the
+    // configured timeout, skip the completion wait so the timeout NACK is
+    // not delayed by a second full timeout window.
     const timeout_ms = server.options.stream_timeout_ms;
-    _ = stream.waitForThread(timeout_ms);
+    if (stream.waitForThread(timeout_ms)) {
+        _ = stream.waitForCompletion(timeout_ms);
+    }
 
     // Get result
     if (stream.getResult()) |result| {
@@ -3253,7 +3280,7 @@ test "credential resolution: missing api_key loads credentials from storage by p
     try std.testing.expectEqualStrings("sk-from-storage", CapturedCreds.captured_key.?);
 }
 
-test "credential resolution: missing api_key and missing storage entry returns auth_required nack" {
+test "credential resolution: missing api_key and missing storage entry falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3302,16 +3329,13 @@ test "credential resolution: missing api_key and missing storage entry returns a
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
-    // Server must NOT have created a stream when auth fails.
+    try std.testing.expect(response.?.payload == .ack);
+    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 }
 
-test "credential resolution: complete_request without credentials returns auth_required nack" {
+test "credential resolution: complete_request without credentials falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3353,11 +3377,7 @@ test "credential resolution: complete_request without credentials returns auth_r
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
+    try std.testing.expect(response.?.payload == .result);
 }
 
 // ===========================================================================

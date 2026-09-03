@@ -295,6 +295,7 @@ fn serializeOpenAICompatOptions(
     try serializeOptionalBoolField(w, "requires_mistral_tool_ids", compat_options.requires_mistral_tool_ids);
     try w.writeStringField("thinking_format", @tagName(compat_options.thinking_format));
     try serializeOptionalBoolField(w, "supports_strict_mode", compat_options.supports_strict_mode);
+    try serializeOptionalBoolField(w, "supports_anthropic_cache_ttl", compat_options.supports_anthropic_cache_ttl);
     try w.endObject();
 }
 
@@ -1011,6 +1012,7 @@ fn deserializeOpenAICompatOptions(obj: std.json.ObjectMap) !ai_types.OpenAICompa
             break :blk try parseThinkingFormat(value.string);
         } else .openai,
         .supports_strict_mode = try optionalBool(obj, "supports_strict_mode"),
+        .supports_anthropic_cache_ttl = try optionalBool(obj, "supports_anthropic_cache_ttl"),
     };
 }
 

@@ -180,9 +180,13 @@ test "agent event push blocks instead of dropping ordered events" {
     }
 
     const thread = try std.Thread.spawn(.{}, delayedAgentEventPush, .{&stream});
-    defer thread.join();
 
+    // Free one slot so the blocked producer can publish agent_end, then join
+    // before draining: the producer's pushBlocking retries on a 1ms cadence,
+    // so draining first could race it and miss the event entirely.
     const first = stream.poll() orelse return error.ExpectedEvent;
+    thread.join();
+
     try std.testing.expectEqual(AgentEvent.agent_start, first);
 
     var saw_agent_start = false;

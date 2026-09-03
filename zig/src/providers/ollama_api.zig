@@ -1205,6 +1205,10 @@ pub fn streamOllama(
     // 2. Cloud API (ollama.com) - requires OLLAMA_API_KEY via Authorization header
     const api_key: ?[]u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        // Read the vendor env key only for the canonical provider so a
+        // custom or routed base URL (MAKAI_BASE_URL) cannot receive an
+        // OLLAMA_API_KEY meant for ollama.com.
+        if (!std.mem.eql(u8, model.provider, "ollama")) break :blk null;
         if (env(allocator, "OLLAMA_API_KEY")) |k| break :blk @constCast(k);
         break :blk null;
     };

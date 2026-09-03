@@ -105,15 +105,43 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
     }
 }
 
-fn reasoningEffort(level: ai_types.ThinkingLevel) []const u8 {
+fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const u8 {
     return switch (level) {
-        .off => "none",
+        .off => if (isGpt51OrLater(model_id)) "none" else "low",
         .minimal => "low",
         .low => "low",
         .medium => "medium",
         .high => "high",
-        .xhigh => "xhigh",
+        // xhigh is reserved for models after gpt-5.1-codex-max; other
+        // families reject the request outright, so clamp to high.
+        .xhigh => if (supportsXhighReasoning(model_id)) "xhigh" else "high",
     };
+}
+
+/// Whether the model supports the `none` reasoning effort: per the bundled
+/// OpenAI specification (docs/openai/responses.md), `none` is available on
+/// GPT models from gpt-5.1 onward; earlier families only take low/medium/
+/// high and default to medium.
+fn isGpt51OrLater(model_id: []const u8) bool {
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '1';
+}
+
+/// Whether the model family accepts the `xhigh` reasoning effort. Per the
+/// bundled OpenAI specification (docs/openai/responses.md), xhigh is
+/// supported for models after gpt-5.1-codex-max — the codex-max family
+/// itself and later minor versions (gpt-5.2 onward); `high` is accepted by
+/// every reasoning-capable family.
+fn supportsXhighReasoning(model_id: []const u8) bool {
+    if (std.mem.indexOf(u8, model_id, "codex-max") != null) return true;
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '2';
 }
 
 fn thinkingEffort(level: ai_types.ThinkingLevel) []const u8 {
@@ -149,8 +177,8 @@ fn thinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudg
     };
 }
 
-fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
-    const reason_effort = reasoningEffort(options.thinking_level);
+fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, model_id: []const u8, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
+    const reason_effort = reasoningEffort(options.thinking_level, model_id);
     const think_effort = thinkingEffort(options.thinking_level);
     return .{
         .api_key = if (api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
@@ -191,7 +219,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         .allocator = ctx.allocator,
     };
 
-    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.api_key, ctx.session_id);
+    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.model.id, ctx.api_key, ctx.session_id);
 
     // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
     var request_model = ctx.model;
@@ -381,21 +409,35 @@ test "provider protocol bridge maps thinking level to stream options" {
         .session_id = "sid",
         .thinking_level = .xhigh,
         .thinking_budgets = .{ .xhigh = 8192 },
-    }, "key", "sid");
+    }, "gpt-5.1", "key", "sid");
 
     try std.testing.expect(opts.thinking_enabled);
     try std.testing.expect(opts.reasoning_enabled);
     try std.testing.expectEqual(@as(?u32, 8192), opts.thinking_budget_tokens);
     try std.testing.expectEqualStrings("max", opts.getThinkingEffort().?);
-    try std.testing.expectEqualStrings("xhigh", opts.getReasoningEffort().?);
+    // gpt-5.1 rejects xhigh; the mapper clamps it to high.
+    try std.testing.expectEqualStrings("high", opts.getReasoningEffort().?);
 
-    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, null, null);
+    const codex_max = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.1-codex-max", null, null);
+    try std.testing.expectEqualStrings("xhigh", codex_max.getReasoningEffort().?);
+
+    // Later families ship after gpt-5.1-codex-max and accept xhigh.
+    const gpt52_xhigh = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("xhigh", gpt52_xhigh.getReasoningEffort().?);
+
+    // Post-5.1 families accept none; pre-5.1 families do not.
+    const gpt52_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("none", gpt52_off.getReasoningEffort().?);
+    const gpt5_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5", null, null);
+    try std.testing.expectEqualStrings("low", gpt5_off.getReasoningEffort().?);
+
+    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.1", null, null);
     try std.testing.expect(!off.thinking_enabled);
     try std.testing.expect(!off.reasoning_enabled);
     try std.testing.expect(off.getThinkingEffort() == null);
     try std.testing.expectEqualStrings("none", off.getReasoningEffort().?);
 
-    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, null, null);
+    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, "gpt-5", null, null);
     try std.testing.expectEqualStrings("low", minimal.getReasoningEffort().?);
 }
 

@@ -33,17 +33,26 @@ const MergedCompat = struct {
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = isOpenAIHost(model.base_url);
+    // detectCapabilities matches api.openai.com anywhere in the URL, so a
+    // generic gateway whose path merely contains that host would inherit
+    // OpenAI-native roles, reasoning effort and token fields. Honor those
+    // only on the parsed OpenAI host or an explicitly declared transparent
+    // proxy; every other endpoint keeps the compatible-endpoint defaults.
+    const honors_native_caps = is_openai_native or isTransparentOpenAIProxy(model);
+    const detected_developer_role = if (honors_native_caps) caps.supports_developer_role else false;
+    const detected_reasoning_effort = if (honors_native_caps) caps.supports_reasoning_effort else false;
+    const detected_max_tokens_field: []const u8 = if (honors_native_caps) caps.max_tokens_field else "max_tokens";
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
-        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse caps.supports_developer_role else caps.supports_developer_role,
-        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse caps.supports_reasoning_effort else caps.supports_reasoning_effort,
+        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse detected_developer_role else detected_developer_role,
+        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse detected_reasoning_effort else detected_reasoning_effort,
         .supports_usage_in_streaming = if (compat) |c| c.supports_usage_in_streaming orelse true else true,
         .max_tokens_field = if (compat) |c| switch (c.max_tokens_field) {
             .max_completion_tokens => "max_completion_tokens",
             .max_tokens => "max_tokens",
-        } else caps.max_tokens_field,
+        } else detected_max_tokens_field,
         .requires_tool_result_name = if (compat) |c| c.requires_tool_result_name orelse caps.requires_tool_result_name else caps.requires_tool_result_name,
         .requires_assistant_after_tool_result = if (compat) |c| c.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool else caps.requires_assistant_after_tool,
         .requires_thinking_as_text = if (compat) |c| c.requires_thinking_as_text orelse caps.requires_thinking_as_text else caps.requires_thinking_as_text,
@@ -57,12 +66,34 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
             .zai => .zai,
             .qwen => .qwen,
         },
-        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse true else true,
+        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse honors_native_caps else is_openai_native,
     };
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
+    if (!std.mem.eql(u8, model.provider, "openai")) return false;
+    const compat = model.compat orelse return false;
+    return compat.supports_store == true and
+        compat.supports_developer_role == true and
+        compat.supports_reasoning_effort == true;
+}
+
+fn isOpenAIHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "openai.com") or
+        (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
+}
+
+fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "deepseek")) {
+        return compat_mod.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    }
+    return null;
 }
 
 fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -640,7 +671,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .max_tool_id_len = if (isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model)) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,
@@ -1804,7 +1835,7 @@ pub fn streamOpenAICompletions(
     var key_owned: ?[]const u8 = null;
     const api_key = blk: {
         if (resolved.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        key_owned = envApiKey(allocator);
+        key_owned = envApiKeyForProvider(allocator, model.provider);
         if (key_owned) |k| break :blk k;
         return error.MissingApiKey;
     };
@@ -2527,6 +2558,51 @@ test "mergeCompat falls back to detected capabilities when model compat is null"
     try std.testing.expect(merged.supports_developer_role);
     try std.testing.expect(merged.supports_reasoning_effort);
     try std.testing.expectEqualStrings("max_completion_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps custom OpenAI endpoints generic" {
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
+    // detectCapabilities substring-matches api.openai.com anywhere in the
+    // URL; a gateway whose path merely contains the host must not inherit
+    // OpenAI-native capabilities.
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://gateway.example/api.openai.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
 }
 
 test "buildRequestBody uses max_tokens field from compat options" {
