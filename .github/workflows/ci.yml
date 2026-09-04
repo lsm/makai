@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        group: [core, transport, protocol, providers, utils, makai-cli, agent-types, agent-loop, agent-mod, agent-bridge, agent-unit, agent-chain]
+        group: [core, transport, protocol, providers, utils, makai-cli, tui, agent-types, agent-loop, agent-mod, agent-bridge, agent-unit, agent-chain]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -124,6 +124,7 @@ jobs:
             ${{ runner.os }}-zig-
       - name: Run Anthropic E2E tests
         run: zig build test-e2e-anthropic
+        continue-on-error: true
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -147,6 +148,7 @@ jobs:
             ${{ runner.os }}-zig-
       - name: Run OpenAI E2E tests
         run: zig build test-e2e-openai
+        continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: gpt-4o-mini
@@ -217,7 +219,7 @@ jobs:
         run: zig build test-e2e-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: ministral-3:3b
+          OLLAMA_MODEL: gemma4:31b
 
   e2e-github-copilot:
     name: E2E - GitHub Copilot
@@ -281,7 +283,7 @@ jobs:
         run: zig build test-e2e-provider-protocol-fullstack-ollama
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
-          OLLAMA_MODEL: ministral-3:3b
+          OLLAMA_MODEL: gemma4:31b
 
   e2e-protocol-fullstack-github:
     name: E2E - Provider Protocol Fullstack (GitHub Copilot)

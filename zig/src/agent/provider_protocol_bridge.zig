@@ -60,6 +60,7 @@ fn streamViaProtocol(
     const out_stream = try allocator.create(event_stream.AssistantMessageEventStream);
     out_stream.* = event_stream.AssistantMessageEventStream.init(allocator);
     out_stream.owns_events = true;
+    out_stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     out_stream.wait_for_thread_on_deinit = true;
 
     const thread_ctx = try allocator.create(StreamThreadContext);
@@ -82,17 +83,15 @@ fn streamViaProtocol(
     return out_stream;
 }
 
-fn pushEventBlocking(allocator: std.mem.Allocator, stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
-    const cloned = try ai_types.cloneAssistantMessageEvent(allocator, ev);
-    errdefer {
-        var cleanup = cloned;
-        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
-    }
-
+fn pushEventBlocking(stream: *event_stream.AssistantMessageEventStream, ev: ai_types.AssistantMessageEvent) !void {
     while (true) {
-        stream.push(cloned) catch {
-            compat.time.sleepNs(1 * std.time.ns_per_ms);
-            continue;
+        stream.push(ev) catch |err| switch (err) {
+            error.QueueFull => {
+                compat.time.sleepNs(1 * std.time.ns_per_ms);
+                continue;
+            },
+            error.StreamCompleted => return error.StreamCompleted,
+            error.OutOfMemory => return error.OutOfMemory,
         };
         return;
     }
@@ -102,8 +101,97 @@ fn drainClientEvents(client: *ProtocolClient, out_stream: *event_stream.Assistan
     while (client.getEventStream().poll()) |ev| {
         var owned_ev = ev;
         defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
-        try pushEventBlocking(allocator, out_stream, ev);
+        try pushEventBlocking(out_stream, ev);
     }
+}
+
+fn reasoningEffort(level: ai_types.ThinkingLevel, model_id: []const u8) []const u8 {
+    return switch (level) {
+        .off => if (isGpt51OrLater(model_id)) "none" else "low",
+        .minimal => "low",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        // xhigh is reserved for models after gpt-5.1-codex-max; other
+        // families reject the request outright, so clamp to high.
+        .xhigh => if (supportsXhighReasoning(model_id)) "xhigh" else "high",
+    };
+}
+
+/// Whether the model supports the `none` reasoning effort: per the bundled
+/// OpenAI specification (docs/openai/responses.md), `none` is available on
+/// GPT models from gpt-5.1 onward; earlier families only take low/medium/
+/// high and default to medium.
+fn isGpt51OrLater(model_id: []const u8) bool {
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '1';
+}
+
+/// Whether the model family accepts the `xhigh` reasoning effort. Per the
+/// bundled OpenAI specification (docs/openai/responses.md), xhigh is
+/// supported for models after gpt-5.1-codex-max — the codex-max family
+/// itself and later minor versions (gpt-5.2 onward); `high` is accepted by
+/// every reasoning-capable family.
+fn supportsXhighReasoning(model_id: []const u8) bool {
+    if (std.mem.indexOf(u8, model_id, "codex-max") != null) return true;
+    const prefix = "gpt-5.";
+    if (!std.mem.startsWith(u8, model_id, prefix)) return false;
+    const minor = model_id[prefix.len..];
+    if (minor.len == 0) return false;
+    return std.ascii.isDigit(minor[0]) and minor[0] >= '2';
+}
+
+fn thinkingEffort(level: ai_types.ThinkingLevel) []const u8 {
+    return switch (level) {
+        .off => "",
+        .minimal => "low",
+        .low => "low",
+        .medium => "medium",
+        .high => "high",
+        .xhigh => "max",
+    };
+}
+
+fn thinkingBudget(level: ai_types.ThinkingLevel, budgets: ?ai_types.ThinkingBudgets) ?u32 {
+    if (level == .off) return null;
+    if (budgets) |b| {
+        return switch (level) {
+            .off => null,
+            .minimal => b.minimal orelse 256,
+            .low => b.low orelse 512,
+            .medium => b.medium orelse 1024,
+            .high => b.high orelse 2048,
+            .xhigh => b.xhigh orelse 4096,
+        };
+    }
+    return switch (level) {
+        .off => null,
+        .minimal => 256,
+        .low => 512,
+        .medium => 1024,
+        .high => 2048,
+        .xhigh => 4096,
+    };
+}
+
+fn streamOptionsFromProtocolOptions(options: agent_types.ProtocolOptions, model_id: []const u8, api_key: ?[]const u8, session_id: ?[]const u8) ai_types.StreamOptions {
+    const reason_effort = reasoningEffort(options.thinking_level, model_id);
+    const think_effort = thinkingEffort(options.thinking_level);
+    return .{
+        .api_key = if (api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
+        .session_id = if (session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
+        .cancel_token = options.cancel_token,
+        .temperature = options.temperature,
+        .max_tokens = options.max_tokens,
+        .thinking_enabled = options.thinking_level != .off,
+        .thinking_budget_tokens = thinkingBudget(options.thinking_level, options.thinking_budgets),
+        .thinking_effort = ai_types.OwnedSlice(u8).initBorrowed(think_effort),
+        .reasoning_effort = ai_types.OwnedSlice(u8).initBorrowed(reason_effort),
+        .reasoning_enabled = options.thinking_level != .off,
+    };
 }
 
 fn runStreamThread(ctx: *StreamThreadContext) void {
@@ -119,7 +207,9 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
     var server = ProtocolServer.init(ctx.allocator, ctx.registry, .{});
     defer server.deinit();
 
-    var client = ProtocolClient.init(ctx.allocator, .{});
+    var client = ProtocolClient.init(ctx.allocator, .{
+        .event_delivery = .global,
+    });
     defer client.deinit();
     client.setSender(pipe.clientSender());
 
@@ -129,13 +219,7 @@ fn runStreamThread(ctx: *StreamThreadContext) void {
         .allocator = ctx.allocator,
     };
 
-    const stream_options = ai_types.StreamOptions{
-        .api_key = if (ctx.api_key) |k| ai_types.OwnedSlice(u8).initBorrowed(k) else ai_types.OwnedSlice(u8).initBorrowed(""),
-        .session_id = if (ctx.session_id) |sid| ai_types.OwnedSlice(u8).initBorrowed(sid) else ai_types.OwnedSlice(u8).initBorrowed(""),
-        .cancel_token = ctx.options.cancel_token,
-        .temperature = ctx.options.temperature,
-        .max_tokens = ctx.options.max_tokens,
-    };
+    const stream_options = streamOptionsFromProtocolOptions(ctx.options, ctx.model.id, ctx.api_key, ctx.session_id);
 
     // Request envelope deinit frees owned payload fields; send borrowed views of thread-owned state.
     var request_model = ctx.model;
@@ -218,10 +302,15 @@ test "InProcessProviderProtocolBridge smoke test" {
         ) anyerror!*event_stream.AssistantMessageEventStream {
             _ = model;
             _ = context;
-            _ = options;
 
             const s = try a.create(event_stream.AssistantMessageEventStream);
             s.* = event_stream.AssistantMessageEventStream.init(a);
+            if (options) |o| {
+                if (o.requires_owned_stream_events) {
+                    s.owns_events = true;
+                    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+                }
+            }
 
             s.push(.{ .start = .{ .partial = .{
                 .content = &.{},
@@ -312,4 +401,175 @@ test "InProcessProviderProtocolBridge smoke test" {
     stream.result = null;
 
     try std.testing.expect(saw_start);
+}
+
+test "provider protocol bridge maps thinking level to stream options" {
+    const opts = streamOptionsFromProtocolOptions(.{
+        .api_key = "key",
+        .session_id = "sid",
+        .thinking_level = .xhigh,
+        .thinking_budgets = .{ .xhigh = 8192 },
+    }, "gpt-5.1", "key", "sid");
+
+    try std.testing.expect(opts.thinking_enabled);
+    try std.testing.expect(opts.reasoning_enabled);
+    try std.testing.expectEqual(@as(?u32, 8192), opts.thinking_budget_tokens);
+    try std.testing.expectEqualStrings("max", opts.getThinkingEffort().?);
+    // gpt-5.1 rejects xhigh; the mapper clamps it to high.
+    try std.testing.expectEqualStrings("high", opts.getReasoningEffort().?);
+
+    const codex_max = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.1-codex-max", null, null);
+    try std.testing.expectEqualStrings("xhigh", codex_max.getReasoningEffort().?);
+
+    // Later families ship after gpt-5.1-codex-max and accept xhigh.
+    const gpt52_xhigh = streamOptionsFromProtocolOptions(.{ .thinking_level = .xhigh }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("xhigh", gpt52_xhigh.getReasoningEffort().?);
+
+    // Post-5.1 families accept none; pre-5.1 families do not.
+    const gpt52_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.2", null, null);
+    try std.testing.expectEqualStrings("none", gpt52_off.getReasoningEffort().?);
+    const gpt5_off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5", null, null);
+    try std.testing.expectEqualStrings("low", gpt5_off.getReasoningEffort().?);
+
+    const off = streamOptionsFromProtocolOptions(.{ .thinking_level = .off }, "gpt-5.1", null, null);
+    try std.testing.expect(!off.thinking_enabled);
+    try std.testing.expect(!off.reasoning_enabled);
+    try std.testing.expect(off.getThinkingEffort() == null);
+    try std.testing.expectEqualStrings("none", off.getReasoningEffort().?);
+
+    const minimal = streamOptionsFromProtocolOptions(.{ .thinking_level = .minimal }, "gpt-5", null, null);
+    try std.testing.expectEqualStrings("low", minimal.getReasoningEffort().?);
+}
+
+test "InProcessProviderProtocolBridge preserves streamed tool call terminal result" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    const Mock = struct {
+        fn partial(model: ai_types.Model) ai_types.AssistantMessage {
+            return .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            };
+        }
+
+        fn stream(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.StreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = context;
+            const o = options orelse ai_types.StreamOptions{};
+
+            const s = try a.create(event_stream.AssistantMessageEventStream);
+            s.* = event_stream.AssistantMessageEventStream.init(a);
+            if (o.requires_owned_stream_events) {
+                s.owns_events = true;
+                s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+            }
+            const p = partial(model);
+
+            s.push(.{ .start = .{ .partial = p } }) catch {};
+            s.push(.{ .toolcall_start = .{
+                .content_index = 0,
+                .id = "call_shell",
+                .name = "shell_execute",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_delta = .{
+                .content_index = 0,
+                .delta = "{\"command\":\"ls -al\"}",
+                .partial = p,
+            } }) catch {};
+            s.push(.{ .toolcall_end = .{
+                .content_index = 0,
+                .tool_call = .{ .id = "call_shell", .name = "shell_execute", .arguments_json = "{\"command\":\"ls -al\"}" },
+                .partial = p,
+            } }) catch {};
+
+            // Match OpenAI Responses behavior: terminal result can omit streamed
+            // function-call content and report a generic stop reason.
+            s.complete(try ai_types.cloneAssistantMessage(a, .{
+                .content = &.{},
+                .api = model.api,
+                .provider = model.provider,
+                .model = model.id,
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = compat.time.nowMillis(),
+                .is_owned = false,
+            }));
+            s.markThreadDone();
+            return s;
+        }
+
+        fn streamSimple(
+            model: ai_types.Model,
+            context: ai_types.Context,
+            options: ?ai_types.SimpleStreamOptions,
+            a: std.mem.Allocator,
+        ) anyerror!*event_stream.AssistantMessageEventStream {
+            _ = options;
+            return stream(model, context, null, a);
+        }
+    };
+
+    try registry.registerApiProvider(.{
+        .api = "mock-tool-api",
+        .stream = Mock.stream,
+        .stream_simple = Mock.streamSimple,
+    }, null);
+
+    var bridge = InProcessProviderProtocolBridge.init(&registry);
+    const protocol = bridge.protocolClient();
+    const model = ai_types.Model{
+        .id = "mock-tool-model",
+        .name = "Mock Tool",
+        .api = "mock-tool-api",
+        .provider = "mock",
+        .base_url = "",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 1024,
+        .max_tokens = 256,
+    };
+    const user = ai_types.Message{ .user = .{
+        .content = .{ .text = "run ls -al" },
+        .timestamp = compat.time.nowMillis(),
+    } };
+    const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{user} };
+
+    const stream = try protocol.stream(model, ctx, .{ .api_key = "test-key" }, allocator);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var saw_tool_end = false;
+    while (stream.wait()) |ev| {
+        var owned_ev = ev;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &owned_ev);
+        if (ev == .toolcall_end) saw_tool_end = true;
+    }
+
+    const result = stream.getResult().?;
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), result.content.len);
+    try std.testing.expect(result.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("shell_execute", result.content[0].tool_call.name);
+
+    var owned_result = result;
+    owned_result.deinit(allocator);
+    stream.result = null;
+    try std.testing.expect(saw_tool_end);
 }

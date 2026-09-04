@@ -102,17 +102,24 @@ const CacheControlResult = struct {
 };
 
 /// Resolve cache retention and determine cache_control settings
-fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention) ?CacheControlResult {
+fn getCacheControl(base_url: []const u8, cache_retention: ?ai_types.CacheRetention, supports_long_ttl: bool) ?CacheControlResult {
     const retention = cache_retention orelse .short;
     if (retention == .none) return null;
 
     // Only add ttl for "long" retention on api.anthropic.com
-    const has_ttl = retention == .long and std.mem.find(u8, base_url, "api.anthropic.com") != null;
+    const has_ttl = retention == .long and (isAnthropicHost(base_url) or supports_long_ttl);
 
     return .{
         .retention = retention,
         .has_ttl = has_ttl,
     };
+}
+
+fn isAnthropicHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "api.anthropic.com");
 }
 
 /// Check if a model supports adaptive thinking (Opus 4.6+)
@@ -289,18 +296,29 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     tx_context.messages = transformed.messages;
 
     // Resolve cache control settings
-    const cache_control = getCacheControl(model.base_url, options.cache_retention);
+    const supports_long_cache_ttl = if (model.compat) |compat_options|
+        compat_options.supports_anthropic_cache_ttl == true
+    else
+        false;
+    const cache_control = getCacheControl(model.base_url, options.cache_retention, supports_long_cache_ttl);
 
     var w = json_writer.JsonWriter.init(&buf, allocator);
     try w.beginObject();
     try w.writeStringField("model", model.id);
     const default_max = @min(model.max_tokens / 3, 32000);
-    try w.writeIntField("max_tokens", options.max_tokens orelse default_max);
+    const requested_max = options.max_tokens orelse default_max;
+    try w.writeIntField("max_tokens", requested_max);
     try w.writeBoolField("stream", true);
 
+    const emits_thinking = options.thinking_enabled and model.reasoning and
+        (supportsAdaptiveThinking(model.id) or requested_max > 1024);
     if (options.temperature) |t| {
+        if (emits_thinking and t != 1) {
+            // Anthropic extended thinking requires the default temperature.
+        } else {
         try w.writeKey("temperature");
         try w.writeFloat(t);
+        }
     }
 
     // System prompt as array of content blocks with cache_control
@@ -808,7 +826,7 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
     }
 
     // Configure thinking mode: adaptive (Opus 4.6+) or budget-based (older models)
-    if (options.thinking_enabled) {
+    if (options.thinking_enabled and model.reasoning) {
         if (supportsAdaptiveThinking(model.id)) {
             // Adaptive thinking: Claude decides when and how much to think
             try w.writeKey("thinking");
@@ -822,12 +840,13 @@ fn buildRequestBody(model: ai_types.Model, context: ai_types.Context, options: a
                 try w.writeStringField("effort", effort);
                 try w.endObject();
             }
-        } else {
+        } else if (requested_max > 1024) {
             // Budget-based thinking for older models
             try w.writeKey("thinking");
             try w.beginObject();
             try w.writeStringField("type", "enabled");
-            try w.writeIntField("budget_tokens", options.thinking_budget_tokens orelse 1024);
+            const max_thinking_budget = if (requested_max > 0) requested_max - 1 else 0;
+            try w.writeIntField("budget_tokens", @max(1024, @min(options.thinking_budget_tokens orelse 1024, max_thinking_budget)));
             try w.endObject();
         }
     }
@@ -1116,7 +1135,6 @@ fn buildAnthropicHeaders(allocator: std.mem.Allocator, api_key: []const u8) !Ant
 
     return out;
 }
-
 
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
@@ -1474,10 +1492,10 @@ fn runThread(ctx: *ThreadCtx) void {
             raw_body.appendSlice(allocator, read_buf[0..@min(n, cap)]) catch {};
         }
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
             stream.markThreadDone();
-            stream.completeWithError("sse parse error");
+            stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 
@@ -1655,7 +1673,12 @@ fn runThread(ctx: *ThreadCtx) void {
     // sending the final blank line.  Only api_error is actionable here; other events
     // from a genuinely truncated stream are incomplete and best ignored.
     {
-        const tail = parser.feed("\n\n") catch &.{};
+        const tail = parser.feed("\n\n") catch |err| {
+            ctx.deinit();
+            stream.markThreadDone();
+            stream.completeWithError(sse_parser.errorMessage(err));
+            return;
+        };
         for (tail) |ev| {
             const result = parseAnthropicEventType(ev.data, allocator) catch continue;
             switch (result) {
@@ -1822,6 +1845,10 @@ pub fn streamAnthropicMessages(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    if (o.requires_owned_stream_events) {
+        s.owns_events = true;
+        s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    }
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);
@@ -1857,14 +1884,21 @@ pub fn streamSimpleAnthropicMessages(
     var thinking_budget_tokens: ?u32 = null;
     var thinking_effort: ?[]const u8 = null;
 
-    if (o.reasoning) |level| {
-        thinking_enabled = true;
-        if (supportsAdaptiveThinking(model.id)) {
-            // Adaptive thinking: use effort level
-            thinking_effort = mapThinkingLevelToEffort(level);
-        } else {
-            // Budget-based thinking for older models
-            thinking_budget_tokens = getDefaultThinkingBudget(level, o.thinking_budgets);
+    if (model.reasoning) {
+        if (o.reasoning) |level| {
+            thinking_enabled = true;
+            if (supportsAdaptiveThinking(model.id)) {
+                // Adaptive thinking: use effort level
+                thinking_effort = mapThinkingLevelToEffort(level);
+            } else {
+                // Budget-based thinking for older models
+                const max_tokens = o.max_tokens orelse model.max_tokens;
+                if (level != .off and max_tokens > 1024) {
+                    thinking_budget_tokens = @max(1024, @min(getDefaultThinkingBudget(level, o.thinking_budgets), max_tokens - 1));
+                } else {
+                    thinking_enabled = false;
+                }
+            }
         }
     }
 
@@ -1898,26 +1932,26 @@ pub fn registerAnthropicMessagesApiProvider(registry: *api_registry.ApiRegistry)
 }
 
 test "getCacheControl returns null for none retention" {
-    const result = getCacheControl("https://api.anthropic.com", .none);
+    const result = getCacheControl("https://api.anthropic.com", .none, false);
     try std.testing.expect(result == null);
 }
 
 test "getCacheControl returns short retention without ttl for non-anthropic url" {
-    const result = getCacheControl("https://custom.api.com", .short);
+    const result = getCacheControl("https://custom.api.com", .short, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.short, result.?.retention);
     try std.testing.expectEqual(false, result.?.has_ttl);
 }
 
 test "getCacheControl returns long retention with ttl for anthropic url" {
-    const result = getCacheControl("https://api.anthropic.com", .long);
+    const result = getCacheControl("https://api.anthropic.com", .long, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
     try std.testing.expectEqual(true, result.?.has_ttl);
 }
 
 test "getCacheControl returns long retention without ttl for non-anthropic url" {
-    const result = getCacheControl("https://custom.api.com", .long);
+    const result = getCacheControl("https://custom.api.com", .long, false);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(ai_types.CacheRetention.long, result.?.retention);
     try std.testing.expectEqual(false, result.?.has_ttl);
@@ -2171,7 +2205,6 @@ test "parseAnthropicEventType extracts tool_use id and name" {
     allocator.free(result.content_block_start.tool_id);
     allocator.free(result.content_block_start.tool_name);
 }
-
 
 fn regressionModel(api_name: []const u8, provider_name: []const u8, base_url: []const u8) ai_types.Model {
     return .{

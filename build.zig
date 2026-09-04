@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const zigzag_dep = b.dependency("zigzag", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigzag_mod = zigzag_dep.module("zigzag");
 
     const ai_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/ai_types.zig"),
@@ -81,6 +86,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const artifact_store_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/artifact/store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
     const oauth_storage_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/utils/oauth/storage.zig"),
         .target = target,
@@ -89,6 +106,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "compat", .module = compat_mod },
         },
     });
+    if (target.result.os.tag == .macos) {
+        oauth_storage_mod.linkFramework("Security", .{});
+        oauth_storage_mod.linkFramework("CoreFoundation", .{});
+    }
 
     const refresh_lock_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/utils/oauth/refresh_lock.zig"),
@@ -135,6 +156,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
+    const oauth_openai_codex_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/utils/oauth/openai_codex.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
             .{ .name = "oauth/pkce", .module = oauth_utils_pkce_mod },
             .{ .name = "compat", .module = compat_mod },
         },
@@ -283,6 +314,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "pre_transform", .module = pre_transform_mod },
             .{ .name = "string_builder", .module = string_builder_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
         },
     });
 
@@ -411,6 +444,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "transport", .module = transport_mod },
             .{ .name = "sse_parser", .module = sse_parser_mod },
             .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
         },
     });
 
@@ -681,6 +715,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth/providers", .module = auth_provider_defs_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
             .{ .name = "compat", .module = compat_mod },
@@ -734,6 +769,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const permission_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tools/permission.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
     // Agent modules
     const agent_types_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/agent/types.zig"),
@@ -743,7 +787,25 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "permission", .module = permission_mod },
             .{ .name = "compat", .module = compat_mod },
+        },
+    });
+
+    const protocol_tool_local_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/protocol/tool/local_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "tool_types", .module = protocol_tool_types_mod },
+            .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
+            .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
         },
     });
 
@@ -757,6 +819,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "event_stream", .module = event_stream_mod },
             .{ .name = "agent_types", .module = agent_types_mod },
             .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "permission", .module = permission_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
         },
     });
 
@@ -774,6 +838,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "protocol_server", .module = protocol_server_mod },
             .{ .name = "protocol_client", .module = protocol_client_mod },
             .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+            .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
         },
     });
@@ -795,11 +860,272 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const tui_session_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/session.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const tui_config_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
+        },
+    });
+
+    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
+    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "compat", .module = compat_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_file_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_hashline_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/hashline.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "protocol_tool_types", .module = protocol_tool_types_mod } } });
+    const tools_search_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_mcp_bridge_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/mcp_bridge.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "compat", .module = compat_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/hashline", .module = tools_hashline_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod }, .{ .name = "tools/mcp_bridge", .module = tools_mcp_bridge_mod } } });
+
+    const tui_runtime_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "agent_types", .module = agent_types_mod },
+            .{ .name = "permission", .module = permission_mod },
+            .{ .name = "agent_protocol_client", .module = protocol_agent_client_mod },
+            .{ .name = "agent_protocol_server", .module = protocol_agent_server_mod },
+            .{ .name = "agent_protocol_runtime", .module = protocol_agent_runtime_mod },
+            .{ .name = "agent_envelope", .module = protocol_agent_envelope_mod },
+            .{ .name = "agent_protocol_types", .module = protocol_agent_types_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            .{ .name = "transports/stdio", .module = stdio_transport_mod },
+            .{ .name = "transports/sse", .module = sse_transport_mod },
+            .{ .name = "transports/websocket", .module = websocket_transport_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "model_ref", .module = protocol_model_ref_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tools/registry", .module = tools_registry_mod },
+            .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+        },
+    });
+
+    const tui_session_store_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/session_store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "json/writer", .module = json_writer_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const tui_state_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/state.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+        },
+    });
+
+    const tui_commands_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/commands.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "transports/sse", .module = sse_transport_mod },
+        },
+    });
+
+    const tui_theme_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/theme.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod } } });
+    const tui_text_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/text.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
+    const tui_render_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/render.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
+    const tui_markdown_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/markdown.zig"), .target = target, .optimize = optimize, .imports = &.{} });
+
+    const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_markdown", .module = tui_markdown_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_menu_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/menu_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+
+    const tui_login_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/login.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
+            .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+        },
+    });
+
+    const tui_model_catalog_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/model_catalog.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "oauth/openai_codex", .module = oauth_openai_codex_mod },
+        },
+    });
+
+    const tui_app_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/app.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "zigzag", .module = zigzag_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "api_registry", .module = api_registry_mod },
+            .{ .name = "register_builtins", .module = register_builtins_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_commands", .module = tui_commands_mod },
+            .{ .name = "tui_login", .module = tui_login_mod },
+            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "tui_theme", .module = tui_theme_mod },
+            .{ .name = "tui_text", .module = tui_text_mod },
+            .{ .name = "oauth/storage", .module = oauth_storage_mod },
+            .{ .name = "tui_render", .module = tui_render_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
+            .{ .name = "tui_view_transcript", .module = tui_view_transcript_mod },
+            .{ .name = "tui_view_composer", .module = tui_view_composer_mod },
+            .{ .name = "tui_view_status_bar", .module = tui_view_status_bar_mod },
+            .{ .name = "tui_view_tool_panel", .module = tui_view_tool_panel_mod },
+            .{ .name = "tui_view_telemetry", .module = tui_view_telemetry_mod },
+            .{ .name = "tui_view_approval", .module = tui_view_approval_mod },
+            .{ .name = "tui_view_preview", .module = tui_view_preview_mod },
+            .{ .name = "tui_view_session_picker", .module = tui_view_session_picker_mod },
+            .{ .name = "tui_view_menu_picker", .module = tui_view_menu_picker_mod },
+            .{ .name = "permission", .module = permission_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tools/common", .module = tools_common_mod },
+        },
+    });
+
+    const tui_tests_mock_provider_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/tests/mock_provider.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent", .module = agent_mod },
+        },
+    });
+
+    const tui_tests_mock_transport_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/tests/mock_transport.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "transport", .module = transport_mod },
+        },
+    });
+
+    const tui_tests_fixtures_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/tests/fixtures/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "agent", .module = agent_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+        },
+    });
+
+    const tui_tests_scenarios_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/tests/scenario_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+            .{ .name = "tui_tests_mock_transport", .module = tui_tests_mock_transport_mod },
+            .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
+        },
+    });
+
+    const tui_tests_e2e_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/tui/tests/e2e_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "zigzag", .module = zigzag_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "tui_app", .module = tui_app_mod },
+            .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            .{ .name = "tui_state", .module = tui_state_mod },
+            .{ .name = "tui_session", .module = tui_session_mod },
+            .{ .name = "tui_session_store", .module = tui_session_store_mod },
+            .{ .name = "tui_config", .module = tui_config_mod },
+            .{ .name = "owned_slice", .module = owned_slice_mod },
+            .{ .name = "tui_tests_mock_provider", .module = tui_tests_mock_provider_mod },
+            .{ .name = "tui_tests_fixtures", .module = tui_tests_fixtures_mod },
+        },
+    });
+
     // Tests
     const owned_slice_test = b.addTest(.{ .root_module = owned_slice_mod });
     const string_builder_test = b.addTest(.{ .root_module = string_builder_mod });
     const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
     const compat_test = b.addTest(.{ .root_module = compat_mod });
+    const artifact_store_test = b.addTest(.{ .root_module = artifact_store_mod });
 
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -860,9 +1186,11 @@ pub fn build(b: *std.Build) void {
     const google_generative_api_test = b.addTest(.{ .root_module = google_generative_api_mod });
     const google_vertex_api_test = b.addTest(.{ .root_module = google_vertex_api_mod });
     const ollama_api_test = b.addTest(.{ .root_module = ollama_api_mod });
+    const sse_parser_test = b.addTest(.{ .root_module = sse_parser_mod });
 
     const oauth_pkce_test = b.addTest(.{ .root_module = oauth_pkce_mod });
     const oauth_utils_pkce_test = b.addTest(.{ .root_module = oauth_utils_pkce_mod });
+    const oauth_openai_codex_test = b.addTest(.{ .root_module = oauth_openai_codex_mod });
 
     const refresh_lock_test = b.addTest(.{ .root_module = refresh_lock_mod });
 
@@ -1019,6 +1347,19 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const e2e_tui_websocket_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/test/e2e/tui_websocket.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "tui_runtime", .module = tui_runtime_mod },
+            },
+        }),
+    });
+
     const e2e_distributed_fullstack_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/distributed_fullstack.zig"),
@@ -1035,6 +1376,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "tool_types", .module = protocol_tool_types_mod },
                 .{ .name = "tool_envelope", .module = protocol_tool_envelope_mod },
                 .{ .name = "tool_runtime", .module = protocol_tool_runtime_mod },
+                .{ .name = "tool_local_runtime", .module = protocol_tool_local_runtime_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
@@ -1114,15 +1456,53 @@ pub fn build(b: *std.Build) void {
     const protocol_tool_types_test = b.addTest(.{ .root_module = protocol_tool_types_mod });
     const protocol_tool_envelope_test = b.addTest(.{ .root_module = protocol_tool_envelope_mod });
     const protocol_tool_runtime_test = b.addTest(.{ .root_module = protocol_tool_runtime_mod });
+    const protocol_tool_local_runtime_test = b.addTest(.{ .root_module = protocol_tool_local_runtime_mod });
 
     // Agent tests
-    const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
+    const permission_test = b.addTest(.{ .root_module = permission_mod });
 
+    const agent_types_test = b.addTest(.{ .root_module = agent_types_mod });
     const agent_loop_test = b.addTest(.{ .root_module = agent_loop_mod });
 
     const agent_mod_test = b.addTest(.{ .root_module = agent_mod });
 
     const agent_provider_protocol_bridge_test = b.addTest(.{ .root_module = agent_provider_protocol_bridge_mod });
+    const tui_session_test = b.addTest(.{ .root_module = tui_session_mod });
+    const tui_config_test = b.addTest(.{ .root_module = tui_config_mod });
+    const tui_runtime_test = b.addTest(.{ .root_module = tui_runtime_mod });
+    const tui_session_store_test = b.addTest(.{ .root_module = tui_session_store_mod });
+    const tui_state_test = b.addTest(.{ .root_module = tui_state_mod });
+    const tui_commands_test = b.addTest(.{ .root_module = tui_commands_mod });
+    const tui_login_test = b.addTest(.{ .root_module = tui_login_mod });
+    const tui_model_catalog_test = b.addTest(.{ .root_module = tui_model_catalog_mod });
+    const tui_app_test = b.addTest(.{ .root_module = tui_app_mod });
+    const tui_theme_test = b.addTest(.{ .root_module = tui_theme_mod });
+    const tui_text_test = b.addTest(.{ .root_module = tui_text_mod });
+    const tui_render_test = b.addTest(.{ .root_module = tui_render_mod });
+    const tui_markdown_test = b.addTest(.{ .root_module = tui_markdown_mod });
+    const tui_view_transcript_test = b.addTest(.{ .root_module = tui_view_transcript_mod });
+    const tui_view_composer_test = b.addTest(.{ .root_module = tui_view_composer_mod });
+    const tui_view_status_bar_test = b.addTest(.{ .root_module = tui_view_status_bar_mod });
+    const tui_view_tool_panel_test = b.addTest(.{ .root_module = tui_view_tool_panel_mod });
+    const tui_view_telemetry_test = b.addTest(.{ .root_module = tui_view_telemetry_mod });
+    const tui_view_approval_test = b.addTest(.{ .root_module = tui_view_approval_mod });
+    const tui_view_preview_test = b.addTest(.{ .root_module = tui_view_preview_mod });
+    const tui_view_session_picker_test = b.addTest(.{ .root_module = tui_view_session_picker_mod });
+    const tui_view_menu_picker_test = b.addTest(.{ .root_module = tui_view_menu_picker_mod });
+    const tui_tests_scenarios_test = b.addTest(.{ .root_module = tui_tests_scenarios_mod });
+    const tui_tests_e2e_test = b.addTest(.{ .root_module = tui_tests_e2e_mod });
+    const tui_tests_mock_transport_test = b.addTest(.{ .root_module = tui_tests_mock_transport_mod });
+    const tools_common_test = b.addTest(.{ .root_module = tools_common_mod });
+    const tools_process_runner_test = b.addTest(.{ .root_module = tools_process_runner_mod });
+    const tools_artifact_test = b.addTest(.{ .root_module = tools_artifact_mod });
+    const tools_shell_test = b.addTest(.{ .root_module = tools_shell_mod });
+    const tools_file_test = b.addTest(.{ .root_module = tools_file_mod });
+    const tools_edit_test = b.addTest(.{ .root_module = tools_edit_mod });
+    const tools_hashline_test = b.addTest(.{ .root_module = tools_hashline_mod });
+    const tools_search_test = b.addTest(.{ .root_module = tools_search_mod });
+    const tools_workspace_test = b.addTest(.{ .root_module = tools_workspace_mod });
+    const tools_mcp_bridge_test = b.addTest(.{ .root_module = tools_mcp_bridge_mod });
+    const tools_registry_test = b.addTest(.{ .root_module = tools_registry_mod });
     // TODO: Remove once Zig 0.16 self-hosted backend handles this test correctly.
     // The bridge test uses in-process threading + condition variables that trigger
     // a known backend bug; LLVM handles it fine.
@@ -1191,6 +1571,11 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ai_types", .module = ai_types_mod },
             .{ .name = "api_registry", .module = api_registry_mod },
             .{ .name = "event_stream", .module = event_stream_mod },
+            .{ .name = "agent_loop", .module = agent_loop_mod },
+            .{ .name = "agent_bridge", .module = agent_mod },
+            .{ .name = "transport", .module = transport_mod },
+            .{ .name = "model_ref", .module = protocol_model_ref_mod },
+            .{ .name = "json_writer", .module = json_writer_mod },
             .{ .name = "oauth/anthropic", .module = oauth_anthropic_mod },
             .{ .name = "oauth/github_copilot", .module = github_copilot_mod },
             .{ .name = "oauth/storage", .module = oauth_storage_mod },
@@ -1208,6 +1593,8 @@ pub fn build(b: *std.Build) void {
             .{ .name = "auth_cli", .module = auth_cli_mod },
             .{ .name = "transports/in_process", .module = in_process_transport_mod },
             .{ .name = "stdio", .module = stdio_transport_mod },
+            .{ .name = "tui_app", .module = tui_app_mod },
+            .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "compat", .module = compat_mod },
         },
     });
@@ -1229,11 +1616,61 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Makai CLI");
     run_step.dependOn(&run_cmd.step);
 
+    const run_tui_cmd = b.addRunArtifact(makai_cli);
+    run_tui_cmd.addArg("--tui");
+    const run_tui_step = b.step("run-tui", "Run the Makai TUI");
+    run_tui_step.dependOn(&run_tui_cmd.step);
+
+    const counting_allocator_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/bench/counting_allocator.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_options = b.addOptions();
+    bench_options.addOption([]const u8, "git_revision", b.option([]const u8, "git-revision", "Source revision recorded in benchmark reports") orelse "unknown");
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/bench/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "sse_parser", .module = sse_parser_mod },
+            .{ .name = "protocol_envelope", .module = protocol_envelope_mod },
+            .{ .name = "protocol_types", .module = protocol_types_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+            .{ .name = "counting_allocator", .module = counting_allocator_mod },
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "bench_options", .module = bench_options.createModule() },
+        },
+    });
+    const bench_exe = b.addExecutable(.{ .name = "makai-bench", .root_module = bench_mod });
+    const bench_run = b.addRunArtifact(bench_exe);
+    if (b.args) |args| bench_run.addArgs(args);
+    const bench_step = b.step("bench", "Run deterministic performance and allocation baselines");
+    bench_step.dependOn(&bench_run.step);
+
+    const bench_compare_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/bench/compare.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "compat", .module = compat_mod }},
+    });
+    const bench_compare_exe = b.addExecutable(.{ .name = "makai-bench-compare", .root_module = bench_compare_mod });
+    const bench_compare_run = b.addRunArtifact(bench_compare_exe);
+    if (b.args) |args| bench_compare_run.addArgs(args);
+    const bench_compare_step = b.step("bench-compare", "Compare compatible benchmark JSON reports");
+    bench_compare_step.dependOn(&bench_compare_run.step);
+
+    const counting_allocator_test = b.addTest(.{ .root_module = counting_allocator_mod });
+    const bench_compare_test = b.addTest(.{ .root_module = bench_compare_mod });
+
     const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(counting_allocator_test).step);
+    test_step.dependOn(&b.addRunArtifact(bench_compare_test).step);
     test_step.dependOn(&b.addRunArtifact(owned_slice_test).step);
     test_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_step.dependOn(&b.addRunArtifact(compat_test).step);
+    test_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
@@ -1273,12 +1710,50 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
+    test_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
     test_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_step.dependOn(&b.addRunArtifact(oauth_test).step);
+    test_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_config_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_state_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_login_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_app_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_text_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_render_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_markdown_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_e2e_test).step);
+    test_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
+    test_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_agent_types_test).step);
@@ -1293,6 +1768,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tool_local_runtime_test).step);
     test_step.dependOn(&auth_cli_test_run.step);
     test_step.dependOn(&makai_cli_test_run.step);
 
@@ -1306,6 +1782,9 @@ pub fn build(b: *std.Build) void {
     test_unit_core_step.dependOn(&b.addRunArtifact(string_builder_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_unit_core_step.dependOn(&b.addRunArtifact(compat_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(counting_allocator_test).step);
+    test_unit_core_step.dependOn(&b.addRunArtifact(bench_compare_test).step);
 
     const test_unit_transport_step = b.step("test-unit-transport", "Run transport layer unit tests");
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_test).step);
@@ -1338,6 +1817,7 @@ pub fn build(b: *std.Build) void {
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_envelope_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_runtime_test).step);
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_tool_local_runtime_test).step);
 
     const test_unit_providers_step = b.step("test-unit-providers", "Run provider unit tests");
     test_unit_providers_step.dependOn(&b.addRunArtifact(api_registry_test).step);
@@ -1350,12 +1830,14 @@ pub fn build(b: *std.Build) void {
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_generative_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(google_vertex_api_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(ollama_api_test).step);
+    test_unit_providers_step.dependOn(&b.addRunArtifact(sse_parser_test).step);
     test_unit_providers_step.dependOn(&b.addRunArtifact(auth_provider_defs_test).step);
 
     const test_unit_utils_step = b.step("test-unit-utils", "Run utils/oauth unit tests");
     test_unit_utils_step.dependOn(&b.addRunArtifact(github_copilot_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_pkce_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_utils_pkce_test).step);
+    test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_openai_codex_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(refresh_lock_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(oauth_test).step);
     test_unit_utils_step.dependOn(&b.addRunArtifact(overflow_test).step);
@@ -1370,14 +1852,40 @@ pub fn build(b: *std.Build) void {
     test_unit_makai_cli_step.dependOn(&makai_cli_test_run.step);
 
     const test_unit_agent_step = b.step("test-unit-agent", "Run agent unit tests");
+    test_unit_agent_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_types_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_artifact_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_loop_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_mod_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_provider_protocol_bridge_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_config_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
+    test_unit_agent_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_test).step);
     test_unit_agent_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
 
     const test_unit_agent_types_step = b.step("test-unit-agent-types", "Run agent types unit tests");
+    test_unit_agent_types_step.dependOn(&b.addRunArtifact(permission_test).step);
     test_unit_agent_types_step.dependOn(&b.addRunArtifact(agent_types_test).step);
 
     const test_unit_agent_loop_step = b.step("test-unit-agent-loop", "Run agent loop unit tests");
@@ -1394,6 +1902,43 @@ pub fn build(b: *std.Build) void {
 
     const test_unit_agent_chain_step = b.step("test-unit-agent-chain", "Run agent protocol chain unit tests");
     test_unit_agent_chain_step.dependOn(&b.addRunArtifact(agent_protocol_chain_test).step);
+
+    const test_unit_tui_step = b.step("test-unit-tui", "Run TUI runtime unit tests");
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_config_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_runtime_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_session_store_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_state_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_commands_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_login_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_model_catalog_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_app_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_theme_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_text_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_render_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_markdown_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_transcript_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_composer_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_status_bar_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_tool_panel_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_telemetry_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_approval_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_preview_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_session_picker_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_view_menu_picker_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_scenarios_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_e2e_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tui_tests_mock_transport_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_common_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_process_runner_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_shell_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_file_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_edit_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_hashline_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_search_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_workspace_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_mcp_bridge_test).step);
+    test_unit_tui_step.dependOn(&b.addRunArtifact(tools_registry_test).step);
 
     const test_e2e_anthropic_step = b.step("test-e2e-anthropic", "Run Anthropic E2E tests");
     test_e2e_anthropic_step.dependOn(&b.addRunArtifact(e2e_anthropic_test).step);
@@ -1440,6 +1985,9 @@ pub fn build(b: *std.Build) void {
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
 
+    const test_e2e_tui_websocket_step = b.step("test-e2e-tui-websocket", "Run TUI WebSocket remote backend E2E test (mock-based)");
+    test_e2e_tui_websocket_step.dependOn(&b.addRunArtifact(e2e_tui_websocket_test).step);
+
     const test_e2e_distributed_fullstack_step = b.step("test-e2e-distributed-fullstack", "Run distributed fullstack E2E tests (mock-based)");
     test_e2e_distributed_fullstack_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
 
@@ -1456,6 +2004,7 @@ pub fn build(b: *std.Build) void {
     test_e2e_step.dependOn(test_e2e_provider_protocol_fullstack_ollama_step);
     test_e2e_step.dependOn(test_e2e_provider_protocol_fullstack_github_step);
     test_e2e_step.dependOn(test_e2e_protocol_step);
+    test_e2e_step.dependOn(test_e2e_tui_websocket_step);
 
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
     test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);

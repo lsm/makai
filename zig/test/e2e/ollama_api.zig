@@ -52,8 +52,8 @@ test "ollama e2e: basic text generation (new api)" {
         }
     }
 
-    // Use ministral-3:3b as default - it's the smallest Ollama cloud model (~4.67GB)
-    const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "ministral-3:3b");
+    // Use gemma4:31b as default - a free model currently available on the Ollama cloud API
+    const model_id = getEnvOwned(testing.allocator, "OLLAMA_MODEL") orelse try testing.allocator.dupe(u8, "gemma4:31b");
     defer testing.allocator.free(model_id);
 
     const base_url = getEnvOwned(testing.allocator, "OLLAMA_BASE_URL") orelse try testing.allocator.dupe(u8, "");

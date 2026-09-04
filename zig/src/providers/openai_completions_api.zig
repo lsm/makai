@@ -33,17 +33,26 @@ const MergedCompat = struct {
 fn mergeCompat(model: ai_types.Model) MergedCompat {
     const caps = provider_caps.detectCapabilities(model.base_url);
     const compat = model.compat;
-    const is_openai_native = std.mem.find(u8, model.base_url, "openai.com") != null;
+    const is_openai_native = isOpenAIHost(model.base_url);
+    // detectCapabilities matches api.openai.com anywhere in the URL, so a
+    // generic gateway whose path merely contains that host would inherit
+    // OpenAI-native roles, reasoning effort and token fields. Honor those
+    // only on the parsed OpenAI host or an explicitly declared transparent
+    // proxy; every other endpoint keeps the compatible-endpoint defaults.
+    const honors_native_caps = is_openai_native or isTransparentOpenAIProxy(model);
+    const detected_developer_role = if (honors_native_caps) caps.supports_developer_role else false;
+    const detected_reasoning_effort = if (honors_native_caps) caps.supports_reasoning_effort else false;
+    const detected_max_tokens_field: []const u8 = if (honors_native_caps) caps.max_tokens_field else "max_tokens";
 
     return .{
         .supports_store = if (compat) |c| c.supports_store orelse is_openai_native else is_openai_native,
-        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse caps.supports_developer_role else caps.supports_developer_role,
-        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse caps.supports_reasoning_effort else caps.supports_reasoning_effort,
+        .supports_developer_role = if (compat) |c| c.supports_developer_role orelse detected_developer_role else detected_developer_role,
+        .supports_reasoning_effort = if (compat) |c| c.supports_reasoning_effort orelse detected_reasoning_effort else detected_reasoning_effort,
         .supports_usage_in_streaming = if (compat) |c| c.supports_usage_in_streaming orelse true else true,
         .max_tokens_field = if (compat) |c| switch (c.max_tokens_field) {
             .max_completion_tokens => "max_completion_tokens",
             .max_tokens => "max_tokens",
-        } else caps.max_tokens_field,
+        } else detected_max_tokens_field,
         .requires_tool_result_name = if (compat) |c| c.requires_tool_result_name orelse caps.requires_tool_result_name else caps.requires_tool_result_name,
         .requires_assistant_after_tool_result = if (compat) |c| c.requires_assistant_after_tool_result orelse caps.requires_assistant_after_tool else caps.requires_assistant_after_tool,
         .requires_thinking_as_text = if (compat) |c| c.requires_thinking_as_text orelse caps.requires_thinking_as_text else caps.requires_thinking_as_text,
@@ -57,12 +66,34 @@ fn mergeCompat(model: ai_types.Model) MergedCompat {
             .zai => .zai,
             .qwen => .qwen,
         },
-        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse true else true,
+        .supports_strict_mode = if (compat) |c| c.supports_strict_mode orelse honors_native_caps else is_openai_native,
     };
 }
 
-fn envApiKey(allocator: std.mem.Allocator) ?[]const u8 {
-    return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+fn isTransparentOpenAIProxy(model: ai_types.Model) bool {
+    if (!std.mem.eql(u8, model.provider, "openai")) return false;
+    const compat = model.compat orelse return false;
+    return compat.supports_store == true and
+        compat.supports_developer_role == true and
+        compat.supports_reasoning_effort == true;
+}
+
+fn isOpenAIHost(base_url: []const u8) bool {
+    const uri = std.Uri.parse(base_url) catch return false;
+    const host = uri.host orelse return false;
+    const value = host.percent_encoded;
+    return std.ascii.eqlIgnoreCase(value, "openai.com") or
+        (value.len > "openai.com".len and std.ascii.eqlIgnoreCase(value[value.len - "openai.com".len ..], "openai.com") and value[value.len - "openai.com".len - 1] == '.');
+}
+
+fn envApiKeyForProvider(allocator: std.mem.Allocator, provider_id: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, provider_id, "deepseek")) {
+        return compat_mod.getEnvVarOwned(allocator, "DEEPSEEK_API_KEY") catch null;
+    }
+    if (std.mem.eql(u8, provider_id, "openai")) {
+        return compat_mod.getEnvVarOwned(allocator, "OPENAI_API_KEY") catch null;
+    }
+    return null;
 }
 
 fn appendTextContent(msg: ai_types.Message, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -480,6 +511,7 @@ fn writeMessagesArray(
                         try writer.writeStringField("name", tc.name);
                         try writer.writeStringField("arguments", tc.arguments_json);
                         try writer.endObject();
+                        try writer.endObject();
                     },
                     else => {},
                 };
@@ -639,7 +671,7 @@ fn buildRequestBody(
         .target_api = model.api,
         .target_provider = model.provider,
         .target_model_id = model.id,
-        .max_tool_id_len = if (std.mem.find(u8, model.base_url, "openai.com") != null) 40 else 0,
+        .max_tool_id_len = if (isOpenAIHost(model.base_url) or isTransparentOpenAIProxy(model)) 40 else 0,
         .mistral_tool_ids = merged.requires_mistral_tool_ids,
         .insert_synthetic_results = true,
         .tools = context.tools,
@@ -665,8 +697,12 @@ fn buildRequestBody(
     // Use appropriate max tokens field based on provider
     try w.writeIntField(merged.max_tokens_field, options.max_tokens orelse model.max_tokens);
     if (options.temperature) |t| {
-        try w.writeKey("temperature");
-        try w.writeFloat(t);
+        // Kimi Coding only accepts temperature=1. Omit incompatible inherited
+        // TUI defaults instead of turning a valid request into HTTP 400.
+        if (!isKimiModel(model) or t == 1.0) {
+            try w.writeKey("temperature");
+            try w.writeFloat(t);
+        }
     }
     // Add reasoning_effort for providers that support it
     if (options.getReasoningEffort()) |effort| {
@@ -692,6 +728,7 @@ fn buildRequestBody(
                 if (merged.supports_strict_mode) {
                     try w.writeBoolField("strict", true);
                 }
+                try w.endObject();
                 try w.endObject();
             }
             try w.endArray();
@@ -801,6 +838,10 @@ fn findReasoningField(delta: std.json.ObjectMap) ?struct { field: []const u8, va
         }
     }
     return null;
+}
+
+fn canCompletePartialTextOnStreamError(text_len: usize, thinking_len: usize, tool_call_count: usize) bool {
+    return tool_call_count == 0 and (text_len > 0 or thinking_len > 0);
 }
 
 fn parseChunk(
@@ -1041,6 +1082,36 @@ fn buildBearerAuthValue(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
     return out;
 }
 
+/// Clone an event (deep-copy all string/content fields into stable heap
+/// allocations) before pushing it onto the stream. Required because this
+/// provider accumulates text/thinking into growing ArrayLists whose backing
+/// buffers move on reallocation; delta events that borrow a slice
+/// (`buf.items[prev..]`) would dangle after the next append. Cloning makes
+/// every pushed event self-owned so it survives buffer growth. The stream is
+/// configured with `owns_events = true` so consumers free the clones.
+fn pushOwnedEvent(
+    allocator: std.mem.Allocator,
+    stream: *event_stream.AssistantMessageEventStream,
+    event: ai_types.AssistantMessageEvent,
+) void {
+    const owned = ai_types.cloneAssistantMessageEvent(allocator, event) catch return;
+    if (!stream.pushBlocking(owned)) {
+        var cleanup = owned;
+        ai_types.deinitAssistantMessageEvent(allocator, &cleanup);
+    }
+}
+
+fn isKimiModel(model: ai_types.Model) bool {
+    return std.mem.eql(u8, model.provider, "kimi");
+}
+
+fn maybeDumpProviderPayload(allocator: std.mem.Allocator, request_body: []const u8) void {
+    const path = compat_mod.getEnvVarOwned(allocator, "MAKAI_DEBUG_PROVIDER_PAYLOAD") catch return;
+    defer allocator.free(path);
+    if (path.len == 0) return;
+    compat_mod.fs.writeFile(compat_mod.fs.getCwd(), path, request_body) catch {};
+}
+
 fn runThread(ctx: *ThreadCtx) void {
     // Save values from ctx that we need after freeing ctx
     const allocator = ctx.allocator;
@@ -1058,13 +1129,14 @@ fn runThread(ctx: *ThreadCtx) void {
     if (on_payload_fn) |cb| {
         cb(on_payload_ctx, request_body);
     }
+    maybeDumpProviderPayload(allocator, request_body);
 
     // Check cancellation before sending
     if (cancel_token) |ct| {
         if (ct.isCancelled()) {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("request cancelled");
+            stream.markThreadDone();
             return;
         }
     }
@@ -1076,31 +1148,31 @@ fn runThread(ctx: *ThreadCtx) void {
     const url = if (std.mem.eql(u8, model.provider, "github-copilot"))
         buildUrlWithSuffix(allocator, model.base_url, "/chat/completions") catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building url");
+            stream.markThreadDone();
             return;
         }
     else
         buildUrlWithSuffix(allocator, model.base_url, "/v1/chat/completions") catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building url");
+            stream.markThreadDone();
             return;
         };
     defer allocator.free(url);
 
     const auth = buildBearerAuthValue(allocator, api_key) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom building auth header");
+        stream.markThreadDone();
         return;
     };
     defer allocator.free(auth);
 
     const uri = std.Uri.parse(url) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("invalid provider URL");
+        stream.markThreadDone();
         return;
     };
 
@@ -1108,20 +1180,20 @@ fn runThread(ctx: *ThreadCtx) void {
     defer headers.deinit(allocator);
     headers.append(allocator, .{ .name = "authorization", .value = auth }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     headers.append(allocator, .{ .name = "content-type", .value = "application/json" }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
     headers.append(allocator, .{ .name = "accept", .value = "text/event-stream" }) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom headers");
+        stream.markThreadDone();
         return;
     };
 
@@ -1130,26 +1202,26 @@ fn runThread(ctx: *ThreadCtx) void {
         // Static Copilot headers (required for all requests)
         headers.append(allocator, .{ .name = "user-agent", .value = github_copilot.COPILOT_HEADERS.user_agent }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "editor-version", .value = github_copilot.COPILOT_HEADERS.editor_version }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "editor-plugin-version", .value = github_copilot.COPILOT_HEADERS.editor_plugin_version }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         headers.append(allocator, .{ .name = "copilot-integration-id", .value = github_copilot.COPILOT_HEADERS.copilot_integration_id }) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
 
@@ -1161,8 +1233,8 @@ fn runThread(ctx: *ThreadCtx) void {
             allocator,
         ) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom copilot headers");
+            stream.markThreadDone();
             return;
         };
         defer allocator.free(copilot_headers);
@@ -1170,12 +1242,22 @@ fn runThread(ctx: *ThreadCtx) void {
         for (copilot_headers) |h| {
             headers.append(allocator, h) catch {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("oom headers");
+                stream.markThreadDone();
                 return;
             };
         }
     }
+
+    // Kimi requires a specific User-Agent header for authentication; without it
+    // the WAF returns 403 ("only available for Coding Agents"). We must OVERRIDE
+    // the client's default user-agent (which would otherwise be `zig/...` and
+    // collide with any value added via extra_headers, producing a duplicate
+    // header). The override is applied in openRequest below.
+    const user_agent_override: ?[]const u8 = if (isKimiModel(model))
+        "claude-code/0.1.0"
+    else
+        null;
 
     // Retry configuration
     const MAX_RETRIES: u8 = 3;
@@ -1194,8 +1276,8 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
@@ -1206,7 +1288,7 @@ fn runThread(ctx: *ThreadCtx) void {
             req_initialized = false;
         }
 
-        req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items }) catch {
+        req = client.openRequest(.POST, uri, .{ .extra_headers = headers.items, .user_agent = user_agent_override }) catch {
             // Network error - check if we should retry
             if (retry_attempt < MAX_RETRIES) {
                 const delay = retry.calculateDelay(retry_attempt, BASE_DELAY_MS, max_delay_ms);
@@ -1216,13 +1298,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to open request");
+            stream.markThreadDone();
             return;
         };
         req_initialized = true;
@@ -1237,13 +1319,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to send request");
+            stream.markThreadDone();
             return;
         };
 
@@ -1257,13 +1339,13 @@ fn runThread(ctx: *ThreadCtx) void {
                 }
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("failed to receive response");
+            stream.markThreadDone();
             return;
         };
 
@@ -1320,8 +1402,8 @@ fn runThread(ctx: *ThreadCtx) void {
             if (!retry.sleepMs(delay, if (cancel_token) |ct| ct.cancelled else null)) {
                 // Sleep was cancelled
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
 
@@ -1346,9 +1428,13 @@ fn runThread(ctx: *ThreadCtx) void {
             std.debug.print("Error body: {s}\n", .{eb});
         }
 
+        const status_code: u16 = @intFromEnum(response.head.status);
+        const error_msg = std.fmt.allocPrint(allocator, "openai request failed: status={d}", .{status_code}) catch "openai request failed";
+        defer if (!std.mem.eql(u8, error_msg, "openai request failed")) allocator.free(error_msg);
+
         ctx.deinit();
+        stream.completeWithError(error_msg);
         stream.markThreadDone();
-        stream.completeWithError("openai request failed");
         return;
     }
 
@@ -1394,7 +1480,7 @@ fn runThread(ctx: *ThreadCtx) void {
     const ping_interval = ctx.ping_interval_ms orelse 0;
 
     // Emit start event
-    _ = stream.push(.{
+    pushOwnedEvent(allocator, stream, .{
         .start = .{
             .partial = .{
                 .content = &.{},
@@ -1406,9 +1492,9 @@ fn runThread(ctx: *ThreadCtx) void {
                 .timestamp = compat_mod.time.nowMillis(),
             },
         },
-    }) catch {};
+    });
 
-    while (true) {
+    read_loop: while (true) {
         // Emit ping if interval is configured
         if (ping_interval > 0) {
             const now = compat_mod.time.nowMillis();
@@ -1422,24 +1508,24 @@ fn runThread(ctx: *ThreadCtx) void {
         if (cancel_token) |ct| {
             if (ct.isCancelled()) {
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("request cancelled");
+                stream.markThreadDone();
                 return;
             }
         }
 
         const n = compat_mod.http.readResponse(reader, &read_buf) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("read error");
+            stream.markThreadDone();
             return;
         };
         if (n == 0) break;
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
+            stream.completeWithError(sse_parser.errorMessage(err));
             stream.markThreadDone();
-            stream.completeWithError("sse parse error");
             return;
         };
 
@@ -1460,16 +1546,20 @@ fn runThread(ctx: *ThreadCtx) void {
             const prev_thinking_len = thinking.items.len;
 
             parseChunk(ev.data, &text, &thinking, &usage, &stop_reason, &current_block, &reasoning_signature, &tool_call_events, &reasoning_detail_events, allocator) catch {
+                if (canCompletePartialTextOnStreamError(text.items.len, thinking.items.len, tool_call_count)) {
+                    stop_reason = .length;
+                    break :read_loop;
+                }
                 ctx.deinit();
-                stream.markThreadDone();
                 stream.completeWithError("json parse error");
+                stream.markThreadDone();
                 return;
             };
 
             // Emit text_delta event if text was appended
             if (text.items.len > prev_text_len) {
                 const delta = text.items[prev_text_len..];
-                _ = stream.push(.{
+                pushOwnedEvent(allocator, stream, .{
                     .text_delta = .{
                         .content_index = 0, // Text is always first content block
                         .delta = delta,
@@ -1483,13 +1573,13 @@ fn runThread(ctx: *ThreadCtx) void {
                             .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
-                }) catch {};
+                });
             }
 
             // Emit thinking_delta event if thinking was appended
-            if (thinking.items.len > prev_thinking_len) {
+            if (thinking.items.len > prev_thinking_len and !isKimiModel(model)) {
                 const delta = thinking.items[prev_thinking_len..];
-                _ = stream.push(.{
+                pushOwnedEvent(allocator, stream, .{
                     .thinking_delta = .{
                         .content_index = 0, // Thinking is always first if present
                         .delta = delta,
@@ -1503,7 +1593,7 @@ fn runThread(ctx: *ThreadCtx) void {
                             .timestamp = compat_mod.time.nowMillis(),
                         },
                     },
-                }) catch {};
+                });
             }
 
             // Process reasoning detail events - set thought_signature on matching tool calls
@@ -1520,15 +1610,15 @@ fn runThread(ctx: *ThreadCtx) void {
                     const name = tce.name orelse "";
                     _ = tool_call_tracker_instance.startCall(tce.api_index, content_index, id, name) catch {
                         ctx.deinit();
-                        stream.markThreadDone();
                         stream.completeWithError("oom tool call start");
+                        stream.markThreadDone();
                         return;
                     };
                     next_content_index += 1;
                     tool_call_count += 1;
 
                     // Emit toolcall_start event
-                    _ = stream.push(.{
+                    pushOwnedEvent(allocator, stream, .{
                         .toolcall_start = .{
                             .content_index = content_index,
                             .id = id,
@@ -1543,19 +1633,19 @@ fn runThread(ctx: *ThreadCtx) void {
                                 .timestamp = compat_mod.time.nowMillis(),
                             },
                         },
-                    }) catch {};
+                    });
                 } else if (tce.arguments_delta) |delta| {
                     // Append arguments delta
                     tool_call_tracker_instance.appendDelta(tce.api_index, delta) catch {
                         ctx.deinit();
-                        stream.markThreadDone();
                         stream.completeWithError("oom tool call delta");
+                        stream.markThreadDone();
                         return;
                     };
 
                     // Emit toolcall_delta event
                     if (tool_call_tracker_instance.getContentIndex(tce.api_index)) |content_index| {
-                        _ = stream.push(.{
+                        pushOwnedEvent(allocator, stream, .{
                             .toolcall_delta = .{
                                 .content_index = content_index,
                                 .delta = delta,
@@ -1569,7 +1659,7 @@ fn runThread(ctx: *ThreadCtx) void {
                                     .timestamp = compat_mod.time.nowMillis(),
                                 },
                             },
-                        }) catch {};
+                        });
                     }
                 }
             }
@@ -1604,15 +1694,15 @@ fn runThread(ctx: *ThreadCtx) void {
     const has_thinking = thinking.items.len > 0;
     const has_text = text.items.len > 0;
     const content_count: usize = if (has_thinking) 1 else 0;
-    const content_count_final = content_count + if (has_text) @as(usize, 1) else @as(usize, 0) + tool_call_count;
+    const content_count_final = content_count + (if (has_text) @as(usize, 1) else @as(usize, 0)) + tool_call_count;
 
     if (content_count_final == 0) {
         // No content - create empty text block with borrowed empty string reference
         // Using a static empty string avoids an unnecessary allocation for the empty case
         var content = allocator.alloc(ai_types.AssistantContent, 1) catch {
             ctx.deinit();
-            stream.markThreadDone();
             stream.completeWithError("oom building result");
+            stream.markThreadDone();
             return;
         };
         content[0] = .{ .text = .{ .text = "" } };
@@ -1626,15 +1716,15 @@ fn runThread(ctx: *ThreadCtx) void {
             .timestamp = compat_mod.time.nowMillis(),
         };
         ctx.deinit();
-        stream.markThreadDone();
         stream.complete(out);
+        stream.markThreadDone();
         return;
     }
 
     var content = allocator.alloc(ai_types.AssistantContent, content_count_final) catch {
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom building result");
+        stream.markThreadDone();
         return;
     };
     var idx: usize = 0;
@@ -1645,8 +1735,8 @@ fn runThread(ctx: *ThreadCtx) void {
                 .thinking = allocator.dupe(u8, thinking.items) catch {
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building thinking");
+                    stream.markThreadDone();
                     return;
                 },
                 .thinking_signature = if (reasoning_signature) |sig| allocator.dupe(u8, sig) catch {
@@ -1659,8 +1749,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building signature");
+                    stream.markThreadDone();
                     return;
                 } else null,
             },
@@ -1684,8 +1774,8 @@ fn runThread(ctx: *ThreadCtx) void {
                     }
                     allocator.free(content);
                     ctx.deinit();
-                    stream.markThreadDone();
                     stream.completeWithError("oom building text");
+                    stream.markThreadDone();
                     return;
                 },
             },
@@ -1698,21 +1788,11 @@ fn runThread(ctx: *ThreadCtx) void {
         if (tool_call_tracker_instance.completeCall(api_idx, allocator)) |tc| {
             content[idx] = .{ .tool_call = tc };
 
-            // Dupe the tool_call for the event so it owns its own memory
-            // The content array's tool_call is owned by the final message,
-            // and the event's tool_call needs its own copies for proper cleanup
-            const event_tc = ai_types.ToolCall{
-                .id = allocator.dupe(u8, tc.id) catch tc.id,
-                .name = allocator.dupe(u8, tc.name) catch tc.name,
-                .arguments_json = if (tc.arguments_json.len > 0) allocator.dupe(u8, tc.arguments_json) catch tc.arguments_json else "",
-                .thought_signature = if (tc.thought_signature) |sig| allocator.dupe(u8, sig) catch sig else null,
-            };
-
             // Emit toolcall_end event
-            _ = stream.push(.{
+            pushOwnedEvent(allocator, stream, .{
                 .toolcall_end = .{
                     .content_index = idx,
-                    .tool_call = event_tc,
+                    .tool_call = tc,
                     .partial = .{
                         .content = content[0..idx],
                         .api = model.api,
@@ -1723,7 +1803,7 @@ fn runThread(ctx: *ThreadCtx) void {
                         .timestamp = compat_mod.time.nowMillis(),
                     },
                 },
-            }) catch {};
+            });
 
             idx += 1;
         }
@@ -1740,8 +1820,8 @@ fn runThread(ctx: *ThreadCtx) void {
     };
 
     ctx.deinit();
-    stream.markThreadDone();
     stream.complete(out);
+    stream.markThreadDone();
 }
 
 pub fn streamOpenAICompletions(
@@ -1755,7 +1835,7 @@ pub fn streamOpenAICompletions(
     var key_owned: ?[]const u8 = null;
     const api_key = blk: {
         if (resolved.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
-        key_owned = envApiKey(allocator);
+        key_owned = envApiKeyForProvider(allocator, model.provider);
         if (key_owned) |k| break :blk k;
         return error.MissingApiKey;
     };
@@ -1782,6 +1862,9 @@ pub fn streamOpenAICompletions(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    // Events are deep-cloned in pushOwnedEvent, so the stream owns them and
+    // consumers must free each polled event via deinitAssistantMessageEvent.
+    s.owns_events = true;
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer {
@@ -1904,11 +1987,45 @@ test "buildRequestBody includes stream_options and tools without memory leak" {
     defer allocator.free(body);
 
     // Verify the body contains expected fields
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
     try std.testing.expect(std.mem.find(u8, body, "stream_options") != null);
     try std.testing.expect(std.mem.find(u8, body, "include_usage") != null);
     try std.testing.expect(std.mem.find(u8, body, "tools") != null);
     try std.testing.expect(std.mem.find(u8, body, "tool_calls") != null);
     try std.testing.expect(std.mem.find(u8, body, "test_tool") != null);
+}
+
+test "buildRequestBody omits non-default temperature for Kimi" {
+    const allocator = std.testing.allocator;
+
+    const model = ai_types.Model{
+        .id = "kimi-k2.7-code",
+        .name = "Kimi K2.7 Code",
+        .api = "openai-completions",
+        .provider = "kimi",
+        .base_url = "https://api.kimi.com/coding/",
+        .reasoning = false,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 262_144,
+        .max_tokens = 100,
+    };
+
+    const messages = [_]ai_types.Message{.{ .user = .{
+        .content = .{ .text = "Hello" },
+        .timestamp = 0,
+    } }};
+    const ctx = ai_types.Context{
+        .system_prompt = ai_types.OwnedSlice(u8).initBorrowed("You are helpful"),
+        .messages = &messages,
+        .tools = null,
+    };
+
+    const body = try buildRequestBody(model, ctx, .{ .max_tokens = 100, .temperature = 0.7 }, allocator);
+    defer allocator.free(body);
+
+    try std.testing.expect(std.mem.find(u8, body, "\"temperature\"") == null);
 }
 
 test "buildRequestBody with assistant message containing tool_calls" {
@@ -1958,6 +2075,13 @@ test "buildRequestBody with assistant message containing tool_calls" {
     try std.testing.expect(std.mem.find(u8, body, "call_456") != null);
     try std.testing.expect(std.mem.find(u8, body, "bash") != null);
     try std.testing.expect(std.mem.find(u8, body, "ls -la") != null);
+}
+
+test "stream errors can finalize accumulated text but not partial tool calls" {
+    try std.testing.expect(canCompletePartialTextOnStreamError(1, 0, 0));
+    try std.testing.expect(canCompletePartialTextOnStreamError(0, 1, 0));
+    try std.testing.expect(!canCompletePartialTextOnStreamError(0, 0, 0));
+    try std.testing.expect(!canCompletePartialTextOnStreamError(1, 0, 1));
 }
 
 test "parseChunk does not leak memory with reasoning content" {
@@ -2434,6 +2558,51 @@ test "mergeCompat falls back to detected capabilities when model compat is null"
     try std.testing.expect(merged.supports_developer_role);
     try std.testing.expect(merged.supports_reasoning_effort);
     try std.testing.expectEqualStrings("max_completion_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps custom OpenAI endpoints generic" {
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://proxy.example.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
+}
+
+test "mergeCompat keeps gateway URLs containing the OpenAI host in their path generic" {
+    // detectCapabilities substring-matches api.openai.com anywhere in the
+    // URL; a gateway whose path merely contains the host must not inherit
+    // OpenAI-native capabilities.
+    const model: ai_types.Model = .{
+        .id = "custom-model",
+        .name = "Custom Model",
+        .api = "openai-completions",
+        .provider = "openai",
+        .base_url = "https://gateway.example/api.openai.com",
+        .reasoning = true,
+        .input = &[_][]const u8{"text"},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128_000,
+        .max_tokens = 100,
+    };
+
+    const merged = mergeCompat(model);
+    try std.testing.expect(!merged.supports_store);
+    try std.testing.expect(!merged.supports_developer_role);
+    try std.testing.expect(!merged.supports_reasoning_effort);
+    try std.testing.expectEqualStrings("max_tokens", merged.max_tokens_field);
 }
 
 test "buildRequestBody uses max_tokens field from compat options" {

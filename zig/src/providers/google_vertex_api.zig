@@ -963,10 +963,10 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         if (n == 0) break;
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.deinit();
             stream.markThreadDone();
-            stream.completeWithError("parse failed");
+            stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 
@@ -1348,6 +1348,13 @@ pub fn streamGoogleVertex(
     // Resolve API key (required for Vertex AI with API key auth)
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        // Read the vendor env key only for the canonical Google providers
+        // so a custom or routed base URL (MAKAI_BASE_URL) cannot receive a
+        // GOOGLE_API_KEY meant for Google's own endpoint.
+        if (!std.mem.eql(u8, model.provider, "google") and !std.mem.eql(u8, model.provider, "google-vertex")) {
+            std.log.err("Vertex AI requires an explicit api_key for non-Google providers.", .{});
+            return error.MissingApiKey;
+        }
         const e = env(allocator, "GOOGLE_API_KEY");
         if (e) |k| break :blk @constCast(k);
         std.log.err("Vertex AI requires an API key. Set GOOGLE_API_KEY environment variable or pass api_key in options.", .{});
@@ -1376,6 +1383,10 @@ pub fn streamGoogleVertex(
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    if (o.requires_owned_stream_events) {
+        s.owns_events = true;
+        s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    }
 
     const ctx = allocator.create(ThreadCtx) catch return error.InvalidConfiguration;
     errdefer allocator.destroy(ctx);

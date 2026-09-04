@@ -25,8 +25,18 @@ pub const ProtocolClient = struct {
     };
 
     pub const Options = struct {
+        pub const EventDelivery = enum {
+            global,
+            per_stream,
+            both,
+        };
+
         include_partial: bool = false,
         request_timeout_ms: u64 = 30_000,
+
+        /// Select the queue(s) that receive events. Consumers must drain every
+        /// selected queue; single-queue adapters should not use `.both`.
+        event_delivery: EventDelivery = .both,
 
         /// Retry configuration for transient transport errors.
         /// When set, the client applies retry with exponential backoff to:
@@ -221,7 +231,7 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        if (!already_complete) {
+        if (!already_complete and self.options.event_delivery != .global) {
             const ses = try self.ensureStreamEventStream(stream_id);
             ses.completeWithError(msg);
         }
@@ -238,10 +248,46 @@ pub const ProtocolClient = struct {
         }
         try self.stream_complete_flags.put(stream_id, true);
 
-        if (!already_complete) {
+        if (!already_complete and self.options.event_delivery != .global) {
             const ses = try self.ensureStreamEventStream(stream_id);
             ses.complete(try ai_types.cloneAssistantMessage(self.allocator, self.stream_results.get(stream_id).?));
         }
+    }
+
+    fn hasToolCallContent(msg: ai_types.AssistantMessage) bool {
+        for (msg.content) |block| {
+            if (block == .tool_call) return true;
+        }
+        return false;
+    }
+
+    fn hasReconstructedToolCall(recon: *const partial_reconstructor.PartialReconstructor) bool {
+        var iter = recon.content_blocks.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == .tool_call) return true;
+        }
+        return false;
+    }
+
+    fn cloneOrReconstructResult(self: *Self, stream_id: protocol_types.Ulid, result: ai_types.AssistantMessage) !ai_types.AssistantMessage {
+        if (!hasToolCallContent(result)) {
+            if (self.reconstructors.getPtr(stream_id)) |recon| {
+                if (hasReconstructedToolCall(recon)) {
+                    const rebuilt = recon.buildMessage(.tool_use, result.timestamp) catch null;
+                    if (rebuilt) |msg| {
+                        if (hasToolCallContent(msg)) {
+                            var with_usage = msg;
+                            with_usage.usage = result.usage;
+                            return with_usage;
+                        }
+                        var cleanup = msg;
+                        cleanup.deinit(self.allocator);
+                    }
+                }
+            }
+        }
+
+        return try ai_types.cloneAssistantMessage(self.allocator, result);
     }
 
     /// Start a new stream and return both stream_id and message_id.
@@ -292,7 +338,9 @@ pub const ProtocolClient = struct {
         });
         try self.stream_complete_flags.put(stream_id, false);
         _ = try self.ensureReconstructor(stream_id);
-        _ = try self.ensureStreamEventStream(stream_id);
+        if (self.options.event_delivery != .global) {
+            _ = try self.ensureStreamEventStream(stream_id);
+        }
 
         return .{ .stream_id = stream_id, .message_id = message_id };
     }
@@ -366,6 +414,11 @@ pub const ProtocolClient = struct {
                 if (self.pending_requests.fetchRemove(nack.rejected_id)) |pending| {
                     var sid = pending.value.stream_id;
                     if (std.mem.allEqual(u8, &sid, 0)) sid = env.stream_id;
+                    self.current_stream_id = sid;
+                    try self.setStreamError(sid, nack.reason.slice());
+                } else {
+                    const sid = env.stream_id;
+                    self.current_stream_id = sid;
                     try self.setStreamError(sid, nack.reason.slice());
                 }
 
@@ -373,32 +426,28 @@ pub const ProtocolClient = struct {
                 try self.setLastError(nack.reason.slice());
             },
             .event => |evt| {
-                // Deep copy the event so the event stream owns its memory
-                // This is necessary because the envelope's deinit will free
-                // the original event's strings
-                const owned_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, evt);
+                if (self.options.event_delivery != .per_stream) {
+                    try self.pushOwnedEvent(self.event_stream, evt);
+                }
 
-                // Push to global event stream for polling
-                try self.event_stream.push(owned_evt);
-
-                // Push to per-stream event stream
-                const stream_es = try self.ensureStreamEventStream(env.stream_id);
-                const per_stream_evt = try ai_types.cloneAssistantMessageEvent(self.allocator, owned_evt);
-                try stream_es.push(per_stream_evt);
+                if (self.options.event_delivery != .global) {
+                    const stream_es = try self.ensureStreamEventStream(env.stream_id);
+                    try self.pushOwnedEvent(stream_es, evt);
+                }
 
                 // Process through legacy reconstructor for compatibility
-                try self.reconstructor.processEvent(owned_evt);
+                try self.reconstructor.processEvent(evt);
 
                 // Process through per-stream reconstructor
                 const recon = try self.ensureReconstructor(env.stream_id);
-                try recon.processEvent(owned_evt);
+                try recon.processEvent(evt);
 
                 // Check for done event
-                if (owned_evt == .done) {
+                if (evt == .done) {
                     const stream_result = recon.buildMessage(
-                        owned_evt.done.reason,
-                        owned_evt.done.message.timestamp,
-                    ) catch try ai_types.cloneAssistantMessage(self.allocator, owned_evt.done.message);
+                        evt.done.reason,
+                        evt.done.message.timestamp,
+                    ) catch try ai_types.cloneAssistantMessage(self.allocator, evt.done.message);
                     try self.setStreamResult(env.stream_id, stream_result);
 
                     // Legacy fields for current stream users use the legacy reconstructor
@@ -407,13 +456,13 @@ pub const ProtocolClient = struct {
                         prev.deinit(self.allocator);
                     }
                     self.last_result = try self.reconstructor.buildMessage(
-                        owned_evt.done.reason,
-                        owned_evt.done.message.timestamp,
+                        evt.done.reason,
+                        evt.done.message.timestamp,
                     );
                 }
             },
             .result => |result| {
-                const result_copy = try ai_types.cloneAssistantMessage(self.allocator, result);
+                const result_copy = try self.cloneOrReconstructResult(env.stream_id, result);
                 try self.setStreamResult(env.stream_id, result_copy);
 
                 // Legacy compatibility
@@ -438,6 +487,57 @@ pub const ProtocolClient = struct {
                 // Ignore other payload types
             },
         }
+    }
+
+    fn pushOwnedEvent(self: *Self, destination: *event_stream.AssistantMessageEventStream, event: ai_types.AssistantMessageEvent) !void {
+        const owned = try ai_types.cloneAssistantMessageEvent(self.allocator, event);
+        var transferred = false;
+        errdefer if (!transferred) {
+            var cleanup = owned;
+            ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
+        };
+        try destination.push(owned);
+        transferred = true;
+    }
+
+    /// Available capacity across every authoritative event destination.
+    pub fn eventDeliveryCapacity(self: *Self) usize {
+        if (self.options.event_delivery == .per_stream) {
+            var capacity: usize = 0;
+            var streams = self.stream_event_streams.valueIterator();
+            while (streams.next()) |stream| {
+                capacity = @max(capacity, stream.*.freeSlots());
+            }
+            return if (self.stream_event_streams.count() == 0)
+                @TypeOf(self.event_stream.*).usable_capacity
+            else
+                capacity;
+        }
+
+        var capacity = self.event_stream.freeSlots();
+
+        if (self.options.event_delivery != .global) {
+            var streams = self.stream_event_streams.valueIterator();
+            while (streams.next()) |stream| {
+                capacity = @min(capacity, stream.*.freeSlots());
+            }
+        }
+        return capacity;
+    }
+
+    /// Available capacity for an event belonging to one stream.
+    pub fn eventDeliveryCapacityFor(self: *Self, stream_id: protocol_types.Ulid) usize {
+        var capacity = if (self.options.event_delivery == .per_stream)
+            @TypeOf(self.event_stream.*).usable_capacity
+        else
+            self.event_stream.freeSlots();
+
+        if (self.options.event_delivery != .global) {
+            if (self.stream_event_streams.get(stream_id)) |stream| {
+                capacity = @min(capacity, stream.freeSlots());
+            }
+        }
+        return capacity;
     }
 
     /// Get the global event stream for consuming interleaved events
@@ -901,6 +1001,48 @@ test "processEnvelope routes events to per-stream event stream" {
     }
 }
 
+test "processEnvelope can select global-only event delivery" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{ .event_delivery = .global });
+    defer client.deinit();
+
+    const stream_id = protocol_types.generateUlid();
+    const env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .keepalive = {} } },
+    };
+
+    try client.processEnvelope(env);
+    try std.testing.expect(client.getEventStreamFor(stream_id) == null);
+
+    var event = client.getEventStream().poll().?;
+    defer ai_types.deinitAssistantMessageEvent(allocator, &event);
+    try std.testing.expect(event == .keepalive);
+
+    const result_env = protocol_types.Envelope{
+        .stream_id = stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .result = .{
+            .content = &.{},
+            .api = "test-api",
+            .provider = "test-provider",
+            .model = "test-model",
+            .usage = .{},
+            .stop_reason = .stop,
+            .timestamp = 0,
+        } },
+    };
+    try client.processEnvelope(result_env);
+    try std.testing.expect(client.getEventStreamFor(stream_id) == null);
+    try std.testing.expect(client.isCompleteFor(stream_id));
+}
+
 test "processEnvelope handles ack" {
     const allocator = std.testing.allocator;
 
@@ -954,9 +1096,10 @@ test "processEnvelope handles nack" {
     // Create a nack envelope
     const nack_reason = try allocator.dupe(u8, "Model not found");
     // Note: nack_reason ownership is transferred to envelope, will be freed by env.deinit()
+    const stream_id = protocol_types.generateUlid();
 
     var env = protocol_types.Envelope{
-        .stream_id = protocol_types.generateUlid(),
+        .stream_id = stream_id,
         .message_id = protocol_types.generateUlid(),
         .sequence = 2,
         .timestamp = compat.time.nowMillis(),
@@ -975,8 +1118,42 @@ test "processEnvelope handles nack" {
     // Verify error was stored
     try std.testing.expect(client.getLastError() != null);
     try std.testing.expectEqualStrings("Model not found", client.getLastError().?);
+    try std.testing.expect(client.isComplete());
+    try std.testing.expect(client.getLastErrorFor(stream_id) != null);
+    try std.testing.expectEqualStrings("Model not found", client.getLastErrorFor(stream_id).?);
 
     env.deinit(allocator);
+}
+
+test "processEnvelope attributes unmatched nack to envelope stream" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const current_stream_id = protocol_types.generateUlid();
+    const nack_stream_id = protocol_types.generateUlid();
+    client.current_stream_id = current_stream_id;
+
+    const nack_reason = try allocator.dupe(u8, "Abort rejected");
+    var env = protocol_types.Envelope{
+        .stream_id = nack_stream_id,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .nack = .{
+            .rejected_id = protocol_types.generateUlid(),
+            .reason = OwnedSlice(u8).initOwned(nack_reason),
+            .error_code = .internal_error,
+        } },
+    };
+    defer env.deinit(allocator);
+
+    try client.processEnvelope(env);
+
+    try std.testing.expect(client.getLastErrorFor(nack_stream_id) != null);
+    try std.testing.expectEqualStrings("Abort rejected", client.getLastErrorFor(nack_stream_id).?);
+    try std.testing.expect(client.getLastErrorFor(current_stream_id) == null);
 }
 
 test "processEnvelope handles events" {
@@ -1599,6 +1776,122 @@ test "processEnvelope keeps interleaved terminal state isolated per stream" {
     try std.testing.expectEqualStrings("done-model", got_done.?.model);
 }
 
+test "processEnvelope reconstructs streamed tool calls when terminal result omits them" {
+    const allocator = std.testing.allocator;
+
+    var client = ProtocolClient.init(allocator, .{});
+    defer client.deinit();
+
+    const sid = protocol_types.generateUlid();
+    const start_id = try allocator.dupe(u8, "call_shell");
+    const start_name = try allocator.dupe(u8, "shell_execute");
+    const delta_json = try allocator.dupe(u8, "{\"command\":\"ls -al\"}");
+    const end_id = try allocator.dupe(u8, "call_shell");
+    const end_name = try allocator.dupe(u8, "shell_execute");
+    const end_args = try allocator.dupe(u8, "{\"command\":\"ls -al\"}");
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 0);
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "openai-responses",
+        .provider = "openai",
+        .model = "gpt-test",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 10,
+    };
+
+    var env_start = protocol_types.Envelope{
+        .stream_id = sid,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .start = .{ .partial = partial } } },
+    };
+    defer env_start.deinit(allocator);
+
+    var env_tool_start = protocol_types.Envelope{
+        .stream_id = sid,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .toolcall_start = .{
+            .content_index = 0,
+            .id = start_id,
+            .name = start_name,
+            .partial = partial,
+        } } },
+    };
+    defer env_tool_start.deinit(allocator);
+
+    var env_tool_delta = protocol_types.Envelope{
+        .stream_id = sid,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 3,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .toolcall_delta = .{
+            .content_index = 0,
+            .delta = delta_json,
+            .partial = partial,
+        } } },
+    };
+    defer env_tool_delta.deinit(allocator);
+
+    var env_tool_end = protocol_types.Envelope{
+        .stream_id = sid,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 4,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .event = .{ .toolcall_end = .{
+            .content_index = 0,
+            .tool_call = .{
+                .id = end_id,
+                .name = end_name,
+                .arguments_json = end_args,
+            },
+            .partial = partial,
+        } } },
+    };
+    defer env_tool_end.deinit(allocator);
+
+    const result_api = try allocator.dupe(u8, "openai-responses");
+    const result_provider = try allocator.dupe(u8, "openai");
+    const result_model = try allocator.dupe(u8, "gpt-test");
+    var env_result = protocol_types.Envelope{
+        .stream_id = sid,
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 5,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .result = .{
+            .content = result_content,
+            .api = result_api,
+            .provider = result_provider,
+            .model = result_model,
+            .usage = .{ .input = 11, .output = 7, .cost = .{ .input = 0.011, .output = 0.014, .total = 0.025 } },
+            .stop_reason = .stop,
+            .timestamp = 20,
+            .is_owned = true,
+        } },
+    };
+    defer env_result.deinit(allocator);
+
+    try client.processEnvelope(env_start);
+    try client.processEnvelope(env_tool_start);
+    try client.processEnvelope(env_tool_delta);
+    try client.processEnvelope(env_tool_end);
+    try client.processEnvelope(env_result);
+
+    const got = (try client.waitResultFor(sid, 1000)).?;
+    try std.testing.expectEqual(ai_types.StopReason.tool_use, got.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), got.content.len);
+    try std.testing.expect(got.content[0] == .tool_call);
+    try std.testing.expectEqualStrings("call_shell", got.content[0].tool_call.id);
+    try std.testing.expectEqualStrings("shell_execute", got.content[0].tool_call.name);
+    try std.testing.expectEqualStrings("{\"command\":\"ls -al\"}", got.content[0].tool_call.arguments_json);
+    try std.testing.expectEqual(@as(u64, 11), got.usage.input);
+    try std.testing.expectEqual(@as(u64, 7), got.usage.output);
+    try std.testing.expectEqual(@as(f64, 0.025), got.usage.cost.total);
+}
+
 test "sendStreamRequest without sender returns error" {
     const allocator = std.testing.allocator;
 
@@ -1695,7 +1988,7 @@ test "receiveLoopWithRetry processes envelopes with retry on transient errors" {
         }
     };
 
-    const items = [_][]const u8{ env_json };
+    const items = [_][]const u8{env_json};
     var mock = MockReceiver{
         .items = &items,
         .remaining_failures = 2,

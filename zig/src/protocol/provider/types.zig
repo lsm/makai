@@ -118,6 +118,11 @@ pub fn generateUlid() Ulid {
 /// Convert ULID to Crockford Base32 string representation (26 chars).
 pub fn ulidToString(ulid: Ulid, allocator: std.mem.Allocator) ![]const u8 {
     const result = try allocator.alloc(u8, 26);
+    return ulidToBuffer(ulid, @ptrCast(result.ptr));
+}
+
+/// Convert ULID to Crockford Base32 in caller-provided storage.
+pub fn ulidToBuffer(ulid: Ulid, result: *[26]u8) []const u8 {
     for (result, 0..) |*out, i| {
         var value: u5 = 0;
         for (0..5) |j| {
@@ -522,6 +527,9 @@ test "ulidToString and parseUlid roundtrip" {
     const known_str = try ulidToString(known_ulid, std.testing.allocator);
     defer std.testing.allocator.free(known_str);
     try std.testing.expectEqualStrings("014D2PF2DBSQQZXQ5TK1V58CGG", known_str);
+
+    var known_buffer: [26]u8 = undefined;
+    try std.testing.expectEqualStrings(known_str, ulidToBuffer(known_ulid, &known_buffer));
 
     const parsed_known = parseUlid(known_str);
     try std.testing.expect(parsed_known != null);

@@ -4,6 +4,7 @@ const auth_providers = @import("auth/providers");
 const auth_types = @import("auth_types");
 const anthropic_oauth = @import("oauth/anthropic");
 const github_oauth = @import("oauth/github_copilot");
+const codex_oauth = @import("oauth/openai_codex");
 const oauth_storage = @import("oauth/storage");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
@@ -77,6 +78,7 @@ pub const AuthProtocolServer = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        const allocator = self.allocator;
         self.mutex.lockUncancelable(defaultIo());
 
         var flow_iter = self.flows.iterator();
@@ -89,11 +91,11 @@ pub const AuthProtocolServer = struct {
         }
 
         var join_list = std.ArrayList(*FlowState).empty;
-        defer join_list.deinit(self.allocator);
+        defer join_list.deinit(allocator);
 
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
-            join_list.append(self.allocator, entry.value_ptr.*) catch {};
+            join_list.append(allocator, entry.value_ptr.*) catch {};
         }
 
         self.mutex.unlock(defaultIo());
@@ -110,8 +112,8 @@ pub const AuthProtocolServer = struct {
         flow_iter = self.flows.iterator();
         while (flow_iter.next()) |entry| {
             const flow = entry.value_ptr.*;
-            flow.deinit(self.allocator);
-            self.allocator.destroy(flow);
+            flow.deinit(allocator);
+            allocator.destroy(flow);
         }
 
         self.flows.deinit();
@@ -119,9 +121,9 @@ pub const AuthProtocolServer = struct {
         self.outgoing_sequences.deinit();
 
         for (self.outbox.items) |*env| {
-            env.deinit(self.allocator);
+            env.deinit(allocator);
         }
-        self.outbox.deinit(self.allocator);
+        self.outbox.deinit(allocator);
 
         self.mutex.unlock(defaultIo());
         self.* = undefined;
@@ -396,7 +398,7 @@ pub const AuthProtocolServer = struct {
             self.allocator.free(providers);
         }
 
-        var storage = oauth_storage.AuthStorage.loadFromFile(self.allocator) catch null;
+        var storage = oauth_storage.AuthStorage.loadDefault(self.allocator) catch null;
         defer if (storage) |*auth_storage| auth_storage.deinit();
 
         const now_ms = compat.time.nowMillis();
@@ -547,6 +549,10 @@ pub const AuthProtocolServer = struct {
             return try self.loginGitHubCopilot(flow);
         }
 
+        if (std.mem.eql(u8, flow.provider_id, "openai-codex")) {
+            return try self.loginOpenAICodex(flow);
+        }
+
         return error.UnknownProvider;
     }
 
@@ -612,6 +618,27 @@ pub const AuthProtocolServer = struct {
         if (credentials.base_url) |base_url| {
             self.allocator.free(base_url);
         }
+
+        return .{
+            .refresh = credentials.refresh,
+            .access = credentials.access,
+            .expires = credentials.expires,
+            .provider_data = credentials.provider_data,
+        };
+    }
+
+    fn loginOpenAICodex(self: *Self, flow: *FlowState) !oauth_storage.Credentials {
+        var context = OAuthThreadContext{
+            .server = self,
+            .flow = flow,
+        };
+        g_oauth_thread_context = &context;
+        defer g_oauth_thread_context = null;
+
+        const credentials = try codex_oauth.login(.{
+            .onAuth = codexOnAuth,
+            .onPrompt = codexOnPrompt,
+        }, self.allocator);
 
         return .{
             .refresh = credentials.refresh,
@@ -863,8 +890,18 @@ fn githubOnPrompt(prompt: github_oauth.Prompt) []const u8 {
     return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch emptyPromptAnswer(context.server.allocator);
 }
 
+fn codexOnAuth(info: codex_oauth.AuthInfo) void {
+    const context = g_oauth_thread_context orelse return;
+    context.server.emitAuthUrl(context.flow, info.url, info.instructions) catch {};
+}
+
+fn codexOnPrompt(prompt: codex_oauth.Prompt) []const u8 {
+    const context = g_oauth_thread_context orelse @panic("missing oauth context");
+    return context.server.promptForAnswer(context.flow, prompt.message, prompt.allow_empty) catch emptyPromptAnswer(context.server.allocator);
+}
+
 fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Credentials, allocator: std.mem.Allocator) !void {
-    var storage = try oauth_storage.AuthStorage.loadFromFile(allocator);
+    var storage = try oauth_storage.AuthStorage.loadDefault(allocator);
     defer storage.deinit();
 
     if (storage.providers.fetchRemove(provider_id)) |existing| {
@@ -881,7 +918,7 @@ fn saveOAuthCredentials(provider_id: []const u8, credentials: oauth_storage.Cred
             .provider_data = credentials.provider_data,
         },
     });
-    try storage.saveToFile();
+    try storage.persist();
 }
 
 test "AuthProtocolServer type is available" {

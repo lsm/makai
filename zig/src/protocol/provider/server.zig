@@ -255,7 +255,7 @@ pub const ProtocolServer = struct {
 
     fn defaultLoadAuthStorage(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
         _ = ctx;
-        return oauth_storage.AuthStorage.loadFromFile(allocator);
+        return oauth_storage.AuthStorage.loadDefault(allocator);
     }
 
     pub const Options = struct {
@@ -555,14 +555,17 @@ fn deinitInjectedApiKey(allocator: std.mem.Allocator, injected: *ai_types.Stream
     injected.api_key = ai_types.OwnedSlice(u8).initBorrowed("");
 }
 
-/// Merge a server-side CancelToken into the caller's StreamOptions.
-/// Preserves any existing fields; only sets cancel_token.
-fn injectCancelToken(
+/// Merge server-side options into the caller's StreamOptions.
+/// Preserves all existing fields; only sets cancel_token and marks the stream
+/// as requiring owned events so the producer thread can exit while the protocol
+/// runtime is still forwarding unconsumed events.
+fn injectServerOptions(
     options: ?ai_types.StreamOptions,
     cancel_token: ai_types.CancelToken,
 ) ai_types.StreamOptions {
     var resolved = options orelse ai_types.StreamOptions{};
     resolved.cancel_token = cancel_token;
+    resolved.requires_owned_stream_events = true;
     return resolved;
 }
 
@@ -586,8 +589,20 @@ fn streamWithResolvedKey(
     context: ai_types.Context,
     options: ?ai_types.StreamOptions,
 ) !*event_stream.AssistantMessageEventStream {
-    const resolved = auth_resolver.resolveApiKey(server.allocator, server.options.auth_storage, provider_id, null) catch |err| switch (err) {
-        error.AuthRequired => return error.AuthRequired,
+    var loaded_storage: ?oauth_storage.AuthStorage = null;
+    defer if (loaded_storage) |*storage| storage.deinit();
+
+    const storage = if (server.options.auth_storage) |auth_storage|
+        auth_storage
+    else
+        blk: {
+            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
+                break :blk null;
+            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+        };
+
+    const resolved = auth_resolver.resolveApiKey(server.allocator, storage, provider_id, null) catch |err| switch (err) {
+        error.AuthRequired => return provider.stream(model, context, options, server.allocator),
         error.OutOfMemory => return error.OutOfMemory,
     };
     var resolved_options = try injectApiKey(server.allocator, options, resolved.api_key);
@@ -652,6 +667,15 @@ fn streamWithRefresh(
         if (opts.getApiKey() != null) return provider.stream(model, context, options, server.allocator);
     }
 
+    // API handlers may advertise a vendor credential source (for example,
+    // Anthropic Messages). Do not use that source for a differently named
+    // model provider: a global/custom endpoint must receive an explicit key
+    // instead of an ambient vendor credential.
+    if (provider.auth_provider_id) |auth_provider_id| {
+        const is_vendor_oauth = std.mem.eql(u8, auth_provider_id, "anthropic") or
+            std.mem.eql(u8, auth_provider_id, "openai-codex");
+        if (is_vendor_oauth and !std.mem.eql(u8, model.provider, auth_provider_id)) return error.AuthRequired;
+    }
     const provider_id = provider.auth_provider_id orelse model.provider;
     const oauth_provider = authProvider(provider) orelse
         return streamWithResolvedKey(server, provider, provider_id, model, context, options);
@@ -789,7 +813,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     const cancel_token = ai_types.CancelToken{ .cancelled = cancelled };
 
     // Inject cancel token into options so the provider can observe it.
-    const options_with_cancel = injectCancelToken(request.options, cancel_token);
+    const options_with_cancel = injectServerOptions(request.options, cancel_token);
 
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
     const stream = streamWithRefresh(server, provider, request.model, request.context, options_with_cancel) catch |err| {
@@ -802,7 +826,29 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
         );
     };
     // Provider streams are produced by background threads; wait for producer completion
-    // before deinit/destroy during abort and cleanup paths.
+    // before deinit/destroy during abort and cleanup paths. Providers must honor
+    // `requires_owned_stream_events` in their stream init by setting owns_events and
+    // clone_event_fn before spawning the producer, so no post-creation mutation is
+    // needed here. Extension providers are validated at the protocol boundary so
+    // borrowed events cannot outlive producer-owned temporary buffers while the
+    // server forwards queued events.
+    if (!stream.owns_events) {
+        // Extension providers must return owned events so the server can forward
+        // queued events after the producer thread exits. Cancel the in-flight
+        // producer and wait for it to finish before freeing the stream, otherwise
+        // a background thread could still be writing to the freed ring buffer.
+        cancelled.store(true, .release);
+        stream.wait_for_thread_on_deinit = true;
+        stream.deinit();
+        server.allocator.destroy(stream);
+        server.allocator.destroy(cancelled);
+        return try envelope.createNack(
+            nackTemplate(stream_id, in_reply_to),
+            "Provider returned borrowed events for protocol streaming",
+            .provider_error,
+            server.allocator,
+        );
+    }
     stream.wait_for_thread_on_deinit = true;
 
     // Create ActiveStream entry
@@ -970,10 +1016,28 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
             server.allocator,
         );
     };
+    // The stream is ephemeral to this request (never registered in
+    // active_streams), so free it once the response has been built. Deferred
+    // cleanup runs after the return expression, by which point the result has
+    // been deep-cloned and the error message copied out of stream storage.
+    defer {
+        stream.deinit();
+        server.allocator.destroy(stream);
+    }
 
-    // Wait for stream to complete (with timeout)
+    // Wait for the producer to finish and publish its terminal state. Some
+    // providers mark their thread done immediately before the final
+    // complete()/completeWithError() call, while others complete first and
+    // mark done from a defer, so gate on both signals: once the thread is
+    // done AND the stream is completed, the producer no longer touches the
+    // stream, making the deferred cleanup below race-free (and its internal
+    // thread wait returns immediately). When the producer stalls past the
+    // configured timeout, skip the completion wait so the timeout NACK is
+    // not delayed by a second full timeout window.
     const timeout_ms = server.options.stream_timeout_ms;
-    _ = stream.waitForThread(timeout_ms);
+    if (stream.waitForThread(timeout_ms)) {
+        _ = stream.waitForCompletion(timeout_ms);
+    }
 
     // Get result
     if (stream.getResult()) |result| {
@@ -1322,6 +1386,8 @@ fn mockStream(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -1350,6 +1416,8 @@ fn mockStreamSimple(
     _ = options;
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     const result = ai_types.AssistantMessage{
         .content = &.{},
@@ -1453,6 +1521,8 @@ fn authTestStream(
     }
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     if (state.auth_fail_all_calls or (state.auth_fail_first_call and state.stream_calls == 1)) {
         s.completeWithError("401 unauthorized");
     } else {
@@ -2660,6 +2730,8 @@ fn cancelCapturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
 
     // Complete immediately for tests
     const result = ai_types.AssistantMessage{
@@ -2758,6 +2830,8 @@ fn cancelCapturingStreamSimple(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     s.complete(.{
         .content = &.{},
         .api = "test-api",
@@ -3066,6 +3140,8 @@ fn capturingStream(
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
     const result = ai_types.AssistantMessage{
         .content = &.{},
         .api = "test-api",
@@ -3204,7 +3280,7 @@ test "credential resolution: missing api_key loads credentials from storage by p
     try std.testing.expectEqualStrings("sk-from-storage", CapturedCreds.captured_key.?);
 }
 
-test "credential resolution: missing api_key and missing storage entry returns auth_required nack" {
+test "credential resolution: missing api_key and missing storage entry falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3253,16 +3329,13 @@ test "credential resolution: missing api_key and missing storage entry returns a
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
-    // Server must NOT have created a stream when auth fails.
+    try std.testing.expect(response.?.payload == .ack);
+    try std.testing.expectEqual(@as(usize, 1), server.activeStreamCount());
+    server.cleanupCompletedStreams();
     try std.testing.expectEqual(@as(usize, 0), server.activeStreamCount());
 }
 
-test "credential resolution: complete_request without credentials returns auth_required nack" {
+test "credential resolution: complete_request without credentials falls back to provider" {
     var registry = api_registry.ApiRegistry.init(std.testing.allocator);
     defer registry.deinit();
 
@@ -3304,11 +3377,7 @@ test "credential resolution: complete_request without credentials returns auth_r
     defer if (response) |*r| r.deinit(std.testing.allocator);
 
     try std.testing.expect(response != null);
-    try std.testing.expect(response.?.payload == .nack);
-    try std.testing.expectEqual(
-        protocol_types.ErrorCode.auth_required,
-        response.?.payload.nack.error_code.?,
-    );
+    try std.testing.expect(response.?.payload == .result);
 }
 
 // ===========================================================================

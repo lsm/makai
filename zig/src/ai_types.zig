@@ -129,6 +129,10 @@ pub const StreamOptions = struct {
     ping_interval_ms: ?u64 = null,
     /// Owned storage for headers when deserialized/cloned.
     owned_headers: ?OwnedSlice(HeaderPair) = null,
+    /// When true, the provider should configure its returned stream to own deep
+    /// copies of every event. The protocol server sets this because the consumer
+    /// may outlive the producer thread, so borrowed slices would dangle.
+    requires_owned_stream_events: bool = false,
 
     pub fn getApiKey(self: *const StreamOptions) ?[]const u8 {
         const key = self.api_key.slice();
@@ -296,6 +300,44 @@ pub const UserMessage = struct {
     }
 };
 
+/// Reference to raw data stored outside the model transcript.
+pub const ArtifactReference = struct {
+    artifact_id: []const u8,
+    uri: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    mime_type: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    byte_size: ?u64 = null,
+    sha256: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    description: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+
+    pub fn getUri(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.uri.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getMimeType(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.mime_type.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getSha256(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.sha256.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn getDescription(self: *const ArtifactReference) ?[]const u8 {
+        const value = self.description.slice();
+        return if (value.len > 0) value else null;
+    }
+
+    pub fn deinit(self: *ArtifactReference, allocator: std.mem.Allocator) void {
+        allocator.free(self.artifact_id);
+        self.uri.deinit(allocator);
+        self.mime_type.deinit(allocator);
+        self.sha256.deinit(allocator);
+        self.description.deinit(allocator);
+    }
+};
+
 pub const AssistantMessage = struct {
     content: []const AssistantContent,
     api: []const u8,
@@ -385,6 +427,7 @@ pub const ToolResultMessage = struct {
     tool_name: []const u8,
     content: []const UserContentPart,
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
     is_error: bool,
     timestamp: i64,
 
@@ -404,6 +447,7 @@ pub const ToolResultMessage = struct {
         }
         allocator.free(self.content);
         self.details_json.deinit(allocator);
+        self.artifacts.deinit(allocator);
     }
 };
 
@@ -421,7 +465,149 @@ pub const Message = union(enum) {
             .tool_result => |*msg| msg.deinit(allocator),
         }
     }
+
+    pub fn timestamp(self: Message) i64 {
+        return switch (self) {
+            .user => |m| m.timestamp,
+            .assistant => |m| m.timestamp,
+            .tool_result => |m| m.timestamp,
+        };
+    }
 };
+
+pub const CompactMessagesResult = struct {
+    before: usize,
+    after: usize,
+};
+
+const compact_keep_recent_messages = 8;
+const compact_max_message_chars = 800;
+const compact_max_summary_chars = 12 * 1024;
+
+/// Replace older history with one bounded synthetic summary message while
+/// preserving the most recent messages verbatim.
+pub fn compactMessageHistory(allocator: std.mem.Allocator, messages: *std.ArrayList(Message)) !CompactMessagesResult {
+    const before = messages.items.len;
+    if (before <= compact_keep_recent_messages + 1) return .{ .before = before, .after = before };
+
+    const keep_start = before - compact_keep_recent_messages;
+    const summary_text = try buildCompactSummary(allocator, messages.items[0..keep_start]);
+    var summary_transferred = false;
+    errdefer if (!summary_transferred) allocator.free(summary_text);
+
+    var next = std.ArrayList(Message).empty;
+    errdefer {
+        for (next.items) |*msg| msg.deinit(allocator);
+        next.deinit(allocator);
+    }
+
+    try next.append(allocator, .{ .user = .{
+        .content = .{ .text = summary_text },
+        .timestamp = messages.items[keep_start - 1].timestamp(),
+    } });
+    summary_transferred = true;
+
+    for (messages.items[keep_start..]) |msg| {
+        try next.append(allocator, try cloneMessage(allocator, msg));
+    }
+
+    for (messages.items) |*msg| msg.deinit(allocator);
+    messages.clearRetainingCapacity();
+    try messages.appendSlice(allocator, next.items);
+    next.clearRetainingCapacity();
+    next.deinit(allocator);
+
+    return .{ .before = before, .after = messages.items.len };
+}
+
+fn buildCompactSummary(allocator: std.mem.Allocator, messages: []const Message) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "Previous conversation context was compacted. Summary of older messages:\n");
+    for (messages) |msg| {
+        if (out.items.len >= compact_max_summary_chars) {
+            try out.appendSlice(allocator, "\n[summary truncated]\n");
+            break;
+        }
+        try appendMessageSummary(allocator, &out, msg);
+    }
+
+    return try out.toOwnedSlice(allocator);
+}
+
+fn appendMessageSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), msg: Message) !void {
+    switch (msg) {
+        .user => |m| {
+            try out.appendSlice(allocator, "- User: ");
+            try appendUserContentSummary(allocator, out, m.content);
+        },
+        .assistant => |m| {
+            try out.appendSlice(allocator, "- Assistant: ");
+            try appendAssistantContentSummary(allocator, out, m.content);
+        },
+        .tool_result => |m| {
+            try appendFmt(allocator, out, "- Tool result ({s}{s}): ", .{ m.tool_name, if (m.is_error) ", error" else "" });
+            try appendUserContentPartsSummary(allocator, out, m.content);
+        },
+    }
+    try out.append(allocator, '\n');
+}
+
+fn appendUserContentSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), content: UserContent) !void {
+    switch (content) {
+        .text => |text| try appendBoundedText(allocator, out, text),
+        .parts => |parts| try appendUserContentPartsSummary(allocator, out, parts),
+    }
+}
+
+fn appendUserContentPartsSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), parts: []const UserContentPart) !void {
+    var wrote = false;
+    for (parts) |part| {
+        if (wrote) try out.appendSlice(allocator, " ");
+        switch (part) {
+            .text => |text| try appendBoundedText(allocator, out, text.text),
+            .image => |image| try appendFmt(allocator, out, "[image {s}, {d} bytes]", .{ image.mime_type, image.data.len }),
+        }
+        wrote = true;
+    }
+    if (!wrote) try out.appendSlice(allocator, "[empty]");
+}
+
+fn appendAssistantContentSummary(allocator: std.mem.Allocator, out: *std.ArrayList(u8), content: []const AssistantContent) !void {
+    var wrote = false;
+    for (content) |block| {
+        if (wrote) try out.appendSlice(allocator, " ");
+        switch (block) {
+            .text => |text| try appendBoundedText(allocator, out, text.text),
+            .thinking => |thinking| {
+                try out.appendSlice(allocator, "[thinking] ");
+                try appendBoundedText(allocator, out, thinking.thinking);
+            },
+            .tool_call => |tool_call| try appendFmt(allocator, out, "[tool call {s} args={s}]", .{ tool_call.name, boundedSlice(tool_call.arguments_json) }),
+            .image => |image| try appendFmt(allocator, out, "[image {s}, {d} bytes]", .{ image.mime_type, image.data.len }),
+        }
+        wrote = true;
+    }
+    if (!wrote) try out.appendSlice(allocator, "[empty]");
+}
+
+fn appendBoundedText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), text: []const u8) !void {
+    const slice = boundedSlice(text);
+    try out.appendSlice(allocator, slice);
+    if (slice.len < text.len) try out.appendSlice(allocator, "...");
+}
+
+fn appendFmt(allocator: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const text = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(text);
+    try out.appendSlice(allocator, text);
+}
+
+fn boundedSlice(text: []const u8) []const u8 {
+    if (text.len <= compact_max_message_chars) return text;
+    return text[0..compact_max_message_chars];
+}
 
 pub const Tool = struct {
     name: []const u8,
@@ -503,6 +689,8 @@ pub const OpenAICompatOptions = struct {
     thinking_format: enum { openai, zai, qwen } = .openai,
     /// Whether the provider supports the `strict` field in tool definitions
     supports_strict_mode: ?bool = true,
+    /// Whether an Anthropic-compatible endpoint supports one-hour prompt caching
+    supports_anthropic_cache_ttl: ?bool = null,
 };
 
 pub const RoutingPreferences = struct {
@@ -911,6 +1099,12 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
         OwnedSlice(u8).initBorrowed("");
     errdefer details_json.deinit(allocator);
 
+    const cloned_artifacts = try cloneArtifactReferences(allocator, tr.artifacts.slice());
+    errdefer {
+        var artifacts = OwnedSlice(ArtifactReference).initOwned(cloned_artifacts);
+        artifacts.deinit(allocator);
+    }
+
     const tool_call_id = try allocator.dupe(u8, tr.tool_call_id);
     errdefer allocator.free(tool_call_id);
     const tool_name = try allocator.dupe(u8, tr.tool_name);
@@ -921,8 +1115,75 @@ fn cloneToolResultMessage(allocator: std.mem.Allocator, tr: ToolResultMessage) !
         .tool_name = tool_name,
         .content = cloned_content,
         .details_json = details_json,
+        .artifacts = OwnedSlice(ArtifactReference).initOwned(cloned_artifacts),
         .is_error = tr.is_error,
         .timestamp = tr.timestamp,
+    };
+}
+
+fn cloneArtifactReferences(allocator: std.mem.Allocator, artifacts: []const ArtifactReference) ![]ArtifactReference {
+    const cloned = try allocator.alloc(ArtifactReference, artifacts.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (cloned[0..initialized]) |*artifact| artifact.deinit(allocator);
+        allocator.free(cloned);
+    }
+
+    for (artifacts, 0..) |artifact, i| {
+        cloned[i] = try cloneArtifactReference(allocator, artifact);
+        initialized += 1;
+    }
+
+    return cloned;
+}
+
+fn cloneArtifactReference(allocator: std.mem.Allocator, artifact: ArtifactReference) !ArtifactReference {
+    const artifact_id = try allocator.dupe(u8, artifact.artifact_id);
+    errdefer allocator.free(artifact_id);
+
+    const uri = if (artifact.getUri()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = uri;
+        mutable.deinit(allocator);
+    }
+
+    const mime_type = if (artifact.getMimeType()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = mime_type;
+        mutable.deinit(allocator);
+    }
+
+    const sha256 = if (artifact.getSha256()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = sha256;
+        mutable.deinit(allocator);
+    }
+
+    const description = if (artifact.getDescription()) |value|
+        OwnedSlice(u8).initOwned(try allocator.dupe(u8, value))
+    else
+        OwnedSlice(u8).initBorrowed("");
+    errdefer {
+        var mutable = description;
+        mutable.deinit(allocator);
+    }
+
+    return .{
+        .artifact_id = artifact_id,
+        .uri = uri,
+        .mime_type = mime_type,
+        .byte_size = artifact.byte_size,
+        .sha256 = sha256,
+        .description = description,
     };
 }
 
@@ -1097,6 +1358,33 @@ test "ToolResultMessage details_json uses OwnedSlice and deep clones" {
     try std.testing.expectEqualStrings("{\"k\":1}", msg.getDetailsJson().?);
     try std.testing.expectEqualStrings("{\"k\":1}", cloned.getDetailsJson().?);
     try std.testing.expect(@intFromPtr(msg.details_json.slice().ptr) != @intFromPtr(cloned.details_json.slice().ptr));
+}
+
+test "compactMessageHistory summarizes older messages and keeps recent messages" {
+    var messages = std.ArrayList(Message).empty;
+    defer {
+        for (messages.items) |*msg| msg.deinit(std.testing.allocator);
+        messages.deinit(std.testing.allocator);
+    }
+
+    for (0..12) |i| {
+        const text = try std.fmt.allocPrint(std.testing.allocator, "message {d}", .{i});
+        errdefer std.testing.allocator.free(text);
+        try messages.append(std.testing.allocator, .{ .user = .{
+            .content = .{ .text = text },
+            .timestamp = @intCast(i),
+        } });
+    }
+
+    const result = try compactMessageHistory(std.testing.allocator, &messages);
+
+    try std.testing.expectEqual(@as(usize, 12), result.before);
+    try std.testing.expectEqual(@as(usize, 9), result.after);
+    try std.testing.expectEqual(@as(usize, 9), messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].user.content.text, "Previous conversation context was compacted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].user.content.text, "message 3") != null);
+    try std.testing.expectEqualStrings("message 4", messages.items[1].user.content.text);
+    try std.testing.expectEqualStrings("message 11", messages.items[8].user.content.text);
 }
 
 test "AssistantMessageEventStream deinit drains unpolled events" {

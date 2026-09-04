@@ -1,7 +1,11 @@
 .{
     .name = .makai,
     .version = "0.1.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zigzag = .{
+            .path = "zig/vendor/zigzag",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

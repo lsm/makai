@@ -38,13 +38,13 @@ export function bestEffortCancelStream(transport: MakaiStdioClient, streamId: st
  * Sends an `agent_stop` envelope for the given session, swallowing any
  * transport errors so the original abort error propagates cleanly.
  */
-export function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: string): void {
+export function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: string, sequence = 2): void {
   try {
     transport.send({
       type: "agent_stop",
       session_id: sessionId,
       message_id: ulid(),
-      sequence: 999,
+      sequence,
       timestamp: Date.now(),
       version: ENVELOPE_VERSION,
       payload: { session_id: sessionId, reason: "client aborted" },

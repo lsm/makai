@@ -348,9 +348,9 @@ fn runThread(ctx: *ThreadCtx) void {
         };
         if (n == 0) break;
 
-        const events = parser.feed(read_buf[0..n]) catch {
+        const events = parser.feed(read_buf[0..n]) catch |err| {
             ctx.stream.markThreadDone();
-            ctx.stream.completeWithError("parse failed");
+            ctx.stream.completeWithError(sse_parser.errorMessage(err));
             return;
         };
 
@@ -406,6 +406,10 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
 
     const api_key: []u8 = blk: {
         if (o.getApiKey()) |k| break :blk try allocator.dupe(u8, k);
+        // Read the vendor env key only for the canonical provider so a
+        // custom or routed base URL (MAKAI_BASE_URL) cannot receive an
+        // AZURE_OPENAI_API_KEY meant for Azure's own endpoint.
+        if (!std.mem.eql(u8, model.provider, "azure")) return error.MissingApiKey;
         const e = env(allocator, "AZURE_OPENAI_API_KEY");
         if (e) |k| break :blk @constCast(k);
         return error.MissingApiKey;
@@ -443,6 +447,10 @@ pub fn streamAzureOpenAIResponses(model: ai_types.Model, context: ai_types.Conte
     errdefer allocator.destroy(s);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
     s.wait_for_thread_on_deinit = true;
+    if (o.requires_owned_stream_events) {
+        s.owns_events = true;
+        s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    }
 
     const ctx = try allocator.create(ThreadCtx);
     errdefer allocator.destroy(ctx);

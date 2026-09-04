@@ -3,8 +3,10 @@ const compat = @import("compat");
 const ai_types = @import("ai_types");
 const event_stream = @import("event_stream");
 const owned_slice_mod = @import("owned_slice");
+pub const permission = @import("permission");
 
 pub const OwnedSlice = owned_slice_mod.OwnedSlice;
+pub const ArtifactReference = ai_types.ArtifactReference;
 
 // ============================================================================
 // Agent Event Types
@@ -42,11 +44,50 @@ pub const MessageStartPayload = struct {
 pub const MessageUpdatePayload = struct {
     message: ai_types.AssistantMessage,
     event: ai_types.AssistantMessageEvent,
+    owns_event: bool = false,
+
+    pub fn deinit(self: *MessageUpdatePayload, allocator: std.mem.Allocator) void {
+        if (self.owns_event) {
+            ai_types.deinitAssistantMessageEvent(allocator, &self.event);
+            self.owns_event = false;
+        }
+    }
 };
 
 /// Payload for message_end event
 pub const MessageEndPayload = struct {
     message: ai_types.Message,
+};
+
+/// Aggregate byte/token pressure for one provider request context.
+pub const ContextUsagePayload = struct {
+    system_prompt_bytes: u64 = 0,
+    message_bytes: u64 = 0,
+    tool_definition_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    message_count: u32 = 0,
+    tool_count: u32 = 0,
+};
+
+pub const PromptSegmentKind = enum {
+    system_prompt,
+    message_history,
+    tool_definitions,
+};
+
+pub const PromptSegmentCacheRole = enum {
+    stable,
+    dynamic,
+};
+
+/// Cache-aware prompt segment accounting for TUI context-pressure views.
+pub const PromptSegmentUsagePayload = struct {
+    segment: PromptSegmentKind,
+    cache_role: PromptSegmentCacheRole,
+    bytes: u64 = 0,
+    estimated_tokens: u64 = 0,
+    item_count: u32 = 0,
 };
 
 /// Payload for tool_execution_start event
@@ -69,7 +110,18 @@ pub const ToolExecutionEndPayload = struct {
     tool_call_id: []const u8,
     tool_name: []const u8,
     result_json: []const u8,
+    content_json: []const u8 = "",
     is_error: bool,
+    args_bytes: u64 = 0,
+    raw_result_bytes: u64 = 0,
+    returned_result_bytes: u64 = 0,
+    raw_details_bytes: u64 = 0,
+    returned_details_bytes: u64 = 0,
+    raw_total_bytes: u64 = 0,
+    returned_total_bytes: u64 = 0,
+    estimated_returned_tokens: u64 = 0,
+    artifact_count: u32 = 0,
+    artifacts: []const ArtifactReference = &.{},
 };
 
 /// Agent event types emitted during execution
@@ -86,11 +138,21 @@ pub const AgentEvent = union(enum) {
     message_start: MessageStartPayload,
     message_update: MessageUpdatePayload,
     message_end: MessageEndPayload,
+    context_usage: ContextUsagePayload,
+    prompt_segment_usage: PromptSegmentUsagePayload,
 
     // Tool execution lifecycle
     tool_execution_start: ToolExecutionStartPayload,
     tool_execution_update: ToolExecutionUpdatePayload,
     tool_execution_end: ToolExecutionEndPayload,
+
+    pub fn deinit(self: *AgentEvent, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .message_update => |*payload| payload.deinit(allocator),
+            else => {},
+        }
+        self.* = undefined;
+    }
 };
 
 // ============================================================================
@@ -101,6 +163,8 @@ pub const AgentEvent = union(enum) {
 pub const AgentToolResult = struct {
     content: OwnedSlice(ai_types.UserContentPart) = OwnedSlice(ai_types.UserContentPart).initBorrowed(&.{}),
     details_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
+    artifacts: OwnedSlice(ArtifactReference) = OwnedSlice(ArtifactReference).initBorrowed(&.{}),
+    is_error: bool = false,
 
     pub fn getDetailsJson(self: *const AgentToolResult) ?[]const u8 {
         const details = self.details_json.slice();
@@ -110,6 +174,7 @@ pub const AgentToolResult = struct {
     pub fn deinit(self: *AgentToolResult, allocator: std.mem.Allocator) void {
         self.content.deinit(allocator);
         self.details_json.deinit(allocator);
+        self.artifacts.deinit(allocator);
     }
 };
 
@@ -121,7 +186,7 @@ pub const ToolUpdateCallback = *const fn (
     partial_result_json: []const u8,
 ) void;
 
-/// Tool execution function signature
+/// Tool execution function signature used by local tool runtimes behind ToolProtocolServer.
 pub const ToolExecuteFn = *const fn (
     tool_call_id: []const u8,
     args_json: []const u8,
@@ -131,7 +196,18 @@ pub const ToolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
-/// Tool execution via remote protocol path
+/// Context-aware runtime function used only inside ToolProtocolServer.
+pub const ToolRuntimeExecuteFn = *const fn (
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult;
+
+/// Single tool protocol dispatch path used by the agent loop.
 pub const ToolProtocolExecuteFn = *const fn (
     ctx: ?*anyopaque,
     tool_call_id: []const u8,
@@ -143,20 +219,91 @@ pub const ToolProtocolExecuteFn = *const fn (
     allocator: std.mem.Allocator,
 ) anyerror!AgentToolResult;
 
+fn defaultToolProtocolExecute(
+    ctx: ?*anyopaque,
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    cancel_token: ?ai_types.CancelToken,
+    on_update_ctx: ?*anyopaque,
+    on_update: ?ToolUpdateCallback,
+    allocator: std.mem.Allocator,
+) anyerror!AgentToolResult {
+    _ = ctx;
+    _ = tool_call_id;
+    _ = tool_name;
+    _ = args_json;
+    _ = cancel_token;
+    _ = on_update_ctx;
+    _ = on_update;
+    _ = allocator;
+    return error.ToolProtocolNotConfigured;
+}
+
+pub const ToolOutputMiddlewareInput = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+    is_error: bool,
+    raw_result_bytes: u64,
+    raw_details_bytes: u64,
+    raw_total_bytes: u64,
+};
+
+/// Hook point for reversible tool-output filtering/artifact backing.
+///
+/// Implementations may mutate `result` in place, for example by replacing a
+/// large text payload with a compact summary plus `ArtifactReference` entries.
+/// The hook owns any memory it puts into `result`.
+pub const ToolOutputMiddlewareFn = *const fn (
+    ctx: ?*anyopaque,
+    input: ToolOutputMiddlewareInput,
+    result: *AgentToolResult,
+    allocator: std.mem.Allocator,
+) anyerror!void;
+
+pub const ToolApprovalDecision = permission.ApprovalDecision;
+
+pub const ToolApprovalRequest = struct {
+    tool_call_id: []const u8,
+    tool_name: []const u8,
+    args_json: []const u8,
+};
+
+pub const ToolApprovalUiFn = *const fn (
+    ctx: ?*anyopaque,
+    request: ToolApprovalRequest,
+    allocator: std.mem.Allocator,
+) void;
+
+pub const ToolApprovalDecisionFn = *const fn (
+    ctx: ?*anyopaque,
+    request: ToolApprovalRequest,
+) ToolApprovalDecision;
+
+pub const ToolApprovalFn = ToolApprovalDecisionFn;
+
 /// Agent tool definition
 pub const AgentTool = struct {
     label: []const u8, // Human-readable label for UI
     name: []const u8,
     description: []const u8,
+    short_description: ?[]const u8 = null,
     parameters_schema_json: []const u8,
     execute: ToolExecuteFn,
+    runtime_ctx: ?*anyopaque = null,
+    runtime_execute: ?ToolRuntimeExecuteFn = null,
+    approval_ctx: ?*anyopaque = null,
+    approval_fn: ?ToolApprovalFn = null,
+    approval_ui_ctx: ?*anyopaque = null,
+    approval_ui_fn: ?ToolApprovalUiFn = null,
 
     /// Convert to ai_types.Tool for LLM requests
     pub fn toTool(self: AgentTool, allocator: std.mem.Allocator) !ai_types.Tool {
         _ = allocator;
         return .{
             .name = self.name,
-            .description = self.description,
+            .description = self.short_description orelse self.description,
             .parameters_schema_json = self.parameters_schema_json,
         };
     }
@@ -172,6 +319,7 @@ pub const ProtocolOptions = struct {
     api_key: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: u32 = 60_000,
     temperature: ?f32 = null,
@@ -272,14 +420,19 @@ pub const AgentLoopConfig = struct {
 
     // Tools (optional)
     tools: ?[]const AgentTool = null,
-    execute_tool_via_protocol_fn: ?ToolProtocolExecuteFn = null,
+    execute_tool_via_protocol_fn: ToolProtocolExecuteFn = defaultToolProtocolExecute,
     execute_tool_via_protocol_ctx: ?*anyopaque = null,
+    tool_output_middleware_fn: ?ToolOutputMiddlewareFn = null,
+    tool_output_middleware_ctx: ?*anyopaque = null,
+    permission_engine: ?*permission.PermissionEngine = null,
+    compact_tool_output: bool = false,
 
     // Streaming options (passed through to protocol)
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
     api_key: ?[]const u8 = null,
     cancel_token: ?ai_types.CancelToken = null,
+    thinking_level: ai_types.ThinkingLevel = .minimal,
 
     // Agent-specific options
     max_iterations: ?u32 = null, // Max tool use iterations
@@ -376,10 +529,18 @@ pub const AgentState = struct {
             msg.deinit(self.allocator);
         }
         self.messages.deinit(self.allocator);
+        self.clearStreamMessage();
         if (self.system_prompt.len > 0) self.allocator.free(self.system_prompt);
         self.error_message.deinit(self.allocator);
         // Note: doesn't own model or tools
         self.pending_tool_calls.deinit();
+    }
+
+    pub fn clearStreamMessage(self: *AgentState) void {
+        if (self.stream_message) |*msg| {
+            msg.deinit(self.allocator);
+        }
+        self.stream_message = null;
     }
 };
 
@@ -562,13 +723,14 @@ test "AgentTool.toTool conversion" {
         .label = "Test Tool",
         .name = "test_tool",
         .description = "A test tool",
+        .short_description = "Test compact",
         .parameters_schema_json = "{}",
-        .execute = undefined, // Would be a real function in practice
+        .execute = undefined, // Runtime registration callback only; agent loop never calls directly.
     };
 
     const converted = try tool.toTool(std.testing.allocator);
     try std.testing.expectEqualStrings("test_tool", converted.name);
-    try std.testing.expectEqualStrings("A test tool", converted.description);
+    try std.testing.expectEqualStrings("Test compact", converted.description);
 }
 
 test "QueueMode enum values" {
@@ -602,6 +764,62 @@ test "AgentEventStream basic usage" {
     stream.complete(result);
 
     try std.testing.expect(stream.isDone());
+}
+
+test "AgentEvent deinit releases owned message update provider event" {
+    const allocator = std.testing.allocator;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    const borrowed = ai_types.AssistantMessageEvent{ .toolcall_start = .{
+        .content_index = 0,
+        .id = "call-1",
+        .name = "shell_execute",
+        .partial = partial,
+    } };
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, borrowed);
+
+    var event = AgentEvent{ .message_update = .{
+        .message = owned.toolcall_start.partial,
+        .event = owned,
+        .owns_event = true,
+    } };
+    event.deinit(allocator);
+}
+
+test "AgentEventStream deinit drains owned message update events" {
+    const allocator = std.testing.allocator;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    const borrowed = ai_types.AssistantMessageEvent{ .text_delta = .{
+        .content_index = 0,
+        .delta = "hello",
+        .partial = partial,
+    } };
+    const owned = try ai_types.cloneAssistantMessageEvent(allocator, borrowed);
+
+    var stream = AgentEventStream.init(allocator);
+    defer stream.deinit();
+    try stream.push(.{ .message_update = .{
+        .message = owned.text_delta.partial,
+        .event = owned,
+        .owns_event = true,
+    } });
 }
 
 test "AgentEndPayload deinit with owned strings" {
@@ -654,6 +872,7 @@ test "ProtocolOptions defaults" {
     try std.testing.expect(opts.api_key == null);
     try std.testing.expect(opts.session_id == null);
     try std.testing.expect(opts.cancel_token == null);
+    try std.testing.expectEqual(ai_types.ThinkingLevel.minimal, opts.thinking_level);
     try std.testing.expect(opts.thinking_budgets == null);
     try std.testing.expectEqual(@as(u32, 60_000), opts.max_retry_delay_ms);
     try std.testing.expect(opts.temperature == null);

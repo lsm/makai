@@ -1,0 +1,397 @@
+//! Markdown renderer for terminal output.
+//! Converts a subset of markdown to ANSI-styled text.
+
+const std = @import("std");
+const Writer = std.Io.Writer;
+const style_mod = @import("../style/style.zig");
+const Color = @import("../style/color.zig").Color;
+const border_mod = @import("../style/border.zig");
+
+pub const Markdown = struct {
+    // Styling
+    h1_style: style_mod.Style,
+    h2_style: style_mod.Style,
+    h3_style: style_mod.Style,
+    bold_style: style_mod.Style,
+    italic_style: style_mod.Style,
+    code_style: style_mod.Style,
+    code_block_style: style_mod.Style,
+    code_block_border: style_mod.Style,
+    link_style: style_mod.Style,
+    blockquote_style: style_mod.Style,
+    blockquote_bar: style_mod.Style,
+    list_bullet_style: style_mod.Style,
+    hr_style: style_mod.Style,
+    text_style: style_mod.Style,
+
+    // Layout
+    width: u16,
+    hr_char: []const u8,
+
+    pub fn init() Markdown {
+        return .{
+            .h1_style = blk: {
+                var s = style_mod.Style{};
+                s = s.bold(true);
+                s = s.fg(.magenta);
+                s = s.underline(true);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .h2_style = blk: {
+                var s = style_mod.Style{};
+                s = s.bold(true);
+                s = s.fg(.cyan);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .h3_style = blk: {
+                var s = style_mod.Style{};
+                s = s.bold(true);
+                s = s.fg(.green);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .bold_style = blk: {
+                var s = style_mod.Style{};
+                s = s.bold(true);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .italic_style = blk: {
+                var s = style_mod.Style{};
+                s = s.italic(true);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .code_style = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.yellow);
+                s = s.bg(.fromRgb(40, 40, 40));
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .code_block_style = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.green);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .code_block_border = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.gray(8));
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .link_style = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.cyan);
+                s = s.underline(true);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .blockquote_style = blk: {
+                var s = style_mod.Style{};
+                s = s.italic(true);
+                s = s.fg(.gray(14));
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .blockquote_bar = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.gray(10));
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .list_bullet_style = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.cyan);
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .hr_style = blk: {
+                var s = style_mod.Style{};
+                s = s.fg(.gray(8));
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .text_style = blk: {
+                var s = style_mod.Style{};
+                s = s.inline_style(true);
+                break :blk s;
+            },
+            .width = 80,
+            .hr_char = "─",
+        };
+    }
+
+    /// Render markdown text to styled terminal output.
+    pub fn render(self: *const Markdown, allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+        var result: Writer.Allocating = .init(allocator);
+        errdefer result.deinit();
+        const writer = &result.writer;
+
+        // Intermediate styled spans get freed in bulk at end of render.
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const tmp = arena.allocator();
+
+        var lines_iter = std.mem.splitScalar(u8, source, '\n');
+        var in_code_block = false;
+        var code_fence_len: usize = 0;
+        var first_line = true;
+
+        while (lines_iter.next()) |line| {
+            if (!first_line) try writer.writeByte('\n');
+            first_line = false;
+
+            // Code block toggle. Track the opener length so a four-backtick
+            // block can safely contain literal triple-backtick examples without
+            // prematurely closing the displayed block.
+            const trimmed_for_fence = std.mem.trimStart(u8, line, " ");
+            const fence_len = countLeadingChar(trimmed_for_fence, '`');
+            if (fence_len >= 3 and (!in_code_block or isCodeFenceClose(trimmed_for_fence, code_fence_len))) {
+                in_code_block = !in_code_block;
+                if (in_code_block) {
+                    code_fence_len = fence_len;
+                    // Opening fence
+                    const bar = try self.code_block_border.render(tmp, "┌");
+                    try writer.writeAll(bar);
+                    const dash = try self.code_block_border.render(tmp, "─");
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
+                        try writer.writeAll(dash);
+                    }
+                    const end = try self.code_block_border.render(tmp, "┐");
+                    try writer.writeAll(end);
+                } else {
+                    code_fence_len = 0;
+                    // Closing fence
+                    const bar = try self.code_block_border.render(tmp, "└");
+                    try writer.writeAll(bar);
+                    const dash = try self.code_block_border.render(tmp, "─");
+                    const block_width = self.codeBlockWidth();
+                    for (0..block_width - 2) |_| {
+                        try writer.writeAll(dash);
+                    }
+                    const end = try self.code_block_border.render(tmp, "┘");
+                    try writer.writeAll(end);
+                }
+                continue;
+            }
+
+            if (in_code_block) {
+                const block_width = self.codeBlockWidth();
+                const inner_width = block_width - 4; // border + side padding
+                const visible_len = @min(line.len, inner_width);
+                const start_bar = try self.code_block_border.render(tmp, "│ ");
+                try writer.writeAll(start_bar);
+                const styled = try self.code_block_style.render(tmp, line[0..visible_len]);
+                try writer.writeAll(styled);
+                for (visible_len..inner_width) |_| try writer.writeByte(' ');
+                const end_bar = try self.code_block_border.render(tmp, " │");
+                try writer.writeAll(end_bar);
+                continue;
+            }
+
+            const trimmed = std.mem.trimStart(u8, line, " ");
+
+            // Horizontal rule
+            if (trimmed.len >= 3 and isAllChar(trimmed, '-')) {
+                const dash = try self.hr_style.render(tmp, self.hr_char);
+                for (0..@min(self.width, 60)) |_| {
+                    try writer.writeAll(dash);
+                }
+                continue;
+            }
+
+            if (trimmed.len >= 3 and isAllChar(trimmed, '*') and !std.mem.startsWith(u8, trimmed, "**")) {
+                const dash = try self.hr_style.render(tmp, self.hr_char);
+                for (0..@min(self.width, 60)) |_| {
+                    try writer.writeAll(dash);
+                }
+                continue;
+            }
+
+            // Headers
+            if (std.mem.startsWith(u8, trimmed, "### ")) {
+                const content = trimmed[4..];
+                const styled = try self.h3_style.render(tmp, content);
+                try writer.writeAll(styled);
+                continue;
+            }
+            if (std.mem.startsWith(u8, trimmed, "## ")) {
+                const content = trimmed[3..];
+                const styled = try self.h2_style.render(tmp, content);
+                try writer.writeAll(styled);
+                continue;
+            }
+            if (std.mem.startsWith(u8, trimmed, "# ")) {
+                const content = trimmed[2..];
+                const styled = try self.h1_style.render(tmp, content);
+                try writer.writeAll(styled);
+                continue;
+            }
+
+            // Blockquote
+            if (std.mem.startsWith(u8, trimmed, "> ")) {
+                const content = trimmed[2..];
+                const bar = try self.blockquote_bar.render(tmp, "│ ");
+                try writer.writeAll(bar);
+                const styled = try self.blockquote_style.render(tmp, content);
+                try writer.writeAll(styled);
+                continue;
+            }
+
+            // Unordered list
+            if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.startsWith(u8, trimmed, "* ")) {
+                const indent = line.len - trimmed.len;
+                for (0..indent) |_| try writer.writeByte(' ');
+                const bullet = try self.list_bullet_style.render(tmp, "• ");
+                try writer.writeAll(bullet);
+                const content = trimmed[2..];
+                const styled = try self.renderInline(tmp, content);
+                try writer.writeAll(styled);
+                continue;
+            }
+
+            // Ordered list (simple: "1. ", "2. ", etc.)
+            if (trimmed.len >= 3 and trimmed[0] >= '0' and trimmed[0] <= '9') {
+                if (std.mem.indexOf(u8, trimmed[0..@min(4, trimmed.len)], ". ")) |dot_pos| {
+                    const indent = line.len - trimmed.len;
+                    for (0..indent) |_| try writer.writeByte(' ');
+                    const num = try self.list_bullet_style.render(tmp, trimmed[0 .. dot_pos + 2]);
+                    try writer.writeAll(num);
+                    const content = trimmed[dot_pos + 2 ..];
+                    const styled = try self.renderInline(tmp, content);
+                    try writer.writeAll(styled);
+                    continue;
+                }
+            }
+
+            // Empty line
+            if (trimmed.len == 0) {
+                continue;
+            }
+
+            // Regular paragraph with inline formatting
+            const styled = try self.renderInline(tmp, line);
+            try writer.writeAll(styled);
+        }
+
+        return result.toOwnedSlice();
+    }
+
+    /// Render inline formatting: **bold**, *italic*, `code`, [links](url)
+    /// `allocator` should be a short-lived/arena allocator: intermediate styled
+    /// spans are leaked into it (freed in bulk when the arena is reset).
+    fn renderInline(self: *const Markdown, allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+        var result: Writer.Allocating = .init(allocator);
+        errdefer result.deinit();
+        const writer = &result.writer;
+
+        var i: usize = 0;
+        while (i < text.len) {
+            // Bold: **text**
+            if (i + 1 < text.len and text[i] == '*' and text[i + 1] == '*') {
+                if (std.mem.indexOf(u8, text[i + 2 ..], "**")) |end| {
+                    const content = text[i + 2 .. i + 2 + end];
+                    const styled = try self.bold_style.render(allocator, content);
+                    try writer.writeAll(styled);
+                    i += 4 + end;
+                    continue;
+                }
+            }
+
+            // Italic: *text*
+            if (text[i] == '*' and (i + 1 >= text.len or text[i + 1] != '*')) {
+                if (std.mem.indexOfScalar(u8, text[i + 1 ..], '*')) |end| {
+                    const content = text[i + 1 .. i + 1 + end];
+                    const styled = try self.italic_style.render(allocator, content);
+                    try writer.writeAll(styled);
+                    i += 2 + end;
+                    continue;
+                }
+            }
+
+            // Inline code: `code`
+            if (text[i] == '`') {
+                if (std.mem.indexOfScalar(u8, text[i + 1 ..], '`')) |end| {
+                    const content = text[i + 1 .. i + 1 + end];
+                    const styled = try self.code_style.render(allocator, content);
+                    try writer.writeAll(styled);
+                    i += 2 + end;
+                    continue;
+                }
+            }
+
+            // Link: [text](url)
+            if (text[i] == '[') {
+                if (std.mem.indexOfScalar(u8, text[i + 1 ..], ']')) |text_end| {
+                    const link_text = text[i + 1 .. i + 1 + text_end];
+                    const after_bracket = i + 2 + text_end;
+                    if (after_bracket < text.len and text[after_bracket] == '(') {
+                        if (std.mem.indexOfScalar(u8, text[after_bracket + 1 ..], ')')) |url_end| {
+                            const url = text[after_bracket + 1 .. after_bracket + 1 + url_end];
+                            const styled_text = try self.link_style.render(allocator, link_text);
+                            try writer.writeAll(styled_text);
+                            var dim = style_mod.Style{};
+                            dim = dim.fg(.gray(10));
+                            dim = dim.inline_style(true);
+                            const url_str = try std.fmt.allocPrint(allocator, " ({s})", .{url});
+                            const styled_url = try dim.render(allocator, url_str);
+                            try writer.writeAll(styled_url);
+                            i = after_bracket + 2 + url_end;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Regular character
+            try writer.writeByte(text[i]);
+            i += 1;
+        }
+
+        return result.toOwnedSlice();
+    }
+
+    fn codeBlockWidth(self: *const Markdown) usize {
+        return @max(@as(usize, self.width), 8);
+    }
+
+    fn isAllChar(s: []const u8, c: u8) bool {
+        for (s) |ch| {
+            if (ch != c and ch != ' ') return false;
+        }
+        return true;
+    }
+
+    fn countLeadingChar(s: []const u8, c: u8) usize {
+        var n: usize = 0;
+        while (n < s.len and s[n] == c) n += 1;
+        return n;
+    }
+
+    fn isCodeFenceClose(trimmed: []const u8, opener_len: usize) bool {
+        if (countLeadingChar(trimmed, '`') < opener_len) return false;
+        for (trimmed) |c| {
+            if (c != '`' and c != ' ' and c != '\t' and c != '\r') return false;
+        }
+        return true;
+    }
+};
+
+
+test "markdown renderer respects long backtick fence length" {
+    const src = "````text\n```mermaid\nflowchart TD\n```\n````";
+    var md = Markdown.init();
+    const out = try md.render(std.testing.allocator, src);
+    defer std.testing.allocator.free(out);
+
+    // One outer opener and one outer closer; inner triple-backtick lines should
+    // render as code content, not toggle the code-block state.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "┌"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "└"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "```mermaid") != null);
+}

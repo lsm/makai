@@ -116,8 +116,8 @@ test "AgentProtocolRuntime supports multi-session routing" {
     var ev2 = client.popEvent().?;
     defer ev2.deinit(allocator);
 
-    const a = ev1.slice();
-    const b = ev2.slice();
+    const a = ev1.json.slice();
+    const b = ev2.json.slice();
     const ok = (std.mem.find(u8, a, "session") != null) and (std.mem.find(u8, b, "session") != null);
     try std.testing.expect(ok);
 
@@ -155,6 +155,6 @@ test "AgentProtocolRuntime pumps full request/response and outbox" {
 
     var ev = client.popEvent().?;
     defer ev.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"type\":\"message\"}", ev.slice());
+    try std.testing.expectEqualStrings("{\"type\":\"message\"}", ev.json.slice());
     try std.testing.expectEqualStrings("{\"messages\":[]}", client.getLastResultJson().?);
 }

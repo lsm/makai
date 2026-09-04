@@ -304,6 +304,8 @@ export interface CompletionResponse {
   api: ApiId;
   model_id: string;
   stop_reason?: StopReason;
+  // Optional diagnostic error text when stop_reason === "error".
+  error_message?: string;
 }
 
 export type AgentRunResponse = CompletionResponse;

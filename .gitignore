@@ -23,6 +23,7 @@ yarn-error.log*
 zig-cache/
 zig-out/
 .zig-cache/
+zig/zig-pkg/
 *.o
 *.a
 *.so
@@ -36,3 +37,5 @@ tmp/
 # Environment / secrets
 .env
 .env.*
+zig/.makai/
+zig/src/.makai/

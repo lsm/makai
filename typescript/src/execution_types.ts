@@ -84,6 +84,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters_schema_json: string;
+  execute?: (args: Record<string, unknown>, context: { tool_call_id: string; tool_name: string; args_json: string }) => Promise<string | TextContentPart[]> | string | TextContentPart[];
 }
 
 /** Optional execution controls shared by agent and provider requests. */
@@ -125,6 +126,11 @@ export interface CompletionResponse {
   api: ApiId;
   model_id: string;
   stop_reason?: StopReason;
+  /**
+   * Failure cause when stop_reason is "error" (e.g. a Zig error name from the
+   * server-side stream such as "QueueFull"); absent for successful results.
+   */
+  error_message?: string;
 }
 
 /** Final response returned by {@link MakaiAgentApi.run}. */

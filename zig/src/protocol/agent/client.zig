@@ -5,6 +5,19 @@ const envelope = @import("agent_envelope");
 const transport = @import("transport");
 const OwnedSlice = @import("owned_slice").OwnedSlice;
 
+/// A remote agent_event waiting to be normalized into a TuiEvent, tagged with
+/// the session that produced it so the consumer can discard late events from a
+/// previous remote session.
+pub const QueuedEvent = struct {
+    session_id: agent_types.SessionId,
+    json: OwnedSlice(u8),
+
+    pub fn deinit(self: *QueuedEvent, allocator: std.mem.Allocator) void {
+        self.json.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 pub const AgentProtocolClient = struct {
     allocator: std.mem.Allocator,
     sender: ?transport.AsyncSender = null,
@@ -13,7 +26,7 @@ pub const AgentProtocolClient = struct {
     session_id: ?agent_types.SessionId = null,
     last_error: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
     last_result_json: OwnedSlice(u8) = OwnedSlice(u8).initBorrowed(""),
-    event_queue: std.ArrayList(OwnedSlice(u8)),
+    event_queue: std.ArrayList(QueuedEvent),
     next_sequence_by_session: std.AutoHashMap(agent_types.SessionId, u64),
     session_complete_flags: std.AutoHashMap(agent_types.SessionId, bool),
     session_last_errors: std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)),
@@ -24,7 +37,7 @@ pub const AgentProtocolClient = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .event_queue = std.ArrayList(OwnedSlice(u8)).empty,
+            .event_queue = std.ArrayList(QueuedEvent).empty,
             .next_sequence_by_session = std.AutoHashMap(agent_types.SessionId, u64).init(allocator),
             .session_complete_flags = std.AutoHashMap(agent_types.SessionId, bool).init(allocator),
             .session_last_errors = std.AutoHashMap(agent_types.SessionId, OwnedSlice(u8)).init(allocator),
@@ -68,6 +81,10 @@ pub const AgentProtocolClient = struct {
 
     pub fn sendAgentStart(self: *Self, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const sid = agent_types.generateSessionId();
+        return self.sendAgentStartWithSession(sid, config_json, system_prompt);
+    }
+
+    pub fn sendAgentStartWithSession(self: *Self, sid: agent_types.SessionId, config_json: []const u8, system_prompt: ?[]const u8) !agent_types.Ulid {
         const msg_id = agent_types.generateUlid();
         const seq = try self.nextSequence(sid);
 
@@ -155,7 +172,8 @@ pub const AgentProtocolClient = struct {
         try self.session_complete_flags.put(session_id, true);
     }
 
-    fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
+    pub fn clearSessionTerminalState(self: *Self, session_id: agent_types.SessionId) void {
+        self.session_complete_flags.put(session_id, false) catch {};
         if (self.session_last_errors.fetchRemove(session_id)) |entry| {
             var err = entry.value;
             err.deinit(self.allocator);
@@ -173,7 +191,14 @@ pub const AgentProtocolClient = struct {
                 self.clearSessionTerminalState(p.session_id);
                 try self.session_complete_flags.put(p.session_id, false);
             },
-            .agent_event => |json| try self.event_queue.append(self.allocator, OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json))),
+            .agent_event => |json| {
+                var owned_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
+                errdefer owned_json.deinit(self.allocator);
+                try self.event_queue.append(self.allocator, .{
+                    .session_id = env.session_id,
+                    .json = owned_json,
+                });
+            },
             .agent_result => |json| {
                 self.last_result_json.deinit(self.allocator);
                 self.last_result_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, json));
@@ -195,7 +220,7 @@ pub const AgentProtocolClient = struct {
         }
     }
 
-    pub fn popEvent(self: *Self) ?OwnedSlice(u8) {
+    pub fn popEvent(self: *Self) ?QueuedEvent {
         if (self.event_queue.items.len == 0) return null;
         return self.event_queue.orderedRemove(0);
     }
@@ -292,7 +317,7 @@ test "AgentProtocolClient processes events and results" {
 
     var ev = client.popEvent().?;
     defer ev.deinit(allocator);
-    try std.testing.expectEqualStrings("{\"type\":\"turn_start\"}", ev.slice());
+    try std.testing.expectEqualStrings("{\"type\":\"turn_start\"}", ev.json.slice());
     try std.testing.expectEqualStrings("{\"ok\":true}", client.getLastResultJson().?);
     try std.testing.expect(client.isSessionComplete(sid));
     try std.testing.expectEqualStrings("{\"ok\":true}", client.getLastResultJsonForSession(sid).?);

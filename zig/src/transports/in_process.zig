@@ -63,6 +63,7 @@ pub const InProcessTransport = struct {
         errdefer allocator.destroy(stream);
 
         stream.* = event_stream.AssistantMessageStream.init(allocator);
+        stream.owns_events = true;
 
         self.* = .{
             .stream = stream,
@@ -223,12 +224,12 @@ pub const InProcessTransport = struct {
     }
 };
 
-
 /// Create a connected pair of in-process transports.
 /// Returns client (for sending) and server (for receiving).
 pub fn createPair(allocator: std.mem.Allocator) !struct { client: *InProcessTransport, server: *InProcessTransport } {
     const stream = try allocator.create(event_stream.AssistantMessageStream);
     stream.* = event_stream.AssistantMessageStream.init(allocator);
+    stream.owns_events = true;
 
     const client = try allocator.create(InProcessTransport);
     client.* = InProcessTransport.initWithStream(stream, allocator);
@@ -300,6 +301,24 @@ pub const SerializedPipe = struct {
 
         // Poison freed memory to catch use-after-free in debug builds
         self.* = undefined;
+    }
+
+    pub fn compact(self: *SerializedPipe) void {
+        compactBuffer(&self.to_client, &self.to_client_read_pos);
+        compactBuffer(&self.to_server, &self.to_server_read_pos);
+    }
+
+    fn compactBuffer(buffer: *std.ArrayList(u8), read_pos: *usize) void {
+        if (read_pos.* == 0) return;
+        if (read_pos.* >= buffer.items.len) {
+            buffer.clearRetainingCapacity();
+            read_pos.* = 0;
+            return;
+        }
+        const remaining = buffer.items[read_pos.*..];
+        std.mem.copyForwards(u8, buffer.items[0..remaining.len], remaining);
+        buffer.shrinkRetainingCapacity(remaining.len);
+        read_pos.* = 0;
     }
 
     /// Server writes to this to send to client
@@ -485,6 +504,8 @@ pub const ZeroCopyForwarder = struct {
     /// Forward an event directly (takes ownership of the event).
     /// The caller must not use the event after calling this.
     pub fn forward(self: *Self, ev: ai_types.AssistantMessageEvent) !void {
+        var cleanup = ev;
+        errdefer ai_types.deinitAssistantMessageEvent(self.allocator, &cleanup);
         try self.dest.push(ev);
     }
 
@@ -791,8 +812,8 @@ test "InProcessTransport applies queue backpressure under burst writes" {
         .timestamp = 0,
     };
 
-    // Fill ring buffer capacity (255 usable slots).
-    for (0..255) |_| {
+    // Fill ring buffer capacity; the exact size is owned by EventStream.
+    for (0..event_stream.AssistantMessageStream.usable_capacity) |_| {
         const event_json = try transport_mod.serializeEvent(
             .{ .start = .{ .partial = partial } },
             allocator,

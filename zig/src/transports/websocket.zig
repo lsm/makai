@@ -9,14 +9,30 @@
 //! the project default `std.Io.Threaded` context (`std.testing.io` in tests).
 //! Zig 0.16 `std.Io.Evented` networking remains unsupported by that seam.
 //!
-//! Handshake validation checks status/upgrade headers and the presence of
-//! `Sec-WebSocket-Accept`; it does not yet verify the accept value against the
-//! request nonce.
+//! Handshake validation checks status/upgrade headers and verifies the
+//! `Sec-WebSocket-Accept` value per RFC 6455 §4.2.2.
 
 const std = @import("std");
 const transport = @import("transport");
 const ai_types = @import("ai_types");
 const compat = @import("compat");
+
+const default_subprotocol = "makai.v1";
+
+pub const Limits = struct {
+    frame_payload_bytes: usize = 1024 * 1024,
+    message_bytes: usize = 4 * 1024 * 1024,
+    receive_buffer_bytes: usize = 1024 * 1024 + 14,
+};
+
+fn defaultIo() std.Io {
+    return if (@import("builtin").is_test)
+        std.testing.io
+    else
+        std.Io.Threaded.global_single_threaded.io();
+}
+
+pub const AsyncStreamHandle = WebSocketClient.AsyncStreamHandle;
 
 fn streamFromSocketHandle(handle: std.Io.net.Socket.Handle) compat.net.Stream {
     return compat.net.Stream.init(.{ .socket = .{ .handle = handle, .address = .{ .ip4 = .loopback(0) } } });
@@ -32,6 +48,9 @@ pub const WebSocketClient = struct {
     // For async operation
     send_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
     recv_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    fragment_buffer: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    fragment_opcode: ?Opcode = null,
+    limits: Limits = .{},
 
     // Callbacks
     on_message: ?*const fn (ctx: ?*anyopaque, data: []const u8) void = null,
@@ -39,6 +58,13 @@ pub const WebSocketClient = struct {
 
     // Handshake key (stored for verification)
     handshake_key: [24]u8 = undefined,
+
+    // Serializes tcp_stream state changes. Cancellation uses this mutex only
+    // long enough to call shutdown, so it can bypass blocked writers.
+    mutex: std.atomic.Mutex = .unlocked,
+
+    // Serializes WebSocket frame writes so multi-write frames cannot interleave.
+    write_mutex: std.atomic.Mutex = .unlocked,
 
     // Ping/pong timeout tracking
     ping_timeout_ms: u64 = 30_000,
@@ -56,11 +82,17 @@ pub const WebSocketClient = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator) Self {
+        return initWithLimits(allocator, .{});
+    }
+
+    pub fn initWithLimits(allocator: std.mem.Allocator, limits: Limits) Self {
         return .{
             .allocator = allocator,
             .state = .disconnected,
             .send_buffer = std.ArrayList(u8).empty,
             .recv_buffer = std.ArrayList(u8).empty,
+            .fragment_buffer = std.ArrayList(u8).empty,
+            .limits = limits,
         };
     }
 
@@ -68,15 +100,27 @@ pub const WebSocketClient = struct {
         self.close();
         self.send_buffer.deinit(self.allocator);
         self.recv_buffer.deinit(self.allocator);
+        self.fragment_buffer.deinit(self.allocator);
     }
 
-    /// Connect to WebSocket endpoint
+    /// Connect to WebSocket endpoint using the default `makai.v1` subprotocol.
     /// url format: ws://host:port/path or wss://host:port/path
     /// headers: optional headers (e.g., Authorization: Bearer <api_key>)
     pub fn connect(
         self: *Self,
         url: []const u8,
         headers: ?[]const ai_types.HeaderPair,
+    ) !void {
+        return self.connectWithSubprotocol(url, headers, default_subprotocol);
+    }
+
+    /// Connect to WebSocket endpoint with a configurable subprotocol.
+    /// Pass `null` for subprotocol to omit the `Sec-WebSocket-Protocol` header.
+    pub fn connectWithSubprotocol(
+        self: *Self,
+        url: []const u8,
+        headers: ?[]const ai_types.HeaderPair,
+        subprotocol: ?[]const u8,
     ) !void {
         if (!canInitiateConnect(self.state)) {
             return error.AlreadyConnected;
@@ -85,6 +129,8 @@ pub const WebSocketClient = struct {
         // Start each connection attempt from a clean session buffer state.
         self.send_buffer.clearRetainingCapacity();
         self.recv_buffer.clearRetainingCapacity();
+        self.fragment_buffer.clearRetainingCapacity();
+        self.fragment_opcode = null;
         self.resetPingState();
 
         self.state = .connecting;
@@ -110,7 +156,7 @@ pub const WebSocketClient = struct {
         };
 
         // Perform WebSocket handshake
-        performHandshake(self, parsed.host, parsed.port, parsed.path, headers) catch |err| {
+        performHandshake(self, parsed.host, parsed.port, parsed.path, headers, subprotocol) catch |err| {
             if (self.tcp_stream) |stream| {
                 var closable = stream;
                 closable.close();
@@ -129,9 +175,12 @@ pub const WebSocketClient = struct {
             return error.NotConnected;
         }
 
-        const stream = self.tcp_stream orelse return error.NotConnected;
+        _ = defaultIo();
 
-        // Encode the frame
+        // Encode before locking, then hold the write mutex until writeAll
+        // completes so multi-write frames cannot interleave. Do not hold the
+        // transport-state mutex during writeAll; cancellation must be able to
+        // shutdown the socket even when a write is blocked.
         const frame = Frame{
             .opcode = .text,
             .payload = data,
@@ -142,25 +191,44 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
+        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.write_mutex.unlock();
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const stream = self.tcp_stream orelse {
+            self.mutex.unlock();
+            return error.NotConnected;
+        };
         var writable = stream;
+        self.mutex.unlock();
+
         try writable.writeAll(encoded);
     }
 
     /// Receive a message (blocking)
     pub fn receive(self: *Self, allocator: std.mem.Allocator) !?[]const u8 {
+        _ = defaultIo();
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         if (self.state != .connected) {
+            self.mutex.unlock();
             return error.NotConnected;
         }
-
-        const stream = self.tcp_stream orelse return error.NotConnected;
+        self.mutex.unlock();
 
         // Read frames until we have a complete message
         while (true) {
             // Try to decode a frame from existing buffer
-            if (decodeFrame(self.recv_buffer.items)) |result| {
+            const decoded = decodeFrameWithLimit(self.recv_buffer.items, self.limits.frame_payload_bytes) catch |err| {
+                self.terminateReceive();
+                return err;
+            };
+            if (decoded) |result| {
                 const frame = result.frame;
+                const owned_payload = try allocator.dupe(u8, frame.payload);
+                defer allocator.free(owned_payload);
 
-                // Remove consumed bytes
+                // Remove consumed bytes after copying the payload because decodeFrame
+                // returns slices into recv_buffer.
                 if (result.consumed > 0) {
                     const remaining = self.recv_buffer.items[result.consumed..];
                     std.mem.copyForwards(u8, self.recv_buffer.items[0..remaining.len], remaining);
@@ -170,12 +238,14 @@ pub const WebSocketClient = struct {
                 // Handle control frames
                 switch (frame.opcode) {
                     .close => {
+                        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                        defer self.mutex.unlock();
                         self.state = .closing;
                         return null;
                     },
                     .ping => {
                         // Respond with pong
-                        try self.sendPong(frame.payload);
+                        try self.sendPong(owned_payload);
                         continue;
                     },
                     .pong => {
@@ -183,21 +253,66 @@ pub const WebSocketClient = struct {
                         continue;
                     },
                     .text, .binary => {
-                        // Return text/binary payload
-                        return try allocator.dupe(u8, frame.payload);
+                        if (self.fragment_opcode != null) {
+                            self.terminateReceive();
+                            return error.ProtocolError;
+                        }
+                        if (frame.fin) {
+                            if (owned_payload.len > self.limits.message_bytes) return error.MessageTooLarge;
+                            return try allocator.dupe(u8, owned_payload);
+                        }
+                        self.fragment_buffer.clearRetainingCapacity();
+                        self.appendFragment(owned_payload) catch |err| {
+                            self.resetFragments();
+                            return err;
+                        };
+                        self.fragment_opcode = frame.opcode;
+                        continue;
                     },
                     .continuation => {
-                        // Continuation frames not fully supported - return payload
-                        return try allocator.dupe(u8, frame.payload);
+                        if (self.fragment_opcode == null) {
+                            self.terminateReceive();
+                            return error.ProtocolError;
+                        }
+                        self.appendFragment(owned_payload) catch |err| {
+                            self.resetFragments();
+                            return err;
+                        };
+                        if (!frame.fin) continue;
+                        defer {
+                            self.fragment_buffer.clearRetainingCapacity();
+                            self.fragment_opcode = null;
+                        }
+                        return try allocator.dupe(u8, self.fragment_buffer.items);
                     },
                 }
             }
 
             // Need more data - read from stream
-            var read_buf: [4096]u8 = undefined;
+            const available = self.limits.receive_buffer_bytes -| self.recv_buffer.items.len;
+            if (available == 0) {
+                self.terminateReceive();
+                return error.ReceiveBufferTooLarge;
+            }
+
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            const stream = self.tcp_stream orelse {
+                self.mutex.unlock();
+                return error.NotConnected;
+            };
             var readable = stream;
-            const bytes_read = readable.read(&read_buf) catch |err| {
+            self.mutex.unlock();
+
+            var read_buf: [4096]u8 = undefined;
+            const bytes_read = readable.read(read_buf[0..@min(read_buf.len, available)]) catch |err| {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
                 if (err == error.EndOfStream) {
+                    if (self.tcp_stream) |open_stream| {
+                        var closable = open_stream;
+                        closable.close();
+                        self.tcp_stream = null;
+                    }
                     self.state = .closed;
                     return null;
                 }
@@ -205,20 +320,80 @@ pub const WebSocketClient = struct {
             };
 
             if (bytes_read == 0) {
+                while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+                defer self.mutex.unlock();
+                if (self.tcp_stream) |open_stream| {
+                    var closable = open_stream;
+                    closable.close();
+                    self.tcp_stream = null;
+                }
                 self.state = .closed;
                 return null;
             }
 
-            try self.recv_buffer.appendSlice(self.allocator, read_buf[0..bytes_read]);
+            try self.appendReceiveBytes(read_buf[0..bytes_read]);
         }
+    }
+
+    fn appendFragment(self: *Self, payload: []const u8) !void {
+        if (payload.len > self.limits.message_bytes -| self.fragment_buffer.items.len) return error.MessageTooLarge;
+        const new_len = self.fragment_buffer.items.len + payload.len;
+        try self.ensureBoundedCapacity(&self.fragment_buffer, new_len, self.limits.message_bytes);
+        self.fragment_buffer.appendSliceAssumeCapacity(payload);
+    }
+
+    fn appendReceiveBytes(self: *Self, bytes: []const u8) !void {
+        if (bytes.len > self.limits.receive_buffer_bytes -| self.recv_buffer.items.len) return error.ReceiveBufferTooLarge;
+        const new_len = self.recv_buffer.items.len + bytes.len;
+        try self.ensureBoundedCapacity(&self.recv_buffer, new_len, self.limits.receive_buffer_bytes);
+        self.recv_buffer.appendSliceAssumeCapacity(bytes);
+    }
+
+    fn resetFragments(self: *Self) void {
+        self.fragment_buffer.clearRetainingCapacity();
+        self.fragment_opcode = null;
+    }
+
+    fn terminateReceive(self: *Self) void {
+        // Unblock any concurrent write before close takes ownership of the
+        // socket and waits for write_mutex.
+        self.abort();
+        self.close();
+    }
+
+    fn ensureBoundedCapacity(self: *Self, buffer: *std.ArrayList(u8), needed: usize, limit: usize) !void {
+        if (needed <= buffer.capacity) return;
+        const doubled = std.math.mul(usize, buffer.capacity, 2) catch limit;
+        const target = @min(limit, @max(needed, @max(@as(usize, 8), doubled)));
+        try buffer.ensureTotalCapacityPrecise(self.allocator, target);
     }
 
     /// Close the connection
     pub fn close(self: *Self) void {
-        if (self.tcp_stream) |stream| {
+        _ = defaultIo();
+
+        // Capture the socket under the state mutex, then drop the mutex before
+        // performing I/O. This prevents a blocked writer from pinning the state
+        // mutex and stalling cancellation paths that need to shut the socket down.
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const maybe_stream = self.tcp_stream;
+        const send_close_frame = self.state == .connected;
+        self.tcp_stream = null;
+        self.state = .closing;
+        self.mutex.unlock();
+
+        if (maybe_stream) |stream| {
             var closable = stream;
-            // Send close frame if connected
-            if (self.state == .connected) {
+            // A graceful close is possible only when no writer is active. If a
+            // writer owns the socket, shutdown first so waiting for it cannot
+            // deadlock.
+            const writer_idle = self.write_mutex.tryLock();
+            if (!writer_idle) {
+                closable.shutdown();
+                while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+            }
+            defer self.write_mutex.unlock();
+            if (send_close_frame and writer_idle) {
                 const close_frame = Frame{
                     .opcode = .close,
                     .payload = &.{},
@@ -231,12 +406,29 @@ pub const WebSocketClient = struct {
                 } else |_| {}
             }
             closable.close();
-            self.tcp_stream = null;
         }
+
+        // Re-acquire the state mutex to clear buffers and finalize state.
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         self.send_buffer.clearRetainingCapacity();
         self.recv_buffer.clearRetainingCapacity();
+        self.fragment_buffer.clearRetainingCapacity();
+        self.fragment_opcode = null;
         self.resetPingState();
         self.state = .closed;
+    }
+
+    /// Force-close the socket without sending a close frame; safe from cancellation paths.
+    fn abort(self: *Self) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.tcp_stream) |stream| {
+            var closable = stream;
+            closable.shutdown();
+        }
+        self.resetPingState();
+        self.state = .closing;
     }
 
     /// Convert to AsyncSender interface
@@ -260,7 +452,7 @@ pub const WebSocketClient = struct {
     }
 
     fn sendPong(self: *Self, payload: []const u8) !void {
-        const stream = self.tcp_stream orelse return error.NotConnected;
+        _ = defaultIo();
 
         const frame = Frame{
             .opcode = .pong,
@@ -272,7 +464,17 @@ pub const WebSocketClient = struct {
         const encoded = try encodeFrame(frame, self.allocator);
         defer self.allocator.free(encoded);
 
+        while (!self.write_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.write_mutex.unlock();
+
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const stream = self.tcp_stream orelse {
+            self.mutex.unlock();
+            return error.NotConnected;
+        };
         var writable = stream;
+        self.mutex.unlock();
+
         try writable.writeAll(encoded);
     }
 
@@ -322,6 +524,46 @@ pub const WebSocketClient = struct {
         allocator: std.mem.Allocator,
     };
 
+    /// Handle for a cancelable WebSocket reader thread.
+    /// Created by `receiveStreamWithHandle`; call `deinit` to join the thread.
+    pub const AsyncStreamHandle = struct {
+        stream: *transport.ByteStream,
+        thread: std.Thread,
+        cancel_token: *std.atomic.Value(bool),
+        client: *WebSocketClient,
+        allocator: std.mem.Allocator,
+
+        const Handle = @This();
+
+        pub fn deinit(self: *Handle, timeout_ms: u64) bool {
+            self.cancel();
+            const exited = self.stream.waitForThread(timeout_ms);
+            if (!exited) {
+                self.thread.detach();
+                return false;
+            }
+            self.thread.join();
+            self.stream.deinit();
+            self.allocator.destroy(self.stream);
+            self.allocator.destroy(self.cancel_token);
+            self.allocator.destroy(self);
+            return true;
+        }
+
+        pub fn cancel(self: *Handle) void {
+            self.cancel_token.store(true, .release);
+            // Force-closing the socket unblocks a reader thread parked in receive().
+            self.client.abort();
+        }
+    };
+
+    const HandleProducerContext = struct {
+        stream: *transport.ByteStream,
+        client: *WebSocketClient,
+        allocator: std.mem.Allocator,
+        cancel_token: *std.atomic.Value(bool),
+    };
+
     fn receiveStreamFn(ctx: *anyopaque, allocator: std.mem.Allocator) !*transport.ByteStream {
         const self: *Self = @ptrCast(@alignCast(ctx));
 
@@ -339,6 +581,44 @@ pub const WebSocketClient = struct {
         thread.detach();
 
         return stream;
+    }
+
+    /// Create an async stream with explicit thread-lifecycle management.
+    /// The returned handle owns the `ByteStream`, cancel token, and reader thread.
+    pub fn receiveStreamWithHandle(self: *Self, allocator: std.mem.Allocator) !*Self.AsyncStreamHandle {
+        const stream = try allocator.create(transport.ByteStream);
+        stream.* = transport.ByteStream.init(allocator);
+        errdefer {
+            stream.deinit();
+            allocator.destroy(stream);
+        }
+
+        const cancel_token = try allocator.create(std.atomic.Value(bool));
+        cancel_token.* = std.atomic.Value(bool).init(false);
+        errdefer allocator.destroy(cancel_token);
+
+        const handle = try allocator.create(Self.AsyncStreamHandle);
+        errdefer allocator.destroy(handle);
+
+        const thread_ctx = try allocator.create(HandleProducerContext);
+        thread_ctx.* = .{
+            .stream = stream,
+            .client = self,
+            .allocator = allocator,
+            .cancel_token = cancel_token,
+        };
+        errdefer allocator.destroy(thread_ctx);
+
+        const thread = try std.Thread.spawn(.{}, handleProducerThread, .{thread_ctx});
+
+        handle.* = .{
+            .stream = stream,
+            .thread = thread,
+            .cancel_token = cancel_token,
+            .client = self,
+            .allocator = allocator,
+        };
+        return handle;
     }
 
     fn producerThread(ctx: *ProducerContext) void {
@@ -367,6 +647,40 @@ pub const WebSocketClient = struct {
                 return;
             }
         }
+    }
+
+    fn handleProducerThread(ctx: *HandleProducerContext) void {
+        defer {
+            ctx.stream.markThreadDone();
+            ctx.allocator.destroy(ctx);
+        }
+
+        while (!ctx.cancel_token.load(.acquire)) {
+            const msg = ctx.client.receive(ctx.allocator) catch {
+                if (ctx.cancel_token.load(.acquire)) {
+                    ctx.stream.complete({});
+                    return;
+                }
+                ctx.stream.completeWithError("Receive error");
+                return;
+            };
+
+            if (msg) |data| {
+                const chunk = transport.ByteChunk{
+                    .data = data,
+                    .owned = true,
+                };
+                if (!pushChunkOrFail(ctx.stream, chunk, ctx.allocator)) {
+                    return;
+                }
+            } else {
+                // Connection closed
+                ctx.stream.complete({});
+                return;
+            }
+        }
+
+        ctx.stream.complete({});
     }
 
     fn readFn(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]const u8 {
@@ -403,6 +717,72 @@ fn hasHeaderName(response: []const u8, name: []const u8) bool {
         line_start = if (line_end < response.len) line_end + 1 else response.len;
     }
     return false;
+}
+
+fn headerValueContainsToken(response: []const u8, name: []const u8, token: []const u8) bool {
+    var line_start: usize = 0;
+    while (line_start < response.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, response, line_start, '\n') orelse response.len;
+        var line = response[line_start..line_end];
+        if (std.mem.endsWith(u8, line, "\r")) {
+            line = line[0 .. line.len - 1];
+        }
+
+        if (line.len == 0) return false;
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const header_name = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(header_name, name)) {
+                const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                var parts = std.mem.splitScalar(u8, value, ',');
+                while (parts.next()) |part| {
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+                }
+            }
+        }
+
+        line_start = if (line_end < response.len) line_end + 1 else response.len;
+    }
+    return false;
+}
+
+fn getHeaderValue(response: []const u8, name: []const u8) ?[]const u8 {
+    var line_start: usize = 0;
+    while (line_start < response.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, response, line_start, '\n') orelse response.len;
+        var line = response[line_start..line_end];
+        if (std.mem.endsWith(u8, line, "\r")) {
+            line = line[0 .. line.len - 1];
+        }
+
+        if (line.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const header_name = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(header_name, name)) {
+                return std.mem.trim(u8, line[colon + 1 ..], " \t");
+            }
+        }
+
+        line_start = if (line_end < response.len) line_end + 1 else response.len;
+    }
+    return null;
+}
+
+const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+fn verifyAcceptHeader(response: []const u8, request_key: []const u8) bool {
+    const accept_value = getHeaderValue(response, "Sec-WebSocket-Accept") orelse return false;
+
+    var hash_input: [60]u8 = undefined;
+    @memcpy(hash_input[0..24], request_key);
+    @memcpy(hash_input[24..60], websocket_guid);
+
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(&hash_input, &digest, .{});
+
+    var expected: [28]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&expected, &digest);
+
+    return std.mem.eql(u8, accept_value, &expected);
 }
 
 // --- Internal types ---
@@ -503,32 +883,54 @@ pub fn encodeFrame(frame: Frame, allocator: std.mem.Allocator) ![]u8 {
 
 /// Decode a WebSocket frame from buffer, returns frame and bytes consumed
 /// Note: The returned payload is a slice into the input data
-pub fn decodeFrame(data: []const u8) ?struct { frame: Frame, consumed: usize } {
+pub const DecodedFrame = struct { frame: Frame, consumed: usize };
+
+pub fn decodeFrame(data: []const u8) ?DecodedFrame {
+    return decodeFrameWithLimit(data, std.math.maxInt(usize)) catch null;
+}
+
+pub fn decodeFrameWithLimit(data: []const u8, frame_payload_bytes: usize) !?DecodedFrame {
     if (data.len < 2) return null;
 
     const first_byte = data[0];
     const second_byte = data[1];
 
+    if ((first_byte & 0x70) != 0) return error.ProtocolError;
     const fin = (first_byte & 0x80) != 0;
-    const opcode: Opcode = @enumFromInt(first_byte & 0x0F);
+    const opcode: Opcode = switch (first_byte & 0x0F) {
+        0x0 => .continuation,
+        0x1 => .text,
+        0x2 => .binary,
+        0x8 => .close,
+        0x9 => .ping,
+        0xA => .pong,
+        else => return error.ProtocolError,
+    };
     const masked = (second_byte & 0x80) != 0;
 
-    var payload_len: u64 = @as(u64, second_byte) & 0x7F;
+    const payload_marker: u7 = @truncate(second_byte & 0x7F);
+    var payload_len: u64 = payload_marker;
     var offset: usize = 2;
 
     // Extended payload length
-    if (payload_len == 126) {
+    if (payload_marker == 126) {
         if (data.len < 4) return null;
         payload_len = (@as(u64, data[2]) << 8) | @as(u64, data[3]);
+        if (payload_len < 126) return error.ProtocolError;
         offset = 4;
-    } else if (payload_len == 127) {
+    } else if (payload_marker == 127) {
         if (data.len < 10) return null;
+        if ((data[2] & 0x80) != 0) return error.ProtocolError;
         payload_len = 0;
         for (data[2..10], 0..) |byte, i| {
             payload_len |= @as(u64, byte) << @as(u6, @intCast(56 - i * 8));
         }
+        if (payload_len < 65_536) return error.ProtocolError;
         offset = 10;
     }
+
+    if (payload_len > frame_payload_bytes or payload_len > std.math.maxInt(usize)) return error.FrameTooLarge;
+    if ((opcode == .close or opcode == .ping or opcode == .pong) and (!fin or payload_len > 125)) return error.ProtocolError;
 
     // Masking key
     const mask: ?[4]u8 = if (masked) blk: {
@@ -539,14 +941,16 @@ pub fn decodeFrame(data: []const u8) ?struct { frame: Frame, consumed: usize } {
     } else null;
 
     // Payload
-    if (data.len < offset + payload_len) return null;
+    const payload_len_usize: usize = @intCast(payload_len);
+    const frame_end = std.math.add(usize, offset, payload_len_usize) catch return error.FrameTooLarge;
+    if (data.len < frame_end) return null;
     const payload_start = offset;
-    offset += @as(usize, @intCast(payload_len));
+    offset = frame_end;
 
     // If masked, we need to unmask - but for now just return a reference
     // The caller should handle masking if needed
     // For server->client frames, masked is typically false
-    const payload = data[payload_start..][0..@as(usize, @intCast(payload_len))];
+    const payload = data[payload_start..][0..payload_len_usize];
 
     // If the frame is masked, we need to allocate and unmask
     // For simplicity, we return the raw payload and note if it was masked
@@ -571,6 +975,7 @@ fn performHandshake(
     port: u16,
     path: []const u8,
     headers: ?[]const ai_types.HeaderPair,
+    subprotocol: ?[]const u8,
 ) !void {
     _ = port; // Port is already resolved and connected before calling this
     const stream = client.tcp_stream orelse return error.NotConnected;
@@ -592,7 +997,9 @@ fn performHandshake(
     try request.print(client.allocator, "Upgrade: websocket\r\n", .{});
     try request.print(client.allocator, "Connection: Upgrade\r\n", .{});
     try request.print(client.allocator, "Sec-WebSocket-Key: {s}\r\n", .{key});
-    try request.print(client.allocator, "Sec-WebSocket-Protocol: makai.v1\r\n", .{});
+    if (subprotocol) |sp| {
+        try request.print(client.allocator, "Sec-WebSocket-Protocol: {s}\r\n", .{sp});
+    }
     try request.print(client.allocator, "Sec-WebSocket-Version: 13\r\n", .{});
 
     // Add custom headers
@@ -608,38 +1015,53 @@ fn performHandshake(
     var io_stream = stream;
     try io_stream.writeAll(request.items);
 
-    // Read response
+    // Read response headers. TCP can split the HTTP response across reads, so
+    // keep reading until the header terminator arrives and preserve any frame
+    // bytes coalesced after it.
     var response_buf: [4096]u8 = undefined;
-    const response_len = try io_stream.read(&response_buf);
+    var response_len: usize = 0;
+    var header_end: ?usize = null;
+    while (response_len < response_buf.len) {
+        const n = try io_stream.read(response_buf[response_len..]);
+        if (n == 0) return error.HandshakeFailed;
+        response_len += n;
+        if (std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n")) |idx| {
+            header_end = idx;
+            break;
+        }
+    }
+    const end = header_end orelse return error.HandshakeFailed;
     const response = response_buf[0..response_len];
+    const headers_part = response[0 .. end + 4];
+    const leftover = response[end + 4 ..];
 
     // Verify response
     // Should start with "HTTP/1.1 101"
-    if (!std.mem.startsWith(u8, response, "HTTP/1.1 101")) {
+    if (!std.mem.startsWith(u8, headers_part, "HTTP/1.1 101")) {
         return error.HandshakeFailed;
     }
 
-    // Verify Upgrade: websocket
-    if (std.mem.find(u8, response, "Upgrade: websocket") == null and
-        std.mem.find(u8, response, "Upgrade: Websocket") == null)
-    {
+    // Verify Upgrade and Connection headers case-insensitively.
+    if (!headerValueContainsToken(headers_part, "Upgrade", "websocket")) {
         return error.HandshakeFailed;
     }
 
-    // Verify Connection: Upgrade
-    if (std.mem.find(u8, response, "Connection: Upgrade") == null and
-        std.mem.find(u8, response, "Connection: upgrade") == null)
-    {
+    if (!headerValueContainsToken(headers_part, "Connection", "upgrade")) {
         return error.HandshakeFailed;
     }
 
-    // Verify Sec-WebSocket-Accept header.
-    // The expected accept key is base64(sha1(key ++
-    // "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")). Full value verification is
-    // intentionally deferred; this migration preserves existing behavior by
-    // only requiring the accept header to be present.
-    if (!hasHeaderName(response, "Sec-WebSocket-Accept")) {
+    if (subprotocol) |expected_protocol| {
+        const selected_protocol = getHeaderValue(headers_part, "Sec-WebSocket-Protocol") orelse return error.HandshakeFailed;
+        if (!std.mem.eql(u8, selected_protocol, expected_protocol)) return error.HandshakeFailed;
+    }
+
+    // Verify Sec-WebSocket-Accept header matches the request key (RFC 6455 §4.2.2).
+    if (!verifyAcceptHeader(headers_part, client.handshake_key[0..24])) {
         return error.HandshakeFailed;
+    }
+
+    if (leftover.len > 0) {
+        try client.appendReceiveBytes(leftover);
     }
 }
 
@@ -788,6 +1210,128 @@ test "decodeFrame rejects incomplete extended length and masked payloads" {
 
     // Mask + key present, but payload byte missing
     try std.testing.expect(decodeFrame(&.{ 0x81, 0x81, 1, 2, 3, 4 }) == null);
+}
+
+test "decodeFrameWithLimit validates declared payload and opcode before buffering" {
+    const exact = [_]u8{ 0x81, 4, 't', 'e', 's', 't' };
+    const decoded = (try decodeFrameWithLimit(&exact, 4)).?;
+    try std.testing.expectEqualStrings("test", decoded.frame.payload);
+    try std.testing.expectError(error.FrameTooLarge, decodeFrameWithLimit(&exact, 3));
+
+    const declared_over = [_]u8{ 0x81, 126, 0, 126 };
+    try std.testing.expectError(error.FrameTooLarge, decodeFrameWithLimit(&declared_over, 4));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0x83, 0 }, 4));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0xC1, 0 }, 4));
+}
+
+test "decodeFrameWithLimit rejects non-canonical extended lengths" {
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0x81, 126, 0, 125 }, 1024));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0x81, 127, 0, 0, 0, 0, 0, 0, 0, 126 }, 1024));
+    try std.testing.expectError(error.ProtocolError, decodeFrameWithLimit(&.{ 0x81, 127, 0x80, 0, 0, 0, 0, 1, 0, 0 }, std.math.maxInt(usize)));
+}
+
+test "WebSocketClient applies receive budget to handshake leftovers" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 4,
+        .receive_buffer_bytes = 4,
+    });
+    defer client.deinit();
+
+    try client.appendReceiveBytes("1234");
+    try std.testing.expectError(error.ReceiveBufferTooLarge, client.appendReceiveBytes("5"));
+    try std.testing.expectEqualStrings("1234", client.recv_buffer.items);
+}
+
+test "WebSocketClient fragmented message budget accepts exact and rejects one over" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 6,
+        .receive_buffer_bytes = 18,
+    });
+    defer client.deinit();
+
+    try client.appendFragment("abc");
+    try client.appendFragment("def");
+    try std.testing.expectEqualStrings("abcdef", client.fragment_buffer.items);
+    try std.testing.expectError(error.MessageTooLarge, client.appendFragment("g"));
+}
+
+test "WebSocketClient resets fragmented state after aggregate limit error" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 4,
+        .receive_buffer_bytes = 18,
+    });
+    defer client.deinit();
+    client.state = .connected;
+    client.fragment_opcode = .text;
+    try client.appendFragment("abc");
+
+    const continuation = [_]u8{ 0x80, 2, 'd', 'e' };
+    try client.appendReceiveBytes(&continuation);
+    try std.testing.expectError(error.MessageTooLarge, client.receive(allocator));
+    try std.testing.expect(client.fragment_opcode == null);
+    try std.testing.expectEqual(@as(usize, 0), client.fragment_buffer.items.len);
+}
+
+test "WebSocketClient closes and clears malformed receive data" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+    client.state = .connected;
+    try client.appendReceiveBytes(&.{ 0x83, 0 });
+
+    try std.testing.expectError(error.ProtocolError, client.receive(allocator));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
+}
+
+test "WebSocketClient applies message budget to complete frames" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 4,
+        .message_bytes = 3,
+        .receive_buffer_bytes = 18,
+    });
+    defer client.deinit();
+    client.state = .connected;
+    try client.appendReceiveBytes(&.{ 0x81, 4, 't', 'e', 's', 't' });
+
+    try std.testing.expectError(error.MessageTooLarge, client.receive(allocator));
+}
+
+test "WebSocketClient closes on fragmented sequence protocol error" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.init(allocator);
+    defer client.deinit();
+    client.state = .connected;
+    client.fragment_opcode = .text;
+    try client.appendFragment("old");
+    try client.appendReceiveBytes(&.{ 0x81, 3, 'n', 'e', 'w' });
+
+    try std.testing.expectError(error.ProtocolError, client.receive(allocator));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expect(client.fragment_opcode == null);
+}
+
+test "WebSocketClient closes when an incomplete frame exhausts receive budget" {
+    const allocator = std.testing.allocator;
+    var client = WebSocketClient.initWithLimits(allocator, .{
+        .frame_payload_bytes = 3,
+        .message_bytes = 3,
+        .receive_buffer_bytes = 3,
+    });
+    defer client.deinit();
+    client.state = .connected;
+    try client.appendReceiveBytes(&.{ 0x81, 3, 'a' });
+
+    try std.testing.expectError(error.ReceiveBufferTooLarge, client.receive(allocator));
+    try std.testing.expectEqual(WebSocketClient.ConnectionState.closed, client.state);
+    try std.testing.expectEqual(@as(usize, 0), client.recv_buffer.items.len);
 }
 
 test "decodeFrame supports partial buffering and consumed ordering" {
@@ -1138,19 +1682,16 @@ test "AsyncSender and AsyncReceiver interfaces" {
     _ = receiver.context;
 }
 
-
 test "websocket_masking_key_xor_output_byte_for_byte" {
     const payload = "Mask me";
     const mask = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
     const encoded = [_]u8{
-        0x81, 0x80 | @as(u8, @intCast(payload.len)),
-        mask[0], mask[1], mask[2], mask[3],
-        payload[0] ^ mask[0],
-        payload[1] ^ mask[1],
-        payload[2] ^ mask[2],
-        payload[3] ^ mask[3],
-        payload[4] ^ mask[0],
-        payload[5] ^ mask[1],
+        0x81,                 0x80 | @as(u8, @intCast(payload.len)),
+        mask[0],              mask[1],
+        mask[2],              mask[3],
+        payload[0] ^ mask[0], payload[1] ^ mask[1],
+        payload[2] ^ mask[2], payload[3] ^ mask[3],
+        payload[4] ^ mask[0], payload[5] ^ mask[1],
         payload[6] ^ mask[2],
     };
 

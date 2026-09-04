@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("compat");
 const ai_types = @import("ai_types");
+const tool_local_runtime = @import("tool_local_runtime");
 const event_stream_mod = @import("event_stream");
 const types = @import("agent_types");
 const agent_loop = @import("agent_loop");
@@ -17,6 +18,10 @@ pub const AgentEvent = types.AgentEvent;
 pub const AgentEventStream = types.AgentEventStream;
 pub const AgentLoopResult = types.AgentLoopResult;
 pub const AgentTool = types.AgentTool;
+const Listener = struct {
+    callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void,
+    ctx: ?*anyopaque = null,
+};
 pub const AgentToolResult = types.AgentToolResult;
 pub const AgentState = types.AgentState;
 pub const AgentContext = types.AgentContext;
@@ -48,15 +53,24 @@ pub const AgentOptions = struct {
 
     // Provider options
     session_id: ?[]const u8 = null,
+    execute_tool_via_protocol_fn: ?types.ToolProtocolExecuteFn = null,
+    execute_tool_via_protocol_ctx: ?*anyopaque = null,
     get_api_key_fn: ?GetApiKeyFn = null,
     get_api_key_ctx: ?*anyopaque = null,
     thinking_budgets: ?ai_types.ThinkingBudgets = null,
     max_retry_delay_ms: ?u32 = 60_000,
+    compact_tool_output: bool = false,
+    permission_engine: ?*types.permission.PermissionEngine = null,
 };
 
 /// High-level Agent class that manages state, subscriptions, and message queues.
 /// Provides a stateful wrapper around the low-level agent loop.
 pub const Agent = struct {
+    const ContinueRequest = struct {
+        messages: []ai_types.Message,
+        skip_steering: bool,
+    };
+
     // Internal state
     _state: AgentState,
     _allocator: std.mem.Allocator,
@@ -65,10 +79,11 @@ pub const Agent = struct {
     _protocol: ProtocolClient,
 
     // Subscribers
-    _listeners: std.ArrayList(*const fn (event: AgentEvent) void),
+    _listeners: std.ArrayList(Listener),
 
     // Control
     _cancel_token: ?ai_types.CancelToken,
+    _pending_cancel: std.atomic.Value(bool),
     _is_running: bool,
 
     // Message queues
@@ -86,10 +101,15 @@ pub const Agent = struct {
     _transform_context_fn: ?TransformContextFn,
     _transform_context_ctx: ?*anyopaque,
     _session_id: ?[]const u8,
+    _execute_tool_via_protocol_fn: ?types.ToolProtocolExecuteFn,
+    _execute_tool_via_protocol_ctx: ?*anyopaque,
+    _local_tool_protocol: ?*tool_local_runtime.LocalToolProtocol,
     _get_api_key_fn: ?GetApiKeyFn,
     _get_api_key_ctx: ?*anyopaque,
     _thinking_budgets: ?ai_types.ThinkingBudgets,
     _max_retry_delay_ms: ?u32,
+    _compact_tool_output: bool,
+    _permission_engine: ?*types.permission.PermissionEngine,
 
     // Async support
     _thread: ?std.Thread,
@@ -109,8 +129,9 @@ pub const Agent = struct {
             ._state = initial_state.?,
             ._allocator = allocator,
             ._protocol = options.protocol,
-            ._listeners = std.ArrayList(*const fn (event: AgentEvent) void).empty,
+            ._listeners = std.ArrayList(Listener).empty,
             ._cancel_token = null,
+            ._pending_cancel = std.atomic.Value(bool).init(false),
             ._is_running = false,
             ._steering_queue = std.ArrayList(ai_types.Message).empty,
             ._follow_up_queue = std.ArrayList(ai_types.Message).empty,
@@ -122,10 +143,15 @@ pub const Agent = struct {
             ._transform_context_fn = options.transform_context_fn,
             ._transform_context_ctx = options.transform_context_ctx,
             ._session_id = options.session_id,
+            ._execute_tool_via_protocol_fn = options.execute_tool_via_protocol_fn,
+            ._execute_tool_via_protocol_ctx = options.execute_tool_via_protocol_ctx,
+            ._local_tool_protocol = null,
             ._get_api_key_fn = options.get_api_key_fn,
             ._get_api_key_ctx = options.get_api_key_ctx,
             ._thinking_budgets = options.thinking_budgets,
             ._max_retry_delay_ms = options.max_retry_delay_ms,
+            ._compact_tool_output = options.compact_tool_output,
+            ._permission_engine = options.permission_engine,
             ._thread = null,
             ._done_event = .is_set,
             ._mutex = .init,
@@ -138,6 +164,12 @@ pub const Agent = struct {
         // Wait for any running thread to complete
         if (self._thread != null) {
             self.waitForIdle();
+        }
+
+        if (self._local_tool_protocol) |local| {
+            local.deinit();
+            self._allocator.destroy(local);
+            self._local_tool_protocol = null;
         }
 
         // Clear queues
@@ -162,16 +194,40 @@ pub const Agent = struct {
 
     // === Subscribe ===
 
+    fn legacyListenerShim(ctx: ?*anyopaque, event: AgentEvent) void {
+        const callback: *const fn (event: AgentEvent) void = @ptrCast(@alignCast(ctx.?));
+        callback(event);
+    }
+
     /// Subscribe to agent events.
     /// Returns a token that can be used to unsubscribe.
     pub fn subscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
-        self._listeners.append(self._allocator, callback) catch {};
+        self.subscribeWithContext(@ptrCast(@constCast(callback)), legacyListenerShim);
+    }
+
+    /// Subscribe to agent events with caller context.
+    pub fn subscribeWithContext(
+        self: *Agent,
+        ctx: ?*anyopaque,
+        callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void,
+    ) void {
+        self._listeners.append(self._allocator, .{ .callback = callback, .ctx = ctx }) catch {};
     }
 
     /// Unsubscribe from agent events.
     pub fn unsubscribe(self: *Agent, callback: *const fn (event: AgentEvent) void) void {
         for (self._listeners.items, 0..) |listener, i| {
-            if (listener == callback) {
+            if (listener.callback == legacyListenerShim and listener.ctx == @as(?*anyopaque, @ptrCast(@constCast(callback)))) {
+                _ = self._listeners.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Unsubscribe a contextual agent event listener.
+    pub fn unsubscribeWithContext(self: *Agent, ctx: ?*anyopaque, callback: *const fn (ctx: ?*anyopaque, event: AgentEvent) void) void {
+        for (self._listeners.items, 0..) |listener, i| {
+            if (listener.callback == callback and listener.ctx == ctx) {
                 _ = self._listeners.orderedRemove(i);
                 return;
             }
@@ -190,9 +246,47 @@ pub const Agent = struct {
         return self._state.is_streaming;
     }
 
+    pub const QueuedCounts = struct {
+        steering: usize = 0,
+        follow_up: usize = 0,
+
+        pub fn total(self: QueuedCounts) usize {
+            return self.steering + self.follow_up;
+        }
+    };
+
     /// Check if there are queued messages.
     pub fn hasQueuedMessages(self: Agent) bool {
         return self._steering_queue.items.len > 0 or self._follow_up_queue.items.len > 0;
+    }
+
+    /// Return queued steering and follow-up counts.
+    pub fn queuedCounts(self: *Agent) QueuedCounts {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+        return .{
+            .steering = self._steering_queue.items.len,
+            .follow_up = self._follow_up_queue.items.len,
+        };
+    }
+
+    /// Validate continueFromContext without mutating queues.
+    pub fn validateContinueFromContext(self: *Agent) !void {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._state.is_streaming or self._thread != null) {
+            return error.AgentAlreadyStreaming;
+        }
+        if (self._state.model == null) {
+            return error.NoModelConfigured;
+        }
+
+        const messages = self._state.messages.items;
+        if (messages.len == 0) return error.NoMessagesToContinue;
+        if (messages[messages.len - 1] == .assistant and self._steering_queue.items.len == 0 and self._follow_up_queue.items.len == 0) {
+            return error.CannotContinueFromAssistant;
+        }
     }
 
     // === State Mutators ===
@@ -220,6 +314,14 @@ pub const Agent = struct {
         self._state.tools = tools;
     }
 
+    pub fn setCompactToolOutput(self: *Agent, enabled: bool) void {
+        self._compact_tool_output = enabled;
+    }
+
+    pub fn setPermissionEngine(self: *Agent, engine: ?*types.permission.PermissionEngine) void {
+        self._permission_engine = engine;
+    }
+
     /// Set the steering mode.
     pub fn setSteeringMode(self: *Agent, mode: QueueMode) void {
         self._steering_mode = mode;
@@ -240,7 +342,7 @@ pub const Agent = struct {
         return self._follow_up_mode;
     }
 
-    /// Replace all messages with the given slice.
+    /// Replace all messages with deep-cloned copies of the given slice.
     pub fn replaceMessages(self: *Agent, messages: []const ai_types.Message) !void {
         // Clear existing messages
         for (self._state.messages.items) |*msg| {
@@ -250,8 +352,13 @@ pub const Agent = struct {
 
         // Add new messages (deep copy)
         for (messages) |msg| {
-            try self._state.messages.append(self._allocator, msg);
+            try self._state.messages.append(self._allocator, try ai_types.cloneMessage(self._allocator, msg));
         }
+    }
+
+    /// Compact older conversation history into a bounded summary message.
+    pub fn compactMessages(self: *Agent) !ai_types.CompactMessagesResult {
+        return try ai_types.compactMessageHistory(self._allocator, &self._state.messages);
     }
 
     /// Append a message to the conversation.
@@ -447,6 +554,7 @@ pub const Agent = struct {
 
     /// Abort the current operation.
     pub fn abort(self: *Agent) void {
+        self._pending_cancel.store(true, .release);
         if (self._cancel_token) |token| {
             token.cancelled.store(true, .release);
         }
@@ -457,6 +565,59 @@ pub const Agent = struct {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
         return !self._state.is_streaming;
+    }
+
+    fn prepareContinueFromContextLocked(self: *Agent) !ContinueRequest {
+        const messages = self._state.messages.items;
+        if (messages.len == 0) {
+            return error.NoMessagesToContinue;
+        }
+
+        if (messages[messages.len - 1] == .assistant) {
+            if (self._steering_queue.items.len > 0) {
+                const steering = try self.dequeueSteeringMessagesLocked();
+                return .{ .messages = steering, .skip_steering = true };
+            }
+
+            if (self._follow_up_queue.items.len > 0) {
+                const follow_up = try self.dequeueFollowUpMessagesLocked();
+                return .{ .messages = follow_up, .skip_steering = false };
+            }
+
+            return error.CannotContinueFromAssistant;
+        }
+
+        return .{ .messages = try self._allocator.alloc(ai_types.Message, 0), .skip_steering = false };
+    }
+
+    /// Continue from current context asynchronously.
+    /// Use waitForIdle() to block until completion.
+    pub fn continueFromContextAsync(self: *Agent) !void {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._state.is_streaming or self._thread != null) {
+            return error.AgentAlreadyStreaming;
+        }
+        if (self._state.model == null) {
+            return error.NoModelConfigured;
+        }
+
+        const request = try self.prepareContinueFromContextLocked();
+        errdefer {
+            for (request.messages) |*msg| msg.deinit(self._allocator);
+            self._allocator.free(request.messages);
+        }
+
+        self._pending_cancel.store(false, .release);
+        self._cancel_token = .{ .cancelled = &self._pending_cancel };
+        self._done_event.reset();
+        self._state.is_streaming = true;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, request.messages, request.skip_steering });
     }
 
     /// Wait for the agent to become idle.
@@ -471,16 +632,16 @@ pub const Agent = struct {
             return;
         }
 
-        // Wait for the done event (blocks until set)
+        // Wait for the done event (blocks until worker cleanup is complete).
         self._done_event.waitUncancelable(defaultIo());
 
-        // Join the thread if it exists
         self._mutex.lockUncancelable(defaultIo());
-        defer self._mutex.unlock(defaultIo());
+        const thread = self._thread;
+        self._thread = null;
+        self._mutex.unlock(defaultIo());
 
-        if (self._thread) |t| {
+        if (thread) |t| {
             t.join();
-            self._thread = null;
         }
     }
 
@@ -491,7 +652,7 @@ pub const Agent = struct {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
 
-        if (self._state.is_streaming) {
+        if (self._state.is_streaming or self._thread != null) {
             return error.AgentAlreadyStreaming;
         }
 
@@ -507,19 +668,31 @@ pub const Agent = struct {
         // Deep copy messages for thread ownership
         const owned_messages = try self.copyMessagesForThread(messages);
 
-        // Reset done event and set streaming flag
+        // Reset cancellation, done event, and streaming flag before spawning.
+        self._pending_cancel.store(false, .release);
+        self._cancel_token = .{ .cancelled = &self._pending_cancel };
         self._done_event.reset();
         self._state.is_streaming = true;
+        errdefer {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+        }
 
         // Spawn thread
-        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, false });
+        self._thread = try std.Thread.spawn(.{}, runLoopThread, .{ self, owned_messages, true });
     }
 
     /// Deep copy messages for thread ownership
     fn copyMessagesForThread(self: *Agent, messages: []const ai_types.Message) ![]ai_types.Message {
         const owned = try self._allocator.alloc(ai_types.Message, messages.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (owned[0..initialized]) |*msg| msg.deinit(self._allocator);
+            self._allocator.free(owned);
+        }
         for (messages, 0..) |msg, i| {
             owned[i] = try self.cloneMessage(msg);
+            initialized += 1;
         }
         return owned;
     }
@@ -536,13 +709,27 @@ pub const Agent = struct {
         };
     }
 
+    fn setStreamMessage(self: *Agent, msg: ai_types.Message) !void {
+        var cloned = try self.cloneMessage(msg);
+        errdefer cloned.deinit(self._allocator);
+
+        self._state.clearStreamMessage();
+        self._state.stream_message = cloned;
+    }
+
     fn cloneUserContent(self: *Agent, content: ai_types.UserContent) !ai_types.UserContent {
         return switch (content) {
             .text => |t| .{ .text = try self._allocator.dupe(u8, t) },
             .parts => |parts| blk: {
                 var cloned_parts = try self._allocator.alloc(ai_types.UserContentPart, parts.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (cloned_parts[0..initialized]) |*part| part.deinit(self._allocator);
+                    self._allocator.free(cloned_parts);
+                }
                 for (parts, 0..) |p, i| {
                     cloned_parts[i] = try self.cloneUserContentPart(p);
+                    initialized += 1;
                 }
                 break :blk .{ .parts = cloned_parts };
             },
@@ -560,60 +747,111 @@ pub const Agent = struct {
     }
 
     fn cloneAssistantMessage(self: *Agent, msg: ai_types.AssistantMessage) !ai_types.AssistantMessage {
-        var content = try self._allocator.alloc(ai_types.AssistantContent, msg.content.len);
-        for (msg.content, 0..) |c, i| {
-            content[i] = try self.cloneAssistantContent(c);
-        }
-        return .{
-            .content = content,
-            .api = try self._allocator.dupe(u8, msg.api),
-            .provider = try self._allocator.dupe(u8, msg.provider),
-            .model = try self._allocator.dupe(u8, msg.model),
-            .usage = msg.usage,
-            .stop_reason = msg.stop_reason,
-            .error_message = if (msg.getErrorMessage()) |e|
-                ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, e))
-            else
-                ai_types.OwnedSlice(u8).initBorrowed(""),
-            .timestamp = msg.timestamp,
-            .is_owned = true,
-        };
-    }
-
-    fn cloneAssistantContent(self: *Agent, content: ai_types.AssistantContent) !ai_types.AssistantContent {
-        return switch (content) {
-            .text => |t| .{ .text = .{ .text = try self._allocator.dupe(u8, t.text) } },
-            .thinking => |t| .{ .thinking = .{ .thinking = try self._allocator.dupe(u8, t.thinking) } },
-            .tool_call => |tc| .{ .tool_call = .{
-                .id = try self._allocator.dupe(u8, tc.id),
-                .name = try self._allocator.dupe(u8, tc.name),
-                .arguments_json = try self._allocator.dupe(u8, tc.arguments_json),
-            } },
-            .image => |i| .{ .image = .{
-                .data = try self._allocator.dupe(u8, i.data),
-                .mime_type = try self._allocator.dupe(u8, i.mime_type),
-            } },
-        };
+        return ai_types.cloneAssistantMessage(self._allocator, msg);
     }
 
     fn cloneToolResultMessage(self: *Agent, msg: ai_types.ToolResultMessage) !ai_types.ToolResultMessage {
         var content = try self._allocator.alloc(ai_types.UserContentPart, msg.content.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (content[0..initialized]) |*part| part.deinit(self._allocator);
+            self._allocator.free(content);
+        }
         for (msg.content, 0..) |c, i| {
             content[i] = .{ .text = .{ .text = try self._allocator.dupe(u8, c.text.text) } };
+            initialized += 1;
         }
 
         const details_json = if (msg.getDetailsJson()) |d|
             ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, d))
         else
             ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = details_json;
+            mutable.deinit(self._allocator);
+        }
+
+        const artifacts = try self.cloneArtifactReferences(msg.artifacts.slice());
+        errdefer {
+            var mutable = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts);
+            mutable.deinit(self._allocator);
+        }
+
+        const tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id);
+        errdefer self._allocator.free(tool_call_id);
+        const tool_name = try self._allocator.dupe(u8, msg.tool_name);
+        errdefer self._allocator.free(tool_name);
 
         return .{
-            .tool_call_id = try self._allocator.dupe(u8, msg.tool_call_id),
-            .tool_name = try self._allocator.dupe(u8, msg.tool_name),
+            .tool_call_id = tool_call_id,
+            .tool_name = tool_name,
             .content = content,
             .details_json = details_json,
+            .artifacts = ai_types.OwnedSlice(ai_types.ArtifactReference).initOwned(artifacts),
             .is_error = msg.is_error,
             .timestamp = msg.timestamp,
+        };
+    }
+
+    fn cloneArtifactReferences(self: *Agent, artifacts: []const ai_types.ArtifactReference) ![]ai_types.ArtifactReference {
+        const cloned = try self._allocator.alloc(ai_types.ArtifactReference, artifacts.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (cloned[0..initialized]) |*artifact| artifact.deinit(self._allocator);
+            self._allocator.free(cloned);
+        }
+
+        for (artifacts, 0..) |artifact, i| {
+            cloned[i] = try self.cloneArtifactReference(artifact);
+            initialized += 1;
+        }
+
+        return cloned;
+    }
+
+    fn cloneArtifactReference(self: *Agent, artifact: ai_types.ArtifactReference) !ai_types.ArtifactReference {
+        const artifact_id = try self._allocator.dupe(u8, artifact.artifact_id);
+        errdefer self._allocator.free(artifact_id);
+
+        const uri = if (artifact.getUri()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = uri;
+            mutable.deinit(self._allocator);
+        }
+
+        const mime_type = if (artifact.getMimeType()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = mime_type;
+            mutable.deinit(self._allocator);
+        }
+
+        const sha256 = if (artifact.getSha256()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+        errdefer {
+            var mutable = sha256;
+            mutable.deinit(self._allocator);
+        }
+
+        const description = if (artifact.getDescription()) |value|
+            ai_types.OwnedSlice(u8).initOwned(try self._allocator.dupe(u8, value))
+        else
+            ai_types.OwnedSlice(u8).initBorrowed("");
+
+        return .{
+            .artifact_id = artifact_id,
+            .uri = uri,
+            .mime_type = mime_type,
+            .byte_size = artifact.byte_size,
+            .sha256 = sha256,
+            .description = description,
         };
     }
 
@@ -628,13 +866,12 @@ pub const Agent = struct {
             }
             self._allocator.free(messages);
 
-            // Signal completion
-            self._done_event.set(defaultIo());
-
-            // Update state under lock
+            // Finish worker-visible cleanup before waking waiters.
             self._mutex.lockUncancelable(defaultIo());
             self._state.is_streaming = false;
             self._mutex.unlock(defaultIo());
+
+            self._done_event.set(defaultIo());
         }
 
         if (messages.len > 0 and self._state.model == null) {
@@ -642,6 +879,9 @@ pub const Agent = struct {
         }
 
         var run_messages: ?[]const ai_types.Message = if (messages.len > 0) messages else null;
+        if (messages.len == 0 and self._state.messages.items.len == 0) {
+            return;
+        }
 
         // Run the loop. runLoopInternal only clears run_messages after the
         // prompt slice has been consumed successfully. If an error occurs before
@@ -659,7 +899,7 @@ pub const Agent = struct {
         self.clearMessages();
         self.clearAllQueues();
         self._state.is_streaming = false;
-        self._state.stream_message = null;
+        self._state.clearStreamMessage();
         self._state.pending_tool_calls.clearRetainingCapacity();
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
@@ -673,7 +913,7 @@ pub const Agent = struct {
 
     fn runLoop(self: *Agent, messages: []const ai_types.Message) !void {
         var run_messages: ?[]const ai_types.Message = messages;
-        try self.runLoopInternal(&run_messages, .{});
+        try self.runLoopInternal(&run_messages, .{ .skip_initial_steering_poll = true });
     }
 
     fn runLoopInternal(
@@ -683,15 +923,18 @@ pub const Agent = struct {
     ) !void {
         const model = self._state.model orelse return error.NoModelConfigured;
 
-        // Set up cancel token
-        var cancelled = std.atomic.Value(bool).init(false);
-        self._cancel_token = .{ .cancelled = &cancelled };
+        // Set up cancel token. promptAsync/continueFromContextAsync install this
+        // before spawning so immediate aborts reach provider options.
+        if (self._cancel_token == null) {
+            self._cancel_token = .{ .cancelled = &self._pending_cancel };
+        }
         self._state.is_streaming = true;
         errdefer {
             self._state.is_streaming = false;
             self._cancel_token = null;
+            self._state.clearStreamMessage();
         }
-        self._state.stream_message = null;
+        self._state.clearStreamMessage();
         self._state.error_message.deinit(self._allocator);
         self._state.error_message = types.OwnedSlice(u8).initBorrowed("");
 
@@ -705,9 +948,25 @@ pub const Agent = struct {
         context.system_prompt = types.OwnedSlice(u8).initBorrowed(self._state.system_prompt);
         context.tools = self._state.tools;
 
-        // Copy existing messages
+        // Copy existing state messages into the loop context. AgentContext owns
+        // its messages and frees them on deinit, while AgentState also owns its
+        // history, so context must receive independent clones.
         for (self._state.messages.items) |msg| {
-            try context.appendMessage(msg);
+            var cloned = try self.cloneMessage(msg);
+            errdefer cloned.deinit(self._allocator);
+            try context.appendMessage(cloned);
+        }
+
+        if (self._execute_tool_via_protocol_fn == null) {
+            if (self._local_tool_protocol == null) {
+                const local = try self._allocator.create(tool_local_runtime.LocalToolProtocol);
+                errdefer self._allocator.destroy(local);
+                local.* = try tool_local_runtime.LocalToolProtocol.init(self._allocator, self._state.tools);
+                self._local_tool_protocol = local;
+            } else {
+                self._local_tool_protocol.?.server.tools.clearRetainingCapacity();
+                try self._local_tool_protocol.?.server.registerTools(self._state.tools);
+            }
         }
 
         // Build config. Agent remains auth-agnostic; provider layer owns credentials.
@@ -715,14 +974,19 @@ pub const Agent = struct {
             .model = model,
             .protocol = self._protocol,
             .tools = self._state.tools,
+            .execute_tool_via_protocol_fn = self._execute_tool_via_protocol_fn orelse tool_local_runtime.LocalToolProtocol.executeFn,
+            .execute_tool_via_protocol_ctx = self._execute_tool_via_protocol_ctx orelse self._local_tool_protocol,
             .temperature = null,
-            .max_tokens = null,
+            .max_tokens = model.max_tokens,
             .api_key = null,
             .cancel_token = self._cancel_token,
+            .thinking_level = self._state.thinking_level,
             .max_iterations = null,
             .session_id = self._session_id,
             .thinking_budgets = self._thinking_budgets,
             .max_retry_delay_ms = self._max_retry_delay_ms,
+            .compact_tool_output = self._compact_tool_output,
+            .permission_engine = self._permission_engine,
             .transform_context_fn = self._transform_context_fn,
             .transform_context_ctx = self._transform_context_ctx,
             .get_steering_messages_fn = getSteeringMessages,
@@ -752,18 +1016,24 @@ pub const Agent = struct {
 
         // Process events
         while (stream.wait()) |event| {
+            var owned_event = event;
+            defer owned_event.deinit(self._allocator);
+
             // Update internal state based on events
-            switch (event) {
+            switch (owned_event) {
                 .message_start => |e| {
-                    self._state.stream_message = e.message;
+                    try self.setStreamMessage(e.message);
                 },
                 .message_update => |e| {
-                    self._state.stream_message = .{ .assistant = e.message };
+                    try self.setStreamMessage(.{ .assistant = e.message });
                 },
                 .message_end => |e| {
-                    // Add message to state
-                    try self._state.messages.append(self._allocator, e.message);
-                    self._state.stream_message = null;
+                    // Add an owned copy to Agent state; event payloads may be borrowed
+                    // from loop context/provider buffers and are freed elsewhere.
+                    var cloned_message = try self.cloneMessage(e.message);
+                    errdefer cloned_message.deinit(self._allocator);
+                    try self._state.messages.append(self._allocator, cloned_message);
+                    self._state.clearStreamMessage();
                 },
                 .tool_execution_start => |e| {
                     try self._state.pending_tool_calls.put(e.tool_call_id, {});
@@ -779,13 +1049,13 @@ pub const Agent = struct {
                 },
                 .agent_end => {
                     self._state.is_streaming = false;
-                    self._state.stream_message = null;
+                    self._state.clearStreamMessage();
                 },
                 else => {},
             }
 
             // Emit to listeners
-            self.emit(event);
+            self.emit(owned_event);
         }
 
         // Transfer ownership if any prompts were actually consumed (appended to
@@ -802,43 +1072,45 @@ pub const Agent = struct {
         // stream with neither result nor error (e.g., OOM in completeWithError)
         // is also treated as failure.
         if (stream.getError() != null) {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+            self._pending_cancel.store(false, .release);
             return error.AgentLoopFailed;
         }
         if (stream.getResult()) |result| {
             if (result.final_message.stop_reason == .@"error") {
+                self._state.is_streaming = false;
+                self._cancel_token = null;
+                self._pending_cancel.store(false, .release);
                 return error.AgentLoopFailed;
             }
         } else if (stream.isDone()) {
+            self._state.is_streaming = false;
+            self._cancel_token = null;
+            self._pending_cancel.store(false, .release);
             return error.AgentLoopFailed;
         }
 
         self._state.is_streaming = false;
         self._cancel_token = null;
+        self._pending_cancel.store(false, .release);
     }
 
     fn emit(self: *Agent, event: AgentEvent) void {
         for (self._listeners.items) |listener| {
-            listener(event);
+            listener.callback(listener.ctx, event);
         }
     }
 
-    fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
-        self._mutex.lockUncancelable(defaultIo());
-        defer self._mutex.unlock(defaultIo());
-
+    fn dequeueSteeringMessagesLocked(self: *Agent) ![]ai_types.Message {
         if (self._steering_mode == .one_at_a_time) {
-            if (self._steering_queue.items.len > 0) {
-                const first = self._steering_queue.orderedRemove(0);
-                const result = try self._allocator.alloc(ai_types.Message, 1);
-                result[0] = first;
-                return result;
-            }
-            return null;
+            const first = self._steering_queue.orderedRemove(0);
+            const result = try self._allocator.alloc(ai_types.Message, 1);
+            result[0] = first;
+            return result;
         }
 
         const count = self._steering_queue.items.len;
-        if (count == 0) return null;
-
         const result = try self._allocator.alloc(ai_types.Message, count);
         for (self._steering_queue.items, 0..) |msg, i| {
             result[i] = msg;
@@ -847,29 +1119,37 @@ pub const Agent = struct {
         return result;
     }
 
-    fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
+    fn dequeueSteeringMessages(self: *Agent) !?[]ai_types.Message {
         self._mutex.lockUncancelable(defaultIo());
         defer self._mutex.unlock(defaultIo());
 
+        if (self._steering_queue.items.len == 0) return null;
+        return try self.dequeueSteeringMessagesLocked();
+    }
+
+    fn dequeueFollowUpMessagesLocked(self: *Agent) ![]ai_types.Message {
         if (self._follow_up_mode == .one_at_a_time) {
-            if (self._follow_up_queue.items.len > 0) {
-                const first = self._follow_up_queue.orderedRemove(0);
-                const result = try self._allocator.alloc(ai_types.Message, 1);
-                result[0] = first;
-                return result;
-            }
-            return null;
+            const first = self._follow_up_queue.orderedRemove(0);
+            const result = try self._allocator.alloc(ai_types.Message, 1);
+            result[0] = first;
+            return result;
         }
 
         const count = self._follow_up_queue.items.len;
-        if (count == 0) return null;
-
         const result = try self._allocator.alloc(ai_types.Message, count);
         for (self._follow_up_queue.items, 0..) |msg, i| {
             result[i] = msg;
         }
         self._follow_up_queue.clearRetainingCapacity();
         return result;
+    }
+
+    fn dequeueFollowUpMessages(self: *Agent) !?[]ai_types.Message {
+        self._mutex.lockUncancelable(defaultIo());
+        defer self._mutex.unlock(defaultIo());
+
+        if (self._follow_up_queue.items.len == 0) return null;
+        return try self.dequeueFollowUpMessagesLocked();
     }
 
     // === Static Callbacks ===
@@ -1085,6 +1365,37 @@ fn createDelayedErrorProtocol() types.ProtocolClient {
     };
 }
 
+const CaptureOptionsCtx = struct {
+    max_tokens: ?u32 = null,
+};
+
+fn captureOptionsStreamFn(
+    ctx: ?*anyopaque,
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: types.ProtocolOptions,
+    allocator: std.mem.Allocator,
+) anyerror!*event_stream_mod.AssistantMessageEventStream {
+    _ = context;
+    const capture: *CaptureOptionsCtx = @ptrCast(@alignCast(ctx.?));
+    capture.max_tokens = options.max_tokens;
+
+    const stream = try allocator.create(event_stream_mod.AssistantMessageEventStream);
+    stream.* = event_stream_mod.AssistantMessageEventStream.init(allocator);
+    const message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = model.api,
+        .provider = model.provider,
+        .model = model.id,
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    stream.push(.{ .done = .{ .reason = .stop, .message = message } }) catch {};
+    stream.complete(message);
+    return stream;
+}
+
 const test_model = ai_types.Model{
     .id = "test-model",
     .name = "Test Model",
@@ -1111,6 +1422,79 @@ test "Agent async completion signals waitForIdle" {
     try std.testing.expect(agent._thread == null);
 }
 
+test "Agent passes model max_tokens to protocol" {
+    var capture = CaptureOptionsCtx{};
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = .{ .stream_fn = captureOptionsStreamFn, .ctx = &capture } });
+    defer agent.deinit();
+    var model = test_model;
+    model.max_tokens = 8192;
+    agent.setModel(model);
+
+    const text = try std.testing.allocator.dupe(u8, "hello");
+    const message = ai_types.Message{ .user = .{ .content = .{ .text = text }, .timestamp = 0 } };
+    try agent.prompt(@as([]const ai_types.Message, &.{message}));
+
+    try std.testing.expectEqual(@as(?u32, 8192), capture.max_tokens);
+}
+
+test "Agent validateContinueFromContext reports resume errors" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoModelConfigured, agent.validateContinueFromContext());
+    agent.setModel(test_model);
+    try std.testing.expectError(error.NoMessagesToContinue, agent.validateContinueFromContext());
+}
+
+test "Agent continueFromContextAsync rejects missing model" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+
+    const text = try std.testing.allocator.dupe(u8, "hi");
+    try agent.appendMessage(.{ .user = .{ .content = .{ .text = text }, .timestamp = 0 } });
+    try std.testing.expectError(error.NoModelConfigured, agent.continueFromContextAsync());
+    try std.testing.expect(!agent.isStreaming());
+    try std.testing.expect(agent._thread == null);
+}
+
+test "Agent continueFromContextAsync mirrors sync resume checks" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createDelayedErrorProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    const assistant = ai_types.Message{ .assistant = .{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    } };
+    try agent.appendMessage(assistant);
+
+    try std.testing.expectError(error.CannotContinueFromAssistant, agent.continueFromContextAsync());
+
+    const steering_text = try std.testing.allocator.dupe(u8, "steer");
+    try agent.steer(.{ .user = .{ .content = .{ .text = steering_text }, .timestamp = 1 } });
+    try agent.continueFromContextAsync();
+    try std.testing.expect(agent.isStreaming());
+    agent.waitForIdle();
+    try std.testing.expectEqual(@as(usize, 0), agent._steering_queue.items.len);
+}
+
+test "Agent installs cancel token before async worker can run" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
+    defer agent.deinit();
+    agent.setModel(test_model);
+
+    const msg = ai_types.Message{ .user = .{ .content = .{ .text = "cancel me" }, .timestamp = 0 } };
+    try agent.promptAsync(msg);
+    try std.testing.expect(agent._cancel_token != null);
+    agent.abort();
+    try std.testing.expect(agent._cancel_token.?.isCancelled());
+    agent.waitForIdle();
+}
 test "Agent cloneMessage" {
     var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
     defer agent.deinit();
@@ -1127,4 +1511,32 @@ test "Agent cloneMessage" {
 
     try std.testing.expect(cloned == .user);
     try std.testing.expectEqualStrings("Hello, world!", cloned.user.content.text);
+}
+
+test "Agent cloneMessage preserves assistant signatures" {
+    var agent = Agent.init(std.testing.allocator, .{ .protocol = createMockProtocol() });
+    defer agent.deinit();
+
+    const content = [_]ai_types.AssistantContent{
+        .{ .text = .{ .text = "text", .text_signature = "text-sig" } },
+        .{ .thinking = .{ .thinking = "thought", .thinking_signature = "thinking-sig" } },
+        .{ .tool_call = .{ .id = "tool-id", .name = "tool", .arguments_json = "{}", .thought_signature = "thought-sig" } },
+    };
+    const original = ai_types.Message{ .assistant = .{
+        .content = &content,
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 12345,
+    } };
+
+    var cloned = try agent.cloneMessage(original);
+    defer cloned.deinit(std.testing.allocator);
+
+    try std.testing.expect(cloned == .assistant);
+    try std.testing.expectEqualStrings("text-sig", cloned.assistant.content[0].text.text_signature.?);
+    try std.testing.expectEqualStrings("thinking-sig", cloned.assistant.content[1].thinking.thinking_signature.?);
+    try std.testing.expectEqualStrings("thought-sig", cloned.assistant.content[2].tool_call.thought_signature.?);
 }
