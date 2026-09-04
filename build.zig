@@ -10,13 +10,13 @@ pub fn build(b: *std.Build) void {
     const zigzag_mod = zigzag_dep.module("zigzag");
 
     const ai_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/ai_types.zig"),
+        .root_source_file = b.path("zig/src/ai_types.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const event_stream_mod = b.createModule(.{
-        .root_source_file = b.path("src/event_stream.zig"),
+        .root_source_file = b.path("zig/src/event_stream.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -28,19 +28,19 @@ pub fn build(b: *std.Build) void {
     ai_types_mod.addImport("event_stream", event_stream_mod);
 
     const sse_parser_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/sse_parser.zig"),
+        .root_source_file = b.path("zig/src/providers/sse_parser.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const json_writer_mod = b.createModule(.{
-        .root_source_file = b.path("src/json/writer.zig"),
+        .root_source_file = b.path("zig/src/json/writer.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const owned_slice_mod = b.createModule(.{
-        .root_source_file = b.path("src/owned_slice.zig"),
+        .root_source_file = b.path("zig/src/owned_slice.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -49,19 +49,19 @@ pub fn build(b: *std.Build) void {
     ai_types_mod.addImport("owned_slice", owned_slice_mod);
 
     const string_builder_mod = b.createModule(.{
-        .root_source_file = b.path("src/string_builder.zig"),
+        .root_source_file = b.path("zig/src/string_builder.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const hive_array_mod = b.createModule(.{
-        .root_source_file = b.path("src/hive_array.zig"),
+        .root_source_file = b.path("zig/src/hive_array.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const compat_mod = b.createModule(.{
-        .root_source_file = b.path("src/compat/mod.zig"),
+        .root_source_file = b.path("zig/src/compat/mod.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -70,13 +70,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const streaming_json_mod = b.createModule(.{
-        .root_source_file = b.path("src/streaming_json.zig"),
+        .root_source_file = b.path("zig/src/streaming_json.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const tool_call_tracker_mod = b.createModule(.{
-        .root_source_file = b.path("src/tool_call_tracker.zig"),
+        .root_source_file = b.path("zig/src/tool_call_tracker.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const artifact_store_mod = b.createModule(.{
-        .root_source_file = b.path("src/artifact/store.zig"),
+        .root_source_file = b.path("zig/src/artifact/store.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -99,7 +99,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const oauth_storage_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/storage.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/storage.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -112,7 +112,7 @@ pub fn build(b: *std.Build) void {
     }
 
     const refresh_lock_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/refresh_lock.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/refresh_lock.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -121,7 +121,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const api_registry_mod = b.createModule(.{
-        .root_source_file = b.path("src/api_registry.zig"),
+        .root_source_file = b.path("zig/src/api_registry.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -132,7 +132,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const github_copilot_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/github_copilot.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/github_copilot.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -142,7 +142,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const oauth_utils_pkce_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/pkce.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/pkce.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -151,7 +151,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const oauth_anthropic_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/anthropic.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/anthropic.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -162,7 +162,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const oauth_openai_codex_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oauth/openai_codex.zig"),
+        .root_source_file = b.path("zig/src/utils/oauth/openai_codex.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -172,7 +172,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const auth_resolver_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/auth_resolver.zig"),
+        .root_source_file = b.path("zig/src/utils/auth_resolver.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -182,19 +182,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const auth_provider_defs_mod = b.createModule(.{
-        .root_source_file = b.path("src/auth/providers.zig"),
+        .root_source_file = b.path("zig/src/auth/providers.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const provider_caps_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/provider_caps.zig"),
+        .root_source_file = b.path("zig/src/utils/provider_caps.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const overflow_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/overflow.zig"),
+        .root_source_file = b.path("zig/src/utils/overflow.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -203,7 +203,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const retry_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/retry.zig"),
+        .root_source_file = b.path("zig/src/utils/retry.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -212,19 +212,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const oom_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/oom.zig"),
+        .root_source_file = b.path("zig/src/utils/oom.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const sanitize_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/sanitize.zig"),
+        .root_source_file = b.path("zig/src/utils/sanitize.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const pre_transform_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/pre_transform.zig"),
+        .root_source_file = b.path("zig/src/utils/pre_transform.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -235,7 +235,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_helpers_mod = b.createModule(.{
-        .root_source_file = b.path("test/e2e/test_helpers.zig"),
+        .root_source_file = b.path("zig/test/e2e/test_helpers.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -248,7 +248,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const oauth_pkce_mod = b.createModule(.{
-        .root_source_file = b.path("src/oauth/pkce.zig"),
+        .root_source_file = b.path("zig/src/oauth/pkce.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -257,7 +257,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const openai_completions_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/openai_completions_api.zig"),
+        .root_source_file = b.path("zig/src/providers/openai_completions_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -278,7 +278,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const anthropic_messages_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/anthropic_messages_api.zig"),
+        .root_source_file = b.path("zig/src/providers/anthropic_messages_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -299,7 +299,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const openai_responses_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/openai_responses_api.zig"),
+        .root_source_file = b.path("zig/src/providers/openai_responses_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -320,7 +320,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const azure_openai_responses_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/azure_openai_responses_api.zig"),
+        .root_source_file = b.path("zig/src/providers/azure_openai_responses_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -334,7 +334,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const google_generative_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/google_generative_api.zig"),
+        .root_source_file = b.path("zig/src/providers/google_generative_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -353,7 +353,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const google_vertex_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/google_vertex_api.zig"),
+        .root_source_file = b.path("zig/src/providers/google_vertex_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -371,7 +371,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const ollama_api_mod = b.createModule(.{
-        .root_source_file = b.path("src/providers/ollama_api.zig"),
+        .root_source_file = b.path("zig/src/providers/ollama_api.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -389,7 +389,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const register_builtins_mod = b.createModule(.{
-        .root_source_file = b.path("src/register_builtins.zig"),
+        .root_source_file = b.path("zig/src/register_builtins.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -404,7 +404,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const stream_mod = b.createModule(.{
-        .root_source_file = b.path("src/stream.zig"),
+        .root_source_file = b.path("zig/src/stream.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -415,7 +415,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/transport.zig"),
+        .root_source_file = b.path("zig/src/transport.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -427,7 +427,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const stdio_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/transports/stdio.zig"),
+        .root_source_file = b.path("zig/src/transports/stdio.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -437,7 +437,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const sse_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/transports/sse.zig"),
+        .root_source_file = b.path("zig/src/transports/sse.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -449,7 +449,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const websocket_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/transports/websocket.zig"),
+        .root_source_file = b.path("zig/src/transports/websocket.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -460,7 +460,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const in_process_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/transports/in_process.zig"),
+        .root_source_file = b.path("zig/src/transports/in_process.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -473,7 +473,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const transport_retry_mod = b.createModule(.{
-        .root_source_file = b.path("src/transports/transport_retry.zig"),
+        .root_source_file = b.path("zig/src/transports/transport_retry.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -486,12 +486,12 @@ pub fn build(b: *std.Build) void {
 
     // Standalone protocol helper modules (no runtime wiring in M-003 scope).
     const protocol_model_ref_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/model_ref.zig"),
+        .root_source_file = b.path("zig/src/protocol/model_ref.zig"),
         .target = target,
         .optimize = optimize,
     });
     const protocol_model_catalog_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/model_catalog_types.zig"),
+        .root_source_file = b.path("zig/src/protocol/model_catalog_types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -503,7 +503,7 @@ pub fn build(b: *std.Build) void {
     // Protocol Provider Modules (protocol/provider/)
     // =========================================================================
     const content_partial_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/content_partial.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/content_partial.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -513,7 +513,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const partial_serializer_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/partial_serializer.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/partial_serializer.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -525,7 +525,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/types.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -537,7 +537,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_envelope_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/envelope.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/envelope.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -550,7 +550,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const partial_reconstructor_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/partial_reconstructor.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/partial_reconstructor.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -562,7 +562,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_server_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/server.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -586,7 +586,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_client_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/client.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/client.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -606,7 +606,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/provider/runtime.zig"),
+        .root_source_file = b.path("zig/src/protocol/provider/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -622,7 +622,7 @@ pub fn build(b: *std.Build) void {
     // Protocol Agent Modules (protocol/agent/)
     // =========================================================================
     const protocol_agent_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/agent/types.zig"),
+        .root_source_file = b.path("zig/src/protocol/agent/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -633,7 +633,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_agent_envelope_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/agent/envelope.zig"),
+        .root_source_file = b.path("zig/src/protocol/agent/envelope.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -646,7 +646,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_agent_server_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/agent/server.zig"),
+        .root_source_file = b.path("zig/src/protocol/agent/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -657,7 +657,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_agent_client_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/agent/client.zig"),
+        .root_source_file = b.path("zig/src/protocol/agent/client.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -670,7 +670,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_agent_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/agent/runtime.zig"),
+        .root_source_file = b.path("zig/src/protocol/agent/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -685,7 +685,7 @@ pub fn build(b: *std.Build) void {
     // Protocol Auth Modules (protocol/auth/)
     // =========================================================================
     const protocol_auth_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/auth/types.zig"),
+        .root_source_file = b.path("zig/src/protocol/auth/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -695,7 +695,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_auth_envelope_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/auth/envelope.zig"),
+        .root_source_file = b.path("zig/src/protocol/auth/envelope.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -707,7 +707,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_auth_server_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/auth/server.zig"),
+        .root_source_file = b.path("zig/src/protocol/auth/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -723,7 +723,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_auth_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/auth/runtime.zig"),
+        .root_source_file = b.path("zig/src/protocol/auth/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -737,7 +737,7 @@ pub fn build(b: *std.Build) void {
     // Protocol Tool Modules (protocol/tool/)
     // =========================================================================
     const protocol_tool_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/tool/types.zig"),
+        .root_source_file = b.path("zig/src/protocol/tool/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -747,7 +747,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_tool_envelope_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/tool/envelope.zig"),
+        .root_source_file = b.path("zig/src/protocol/tool/envelope.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -759,7 +759,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_tool_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/tool/runtime.zig"),
+        .root_source_file = b.path("zig/src/protocol/tool/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -770,7 +770,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const permission_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/permission.zig"),
+        .root_source_file = b.path("zig/src/tools/permission.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -780,7 +780,7 @@ pub fn build(b: *std.Build) void {
 
     // Agent modules
     const agent_types_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/types.zig"),
+        .root_source_file = b.path("zig/src/agent/types.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -793,7 +793,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const protocol_tool_local_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/protocol/tool/local_runtime.zig"),
+        .root_source_file = b.path("zig/src/protocol/tool/local_runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -810,7 +810,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const agent_loop_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/agent_loop.zig"),
+        .root_source_file = b.path("zig/src/agent/agent_loop.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -825,7 +825,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const agent_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/mod.zig"),
+        .root_source_file = b.path("zig/src/agent/mod.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -844,7 +844,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const agent_provider_protocol_bridge_mod = b.createModule(.{
-        .root_source_file = b.path("src/agent/provider_protocol_bridge.zig"),
+        .root_source_file = b.path("zig/src/agent/provider_protocol_bridge.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -861,7 +861,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_session_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/session.zig"),
+        .root_source_file = b.path("zig/src/tui/session.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -873,7 +873,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_config_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/config.zig"),
+        .root_source_file = b.path("zig/src/tui/config.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -882,20 +882,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
-    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "compat", .module = compat_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
-    const tools_file_mod = b.createModule(.{ .root_source_file = b.path("src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_hashline_mod = b.createModule(.{ .root_source_file = b.path("src/tools/hashline.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "protocol_tool_types", .module = protocol_tool_types_mod } } });
-    const tools_search_mod = b.createModule(.{ .root_source_file = b.path("src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
-    const tools_mcp_bridge_mod = b.createModule(.{ .root_source_file = b.path("src/tools/mcp_bridge.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "compat", .module = compat_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
-    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/hashline", .module = tools_hashline_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod }, .{ .name = "tools/mcp_bridge", .module = tools_mcp_bridge_mod } } });
+    const tools_common_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/common.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "artifact/store", .module = artifact_store_mod }, .{ .name = "compat", .module = compat_mod } } });
+    const tools_process_runner_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/process_runner.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "compat", .module = compat_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_artifact_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/artifact.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_shell_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/shell.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_file_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/file.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_edit_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/edit.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_hashline_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/hashline.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "protocol_tool_types", .module = protocol_tool_types_mod } } });
+    const tools_search_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/search.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_workspace_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/workspace.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod }, .{ .name = "tools/process_runner", .module = tools_process_runner_mod } } });
+    const tools_mcp_bridge_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/mcp_bridge.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "compat", .module = compat_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/common", .module = tools_common_mod } } });
+    const tools_registry_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tools/registry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "agent", .module = agent_mod }, .{ .name = "tools/shell", .module = tools_shell_mod }, .{ .name = "tools/file", .module = tools_file_mod }, .{ .name = "tools/edit", .module = tools_edit_mod }, .{ .name = "tools/hashline", .module = tools_hashline_mod }, .{ .name = "tools/search", .module = tools_search_mod }, .{ .name = "tools/workspace", .module = tools_workspace_mod }, .{ .name = "tools/artifact", .module = tools_artifact_mod }, .{ .name = "tools/mcp_bridge", .module = tools_mcp_bridge_mod } } });
 
     const tui_runtime_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/runtime.zig"),
+        .root_source_file = b.path("zig/src/tui/runtime.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -928,7 +928,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_session_store_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/session_store.zig"),
+        .root_source_file = b.path("zig/src/tui/session_store.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -944,7 +944,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_state_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/state.zig"),
+        .root_source_file = b.path("zig/src/tui/state.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -957,7 +957,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_commands_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/commands.zig"),
+        .root_source_file = b.path("zig/src/tui/commands.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -970,23 +970,23 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    const tui_theme_mod = b.createModule(.{ .root_source_file = b.path("src/tui/theme.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod } } });
-    const tui_text_mod = b.createModule(.{ .root_source_file = b.path("src/tui/text.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
-    const tui_render_mod = b.createModule(.{ .root_source_file = b.path("src/tui/render.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
-    const tui_markdown_mod = b.createModule(.{ .root_source_file = b.path("src/tui/markdown.zig"), .target = target, .optimize = optimize, .imports = &.{} });
+    const tui_theme_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/theme.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod } } });
+    const tui_text_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/text.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
+    const tui_render_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/render.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "zigzag", .module = zigzag_mod }} });
+    const tui_markdown_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/markdown.zig"), .target = target, .optimize = optimize, .imports = &.{} });
 
-    const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_markdown", .module = tui_markdown_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
-    const tui_view_menu_picker_mod = b.createModule(.{ .root_source_file = b.path("src/tui/views/menu_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_transcript_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/transcript.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_markdown", .module = tui_markdown_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_composer_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/composer.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_status_bar_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/status_bar.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_tool_panel_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/tool_panel.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "ai_types", .module = ai_types_mod }, .{ .name = "agent", .module = agent_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_telemetry_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/telemetry.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_approval_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/approval.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_preview_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/preview.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_session_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/session_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "zigzag", .module = zigzag_mod }, .{ .name = "tui_state", .module = tui_state_mod }, .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
+    const tui_view_menu_picker_mod = b.createModule(.{ .root_source_file = b.path("zig/src/tui/views/menu_picker.zig"), .target = target, .optimize = optimize, .imports = &.{ .{ .name = "tui_theme", .module = tui_theme_mod }, .{ .name = "tui_text", .module = tui_text_mod }, .{ .name = "tui_render", .module = tui_render_mod } } });
 
     const tui_login_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/login.zig"),
+        .root_source_file = b.path("zig/src/tui/login.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -999,7 +999,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_model_catalog_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/model_catalog.zig"),
+        .root_source_file = b.path("zig/src/tui/model_catalog.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1011,7 +1011,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_app_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/app.zig"),
+        .root_source_file = b.path("zig/src/tui/app.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1050,7 +1050,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_tests_mock_provider_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/mock_provider.zig"),
+        .root_source_file = b.path("zig/src/tui/tests/mock_provider.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1062,7 +1062,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_tests_mock_transport_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/mock_transport.zig"),
+        .root_source_file = b.path("zig/src/tui/tests/mock_transport.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1071,7 +1071,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_tests_fixtures_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/fixtures/mod.zig"),
+        .root_source_file = b.path("zig/src/tui/tests/fixtures/mod.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1083,7 +1083,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_tests_scenarios_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/scenario_tests.zig"),
+        .root_source_file = b.path("zig/src/tui/tests/scenario_tests.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1100,7 +1100,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const tui_tests_e2e_mod = b.createModule(.{
-        .root_source_file = b.path("src/tui/tests/e2e_tests.zig"),
+        .root_source_file = b.path("zig/src/tui/tests/e2e_tests.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1137,7 +1137,7 @@ pub fn build(b: *std.Build) void {
 
     const api_registry_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/api_registry.zig"),
+            .root_source_file = b.path("zig/src/api_registry.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1150,7 +1150,7 @@ pub fn build(b: *std.Build) void {
 
     const stream_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/stream.zig"),
+            .root_source_file = b.path("zig/src/stream.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1196,7 +1196,7 @@ pub fn build(b: *std.Build) void {
 
     const oauth_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/oauth/mod.zig"),
+            .root_source_file = b.path("zig/src/oauth/mod.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1208,7 +1208,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_anthropic_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/anthropic_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/anthropic_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1224,7 +1224,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_openai_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/openai_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/openai_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1241,7 +1241,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_azure_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/azure_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/azure_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1257,7 +1257,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_google_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/google_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/google_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1273,7 +1273,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/ollama_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/ollama_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1290,7 +1290,7 @@ pub fn build(b: *std.Build) void {
     // Provider Protocol Fullstack E2E tests - Ollama
     const e2e_provider_protocol_fullstack_ollama_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/provider_protocol_fullstack_ollama.zig"),
+            .root_source_file = b.path("zig/test/e2e/provider_protocol_fullstack_ollama.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1311,7 +1311,7 @@ pub fn build(b: *std.Build) void {
     // Provider Protocol Fullstack E2E tests - GitHub Copilot
     const e2e_provider_protocol_fullstack_github_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/provider_protocol_fullstack_github.zig"),
+            .root_source_file = b.path("zig/test/e2e/provider_protocol_fullstack_github.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1333,7 +1333,7 @@ pub fn build(b: *std.Build) void {
     // Uses protocol_types as the root module to avoid conflict with server's local types.zig import
     const e2e_protocol_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/protocol.zig"),
+            .root_source_file = b.path("zig/test/e2e/protocol.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1349,7 +1349,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_tui_websocket_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/tui_websocket.zig"),
+            .root_source_file = b.path("zig/test/e2e/tui_websocket.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1362,7 +1362,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_distributed_fullstack_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/distributed_fullstack.zig"),
+            .root_source_file = b.path("zig/test/e2e/distributed_fullstack.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1388,7 +1388,7 @@ pub fn build(b: *std.Build) void {
 
     const e2e_distributed_fullstack_github_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/distributed_fullstack_github.zig"),
+            .root_source_file = b.path("zig/test/e2e/distributed_fullstack_github.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1510,7 +1510,7 @@ pub fn build(b: *std.Build) void {
 
     const agent_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/unit/agent.zig"),
+            .root_source_file = b.path("zig/test/unit/agent.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1525,7 +1525,7 @@ pub fn build(b: *std.Build) void {
 
     const agent_protocol_chain_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/unit/agent_protocol_chain.zig"),
+            .root_source_file = b.path("zig/test/unit/agent_protocol_chain.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -1550,7 +1550,7 @@ pub fn build(b: *std.Build) void {
     // tests can exercise it with in-memory IO without dragging in the entire
     // `makai.zig` surface.
     const auth_cli_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/auth_cli.zig"),
+        .root_source_file = b.path("zig/src/tools/auth_cli.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1564,7 +1564,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const makai_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/tools/makai.zig"),
+        .root_source_file = b.path("zig/src/tools/makai.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1622,14 +1622,14 @@ pub fn build(b: *std.Build) void {
     run_tui_step.dependOn(&run_tui_cmd.step);
 
     const counting_allocator_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench/counting_allocator.zig"),
+        .root_source_file = b.path("zig/src/bench/counting_allocator.zig"),
         .target = target,
         .optimize = optimize,
     });
     const bench_options = b.addOptions();
     bench_options.addOption([]const u8, "git_revision", b.option([]const u8, "git-revision", "Source revision recorded in benchmark reports") orelse "unknown");
     const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench/main.zig"),
+        .root_source_file = b.path("zig/src/bench/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -1649,7 +1649,7 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&bench_run.step);
 
     const bench_compare_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench/compare.zig"),
+        .root_source_file = b.path("zig/src/bench/compare.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "compat", .module = compat_mod }},
@@ -1961,7 +1961,7 @@ pub fn build(b: *std.Build) void {
     // GitHub Copilot E2E tests
     const e2e_github_copilot_test = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("test/e2e/github_copilot_api.zig"),
+            .root_source_file = b.path("zig/test/e2e/github_copilot_api.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -2008,4 +2008,14 @@ pub fn build(b: *std.Build) void {
 
     const test_protocol_types_step = b.step("test-protocol-types", "Run protocol types tests");
     test_protocol_types_step.dependOn(&b.addRunArtifact(protocol_types_test).step);
+
+    // Expose modules for consumers via `b.dependency("makai", .{}).module("...")`
+    b.modules.put(b.allocator, b.dupe("ai_types"), ai_types_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("event_stream"), event_stream_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("stream"), stream_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("api_registry"), api_registry_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("register_builtins"), register_builtins_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("transport"), transport_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("protocol_runtime"), protocol_runtime_mod) catch @panic("OOM");
+    b.modules.put(b.allocator, b.dupe("agent"), agent_mod) catch @panic("OOM");
 }

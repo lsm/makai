@@ -13,7 +13,7 @@ git_revision=${3:-$(git rev-parse HEAD)}
 mkdir -p "$output_directory"
 output_directory=$(cd "$output_directory" && pwd)
 
-cd "$(git rev-parse --show-toplevel)/zig"
+cd "$(git rev-parse --show-toplevel)"
 
 zig build bench -Doptimize=ReleaseFast -Dgit-revision="$git_revision" -- \
   --mode latency --samples 30 --iterations 100 --host-class "$host_class" \

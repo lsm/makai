@@ -93,7 +93,6 @@ jobs:
 
       - name: Compare with canonical baseline
         if: steps.baseline.outputs.found == 'true'
-        working-directory: zig
         run: |
           {
             echo '## Benchmark comparison'
@@ -101,7 +100,7 @@ jobs:
             echo '```text'
             comparison_valid=true
             for mode in latency allocation; do
-              if output=$(zig build bench-compare -Doptimize=ReleaseFast -- "../artifacts/baseline/$mode.jsonl" "../artifacts/candidate/$mode.jsonl" 2>&1); then
+              if output=$(zig build bench-compare -Doptimize=ReleaseFast -- "artifacts/baseline/$mode.jsonl" "artifacts/candidate/$mode.jsonl" 2>&1); then
                 printf '%s\n' "$output"
               else
                 comparison_valid=false
@@ -119,7 +118,7 @@ jobs:
               echo
               echo "Canonical source: workflow run ${{ steps.baseline.outputs.run_id }}."
             fi
-          } | tee ../artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
+          } | tee artifacts/candidate/comparison.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Explain unavailable comparison
         if: steps.baseline.outputs.found != 'true'

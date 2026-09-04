@@ -169,6 +169,19 @@ export async function resolveMakaiBinary(options: BinaryResolverOptions = {}): P
   }
 
   const binaryName = binaryNameForPlatform();
+
+  // Check bundled platform-specific package first
+  const platformKey = `${process.platform}-${process.arch}`;
+  const bundledPackage = `@makai/cli-${platformKey}`;
+  try {
+    const bundledBinaryName = process.platform === "win32" ? "makai.exe" : "makai";
+    const bundledPath = require.resolve(`${bundledPackage}/bin/${bundledBinaryName}`);
+    logger.debug("binary: resolved from bundled package", { path: bundledPath, package: bundledPackage });
+    return bundledPath;
+  } catch {
+    logger.debug("binary: bundled package not found", { package: bundledPackage });
+  }
+
   const localCandidates = [
     path.resolve(process.cwd(), "zig-out", "bin", binaryName),
     path.resolve(process.cwd(), "zig", "zig-out", "bin", binaryName),
