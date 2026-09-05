@@ -1101,6 +1101,7 @@ fn runLoop(
     // capped tool_use turn, an unprocessed queued steering/follow-up message,
     // or a zero-iteration run — the run terminated on max turns.
     var ended_before_cap = false;
+    var cancelled_run = false;
 
     // Outer loop: handles follow-up messages
     outer: while (state.iterations < max_iterations) {
@@ -1108,6 +1109,7 @@ fn runLoop(
         if (config.cancel_token) |token| {
             if (token.isCancelled()) {
                 ended_before_cap = true;
+                cancelled_run = true;
                 break;
             }
         }
@@ -1302,8 +1304,15 @@ fn runLoop(
 
     // Exiting the loop without a terminal break means the iteration-cap
     // condition ended the run: a capped tool_use turn, a queued steering or
-    // follow-up message that never ran, or a zero-iteration run.
-    const termination: ?types.AgentTermination = if (ended_before_cap) null else .max_turns;
+    // follow-up message that never ran, or a zero-iteration run. Cancellation
+    // is its own agent-level outcome so consumers never see a cancelled run
+    // reported through the previous turn's stop reason.
+    const termination: ?types.AgentTermination = if (cancelled_run)
+        .cancelled
+    else if (!ended_before_cap)
+        .max_turns
+    else
+        null;
 
     const result_final_message: ai_types.AssistantMessage = if (state.final_message) |fm| blk: {
         state.final_message = null;

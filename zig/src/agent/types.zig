@@ -14,10 +14,11 @@ pub const ArtifactReference = ai_types.ArtifactReference;
 
 /// Agent-level termination reason for a finished run. Distinct from the
 /// turn-scoped `StopReason` on assistant messages: when set, it reports why
-/// the *run* ended (e.g. the iteration cap) rather than echoing the final
-/// turn's own stop reason.
+/// the *run* ended (e.g. the iteration cap, cancellation) rather than echoing
+/// the final turn's own stop reason.
 pub const AgentTermination = enum {
     max_turns,
+    cancelled,
 };
 
 /// Payload for agent_end event

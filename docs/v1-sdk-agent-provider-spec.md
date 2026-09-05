@@ -324,7 +324,7 @@ export type ProviderStreamEvent =
 export type AgentStreamEvent =
   | ProviderStreamEvent
   | { type: "agent_start"; session_id?: string /* 21-character alphanumeric NanoID */ }
-  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary; error_message?: string; provider_id?: ProviderId }
+  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary; error_message?: string; provider_id?: ProviderId; api?: ApiId }
   | { type: "turn_start" }
   | { type: "turn_end"; stop_reason?: StopReason; error_message?: string }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }

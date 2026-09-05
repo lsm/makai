@@ -774,7 +774,14 @@ test("client.agent.run scopes provider-specific auth patterns to the matching pr
   assert.equal(completion.stop_reason, "error");
   assert.equal(completion.error_message, "permission_error: scope denied");
 
-  // Anthropic: the registered detector treats permission_error as auth.
+  // Remapped model: provider_id "anthropic" on a non-Anthropic API must not
+  // borrow the anthropic-messages detector patterns.
+  const remapped = createMakaiAgentApi(transportFor("openai-completions", "anthropic") as unknown as MakaiStdioClient);
+  const remappedCompletion = await remapped.run(request());
+  assert.equal(remappedCompletion.stop_reason, "error");
+  assert.equal(remappedCompletion.error_message, "permission_error: scope denied");
+
+  // Anthropic API: the registered detector treats permission_error as auth.
   const anthropic = createMakaiAgentApi(transportFor("anthropic-messages", "anthropic") as unknown as MakaiStdioClient);
   await assert.rejects(
     () => anthropic.run(request()),

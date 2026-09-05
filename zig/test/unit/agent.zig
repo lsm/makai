@@ -465,6 +465,51 @@ test "agentLoop: zero max_iterations still reports max_turns termination" {
     try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), result.termination);
 }
 
+test "agentLoop: cancellation reports cancelled termination" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "unused" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "Hello");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = compat.time.nowMillis(),
+    } };
+
+    var cancel_flag = std.atomic.Value(bool).init(true);
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .cancel_token = .{ .cancelled = &cancel_flag },
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var agent_end_termination: ?agent_types.AgentTermination = null;
+    while (stream.wait()) |event| {
+        switch (event) {
+            .agent_end => |payload| agent_end_termination = payload.termination,
+            else => {},
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 0), state.call_count);
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .cancelled), agent_end_termination);
+
+    const result = stream.getResult().?;
+    var owned_result = result;
+    defer owned_result.deinit(allocator);
+    stream.result = null;
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .cancelled), result.termination);
+}
+
 test "ProtocolOptions: passed through to protocol client" {
     const allocator = testing.allocator;
 

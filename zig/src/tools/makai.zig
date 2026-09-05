@@ -1781,9 +1781,13 @@ fn serializeAgentLoopEvent(
             }
             if (last_assistant) |message| {
                 // Event-only peers have no agent_result frame; the resolved
-                // provider keeps SDK auth retry targetable for opaque refs.
+                // provider/api keep SDK auth retry targetable for opaque refs
+                // and let clients scope provider-specific error semantics.
                 if (message.provider.len > 0) {
                     try w.writeStringField("provider_id", message.provider);
+                }
+                if (message.api.len > 0) {
+                    try w.writeStringField("api", message.api);
                 }
                 if (message.error_message.slice().len > 0) {
                     try w.writeStringField("error_message", message.error_message.slice());
@@ -4152,6 +4156,33 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         defer allocator.free(json);
         try std.testing.expect(std.mem.find(u8, json, "\"type\":\"agent_end\"") != null);
         try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"max_turns\"") != null);
+    }
+
+    // Cancellation overrides any historical assistant reason and keeps the
+    // resolved api alongside the provider for downstream scoping.
+    {
+        const messages = [_]ai_types.Message{
+            .{ .assistant = .{
+                .content = &.{},
+                .api = "fixture-ok-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = 0,
+            } },
+        };
+        const event = agent_loop.AgentEvent{ .agent_end = .{
+            .messages = ai_types.OwnedSlice(ai_types.Message).initBorrowed(&messages),
+            .termination = .cancelled,
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\":\"agent_end\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"cancelled\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"stop\"") == null);
+        try std.testing.expect(std.mem.find(u8, json, "\"provider_id\":\"fixture\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"api\":\"fixture-ok-api\"") != null);
     }
 }
 

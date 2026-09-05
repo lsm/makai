@@ -586,7 +586,7 @@ class StdioAgentApi implements MakaiAgentApi {
             // outer stream() gates auto_once on no content having been yielded
             // (tool execution events are non-replayable), so tool side effects
             // are never re-run; the failed attempt's lifecycle events replay.
-            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message, { providerId: event.provider_id })) {
+            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message, { providerId: event.provider_id, api: event.api })) {
               const resolvedProviderId = event.provider_id ?? fallbackProviderId;
               throw new MakaiStreamError(event.error_message ?? "auth_required", {
                 kind: "provider_error",
@@ -1272,6 +1272,7 @@ function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
     ...(optionalString(data.stop_reason ?? data.reason) ? { stop_reason: optionalString(data.stop_reason ?? data.reason) } : {}),
     ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
     ...(optionalString(data.provider_id ?? data.provider) ? { provider_id: optionalString(data.provider_id ?? data.provider) } : {}),
+    ...(optionalString(data.api) ? { api: optionalString(data.api) } : {}),
   };
 }
 
@@ -1436,9 +1437,10 @@ function isReplayableAgentEvent(event: AgentStreamEvent): boolean {
  * Detects provider auth failure text carried in an agent event/response
  * `error_message`. Base patterns mirror the server-wide default detector
  * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus
- * NACK reasons); provider-specific patterns (from the registered Anthropic
- * detector, zig/src/providers/anthropic_messages_api.zig) apply only when the
- * response identifies that provider, matching how the server scopes them.
+ * NACK reasons); provider-specific patterns (from the detector registered
+ * for the anthropic-messages API, zig/src/providers/anthropic_messages_api.zig)
+ * apply only when the response resolved to that API — not merely a provider
+ * id, which a remapped model ref can reuse across APIs.
  */
 function isAuthFailureMessage(message: string | undefined, identity?: { providerId?: string; api?: string }): boolean {
   if (!message) return false;
@@ -1453,8 +1455,7 @@ function isAuthFailureMessage(message: string | undefined, identity?: { provider
     normalized.includes("forbidden")) {
     return true;
   }
-  const isAnthropic = identity?.api === "anthropic-messages" || identity?.providerId === "anthropic";
-  return isAnthropic && (
+  return identity?.api === "anthropic-messages" && (
     normalized.includes("authentication_error") ||
     normalized.includes("permission_error") ||
     normalized.includes("invalid api key")
