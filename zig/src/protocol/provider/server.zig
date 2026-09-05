@@ -803,9 +803,11 @@ const DEFAULT_MODEL_MAX_TOKENS: u32 = 4_096;
 ///   pairs — otherwise URL construction fails with e.g. "invalid anthropic
 ///   URL". Env overrides (`MAKAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
 ///   `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`) win over the canonical
-///   endpoints; explicit non-empty base URLs pass through unchanged;
-///   unknown providers keep the empty base URL so no endpoint is derived
-///   from the API type.
+///   endpoints; catalog-issued pairs (openai-codex, kimi) resolve to the
+///   endpoints the production catalog itself serves, honoring the Kimi
+///   region stored on its OAuth credentials; explicit non-empty base URLs
+///   pass through unchanged; unknown providers keep the empty base URL so
+///   no endpoint is derived from the API type.
 /// - A zero `max_tokens` (client sent none) becomes a usable default.
 /// - When the effective base URL comes from the environment rather than the
 ///   client and the client sent no compat options, transparent-proxy compat
@@ -815,16 +817,26 @@ const DEFAULT_MODEL_MAX_TOKENS: u32 = 4_096;
 /// The returned model is a shallow copy — providers clone what they need
 /// before `stream()` returns, so `deinit` only owns the defaulted base URL.
 fn modelWithProtocolDefaults(
-    allocator: std.mem.Allocator,
+    server: *ProtocolServer,
     model: ai_types.Model,
 ) !EffectiveModel {
+    const allocator = server.allocator;
     const client_supplied_base = model.base_url.len > 0;
     var effective = model;
     var defaulted_base: ?[]const u8 = null;
     errdefer if (defaulted_base) |base| allocator.free(base);
 
     if (!client_supplied_base and model.provider.len > 0 and model.api.len > 0) {
-        const resolved = try provider_base_url.defaultBaseUrlForRef(allocator, model.provider, model.api);
+        const stored_kimi_region: ?[]const u8 = if (isKimiPair(model.provider, model.api))
+            try storedKimiRegion(server)
+        else
+            null;
+        const resolved = try provider_base_url.defaultBaseUrlForRefWithRegion(
+            allocator,
+            model.provider,
+            model.api,
+            stored_kimi_region,
+        );
         if (resolved.len > 0) {
             defaulted_base = resolved;
             effective.base_url = resolved;
@@ -842,6 +854,36 @@ fn modelWithProtocolDefaults(
     }
 
     return .{ .model = effective, .defaulted_base_url = defaulted_base };
+}
+
+/// The catalog's Kimi pair: provider/api of the production Kimi entry.
+fn isKimiPair(provider_id: []const u8, api: []const u8) bool {
+    return std.mem.eql(u8, provider_id, "kimi") and std.mem.eql(u8, api, "openai-completions");
+}
+
+/// Kimi region recorded on the provider's stored OAuth credentials
+/// (`provider_data: "region:<value>"`), null when unavailable. Must be
+/// evaluated before any storage deinit — normalizeKimiRegion in
+/// defaultBaseUrlForRefWithRegion returns static literals, so the borrowed
+/// slice never outlives the call.
+fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
+    var loaded_storage: ?oauth_storage.AuthStorage = null;
+    defer if (loaded_storage) |*storage| storage.deinit();
+
+    const storage = if (server.options.auth_storage) |auth_storage|
+        auth_storage
+    else
+        blk: {
+            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
+                break :blk null;
+            break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
+        } orelse return null;
+
+    const auth = storage.providers.get("kimi") orelse return null;
+    if (auth != .oauth) return null;
+    const provider_data = auth.oauth.provider_data orelse return null;
+    if (!std.mem.startsWith(u8, provider_data, "region:")) return null;
+    return provider_data["region:".len..];
 }
 
 /// Handle stream_request - create stream, return ack with stream_id
@@ -887,7 +929,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
 
     // Default an empty client-supplied base URL to the canonical vendor
     // endpoint so protocol clients don't need their own provider tables.
-    var effective_model = try modelWithProtocolDefaults(server.allocator, request.model);
+    var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
@@ -1084,7 +1126,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
 
     // Default an empty client-supplied base URL to the canonical vendor
     // endpoint so protocol clients don't need their own provider tables.
-    var effective_model = try modelWithProtocolDefaults(server.allocator, request.model);
+    var effective_model = try modelWithProtocolDefaults(server, request.model);
     defer effective_model.deinit(server.allocator);
 
     // Create a stream for non-streaming completion, resolving and refreshing stored auth when configured.
@@ -3001,10 +3043,10 @@ fn baseUrlCaptureRegistry(allocator: std.mem.Allocator) !api_registry.ApiRegistr
 /// Model shaped like the TS SDK's descriptors: known provider/API routing
 /// but an empty base URL and no token metadata (deserializeModel defaults
 /// max_tokens to 0 when the client omits it).
-fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8) ai_types.Model {
+fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8, model_id: []const u8) ai_types.Model {
     return .{
-        .id = "test-model",
-        .name = "Test Model",
+        .id = model_id,
+        .name = model_id,
         .api = api,
         .provider = provider_id,
         .base_url = "",
@@ -3032,7 +3074,7 @@ test "handleStreamRequest defaults empty base URL for known provider" {
         .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
-            .model = emptyBaseUrlModel("anthropic", "anthropic-messages"),
+            .model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-test"),
             .context = .{ .messages = &.{} },
             .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
@@ -3067,7 +3109,7 @@ test "handleStreamRequest preserves explicit base URL" {
     var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
     defer server.deinit();
 
-    var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages");
+    var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-test");
     explicit_model.base_url = "https://explicit.example.com";
     explicit_model.max_tokens = 1234;
 
@@ -3111,7 +3153,7 @@ test "handleStreamRequest keeps unknown provider base URL empty" {
         .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .stream_request = .{
-            .model = emptyBaseUrlModel("mystery-vendor", "anthropic-messages"),
+            .model = emptyBaseUrlModel("mystery-vendor", "anthropic-messages", "mystery-model"),
             .context = .{ .messages = &.{} },
             .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },
@@ -3123,10 +3165,104 @@ test "handleStreamRequest keeps unknown provider base URL empty" {
         mutable_resp.deinit(std.testing.allocator);
     }
 
-    // No endpoint may be derived from the API type for an unknown provider —
-    // the provider sees the empty base and fails before the network.
+    // No endpoint may be derived from the API type for an unknown provider.
+    // A configured global override (MAKAI_BASE_URL) still applies by design,
+    // so compare against the resolver instead of a bare empty string.
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("", captured);
+    const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "mystery-vendor", "anthropic-messages", null);
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, captured);
+}
+
+test "handleStreamRequest defaults catalog-issued codex and kimi base URLs" {
+    // openai-codex models always use the ChatGPT backend regardless of the
+    // host environment (no override form), so a literal assertion is safe.
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+        defer registry.deinit();
+        const provider = api_registry.ApiProvider{
+            .api = "openai-codex-responses",
+            .stream = baseUrlCapturingStream,
+            .stream_simple = baseUrlCapturingStreamSimple,
+        };
+        try registry.registerApiProvider(provider, null);
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = emptyBaseUrlModel("openai-codex", "openai-codex-responses", "gpt-5-codex"),
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+        try std.testing.expect(captured.len > 0);
+        // Exact endpoint literals are pinned by the provider_base_url unit
+        // tests; here a global host override (MAKAI_BASE_URL) legitimately
+        // changes the answer, so compare against the resolver.
+        const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "openai-codex", "openai-codex-responses", null);
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, captured);
+    }
+
+    // Kimi resolves through the region-aware path (env / stored region /
+    // china default), so compare against the same resolver the server uses.
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+        defer registry.deinit();
+        const provider = api_registry.ApiProvider{
+            .api = "openai-completions",
+            .stream = baseUrlCapturingStream,
+            .stream_simple = baseUrlCapturingStreamSimple,
+        };
+        try registry.registerApiProvider(provider, null);
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = emptyBaseUrlModel("kimi", "openai-completions", "kimi-k2.7-code"),
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+        try std.testing.expect(captured.len > 0);
+        const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "kimi", "openai-completions", null);
+        defer std.testing.allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, captured);
+    }
 }
 
 test "handleCompleteRequest defaults empty base URL for known provider" {
@@ -3145,7 +3281,7 @@ test "handleCompleteRequest defaults empty base URL for known provider" {
         .sequence = 1,
         .timestamp = compat.time.nowMillis(),
         .payload = .{ .complete_request = .{
-            .model = emptyBaseUrlModel("anthropic", "anthropic-messages"),
+            .model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-test"),
             .context = .{ .messages = &.{} },
             .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
         } },

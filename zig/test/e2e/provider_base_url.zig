@@ -31,8 +31,13 @@ const protocol_types = envelope.protocol_types;
 
 /// Forced by the build step for this test binary, together with
 /// `OPENAI_BASE_URL_IS_PROXY=true` and cleared `MAKAI_BASE_URL` /
-/// `ANTHROPIC_BASE_URL` / `DEEPSEEK_BASE_URL`.
+/// `ANTHROPIC_BASE_URL` / `DEEPSEEK_BASE_URL` (and `KIMI_REGION` unset).
 const FORCED_OPENAI_BASE_URL = "https://env-override.makai.test/openai";
+
+/// Endpoints for the production catalog pairs; KIMI_REGION is unset for
+/// this binary, so Kimi takes the china-region default.
+const EXPECTED_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const EXPECTED_KIMI_BASE_URL = "https://api.kimi.com/coding";
 
 /// Server-side default the provider must observe for models that arrive
 /// without token metadata (mirrors the CLI's non-catalog default).
@@ -244,6 +249,90 @@ test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
     try testing.expectEqual(@as(?bool, true), compat_options.supports_store);
     try testing.expectEqual(@as(?bool, true), compat_options.supports_developer_role);
     try testing.expectEqual(@as(@TypeOf(compat_options.max_tokens_field), .max_completion_tokens), compat_options.max_tokens_field);
+}
+
+test "stdio protocol stream defaults catalog-issued codex and kimi refs" {
+    // Codex OAuth model: SDK-style descriptor rebuilt from a catalog-issued
+    // ref (empty base URL) must reach the ChatGPT backend.
+    {
+        MockCapture.reset();
+        defer MockCapture.reset();
+
+        const allocator = testing.allocator;
+
+        var registry = api_registry.ApiRegistry.init(allocator);
+        defer registry.deinit();
+        try registerCapturingProvider(&registry, "openai-codex-responses");
+
+        var server = ProtocolServer.init(allocator, &registry, .{});
+        defer server.deinit();
+
+        var pipe = in_process.createSerializedPipe(allocator);
+        defer pipe.deinit();
+
+        var client = ProtocolClient.init(allocator, .{});
+        defer client.deinit();
+        client.setSender(pipe.clientSender());
+
+        var runtime = ProviderProtocolRuntime{
+            .server = &server,
+            .pipe = &pipe,
+            .allocator = allocator,
+        };
+
+        const model = emptyBaseUrlModel("openai-codex", "openai-codex-responses", "gpt-5-codex");
+        const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{} };
+        const options = ai_types.StreamOptions{
+            .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
+        };
+
+        _ = try client.sendStreamRequest(model, ctx, options);
+        try runtime.pumpClientMessages();
+
+        const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(EXPECTED_CODEX_BASE_URL, captured);
+    }
+
+    // Kimi: no stored credentials and no KIMI_REGION in this binary, so the
+    // china-region coding endpoint applies (the catalog default).
+    {
+        MockCapture.reset();
+        defer MockCapture.reset();
+
+        const allocator = testing.allocator;
+
+        var registry = api_registry.ApiRegistry.init(allocator);
+        defer registry.deinit();
+        try registerCapturingProvider(&registry, "openai-completions");
+
+        var server = ProtocolServer.init(allocator, &registry, .{});
+        defer server.deinit();
+
+        var pipe = in_process.createSerializedPipe(allocator);
+        defer pipe.deinit();
+
+        var client = ProtocolClient.init(allocator, .{});
+        defer client.deinit();
+        client.setSender(pipe.clientSender());
+
+        var runtime = ProviderProtocolRuntime{
+            .server = &server,
+            .pipe = &pipe,
+            .allocator = allocator,
+        };
+
+        const model = emptyBaseUrlModel("kimi", "openai-completions", "kimi-k2.7-code");
+        const ctx = ai_types.Context{ .messages = &[_]ai_types.Message{} };
+        const options = ai_types.StreamOptions{
+            .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key"),
+        };
+
+        _ = try client.sendStreamRequest(model, ctx, options);
+        try runtime.pumpClientMessages();
+
+        const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(EXPECTED_KIMI_BASE_URL, captured);
+    }
 }
 
 test "stdio protocol complete_request defaults empty base URL" {

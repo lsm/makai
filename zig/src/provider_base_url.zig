@@ -17,6 +17,18 @@ const ai_types = @import("ai_types");
 /// <PROVIDER>_BASE_URL conventions so proxies and custom endpoints work;
 /// MAKAI_BASE_URL overrides everything.
 pub fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u8, api: []const u8) ![]const u8 {
+    return defaultBaseUrlForRefWithRegion(allocator, provider_id, api, null);
+}
+
+/// `defaultBaseUrlForRef` with the region stored on a provider's OAuth
+/// credentials (Kimi only). `KIMI_REGION` still wins over `stored_kimi_region`,
+/// matching the production catalog's precedence (tui/model_catalog.zig).
+pub fn defaultBaseUrlForRefWithRegion(
+    allocator: std.mem.Allocator,
+    provider_id: []const u8,
+    api: []const u8,
+    stored_kimi_region: ?[]const u8,
+) ![]const u8 {
     const global = try envOwnedOrNull(allocator, "MAKAI_BASE_URL");
     defer if (global) |g| allocator.free(g);
     const anthropic = try envOwnedOrNull(allocator, "ANTHROPIC_BASE_URL");
@@ -26,11 +38,26 @@ pub fn defaultBaseUrlForRef(allocator: std.mem.Allocator, provider_id: []const u
     const deepseek = try envOwnedOrNull(allocator, "DEEPSEEK_BASE_URL");
     defer if (deepseek) |v| allocator.free(v);
 
+    // KIMI_REGION env beats the stored region; both fall back to china,
+    // the catalog default. normalizeKimiRegion returns static literals, so
+    // the result outlives the borrowed stored slice.
+    const kimi_region: []const u8 = blk: {
+        if (try envOwnedOrNull(allocator, "KIMI_REGION")) |env_region| {
+            defer allocator.free(env_region);
+            if (normalizeKimiRegion(env_region)) |region| break :blk region;
+        }
+        if (stored_kimi_region) |stored| {
+            if (normalizeKimiRegion(stored)) |region| break :blk region;
+        }
+        break :blk "china";
+    };
+
     return baseUrlWithOverrides(allocator, provider_id, api, .{
         .global = global orelse "",
         .anthropic = anthropic orelse "",
         .openai = openai orelse "",
         .deepseek = deepseek orelse "",
+        .kimi_region = kimi_region,
     });
 }
 
@@ -40,7 +67,33 @@ pub const BaseUrlOverrides = struct {
     anthropic: []const u8 = "",
     openai: []const u8 = "",
     deepseek: []const u8 = "",
+    /// Kimi OAuth region ("china" or "global"); selects the region endpoint
+    /// exactly like the production catalog does.
+    kimi_region: []const u8 = "china",
 };
+
+/// Canonical endpoints for the production catalog's provider pairs
+/// (tui/model_catalog.zig). The TS SDK rebuilds model descriptors from
+/// catalog-issued refs with `base_url: ""`, so these must be defaulted the
+/// same way the catalog itself would (#183).
+const OPENAI_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const KIMI_CHINA_BASE_URL = "https://api.kimi.com/coding";
+const KIMI_GLOBAL_BASE_URL = "https://api.moonshot.ai";
+
+/// Kimi region alias normalization; mirrors tui/model_catalog.zig (kept in
+/// sync rather than importing the whole TUI catalog + OAuth stack here).
+/// Returns the static literal "global"/"china", or null for unknown values.
+pub fn normalizeKimiRegion(value: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "global") or std.ascii.eqlIgnoreCase(trimmed, "moonshot")) return "global";
+    if (std.ascii.eqlIgnoreCase(trimmed, "china") or
+        std.ascii.eqlIgnoreCase(trimmed, "cn") or
+        std.ascii.eqlIgnoreCase(trimmed, "coding"))
+    {
+        return "china";
+    }
+    return null;
+}
 
 /// Provider routes append `/v1/...`; accept the common versioned override
 /// form without producing a duplicate `/v1/v1/...` path.
@@ -74,6 +127,10 @@ pub fn baseUrlWithOverrides(allocator: std.mem.Allocator, provider_id: []const u
         if (ov.openai.len > 0) normalizeVersionedBaseUrl(ov.openai) else "https://api.openai.com"
     else if (std.mem.eql(u8, provider_id, "deepseek") and std.mem.eql(u8, api, "openai-completions"))
         if (ov.deepseek.len > 0) normalizeVersionedBaseUrl(ov.deepseek) else "https://api.deepseek.com"
+    else if (std.mem.eql(u8, provider_id, "openai-codex") and std.mem.eql(u8, api, "openai-codex-responses"))
+        OPENAI_CODEX_BASE_URL
+    else if (std.mem.eql(u8, provider_id, "kimi") and std.mem.eql(u8, api, "openai-completions"))
+        if (std.mem.eql(u8, ov.kimi_region, "global")) KIMI_GLOBAL_BASE_URL else KIMI_CHINA_BASE_URL
     else
         null;
     if (by_provider) |url| return try allocator.dupe(u8, url);
@@ -278,4 +335,51 @@ test "transparent proxy compat preserves vendor token-limit fields" {
     const openai = transparentProxyCompatForFlags("openai", .{ .openai_proxy = true });
     try std.testing.expect(openai != null);
     try std.testing.expectEqual(@as(@TypeOf(openai.?.max_tokens_field), .max_completion_tokens), openai.?.max_tokens_field);
+}
+
+test "baseUrlWithOverrides resolves production catalog pairs" {
+    const allocator = std.testing.allocator;
+
+    // Codex OAuth models always use the ChatGPT backend, no override form.
+    const codex = try baseUrlWithOverrides(allocator, "openai-codex", "openai-codex-responses", .{});
+    defer allocator.free(codex);
+    try std.testing.expectEqualStrings(OPENAI_CODEX_BASE_URL, codex);
+
+    // Kimi defaults to the China coding endpoint and switches on region.
+    const kimi_china = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{});
+    defer allocator.free(kimi_china);
+    try std.testing.expectEqualStrings(KIMI_CHINA_BASE_URL, kimi_china);
+
+    const kimi_global = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{
+        .kimi_region = "global",
+    });
+    defer allocator.free(kimi_global);
+    try std.testing.expectEqualStrings(KIMI_GLOBAL_BASE_URL, kimi_global);
+
+    // The global override still wins over every catalog endpoint.
+    const kimi_overridden = try baseUrlWithOverrides(allocator, "kimi", "openai-completions", .{
+        .global = "https://everywhere.example.com",
+    });
+    defer allocator.free(kimi_overridden);
+    try std.testing.expectEqualStrings("https://everywhere.example.com", kimi_overridden);
+
+    // Catalog pairs stay provider-specific: kimi is not openai, and the
+    // codex API name alone must not default the plain openai provider.
+    const kimi_wrong_api = try baseUrlWithOverrides(allocator, "kimi", "openai-responses", .{});
+    defer allocator.free(kimi_wrong_api);
+    try std.testing.expectEqualStrings("", kimi_wrong_api);
+
+    const codex_wrong_provider = try baseUrlWithOverrides(allocator, "openai", "openai-codex-responses", .{});
+    defer allocator.free(codex_wrong_provider);
+    try std.testing.expectEqualStrings("", codex_wrong_provider);
+}
+
+test "normalizeKimiRegion accepts catalog region aliases" {
+    try std.testing.expectEqualStrings("global", normalizeKimiRegion("global").?);
+    try std.testing.expectEqualStrings("global", normalizeKimiRegion(" moonshot ").?);
+    try std.testing.expectEqualStrings("china", normalizeKimiRegion("CN").?);
+    try std.testing.expectEqualStrings("china", normalizeKimiRegion("coding").?);
+    try std.testing.expectEqualStrings("china", normalizeKimiRegion("china").?);
+    try std.testing.expect(normalizeKimiRegion("mars") == null);
+    try std.testing.expect(normalizeKimiRegion("") == null);
 }
