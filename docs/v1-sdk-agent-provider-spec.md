@@ -475,6 +475,7 @@ Agent stream rules:
 - `turn_end` marks per-turn boundaries only and must not be interpreted as overall stream completion.
 - `turn_end.stop_reason` is turn-scoped; `agent_end.stop_reason` may include agent-level reasons such as `max_turns`.
 - When a turn fails at the provider (auth, invalid URL, network), `turn_end` and `agent_end` must carry the provider error detail in `error_message` (e.g. `"auth_required"`); `message_end` includes `error_message` when the failed turn still produced a terminal provider message event.
+- The SDK keeps provider auth failures retryable: when the terminal `agent_end` (or the non-streaming run response) reports `stop_reason: "error"` with an auth failure `error_message` (mirroring the server-side auth failure detector: `auth_required` / `auth_expired` / `auth_refresh_failed` / 401 / 403 / unauthorized / forbidden), the SDK raises the typed auth error path (`MakaiAuthRequiredError`, engaging `auth_retry_policy`) instead of treating the run as a normal completion. Non-auth provider failures surface via the `error_message` fields above.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
 - `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
 - For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted.

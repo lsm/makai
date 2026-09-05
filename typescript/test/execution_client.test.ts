@@ -508,14 +508,83 @@ test("client.agent.run surfaces provider error details from agent_result", async
     cache_read: 0,
     cache_write: 0,
     content: [],
-    error_message: "auth_required",
+    error_message: "invalid anthropic URL",
   }));
   const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
   try {
     const agent = createMakaiAgentApi(harness.client);
     const result = await agent.run(request());
     assert.equal(result.stop_reason, "error");
-    assert.equal(result.error_message, "auth_required");
+    assert.equal(result.error_message, "invalid anthropic URL");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run translates auth_required provider failures into MakaiAuthRequiredError", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-result-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "auth_required",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) =>
+        err instanceof MakaiAuthRequiredError &&
+        err.code === "auth_required" &&
+        err.provider_id === "anthropic" &&
+        err.message === "auth_required",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream yields turn_end detail then throws retryable auth error", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-stream-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "auth_required" },
+    { type: "agent_end", stop_reason: "error", error_message: "auth_required" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events: AgentStreamEvent[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of agent.stream(request())) events.push(event);
+      },
+      (err: unknown) =>
+        err instanceof MakaiAuthRequiredError &&
+        err.code === "auth_required" &&
+        err.provider_id === "anthropic" &&
+        err.message === "auth_required",
+    );
+    // The failing turn's detail is still surfaced on the yielded turn_end
+    // event before the typed auth error terminates the stream.
+    assert.deepEqual(events.map((event) => event.type), ["agent_start", "turn_start", "turn_end"]);
+    const turnEnd = events.at(-1);
+    assert.equal(turnEnd?.type, "turn_end");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.error_message : undefined, "auth_required");
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });

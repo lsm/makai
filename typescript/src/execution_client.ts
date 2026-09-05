@@ -411,8 +411,8 @@ class StdioAgentApi implements MakaiAgentApi {
           }
           continue;
         }
-        if (frame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(frame, "result_json"));
-        if (frame.type === "result" || frame.type === "complete_response") return parseCompletionResponse(frame.payload ?? frame);
+        if (frame.type === "agent_result") return responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId);
+        if (frame.type === "result" || frame.type === "complete_response") return responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId);
         if (frame.type === "tool_execute") {
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
           continue;
@@ -425,7 +425,7 @@ class StdioAgentApi implements MakaiAgentApi {
         for (const event of normalized) {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
           events.push(event);
-          if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
+          if (event.type === "agent_end") return responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId);
         }
       }
     } catch (error) {
@@ -570,6 +570,13 @@ class StdioAgentApi implements MakaiAgentApi {
             event = usage ? { ...event, usage } : { ...event };
             if (!usage) delete event.usage;
             terminal = true;
+            // Provider auth failures surfaced via the agent event stream keep
+            // the typed retryable path: mirror the provider stream convention
+            // (error events with code auth_required throw instead of ending
+            // the stream normally) so manual/auto_once auth retry engages.
+            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message)) {
+              throw new MakaiStreamError(event.error_message ?? "auth_required", { kind: "provider_error", code: "auth_required", provider_id: fallbackProviderId });
+            }
           } else if (event.type === "error") {
             terminal = true;
           }
@@ -1386,6 +1393,38 @@ function isRetryableAuthError(error: unknown): error is MakaiStreamError {
 
 function authRequiredError(providerId: string, message: string): MakaiAuthRequiredError {
   return new MakaiAuthRequiredError(providerId, message);
+}
+
+/**
+ * Detects provider auth failure text carried in an agent event/response
+ * `error_message`. Mirrors the server-side auth failure detector
+ * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus the
+ * `auth_required`/`auth_expired`/`auth_refresh_failed` NACK reasons) so the
+ * same failures the server treats as auth errors keep the SDK's typed,
+ * retryable auth path instead of ending the run as a plain error completion.
+ */
+function isAuthFailureMessage(message: string | undefined): boolean {
+  if (!message) return false;
+  const normalized = message.toLowerCase();
+  return normalized === "auth_required" ||
+    normalized === "auth_expired" ||
+    normalized === "auth_refresh_failed" ||
+    normalized.includes("401") ||
+    normalized.includes("403") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("forbidden");
+}
+
+/**
+ * Translates an agent run response whose provider turn failed with an auth
+ * error into the thrown, retryable MakaiStreamError shape consumed by
+ * withAuthRetry; non-auth failures return the response unchanged.
+ */
+function responseOrAuthError(response: CompletionResponse, providerId?: string): CompletionResponse {
+  if (response.stop_reason === "error" && isAuthFailureMessage(response.error_message)) {
+    throw new MakaiStreamError(response.error_message ?? "auth_required", { kind: "provider_error", code: "auth_required", provider_id: providerId });
+  }
+  return response;
 }
 
 function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunRequest): string | undefined {
