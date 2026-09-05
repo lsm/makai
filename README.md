@@ -109,7 +109,7 @@ If you are migrating from an API that used `client.complete({ stream: true })`, 
 
 ## Agent loop with tools
 
-Use `client.agent.run(...)` when you want the Makai agent loop to manage provider turns and tool execution lifecycle. Tool definitions are JSON Schema strings. Tool execution is handled by the Makai runtime/tool protocol boundary; the TypeScript SDK sends tool schemas and receives the final assistant response plus streaming lifecycle events when using `agent.stream(...)`.
+Use `client.agent.run(...)` when you want the Makai agent loop to manage provider turns and tool execution lifecycle. Tool definitions are JSON Schema strings. Tool execution runs in your client code: when the runtime requests a tool call, the SDK invokes that tool's `execute(args, context)` callback and sends the result back to the runtime. Tools without an `execute` callback — and callbacks that throw — are reported to the model as error tool results. When using `agent.stream(...)`, you also receive streaming lifecycle events; the iteration ends with `agent_end` on success, or with an `error` event / a thrown `MakaiStreamError` on failure.
 
 ```ts
 import { createMakaiClient, type ToolDefinition } from "makai";
@@ -126,6 +126,11 @@ const tools: ToolDefinition[] = [
       required: ["city"],
       additionalProperties: false,
     }),
+    // Executed in your client code when the runtime requests this tool:
+    execute: async (args) => {
+      const city = typeof args.city === "string" ? args.city : "an unknown city";
+      return `It is sunny in ${city} today.`;
+    },
   },
 ];
 
@@ -457,6 +462,7 @@ import type {
   ProviderCompleteResponse,
   ProviderStreamEvent,
   RunOptions,
+  TextContentPart,
   ToolDefinition,
   UsageSummary,
 } from "makai";
@@ -476,6 +482,11 @@ type ToolDefinition = {
   name: string;
   description: string;
   parameters_schema_json: string;
+  // Called in your client code when the runtime requests this tool:
+  execute?: (
+    args: Record<string, unknown>,
+    context: { tool_call_id: string; tool_name: string; args_json: string },
+  ) => Promise<string | TextContentPart[]> | string | TextContentPart[];
 };
 
 type RunOptions = {
