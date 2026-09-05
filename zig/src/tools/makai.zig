@@ -1756,6 +1756,9 @@ fn serializeAgentLoopEvent(
         .turn_end => |payload| {
             try w.writeStringField("type", "turn_end");
             try w.writeStringField("stop_reason", @tagName(payload.message.stop_reason));
+            if (payload.message.error_message.slice().len > 0) {
+                try w.writeStringField("error_message", payload.message.error_message.slice());
+            }
         },
         .message_start => |payload| {
             try w.writeStringField("type", "message_start");
@@ -1772,6 +1775,9 @@ fn serializeAgentLoopEvent(
             try w.writeStringField("type", "message_end");
             if (payload.message == .assistant) {
                 try w.writeStringField("stop_reason", @tagName(payload.message.assistant.stop_reason));
+                if (payload.message.assistant.error_message.slice().len > 0) {
+                    try w.writeStringField("error_message", payload.message.assistant.error_message.slice());
+                }
                 try writeUsageField(&w, payload.message.assistant.usage);
             }
         },
@@ -3817,6 +3823,144 @@ test "stdio protocol loop executes agent messages through real agent loop" {
     try std.testing.expect(saw_agent_result);
     try std.testing.expect(agent_result_index.? < agent_end_index.?);
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+}
+
+test "stdio protocol loop surfaces provider error details in agent events" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-error-api",
+        .stream = fixtureErrorStream,
+        .stream_simple = fixtureErrorStreamSimple,
+    }, "test-fixtures");
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-error-api@fixture-model";
+
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+    try std.testing.expectEqual(@as(usize, 1), outbound.items.len);
+    clearOwnedLines(allocator, &outbound);
+
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+
+    var saw_result_line = false;
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            if (std.mem.find(u8, line, "\"type\":\"agent_result\"") != null) {
+                saw_result_line = true;
+                break;
+            }
+        }
+        if (saw_result_line) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(saw_result_line);
+
+    var saw_error_turn_end = false;
+    var saw_result_error = false;
+    for (outbound.items) |line| {
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        switch (env.payload) {
+            .agent_event => |event_json| {
+                if (std.mem.find(u8, event_json, "\"type\":\"turn_end\"") != null) {
+                    saw_error_turn_end = std.mem.find(u8, event_json, "\"stop_reason\":\"error\"") != null and
+                        std.mem.find(u8, event_json, "\"error_message\":\"fixture stream failure\"") != null;
+                }
+            },
+            .agent_result => |result_json| {
+                saw_result_error = std.mem.find(u8, result_json, "\"stop_reason\":\"error\"") != null and
+                    std.mem.find(u8, result_json, "\"error_message\":\"fixture stream failure\"") != null;
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(saw_error_turn_end);
+    try std.testing.expect(saw_result_error);
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+}
+
+test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
+    const allocator = std.testing.allocator;
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    {
+        const event = agent_loop.AgentEvent{ .turn_end = .{
+            .message = .{
+                .content = &.{},
+                .api = "fixture-error-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .@"error",
+                .error_message = ai_types.OwnedSlice(u8).initBorrowed("fixture stream failure"),
+                .timestamp = 0,
+            },
+            .tool_results = ai_types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\":\"turn_end\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"error\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"error_message\":\"fixture stream failure\"") != null);
+    }
+
+    {
+        const event = agent_loop.AgentEvent{ .message_end = .{
+            .message = .{ .assistant = .{
+                .content = &.{},
+                .api = "fixture-error-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .@"error",
+                .error_message = ai_types.OwnedSlice(u8).initBorrowed("invalid anthropic URL"),
+                .timestamp = 0,
+            } },
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\":\"message_end\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"error\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"error_message\":\"invalid anthropic URL\"") != null);
+    }
+
+    // Successful turns must not carry an empty error_message field.
+    {
+        const event = agent_loop.AgentEvent{ .turn_end = .{
+            .message = .{
+                .content = &.{},
+                .api = "fixture-ok-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = 0,
+            },
+            .tool_results = ai_types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"error_message\"") == null);
+    }
 }
 
 test "stdio protocol loop emits terminal agent_error when agent startup fails" {

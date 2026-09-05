@@ -984,11 +984,9 @@ fn streamAssistantResponse(
 
     if (final_message == null) {
         if (provider_stream.getError()) |provider_error| {
-            if (std.mem.eql(u8, provider_error, "auth_required") or
-                std.mem.indexOf(u8, provider_error, "Authentication required") != null)
-            {
-                return error.AuthRequired;
-            }
+            // Preserve the provider's own error text (e.g. "auth_required",
+            // "invalid anthropic URL") verbatim so the turn_end event carries
+            // the root cause instead of a generic Zig error name.
             return try makeProviderErrorAssistantMessage(allocator, config.model, provider_error);
         }
     }

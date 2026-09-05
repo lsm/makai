@@ -304,7 +304,8 @@ export interface CompletionResponse {
   api: ApiId;
   model_id: string;
   stop_reason?: StopReason;
-  // Optional diagnostic error text when stop_reason === "error".
+  // Optional diagnostic error text when stop_reason === "error" — the provider
+  // error detail (e.g. "auth_required") or a server-side failure cause.
   error_message?: string;
 }
 
@@ -317,15 +318,15 @@ export type ProviderStreamEvent =
   | { type: "thinking_delta"; delta: string }
   // V1 emits tool calls only after full argument buffering (non-incremental).
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
-  | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason }
+  | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason; error_message?: string }
   | { type: "error"; message: string; code?: string };
 
 export type AgentStreamEvent =
   | ProviderStreamEvent
   | { type: "agent_start"; session_id?: string /* 21-character alphanumeric NanoID */ }
-  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary }
+  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary; error_message?: string }
   | { type: "turn_start" }
-  | { type: "turn_end"; stop_reason?: StopReason }
+  | { type: "turn_end"; stop_reason?: StopReason; error_message?: string }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
   | { type: "tool_execution_end"; tool_call_id: string; is_error?: boolean };
 
@@ -473,6 +474,7 @@ Agent stream rules:
 - Aggregate `usage` sums token counts across all provider turns; `cache_read` reflects total cache-hit tokens, not unique cached content.
 - `turn_end` marks per-turn boundaries only and must not be interpreted as overall stream completion.
 - `turn_end.stop_reason` is turn-scoped; `agent_end.stop_reason` may include agent-level reasons such as `max_turns`.
+- When a turn fails at the provider (auth, invalid URL, network), `turn_end` and `agent_end` must carry the provider error detail in `error_message` (e.g. `"auth_required"`); `message_end` includes `error_message` when the failed turn still produced a terminal provider message event.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
 - `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
 - For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted.

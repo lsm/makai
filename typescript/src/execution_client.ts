@@ -1070,7 +1070,11 @@ function normalizeAgentEvent(
     case "turn_start":
       return [{ type: "turn_start" }];
     case "turn_end":
-      return [{ type: "turn_end", ...(optionalString(data.stop_reason) ? { stop_reason: optionalString(data.stop_reason) } : {}) }];
+      return [{
+        type: "turn_end",
+        ...(optionalString(data.stop_reason) ? { stop_reason: optionalString(data.stop_reason) } : {}),
+        ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
+      }];
     case "tool_execution_start":
       return [{ type: "tool_execution_start", tool_call_id: stringValue(data.tool_call_id), tool_name: stringValue(data.tool_name) }];
     case "tool_execution_end":
@@ -1145,6 +1149,7 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
     api: start?.api ?? "",
     model_id: start?.model_id ?? "",
     stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
+    error_message: terminal && "error_message" in terminal ? terminal.error_message : undefined,
   };
 }
 
@@ -1226,7 +1231,12 @@ function messageStartFrom(data: Record<string, unknown>): ProviderStreamEvent {
 
 function messageEndFrom(data: Record<string, unknown>): ProviderStreamEvent {
   const message = data.message && isObject(data.message) ? data.message as Record<string, unknown> : data;
-  return { type: "message_end", usage: parseUsage(message.usage ?? data.usage ?? message), stop_reason: optionalString(data.stop_reason ?? data.reason ?? message.stop_reason) };
+  return {
+    type: "message_end",
+    usage: parseUsage(message.usage ?? data.usage ?? message),
+    stop_reason: optionalString(data.stop_reason ?? data.reason ?? message.stop_reason),
+    ...(optionalString(data.error_message ?? message.error_message) ? { error_message: optionalString(data.error_message ?? message.error_message) } : {}),
+  };
 }
 
 function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
@@ -1235,6 +1245,7 @@ function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
     type: "agent_end",
     ...(usage ? { usage } : {}),
     ...(optionalString(data.stop_reason ?? data.reason) ? { stop_reason: optionalString(data.stop_reason ?? data.reason) } : {}),
+    ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
   };
 }
 

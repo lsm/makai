@@ -444,6 +444,84 @@ test("client.agent.run event fallback returns only final assistant turn content"
   }
 });
 
+test("client.agent.stream surfaces provider error details on turn_end and agent_end", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-events-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "fixture stream failure" },
+    { type: "agent_end", stop_reason: "error", error_message: "fixture stream failure" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events = await collect(agent.stream(request()));
+    const turnEnd = events.find((event) => event.type === "turn_end");
+    assert.equal(turnEnd?.type, "turn_end");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.error_message : undefined, "fixture stream failure");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.stop_reason : undefined, "error");
+
+    const agentEnd = events.at(-1);
+    assert.equal(agentEnd?.type, "agent_end");
+    assert.equal(agentEnd.type === "agent_end" ? agentEnd.error_message : undefined, "fixture stream failure");
+    assert.equal(agentEnd.type === "agent_end" ? agentEnd.stop_reason : undefined, "error");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run surfaces provider error details from event fallback", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-fallback-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "fixture stream failure" },
+    { type: "agent_end", stop_reason: "error", error_message: "fixture stream failure" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "fixture stream failure");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run surfaces provider error details from agent_result", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-result-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "auth_required",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "auth_required");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-tool-buffer-test-"));
   const eventsPath = path.join(tmpDir, "events.json");
