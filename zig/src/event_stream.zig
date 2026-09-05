@@ -51,7 +51,6 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             };
         }
 
-
         /// Deinitialize a single generic event value. Used both for events that were
         /// cloned but never stored in the ring buffer and for draining remaining events
         /// during deinit().
@@ -399,6 +398,13 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return count;
         }
 
+        /// Block until the next event is available, or until the stream completes.
+        ///
+        /// Returns null once the stream has completed AND all queued events have
+        /// been drained — treat that null as the completion signal, then take the
+        /// result with `cloneResult()` (or check `getError()`). Do NOT rely on
+        /// receiving a `done` event: several providers complete the stream via
+        /// `complete()` without ever pushing a `.done` event.
         pub fn wait(self: *Self) ?T {
             var futex_value = self.futex.load(.acquire);
 
@@ -464,11 +470,45 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             return (RING_BUFFER_SIZE - 1) - used;
         }
 
+        /// Borrowed view of the completed result.
+        ///
+        /// The returned value aliases the stream's internal copy: never call
+        /// `AssistantMessage.deinit()` on it, and never use it after `deinit()`
+        /// (which frees the internal copy). Use `cloneResult()` to take a
+        /// caller-owned copy instead.
         pub fn getResult(self: *Self) ?R {
             self.mutex.lockUncancelable(defaultIo());
             defer self.mutex.unlock(defaultIo());
 
             return self.result;
+        }
+
+        /// Deep-copy the completed result of an `AssistantMessageStream`.
+        ///
+        /// This is the one-call safe way to take the final result: the returned
+        /// message owns deep copies of every string (`is_owned = true`), stays
+        /// valid after `deinit()`, and is the only result value the consumer
+        /// should call `AssistantMessage.deinit()` on.
+        ///
+        /// Returns null when the stream has not completed or carries an error
+        /// (`getError()` non-null — check it; a stream can hold both an error
+        /// and a late result after an abort, and the error wins). Only
+        /// available on streams whose result type is `AssistantMessage`.
+        pub fn cloneResult(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!?ai_types.AssistantMessage {
+            comptime if (R != ai_types.AssistantMessage) {
+                @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
+            };
+            // Snapshot err_msg and result under one lock: reading them through
+            // separate critical sections could observe "no error" before an
+            // abort's completeWithError() and a late complete() after it,
+            // returning a "success" from a state where the error must win.
+            self.mutex.lockUncancelable(defaultIo());
+            const snapshot = self.result;
+            const err = self.err_msg;
+            self.mutex.unlock(defaultIo());
+            if (err != null) return null;
+            const result = snapshot orelse return null;
+            return try ai_types.cloneAssistantMessage(allocator, result);
         }
 
         pub fn getError(self: *Self) ?[]const u8 {
@@ -639,6 +679,254 @@ test "EventStream push returns QueueFull when ring buffer exhausted" {
     try std.testing.expectError(error.QueueFull, stream.push(TestStream.usable_capacity));
     _ = stream.poll().?;
     try std.testing.expect(!stream.isFull());
+}
+
+test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit" {
+    // Demonstrates the documented consumer flow end-to-end under the testing
+    // allocator (which fails the test on any leak):
+    //   1. drain events with wait() until it returns null — that null is the
+    //      completion signal; providers are NOT required to push a `done` event
+    //   2. deep-copy anything you keep: delta and tool_call strings in events
+    //      are BORROWED from provider-managed buffers
+    //   3. take the result with cloneResult(): the copy is fully owned
+    //      (is_owned = true) and stays valid after the stream is deinit'd
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+
+    // --- producer side: mock provider ---
+    // Events carry borrowed slices (string literals here, standing in for a
+    // provider streaming out of its own buffers) with a borrowed partial.
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+    try stream.push(.{ .start = .{ .partial = partial } });
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "hello ",
+        .partial = partial,
+    } });
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "world",
+        .partial = partial,
+    } });
+    try stream.push(.{ .toolcall_end = .{
+        .content_index = 1,
+        .tool_call = .{
+            .id = "call-1",
+            .name = "get_weather",
+            .arguments_json = "{\"city\":\"SF\"}",
+        },
+        .partial = partial,
+    } });
+
+    // Completed results must be heap-owned: providers dupe every string and
+    // set is_owned = true (see docs/zig-stream-memory-ownership.md), because
+    // EventStream.deinit() calls AssistantMessage.deinit() on the result.
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 2);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "hello world") } };
+    result_content[1] = .{ .tool_call = .{
+        .id = try allocator.dupe(u8, "call-1"),
+        .name = try allocator.dupe(u8, "get_weather"),
+        .arguments_json = try allocator.dupe(u8, "{\"city\":\"SF\"}"),
+    } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{ .input = 3, .output = 2 },
+        .stop_reason = .tool_use,
+        .timestamp = 1,
+        .is_owned = true,
+    });
+
+    // --- consumer side: the documented safe flow ---
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+
+    var tool_calls = std.ArrayList(ai_types.ToolCall).empty;
+    defer {
+        for (tool_calls.items) |*tc| ai_types.deinitToolCall(allocator, tc);
+        tool_calls.deinit(allocator);
+    }
+
+    var saw_done_event = false;
+    while (stream.wait()) |event| {
+        switch (event) {
+            // Delta strings are borrowed: copy them if you keep them.
+            .text_delta => |d| try text.appendSlice(allocator, d.delta),
+            // tool_call strings are borrowed (they share storage with the
+            // completed result's blocks): deep-copy with cloneToolCall. The
+            // errdefer releases the copy if the append itself fails.
+            .toolcall_end => |tc| {
+                var owned = try ai_types.cloneToolCall(allocator, tc.tool_call);
+                errdefer ai_types.deinitToolCall(allocator, &owned);
+                try tool_calls.append(allocator, owned);
+            },
+            .done => saw_done_event = true,
+            else => {},
+        }
+    }
+    // wait() returned null: the stream completed without a `done` event.
+    try std.testing.expect(!saw_done_event);
+    try std.testing.expect(stream.getError() == null);
+
+    // One-call result extraction: a fully owned copy that outlives the stream.
+    var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
+
+    // The stream can be deinit'd from here on; `result` stays valid.
+    stream.deinit();
+
+    try std.testing.expectEqualStrings("hello world", text.items);
+    try std.testing.expectEqual(@as(usize, 1), tool_calls.items.len);
+    try std.testing.expectEqualStrings("get_weather", tool_calls.items[0].name);
+    try std.testing.expectEqualStrings("hello world", result.content[0].text.text);
+    try std.testing.expectEqualStrings("get_weather", result.content[1].tool_call.name);
+    try std.testing.expect(result.is_owned);
+
+    result.deinit(allocator);
+}
+
+test "AssistantMessageStream cloneResult returns an independent deep copy" {
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    var copy = (try stream.cloneResult(allocator)) orelse return error.NoResult;
+
+    // The copy has its own backing memory (checked before deinit poisons the
+    // stream), so both the stream's internal result and the copy can be
+    // deinit'd without double-freeing.
+    const internal = stream.getResult().?;
+    try std.testing.expectEqualStrings("ok", copy.content[0].text.text);
+    try std.testing.expect(
+        @intFromPtr(copy.content[0].text.text.ptr) != @intFromPtr(internal.content[0].text.text.ptr),
+    );
+
+    stream.deinit();
+    copy.deinit(allocator);
+}
+
+test "AssistantMessageStream cloneResult returns null on error-completed stream" {
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+    defer stream.deinit();
+
+    stream.completeWithError("boom");
+
+    try std.testing.expect((try stream.cloneResult(allocator)) == null);
+    try std.testing.expectEqualStrings("boom", stream.getError().?);
+
+    // A late complete() on top of an error publishes a result while the error
+    // stays set (see `completion_after_error_is_stable`). The one-call API
+    // must keep returning null so the failure is not masked by a result.
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "late") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    try std.testing.expect(stream.getResult() != null);
+    try std.testing.expect((try stream.cloneResult(allocator)) == null);
+    try std.testing.expectEqualStrings("boom", stream.getError().?);
+}
+
+test "AssistantMessageStream owned events: consumer frees each polled event" {
+    // Streams configured with owns_events = true (e.g. OpenAI Completions, or
+    // any provider started with requires_owned_stream_events) deep-copy events
+    // on push and transfer ownership of each polled event to the consumer:
+    // polled events must be freed with deinitAssistantMessageEvent. Events
+    // still queued at deinit() are freed by the stream. The testing allocator
+    // fails this test if either side is missed.
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+    stream.owns_events = true;
+    stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    // Both events are deep-copied into stream-owned storage by push().
+    // The first is polled by the consumer (freed per iteration); the second
+    // stays queued (freed by deinit).
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "consumed",
+        .partial = partial,
+    } });
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "left queued",
+        .partial = partial,
+    } });
+
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    var polled: usize = 0;
+    while (stream.wait()) |event| {
+        var ev = event;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &ev);
+        switch (ev) {
+            .text_delta => |d| try std.testing.expect(d.delta.len > 0),
+            else => {},
+        }
+        polled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), polled);
+
+    var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("ok", result.content[0].text.text);
+
+    stream.deinit();
 }
 
 test "EventStream pushBlocking reports completed full stream" {

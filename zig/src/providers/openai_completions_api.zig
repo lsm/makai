@@ -1706,14 +1706,42 @@ fn runThread(ctx: *ThreadCtx) void {
             return;
         };
         content[0] = .{ .text = .{ .text = "" } };
+        // The result outlives the producer thread, so it must own its metadata
+        // strings: ctx.deinit() below frees the thread-owned model before
+        // complete() publishes the result to the consumer.
+        const api = allocator.dupe(u8, model.api) catch {
+            ai_types.deinitAssistantContent(allocator, content);
+            ctx.deinit();
+            stream.completeWithError("oom building result");
+            stream.markThreadDone();
+            return;
+        };
+        const provider = allocator.dupe(u8, model.provider) catch {
+            allocator.free(api);
+            ai_types.deinitAssistantContent(allocator, content);
+            ctx.deinit();
+            stream.completeWithError("oom building result");
+            stream.markThreadDone();
+            return;
+        };
+        const model_id = allocator.dupe(u8, model.id) catch {
+            allocator.free(api);
+            allocator.free(provider);
+            ai_types.deinitAssistantContent(allocator, content);
+            ctx.deinit();
+            stream.completeWithError("oom building result");
+            stream.markThreadDone();
+            return;
+        };
         const out = ai_types.AssistantMessage{
             .content = content,
-            .api = model.api,
-            .provider = model.provider,
-            .model = model.id,
+            .api = api,
+            .provider = provider,
+            .model = model_id,
             .usage = usage,
             .stop_reason = stop_reason,
             .timestamp = compat_mod.time.nowMillis(),
+            .is_owned = true, // Strings were duped above
         };
         ctx.deinit();
         stream.complete(out);
@@ -1809,14 +1837,43 @@ fn runThread(ctx: *ThreadCtx) void {
         }
     }
 
+    // The result outlives the producer thread, so it must own its metadata
+    // strings: ctx.deinit() below frees the thread-owned model before
+    // complete() publishes the result to the consumer.
+    const api = allocator.dupe(u8, model.api) catch {
+        ai_types.deinitAssistantContent(allocator, content);
+        ctx.deinit();
+        stream.completeWithError("oom");
+        stream.markThreadDone();
+        return;
+    };
+    const provider = allocator.dupe(u8, model.provider) catch {
+        allocator.free(api);
+        ai_types.deinitAssistantContent(allocator, content);
+        ctx.deinit();
+        stream.completeWithError("oom");
+        stream.markThreadDone();
+        return;
+    };
+    const model_id = allocator.dupe(u8, model.id) catch {
+        allocator.free(api);
+        allocator.free(provider);
+        ai_types.deinitAssistantContent(allocator, content);
+        ctx.deinit();
+        stream.completeWithError("oom");
+        stream.markThreadDone();
+        return;
+    };
+
     const out = ai_types.AssistantMessage{
         .content = content,
-        .api = model.api,
-        .provider = model.provider,
-        .model = model.id,
+        .api = api,
+        .provider = provider,
+        .model = model_id,
         .usage = usage,
         .stop_reason = stop_reason,
         .timestamp = compat_mod.time.nowMillis(),
+        .is_owned = true, // Strings were duped above
     };
 
     ctx.deinit();

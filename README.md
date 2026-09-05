@@ -422,6 +422,12 @@ async function run(): Promise<void> {
 void run();
 ```
 
+## Zig core library
+
+The Zig core lives under `zig/src/` and is consumed directly as a path dependency (see `build.zig.zon`). Streaming APIs hand out borrowed string slices by design, so memory ownership follows explicit rules: event strings are borrowed from provider buffers by default (owned-event streams — `stream.owns_events == true`, e.g. OpenAI Completions — flip that: you free each polled event with `deinitAssistantMessageEvent`), `wait()` returning `null` is the completion signal (not a `done` event), and the final result is taken with `cloneResult()` as a caller-owned deep copy.
+
+Read [`docs/zig-stream-memory-ownership.md`](docs/zig-stream-memory-ownership.md) before writing your first consumer loop or mock provider — it documents the ownership contract for streams, events, and results, and the helper APIs (`cloneResult`, `cloneToolCall`) that make the safe pattern one call.
+
 ## TypeScript types
 
 Public types are exported from the package root and generated in `dist/src/index.d.ts` when you run `npm run build:sdk`. Key API types include:
