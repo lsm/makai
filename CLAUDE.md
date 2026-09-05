@@ -8,10 +8,9 @@ Makai is a Zig implementation of a unified multi-provider AI streaming abstracti
 
 ## Build Commands
 
-All build commands run from the `zig/` directory. Requires Zig 0.16.0.
+All build commands run from the repo root (where `build.zig` and `build.zig.zon` live). Requires Zig 0.16.0.
 
 ```bash
-cd zig
 zig build test                    # Run all unit tests
 zig build run                     # Run the demo application
 ```
@@ -27,6 +26,7 @@ zig build test-unit-protocol      # content_partial, partial_serializer, protoco
 zig build test-unit-providers     # api_registry, stream, register_builtins, all provider APIs
 zig build test-unit-utils         # github_copilot, oauth/pkce, oauth/mod, overflow, retry, sanitize, pre_transform
 zig build test-unit-makai-cli     # makai CLI unit tests
+zig build test-unit-tui           # TUI runtime, session, config, session store
 zig build test-unit-agent         # aggregate agent unit tests
 zig build test-unit-agent-types   # agent types
 zig build test-unit-agent-loop    # agent loop
@@ -53,7 +53,7 @@ There is no single-test command. Tests are inline in each `.zig` file using Zig'
 
 ## Dependencies
 
-No external Zig package dependencies are currently declared in `zig/build.zig.zon`; the unused `libxev` declaration was removed during the Zig 0.16.0 migration.
+No external Zig package dependencies are currently declared in `build.zig.zon` (repo root); the unused `libxev` declaration was removed during the Zig 0.16.0 migration.
 
 ## Architecture
 
@@ -130,13 +130,15 @@ Ownership and auth boundary:
 **`ai_types.zig`** - Core domain types:
 - `ContentBlock`: Tagged union — `text`, `tool_use`, `thinking`, `image`, `tool_result`
 - `MessageEvent` / `AssistantMessageEvent`: 13-variant tagged union for streaming events (start, text_delta, thinking_delta, toolcall_delta, done, error, etc.)
-- `Usage`: Token counting with `add()` and `total()` methods, includes cache read/write tokens
+- `Usage`: Token counters (`input`, `output`, `cache_read`, `cache_write`, `total_tokens`) plus a `cost: UsageCost` field; `calculateCost(model_cost)` fills in dollar costs from per-1M-token `Cost` rates
 - `AssistantMessage`: Final result containing content blocks, usage, stop reason, model
 - `Model`: Provider, name, context window, pricing, compatibility options (`OpenAICompatOptions`)
 - `StreamOptions`: All streaming options including service_tier, reasoning_summary, thinking config, cache control
 - `CancelToken`: Atomic bool wrapper for request cancellation
 
 **`event_stream.zig`** - `EventStream(T, R)`: Lock-free ring buffer (256 slots) with futex synchronization. Main type: `AssistantMessageStream = EventStream(MessageEvent, AssistantMessage)`. Key methods: `push`, `poll`, `pollBatch`, `wait` (blocking), `complete`, `completeWithError`.
+
+**Stream completion pattern (for consumers):** a stream ends via `complete(result)` / `completeWithError(msg)` — do NOT rely on receiving a `.done` event (no built-in provider pushes one; only higher layers like the agent and TUI emit `.done` on their own streams). The reliable consumption pattern: drain `wait()` until it returns `null` (ring empty AND stream completed), check `getError()`, then take the result with `cloneResult(allocator)` before `deinit()` — the copy is caller-owned and survives `deinit()` (`getResult()` is a borrowed view of the stream's internal copy). See `docs/zig-stream-memory-ownership.md` for the full contract.
 
 **`transport.zig`** - Defines transport interfaces (`Sender`, `Receiver`, `AsyncSender`, `AsyncReceiver`) and wire message types (`MessageOrControl`, `ControlMessage`). Also defines `ByteStream = EventStream(ByteChunk, void)` for async byte-level I/O. Transports implement these interfaces over different backends.
 
@@ -172,12 +174,12 @@ Ownership and auth boundary:
 1. Create `zig/src/providers/<name>_api.zig` implementing `stream*()` functions
 2. Register in `zig/src/register_builtins.zig` with the API registry
 3. Add provider-specific config struct in `config.zig` if needed
-4. Create module in `zig/build.zig`, add to test step and appropriate test group
+4. Create module in `build.zig` (repo root), add to test step and appropriate test group
 
 ### Adding a New Transport
 
 1. Create `zig/src/transports/<name>.zig` implementing `Sender`/`Receiver` from `transport.zig`
-2. Create module in `zig/build.zig` with `transport` import, add to test step and `test-unit-transport` group
+2. Create module in `build.zig` (repo root) with `transport` import, add to test step and `test-unit-transport` group
 
 ### Provider-Specific Notes
 
