@@ -716,20 +716,70 @@ test("client.agent.run does not auth-retry after tools have executed", async () 
   };
   const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
   // The run already executed a tool; a retry would replay its side effects, so
-  // the auth-shaped terminal failure returns as a response instead of throwing.
-  const result = await agent.run({
-    ...request(),
-    tools: [{
-      name: "sum",
-      description: "sum numbers",
-      parameters_schema_json: "{}",
-      execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
-    }],
-  });
-  assert.equal(result.stop_reason, "error");
-  assert.equal(result.error_message, "auth_required");
+  // the auth-shaped terminal failure surfaces as the typed terminal auth error
+  // (never re-entering auto_once) rather than a retryable error.
+  await assert.rejects(
+    () => agent.run({
+      ...request(),
+      tools: [{
+        name: "sum",
+        description: "sum numbers",
+        parameters_schema_json: "{}",
+        execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
+      }],
+    }),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "fixture-provider",
+  );
   // Only one agent run was started: no retry attempt.
   assert.equal(transport.sent.filter((frame) => frame.type === "agent_start").length, 1);
+});
+
+test("client.agent.run scopes provider-specific auth patterns to the matching provider", async () => {
+  const transportFor = (api: string, provider: string) => ({
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api,
+            provider,
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "permission_error: scope denied",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  });
+
+  // Non-Anthropic provider: permission_error is not an auth failure per the
+  // server's default detector, so the run resolves with the error completion.
+  const generic = createMakaiAgentApi(transportFor("fixture-error-api", "fixture-provider") as unknown as MakaiStdioClient);
+  const completion = await generic.run(request());
+  assert.equal(completion.stop_reason, "error");
+  assert.equal(completion.error_message, "permission_error: scope denied");
+
+  // Anthropic: the registered detector treats permission_error as auth.
+  const anthropic = createMakaiAgentApi(transportFor("anthropic-messages", "anthropic") as unknown as MakaiStdioClient);
+  await assert.rejects(
+    () => anthropic.run(request()),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic",
+  );
 });
 
 test("client.agent.run matches human-readable auth failure messages", async () => {

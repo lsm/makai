@@ -1,0 +1,4 @@
+stdout:
+ok
+
+stderr:

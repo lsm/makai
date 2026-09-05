@@ -417,7 +417,8 @@ test "agentLoop: iteration cap reports max_turns on agent_end" {
 
     // The final turn still ended wanting tools; the run ended on the cap.
     try testing.expect(result.final_message.stop_reason == .tool_use);
-    try testing.expectEqual(agent_types.AgentTermination.max_turns, agent_end_termination orelse .max_turns);
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), result.termination);
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), agent_end_termination);
 }
 
 test "agentLoop: zero max_iterations still reports max_turns termination" {
@@ -455,7 +456,13 @@ test "agentLoop: zero max_iterations still reports max_turns termination" {
     }
 
     try testing.expectEqual(@as(usize, 0), state.call_count);
-    try testing.expectEqual(agent_types.AgentTermination.max_turns, agent_end_termination orelse .max_turns);
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), agent_end_termination);
+
+    const result = stream.getResult().?;
+    var owned_result = result;
+    defer owned_result.deinit(allocator);
+    stream.result = null;
+    try testing.expectEqual(@as(?agent_types.AgentTermination, .max_turns), result.termination);
 }
 
 test "ProtocolOptions: passed through to protocol client" {

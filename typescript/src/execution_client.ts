@@ -583,9 +583,10 @@ class StdioAgentApi implements MakaiAgentApi {
             // the typed retryable path: mirror the provider stream convention
             // (error events with code auth_required throw instead of ending
             // the stream normally) so manual/auto_once auth retry engages. The
-            // outer stream() gates auto_once on no content having been yielded;
-            // the failed attempt's lifecycle events replay on retry.
-            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message)) {
+            // outer stream() gates auto_once on no content having been yielded
+            // (tool execution events are non-replayable), so tool side effects
+            // are never re-run; the failed attempt's lifecycle events replay.
+            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message, { providerId: event.provider_id })) {
               const resolvedProviderId = event.provider_id ?? fallbackProviderId;
               throw new MakaiStreamError(event.error_message ?? "auth_required", {
                 kind: "provider_error",
@@ -1406,7 +1407,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 function isRetryableAuthError(error: unknown): error is MakaiStreamError {
-  return error instanceof MakaiStreamError && error.code === "auth_required";
+  // MakaiAuthRequiredError is the terminal typed auth failure (produced after
+  // retries are exhausted or when replaying the run is unsafe); only the plain
+  // MakaiStreamError shape is retry-eligible.
+  return error instanceof MakaiStreamError && !(error instanceof MakaiAuthRequiredError) && error.code === "auth_required";
 }
 
 function authRequiredError(providerId: string, message: string): MakaiAuthRequiredError {
@@ -1430,46 +1434,58 @@ function isReplayableAgentEvent(event: AgentStreamEvent): boolean {
 
 /**
  * Detects provider auth failure text carried in an agent event/response
- * `error_message`. Mirrors the server-side and provider auth failure
- * detectors (zig/src/protocol/provider/server.zig
- * `defaultAuthFailureDetector`/NACK reasons and the registered Anthropic
- * detector in zig/src/providers/anthropic_messages_api.zig) so the same
- * failures the server treats as auth errors keep the SDK's typed, retryable
- * auth path instead of ending the run as a plain error completion.
+ * `error_message`. Base patterns mirror the server-wide default detector
+ * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus
+ * NACK reasons); provider-specific patterns (from the registered Anthropic
+ * detector, zig/src/providers/anthropic_messages_api.zig) apply only when the
+ * response identifies that provider, matching how the server scopes them.
  */
-function isAuthFailureMessage(message: string | undefined): boolean {
+function isAuthFailureMessage(message: string | undefined, identity?: { providerId?: string; api?: string }): boolean {
   if (!message) return false;
   const normalized = message.toLowerCase();
-  return normalized === "auth_required" ||
+  if (normalized === "auth_required" ||
     normalized === "auth_expired" ||
     normalized === "auth_refresh_failed" ||
     normalized.includes("authentication required") ||
     normalized.includes("401") ||
     normalized.includes("403") ||
     normalized.includes("unauthorized") ||
-    normalized.includes("forbidden") ||
+    normalized.includes("forbidden")) {
+    return true;
+  }
+  const isAnthropic = identity?.api === "anthropic-messages" || identity?.providerId === "anthropic";
+  return isAnthropic && (
     normalized.includes("authentication_error") ||
     normalized.includes("permission_error") ||
-    normalized.includes("invalid api key");
+    normalized.includes("invalid api key")
+  );
 }
 
 /**
  * Translates an agent run response whose provider turn failed with an auth
- * error into the thrown, retryable MakaiStreamError shape consumed by
- * withAuthRetry; non-auth failures return the response unchanged. The
- * response's own provider_id wins over the request-derived fallback so opaque
- * or remapped model_refs still resolve a retry target. Retrying is disabled
- * once tools have executed: a retry restarts the run in a fresh session and
- * would replay their side effects.
+ * error into the thrown error shape consumed by withAuthRetry; non-auth
+ * failures return the response unchanged. The response's own provider_id wins
+ * over the request-derived fallback so opaque or remapped model_refs still
+ * resolve a retry target. Once tools have executed, the typed
+ * MakaiAuthRequiredError is still thrown (manual/default policy expects it)
+ * but without retry eligibility — a retry restarts the run in a fresh session
+ * and would replay tool side effects.
  */
 function responseOrAuthError(response: CompletionResponse, providerId: string | undefined, options: { allowAuthRetry: boolean }): CompletionResponse {
-  if (options.allowAuthRetry && response.stop_reason === "error" && isAuthFailureMessage(response.error_message)) {
+  if (response.stop_reason === "error" && isAuthFailureMessage(response.error_message, { providerId: response.provider_id, api: response.api })) {
     const resolvedProviderId = response.provider_id || providerId;
-    throw new MakaiStreamError(response.error_message ?? "auth_required", {
-      kind: "provider_error",
-      code: "auth_required",
-      ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
-    });
+    const message = response.error_message ?? "auth_required";
+    if (options.allowAuthRetry) {
+      throw new MakaiStreamError(message, {
+        kind: "provider_error",
+        code: "auth_required",
+        ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
+      });
+    }
+    if (resolvedProviderId) {
+      throw authRequiredError(resolvedProviderId, message);
+    }
+    throw new MakaiStreamError(message, { kind: "provider_error", code: "auth_required" });
   }
   return response;
 }

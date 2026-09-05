@@ -564,6 +564,9 @@ pub const AgentLoopResult = struct {
     messages: OwnedSlice(ai_types.Message),
     final_message: ai_types.AssistantMessage,
     iterations: u32,
+    /// Agent-level termination reason when the run ended for a reason other
+    /// than the final turn's stop reason (e.g. the iteration cap).
+    termination: ?AgentTermination = null,
 
     pub fn deinit(self: *AgentLoopResult, allocator: std.mem.Allocator) void {
         self.messages.deinit(allocator);
