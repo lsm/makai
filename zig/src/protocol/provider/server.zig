@@ -778,41 +778,70 @@ fn streamWithRefresh(
 /// An `ai_types.Model` paired with the optional base URL allocation the
 /// defaulting path produced. `deinit` frees only that allocation — every
 /// other field keeps the caller's original ownership.
-const ModelWithDefaultBase = struct {
+const EffectiveModel = struct {
     model: ai_types.Model,
     defaulted_base_url: ?[]const u8 = null,
 
-    fn deinit(self: *ModelWithDefaultBase, allocator: std.mem.Allocator) void {
+    fn deinit(self: *EffectiveModel, allocator: std.mem.Allocator) void {
         if (self.defaulted_base_url) |base| allocator.free(base);
         self.defaulted_base_url = null;
     }
 };
 
-/// Resolve the model a provider sees, defaulting an empty base URL to the
-/// canonical vendor endpoint for known provider/API pairs (#183: clients
-/// such as the TS SDK send `base_url: ""` in every model descriptor, which
-/// otherwise fails URL construction with e.g. "invalid anthropic URL").
-/// Env overrides (`MAKAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
-/// `DEEPSEEK_BASE_URL`) win over the canonical endpoints; explicit non-empty
-/// base URLs pass through unchanged; unknown providers keep the empty base
-/// URL so no endpoint is derived from the API type. The returned model is a
-/// shallow copy — providers clone what they need before `stream()` returns,
-/// so `deinit` only owns the defaulted allocation.
-fn modelWithDefaultedBaseUrl(
+/// Server-side model default for clients that send no token metadata. The
+/// TS SDK's model descriptors carry no max_tokens, and providers serialize
+/// a limit of 0 for such models (Anthropic requires max_tokens >= 1), so
+/// real-provider requests would still fail after the base URL fix. Matches
+/// the CLI's non-catalog default (tools/makai.zig modelFromCanonicalRef).
+const DEFAULT_MODEL_MAX_TOKENS: u32 = 4_096;
+
+/// Resolve the model a provider sees, applying the server-side defaults the
+/// CLI print path already applies to non-catalog refs (#183):
+///
+/// - An empty `base_url` (the TS SDK sends "" in every model descriptor)
+///   resolves to the canonical vendor endpoint for known provider/API
+///   pairs — otherwise URL construction fails with e.g. "invalid anthropic
+///   URL". Env overrides (`MAKAI_BASE_URL`, `ANTHROPIC_BASE_URL`,
+///   `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`) win over the canonical
+///   endpoints; explicit non-empty base URLs pass through unchanged;
+///   unknown providers keep the empty base URL so no endpoint is derived
+///   from the API type.
+/// - A zero `max_tokens` (client sent none) becomes a usable default.
+/// - When the effective base URL comes from the environment rather than the
+///   client and the client sent no compat options, transparent-proxy compat
+///   (`*_BASE_URL_IS_PROXY=true`) is applied so env-configured proxies shape
+///   requests exactly as they do on the CLI path.
+///
+/// The returned model is a shallow copy — providers clone what they need
+/// before `stream()` returns, so `deinit` only owns the defaulted base URL.
+fn modelWithProtocolDefaults(
     allocator: std.mem.Allocator,
     model: ai_types.Model,
-) !ModelWithDefaultBase {
-    if (model.base_url.len > 0 or model.provider.len == 0 or model.api.len == 0) {
-        return .{ .model = model };
+) !EffectiveModel {
+    const client_supplied_base = model.base_url.len > 0;
+    var effective = model;
+    var defaulted_base: ?[]const u8 = null;
+    errdefer if (defaulted_base) |base| allocator.free(base);
+
+    if (!client_supplied_base and model.provider.len > 0 and model.api.len > 0) {
+        const resolved = try provider_base_url.defaultBaseUrlForRef(allocator, model.provider, model.api);
+        if (resolved.len > 0) {
+            defaulted_base = resolved;
+            effective.base_url = resolved;
+        } else {
+            allocator.free(resolved);
+        }
     }
-    const resolved = try provider_base_url.defaultBaseUrlForRef(allocator, model.provider, model.api);
-    if (resolved.len == 0) {
-        allocator.free(resolved);
-        return .{ .model = model };
+
+    if (model.max_tokens == 0) {
+        effective.max_tokens = DEFAULT_MODEL_MAX_TOKENS;
     }
-    var defaulted = model;
-    defaulted.base_url = resolved;
-    return .{ .model = defaulted, .defaulted_base_url = resolved };
+
+    if (model.compat == null and !client_supplied_base) {
+        effective.compat = try provider_base_url.transparentProxyCompat(allocator, model.provider);
+    }
+
+    return .{ .model = effective, .defaulted_base_url = defaulted_base };
 }
 
 /// Handle stream_request - create stream, return ack with stream_id
@@ -858,7 +887,7 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
 
     // Default an empty client-supplied base URL to the canonical vendor
     // endpoint so protocol clients don't need their own provider tables.
-    var effective_model = try modelWithDefaultedBaseUrl(server.allocator, request.model);
+    var effective_model = try modelWithProtocolDefaults(server.allocator, request.model);
     defer effective_model.deinit(server.allocator);
 
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
@@ -1055,7 +1084,7 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
 
     // Default an empty client-supplied base URL to the canonical vendor
     // endpoint so protocol clients don't need their own provider tables.
-    var effective_model = try modelWithDefaultedBaseUrl(server.allocator, request.model);
+    var effective_model = try modelWithProtocolDefaults(server.allocator, request.model);
     defer effective_model.deinit(server.allocator);
 
     // Create a stream for non-streaming completion, resolving and refreshing stored auth when configured.
@@ -2870,22 +2899,28 @@ test "handleStreamRequest injects CancelToken into provider stream options" {
 // Default Base URL Tests (#183)
 // ===========================================================================
 
-/// Base URL the last mock provider stream received. The capture happens
+/// Model fields the last mock provider stream received. The capture happens
 /// synchronously inside handleStreamRequest/handleCompleteRequest, before
 /// the test inspects it. The static buffer outlives the request (wire base
 /// URLs are capped at MAX_MODEL_FIELD_LENGTH = 512 bytes).
 const BaseUrlMockState = struct {
     var buffer: [512]u8 = undefined;
     var received_base_url: ?[]const u8 = null;
+    var received_max_tokens: u32 = 0;
+    var received_compat: ?ai_types.OpenAICompatOptions = null;
 
     fn reset() void {
         received_base_url = null;
+        received_max_tokens = 0;
+        received_compat = null;
     }
 
-    fn capture(url: []const u8) void {
-        const len = @min(url.len, buffer.len);
-        @memcpy(buffer[0..len], url[0..len]);
+    fn capture(model: ai_types.Model) void {
+        const len = @min(model.base_url.len, buffer.len);
+        @memcpy(buffer[0..len], model.base_url[0..len]);
         received_base_url = buffer[0..len];
+        received_max_tokens = model.max_tokens;
+        received_compat = model.compat;
     }
 };
 
@@ -2901,7 +2936,7 @@ fn baseUrlCapturingStream(
     _ = context;
     _ = options;
 
-    BaseUrlMockState.capture(model.base_url);
+    BaseUrlMockState.capture(model);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -2929,7 +2964,7 @@ fn baseUrlCapturingStreamSimple(
     _ = context;
     _ = options;
 
-    BaseUrlMockState.capture(model.base_url);
+    BaseUrlMockState.capture(model);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -2964,7 +2999,8 @@ fn baseUrlCaptureRegistry(allocator: std.mem.Allocator) !api_registry.ApiRegistr
 }
 
 /// Model shaped like the TS SDK's descriptors: known provider/API routing
-/// but an empty base URL.
+/// but an empty base URL and no token metadata (deserializeModel defaults
+/// max_tokens to 0 when the client omits it).
 fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8) ai_types.Model {
     return .{
         .id = "test-model",
@@ -2976,7 +3012,7 @@ fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8) ai_types.Model {
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 128000,
-        .max_tokens = 4096,
+        .max_tokens = 0,
     };
 }
 
@@ -3012,11 +3048,13 @@ test "handleStreamRequest defaults empty base URL for known provider" {
     }
 
     // The provider must have seen the canonical endpoint (or the env
-    // override when one is set), never the empty client value.
+    // override when one is set), never the empty client value, plus a
+    // usable token limit (the SDK descriptors carry none).
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     const expected = try provider_base_url.defaultBaseUrlForRef(std.testing.allocator, "anthropic", "anthropic-messages");
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, captured);
+    try std.testing.expectEqual(DEFAULT_MODEL_MAX_TOKENS, BaseUrlMockState.received_max_tokens);
 }
 
 test "handleStreamRequest preserves explicit base URL" {
@@ -3031,6 +3069,7 @@ test "handleStreamRequest preserves explicit base URL" {
 
     var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages");
     explicit_model.base_url = "https://explicit.example.com";
+    explicit_model.max_tokens = 1234;
 
     var req = protocol_types.Envelope{
         .stream_id = protocol_types.generateUlid(),
@@ -3052,6 +3091,8 @@ test "handleStreamRequest preserves explicit base URL" {
 
     const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("https://explicit.example.com", captured);
+    // Client-supplied limits are never overridden.
+    try std.testing.expectEqual(@as(u32, 1234), BaseUrlMockState.received_max_tokens);
 }
 
 test "handleStreamRequest keeps unknown provider base URL empty" {

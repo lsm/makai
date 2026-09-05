@@ -70,13 +70,15 @@ pub fn build(b: *std.Build) void {
     });
 
     // Canonical provider base URL resolution shared by the CLI and the
-    // provider protocol server (empty client base URLs, env overrides).
+    // provider protocol server (empty client base URLs, env overrides,
+    // transparent-proxy compat).
     const provider_base_url_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/provider_base_url.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
         },
     });
 
@@ -1374,8 +1376,10 @@ pub fn build(b: *std.Build) void {
     });
 
     // E2E: default base URL resolution on the stdio protocol path (#183).
-    // Mock providers, no API keys. OPENAI_BASE_URL is pinned for this binary
-    // so the env-override assertion is deterministic on every machine.
+    // Mock providers, no API keys. Every base-URL env var is pinned for this
+    // binary (empty = unset) so the canonical-default and env-override
+    // assertions are deterministic on every machine; OPENAI_BASE_URL plus
+    // its proxy flag exercise the override and compat paths end-to-end.
     const e2e_provider_base_url_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("zig/test/e2e/provider_base_url.zig"),
@@ -1390,13 +1394,16 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "protocol_client", .module = protocol_client_mod },
                 .{ .name = "envelope", .module = protocol_envelope_mod },
                 .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
-                .{ .name = "provider_base_url", .module = provider_base_url_mod },
                 .{ .name = "transports/in_process", .module = in_process_transport_mod },
             },
         }),
     });
     const e2e_provider_base_url_test_run = b.addRunArtifact(e2e_provider_base_url_test);
+    e2e_provider_base_url_test_run.setEnvironmentVariable("MAKAI_BASE_URL", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL", "https://env-override.makai.test/openai");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL_IS_PROXY", "true");
 
     const e2e_distributed_fullstack_test = b.addTest(.{
         .root_module = b.createModule(.{

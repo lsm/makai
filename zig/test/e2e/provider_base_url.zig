@@ -4,9 +4,11 @@
 //! uses (ProtocolClient -> SerializedPipe -> ProtocolServer -> mock provider),
 //! no API keys required. Asserts the server defaults empty client-supplied
 //! base URLs — the TS SDK sends `base_url: ""` in every model descriptor —
-//! and that `*_BASE_URL` env overrides are respected end-to-end. The build
-//! step pins `OPENAI_BASE_URL` for this binary so the override assertion is
-//! deterministic on every machine.
+//! and that `*_BASE_URL` env overrides are respected end-to-end.
+//!
+//! The build step pins every base-URL env var for this binary (empty = unset,
+//! plus a forced `OPENAI_BASE_URL` and its `_IS_PROXY` flag), so all
+//! assertions below are literal and deterministic on every machine.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -17,7 +19,6 @@ const protocol_server = @import("protocol_server");
 const protocol_client = @import("protocol_client");
 const envelope = @import("envelope");
 const protocol_runtime = @import("protocol_runtime");
-const provider_base_url = @import("provider_base_url");
 const in_process = @import("transports/in_process");
 
 const testing = std.testing;
@@ -28,31 +29,42 @@ const ProviderProtocolRuntime = protocol_runtime.ProviderProtocolRuntime;
 // Access protocol_types through envelope module (which re-exports types)
 const protocol_types = envelope.protocol_types;
 
-/// Forced by the build step for this test binary, so the env-override
-/// assertion below is deterministic regardless of the host environment.
+/// Forced by the build step for this test binary, together with
+/// `OPENAI_BASE_URL_IS_PROXY=true` and cleared `MAKAI_BASE_URL` /
+/// `ANTHROPIC_BASE_URL` / `DEEPSEEK_BASE_URL`.
 const FORCED_OPENAI_BASE_URL = "https://env-override.makai.test/openai";
 
-/// Base URL the last mock provider stream received. The capture happens
+/// Server-side default the provider must observe for models that arrive
+/// without token metadata (mirrors the CLI's non-catalog default).
+const EXPECTED_DEFAULT_MAX_TOKENS: u32 = 4_096;
+
+/// Model fields the last mock provider stream received. The capture happens
 /// synchronously while the runtime pumps the client message, before the test
 /// inspects it. The static buffer outlives the request (wire base URLs are
 /// capped at MAX_MODEL_FIELD_LENGTH = 512 bytes).
 const MockCapture = struct {
     var buffer: [512]u8 = undefined;
     var base_url: ?[]const u8 = null;
+    var max_tokens: u32 = 0;
+    var compat_options: ?ai_types.OpenAICompatOptions = null;
 
     fn reset() void {
         base_url = null;
+        max_tokens = 0;
+        compat_options = null;
     }
 
-    fn capture(url: []const u8) void {
-        const len = @min(url.len, buffer.len);
-        @memcpy(buffer[0..len], url[0..len]);
+    fn capture(model: ai_types.Model) void {
+        const len = @min(model.base_url.len, buffer.len);
+        @memcpy(buffer[0..len], model.base_url[0..len]);
         base_url = buffer[0..len];
+        max_tokens = model.max_tokens;
+        compat_options = model.compat;
     }
 };
 
-/// Mock provider stream: captures the model's base URL and completes
-/// immediately with a result (no network, no background thread).
+/// Mock provider stream: captures the model's base URL, token limit, and
+/// compat options, then completes immediately (no network, no thread).
 fn capturingStream(
     model: ai_types.Model,
     context: ai_types.Context,
@@ -62,7 +74,7 @@ fn capturingStream(
     _ = context;
     _ = options;
 
-    MockCapture.capture(model.base_url);
+    MockCapture.capture(model);
 
     const s = try allocator.create(event_stream.AssistantMessageEventStream);
     s.* = event_stream.AssistantMessageEventStream.init(allocator);
@@ -91,8 +103,8 @@ fn capturingStreamSimple(
     return capturingStream(model, context, null, allocator);
 }
 
-/// Model shaped like the TS SDK's descriptors: known provider/API routing
-/// but an empty base URL.
+/// Model shaped like the TS SDK's descriptors: known provider/API routing,
+/// an empty base URL, and no token metadata.
 fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8, model_id: []const u8) ai_types.Model {
     return .{
         .id = model_id,
@@ -104,7 +116,7 @@ fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8, model_id: []const
         .input = &.{},
         .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
         .context_window = 128000,
-        .max_tokens = 4096,
+        .max_tokens = 0,
     };
 }
 
@@ -171,12 +183,12 @@ test "stdio protocol stream defaults empty base URL for anthropic" {
 
     const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
     try expectValidHttpsUrl(captured);
-
-    // Canonical default (or the machine's env override, matched exactly so
-    // the assertion holds wherever *_BASE_URL vars are set).
-    const expected = try provider_base_url.defaultBaseUrlForRef(allocator, "anthropic", "anthropic-messages");
-    defer allocator.free(expected);
-    try testing.expectEqualStrings(expected, captured);
+    // Env is pinned for this binary: the canonical Anthropic endpoint.
+    try testing.expectEqualStrings("https://api.anthropic.com", captured);
+    // No proxy flag is set for anthropic, so no compat override applies.
+    try testing.expect(MockCapture.compat_options == null);
+    // Token metadata absent on the wire resolves to a usable default.
+    try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
 }
 
 test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
@@ -224,6 +236,14 @@ test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
     // must have seen exactly that endpoint — the env override survived the
     // whole client -> wire -> server -> provider path.
     try testing.expectEqualStrings(FORCED_OPENAI_BASE_URL, captured);
+    try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
+
+    // OPENAI_BASE_URL_IS_PROXY=true is also pinned: the server must apply
+    // transparent-proxy compat so the endpoint is treated as native OpenAI.
+    const compat_options = MockCapture.compat_options orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(?bool, true), compat_options.supports_store);
+    try testing.expectEqual(@as(?bool, true), compat_options.supports_developer_role);
+    try testing.expectEqual(@as(@TypeOf(compat_options.max_tokens_field), .max_completion_tokens), compat_options.max_tokens_field);
 }
 
 test "stdio protocol complete_request defaults empty base URL" {
@@ -273,9 +293,8 @@ test "stdio protocol complete_request defaults empty base URL" {
 
     const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
     try expectValidHttpsUrl(captured);
-    const expected = try provider_base_url.defaultBaseUrlForRef(allocator, "anthropic", "anthropic-messages");
-    defer allocator.free(expected);
-    try testing.expectEqualStrings(expected, captured);
+    try testing.expectEqualStrings("https://api.anthropic.com", captured);
+    try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
 
     // The server answered with a result envelope on the client-facing pipe.
     var receiver = pipe.clientReceiver();
