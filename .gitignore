@@ -37,5 +37,4 @@ tmp/
 # Environment / secrets
 .env
 .env.*
-zig/.makai/
-zig/src/.makai/
+.makai/

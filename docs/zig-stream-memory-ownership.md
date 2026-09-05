@@ -75,8 +75,14 @@ defer {
 // 1) Drain events until wait() returns null. That null — not a `done` event —
 //    is the completion signal.
 while (s.wait()) |event| {
-    switch (event) {
-        // Delta strings are borrowed: copy them as you consume them.
+    var ev = event;
+    // Owned-event streams (owns_events == true, e.g. OpenAI Completions)
+    // transfer ownership of each polled event to you: free it per iteration.
+    // Borrowed-event streams (the default) must NOT be freed here.
+    defer if (s.owns_events) ai_types.deinitAssistantMessageEvent(allocator, &ev);
+    switch (ev) {
+        // Delta strings are borrowed (or owned by the event, which the defer
+        // frees): copy them as you consume them either way.
         .text_delta => |d| try text.appendSlice(allocator, d.delta),
         // tool_call strings share storage with the result: deep-copy to keep.
         // The errdefer releases the copy if the append itself fails.

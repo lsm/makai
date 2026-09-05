@@ -498,8 +498,16 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
             comptime if (R != ai_types.AssistantMessage) {
                 @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
             };
-            if (self.getError() != null) return null;
-            const result = self.getResult() orelse return null;
+            // Snapshot err_msg and result under one lock: reading them through
+            // separate critical sections could observe "no error" before an
+            // abort's completeWithError() and a late complete() after it,
+            // returning a "success" from a state where the error must win.
+            self.mutex.lockUncancelable(defaultIo());
+            const snapshot = self.result;
+            const err = self.err_msg;
+            self.mutex.unlock(defaultIo());
+            if (err != null) return null;
+            const result = snapshot orelse return null;
             return try ai_types.cloneAssistantMessage(allocator, result);
         }
 
@@ -850,6 +858,75 @@ test "AssistantMessageStream cloneResult returns null on error-completed stream"
     try std.testing.expect(stream.getResult() != null);
     try std.testing.expect((try stream.cloneResult(allocator)) == null);
     try std.testing.expectEqualStrings("boom", stream.getError().?);
+}
+
+test "AssistantMessageStream owned events: consumer frees each polled event" {
+    // Streams configured with owns_events = true (e.g. OpenAI Completions, or
+    // any provider started with requires_owned_stream_events) deep-copy events
+    // on push and transfer ownership of each polled event to the consumer:
+    // polled events must be freed with deinitAssistantMessageEvent. Events
+    // still queued at deinit() are freed by the stream. The testing allocator
+    // fails this test if either side is missed.
+    const allocator = std.testing.allocator;
+
+    var stream = AssistantMessageStream.init(allocator);
+    stream.owns_events = true;
+    stream.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+
+    const partial = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    // Both events are deep-copied into stream-owned storage by push().
+    // The first is polled by the consumer (freed per iteration); the second
+    // stays queued (freed by deinit).
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "consumed",
+        .partial = partial,
+    } });
+    try stream.push(.{ .text_delta = .{
+        .content_index = 0,
+        .delta = "left queued",
+        .partial = partial,
+    } });
+
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "ok") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    var polled: usize = 0;
+    while (stream.wait()) |event| {
+        var ev = event;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &ev);
+        switch (ev) {
+            .text_delta => |d| try std.testing.expect(d.delta.len > 0),
+            else => {},
+        }
+        polled += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), polled);
+
+    var result = (try stream.cloneResult(allocator)) orelse return error.NoResult;
+    defer result.deinit(allocator);
+    try std.testing.expectEqualStrings("ok", result.content[0].text.text);
+
+    stream.deinit();
 }
 
 test "EventStream pushBlocking reports completed full stream" {

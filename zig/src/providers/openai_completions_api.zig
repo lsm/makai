@@ -1843,16 +1843,16 @@ fn runThread(ctx: *ThreadCtx) void {
     const api = allocator.dupe(u8, model.api) catch {
         ai_types.deinitAssistantContent(allocator, content);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const provider = allocator.dupe(u8, model.provider) catch {
         allocator.free(api);
         ai_types.deinitAssistantContent(allocator, content);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
     const model_id = allocator.dupe(u8, model.id) catch {
@@ -1860,8 +1860,8 @@ fn runThread(ctx: *ThreadCtx) void {
         allocator.free(provider);
         ai_types.deinitAssistantContent(allocator, content);
         ctx.deinit();
-        stream.markThreadDone();
         stream.completeWithError("oom");
+        stream.markThreadDone();
         return;
     };
 
