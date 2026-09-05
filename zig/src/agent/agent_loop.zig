@@ -1290,6 +1290,12 @@ fn runLoop(
     // Build result and transfer ownership out of local loop state.
     const result_messages = try state.messages.toOwnedSlice(allocator);
 
+    // Agent-level termination: exiting at the iteration cap after a tool-use
+    // turn (or before any turn ran) means the run ended on max turns, not with
+    // the final turn's own stop reason.
+    const terminated_on_max_turns = state.iterations >= max_iterations and
+        (state.final_message == null or state.final_message.?.stop_reason == .tool_use);
+
     const result_final_message: ai_types.AssistantMessage = if (state.final_message) |fm| blk: {
         state.final_message = null;
         break :blk fm;
@@ -1316,6 +1322,7 @@ fn runLoop(
     try pushAgentEvent(event_stream, .{
         .agent_end = .{
             .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
+            .termination = if (terminated_on_max_turns) .max_turns else null,
         },
     });
 

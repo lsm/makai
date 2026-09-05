@@ -12,9 +12,20 @@ pub const ArtifactReference = ai_types.ArtifactReference;
 // Agent Event Types
 // ============================================================================
 
+/// Agent-level termination reason for a finished run. Distinct from the
+/// turn-scoped `StopReason` on assistant messages: when set, it reports why
+/// the *run* ended (e.g. the iteration cap) rather than echoing the final
+/// turn's own stop reason.
+pub const AgentTermination = enum {
+    max_turns,
+};
+
 /// Payload for agent_end event
 pub const AgentEndPayload = struct {
     messages: OwnedSlice(ai_types.Message) = OwnedSlice(ai_types.Message).initBorrowed(&.{}),
+    /// Set when the run terminated for an agent-level reason (iteration cap);
+    /// null when the run ended with the final turn's stop reason.
+    termination: ?AgentTermination = null,
 
     pub fn deinit(self: *AgentEndPayload, allocator: std.mem.Allocator) void {
         self.messages.deinit(allocator);

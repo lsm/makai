@@ -634,11 +634,15 @@ test("client.agent.stream auto_once retries after yielded auth lifecycle events"
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-retry-stream-test-"));
   const logPath = path.join(tmpDir, "request.log");
   const eventsPath = path.join(tmpDir, "events.json");
+  // Mirrors a real run: prompt echo message frames arrive before the failing
+  // provider turn, so the retry gate must classify them as replayable.
   fs.writeFileSync(eventsPath, JSON.stringify([
     { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "message_end", stop_reason: "end_turn" },
     { type: "turn_start" },
     { type: "turn_end", stop_reason: "error", error_message: "auth_required" },
-    { type: "agent_end", stop_reason: "error", error_message: "auth_required" },
+    { type: "agent_end", stop_reason: "error", error_message: "auth_required", provider_id: "anthropic" },
   ]));
   const handle = await createMakaiClient({
     command: process.execPath,
@@ -656,11 +660,11 @@ test("client.agent.stream auto_once retries after yielded auth lifecycle events"
       },
       (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "anthropic",
     );
-    // Both attempts yielded only lifecycle markers: the failed attempt's
-    // turn_end detail, then the retried attempt's replay.
+    // Both attempts yielded only replayable markers: the prompt echo frames,
+    // the failed attempt's turn_end detail, then the retried attempt's replay.
     assert.deepEqual(events.map((event) => event.type), [
-      "agent_start", "turn_start", "turn_end",
-      "agent_start", "turn_start", "turn_end",
+      "agent_start", "message_start", "message_end", "turn_start", "turn_end",
+      "agent_start", "message_start", "message_end", "turn_start", "turn_end",
     ]);
     const logged = readLoggedRequests(logPath);
     assert.equal(logged.filter((entry) => entry.type === "agent_message").length, 2);
@@ -669,6 +673,137 @@ test("client.agent.stream auto_once retries after yielded auth lifecycle events"
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("client.agent.run does not auth-retry after tools have executed", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "tool_execute",
+        session_id: "testNanoIdSess1234567",
+        message_id: "tool-request-1",
+        sequence: 3,
+        payload: { tool_call_id: "call-1", tool_name: "sum", args_json: "{\"a\":2,\"b\":3}" },
+      },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  // The run already executed a tool; a retry would replay its side effects, so
+  // the auth-shaped terminal failure returns as a response instead of throwing.
+  const result = await agent.run({
+    ...request(),
+    tools: [{
+      name: "sum",
+      description: "sum numbers",
+      parameters_schema_json: "{}",
+      execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
+    }],
+  });
+  assert.equal(result.stop_reason, "error");
+  assert.equal(result.error_message, "auth_required");
+  // Only one agent run was started: no retry attempt.
+  assert.equal(transport.sent.filter((frame) => frame.type === "agent_start").length, 1);
+});
+
+test("client.agent.run matches human-readable auth failure messages", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-readable-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture-provider",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "Authentication required for provider fixture",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream resolves auth retry provider from the streamed agent_end", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  const events: AgentStreamEvent[] = [];
+  await assert.rejects(
+    async () => {
+      for await (const event of agent.stream({ model_ref: "opaque-model-ref-no-provider", messages: [{ role: "user", content: "hello" }] })) {
+        events.push(event);
+      }
+    },
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider" && err.code === "auth_required",
+  );
 });
 
 test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {

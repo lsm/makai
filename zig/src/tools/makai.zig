@@ -1749,19 +1749,32 @@ fn serializeAgentLoopEvent(
         },
         .agent_end => |payload| {
             try w.writeStringField("type", "agent_end");
-            // Surface the terminal assistant turn's outcome so raw
-            // agent-protocol consumers see the failure detail without the
-            // preceding agent_result frame.
+            // Agent-level termination (e.g. max turns) overrides the final
+            // turn's reason; otherwise surface the terminal assistant turn's
+            // outcome so raw agent-protocol consumers see the failure detail
+            // without the preceding agent_result frame.
             const messages = payload.messages.slice();
+            var last_assistant: ?ai_types.AssistantMessage = null;
             var idx = messages.len;
             while (idx > 0) {
                 idx -= 1;
                 if (messages[idx] == .assistant) {
-                    try w.writeStringField("stop_reason", @tagName(messages[idx].assistant.stop_reason));
-                    if (messages[idx].assistant.error_message.slice().len > 0) {
-                        try w.writeStringField("error_message", messages[idx].assistant.error_message.slice());
-                    }
+                    last_assistant = messages[idx].assistant;
                     break;
+                }
+            }
+            const agent_stop_reason: ?[]const u8 = if (payload.termination) |termination|
+                @tagName(termination)
+            else if (last_assistant) |message|
+                @tagName(message.stop_reason)
+            else
+                null;
+            if (agent_stop_reason) |reason| {
+                try w.writeStringField("stop_reason", reason);
+            }
+            if (last_assistant) |message| {
+                if (message.error_message.slice().len > 0) {
+                    try w.writeStringField("error_message", message.error_message.slice());
                 }
             }
         },
@@ -4021,6 +4034,46 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"type\":\"agent_end\"") != null);
         try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\"") == null);
         try std.testing.expect(std.mem.find(u8, json, "\"error_message\"") == null);
+    }
+
+    // Iteration-cap termination reports the agent-level reason instead of the
+    // final turn's tool_use.
+    {
+        const messages = [_]ai_types.Message{
+            .{ .assistant = .{
+                .content = &.{},
+                .api = "fixture-ok-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .tool_use,
+                .timestamp = 0,
+            } },
+        };
+        const event = agent_loop.AgentEvent{ .agent_end = .{
+            .messages = ai_types.OwnedSlice(ai_types.Message).initBorrowed(&messages),
+            .termination = .max_turns,
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\":\"agent_end\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"max_turns\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"tool_use\"") == null);
+    }
+
+    // Zero-iteration runs still report the max-turns termination.
+    {
+        const prompts = [_]ai_types.Message{
+            .{ .user = .{ .content = .{ .text = "hello" }, .timestamp = 0 } },
+        };
+        const event = agent_loop.AgentEvent{ .agent_end = .{
+            .messages = ai_types.OwnedSlice(ai_types.Message).initBorrowed(&prompts),
+            .termination = .max_turns,
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"type\":\"agent_end\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"max_turns\"") != null);
     }
 }
 

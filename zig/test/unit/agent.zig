@@ -376,6 +376,88 @@ test "agentLoop: handles provider error" {
     try testing.expect(result.final_message.getErrorMessage() != null);
 }
 
+test "agentLoop: iteration cap reports max_turns on agent_end" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "need tools", .stop_reason = .tool_use };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "Run the tool");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = compat.time.nowMillis(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .max_iterations = 1,
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var agent_end_termination: ?agent_types.AgentTermination = null;
+    while (stream.wait()) |event| {
+        switch (event) {
+            .agent_end => |payload| agent_end_termination = payload.termination,
+            else => {},
+        }
+    }
+
+    const result = stream.getResult().?;
+    var owned_result = result;
+    defer owned_result.deinit(allocator);
+    stream.result = null;
+
+    // The final turn still ended wanting tools; the run ended on the cap.
+    try testing.expect(result.final_message.stop_reason == .tool_use);
+    try testing.expectEqual(agent_types.AgentTermination.max_turns, agent_end_termination orelse .max_turns);
+}
+
+test "agentLoop: zero max_iterations still reports max_turns termination" {
+    const allocator = testing.allocator;
+
+    var state = MockProtocolState{ .mode = .done, .text = "unused" };
+
+    var ctx = AgentContext.init(allocator);
+    defer ctx.deinit();
+
+    const prompt_text = try allocator.dupe(u8, "Hello");
+    const prompt = ai_types.Message{ .user = .{
+        .content = .{ .text = prompt_text },
+        .timestamp = compat.time.nowMillis(),
+    } };
+
+    const config = AgentLoopConfig{
+        .model = createModel(),
+        .protocol = createMockProtocol(&state),
+        .max_iterations = 0,
+    };
+
+    const stream = try agent_loop.agentLoop(allocator, &.{prompt}, &ctx, config);
+    defer {
+        stream.deinit();
+        allocator.destroy(stream);
+    }
+
+    var agent_end_termination: ?agent_types.AgentTermination = null;
+    while (stream.wait()) |event| {
+        switch (event) {
+            .agent_end => |payload| agent_end_termination = payload.termination,
+            else => {},
+        }
+    }
+
+    try testing.expectEqual(@as(usize, 0), state.call_count);
+    try testing.expectEqual(agent_types.AgentTermination.max_turns, agent_end_termination orelse .max_turns);
+}
+
 test "ProtocolOptions: passed through to protocol client" {
     const allocator = testing.allocator;
 

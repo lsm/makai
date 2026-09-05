@@ -396,6 +396,9 @@ class StdioAgentApi implements MakaiAgentApi {
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
+    // Retrying after tool execution would replay tool side effects in a fresh
+    // session, so terminal auth translation is disabled once tools ran.
+    let toolsExecuted = false;
     try {
       while (true) {
         checkAbort(signal, "agent.run aborted");
@@ -411,10 +414,11 @@ class StdioAgentApi implements MakaiAgentApi {
           }
           continue;
         }
-        if (frame.type === "agent_result") return responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId);
-        if (frame.type === "result" || frame.type === "complete_response") return responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId);
+        if (frame.type === "agent_result") return responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+        if (frame.type === "result" || frame.type === "complete_response") return responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
         if (frame.type === "tool_execute") {
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
+          toolsExecuted = true;
           continue;
         }
 
@@ -424,8 +428,9 @@ class StdioAgentApi implements MakaiAgentApi {
         }
         for (const event of normalized) {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+          if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolsExecuted = true;
           events.push(event);
-          if (event.type === "agent_end") return responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId);
+          if (event.type === "agent_end") return responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
         }
       }
     } catch (error) {
@@ -499,7 +504,7 @@ class StdioAgentApi implements MakaiAgentApi {
           throw error;
         }
         if (result.done) return;
-        if (!isAgentLifecycleEvent(result.value)) yieldedContent = true;
+        if (!isReplayableAgentEvent(result.value)) yieldedContent = true;
         yield result.value;
       }
     } catch (error) {
@@ -581,7 +586,12 @@ class StdioAgentApi implements MakaiAgentApi {
             // outer stream() gates auto_once on no content having been yielded;
             // the failed attempt's lifecycle events replay on retry.
             if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message)) {
-              throw new MakaiStreamError(event.error_message ?? "auth_required", { kind: "provider_error", code: "auth_required", provider_id: fallbackProviderId });
+              const resolvedProviderId = event.provider_id ?? fallbackProviderId;
+              throw new MakaiStreamError(event.error_message ?? "auth_required", {
+                kind: "provider_error",
+                code: "auth_required",
+                ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
+              });
             }
           } else if (event.type === "error") {
             terminal = true;
@@ -1154,11 +1164,12 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
   const messageEnd = reversed.find((event) => event.type === "message_end");
   const finalMessageEvents = finalAssistantMessageEvents(events);
   const start = finalMessageEvents.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
+  const terminalProviderId = terminal && "provider_id" in terminal && typeof terminal.provider_id === "string" ? terminal.provider_id : undefined;
   const content = contentFromEvents(finalMessageEvents);
   return {
     message: { role: "assistant", content },
     usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
-    provider_id: start?.provider_id ?? "",
+    provider_id: start?.provider_id ?? terminalProviderId ?? "",
     api: start?.api ?? "",
     model_id: start?.model_id ?? "",
     stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
@@ -1259,6 +1270,7 @@ function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
     ...(usage ? { usage } : {}),
     ...(optionalString(data.stop_reason ?? data.reason) ? { stop_reason: optionalString(data.stop_reason ?? data.reason) } : {}),
     ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
+    ...(optionalString(data.provider_id ?? data.provider) ? { provider_id: optionalString(data.provider_id ?? data.provider) } : {}),
   };
 }
 
@@ -1402,21 +1414,28 @@ function authRequiredError(providerId: string, message: string): MakaiAuthRequir
 }
 
 /**
- * Agent lifecycle markers that carry no provider content. A retried attempt
- * re-emits them without duplicating any provider output, so an attempt that
- * yielded only these events is still safe to retry after an auth failure.
+ * Agent events that carry no provider content or side effects and may be
+ * re-emitted by a retried attempt: lifecycle markers plus the metadata-only
+ * message frames the server emits for initial prompts before any provider
+ * call. Provider output deltas, tool calls, and tool execution events are
+ * excluded — replaying those would duplicate content or side effects.
  */
-function isAgentLifecycleEvent(event: AgentStreamEvent): boolean {
-  return event.type === "agent_start" || event.type === "turn_start" || event.type === "turn_end";
+function isReplayableAgentEvent(event: AgentStreamEvent): boolean {
+  return event.type === "agent_start" ||
+    event.type === "turn_start" ||
+    event.type === "turn_end" ||
+    event.type === "message_start" ||
+    event.type === "message_end";
 }
 
 /**
  * Detects provider auth failure text carried in an agent event/response
- * `error_message`. Mirrors the server-side auth failure detector
- * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus the
- * `auth_required`/`auth_expired`/`auth_refresh_failed` NACK reasons) so the
- * same failures the server treats as auth errors keep the SDK's typed,
- * retryable auth path instead of ending the run as a plain error completion.
+ * `error_message`. Mirrors the server-side and provider auth failure
+ * detectors (zig/src/protocol/provider/server.zig
+ * `defaultAuthFailureDetector`/NACK reasons and the registered Anthropic
+ * detector in zig/src/providers/anthropic_messages_api.zig) so the same
+ * failures the server treats as auth errors keep the SDK's typed, retryable
+ * auth path instead of ending the run as a plain error completion.
  */
 function isAuthFailureMessage(message: string | undefined): boolean {
   if (!message) return false;
@@ -1424,10 +1443,14 @@ function isAuthFailureMessage(message: string | undefined): boolean {
   return normalized === "auth_required" ||
     normalized === "auth_expired" ||
     normalized === "auth_refresh_failed" ||
+    normalized.includes("authentication required") ||
     normalized.includes("401") ||
     normalized.includes("403") ||
     normalized.includes("unauthorized") ||
-    normalized.includes("forbidden");
+    normalized.includes("forbidden") ||
+    normalized.includes("authentication_error") ||
+    normalized.includes("permission_error") ||
+    normalized.includes("invalid api key");
 }
 
 /**
@@ -1435,10 +1458,12 @@ function isAuthFailureMessage(message: string | undefined): boolean {
  * error into the thrown, retryable MakaiStreamError shape consumed by
  * withAuthRetry; non-auth failures return the response unchanged. The
  * response's own provider_id wins over the request-derived fallback so opaque
- * or remapped model_refs still resolve a retry target.
+ * or remapped model_refs still resolve a retry target. Retrying is disabled
+ * once tools have executed: a retry restarts the run in a fresh session and
+ * would replay their side effects.
  */
-function responseOrAuthError(response: CompletionResponse, providerId?: string): CompletionResponse {
-  if (response.stop_reason === "error" && isAuthFailureMessage(response.error_message)) {
+function responseOrAuthError(response: CompletionResponse, providerId: string | undefined, options: { allowAuthRetry: boolean }): CompletionResponse {
+  if (options.allowAuthRetry && response.stop_reason === "error" && isAuthFailureMessage(response.error_message)) {
     const resolvedProviderId = response.provider_id || providerId;
     throw new MakaiStreamError(response.error_message ?? "auth_required", {
       kind: "provider_error",
