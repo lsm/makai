@@ -490,13 +490,15 @@ pub fn EventStream(comptime T: type, comptime R: type) type {
         /// valid after `deinit()`, and is the only result value the consumer
         /// should call `AssistantMessage.deinit()` on.
         ///
-        /// Returns null when the stream has not completed (or completed with an
-        /// error — check `getError()`). Only available on streams whose result
-        /// type is `AssistantMessage`.
+        /// Returns null when the stream has not completed or carries an error
+        /// (`getError()` non-null — check it; a stream can hold both an error
+        /// and a late result after an abort, and the error wins). Only
+        /// available on streams whose result type is `AssistantMessage`.
         pub fn cloneResult(self: *Self, allocator: std.mem.Allocator) error{OutOfMemory}!?ai_types.AssistantMessage {
             comptime if (R != ai_types.AssistantMessage) {
                 @compileError("cloneResult() is only available on streams whose result type is ai_types.AssistantMessage");
             };
+            if (self.getError() != null) return null;
             const result = self.getResult() orelse return null;
             return try ai_types.cloneAssistantMessage(allocator, result);
         }
@@ -826,6 +828,26 @@ test "AssistantMessageStream cloneResult returns null on error-completed stream"
 
     stream.completeWithError("boom");
 
+    try std.testing.expect((try stream.cloneResult(allocator)) == null);
+    try std.testing.expectEqualStrings("boom", stream.getError().?);
+
+    // A late complete() on top of an error publishes a result while the error
+    // stays set (see `completion_after_error_is_stable`). The one-call API
+    // must keep returning null so the failure is not masked by a result.
+    const result_content = try allocator.alloc(ai_types.AssistantContent, 1);
+    result_content[0] = .{ .text = .{ .text = try allocator.dupe(u8, "late") } };
+    stream.complete(.{
+        .content = result_content,
+        .api = try allocator.dupe(u8, "test-api"),
+        .provider = try allocator.dupe(u8, "test-provider"),
+        .model = try allocator.dupe(u8, "test-model"),
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+        .is_owned = true,
+    });
+
+    try std.testing.expect(stream.getResult() != null);
     try std.testing.expect((try stream.cloneResult(allocator)) == null);
     try std.testing.expectEqualStrings("boom", stream.getError().?);
 }

@@ -184,7 +184,7 @@ queue (polling), then read `getError()` / `cloneResult()`.
 
 | Helper | Purpose |
 | --- | --- |
-| `EventStream.cloneResult(allocator)` | Deep copy of the completed result (`!?AssistantMessage`, `error{OutOfMemory}`). `null` if the stream has not completed or completed with an error. Available on `AssistantMessageStream` (result type `AssistantMessage`). |
+| `EventStream.cloneResult(allocator)` | Deep copy of the completed result (`!?AssistantMessage`, `error{OutOfMemory}`). `null` if the stream has not completed or carries an error (`getError()` non-null — the error wins over a late result). Available on `AssistantMessageStream` (result type `AssistantMessage`). |
 | `ai_types.cloneToolCall(allocator, tool_call)` | Deep copy of a `ToolCall` (owned by you, free with `deinitToolCall`). |
 | `ai_types.cloneAssistantMessage(allocator, msg)` | Deep copy of any `AssistantMessage` (sets `is_owned = true`). |
 | `ai_types.cloneAssistantMessageEvent(allocator, event)` | Deep copy of a whole event, including its `partial` message. Use when forwarding events across a lifetime boundary. |
