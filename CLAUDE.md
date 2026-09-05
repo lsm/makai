@@ -205,6 +205,8 @@ All allocations go through explicit `std.mem.Allocator` parameters. Tests use `s
 
 **DO NOT** add `deinitAssistantMessageEvent()` to `EventStream.deinit()` - this causes double-free panics. See CI failures from 2026-02-19.
 
+The consumer-facing version of this contract (streams, events, results) is documented in `docs/zig-stream-memory-ownership.md`. `EventStream.cloneResult()` is the supported way for consumers to extract the completed result as a caller-owned deep copy; `getResult()` returns a borrowed view that aliases the stream's internal copy.
+
 ## Zig Conventions in This Codebase
 
 - snake_case for functions/variables, PascalCase for types

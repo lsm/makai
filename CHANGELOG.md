@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Documented the Zig stream/result memory-ownership contract for package consumers in [`docs/zig-stream-memory-ownership.md`](docs/zig-stream-memory-ownership.md): event strings are borrowed, `wait()` returning `null` (not a `done` event) is the completion signal, and results are taken via `cloneResult()` before the stream is deinit'd. Linked from the README (#186).
+- Added `EventStream.cloneResult(allocator)` on `AssistantMessageStream`: one-call deep copy of the completed result that is fully owned (`is_owned = true`), survives `deinit()`, and is safe to `AssistantMessage.deinit()`. Added `ai_types.cloneToolCall`/`deinitToolCall` for collecting `toolcall_end` tool calls, plus unit tests covering the safe consumer flow (stream → events → result → clean deinit) under `std.testing.allocator` (#186).
 - Added `npm run check:declarations`: rebuilds the SDK into a clean `dist/`, then verifies the `makai` npm tarball ships `*.d.ts` declarations under `dist/src` (including `dist/src/index.d.ts` and a matching declaration for every shipped `.js`) and that a fresh-install consumer project type-checks cleanly under strict TS with `skipLibCheck` disabled. Wired into CI (`ts-sdk-e2e`) and the release packaging job so a build without declarations can no longer ship (#184).
 
 ### Changed

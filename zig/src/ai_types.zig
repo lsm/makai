@@ -355,6 +355,19 @@ pub const AssistantMessage = struct {
         return if (err.len > 0) err else null;
     }
 
+    /// Free owned memory.
+    ///
+    /// Ownership contract (see docs/zig-stream-memory-ownership.md):
+    /// - Content-block strings (text, thinking, tool_call, image) are freed
+    ///   UNCONDITIONALLY — every block string must be heap-allocated with
+    ///   `allocator`. Providers must dupe all content strings before building
+    ///   the message they pass to `EventStream.complete()`; string literals
+    ///   here are a bus error waiting to happen.
+    /// - `api`/`provider`/`model` are freed only when `is_owned` is true.
+    /// - `error_message` tracks its own ownership (OwnedSlice).
+    /// Only call this on a message you know owns its content: messages built
+    /// by `cloneAssistantMessage`/`cloneResult` (is_owned = true), or results
+    /// a provider handed to `complete()` on a stream you are deiniting.
     pub fn deinit(self: *AssistantMessage, allocator: std.mem.Allocator) void {
         for (self.content) |block| {
             switch (block) {
@@ -760,6 +773,43 @@ pub const AssistantMessageEvent = union(enum) {
     @"error": struct { reason: StopReason, err: AssistantMessage },
     keepalive: void,
 };
+
+/// Deep copy a `ToolCall`.
+///
+/// `toolcall_end` events carry tool-call strings BORROWED from provider-managed
+/// buffers — they share storage with the completed result's `tool_call` blocks
+/// and must not be freed or kept past the provider's buffer lifetime. Use this
+/// helper when collecting tool calls from events; free the copies with
+/// `deinitToolCall`.
+pub fn cloneToolCall(allocator: std.mem.Allocator, tool_call: ToolCall) error{OutOfMemory}!ToolCall {
+    const id = try allocator.dupe(u8, tool_call.id);
+    errdefer allocator.free(id);
+    const name = try allocator.dupe(u8, tool_call.name);
+    errdefer allocator.free(name);
+    const arguments_json = try allocator.dupe(u8, tool_call.arguments_json);
+    errdefer allocator.free(arguments_json);
+    const thought_signature = if (tool_call.thought_signature) |s|
+        try allocator.dupe(u8, s)
+    else
+        null;
+    errdefer if (thought_signature) |s| allocator.free(s);
+
+    return .{
+        .id = id,
+        .name = name,
+        .arguments_json = arguments_json,
+        .thought_signature = thought_signature,
+    };
+}
+
+/// Free a `ToolCall` produced by `cloneToolCall`.
+pub fn deinitToolCall(allocator: std.mem.Allocator, tool_call: *ToolCall) void {
+    allocator.free(tool_call.id);
+    allocator.free(tool_call.name);
+    // Only free non-empty arguments_json - empty slices may be static
+    if (tool_call.arguments_json.len > 0) allocator.free(tool_call.arguments_json);
+    if (tool_call.thought_signature) |s| allocator.free(s);
+}
 
 pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage) !AssistantMessage {
     var content = try allocator.alloc(AssistantContent, msg.content.len);
@@ -1334,6 +1384,29 @@ test "cloneAssistantMessage deep copies text content" {
 
     try std.testing.expectEqualStrings("hello", cloned.content[0].text.text);
     try std.testing.expectEqualStrings("openai", cloned.provider);
+}
+
+test "cloneToolCall deep copies borrowed tool-call strings" {
+    const allocator = std.testing.allocator;
+
+    // tool_call strings in toolcall_end events are borrowed from provider
+    // buffers (literals here) — the clone must own independent copies.
+    const borrowed = ToolCall{
+        .id = "call-1",
+        .name = "get_weather",
+        .arguments_json = "{\"city\":\"SF\"}",
+        .thought_signature = "sig-1",
+    };
+
+    var owned = try cloneToolCall(allocator, borrowed);
+    defer deinitToolCall(allocator, &owned);
+
+    try std.testing.expectEqualStrings("call-1", owned.id);
+    try std.testing.expectEqualStrings("get_weather", owned.name);
+    try std.testing.expectEqualStrings("{\"city\":\"SF\"}", owned.arguments_json);
+    try std.testing.expectEqualStrings("sig-1", owned.thought_signature.?);
+    try std.testing.expect(@intFromPtr(owned.id.ptr) != @intFromPtr(borrowed.id.ptr));
+    try std.testing.expect(@intFromPtr(owned.name.ptr) != @intFromPtr(borrowed.name.ptr));
 }
 
 test "ToolResultMessage details_json uses OwnedSlice and deep clones" {
