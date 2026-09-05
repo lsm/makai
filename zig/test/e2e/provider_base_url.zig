@@ -43,6 +43,11 @@ const EXPECTED_KIMI_BASE_URL = "https://api.kimi.com/coding";
 /// without token metadata (mirrors the CLI's non-catalog default).
 const EXPECTED_DEFAULT_MAX_TOKENS: u32 = 4_096;
 
+/// Static-catalog advertised limit for the anthropic e2e model
+/// (claude-sonnet-4-5), and the production-catalog Kimi limit.
+const EXPECTED_ANTHROPIC_CATALOG_MAX_TOKENS: u32 = 8_192;
+const EXPECTED_KIMI_CATALOG_MAX_TOKENS: u32 = 16_384;
+
 /// Model fields the last mock provider stream received. The capture happens
 /// synchronously while the runtime pumps the client message, before the test
 /// inspects it. The static buffer outlives the request (wire base URLs are
@@ -195,8 +200,9 @@ test "stdio protocol stream defaults empty base URL for anthropic" {
     try testing.expectEqualStrings("https://api.anthropic.com", captured);
     // No proxy flag is set for anthropic, so no compat override applies.
     try testing.expect(MockCapture.compat_options == null);
-    // Token metadata absent on the wire resolves to a usable default.
-    try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
+    // Token metadata absent on the wire resolves to the advertised
+    // static-catalog limit, not the generic fallback.
+    try testing.expectEqual(EXPECTED_ANTHROPIC_CATALOG_MAX_TOKENS, MockCapture.max_tokens);
 }
 
 test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
@@ -338,6 +344,7 @@ test "stdio protocol stream defaults catalog-issued codex and kimi refs" {
 
         const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
         try testing.expectEqualStrings(EXPECTED_KIMI_BASE_URL, captured);
+        try testing.expectEqual(EXPECTED_KIMI_CATALOG_MAX_TOKENS, MockCapture.max_tokens);
     }
 }
 
@@ -389,7 +396,7 @@ test "stdio protocol complete_request defaults empty base URL" {
     const captured = MockCapture.base_url orelse return error.TestUnexpectedResult;
     try expectValidHttpsUrl(captured);
     try testing.expectEqualStrings("https://api.anthropic.com", captured);
-    try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
+    try testing.expectEqual(EXPECTED_ANTHROPIC_CATALOG_MAX_TOKENS, MockCapture.max_tokens);
 
     // The server answered with a result envelope on the client-facing pipe.
     var receiver = pipe.clientReceiver();

@@ -212,8 +212,7 @@ fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
 /// the provider and model id the way the CLI does for non-catalog refs.
 /// Protocol clients (TS SDK) send no capability metadata, so the server
 /// rehydrates the same flag before dispatch.
-pub fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
-    if (std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "openai-codex")) {
+pub fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {    if (std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "openai-codex")) {
         // The Codex OAuth provider serves the same model families; its
         // catalog entries are all reasoning-capable (o-series / gpt-5*).
         return std.mem.startsWith(u8, model_id, "o1") or
@@ -238,6 +237,19 @@ pub fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
         return !std.mem.startsWith(u8, model_id, "claude-3");
     }
     return false;
+}
+
+/// Server-side output-token default for models that arrive without token
+/// metadata. The generic fallback matches the CLI's non-catalog default
+/// (tools/makai.zig modelFromCanonicalRef); catalog pairs with materially
+/// higher advertised limits use their catalog limit so protocol callers are
+/// never silently constrained below what models.list() advertised.
+pub fn defaultMaxTokensForRef(provider_id: []const u8, api: []const u8) u32 {
+    if (std.mem.eql(u8, provider_id, "kimi") and std.mem.eql(u8, api, "openai-completions")) {
+        // Production catalog: kimiModel sets max_tokens = 16_384.
+        return 16_384;
+    }
+    return 4_096;
 }
 
 test "baseUrlWithOverrides resolves canonical provider defaults" {
@@ -414,4 +426,11 @@ test "normalizeKimiRegion accepts catalog region aliases" {
     try std.testing.expectEqualStrings("china", normalizeKimiRegion("china").?);
     try std.testing.expect(normalizeKimiRegion("mars") == null);
     try std.testing.expect(normalizeKimiRegion("") == null);
+}
+
+test "defaultMaxTokensForRef uses catalog limits for catalog pairs" {
+    try std.testing.expectEqual(@as(u32, 16_384), defaultMaxTokensForRef("kimi", "openai-completions"));
+    try std.testing.expectEqual(@as(u32, 4_096), defaultMaxTokensForRef("anthropic", "anthropic-messages"));
+    try std.testing.expectEqual(@as(u32, 4_096), defaultMaxTokensForRef("openai", "openai-completions"));
+    try std.testing.expectEqual(@as(u32, 4_096), defaultMaxTokensForRef("kimi", "openai-responses"));
 }

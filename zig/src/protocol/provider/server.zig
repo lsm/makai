@@ -792,8 +792,23 @@ const EffectiveModel = struct {
 /// TS SDK's model descriptors carry no max_tokens, and providers serialize
 /// a limit of 0 for such models (Anthropic requires max_tokens >= 1), so
 /// real-provider requests would still fail after the base URL fix. Matches
-/// the CLI's non-catalog default (tools/makai.zig modelFromCanonicalRef).
+/// the CLI's non-catalog default (tools/makai.zig modelFromCanonicalRef);
+/// catalog pairs with higher advertised limits override it.
 const DEFAULT_MODEL_MAX_TOKENS: u32 = 4_096;
+
+/// Output limit advertised for this exact model in the server's static
+/// catalog, null when the model is not a static entry. Used so a caller who
+/// selected a catalog-listed model without options.max_tokens gets the
+/// advertised limit rather than the generic fallback.
+fn staticCatalogMaxTokens(model: ai_types.Model) ?u32 {
+    for (STATIC_MODEL_CATALOG) |entry| {
+        if (!std.mem.eql(u8, entry.provider_id, model.provider)) continue;
+        if (!std.mem.eql(u8, entry.api, model.api)) continue;
+        if (!std.mem.eql(u8, entry.model_id, model.id)) continue;
+        return entry.max_output_tokens orelse DEFAULT_MODEL_MAX_TOKENS;
+    }
+    return null;
+}
 
 /// Resolve the model a provider sees, applying the server-side defaults the
 /// CLI print path already applies to non-catalog refs (#183):
@@ -846,13 +861,17 @@ fn modelWithProtocolDefaults(
     }
 
     if (model.max_tokens == 0) {
-        effective.max_tokens = DEFAULT_MODEL_MAX_TOKENS;
+        effective.max_tokens = staticCatalogMaxTokens(model) orelse
+            provider_base_url.defaultMaxTokensForRef(model.provider, model.api);
     }
 
     // Protocol clients send no capability metadata; a false reasoning flag
     // is indistinguishable from an absent one on the wire, so rehydrate the
-    // CLI's inference (an explicit true from the client always survives).
-    if (!model.reasoning and model.provider.len > 0 and model.id.len > 0) {
+    // CLI's inference — but only for minimal SDK-shaped descriptors (no
+    // base URL). A client that supplied an endpoint explicitly also had its
+    // reasoning flag serialized deliberately and is respected as-is; an
+    // explicit true always survives either way.
+    if (!model.reasoning and !client_supplied_base and model.provider.len > 0 and model.id.len > 0) {
         effective.reasoning = provider_base_url.isReasoningModelRef(model.provider, model.id);
     }
 
@@ -3477,6 +3496,114 @@ test "handleStreamRequest infers reasoning capability and preserves explicit fla
 
         // A non-reasoning family stays false — inference is not blanket-on.
         try std.testing.expect(!BaseUrlMockState.received_reasoning);
+    }
+    // An explicit endpoint means the descriptor was built by a client that
+    // also serialized its reasoning flag deliberately — never overridden.
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+        defer registry.deinit();
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-sonnet-4-5");
+        explicit_model.base_url = "https://explicit.example.com";
+        explicit_model.reasoning = false;
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = explicit_model,
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        try std.testing.expect(!BaseUrlMockState.received_reasoning);
+    }
+}
+
+test "handleStreamRequest applies advertised catalog token limits" {
+    // A static-catalog model selected via models.list() but sent without
+    // options.max_tokens gets its advertised limit, not the generic 4096.
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+        defer registry.deinit();
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-sonnet-4-5"),
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        try std.testing.expectEqual(@as(u32, 8_192), BaseUrlMockState.received_max_tokens);
+    }
+    // The Kimi pair uses its production-catalog limit (16_384).
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+        defer registry.deinit();
+        const provider = api_registry.ApiProvider{
+            .api = "openai-completions",
+            .stream = baseUrlCapturingStream,
+            .stream_simple = baseUrlCapturingStreamSimple,
+        };
+        try registry.registerApiProvider(provider, null);
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = emptyBaseUrlModel("kimi", "openai-completions", "kimi-k2.7-code"),
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        try std.testing.expectEqual(@as(u32, 16_384), BaseUrlMockState.received_max_tokens);
     }
 }
 
