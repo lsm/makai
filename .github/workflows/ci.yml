@@ -101,6 +101,9 @@ jobs:
           MAKAI_BINARY_PATH: /tmp/makai-smoke/bin/makai
         run: npm run test:sdk
 
+      - name: Verify npm package ships TypeScript declarations
+        run: npm run check:declarations
+
   # =============================================================================
   # E2E Tests (run in parallel)
   # Add new tests by adding a new job following the pattern below
