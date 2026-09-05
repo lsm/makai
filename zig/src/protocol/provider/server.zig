@@ -862,10 +862,10 @@ fn isKimiPair(provider_id: []const u8, api: []const u8) bool {
 }
 
 /// Kimi region recorded on the provider's stored OAuth credentials
-/// (`provider_data: "region:<value>"`), null when unavailable. Must be
-/// evaluated before any storage deinit — normalizeKimiRegion in
-/// defaultBaseUrlForRefWithRegion returns static literals, so the borrowed
-/// slice never outlives the call.
+/// (`provider_data: "region:<value>"`), normalized to its static region
+/// literal while the storage is still alive — the borrowed provider_data
+/// slice is securely freed by the storage deinit, so a raw slice must never
+/// escape this function. Null when no stored region is available.
 fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
@@ -883,7 +883,7 @@ fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     if (auth != .oauth) return null;
     const provider_data = auth.oauth.provider_data orelse return null;
     if (!std.mem.startsWith(u8, provider_data, "region:")) return null;
-    return provider_data["region:".len..];
+    return provider_base_url.normalizeKimiRegion(provider_data["region:".len..]);
 }
 
 /// Handle stream_request - create stream, return ack with stream_id
@@ -3263,6 +3263,69 @@ test "handleStreamRequest defaults catalog-issued codex and kimi base URLs" {
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(expected, captured);
     }
+}
+
+test "handleStreamRequest honors kimi region stored on OAuth credentials" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    const provider = api_registry.ApiProvider{
+        .api = "openai-completions",
+        .stream = baseUrlCapturingStream,
+        .stream_simple = baseUrlCapturingStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    // Stored Kimi credentials carrying a global region. The region slice is
+    // securely freed with the storage, so reading it must normalize while
+    // the storage is alive (a dangling read previously resolved global
+    // accounts to the china endpoint).
+    var storage = AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer storage.deinit();
+    {
+        const provider_id = try std.testing.allocator.dupe(u8, "kimi");
+        const provider_data = try std.testing.allocator.dupe(u8, "region:global");
+        try storage.providers.put(provider_id, .{ .oauth = .{
+            .refresh = try std.testing.allocator.dupe(u8, "refresh"),
+            .access = try std.testing.allocator.dupe(u8, "access"),
+            .expires = 0,
+            .provider_data = provider_data,
+        } });
+    }
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{ .auth_storage = &storage });
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = emptyBaseUrlModel("kimi", "openai-completions", "kimi-k2.7-code"),
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    // The stored region flows through resolution (KIMI_REGION env, when set
+    // on the host, legitimately wins — comparing against the same resolver
+    // covers both cases).
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "kimi", "openai-completions", "global");
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, captured);
 }
 
 test "handleCompleteRequest defaults empty base URL for known provider" {
