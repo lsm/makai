@@ -754,11 +754,13 @@ test "AssistantMessageStream safe consumer flow: wait, copy, cloneResult, deinit
             // Delta strings are borrowed: copy them if you keep them.
             .text_delta => |d| try text.appendSlice(allocator, d.delta),
             // tool_call strings are borrowed (they share storage with the
-            // completed result's blocks): deep-copy with cloneToolCall.
-            .toolcall_end => |tc| try tool_calls.append(
-                allocator,
-                try ai_types.cloneToolCall(allocator, tc.tool_call),
-            ),
+            // completed result's blocks): deep-copy with cloneToolCall. The
+            // errdefer releases the copy if the append itself fails.
+            .toolcall_end => |tc| {
+                var owned = try ai_types.cloneToolCall(allocator, tc.tool_call);
+                errdefer ai_types.deinitToolCall(allocator, &owned);
+                try tool_calls.append(allocator, owned);
+            },
             .done => saw_done_event = true,
             else => {},
         }

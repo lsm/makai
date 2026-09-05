@@ -13,10 +13,12 @@ Module names below (`ai_types`, `event_stream`) refer to the Makai modules under
 
 ## TL;DR
 
-1. **Event strings are borrowed.** Delta text, tool-call ids/names/arguments,
-   and the `partial` message inside every `AssistantMessageEvent` point into
-   provider-managed buffers. Never free them, and never keep them past your
-   poll loop without copying.
+1. **Event strings are usually borrowed.** Delta text, tool-call
+   ids/names/arguments, and the `partial` message inside every
+   `AssistantMessageEvent` point into producer-managed memory. Never free
+   them yourself (unless the stream owns its events — see
+   [Borrowed vs owned event streams](#borrowed-vs-owned-event-streams)), and
+   never keep them past your poll loop without copying.
 2. **`wait()` returning `null` is the completion signal.** Do not wait for a
    `done` event — several providers never push one.
 3. **Take the result with `s.cloneResult(allocator)`.** The copy is fully
@@ -31,14 +33,15 @@ Module names below (`ai_types`, `event_stream`) refer to the Makai modules under
 
 | Value | Strings allocated by | Freed by | Safe to keep? |
 | --- | --- | --- | --- |
-| `AssistantMessageEvent` from `wait()`/`poll()` | producer (borrowed slices) | producer's buffers — **not** the stream, **not** you | only after copying |
+| Event from a **borrowed-event** stream (`stream.owns_events == false`, the default) | producer (borrowed slices) | producer's buffers — **not** the stream, **not** you | only after copying |
+| Event from an **owned-event** stream (`stream.owns_events == true`, e.g. OpenAI Completions) | the stream (deep-copied on `push()`) | **you**, via `ai_types.deinitAssistantMessageEvent`, for each polled event; the stream frees only events still queued at `deinit()` | yes |
 | `AssistantMessage` from `getResult()` | producer (borrowed view of the stream's internal copy) | `EventStream.deinit()` | no — read-only, do not deinit |
 | `AssistantMessage` from `cloneResult()` | you (deep copy) | you, via `AssistantMessage.deinit()` | yes |
 | `ToolCall` from `cloneToolCall()` | you (deep copy) | you, via `deinitToolCall()` | yes |
 
-The stream itself never frees event strings (they are borrowed), and it does
-free the completed result in `deinit()` — the result a provider passed to
-`complete()` is transferred to the stream.
+The completed result is transferred to the stream: `EventStream.deinit()`
+frees it. Event handling depends on the stream's `owns_events` flag — check it
+before writing your poll loop.
 
 ## The safe consumer pattern
 
@@ -47,7 +50,8 @@ One complete, leak-free flow (mirrored by the unit test
 
 ```zig
 const std = @import("std");
-const ai_types = @import("ai_types");
+const ai_types = @import("ai_types"); // zig/src/ai_types.zig
+const makai_stream = @import("stream"); // zig/src/stream.zig
 
 const allocator = gpa.allocator();
 
@@ -75,10 +79,12 @@ while (s.wait()) |event| {
         // Delta strings are borrowed: copy them as you consume them.
         .text_delta => |d| try text.appendSlice(allocator, d.delta),
         // tool_call strings share storage with the result: deep-copy to keep.
-        .toolcall_end => |tc| try tool_calls.append(
-            allocator,
-            try ai_types.cloneToolCall(allocator, tc.tool_call),
-        ),
+        // The errdefer releases the copy if the append itself fails.
+        .toolcall_end => |tc| {
+            var owned = try ai_types.cloneToolCall(allocator, tc.tool_call);
+            errdefer ai_types.deinitToolCall(allocator, &owned);
+            try tool_calls.append(allocator, owned);
+        },
         else => {},
     }
 }
@@ -104,6 +110,38 @@ for (result.content) |block| {
 copy-on-keep rule applies. If you prefer non-blocking polling, loop until
 `poll()` returns `null` **and** `isDone()` is true.
 
+## Borrowed vs owned event streams
+
+The sample above assumes the default: a **borrowed-event** stream
+(`owns_events == false`), where the stream stores pushed events as-is and never
+frees their strings. You copy what you keep; you never free the event itself.
+
+Some streams are **owned-event** streams (`owns_events == true`, e.g. OpenAI
+Completions, or any provider started with `requires_owned_stream_events: true`
+in `StreamOptions`): `push()` deep-copies each event into stream-owned storage.
+There the obligations flip — after processing each polled event you must free
+it with `ai_types.deinitAssistantMessageEvent(allocator, &event)`. Events still
+queued when the stream dies are freed by `EventStream.deinit()`.
+
+```zig
+if (s.owns_events) {
+    while (s.wait()) |event| {
+        var ev = event;
+        defer ai_types.deinitAssistantMessageEvent(allocator, &ev);
+        // ... process ev (strings are owned by the event; still copy to keep
+        // them past the defer) ...
+    }
+}
+```
+
+If your consumer may lag the producer (UI buffering, slow sinks), prefer
+`requires_owned_stream_events: true` where the provider supports it: with
+borrowed events the producer is responsible for keeping the backing storage
+alive until you drain the queue, and not every provider upholds that for the
+full queue lifetime yet (the Anthropic direct path frees its delta storage when
+its producer thread exits — #192). Owned events remove that race at the cost of
+one deep copy per event.
+
 ## Completion is `wait()` → `null` → result, not a `done` event
 
 The `done` variant of `AssistantMessageEvent` exists, but providers are not
@@ -125,17 +163,20 @@ queue (polling), then read `getError()` / `cloneResult()`.
    `AssistantMessage.deinit()` — the `is_owned` flag only guards
    `api`/`provider`/`model`. A result whose block strings are string literals
    (read-only memory) crashes when the stream deinits. If you write a provider
-   or mock, allocate every block string with `allocator.dupe` and set
-   `.is_owned = true` (dupe the `api`/`provider`/`model` strings too, as all
-   built-in providers do).
+   or mock, allocate every block string with `allocator.dupe`, and dupe
+   `api`/`provider`/`model` as well, setting `.is_owned = true` — the pattern
+   every built-in provider uses on its main result path. (Passing borrowed
+   `api`/`provider`/`model` with `is_owned = false` is only safe when the
+   content blocks are empty or the borrowed strings outlive the stream.)
 2. **`done` event / `getResult()` aliasing.** The message inside a `done`
    event and the value returned by `getResult()` share memory with the stream's
    internal result. Keeping either past `s.deinit()` dangles; freeing either
    double-frees when the stream deinits its copy. Use `cloneResult()` (or
    `ai_types.cloneAssistantMessage`) to own the data.
-3. **`toolcall_end` aliasing.** A `toolcall_end` event's `tool_call` strings
-   (`id`, `name`, `arguments_json`, `thought_signature`) share storage with the
-   completed result's `tool_call` blocks. Same rule: deep-copy with
+3. **`toolcall_end` aliasing.** On a borrowed-event stream, a `toolcall_end`
+   event's `tool_call` strings (`id`, `name`, `arguments_json`,
+   `thought_signature`) share storage with the completed result's `tool_call`
+   blocks. Same rule: deep-copy with
    `ai_types.cloneToolCall(allocator, tc.tool_call)` when collecting calls, and
    free the copies with `ai_types.deinitToolCall`.
 
@@ -153,11 +194,17 @@ queue (polling), then read `getError()` / `cloneResult()`.
 If you implement the provider side (custom API registration or test mocks):
 
 - `push()` stores the event as-is by default: the event's strings must outlive
-  until the consumer polls them. For producer threads that exit early (protocol
-  forwarding), construct the stream with `owns_events = true` and a
-  `clone_event_fn` so `push()` deep-copies into stream-owned storage.
+  until the consumer polls them — the producer is responsible for keeping the
+  backing storage alive until the queue is drained (this is the obligation the
+  Anthropic direct path currently misses, #192). For producer threads that
+  exit before the consumer drains (protocol forwarding, short-lived workers),
+  construct the stream with `owns_events = true` and a `clone_event_fn` so
+  `push()` deep-copies into stream-owned storage — and document the consumer's
+  `deinitAssistantMessageEvent` obligation that comes with it. OpenAI
+  Completions (`pushOwnedEvent`) is the in-tree example.
 - The `AssistantMessage` given to `complete()` is transferred to the stream:
   `EventStream.deinit()` calls `AssistantMessage.deinit()` on it, which frees
   every content-block string unconditionally and frees `api`/`provider`/`model`
   only when `is_owned` is true. Empty content (`&.{}`) and empty strings are
-  always safe.
+  always safe. Duplicate `api`/`provider`/`model` before freeing the model the
+  strings came from — the published result outlives the producer thread.

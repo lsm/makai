@@ -841,26 +841,57 @@ pub fn cloneAssistantMessage(allocator: std.mem.Allocator, msg: AssistantMessage
         allocator.free(content);
     }
 
+    // Each field dupe carries its own errdefer so a mid-block OOM frees the
+    // partially built block; cloned_count (and the outer errdefer above) then
+    // only has to cover fully constructed blocks.
     for (msg.content, 0..) |block, i| {
         content[i] = switch (block) {
-            .text => |t| .{ .text = .{
-                .text = try allocator.dupe(u8, t.text),
-                .text_signature = if (t.text_signature) |s| try allocator.dupe(u8, s) else null,
-            } },
-            .thinking => |t| .{ .thinking = .{
-                .thinking = try allocator.dupe(u8, t.thinking),
-                .thinking_signature = if (t.thinking_signature) |s| try allocator.dupe(u8, s) else null,
-            } },
-            .tool_call => |tc| .{ .tool_call = .{
-                .id = try allocator.dupe(u8, tc.id),
-                .name = try allocator.dupe(u8, tc.name),
-                .arguments_json = try allocator.dupe(u8, tc.arguments_json),
-                .thought_signature = if (tc.thought_signature) |s| try allocator.dupe(u8, s) else null,
-            } },
-            .image => |img| .{ .image = .{
-                .data = try allocator.dupe(u8, img.data),
-                .mime_type = try allocator.dupe(u8, img.mime_type),
-            } },
+            .text => |t| blk: {
+                const text = try allocator.dupe(u8, t.text);
+                errdefer allocator.free(text);
+                const text_signature = if (t.text_signature) |s| try allocator.dupe(u8, s) else null;
+                errdefer if (text_signature) |s| allocator.free(s);
+                break :blk .{ .text = .{
+                    .text = text,
+                    .text_signature = text_signature,
+                } };
+            },
+            .thinking => |t| blk: {
+                const thinking = try allocator.dupe(u8, t.thinking);
+                errdefer allocator.free(thinking);
+                const thinking_signature = if (t.thinking_signature) |s| try allocator.dupe(u8, s) else null;
+                errdefer if (thinking_signature) |s| allocator.free(s);
+                break :blk .{ .thinking = .{
+                    .thinking = thinking,
+                    .thinking_signature = thinking_signature,
+                } };
+            },
+            .tool_call => |tc| blk: {
+                const id = try allocator.dupe(u8, tc.id);
+                errdefer allocator.free(id);
+                const name = try allocator.dupe(u8, tc.name);
+                errdefer allocator.free(name);
+                const arguments_json = try allocator.dupe(u8, tc.arguments_json);
+                errdefer allocator.free(arguments_json);
+                const thought_signature = if (tc.thought_signature) |s| try allocator.dupe(u8, s) else null;
+                errdefer if (thought_signature) |s| allocator.free(s);
+                break :blk .{ .tool_call = .{
+                    .id = id,
+                    .name = name,
+                    .arguments_json = arguments_json,
+                    .thought_signature = thought_signature,
+                } };
+            },
+            .image => |img| blk: {
+                const data = try allocator.dupe(u8, img.data);
+                errdefer allocator.free(data);
+                const mime_type = try allocator.dupe(u8, img.mime_type);
+                errdefer allocator.free(mime_type);
+                break :blk .{ .image = .{
+                    .data = data,
+                    .mime_type = mime_type,
+                } };
+            },
         };
         cloned_count += 1;
     }
@@ -1384,6 +1415,43 @@ test "cloneAssistantMessage deep copies text content" {
 
     try std.testing.expectEqualStrings("hello", cloned.content[0].text.text);
     try std.testing.expectEqualStrings("openai", cloned.provider);
+}
+
+test "cloneAssistantMessage is leak-free when an allocation fails mid-clone" {
+    // Sweep every allocation index: each induced OutOfMemory must unwind
+    // cleanly. cloneResult()/cloneAssistantMessage() are advertised as the
+    // safe extraction path, so their error path must not leak. The testing
+    // allocator underneath the failing allocator reports any leak at test end.
+    const allocator = std.testing.allocator;
+
+    const content = [_]AssistantContent{
+        .{ .text = .{ .text = "hello", .text_signature = "sig" } },
+        .{ .thinking = .{ .thinking = "hmm", .thinking_signature = "tsig" } },
+        .{ .tool_call = .{ .id = "call-1", .name = "get_weather", .arguments_json = "{}", .thought_signature = "ts" } },
+        .{ .image = .{ .data = "img", .mime_type = "image/png" } },
+    };
+    const msg = AssistantMessage{
+        .content = &content,
+        .api = "openai-completions",
+        .provider = "openai",
+        .model = "gpt-4o",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = 0,
+    };
+
+    // Generous upper bound: fail_index values past the real allocation count
+    // simply succeed and are deinit'd.
+    var fail_index: usize = 0;
+    while (fail_index <= 20) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        if (cloneAssistantMessage(failing.allocator(), msg)) |cloned| {
+            var mutable = cloned;
+            mutable.deinit(failing.allocator());
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+    }
 }
 
 test "cloneToolCall deep copies borrowed tool-call strings" {
