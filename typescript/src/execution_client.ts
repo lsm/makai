@@ -448,7 +448,11 @@ class StdioAgentApi implements MakaiAgentApi {
     const activeSession: { sessionId?: string; nextSequence: number } = { nextSequence: 1 };
     let attempt = this.streamAttempt(streamRequest, effectivePolicy, signal, activeSession);
     let iterator = attempt[Symbol.asyncIterator]();
-    let yielded = false;
+    // Whether any content-bearing event was yielded. auto_once auth retry may
+    // replay agent lifecycle markers (agent_start/turn_start/turn_end of the
+    // failed attempt) but must never duplicate provider content, so only
+    // content-free attempts are retryable.
+    let yieldedContent = false;
     let retried = false;
 
     if (!isNoopLogger(this.logger)) {
@@ -466,7 +470,7 @@ class StdioAgentApi implements MakaiAgentApi {
             // Cancel+drain handled by outer catch to avoid triple-send.
             throw error;
           }
-          if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+          if (!yieldedContent && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
             const providerId = error.provider_id ?? fallbackProviderId;
             if (providerId) {
               try {
@@ -495,7 +499,7 @@ class StdioAgentApi implements MakaiAgentApi {
           throw error;
         }
         if (result.done) return;
-        yielded = true;
+        if (!isAgentLifecycleEvent(result.value)) yieldedContent = true;
         yield result.value;
       }
     } catch (error) {
@@ -573,7 +577,9 @@ class StdioAgentApi implements MakaiAgentApi {
             // Provider auth failures surfaced via the agent event stream keep
             // the typed retryable path: mirror the provider stream convention
             // (error events with code auth_required throw instead of ending
-            // the stream normally) so manual/auto_once auth retry engages.
+            // the stream normally) so manual/auto_once auth retry engages. The
+            // outer stream() gates auto_once on no content having been yielded;
+            // the failed attempt's lifecycle events replay on retry.
             if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message)) {
               throw new MakaiStreamError(event.error_message ?? "auth_required", { kind: "provider_error", code: "auth_required", provider_id: fallbackProviderId });
             }
@@ -1396,6 +1402,15 @@ function authRequiredError(providerId: string, message: string): MakaiAuthRequir
 }
 
 /**
+ * Agent lifecycle markers that carry no provider content. A retried attempt
+ * re-emits them without duplicating any provider output, so an attempt that
+ * yielded only these events is still safe to retry after an auth failure.
+ */
+function isAgentLifecycleEvent(event: AgentStreamEvent): boolean {
+  return event.type === "agent_start" || event.type === "turn_start" || event.type === "turn_end";
+}
+
+/**
  * Detects provider auth failure text carried in an agent event/response
  * `error_message`. Mirrors the server-side auth failure detector
  * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus the
@@ -1418,11 +1433,18 @@ function isAuthFailureMessage(message: string | undefined): boolean {
 /**
  * Translates an agent run response whose provider turn failed with an auth
  * error into the thrown, retryable MakaiStreamError shape consumed by
- * withAuthRetry; non-auth failures return the response unchanged.
+ * withAuthRetry; non-auth failures return the response unchanged. The
+ * response's own provider_id wins over the request-derived fallback so opaque
+ * or remapped model_refs still resolve a retry target.
  */
 function responseOrAuthError(response: CompletionResponse, providerId?: string): CompletionResponse {
   if (response.stop_reason === "error" && isAuthFailureMessage(response.error_message)) {
-    throw new MakaiStreamError(response.error_message ?? "auth_required", { kind: "provider_error", code: "auth_required", provider_id: providerId });
+    const resolvedProviderId = response.provider_id || providerId;
+    throw new MakaiStreamError(response.error_message ?? "auth_required", {
+      kind: "provider_error",
+      code: "auth_required",
+      ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
+    });
   }
   return response;
 }

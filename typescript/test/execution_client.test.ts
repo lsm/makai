@@ -547,7 +547,7 @@ test("client.agent.run translates auth_required provider failures into MakaiAuth
       (err: unknown) =>
         err instanceof MakaiAuthRequiredError &&
         err.code === "auth_required" &&
-        err.provider_id === "anthropic" &&
+        err.provider_id === "fixture" &&
         err.message === "auth_required",
     );
   } finally {
@@ -587,6 +587,86 @@ test("client.agent.stream yields turn_end detail then throws retryable auth erro
     assert.equal(turnEnd.type === "turn_end" ? turnEnd.error_message : undefined, "auth_required");
   } finally {
     await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run resolves auth retry provider from response provider_id for opaque model_ref", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  await assert.rejects(
+    () => agent.run({ model_ref: "opaque-model-ref-no-provider", messages: [{ role: "user", content: "hello" }] }),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider" && err.code === "auth_required",
+  );
+});
+
+test("client.agent.stream auto_once retries after yielded auth lifecycle events", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-retry-stream-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "auth_required" },
+    { type: "agent_end", stop_reason: "error", error_message: "auth_required" },
+  ]));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    const events: AgentStreamEvent[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of handle.agent.stream(request())) events.push(event);
+      },
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    // Both attempts yielded only lifecycle markers: the failed attempt's
+    // turn_end detail, then the retried attempt's replay.
+    assert.deepEqual(events.map((event) => event.type), [
+      "agent_start", "turn_start", "turn_end",
+      "agent_start", "turn_start", "turn_end",
+    ]);
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_message").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
+  } finally {
+    await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
