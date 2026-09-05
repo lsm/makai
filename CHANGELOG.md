@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added `npm run check:declarations`: verifies the `makai` npm tarball ships `*.d.ts` declarations under `dist/src` (including `dist/src/index.d.ts` and a matching declaration for every shipped `.js`) and that a fresh-install consumer project type-checks cleanly under strict TS with `skipLibCheck` disabled. Wired into CI (`ts-sdk-e2e`) and the release packaging job so a build without declarations can no longer ship (#184).
+- Added `npm run check:declarations`: rebuilds the SDK into a clean `dist/`, then verifies the `makai` npm tarball ships `*.d.ts` declarations under `dist/src` (including `dist/src/index.d.ts` and a matching declaration for every shipped `.js`) and that a fresh-install consumer project type-checks cleanly under strict TS with `skipLibCheck` disabled. Wired into CI (`ts-sdk-e2e`) and the release packaging job so a build without declarations can no longer ship (#184).
 
 ### Changed
 

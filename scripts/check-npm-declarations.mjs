@@ -2,7 +2,8 @@
 /**
  * Verifies the `makai` npm tarball ships usable TypeScript declarations (#184).
  *
- * Run after `npm run build:sdk` (see the `check:declarations` npm script):
+ * Rebuilds the SDK from a clean `dist/` (see the `check:declarations` npm
+ * script), then:
  *
  *   1. `npm pack --dry-run` must list `*.d.ts` files under `dist/src`,
  *      including the `dist/src/index.d.ts` entrypoint declaration.
@@ -20,6 +21,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const IS_WINDOWS = process.platform === "win32";
 
 function fail(message) {
   console.error(`check-npm-declarations: FAIL: ${message}`);
@@ -30,11 +32,32 @@ function run(command, args, options = {}) {
   return execFileSync(command, args, { cwd: ROOT, encoding: "utf8", ...options });
 }
 
+// npm is a `.cmd` launcher on Windows, which execFile cannot spawn without a
+// shell (https://nodejs.org/api/child_process.html#spawning-bat-and-cmd-files-on-windows).
+// The shell parses the command line, so args containing spaces must be quoted.
+function npmRun(args, options = {}) {
+  if (!IS_WINDOWS) {
+    return run("npm", args, options);
+  }
+  const quoted = args.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg));
+  return execFileSync("npm", quoted, { cwd: ROOT, encoding: "utf8", shell: true, ...options });
+}
+
+// Build from a clean output directory: a stale `dist/` left by an earlier
+// build (e.g. from before declaration emission was enabled) would otherwise
+// satisfy the checks below and let declarations that no longer match the
+// source ship silently — the exact failure mode reported in #184.
+console.log("rebuilding SDK into clean dist/...");
+rmSync(join(ROOT, "dist"), { recursive: true, force: true });
+run(process.execPath, [join("node_modules", "typescript", "bin", "tsc"), "-p", "tsconfig.json"], {
+  stdio: "inherit",
+});
+
 // ---------------------------------------------------------------------------
 // 1. The tarball must contain declaration files under dist/src.
 // ---------------------------------------------------------------------------
 
-const packListing = JSON.parse(run("npm", ["pack", "--dry-run", "--json"]));
+const packListing = JSON.parse(npmRun(["pack", "--dry-run", "--json"]));
 const tarballFiles = packListing.flatMap((entry) => entry.files.map((file) => file.path));
 
 const declarationFiles = tarballFiles.filter((file) => /^dist\/src\/.*\.d\.ts$/.test(file));
@@ -70,7 +93,7 @@ const workDir = mkdtempSync(join(tmpdir(), "makai-declaration-check-"));
 
 try {
   const packResult = JSON.parse(
-    run("npm", ["pack", "--json", "--pack-destination", workDir])
+    npmRun(["pack", "--json", "--pack-destination", workDir])
   );
   const tarballPath = join(workDir, packResult[0].filename);
 
@@ -80,7 +103,7 @@ try {
   );
 
   console.log("installing packed tarball into fresh consumer project...");
-  run("npm", [
+  npmRun([
     "install",
     tarballPath,
     `typescript@${rootPackage.devDependencies.typescript}`,
