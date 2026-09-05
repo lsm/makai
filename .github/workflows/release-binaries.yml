@@ -188,6 +188,9 @@ jobs:
       - name: Build TypeScript SDK
         run: npm run build:sdk
 
+      - name: Verify npm package ships TypeScript declarations
+        run: node scripts/check-npm-declarations.mjs
+
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
