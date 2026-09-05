@@ -69,6 +69,19 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Canonical provider base URL resolution shared by the CLI and the
+    // provider protocol server (empty client base URLs, env overrides,
+    // transparent-proxy compat).
+    const provider_base_url_mod = b.createModule(.{
+        .root_source_file = b.path("zig/src/provider_base_url.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "compat", .module = compat_mod },
+            .{ .name = "ai_types", .module = ai_types_mod },
+        },
+    });
+
     const streaming_json_mod = b.createModule(.{
         .root_source_file = b.path("zig/src/streaming_json.zig"),
         .target = target,
@@ -582,6 +595,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "oauth/refresh_lock", .module = refresh_lock_mod },
             .{ .name = "oom", .module = oom_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "provider_base_url", .module = provider_base_url_mod },
         },
     });
 
@@ -1126,6 +1140,7 @@ pub fn build(b: *std.Build) void {
     const hive_array_test = b.addTest(.{ .root_module = hive_array_mod });
     const compat_test = b.addTest(.{ .root_module = compat_mod });
     const artifact_store_test = b.addTest(.{ .root_module = artifact_store_mod });
+    const provider_base_url_test = b.addTest(.{ .root_module = provider_base_url_mod });
 
     const event_stream_test = b.addTest(.{ .root_module = event_stream_mod });
 
@@ -1359,6 +1374,42 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // E2E: default base URL resolution on the stdio protocol path (#183).
+    // Mock providers, no API keys. Every base-URL env var is pinned for this
+    // binary (empty = unset) so the canonical-default and env-override
+    // assertions are deterministic on every machine; OPENAI_BASE_URL plus
+    // its proxy flag exercise the override and compat paths end-to-end.
+    const e2e_provider_base_url_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/test/e2e/provider_base_url.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "compat", .module = compat_mod },
+                .{ .name = "ai_types", .module = ai_types_mod },
+                .{ .name = "api_registry", .module = api_registry_mod },
+                .{ .name = "event_stream", .module = event_stream_mod },
+                .{ .name = "protocol_server", .module = protocol_server_mod },
+                .{ .name = "protocol_client", .module = protocol_client_mod },
+                .{ .name = "envelope", .module = protocol_envelope_mod },
+                .{ .name = "protocol_runtime", .module = protocol_runtime_mod },
+                .{ .name = "transports/in_process", .module = in_process_transport_mod },
+            },
+        }),
+    });
+    const e2e_provider_base_url_test_run = b.addRunArtifact(e2e_provider_base_url_test);
+    e2e_provider_base_url_test_run.setEnvironmentVariable("MAKAI_BASE_URL", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("KIMI_REGION", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL", "https://env-override.makai.test/openai");
+    // Clear every other proxy flag so inherited host settings cannot turn on
+    // compat for providers whose URLs the assertions expect to be untouched.
+    e2e_provider_base_url_test_run.setEnvironmentVariable("MAKAI_BASE_URL_IS_PROXY", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL_IS_PROXY", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL_IS_PROXY", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL_IS_PROXY", "true");
 
     const e2e_distributed_fullstack_test = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1596,6 +1647,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "tui_app", .module = tui_app_mod },
             .{ .name = "tui_model_catalog", .module = tui_model_catalog_mod },
             .{ .name = "compat", .module = compat_mod },
+            .{ .name = "provider_base_url", .module = provider_base_url_mod },
         },
     });
 
@@ -1671,6 +1723,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(hive_array_test).step);
     test_step.dependOn(&b.addRunArtifact(compat_test).step);
     test_step.dependOn(&b.addRunArtifact(artifact_store_test).step);
+    test_step.dependOn(&b.addRunArtifact(provider_base_url_test).step);
     test_step.dependOn(&b.addRunArtifact(event_stream_test).step);
     test_step.dependOn(&b.addRunArtifact(streaming_json_test).step);
     test_step.dependOn(&b.addRunArtifact(ai_types_test).step);
@@ -1795,6 +1848,7 @@ pub fn build(b: *std.Build) void {
     test_unit_transport_step.dependOn(&b.addRunArtifact(transport_retry_test).step);
 
     const test_unit_protocol_step = b.step("test-unit-protocol", "Run protocol layer unit tests");
+    test_unit_protocol_step.dependOn(&b.addRunArtifact(provider_base_url_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_ref_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(protocol_model_catalog_types_test).step);
     test_unit_protocol_step.dependOn(&b.addRunArtifact(content_partial_test).step);
@@ -1983,6 +2037,7 @@ pub fn build(b: *std.Build) void {
 
     const test_e2e_protocol_step = b.step("test-e2e-protocol", "Run Protocol E2E tests (mock-based)");
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_protocol_test).step);
+    test_e2e_protocol_step.dependOn(&e2e_provider_base_url_test_run.step);
     test_e2e_protocol_step.dependOn(&b.addRunArtifact(e2e_distributed_fullstack_test).step);
 
     const test_e2e_tui_websocket_step = b.step("test-e2e-tui-websocket", "Run TUI WebSocket remote backend E2E test (mock-based)");
