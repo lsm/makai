@@ -96,7 +96,7 @@ while (s.wait()) |event| {
 }
 
 // 2) An error-completed stream has no result; check getError() first.
-if (s.getError()) |msg| return error.StreamFailed;
+if (s.getError() != null) return error.StreamFailed;
 
 // 3) One call: take a caller-owned copy of the result. It stays valid after
 //    s.deinit() (the deferred deinit above is fine).
