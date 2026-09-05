@@ -1403,6 +1403,11 @@ pub fn build(b: *std.Build) void {
     e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL", "https://env-override.makai.test/openai");
+    // Clear every other proxy flag so inherited host settings cannot turn on
+    // compat for providers whose URLs the assertions expect to be untouched.
+    e2e_provider_base_url_test_run.setEnvironmentVariable("MAKAI_BASE_URL_IS_PROXY", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("ANTHROPIC_BASE_URL_IS_PROXY", "");
+    e2e_provider_base_url_test_run.setEnvironmentVariable("DEEPSEEK_BASE_URL_IS_PROXY", "");
     e2e_provider_base_url_test_run.setEnvironmentVariable("OPENAI_BASE_URL_IS_PROXY", "true");
 
     const e2e_distributed_fullstack_test = b.addTest(.{
