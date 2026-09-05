@@ -52,11 +52,13 @@ const MockCapture = struct {
     var base_url: ?[]const u8 = null;
     var max_tokens: u32 = 0;
     var compat_options: ?ai_types.OpenAICompatOptions = null;
+    var reasoning: bool = false;
 
     fn reset() void {
         base_url = null;
         max_tokens = 0;
         compat_options = null;
+        reasoning = false;
     }
 
     fn capture(model: ai_types.Model) void {
@@ -65,6 +67,7 @@ const MockCapture = struct {
         base_url = buffer[0..len];
         max_tokens = model.max_tokens;
         compat_options = model.compat;
+        reasoning = model.reasoning;
     }
 };
 
@@ -242,6 +245,9 @@ test "stdio protocol stream respects OPENAI_BASE_URL env override end-to-end" {
     // whole client -> wire -> server -> provider path.
     try testing.expectEqualStrings(FORCED_OPENAI_BASE_URL, captured);
     try testing.expectEqual(EXPECTED_DEFAULT_MAX_TOKENS, MockCapture.max_tokens);
+    // gpt-5-mini is a reasoning family; the SDK sends no capability
+    // metadata, so the server must rehydrate the flag before dispatch.
+    try testing.expect(MockCapture.reasoning);
 
     // OPENAI_BASE_URL_IS_PROXY=true is also pinned: the server must apply
     // transparent-proxy compat so the endpoint is treated as native OpenAI.

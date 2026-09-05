@@ -849,6 +849,13 @@ fn modelWithProtocolDefaults(
         effective.max_tokens = DEFAULT_MODEL_MAX_TOKENS;
     }
 
+    // Protocol clients send no capability metadata; a false reasoning flag
+    // is indistinguishable from an absent one on the wire, so rehydrate the
+    // CLI's inference (an explicit true from the client always survives).
+    if (!model.reasoning and model.provider.len > 0 and model.id.len > 0) {
+        effective.reasoning = provider_base_url.isReasoningModelRef(model.provider, model.id);
+    }
+
     if (model.compat == null and !client_supplied_base) {
         effective.compat = try provider_base_url.transparentProxyCompat(allocator, model.provider);
     }
@@ -870,12 +877,17 @@ fn storedKimiRegion(server: *ProtocolServer) !?[]const u8 {
     var loaded_storage: ?oauth_storage.AuthStorage = null;
     defer if (loaded_storage) |*storage| storage.deinit();
 
+    // Same storage source streamWithRefresh authenticates against
+    // (configured instance or configured loader) so the region can never
+    // disagree with the credentials actually used for the request.
     const storage = if (server.options.auth_storage) |auth_storage|
         auth_storage
     else
         blk: {
-            loaded_storage = oauth_storage.AuthStorage.loadDefaultStoredOnly(server.allocator) catch
-                break :blk null;
+            loaded_storage = server.options.load_auth_storage_fn(
+                server.options.load_auth_storage_ctx,
+                server.allocator,
+            ) catch break :blk null;
             break :blk @as(?*oauth_storage.AuthStorage, &loaded_storage.?);
         } orelse return null;
 
@@ -2950,11 +2962,13 @@ const BaseUrlMockState = struct {
     var received_base_url: ?[]const u8 = null;
     var received_max_tokens: u32 = 0;
     var received_compat: ?ai_types.OpenAICompatOptions = null;
+    var received_reasoning: bool = false;
 
     fn reset() void {
         received_base_url = null;
         received_max_tokens = 0;
         received_compat = null;
+        received_reasoning = false;
     }
 
     fn capture(model: ai_types.Model) void {
@@ -2963,6 +2977,7 @@ const BaseUrlMockState = struct {
         received_base_url = buffer[0..len];
         received_max_tokens = model.max_tokens;
         received_compat = model.compat;
+        received_reasoning = model.reasoning;
     }
 };
 
@@ -3219,6 +3234,9 @@ test "handleStreamRequest defaults catalog-issued codex and kimi base URLs" {
         const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "openai-codex", "openai-codex-responses", null);
         defer std.testing.allocator.free(expected);
         try std.testing.expectEqualStrings(expected, captured);
+        // gpt-5-codex is a reasoning family; the SDK sends no capability
+        // metadata, so the server must rehydrate the flag before dispatch.
+        try std.testing.expect(BaseUrlMockState.received_reasoning);
     }
 
     // Kimi resolves through the region-aware path (env / stored region /
@@ -3326,6 +3344,140 @@ test "handleStreamRequest honors kimi region stored on OAuth credentials" {
     const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "kimi", "openai-completions", "global");
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, captured);
+}
+
+/// Loader matching ProtocolServer.Options.load_auth_storage_fn, serving an
+/// in-memory storage with a global-region Kimi credential: proves the
+/// region read goes through the configured loader (the same source
+/// streamWithRefresh authenticates against), not the host default file.
+fn kimiRegionTestLoader(ctx: ?*anyopaque, allocator: std.mem.Allocator) anyerror!oauth_storage.AuthStorage {
+    _ = ctx;
+    var storage = oauth_storage.AuthStorage{
+        .providers = std.StringHashMap(oauth_storage.ProviderAuth).init(allocator),
+        .allocator = allocator,
+    };
+    errdefer storage.deinit();
+    const provider_id = try allocator.dupe(u8, "kimi");
+    const provider_data = try allocator.dupe(u8, "region:global");
+    try storage.providers.put(provider_id, .{ .oauth = .{
+        .refresh = try allocator.dupe(u8, "refresh"),
+        .access = try allocator.dupe(u8, "access"),
+        .expires = 0,
+        .provider_data = provider_data,
+    } });
+    return storage;
+}
+
+test "handleStreamRequest reads kimi region via configured auth loader" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = api_registry.ApiRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    const provider = api_registry.ApiProvider{
+        .api = "openai-completions",
+        .stream = baseUrlCapturingStream,
+        .stream_simple = baseUrlCapturingStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{
+        .load_auth_storage_fn = kimiRegionTestLoader,
+    });
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = emptyBaseUrlModel("kimi", "openai-completions", "kimi-k2.7-code"),
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    const expected = try provider_base_url.defaultBaseUrlForRefWithRegion(std.testing.allocator, "kimi", "openai-completions", "global");
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, captured);
+}
+
+test "handleStreamRequest infers reasoning capability and preserves explicit flags" {
+    // Client-sent true survives; absent/false capabilities are rehydrated
+    // from the CLI's model-family inference.
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+        defer registry.deinit();
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-1-0");
+        explicit_model.reasoning = true;
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = explicit_model,
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        // claude-1-0 infers false, but the client said true explicitly.
+        try std.testing.expect(BaseUrlMockState.received_reasoning);
+    }
+    {
+        BaseUrlMockState.reset();
+        defer BaseUrlMockState.reset();
+
+        var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+        defer registry.deinit();
+
+        var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+        defer server.deinit();
+
+        var req = protocol_types.Envelope{
+            .stream_id = protocol_types.generateUlid(),
+            .message_id = protocol_types.generateUlid(),
+            .sequence = 1,
+            .timestamp = compat.time.nowMillis(),
+            .payload = .{ .stream_request = .{
+                .model = emptyBaseUrlModel("anthropic", "anthropic-messages", "claude-3-5-sonnet"),
+                .context = .{ .messages = &.{} },
+                .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+            } },
+        };
+        const resp = try server.handleEnvelope(req);
+        req.deinit(std.testing.allocator);
+        if (resp) |r| {
+            var mutable_resp = r;
+            mutable_resp.deinit(std.testing.allocator);
+        }
+
+        // A non-reasoning family stays false — inference is not blanket-on.
+        try std.testing.expect(!BaseUrlMockState.received_reasoning);
+    }
 }
 
 test "handleCompleteRequest defaults empty base URL for known provider" {

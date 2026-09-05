@@ -208,6 +208,38 @@ fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
 }
 
+/// Whether a model family supports reasoning/thinking output, inferred from
+/// the provider and model id the way the CLI does for non-catalog refs.
+/// Protocol clients (TS SDK) send no capability metadata, so the server
+/// rehydrates the same flag before dispatch.
+pub fn isReasoningModelRef(provider_id: []const u8, model_id: []const u8) bool {
+    if (std.mem.eql(u8, provider_id, "openai") or std.mem.eql(u8, provider_id, "openai-codex")) {
+        // The Codex OAuth provider serves the same model families; its
+        // catalog entries are all reasoning-capable (o-series / gpt-5*).
+        return std.mem.startsWith(u8, model_id, "o1") or
+            std.mem.startsWith(u8, model_id, "o3") or
+            std.mem.startsWith(u8, model_id, "o4") or
+            (std.mem.startsWith(u8, model_id, "gpt-5") and std.mem.indexOf(u8, model_id, "-chat") == null);
+    }
+    if (std.mem.eql(u8, provider_id, "deepseek")) {
+        return std.mem.startsWith(u8, model_id, "deepseek-reasoner");
+    }
+    if (std.mem.eql(u8, provider_id, "anthropic")) {
+        // Thinking arrived with Claude 3.7 Sonnet; every 4.x+ model has it.
+        // Pre-3.7 3.x models (claude-3, claude-3-5-*) and the legacy 1/2/v1/
+        // instant families do not; unknown future identifiers default to
+        // capable so a selected thinking level is never silently dropped.
+        if (!std.mem.startsWith(u8, model_id, "claude-")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-1")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-2")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-v")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-instant")) return false;
+        if (std.mem.startsWith(u8, model_id, "claude-3-7")) return true;
+        return !std.mem.startsWith(u8, model_id, "claude-3");
+    }
+    return false;
+}
+
 test "baseUrlWithOverrides resolves canonical provider defaults" {
     const allocator = std.testing.allocator;
 
