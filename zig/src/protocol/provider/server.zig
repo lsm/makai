@@ -13,6 +13,7 @@ const auth_resolver = @import("auth_resolver");
 const oauth_storage = @import("oauth/storage");
 const refresh_lock_mod = @import("oauth/refresh_lock");
 const oom = @import("oom");
+const provider_base_url = @import("provider_base_url");
 
 pub const AuthStorage = oauth_storage.AuthStorage;
 
@@ -774,6 +775,46 @@ fn streamWithRefresh(
     return retry_stream;
 }
 
+/// An `ai_types.Model` paired with the optional base URL allocation the
+/// defaulting path produced. `deinit` frees only that allocation — every
+/// other field keeps the caller's original ownership.
+const ModelWithDefaultBase = struct {
+    model: ai_types.Model,
+    defaulted_base_url: ?[]const u8 = null,
+
+    fn deinit(self: *ModelWithDefaultBase, allocator: std.mem.Allocator) void {
+        if (self.defaulted_base_url) |base| allocator.free(base);
+        self.defaulted_base_url = null;
+    }
+};
+
+/// Resolve the model a provider sees, defaulting an empty base URL to the
+/// canonical vendor endpoint for known provider/API pairs (#183: clients
+/// such as the TS SDK send `base_url: ""` in every model descriptor, which
+/// otherwise fails URL construction with e.g. "invalid anthropic URL").
+/// Env overrides (`MAKAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`,
+/// `DEEPSEEK_BASE_URL`) win over the canonical endpoints; explicit non-empty
+/// base URLs pass through unchanged; unknown providers keep the empty base
+/// URL so no endpoint is derived from the API type. The returned model is a
+/// shallow copy — providers clone what they need before `stream()` returns,
+/// so `deinit` only owns the defaulted allocation.
+fn modelWithDefaultedBaseUrl(
+    allocator: std.mem.Allocator,
+    model: ai_types.Model,
+) !ModelWithDefaultBase {
+    if (model.base_url.len > 0 or model.provider.len == 0 or model.api.len == 0) {
+        return .{ .model = model };
+    }
+    const resolved = try provider_base_url.defaultBaseUrlForRef(allocator, model.provider, model.api);
+    if (resolved.len == 0) {
+        allocator.free(resolved);
+        return .{ .model = model };
+    }
+    var defaulted = model;
+    defaulted.base_url = resolved;
+    return .{ .model = defaulted, .defaulted_base_url = resolved };
+}
+
 /// Handle stream_request - create stream, return ack with stream_id
 fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRequest, stream_id: protocol_types.Ulid, in_reply_to: protocol_types.Ulid, received_seq: u64) !protocol_types.Envelope {
     // Reject duplicate stream_id
@@ -815,8 +856,13 @@ fn handleStreamRequest(server: *ProtocolServer, request: protocol_types.StreamRe
     // Inject cancel token into options so the provider can observe it.
     const options_with_cancel = injectServerOptions(request.options, cancel_token);
 
+    // Default an empty client-supplied base URL to the canonical vendor
+    // endpoint so protocol clients don't need their own provider tables.
+    var effective_model = try modelWithDefaultedBaseUrl(server.allocator, request.model);
+    defer effective_model.deinit(server.allocator);
+
     // Create new stream via provider.stream(), resolving and refreshing stored auth when configured.
-    const stream = streamWithRefresh(server, provider, request.model, request.context, options_with_cancel) catch |err| {
+    const stream = streamWithRefresh(server, provider, effective_model.model, request.context, options_with_cancel) catch |err| {
         server.allocator.destroy(cancelled);
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
@@ -1007,8 +1053,13 @@ fn handleCompleteRequest(server: *ProtocolServer, request: protocol_types.Comple
         );
     };
 
+    // Default an empty client-supplied base URL to the canonical vendor
+    // endpoint so protocol clients don't need their own provider tables.
+    var effective_model = try modelWithDefaultedBaseUrl(server.allocator, request.model);
+    defer effective_model.deinit(server.allocator);
+
     // Create a stream for non-streaming completion, resolving and refreshing stored auth when configured.
-    const stream = streamWithRefresh(server, provider, request.model, request.context, request.options) catch |err| {
+    const stream = streamWithRefresh(server, provider, effective_model.model, request.context, request.options) catch |err| {
         return try envelope.createNack(
             nackTemplate(stream_id, in_reply_to),
             providerErrorMessage(err),
@@ -2813,6 +2864,265 @@ test "handleStreamRequest injects CancelToken into provider stream options" {
             try std.testing.expect(!c.load(.acquire));
         }
     }
+}
+
+// ===========================================================================
+// Default Base URL Tests (#183)
+// ===========================================================================
+
+/// Base URL the last mock provider stream received. The capture happens
+/// synchronously inside handleStreamRequest/handleCompleteRequest, before
+/// the test inspects it. The static buffer outlives the request (wire base
+/// URLs are capped at MAX_MODEL_FIELD_LENGTH = 512 bytes).
+const BaseUrlMockState = struct {
+    var buffer: [512]u8 = undefined;
+    var received_base_url: ?[]const u8 = null;
+
+    fn reset() void {
+        received_base_url = null;
+    }
+
+    fn capture(url: []const u8) void {
+        const len = @min(url.len, buffer.len);
+        @memcpy(buffer[0..len], url[0..len]);
+        received_base_url = buffer[0..len];
+    }
+};
+
+/// Mock stream that captures the model's base URL so tests can verify the
+/// server defaulted empty client-supplied base URLs before provider dispatch.
+/// Completes immediately with a result (no background thread).
+fn baseUrlCapturingStream(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.StreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = context;
+    _ = options;
+
+    BaseUrlMockState.capture(model.base_url);
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    s.complete(.{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+    });
+    s.markThreadDone();
+    return s;
+}
+
+fn baseUrlCapturingStreamSimple(
+    model: ai_types.Model,
+    context: ai_types.Context,
+    options: ?ai_types.SimpleStreamOptions,
+    allocator: std.mem.Allocator,
+) !*event_stream.AssistantMessageEventStream {
+    _ = context;
+    _ = options;
+
+    BaseUrlMockState.capture(model.base_url);
+
+    const s = try allocator.create(event_stream.AssistantMessageEventStream);
+    s.* = event_stream.AssistantMessageEventStream.init(allocator);
+    s.owns_events = true;
+    s.clone_event_fn = ai_types.cloneAssistantMessageEvent;
+    s.complete(.{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .stop,
+        .timestamp = compat.time.nowMillis(),
+    });
+    s.markThreadDone();
+    return s;
+}
+
+/// Registry with the capturing mock registered under the real API names, so
+/// models routed like production traffic (e.g. provider "anthropic", api
+/// "anthropic-messages") reach it.
+fn baseUrlCaptureRegistry(allocator: std.mem.Allocator) !api_registry.ApiRegistry {
+    var registry = api_registry.ApiRegistry.init(allocator);
+    errdefer registry.deinit();
+    const provider = api_registry.ApiProvider{
+        .api = "anthropic-messages",
+        .stream = baseUrlCapturingStream,
+        .stream_simple = baseUrlCapturingStreamSimple,
+    };
+    try registry.registerApiProvider(provider, null);
+    return registry;
+}
+
+/// Model shaped like the TS SDK's descriptors: known provider/API routing
+/// but an empty base URL.
+fn emptyBaseUrlModel(provider_id: []const u8, api: []const u8) ai_types.Model {
+    return .{
+        .id = "test-model",
+        .name = "Test Model",
+        .api = api,
+        .provider = provider_id,
+        .base_url = "",
+        .reasoning = false,
+        .input = &.{},
+        .cost = .{ .input = 0, .output = 0, .cache_read = 0, .cache_write = 0 },
+        .context_window = 128000,
+        .max_tokens = 4096,
+    };
+}
+
+test "handleStreamRequest defaults empty base URL for known provider" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = emptyBaseUrlModel("anthropic", "anthropic-messages"),
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.payload == .ack);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    // The provider must have seen the canonical endpoint (or the env
+    // override when one is set), never the empty client value.
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    const expected = try provider_base_url.defaultBaseUrlForRef(std.testing.allocator, "anthropic", "anthropic-messages");
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, captured);
+}
+
+test "handleStreamRequest preserves explicit base URL" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    var explicit_model = emptyBaseUrlModel("anthropic", "anthropic-messages");
+    explicit_model.base_url = "https://explicit.example.com";
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = explicit_model,
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("https://explicit.example.com", captured);
+}
+
+test "handleStreamRequest keeps unknown provider base URL empty" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .stream_request = .{
+            .model = emptyBaseUrlModel("mystery-vendor", "anthropic-messages"),
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    // No endpoint may be derived from the API type for an unknown provider —
+    // the provider sees the empty base and fails before the network.
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("", captured);
+}
+
+test "handleCompleteRequest defaults empty base URL for known provider" {
+    BaseUrlMockState.reset();
+    defer BaseUrlMockState.reset();
+
+    var registry = try baseUrlCaptureRegistry(std.testing.allocator);
+    defer registry.deinit();
+
+    var server = ProtocolServer.init(std.testing.allocator, &registry, .{});
+    defer server.deinit();
+
+    var req = protocol_types.Envelope{
+        .stream_id = protocol_types.generateUlid(),
+        .message_id = protocol_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .complete_request = .{
+            .model = emptyBaseUrlModel("anthropic", "anthropic-messages"),
+            .context = .{ .messages = &.{} },
+            .options = .{ .api_key = ai_types.OwnedSlice(u8).initBorrowed("test-key") },
+        } },
+    };
+    const resp = try server.handleEnvelope(req);
+    req.deinit(std.testing.allocator);
+
+    try std.testing.expect(resp != null);
+    try std.testing.expect(resp.?.payload == .result);
+    if (resp) |r| {
+        var mutable_resp = r;
+        mutable_resp.deinit(std.testing.allocator);
+    }
+
+    const captured = BaseUrlMockState.received_base_url orelse return error.TestUnexpectedResult;
+    const expected = try provider_base_url.defaultBaseUrlForRef(std.testing.allocator, "anthropic", "anthropic-messages");
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, captured);
 }
 
 fn cancelCapturingStreamSimple(
