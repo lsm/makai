@@ -120,6 +120,21 @@ pub fn build(b: *std.Build) void {
         },
     });
     if (target.result.os.tag == .macos) {
+        // Explicit `-Dtarget=*-macos` builds skip Zig's native framework
+        // detection and fail with "unable to find framework 'Security'.
+        // searched paths: none" (#196). Resolve the macOS SDK explicitly:
+        // the framework search path finds Security/CoreFoundation, and the
+        // sysroot resolves their system-library dependencies (CoreFoundation
+        // re-exports /usr/lib/libobjc.A.dylib, which only exists as a .tbd
+        // inside the SDK on modern macOS).
+        if (macOsSdkDir(b)) |sdk_dir| {
+            b.sysroot = sdk_dir;
+            const frameworks_dir = std.fs.path.join(
+                b.allocator,
+                &.{ sdk_dir, "System/Library/Frameworks" },
+            ) catch @panic("OOM");
+            oauth_storage_mod.addFrameworkPath(.{ .cwd_relative = frameworks_dir });
+        }
         oauth_storage_mod.linkFramework("Security", .{});
         oauth_storage_mod.linkFramework("CoreFoundation", .{});
     }
@@ -2073,4 +2088,29 @@ pub fn build(b: *std.Build) void {
     b.modules.put(b.allocator, b.dupe("transport"), transport_mod) catch @panic("OOM");
     b.modules.put(b.allocator, b.dupe("protocol_runtime"), protocol_runtime_mod) catch @panic("OOM");
     b.modules.put(b.allocator, b.dupe("agent"), agent_mod) catch @panic("OOM");
+}
+
+/// macOS SDK root directory, used as the build sysroot and framework search
+/// path base for macos targets. Resolved from `$SDKROOT` when set, otherwise
+/// from `xcrun --show-sdk-path` when the build host is macOS. Returns null
+/// when neither is available (e.g. cross-compiling to macOS from Linux, which
+/// needs a macOS SDK that hosted Linux runners do not have).
+fn macOsSdkDir(b: *std.Build) ?[]const u8 {
+    if (b.graph.environ_map.get("SDKROOT")) |sdkroot| {
+        if (sdkroot.len > 0) return sdkroot;
+    }
+    if (@import("builtin").os.tag != .macos) return null;
+
+    // Allocations come from the build's arena, which lives for the whole
+    // build, so nothing here needs freeing.
+    const run_result = std.process.run(b.allocator, b.graph.io, .{
+        .argv = &.{ "/usr/bin/xcrun", "--show-sdk-path" },
+    }) catch return null;
+    switch (run_result.term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    const sdkroot = std.mem.trim(u8, run_result.stdout, " \t\r\n");
+    if (sdkroot.len == 0) return null;
+    return b.allocator.dupe(u8, sdkroot) catch null;
 }

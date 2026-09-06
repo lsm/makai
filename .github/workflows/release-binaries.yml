@@ -62,6 +62,19 @@ jobs:
         with:
           version: 0.16.0
 
+      # Zig cannot locate the macOS SDK by itself when an explicit -Dtarget is
+      # passed (#196): framework resolution fails with "unable to find
+      # framework 'Security'. searched paths: none". Export SDKROOT for the
+      # build.zig SDK lookup and fail fast if the SDK is unusable.
+      - name: Resolve macOS SDK (SDKROOT)
+        if: matrix.os_name == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_PATH="$(xcrun --show-sdk-path)"
+          echo "SDKROOT=${SDK_PATH}" >> "$GITHUB_ENV"
+          test -d "${SDK_PATH}/System/Library/Frameworks/Security.framework"
+
       - name: Build target binary
         shell: bash
         run: |
