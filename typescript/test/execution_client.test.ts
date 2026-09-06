@@ -863,6 +863,30 @@ test("client.agent.stream resolves auth retry provider from the streamed agent_e
   );
 });
 
+test("client.agent.run event fallback applies API-scoped auth via terminal agent_end api", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-fallback-api-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  // No assistant message_start (failed before provider output); the terminal
+  // agent_end carries the resolved identity including api.
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "permission_error: scope denied" },
+    { type: "agent_end", stop_reason: "error", error_message: "permission_error: scope denied", provider_id: "anthropic", api: "anthropic-messages" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic" && err.code === "auth_required",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-tool-buffer-test-"));
   const eventsPath = path.join(tmpDir, "events.json");

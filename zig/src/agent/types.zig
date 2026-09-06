@@ -27,6 +27,11 @@ pub const AgentEndPayload = struct {
     /// Set when the run terminated for an agent-level reason (iteration cap);
     /// null when the run ended with the final turn's stop reason.
     termination: ?AgentTermination = null,
+    /// Terminal assistant turn of this run (a borrowed view of the loop
+    /// result's final message, including its synthesized placeholder when no
+    /// turn ran). Serializers prefer it over scanning `messages`, whose
+    /// history may end with an assistant message from an older turn/model.
+    final_message: ?ai_types.AssistantMessage = null,
 
     pub fn deinit(self: *AgentEndPayload, allocator: std.mem.Allocator) void {
         self.messages.deinit(allocator);

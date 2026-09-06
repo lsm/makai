@@ -1166,12 +1166,13 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
   const finalMessageEvents = finalAssistantMessageEvents(events);
   const start = finalMessageEvents.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
   const terminalProviderId = terminal && "provider_id" in terminal && typeof terminal.provider_id === "string" ? terminal.provider_id : undefined;
+  const terminalApi = terminal && "api" in terminal && typeof terminal.api === "string" ? terminal.api : undefined;
   const content = contentFromEvents(finalMessageEvents);
   return {
     message: { role: "assistant", content },
     usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
     provider_id: start?.provider_id ?? terminalProviderId ?? "",
-    api: start?.api ?? "",
+    api: start?.api ?? terminalApi ?? "",
     model_id: start?.model_id ?? "",
     stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
     error_message: terminal && "error_message" in terminal ? terminal.error_message : undefined,

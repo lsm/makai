@@ -1756,30 +1756,37 @@ fn serializeAgentLoopEvent(
         },
         .agent_end => |payload| {
             try w.writeStringField("type", "agent_end");
-            // Agent-level termination (e.g. max turns) overrides the final
-            // turn's reason; otherwise surface the terminal assistant turn's
-            // outcome so raw agent-protocol consumers see the failure detail
-            // without the preceding agent_result frame.
-            const messages = payload.messages.slice();
-            var last_assistant: ?ai_types.AssistantMessage = null;
-            var idx = messages.len;
-            while (idx > 0) {
-                idx -= 1;
-                if (messages[idx] == .assistant) {
-                    last_assistant = messages[idx].assistant;
-                    break;
+            // Terminal identity and outcome come from the run's final message
+            // (loop-emitted events carry it explicitly, including the
+            // synthesized placeholder when no turn ran); fall back to the
+            // last assistant message for hand-built events. History must not
+            // supply the identity — it can end with an older turn's message
+            // from a different model.
+            var terminal: ?ai_types.AssistantMessage = payload.final_message;
+            if (terminal == null) {
+                const messages = payload.messages.slice();
+                var idx = messages.len;
+                while (idx > 0) {
+                    idx -= 1;
+                    if (messages[idx] == .assistant) {
+                        terminal = messages[idx].assistant;
+                        break;
+                    }
                 }
             }
+            // Agent-level termination (e.g. max turns, cancellation) overrides
+            // the final turn's reason so raw agent-protocol consumers see the
+            // failure detail without the preceding agent_result frame.
             const agent_stop_reason: ?[]const u8 = if (payload.termination) |termination|
                 @tagName(termination)
-            else if (last_assistant) |message|
+            else if (terminal) |message|
                 @tagName(message.stop_reason)
             else
                 null;
             if (agent_stop_reason) |reason| {
                 try w.writeStringField("stop_reason", reason);
             }
-            if (last_assistant) |message| {
+            if (terminal) |message| {
                 // Event-only peers have no agent_result frame; the resolved
                 // provider/api keep SDK auth retry targetable for opaque refs
                 // and let clients scope provider-specific error semantics.
@@ -4183,6 +4190,42 @@ test "serializeAgentLoopEvent emits error details on turn_end and message_end" {
         try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"stop\"") == null);
         try std.testing.expect(std.mem.find(u8, json, "\"provider_id\":\"fixture\"") != null);
         try std.testing.expect(std.mem.find(u8, json, "\"api\":\"fixture-ok-api\"") != null);
+    }
+
+    // No-turn runs take their identity from the run's final message, never
+    // from an older assistant turn lingering in the history.
+    {
+        const messages = [_]ai_types.Message{
+            .{ .assistant = .{
+                .content = &.{},
+                .api = "historical-api",
+                .provider = "historical-provider",
+                .model = "older-model",
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = 0,
+            } },
+        };
+        const event = agent_loop.AgentEvent{ .agent_end = .{
+            .messages = ai_types.OwnedSlice(ai_types.Message).initBorrowed(&messages),
+            .termination = .max_turns,
+            .final_message = .{
+                .content = &.{},
+                .api = "fixture-error-api",
+                .provider = "fixture",
+                .model = "fixture-model",
+                .usage = .{},
+                .stop_reason = .stop,
+                .timestamp = 0,
+            },
+        } };
+        const json = try serializeAgentLoopEvent(allocator, session_id, event);
+        defer allocator.free(json);
+        try std.testing.expect(std.mem.find(u8, json, "\"stop_reason\":\"max_turns\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"provider_id\":\"fixture\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"provider_id\":\"historical-provider\"") == null);
+        try std.testing.expect(std.mem.find(u8, json, "\"api\":\"fixture-error-api\"") != null);
+        try std.testing.expect(std.mem.find(u8, json, "\"api\":\"historical-api\"") == null);
     }
 }
 

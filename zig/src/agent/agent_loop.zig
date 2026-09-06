@@ -1342,6 +1342,7 @@ fn runLoop(
         .agent_end = .{
             .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
             .termination = termination,
+            .final_message = result_final_message, // Borrowed view; ownership retained by result
         },
     });
 
