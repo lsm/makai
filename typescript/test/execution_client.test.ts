@@ -444,6 +444,449 @@ test("client.agent.run event fallback returns only final assistant turn content"
   }
 });
 
+test("client.agent.stream surfaces provider error details on turn_end and agent_end", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-events-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "fixture stream failure" },
+    { type: "agent_end", stop_reason: "error", error_message: "fixture stream failure" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events = await collect(agent.stream(request()));
+    const turnEnd = events.find((event) => event.type === "turn_end");
+    assert.equal(turnEnd?.type, "turn_end");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.error_message : undefined, "fixture stream failure");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.stop_reason : undefined, "error");
+
+    const agentEnd = events.at(-1);
+    assert.equal(agentEnd?.type, "agent_end");
+    assert.equal(agentEnd.type === "agent_end" ? agentEnd.error_message : undefined, "fixture stream failure");
+    assert.equal(agentEnd.type === "agent_end" ? agentEnd.stop_reason : undefined, "error");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run surfaces provider error details from event fallback", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-fallback-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "fixture stream failure" },
+    { type: "agent_end", stop_reason: "error", error_message: "fixture stream failure" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "fixture stream failure");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run surfaces provider error details from agent_result", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-error-result-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "invalid anthropic URL",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "error");
+    assert.equal(result.error_message, "invalid anthropic URL");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run translates auth_required provider failures into MakaiAuthRequiredError", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-result-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "auth_required",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) =>
+        err instanceof MakaiAuthRequiredError &&
+        err.code === "auth_required" &&
+        err.provider_id === "fixture" &&
+        err.message === "auth_required",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream yields turn_end detail then throws retryable auth error", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-stream-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "auth_required" },
+    { type: "agent_end", stop_reason: "error", error_message: "auth_required" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events: AgentStreamEvent[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of agent.stream(request())) events.push(event);
+      },
+      (err: unknown) =>
+        err instanceof MakaiAuthRequiredError &&
+        err.code === "auth_required" &&
+        err.provider_id === "anthropic" &&
+        err.message === "auth_required",
+    );
+    // The failing turn's detail is still surfaced on the yielded turn_end
+    // event before the typed auth error terminates the stream.
+    assert.deepEqual(events.map((event) => event.type), ["agent_start", "turn_start", "turn_end"]);
+    const turnEnd = events.at(-1);
+    assert.equal(turnEnd?.type, "turn_end");
+    assert.equal(turnEnd.type === "turn_end" ? turnEnd.error_message : undefined, "auth_required");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run resolves auth retry provider from response provider_id for opaque model_ref", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  await assert.rejects(
+    () => agent.run({ model_ref: "opaque-model-ref-no-provider", messages: [{ role: "user", content: "hello" }] }),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider" && err.code === "auth_required",
+  );
+});
+
+test("client.agent.stream auto_once retries after yielded auth lifecycle events", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-retry-stream-test-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const eventsPath = path.join(tmpDir, "events.json");
+  // Mirrors a real run: prompt echo message frames arrive before the failing
+  // provider turn, so the retry gate must classify them as replayable.
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "message_start", provider_id: "anthropic", api: "anthropic-messages", model_id: "claude-sonnet-4-5" },
+    { type: "message_end", stop_reason: "end_turn" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "auth_required" },
+    { type: "agent_end", stop_reason: "error", error_message: "auth_required", provider_id: "anthropic" },
+  ]));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    const events: AgentStreamEvent[] = [];
+    await assert.rejects(
+      async () => {
+        for await (const event of handle.agent.stream(request())) events.push(event);
+      },
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "anthropic",
+    );
+    // Both attempts yielded only replayable markers: the prompt echo frames,
+    // the failed attempt's turn_end detail, then the retried attempt's replay.
+    assert.deepEqual(events.map((event) => event.type), [
+      "agent_start", "message_start", "message_end", "turn_start", "turn_end",
+      "agent_start", "message_start", "message_end", "turn_start", "turn_end",
+    ]);
+    const logged = readLoggedRequests(logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_message").length, 2);
+    assert.equal(logged.filter((entry) => entry.type === "auth_login_start").length, 1);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run does not auth-retry after tools have executed", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "tool_execute",
+        session_id: "testNanoIdSess1234567",
+        message_id: "tool-request-1",
+        sequence: 3,
+        payload: { tool_call_id: "call-1", tool_name: "sum", args_json: "{\"a\":2,\"b\":3}" },
+      },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  // The run already executed a tool; a retry would replay its side effects, so
+  // the auth-shaped terminal failure surfaces as the typed terminal auth error
+  // (never re-entering auto_once) rather than a retryable error.
+  await assert.rejects(
+    () => agent.run({
+      ...request(),
+      tools: [{
+        name: "sum",
+        description: "sum numbers",
+        parameters_schema_json: "{}",
+        execute: (args) => `sum=${Number(args.a) + Number(args.b)}`,
+      }],
+    }),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.code === "auth_required" && err.provider_id === "fixture-provider",
+  );
+  // Only one agent run was started: no retry attempt.
+  assert.equal(transport.sent.filter((frame) => frame.type === "agent_start").length, 1);
+});
+
+test("client.agent.run scopes provider-specific auth patterns to the matching provider", async () => {
+  const transportFor = (api: string, provider: string) => ({
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api,
+            provider,
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "permission_error: scope denied",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  });
+
+  // Non-Anthropic provider: permission_error is not an auth failure per the
+  // server's default detector, so the run resolves with the error completion.
+  const generic = createMakaiAgentApi(transportFor("fixture-error-api", "fixture-provider") as unknown as MakaiStdioClient);
+  const completion = await generic.run(request());
+  assert.equal(completion.stop_reason, "error");
+  assert.equal(completion.error_message, "permission_error: scope denied");
+
+  // Remapped model: provider_id "anthropic" on a non-Anthropic API must not
+  // borrow the anthropic-messages detector patterns.
+  const remapped = createMakaiAgentApi(transportFor("openai-completions", "anthropic") as unknown as MakaiStdioClient);
+  const remappedCompletion = await remapped.run(request());
+  assert.equal(remappedCompletion.stop_reason, "error");
+  assert.equal(remappedCompletion.error_message, "permission_error: scope denied");
+
+  // Anthropic API: the registered detector treats permission_error as auth.
+  const anthropic = createMakaiAgentApi(transportFor("anthropic-messages", "anthropic") as unknown as MakaiStdioClient);
+  await assert.rejects(
+    () => anthropic.run(request()),
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic",
+  );
+});
+
+test("client.agent.run matches human-readable auth failure messages", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-auth-readable-test-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    type: "result",
+    stop_reason: "error",
+    model: "fixture-model",
+    api: "fixture-error-api",
+    provider: "fixture-provider",
+    timestamp: 1,
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_write: 0,
+    content: [],
+    error_message: "Authentication required for provider fixture",
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream resolves auth retry provider from the streamed agent_end", async () => {
+  const transport = {
+    sent: [] as StdioFrame[],
+    frames: [
+      { type: "agent_started", payload: {} },
+      {
+        type: "agent_result",
+        payload: {
+          result_json: JSON.stringify({
+            type: "result",
+            stop_reason: "error",
+            model: "fixture-model",
+            api: "fixture-error-api",
+            provider: "fixture-provider",
+            timestamp: 1,
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            content: [],
+            error_message: "auth_required",
+          }),
+        },
+      },
+    ] as StdioFrame[],
+    send(frame: StdioFrame) { this.sent.push(frame); },
+    async nextFrameForSession(sessionId: string) {
+      const frame = this.frames.shift();
+      if (!frame) throw new Error("stream exhausted");
+      return { session_id: sessionId, ...frame };
+    },
+  };
+  const agent = createMakaiAgentApi(transport as unknown as MakaiStdioClient);
+  const events: AgentStreamEvent[] = [];
+  await assert.rejects(
+    async () => {
+      for await (const event of agent.stream({ model_ref: "opaque-model-ref-no-provider", messages: [{ role: "user", content: "hello" }] })) {
+        events.push(event);
+      }
+    },
+    (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "fixture-provider" && err.code === "auth_required",
+  );
+});
+
+test("client.agent.run event fallback applies API-scoped auth via terminal agent_end api", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-fallback-api-test-"));
+  const eventsPath = path.join(tmpDir, "events.json");
+  // No assistant message_start (failed before provider output); the terminal
+  // agent_end carries the resolved identity including api.
+  fs.writeFileSync(eventsPath, JSON.stringify([
+    { type: "agent_start", session_id: "testNanoIdSess1234567" },
+    { type: "turn_start" },
+    { type: "turn_end", stop_reason: "error", error_message: "permission_error: scope denied" },
+    { type: "agent_end", stop_reason: "error", error_message: "permission_error: scope denied", provider_id: "anthropic", api: "anthropic-messages" },
+  ]));
+  const harness = await setupHarness({ MAKAI_TEST_AGENT_EVENTS_PATH: eventsPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiAuthRequiredError && err.provider_id === "anthropic" && err.code === "auth_required",
+    );
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.provider.stream buffers incremental tool calls into one tool_call event", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-tool-buffer-test-"));
   const eventsPath = path.join(tmpDir, "events.json");

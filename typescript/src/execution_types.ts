@@ -127,8 +127,9 @@ export interface CompletionResponse {
   model_id: string;
   stop_reason?: StopReason;
   /**
-   * Failure cause when stop_reason is "error" (e.g. a Zig error name from the
-   * server-side stream such as "QueueFull"); absent for successful results.
+   * Failure cause when stop_reason is "error" — the provider error detail
+   * (e.g. "auth_required", "invalid anthropic URL") or a Zig error name from
+   * the server-side stream such as "QueueFull"; absent for successful results.
    */
   error_message?: string;
 }
@@ -142,16 +143,16 @@ export type ProviderStreamEvent =
   | { type: "text_delta"; delta: string }
   | { type: "thinking_delta"; delta: string }
   | { type: "tool_call"; name: string; arguments_json: string; tool_call_id: string }
-  | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason }
+  | { type: "message_end"; usage?: UsageSummary; stop_reason?: StopReason; error_message?: string }
   | { type: "error"; message: string; code?: string; provider_id?: string };
 
 /** Streaming events emitted by {@link MakaiAgentApi.stream}, including provider events. */
 export type AgentStreamEvent =
   | ProviderStreamEvent
   | { type: "agent_start"; session_id?: string }
-  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary }
+  | { type: "agent_end"; stop_reason?: StopReason; usage?: UsageSummary; error_message?: string; provider_id?: ProviderId; api?: ApiId }
   | { type: "turn_start" }
-  | { type: "turn_end"; stop_reason?: StopReason }
+  | { type: "turn_end"; stop_reason?: StopReason; error_message?: string }
   | { type: "tool_execution_start"; tool_call_id: string; tool_name: string }
   | { type: "tool_execution_end"; tool_call_id: string; is_error?: boolean };
 

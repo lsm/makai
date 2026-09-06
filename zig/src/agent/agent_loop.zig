@@ -984,11 +984,9 @@ fn streamAssistantResponse(
 
     if (final_message == null) {
         if (provider_stream.getError()) |provider_error| {
-            if (std.mem.eql(u8, provider_error, "auth_required") or
-                std.mem.indexOf(u8, provider_error, "Authentication required") != null)
-            {
-                return error.AuthRequired;
-            }
+            // Preserve the provider's own error text (e.g. "auth_required",
+            // "invalid anthropic URL") verbatim so the turn_end event carries
+            // the root cause instead of a generic Zig error name.
             return try makeProviderErrorAssistantMessage(allocator, config.model, provider_error);
         }
     }
@@ -1098,11 +1096,20 @@ fn runLoop(
 
     const max_iterations = config.max_iterations orelse 100;
 
+    // Set at every terminal exit (completion, error, cancellation). When the
+    // loop instead exits through its iteration-cap condition — including a
+    // capped tool_use turn, an unprocessed queued steering/follow-up message,
+    // or a zero-iteration run — the run terminated on max turns.
+    var ended_before_cap = false;
+    var cancelled_run = false;
+
     // Outer loop: handles follow-up messages
     outer: while (state.iterations < max_iterations) {
         // Check for cancellation
         if (config.cancel_token) |token| {
             if (token.isCancelled()) {
+                ended_before_cap = true;
+                cancelled_run = true;
                 break;
             }
         }
@@ -1169,6 +1176,7 @@ fn runLoop(
                     .tool_results = types.OwnedSlice(ai_types.ToolResultMessage).initBorrowed(&.{}),
                 } });
 
+                ended_before_cap = true;
                 break :outer;
             };
 
@@ -1189,6 +1197,7 @@ fn runLoop(
                         var owned_assistant_message = assistant_message;
                         owned_assistant_message.deinit(allocator);
                     }
+                    ended_before_cap = true;
                     break :outer;
                 },
                 .stop, .length, .content_filter => {
@@ -1246,6 +1255,7 @@ fn runLoop(
                     }
 
                     // No follow-up messages, we're done
+                    ended_before_cap = true;
                     break :outer;
                 },
                 .tool_use => {
@@ -1292,6 +1302,18 @@ fn runLoop(
     // Build result and transfer ownership out of local loop state.
     const result_messages = try state.messages.toOwnedSlice(allocator);
 
+    // Exiting the loop without a terminal break means the iteration-cap
+    // condition ended the run: a capped tool_use turn, a queued steering or
+    // follow-up message that never ran, or a zero-iteration run. Cancellation
+    // is its own agent-level outcome so consumers never see a cancelled run
+    // reported through the previous turn's stop reason.
+    const termination: ?types.AgentTermination = if (cancelled_run)
+        .cancelled
+    else if (!ended_before_cap)
+        .max_turns
+    else
+        null;
+
     const result_final_message: ai_types.AssistantMessage = if (state.final_message) |fm| blk: {
         state.final_message = null;
         break :blk fm;
@@ -1312,12 +1334,15 @@ fn runLoop(
         .messages = owned_slice_mod.OwnedSlice(ai_types.Message).initOwned(result_messages),
         .final_message = result_final_message,
         .iterations = state.iterations,
+        .termination = termination,
     };
 
     // Emit agent_end
     try pushAgentEvent(event_stream, .{
         .agent_end = .{
             .messages = types.OwnedSlice(ai_types.Message).initBorrowed(result.messages.slice()), // Ownership retained by result
+            .termination = termination,
+            .final_message = result_final_message, // Borrowed view; ownership retained by result
         },
     });
 

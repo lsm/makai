@@ -611,13 +611,20 @@ pub fn serializeEvent(event: ai_types.AssistantMessageEvent, allocator: std.mem.
 }
 
 pub fn serializeResult(result: ai_types.AssistantMessage, allocator: std.mem.Allocator) ![]u8 {
+    return serializeResultWithStopReason(result, @tagName(result.stop_reason), allocator);
+}
+
+/// Like serializeResult, but reports `stop_reason` from an explicit override.
+/// Used for agent runs whose agent-level termination (e.g. the iteration cap)
+/// differs from the final turn's own stop reason.
+pub fn serializeResultWithStopReason(result: ai_types.AssistantMessage, stop_reason: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var buffer = std.ArrayList(u8).empty;
     errdefer buffer.deinit(allocator);
     var w = json_writer.JsonWriter.init(&buffer, allocator);
 
     try w.beginObject();
     try w.writeStringField("type", "result");
-    try w.writeStringField("stop_reason", @tagName(result.stop_reason));
+    try w.writeStringField("stop_reason", stop_reason);
     try w.writeStringField("model", result.model);
     try w.writeStringField("api", result.api);
     try w.writeStringField("provider", result.provider);
@@ -2140,6 +2147,26 @@ test "serializeResult omits error_message when unset" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "error_message") == null);
+}
+
+test "serializeResultWithStopReason overrides the reported stop reason" {
+    const allocator = std.testing.allocator;
+    var message = ai_types.AssistantMessage{
+        .content = &.{},
+        .api = "test-api",
+        .provider = "test-provider",
+        .model = "test-model",
+        .usage = .{},
+        .stop_reason = .tool_use,
+        .timestamp = 0,
+    };
+    defer message.deinit(allocator);
+
+    const json = try serializeResultWithStopReason(message, "max_turns", allocator);
+    defer allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stop_reason\":\"max_turns\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"stop_reason\":\"tool_use\"") == null);
 }
 
 test "serializeResult error_message round-trips through deserialize" {

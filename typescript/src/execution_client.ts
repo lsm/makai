@@ -396,6 +396,9 @@ class StdioAgentApi implements MakaiAgentApi {
     const events: AgentStreamEvent[] = [];
     const toolBuffers = new Map<number, { id?: string; name?: string; args: string }>();
     let messageSent = false;
+    // Retrying after tool execution would replay tool side effects in a fresh
+    // session, so terminal auth translation is disabled once tools ran.
+    let toolsExecuted = false;
     try {
       while (true) {
         checkAbort(signal, "agent.run aborted");
@@ -411,10 +414,11 @@ class StdioAgentApi implements MakaiAgentApi {
           }
           continue;
         }
-        if (frame.type === "agent_result") return parseAgentRunResponse(readJsonStringPayload(frame, "result_json"));
-        if (frame.type === "result" || frame.type === "complete_response") return parseCompletionResponse(frame.payload ?? frame);
+        if (frame.type === "agent_result") return responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+        if (frame.type === "result" || frame.type === "complete_response") return responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
         if (frame.type === "tool_execute") {
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
+          toolsExecuted = true;
           continue;
         }
 
@@ -424,8 +428,9 @@ class StdioAgentApi implements MakaiAgentApi {
         }
         for (const event of normalized) {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
+          if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolsExecuted = true;
           events.push(event);
-          if (event.type === "agent_end") return buildAgentRunResponseFromEvents(events);
+          if (event.type === "agent_end") return responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
         }
       }
     } catch (error) {
@@ -448,7 +453,11 @@ class StdioAgentApi implements MakaiAgentApi {
     const activeSession: { sessionId?: string; nextSequence: number } = { nextSequence: 1 };
     let attempt = this.streamAttempt(streamRequest, effectivePolicy, signal, activeSession);
     let iterator = attempt[Symbol.asyncIterator]();
-    let yielded = false;
+    // Whether any content-bearing event was yielded. auto_once auth retry may
+    // replay agent lifecycle markers (agent_start/turn_start/turn_end of the
+    // failed attempt) but must never duplicate provider content, so only
+    // content-free attempts are retryable.
+    let yieldedContent = false;
     let retried = false;
 
     if (!isNoopLogger(this.logger)) {
@@ -466,7 +475,7 @@ class StdioAgentApi implements MakaiAgentApi {
             // Cancel+drain handled by outer catch to avoid triple-send.
             throw error;
           }
-          if (!yielded && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
+          if (!yieldedContent && !retried && isRetryableAuthError(error) && effectivePolicy === "auto_once" && this.auth) {
             const providerId = error.provider_id ?? fallbackProviderId;
             if (providerId) {
               try {
@@ -495,7 +504,7 @@ class StdioAgentApi implements MakaiAgentApi {
           throw error;
         }
         if (result.done) return;
-        yielded = true;
+        if (!isReplayableAgentEvent(result.value)) yieldedContent = true;
         yield result.value;
       }
     } catch (error) {
@@ -570,6 +579,21 @@ class StdioAgentApi implements MakaiAgentApi {
             event = usage ? { ...event, usage } : { ...event };
             if (!usage) delete event.usage;
             terminal = true;
+            // Provider auth failures surfaced via the agent event stream keep
+            // the typed retryable path: mirror the provider stream convention
+            // (error events with code auth_required throw instead of ending
+            // the stream normally) so manual/auto_once auth retry engages. The
+            // outer stream() gates auto_once on no content having been yielded
+            // (tool execution events are non-replayable), so tool side effects
+            // are never re-run; the failed attempt's lifecycle events replay.
+            if (event.stop_reason === "error" && isAuthFailureMessage(event.error_message, { providerId: event.provider_id, api: event.api })) {
+              const resolvedProviderId = event.provider_id ?? fallbackProviderId;
+              throw new MakaiStreamError(event.error_message ?? "auth_required", {
+                kind: "provider_error",
+                code: "auth_required",
+                ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
+              });
+            }
           } else if (event.type === "error") {
             terminal = true;
           }
@@ -1070,7 +1094,11 @@ function normalizeAgentEvent(
     case "turn_start":
       return [{ type: "turn_start" }];
     case "turn_end":
-      return [{ type: "turn_end", ...(optionalString(data.stop_reason) ? { stop_reason: optionalString(data.stop_reason) } : {}) }];
+      return [{
+        type: "turn_end",
+        ...(optionalString(data.stop_reason) ? { stop_reason: optionalString(data.stop_reason) } : {}),
+        ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
+      }];
     case "tool_execution_start":
       return [{ type: "tool_execution_start", tool_call_id: stringValue(data.tool_call_id), tool_name: stringValue(data.tool_name) }];
     case "tool_execution_end":
@@ -1137,14 +1165,17 @@ function buildAgentRunResponseFromEvents(events: AgentStreamEvent[]): AgentRunRe
   const messageEnd = reversed.find((event) => event.type === "message_end");
   const finalMessageEvents = finalAssistantMessageEvents(events);
   const start = finalMessageEvents.find((event) => event.type === "message_start") as Extract<ProviderStreamEvent, { type: "message_start" }> | undefined;
+  const terminalProviderId = terminal && "provider_id" in terminal && typeof terminal.provider_id === "string" ? terminal.provider_id : undefined;
+  const terminalApi = terminal && "api" in terminal && typeof terminal.api === "string" ? terminal.api : undefined;
   const content = contentFromEvents(finalMessageEvents);
   return {
     message: { role: "assistant", content },
     usage: (terminal && "usage" in terminal ? terminal.usage : undefined) ?? messageEnd?.usage,
-    provider_id: start?.provider_id ?? "",
-    api: start?.api ?? "",
+    provider_id: start?.provider_id ?? terminalProviderId ?? "",
+    api: start?.api ?? terminalApi ?? "",
     model_id: start?.model_id ?? "",
     stop_reason: terminal && "stop_reason" in terminal ? terminal.stop_reason : undefined,
+    error_message: terminal && "error_message" in terminal ? terminal.error_message : undefined,
   };
 }
 
@@ -1226,7 +1257,12 @@ function messageStartFrom(data: Record<string, unknown>): ProviderStreamEvent {
 
 function messageEndFrom(data: Record<string, unknown>): ProviderStreamEvent {
   const message = data.message && isObject(data.message) ? data.message as Record<string, unknown> : data;
-  return { type: "message_end", usage: parseUsage(message.usage ?? data.usage ?? message), stop_reason: optionalString(data.stop_reason ?? data.reason ?? message.stop_reason) };
+  return {
+    type: "message_end",
+    usage: parseUsage(message.usage ?? data.usage ?? message),
+    stop_reason: optionalString(data.stop_reason ?? data.reason ?? message.stop_reason),
+    ...(optionalString(data.error_message ?? message.error_message) ? { error_message: optionalString(data.error_message ?? message.error_message) } : {}),
+  };
 }
 
 function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
@@ -1235,6 +1271,9 @@ function agentEndFrom(data: Record<string, unknown>): AgentStreamEvent {
     type: "agent_end",
     ...(usage ? { usage } : {}),
     ...(optionalString(data.stop_reason ?? data.reason) ? { stop_reason: optionalString(data.stop_reason ?? data.reason) } : {}),
+    ...(optionalString(data.error_message) ? { error_message: optionalString(data.error_message) } : {}),
+    ...(optionalString(data.provider_id ?? data.provider) ? { provider_id: optionalString(data.provider_id ?? data.provider) } : {}),
+    ...(optionalString(data.api) ? { api: optionalString(data.api) } : {}),
   };
 }
 
@@ -1370,11 +1409,87 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 function isRetryableAuthError(error: unknown): error is MakaiStreamError {
-  return error instanceof MakaiStreamError && error.code === "auth_required";
+  // MakaiAuthRequiredError is the terminal typed auth failure (produced after
+  // retries are exhausted or when replaying the run is unsafe); only the plain
+  // MakaiStreamError shape is retry-eligible.
+  return error instanceof MakaiStreamError && !(error instanceof MakaiAuthRequiredError) && error.code === "auth_required";
 }
 
 function authRequiredError(providerId: string, message: string): MakaiAuthRequiredError {
   return new MakaiAuthRequiredError(providerId, message);
+}
+
+/**
+ * Agent events that carry no provider content or side effects and may be
+ * re-emitted by a retried attempt: lifecycle markers plus the metadata-only
+ * message frames the server emits for initial prompts before any provider
+ * call. Provider output deltas, tool calls, and tool execution events are
+ * excluded — replaying those would duplicate content or side effects.
+ */
+function isReplayableAgentEvent(event: AgentStreamEvent): boolean {
+  return event.type === "agent_start" ||
+    event.type === "turn_start" ||
+    event.type === "turn_end" ||
+    event.type === "message_start" ||
+    event.type === "message_end";
+}
+
+/**
+ * Detects provider auth failure text carried in an agent event/response
+ * `error_message`. Base patterns mirror the server-wide default detector
+ * (zig/src/protocol/provider/server.zig `defaultAuthFailureDetector` plus
+ * NACK reasons); provider-specific patterns (from the detector registered
+ * for the anthropic-messages API, zig/src/providers/anthropic_messages_api.zig)
+ * apply only when the response resolved to that API — not merely a provider
+ * id, which a remapped model ref can reuse across APIs.
+ */
+function isAuthFailureMessage(message: string | undefined, identity?: { providerId?: string; api?: string }): boolean {
+  if (!message) return false;
+  const normalized = message.toLowerCase();
+  if (normalized === "auth_required" ||
+    normalized === "auth_expired" ||
+    normalized === "auth_refresh_failed" ||
+    normalized.includes("authentication required") ||
+    normalized.includes("401") ||
+    normalized.includes("403") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("forbidden")) {
+    return true;
+  }
+  return identity?.api === "anthropic-messages" && (
+    normalized.includes("authentication_error") ||
+    normalized.includes("permission_error") ||
+    normalized.includes("invalid api key")
+  );
+}
+
+/**
+ * Translates an agent run response whose provider turn failed with an auth
+ * error into the thrown error shape consumed by withAuthRetry; non-auth
+ * failures return the response unchanged. The response's own provider_id wins
+ * over the request-derived fallback so opaque or remapped model_refs still
+ * resolve a retry target. Once tools have executed, the typed
+ * MakaiAuthRequiredError is still thrown (manual/default policy expects it)
+ * but without retry eligibility — a retry restarts the run in a fresh session
+ * and would replay tool side effects.
+ */
+function responseOrAuthError(response: CompletionResponse, providerId: string | undefined, options: { allowAuthRetry: boolean }): CompletionResponse {
+  if (response.stop_reason === "error" && isAuthFailureMessage(response.error_message, { providerId: response.provider_id, api: response.api })) {
+    const resolvedProviderId = response.provider_id || providerId;
+    const message = response.error_message ?? "auth_required";
+    if (options.allowAuthRetry) {
+      throw new MakaiStreamError(message, {
+        kind: "provider_error",
+        code: "auth_required",
+        ...(resolvedProviderId ? { provider_id: resolvedProviderId } : {}),
+      });
+    }
+    if (resolvedProviderId) {
+      throw authRequiredError(resolvedProviderId, message);
+    }
+    throw new MakaiStreamError(message, { kind: "provider_error", code: "auth_required" });
+  }
+  return response;
 }
 
 function providerIdFromRequest(request: ProviderCompleteRequest | AgentRunRequest): string | undefined {
