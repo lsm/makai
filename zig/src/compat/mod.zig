@@ -60,10 +60,14 @@ pub fn getEnvVarOwned(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
             // Windows has no HOME convention; resolve the home directory
             // through USERPROFILE, then HOMEDRIVE ++ HOMEPATH. A plain HOME
             // (e.g. set by Git Bash) is still honored as a last resort by
-            // the generic lookup below.
+            // the generic lookup below. Allocation failures propagate; only
+            // a genuinely absent home directory falls through.
             if (getWindowsHomeDir(allocator)) |home| {
                 return home;
-            } else |_| {}
+            } else |err| switch (err) {
+                error.EnvironmentVariableMissing => {},
+                else => return err,
+            }
         }
     }
     return std.process.Environ.getAlloc(runtimeEnviron(), allocator, name);
@@ -75,11 +79,16 @@ fn getWindowsHomeDir(allocator: std.mem.Allocator) ![]u8 {
 
 /// Windows home-directory resolution: `USERPROFILE` first, then
 /// `HOMEDRIVE` ++ `HOMEPATH` (e.g. "C:" ++ "\Users\name"). Takes the environ
-/// explicitly so tests can feed synthetic values on any host.
+/// explicitly so tests can feed synthetic values on any host. Only
+/// `error.EnvironmentVariableMissing` moves the search to the next candidate;
+/// allocation failures propagate to the caller.
 fn getHomeDirFromEnviron(allocator: std.mem.Allocator, environ: std.process.Environ) ![]u8 {
     if (std.process.Environ.getAlloc(environ, allocator, "USERPROFILE")) |value| {
         return value;
-    } else |_| {}
+    } else |err| switch (err) {
+        error.EnvironmentVariableMissing => {},
+        else => return err,
+    }
 
     const drive = try std.process.Environ.getAlloc(environ, allocator, "HOMEDRIVE");
     const path = std.process.Environ.getAlloc(environ, allocator, "HOMEPATH") catch |err| {
@@ -119,11 +128,12 @@ test "getEnvVarOwned HOME matches the environ lookup" {
 }
 
 // The remaining tests exercise the Windows home-dir resolution against a
-// synthetic environ. The synthetic block below is a POSIX shape, so the test
-// bodies live inside a comptime OS guard and skip on Windows/WASI hosts where
-// `std.process.Environ.Block` is not a `PosixBlock`.
+// synthetic environ. The synthetic block below is a `PosixBlock` shape, so
+// the test bodies are guarded on the block actually being one (Windows,
+// WASI/emscripten without libc, and freestanding use `GlobalBlock` instead)
+// and skip elsewhere.
 test "windows home resolution prefers USERPROFILE over HOMEDRIVE/HOMEPATH" {
-    if (@import("builtin").os.tag != .windows) {
+    if (@hasField(std.process.Environ.Block, "slice")) {
         const allocator = std.testing.allocator;
         const entries = [_]?[*:0]const u8{
             "USERPROFILE=C:\\Users\\tester",
@@ -139,7 +149,7 @@ test "windows home resolution prefers USERPROFILE over HOMEDRIVE/HOMEPATH" {
 }
 
 test "windows home resolution falls back to HOMEDRIVE ++ HOMEPATH" {
-    if (@import("builtin").os.tag != .windows) {
+    if (@hasField(std.process.Environ.Block, "slice")) {
         const allocator = std.testing.allocator;
         const entries = [_]?[*:0]const u8{
             "HOMEDRIVE=C:",
@@ -154,7 +164,7 @@ test "windows home resolution falls back to HOMEDRIVE ++ HOMEPATH" {
 }
 
 test "windows home resolution fails without USERPROFILE and HOMEDRIVE/HOMEPATH" {
-    if (@import("builtin").os.tag != .windows) {
+    if (@hasField(std.process.Environ.Block, "slice")) {
         const allocator = std.testing.allocator;
         const empty_entries = [_]?[*:0]const u8{null};
         const empty_env: std.process.Environ = .{ .block = .{ .slice = empty_entries[0..0 :null] } };
