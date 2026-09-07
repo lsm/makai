@@ -125,8 +125,9 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * The `maxMs` budget covers read-lock acquisition too: the per-read timeout
  * only starts once the transport's read lock is granted, and the lock can be
  * held by a concurrent long-lived read on the shared transport, so the read
- * is raced against the remaining budget. An abandoned read settles within
- * its own idle window and at worst consumes one stale frame.
+ * is raced against the remaining budget — and on timeout the pending read is
+ * aborted via its signal, which re-routes any frame it had dequeued instead
+ * of letting it be consumed after this drain has given up.
  */
 export async function drainSessionFramesUntilQuiescent(
   transport: MakaiStdioClient,
@@ -139,8 +140,15 @@ export async function drainSessionFramesUntilQuiescent(
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
-    const read = transport.nextFrameForSession(sessionId, waitMs).catch(() => null);
-    const frame = await Promise.race([read, new Promise<null>((resolve) => setTimeout(resolve, remaining, null))]);
+    const controller = new AbortController();
+    const read = transport.nextFrameForSession(sessionId, waitMs, { signal: controller.signal }).catch(() => null);
+    const budget = new Promise<null>((resolve) => {
+      setTimeout(() => {
+        controller.abort();
+        resolve(null);
+      }, remaining);
+    });
+    const frame = await Promise.race([read, budget]);
     if (!frame) return;
     // The stop's correlated reply is the server's final word for the session;
     // exiting on positive acknowledgement beats waiting out the idle window

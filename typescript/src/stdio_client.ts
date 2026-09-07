@@ -227,7 +227,7 @@ export class MakaiStdioClient {
    * @returns The next matching frame.
    * @throws If `sessionId` is empty or no matching frame arrives before timeout.
    */
-  async nextFrameForSession(sessionId: string, timeoutMs = 1000): Promise<StdioFrame> {
+  async nextFrameForSession(sessionId: string, timeoutMs = 1000, options?: { signal?: AbortSignal }): Promise<StdioFrame> {
     if (sessionId.length === 0) {
       throw new Error("sessionId is required");
     }
@@ -236,6 +236,9 @@ export class MakaiStdioClient {
     if (queued) return queued;
 
     return this.withStreamReadLock(async () => {
+      if (options?.signal?.aborted) {
+        throw new Error(`frame wait for session ${sessionId} aborted`);
+      }
       const deadline = Date.now() + timeoutMs;
       while (true) {
         const remainingMs = deadline - Date.now();
@@ -254,6 +257,13 @@ export class MakaiStdioClient {
             throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
           }
           throw error;
+        }
+        if (options?.signal?.aborted) {
+          // The wait was abandoned while its read was in flight: put the
+          // frame back so the waiter it actually belongs to can still
+          // receive it, instead of consuming it here.
+          this.enqueueRoutableFrame(frame);
+          throw new Error(`frame wait for session ${sessionId} aborted`);
         }
         const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
         if (frameSessionId === sessionId) return frame;

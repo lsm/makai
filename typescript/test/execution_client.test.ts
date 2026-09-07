@@ -60,6 +60,25 @@ function readLoggedRequests(logPath: string): Array<Record<string, unknown>> {
   return fs.readFileSync(logPath, "utf8").trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
 }
 
+/**
+ * Waits until the fixture's request log satisfies `predicate`. Error-path
+ * teardown sends agent_stop asynchronously (no awaited drain, so the error is
+ * not delayed past caller abort/retry windows), so the log assertion must
+ * tolerate the fixture processing the stop a beat after the rejection.
+ */
+async function waitForLoggedRequests(
+  logPath: string,
+  predicate: (entries: Array<Record<string, unknown>>) => boolean,
+  timeoutMs = 2000,
+): Promise<Array<Record<string, unknown>>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const logged = readLoggedRequests(logPath);
+    if (predicate(logged) || Date.now() >= deadline) return logged;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const out: T[] = [];
   for await (const item of iterable) out.push(item);
@@ -2255,7 +2274,7 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
     );
 
-    const logged = readLoggedRequests(harness.logPath);
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
@@ -2270,7 +2289,8 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
       () => agent.run(request()),
       (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
     );
-    const stopsAfterRetry = readLoggedRequests(harness.logPath).filter((entry) => entry.type === "agent_stop");
+    const stopsAfterRetry = (await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2))
+      .filter((entry) => entry.type === "agent_stop");
     assert.equal(stopsAfterRetry.length, 2);
     assert.equal(stopsAfterRetry[1]?.sequence, 3);
   } finally {
@@ -2331,7 +2351,7 @@ test("client.agent.run does not stop a session owned by another run after agent_
       () => first,
       (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
     );
-    const logged = readLoggedRequests(harness.logPath);
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
     const stops = logged.filter((entry) => entry.type === "agent_stop");
     assert.equal(stops.length, 1);
     assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
