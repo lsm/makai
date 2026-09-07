@@ -142,13 +142,17 @@ export async function drainSessionFramesUntilQuiescent(
     const waitMs = Math.min(idleMs, remaining);
     const controller = new AbortController();
     const read = transport.nextFrameForSession(sessionId, waitMs, { signal: controller.signal }).catch(() => null);
+    let budgetTimer: NodeJS.Timeout | undefined;
     const budget = new Promise<null>((resolve) => {
-      setTimeout(() => {
+      budgetTimer = setTimeout(() => {
         controller.abort();
         resolve(null);
       }, remaining);
     });
     const frame = await Promise.race([read, budget]);
+    // Clear the losing side's timer so a read that settles first does not
+    // keep the event loop alive (or accumulate timers) until the deadline.
+    if (budgetTimer !== undefined) clearTimeout(budgetTimer);
     if (!frame) return;
     // The stop's correlated reply is the server's final word for the session;
     // exiting on positive acknowledgement beats waiting out the idle window
