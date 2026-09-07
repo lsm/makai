@@ -39,6 +39,19 @@ export function bestEffortCancelStream(transport: MakaiStdioClient, streamId: st
  * transport errors so the original abort error propagates cleanly.
  */
 export function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: string, sequence = 2): void {
+  bestEffortStopAgent(transport, sessionId, sequence, "client aborted");
+}
+
+/**
+ * Sends an `agent_stop` envelope for the given session with an explicit
+ * reason, swallowing any transport errors so the caller's own result or
+ * error propagates cleanly.
+ *
+ * `sequence` must be the session's next expected inbound sequence (start=1,
+ * message=2, then one per follow-up message) — the server rejects
+ * out-of-order stops, which would silently leave the session registered.
+ */
+export function bestEffortStopAgent(transport: MakaiStdioClient, sessionId: string, sequence: number, reason: string): void {
   try {
     transport.send({
       type: "agent_stop",
@@ -47,11 +60,11 @@ export function bestEffortCancelAgent(transport: MakaiStdioClient, sessionId: st
       sequence,
       timestamp: Date.now(),
       version: ENVELOPE_VERSION,
-      payload: { session_id: sessionId, reason: "client aborted" },
+      payload: { session_id: sessionId, reason },
     });
   } catch {
-    // Best-effort cancellation; ignore transport errors here so we keep
-    // surfacing the original failure to the caller.
+    // Best-effort teardown; ignore transport errors here so we keep
+    // surfacing the caller's own result or failure.
   }
 }
 
@@ -98,5 +111,52 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
     } catch {
       break;
     }
+  }
+}
+
+/**
+ * Drains remaining frames for a finished agent session until the transport
+ * buffer goes quiet. Unlike {@link drainSessionFrames}, which always runs to
+ * its deadline, this returns as soon as the peer acknowledges the session's
+ * teardown — an `agent_stopped` (or `agent_error`) reply is the server's last
+ * possible frame for the session, so nothing further can poison a later run
+ * reusing the id — or when an idle window passes with no frame.
+ *
+ * The `maxMs` budget covers read-lock acquisition too: the per-read timeout
+ * only starts once the transport's read lock is granted, and the lock can be
+ * held by a concurrent long-lived read on the shared transport, so the read
+ * is raced against the remaining budget — and on timeout the pending read is
+ * aborted via its signal, which re-routes any frame it had dequeued instead
+ * of letting it be consumed after this drain has given up.
+ */
+export async function drainSessionFramesUntilQuiescent(
+  transport: MakaiStdioClient,
+  sessionId: string,
+  idleMs = 50,
+  maxMs = 250,
+): Promise<void> {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    const waitMs = Math.min(idleMs, remaining);
+    const controller = new AbortController();
+    const read = transport.nextFrameForSession(sessionId, waitMs, { signal: controller.signal }).catch(() => null);
+    let budgetTimer: NodeJS.Timeout | undefined;
+    const budget = new Promise<null>((resolve) => {
+      budgetTimer = setTimeout(() => {
+        controller.abort();
+        resolve(null);
+      }, remaining);
+    });
+    const frame = await Promise.race([read, budget]);
+    // Clear the losing side's timer so a read that settles first does not
+    // keep the event loop alive (or accumulate timers) until the deadline.
+    if (budgetTimer !== undefined) clearTimeout(budgetTimer);
+    if (!frame) return;
+    // The stop's correlated reply is the server's final word for the session;
+    // exiting on positive acknowledgement beats waiting out the idle window
+    // and cannot miss a later trailing frame.
+    if (frame.type === "agent_stopped" || frame.type === "agent_error") return;
   }
 }
