@@ -9,7 +9,7 @@
  */
 
 import { ulid } from "ulid";
-import type { MakaiStdioClient } from "./stdio_client";
+import type { MakaiStdioClient, StdioFrame } from "./stdio_client";
 
 const ENVELOPE_VERSION = 1;
 
@@ -117,10 +117,11 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
 /**
  * Drains remaining frames for a finished agent session until the transport
  * buffer goes quiet. Unlike {@link drainSessionFrames}, which always runs to
- * its deadline, this returns as soon as an idle window passes with no frame,
- * so awaiting it after a session's terminal `agent_stop` costs one idle
- * window instead of the full drain timeout. Bounded by `maxMs` so a chatty
- * or wedged peer cannot stall the caller.
+ * its deadline, this returns as soon as the peer acknowledges the session's
+ * teardown — an `agent_stopped` (or `agent_error`) reply is the server's last
+ * possible frame for the session, so nothing further can poison a later run
+ * reusing the id — or when an idle window passes with no frame. Bounded by
+ * `maxMs` so a chatty or wedged peer cannot stall the caller.
  */
 export async function drainSessionFramesUntilQuiescent(
   transport: MakaiStdioClient,
@@ -133,11 +134,16 @@ export async function drainSessionFramesUntilQuiescent(
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
+    let frame: StdioFrame;
     try {
-      await transport.nextFrameForSession(sessionId, waitMs);
+      frame = await transport.nextFrameForSession(sessionId, waitMs);
     } catch {
       // Idle window elapsed with no frame — the session buffer is quiescent.
       return;
     }
+    // The stop's correlated reply is the server's final word for the session;
+    // exiting on positive acknowledgement beats waiting out the idle window
+    // and cannot miss a later trailing frame.
+    if (frame.type === "agent_stopped" || frame.type === "agent_error") return;
   }
 }

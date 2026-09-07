@@ -2262,15 +2262,82 @@ test("client.agent.run sends agent_stop when the run fails and the id stays reus
     assert.equal(stops[0]?.sequence, 3);
     assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
 
-    // The stop took effect server-side: once the run's background frame
-    // drain settles, the id is reusable. (Terminal paths drain synchronously;
-    // error paths drain in the background, so settle past that window here.)
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    const retry = await agent.run(request());
-    assert.equal(retry.stop_reason, "end_turn");
+    // The stop took effect server-side: an immediate retry with the same id
+    // starts a fresh session (the fixture's agent_error replays for it — it
+    // is NOT rejected with agent_busy, and the stale stop-reply frames are
+    // skipped rather than consumed as the retry's own frames).
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
+    );
+    const stopsAfterRetry = readLoggedRequests(harness.logPath).filter((entry) => entry.type === "agent_stop");
+    assert.equal(stopsAfterRetry.length, 2);
+    assert.equal(stopsAfterRetry[1]?.sequence, 3);
   } finally {
     await harness.cleanup();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream tears down the session when the consumer closes the iterator early", async () => {
+  // Breaking out of the for-await at the terminal event closes the generator
+  // while suspended at its yield — loop-exit code never runs, so teardown
+  // must live in the generator's finally (issue #199, review finding).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events: AgentStreamEvent[] = [];
+    for await (const event of agent.stream(request())) {
+      events.push(event);
+      if (event.type === "agent_end") break;
+    }
+    assert.equal(events.at(-1)?.type, "agent_end");
+
+    const result = await agent.run(request());
+    assert.equal(result.stop_reason, "end_turn");
+
+    const logged = readLoggedRequests(harness.logPath);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    for (const stop of stops) {
+      assert.equal(stop.session_id, "testNanoIdSess1234567");
+      assert.equal(stop.sequence, 3);
+      assert.equal((stop.payload as Record<string, unknown>).reason, "completed");
+    }
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run does not stop a session owned by another run after agent_busy", async () => {
+  // A second run on an id owned by a live first run is rejected with
+  // agent_busy; that rejection must NOT send an agent_stop — the tracked
+  // sequence would validate against the other run's session and tear it down
+  // (review finding on #199).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 500 });
+    const first = agent.run(request());
+    // Give the first run's start/message a beat to register the session.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "agent_busy" && err.message === "session already exists",
+    );
+
+    // The live session survives the busy attempt untouched; it is stopped
+    // only by its own run's timeout teardown.
+    await assert.rejects(
+      () => first,
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+    const logged = readLoggedRequests(harness.logPath);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
+    assert.equal(stops[0]?.sequence, 3);
+  } finally {
+    await harness.cleanup();
   }
 });
 

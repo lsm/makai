@@ -161,10 +161,17 @@ export class MakaiStdioClient {
       return Promise.resolve(this.frameQueue.shift()!);
     }
     return new Promise<StdioFrame>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const waiter = { resolve, reject, timer: undefined as unknown as NodeJS.Timeout };
+      waiter.timer = setTimeout(() => {
+        // Remove the timed-out waiter: handleLine resolves waiters FIFO
+        // without checking settlement, so a stale entry here would have the
+        // next incoming frame delivered to an already-rejected promise and
+        // silently dropped.
+        const index = this.frameWaiters.indexOf(waiter);
+        if (index >= 0) this.frameWaiters.splice(index, 1);
         reject(new Error(`timed out waiting for frame after ${timeoutMs}ms`));
       }, timeoutMs);
-      this.frameWaiters.push({ resolve, reject, timer });
+      this.frameWaiters.push(waiter);
     });
   }
 
