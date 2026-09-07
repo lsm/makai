@@ -120,6 +120,13 @@ const requestCounts = new Map();
 const authenticatedProviders = new Set();
 const authFlows = new Map();
 
+// Session-tracking mode mirrors the real agent server's session lifecycle:
+// a live session id rejects agent_start (agent_busy) and only a
+// sequence-valid agent_stop removes the session (replying agent_stopped).
+// Without this env the fixture stays a stateless line responder.
+const trackAgentSessions = Boolean(process.env.MAKAI_TEST_TRACK_AGENT_SESSIONS);
+const agentSessions = new Map();
+
 function loadAuthState() {
   if (!authStatePath || !fs.existsSync(authStatePath)) return;
   try {
@@ -185,12 +192,25 @@ rl.on("line", (line) => {
       emit(frame(env, event.type, event, i + 3));
     }
   } else if (env.type === "agent_start") {
+    if (trackAgentSessions) {
+      if (agentSessions.has(env.session_id)) {
+        emit(frame(env, "nack", { error_code: "agent_busy", reason: "session already exists" }, 3));
+        return;
+      }
+      // Registered before any auth rejection so a failed attempt's teardown
+      // stop still finds (and removes) the session, like the real server.
+      agentSessions.set(env.session_id, 2);
+    }
     if (shouldAuthReject("agent_start")) {
       emit(frame(env, "nack", authRequiredPayload(), 3));
       return;
     }
     emit(frame(env, "agent_started", { session_id: env.session_id }, 3));
   } else if (env.type === "agent_message") {
+    if (trackAgentSessions) {
+      const expected = agentSessions.get(env.session_id) ?? 1;
+      agentSessions.set(env.session_id, expected + 1);
+    }
     if (process.env.MAKAI_TEST_SUPPRESS_AGENT_MESSAGE_RESPONSE) return;
     if (process.env.MAKAI_TEST_AGENT_MALFORMED_RESULT_JSON) {
       emit(frame(env, "agent_result", { result_json: "not-json" }, 3));
@@ -201,10 +221,26 @@ rl.on("line", (line) => {
       emit(frame(env, "agent_error", agentError, 3));
     } else if (agentResult) {
       emit(frame(env, "agent_result", { result_json: JSON.stringify(agentResult) }, 3));
+      if (trackAgentSessions) {
+        // The real server publishes the terminal agent_end event after the
+        // agent_result frame; mirror it so tests exercise the SDK's
+        // post-terminal drain against the stale-frame hazard.
+        emit(frame(env, "agent_event", { event_json: JSON.stringify({ type: "agent_end", stop_reason: "end_turn" }) }, 4));
+      }
     } else {
       for (let i = 0; i < agentEvents.length; i += 1) {
         emit(frame(env, "agent_event", { event_json: JSON.stringify(agentEvents[i]) }, i + 3));
       }
+    }
+  } else if (env.type === "agent_stop") {
+    if (trackAgentSessions) {
+      const expected = agentSessions.get(env.session_id) ?? 1;
+      if (env.sequence !== expected) {
+        emit(frame(env, "nack", { error_code: "invalid_request", reason: "invalid sequence" }, 3));
+        return;
+      }
+      agentSessions.delete(env.session_id);
+      emit(frame(env, "agent_stopped", { session_id: env.session_id, reason: env.payload?.reason || "stopped" }, 3));
     }
   } else if (env.type === "auth_providers_request") {
     const providers = process.env.MAKAI_TEST_AUTH_REQUIRES_PROMPT ? [

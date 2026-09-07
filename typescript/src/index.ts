@@ -87,8 +87,10 @@ export {
 export {
   bestEffortCancelStream,
   bestEffortCancelAgent,
+  bestEffortStopAgent,
   drainStreamFrames,
   drainSessionFrames,
+  drainSessionFramesUntilQuiescent,
 } from "./cancel_helpers";
 
 export {

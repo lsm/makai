@@ -706,6 +706,15 @@ Required shared module:
 
 Normative rule: provider protocol remains canonical source; agent protocol passthrough must return the same model set and shape.
 
+### 6.1 Agent Session Teardown (Normative)
+
+The server removes an agent session only on `agent_stop`; there is no TTL and no terminal-state eviction. Session teardown is therefore client-owned:
+
+- A client that uses one session per run (start → message → result) MUST send `agent_stop` when the run reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered for the process lifetime and its id is permanently rejected on reuse (`agent_busy`).
+- The stop MUST carry the session's next expected inbound sequence (start=1, message=2, then one per follow-up message); out-of-order stops are rejected and leave the session registered. Tool-result replies do not consume inbound sequence numbers.
+- `reason` is a free-form string; the TS SDK sends `"completed"` for terminal and error teardown and `"client aborted"` for signal aborts.
+- After a successful stop, clients SHOULD drain remaining per-session frames: the server queues a terminal `agent_end` event after the `agent_result` frame, and a later run reusing the session id would otherwise consume that stale frame as its first frame.
+
 ## 7. JSON Envelope Examples (Normative)
 
 Auth providers request:

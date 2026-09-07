@@ -2,7 +2,13 @@ import { randomInt } from "node:crypto";
 import { ulid } from "ulid";
 import { checkAbort, isAbortError, raceWithAbort } from "./abort_signal";
 import { MakaiAuthClient, MakaiAuthError, type AuthFlowHandlers, type MakaiAuthApi } from "./auth_protocol";
-import { bestEffortCancelStream, bestEffortCancelAgent, drainStreamFrames, drainSessionFrames } from "./cancel_helpers";
+import {
+  bestEffortCancelStream,
+  bestEffortStopAgent,
+  drainStreamFrames,
+  drainSessionFrames,
+  drainSessionFramesUntilQuiescent,
+} from "./cancel_helpers";
 import { parseModelRef } from "./diagnostics/model_ref";
 import { getNoopLogger, isNoopLogger, type MakaiLogger } from "./logger";
 import { createMakaiModelsApi } from "./models_client";
@@ -54,6 +60,16 @@ type ExecutionOptions = {
   authHandlers?: AuthFlowHandlers;
   logger?: MakaiLogger;
 };
+
+/**
+ * Tracks the in-flight agent attempt across `run()`/`stream()` and their
+ * inner once-attempts so abort handling and session teardown always target
+ * the session that is actually live. `nextSequence` is the next inbound
+ * sequence the server expects for the session (the server validates it on
+ * `agent_stop`); `stopped` makes teardown idempotent when the error path
+ * and the auth-retry abandon path both fire for the same attempt.
+ */
+type ActiveAgentSession = { sessionId?: string; nextSequence: number; stopped?: boolean };
 
 type AgentToolExecutionResult = string | TextContentPart[];
 
@@ -351,7 +367,7 @@ class StdioAgentApi implements MakaiAgentApi {
     let retryRequest = request;
     // Track the active session so withAuthRetry can cancel+drain on abort
     // during auth retry (the session ID is created inside runOnce).
-    const activeSession: { sessionId?: string; nextSequence: number } = { nextSequence: 1 };
+    const activeSession: ActiveAgentSession = { nextSequence: 1 };
     return withAuthRetry(
       () => this.runOnce(retryRequest, effectivePolicy, signal, activeSession),
       {
@@ -362,29 +378,67 @@ class StdioAgentApi implements MakaiAgentApi {
         signal,
         logger: this.logger,
         beforeRetry: () => {
+          // The failed attempt's session is abandoned by the retry (fresh id
+          // assigned below); stop it so it does not stay registered
+          // server-side for the process lifetime.
+          this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "completed");
           retryRequest = {
             ...request,
             options: { ...request.options, session_id: generateNanoId() },
           };
         },
         onAbort: () => {
-          const sessionId = activeSession.sessionId;
-          if (sessionId) {
-            bestEffortCancelAgent(this.transport, sessionId, activeSession.nextSequence);
-            // Fire-and-forget: avoids blocking behind withStreamReadLock.
-            drainSessionFrames(this.transport, sessionId);
-          }
+          this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted");
         },
       },
     );
   }
 
-  private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeSession?: { sessionId?: string; nextSequence: number }): Promise<AgentRunResponse> {
+  /**
+   * Tears down the server-side agent session for a finished attempt by
+   * sending `agent_stop` and draining stale per-session frames. The server
+   * removes a session ONLY on `agent_stop`, so without this every run —
+   * success or failure — leaks a session that permanently rejects its id on
+   * reuse (`agent_busy`). The stop carries the tracked inbound sequence
+   * (out-of-order stops are rejected) and the drain consumes the trailing
+   * terminal frames the server queues after the one the run terminated on
+   * (e.g. the `agent_end` published after `agent_result`), which would
+   * otherwise poison a later run reusing the same session id.
+   *
+   * Best-effort and idempotent per attempt: transport failures are swallowed
+   * so they never mask the run's own result or error, and the tracker's
+   * `stopped` flag prevents double stops when the error path and the
+   * auth-retry abandon path both fire for the same attempt.
+   */
+  private stopAgentSession(
+    session: ActiveAgentSession | undefined,
+    sessionId: string | undefined,
+    sequence: number,
+    reason: string,
+    options: { awaitDrain?: boolean } = {},
+  ): Promise<void> {
+    if (sessionId === undefined) return Promise.resolve();
+    if (session) {
+      if (session.stopped) return Promise.resolve();
+      session.stopped = true;
+    }
+    bestEffortStopAgent(this.transport, sessionId, sequence, reason);
+    // Fire-and-forget by default: avoids blocking behind withStreamReadLock
+    // held by an interrupted read. Terminal paths await the quiescent drain
+    // so a follow-up run reusing the session id cannot race stale frames.
+    if (options.awaitDrain) {
+      return drainSessionFramesUntilQuiescent(this.transport, sessionId);
+    }
+    return drainSessionFrames(this.transport, sessionId);
+  }
+
+  private async runOnce(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeSession?: ActiveAgentSession): Promise<AgentRunResponse> {
     checkAbort(signal, "agent.run aborted");
     const sessionId = agentSessionId(request);
     if (activeSession) {
       activeSession.sessionId = sessionId;
       activeSession.nextSequence = 1;
+      activeSession.stopped = false;
     }
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -399,6 +453,10 @@ class StdioAgentApi implements MakaiAgentApi {
     // Retrying after tool execution would replay tool side effects in a fresh
     // session, so terminal auth translation is disabled once tools ran.
     let toolsExecuted = false;
+    // Session teardown for every exit path of this attempt (terminal frames,
+    // errors, abort); see stopAgentSession for the leak this prevents.
+    const teardownSession = (reason: string, awaitDrain = false): Promise<void> =>
+      this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, reason, { awaitDrain });
     try {
       while (true) {
         checkAbort(signal, "agent.run aborted");
@@ -414,8 +472,16 @@ class StdioAgentApi implements MakaiAgentApi {
           }
           continue;
         }
-        if (frame.type === "agent_result") return responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
-        if (frame.type === "result" || frame.type === "complete_response") return responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+        if (frame.type === "agent_result") {
+          const response = responseOrAuthError(parseAgentRunResponse(readJsonStringPayload(frame, "result_json")), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+          await teardownSession("completed", true);
+          return response;
+        }
+        if (frame.type === "result" || frame.type === "complete_response") {
+          const response = responseOrAuthError(parseCompletionResponse(frame.payload ?? frame), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+          await teardownSession("completed", true);
+          return response;
+        }
         if (frame.type === "tool_execute") {
           this.transport.send(await executeAgentToolFrame(frame, request.tools ?? []));
           toolsExecuted = true;
@@ -430,14 +496,22 @@ class StdioAgentApi implements MakaiAgentApi {
           if (event.type === "error") throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
           if (event.type === "tool_execution_start" || event.type === "tool_execution_end") toolsExecuted = true;
           events.push(event);
-          if (event.type === "agent_end") return responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+          if (event.type === "agent_end") {
+            const response = responseOrAuthError(buildAgentRunResponseFromEvents(events), fallbackProviderId, { allowAuthRetry: !toolsExecuted });
+            await teardownSession("completed", true);
+            return response;
+          }
         }
       }
     } catch (error) {
       if (isAbortError(error)) {
-        bestEffortCancelAgent(this.transport, sessionId, activeSession?.nextSequence ?? 2);
-        // Fire-and-forget: avoids blocking behind withStreamReadLock.
-        drainSessionFrames(this.transport, sessionId);
+        teardownSession("client aborted");
+      } else {
+        // Failed runs must tear their session down too: the server keeps it
+        // registered (and its id permanently agent_busy) until an agent_stop.
+        // Fire-and-forget like the abort path — awaiting the drain here would
+        // delay the error past caller abort/retry windows.
+        teardownSession("completed");
       }
       throw error;
     }
@@ -450,7 +524,7 @@ class StdioAgentApi implements MakaiAgentApi {
     const fallbackProviderId = providerIdFromRequest(request);
     let streamRequest = request;
     // Track the active session so abort during auth retry can cancel+drain
-    const activeSession: { sessionId?: string; nextSequence: number } = { nextSequence: 1 };
+    const activeSession: ActiveAgentSession = { nextSequence: 1 };
     let attempt = this.streamAttempt(streamRequest, effectivePolicy, signal, activeSession);
     let iterator = attempt[Symbol.asyncIterator]();
     // Whether any content-bearing event was yielded. auto_once auth retry may
@@ -488,6 +562,10 @@ class StdioAgentApi implements MakaiAgentApi {
                 throw authRequiredError(providerId, error.message);
               }
               retried = true;
+              // The failed attempt's session is abandoned by the retry (fresh
+              // id assigned below); stop it so it does not stay registered
+              // server-side for the process lifetime.
+              this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "completed");
               streamRequest = {
                 ...request,
                 options: { ...request.options, session_id: generateNanoId() },
@@ -509,23 +587,19 @@ class StdioAgentApi implements MakaiAgentApi {
       }
     } catch (error) {
       if (isAbortError(error)) {
-        const sessionId = activeSession.sessionId;
-        if (sessionId) {
-          bestEffortCancelAgent(this.transport, sessionId, activeSession.nextSequence);
-          // Fire-and-forget: avoids blocking behind withStreamReadLock.
-          drainSessionFrames(this.transport, sessionId);
-        }
+        this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted");
       }
       throw error;
     }
   }
 
-  private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeSession?: { sessionId?: string; nextSequence: number }): AsyncIterable<AgentStreamEvent> {
+  private async *streamAttempt(request: AgentRunRequest, effectivePolicy: RunOptions["auth_retry_policy"] | undefined, signal?: AbortSignal, activeSession?: ActiveAgentSession): AsyncIterable<AgentStreamEvent> {
     checkAbort(signal, "agent.stream aborted");
     const sessionId = agentSessionId(request);
     if (activeSession) {
       activeSession.sessionId = sessionId;
       activeSession.nextSequence = 1;
+      activeSession.stopped = false;
     }
     const fallbackProviderId = providerIdFromRequest(request);
     if (!isNoopLogger(this.logger)) {
@@ -601,9 +675,19 @@ class StdioAgentApi implements MakaiAgentApi {
           if (terminal) break;
         }
       }
+      // Terminal event reached: tear the session down (the server keeps it
+      // registered until an agent_stop) and await the drain so the trailing
+      // terminal frames still queued for this session cannot poison a later
+      // run reusing the same session id.
+      await this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed", { awaitDrain: true });
     } catch (error) {
       if (error instanceof MakaiStreamError) {
         this.logger.error("agent: stream error", { kind: error.kind, code: error.code, message: error.message });
+        // Failed streams must tear their session down too; the outer
+        // stream() catch only handles aborts. Fire-and-forget like the abort
+        // path — awaiting the drain would delay the error past caller
+        // abort/retry windows.
+        this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
         throw error;
       }
       if (isAbortError(error)) {
@@ -611,6 +695,7 @@ class StdioAgentApi implements MakaiAgentApi {
         throw error;
       }
       this.logger.error("agent: unexpected stream error", { error: error instanceof Error ? error.message : String(error) });
+      this.stopAgentSession(activeSession, sessionId, activeSession?.nextSequence ?? 2, "completed");
       throw new MakaiStreamError(error instanceof Error ? error.message : String(error), { kind: "transport_error" });
     }
   }

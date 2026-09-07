@@ -2215,3 +2215,153 @@ test("client.agent.run surfaces error_message from error agent results", async (
     await harness.cleanup();
   }
 });
+
+test("client.agent.run tears down the session so the same session_id can be reused", async () => {
+  // Tracking fixture mirrors the real server: agent_start on a live session
+  // id fails with agent_busy until a sequence-valid agent_stop removes it.
+  // Without teardown, the second run below rejects (issue #199).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const first = await agent.run(request());
+    assert.equal(first.stop_reason, "end_turn");
+    const second = await agent.run(request());
+    assert.equal(second.stop_reason, "end_turn");
+
+    const logged = readLoggedRequests(harness.logPath);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    for (const stop of stops) {
+      assert.equal(stop.session_id, "testNanoIdSess1234567");
+      // start=1, message=2, so the server expects the stop at sequence 3 —
+      // a default-sequence stop would be rejected and the session would leak.
+      assert.equal(stop.sequence, 3);
+      assert.equal((stop.payload as Record<string, unknown>).reason, "completed");
+    }
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run sends agent_stop when the run fails and the id stays reusable", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-error-"));
+  const errorPath = path.join(tmpDir, "agent-error.json");
+  fs.writeFileSync(errorPath, JSON.stringify({ code: "provider_error", message: "fixture agent failure" }));
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_ERROR_PATH: errorPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture agent failure",
+    );
+
+    const logged = readLoggedRequests(harness.logPath);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
+    assert.equal(stops[0]?.sequence, 3);
+    assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
+
+    // The stop took effect server-side: once the run's background frame
+    // drain settles, the id is reusable. (Terminal paths drain synchronously;
+    // error paths drain in the background, so settle past that window here.)
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const retry = await agent.run(request());
+    assert.equal(retry.stop_reason, "end_turn");
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.run auth retry stops the abandoned session", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-auth-retry-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: "ok",
+      usage: { input: 1, output: 1 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+    }],
+  }));
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_AGENT_RESULT_PATH: resultPath, MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 5000,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    await handle.agent.run(request());
+    const logged = readLoggedRequests(logPath);
+    const agentStarts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(agentStarts.length, 2);
+    const firstSessionId = agentStarts[0]?.session_id;
+    const secondSessionId = agentStarts[1]?.session_id;
+    assert.equal(firstSessionId, "testNanoIdSess1234567");
+    assert.match(secondSessionId as string, /^[0-9A-Za-z]{21}$/);
+
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    // The abandoned attempt stopped at the sequence it reached (start only).
+    assert.equal(stops[0]?.session_id, firstSessionId);
+    assert.equal(stops[0]?.sequence, 2);
+    assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
+    // The retried attempt runs its full lifecycle and stops at sequence 3.
+    assert.equal(stops[1]?.session_id, secondSessionId);
+    assert.equal(stops[1]?.sequence, 3);
+    assert.equal((stops[1]?.payload as Record<string, unknown>).reason, "completed");
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("client.agent.stream tears down the session and drains the trailing terminal frame", async () => {
+  // In agent_result mode the tracking fixture mirrors the real server's
+  // double publish: agent_result first, then a trailing terminal agent_end.
+  // The stream terminates on the agent_result-derived event, so the teardown
+  // drain must consume the trailing frame or a follow-up run reusing the
+  // session id would consume it as its first frame (issue #199).
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-stream-"));
+  const resultPath = path.join(tmpDir, "agent-result.json");
+  fs.writeFileSync(resultPath, JSON.stringify({
+    messages: [{
+      role: "assistant",
+      content: "ok",
+      usage: { input: 1, output: 1 },
+      provider: "anthropic",
+      api: "anthropic-messages",
+      model: "claude-sonnet-4-5",
+      stop_reason: "end_turn",
+    }],
+  }));
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_RESULT_PATH: resultPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    const events = await collect(agent.stream(request()));
+    assert.equal(events.at(-1)?.type, "agent_end");
+
+    const result = await agent.run(request());
+    assert.equal(result.message.content, "ok");
+    assert.equal(result.stop_reason, "end_turn");
+
+    const logged = readLoggedRequests(harness.logPath);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    for (const stop of stops) {
+      assert.equal(stop.session_id, "testNanoIdSess1234567");
+      assert.equal(stop.sequence, 3);
+      assert.equal((stop.payload as Record<string, unknown>).reason, "completed");
+    }
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
