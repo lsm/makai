@@ -426,7 +426,7 @@ class StdioAgentApi implements MakaiAgentApi {
     sessionId: string | undefined,
     sequence: number,
     reason: string,
-    options: { drain?: "quiescent" | "background" } = {},
+    options: { drain?: "quiescent" | "background" | "none" } = {},
   ): Promise<void> {
     if (sessionId === undefined) return Promise.resolve();
     if (session) {
@@ -466,7 +466,9 @@ class StdioAgentApi implements MakaiAgentApi {
     if (!isNoopLogger(this.logger)) {
       this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
     }
-    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
+    const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
+    this.transport.send(startEnvelope);
+    const startMessageId = startEnvelope.message_id;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
     const events: AgentStreamEvent[] = [];
@@ -493,17 +495,24 @@ class StdioAgentApi implements MakaiAgentApi {
           continue;
         }
         if (frame.type === "nack") {
+          if (!startAccepted && frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Reply to another call's request on this session id (e.g. a
+            // concurrent duplicate start's agent_busy nack delivered by the
+            // shared per-session route) — not our start's rejection.
+            continue;
+          }
           const error = nackToStreamError(frame, fallbackProviderId);
           if (!startAccepted && error.code === "agent_busy") this.abandonForeignAgentSession(activeSession);
           throw error;
         }
         if (frame.type === "agent_error") {
+          if (!startAccepted && frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Reply to another call's request on this session id (including
+            // a prior attempt's teardown stop) — not ours.
+            continue;
+          }
           const error = streamErrorFrameToError(frame);
-          if (!startAccepted) {
-            if (error.code !== "agent_busy") {
-              // Stale reply to a prior attempt's stop (e.g. agent_not_found).
-              continue;
-            }
+          if (!startAccepted && error.code === "agent_busy") {
             // The id belongs to another live run; stopping would tear that
             // session (and its run) down instead of merely rejecting us.
             this.abandonForeignAgentSession(activeSession);
@@ -638,6 +647,18 @@ class StdioAgentApi implements MakaiAgentApi {
         this.stopAgentSession(activeSession, activeSession.sessionId, activeSession.nextSequence, "client aborted", { drain: "background" });
       }
       throw error;
+    } finally {
+      // Closing this generator (consumer break/return in a for-await) does
+      // not propagate to the inner attempt generator this loop advances
+      // manually — close it explicitly so its finally teardown runs and the
+      // session does not stay registered. Harmless when it already settled;
+      // a superseded retry iterator is already completed by its own error.
+      // On abort the inner generator is mid-read (its read pends until the
+      // response timeout), so closing it is fire-and-forget there — the
+      // abort path above already stopped the session, and the inner finally
+      // skips teardown for error exits anyway.
+      const closed = iterator.return?.();
+      if (!signal?.aborted && closed) await closed.catch(() => undefined);
     }
   }
 
@@ -653,7 +674,9 @@ class StdioAgentApi implements MakaiAgentApi {
     if (!isNoopLogger(this.logger)) {
       this.logger.debug("agent: sending agent_start", { session_id: sessionId, model_ref: request.model_ref });
     }
-    this.transport.send(buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId)));
+    const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
+    this.transport.send(startEnvelope);
+    const startMessageId = startEnvelope.message_id;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
     let terminal = false;
@@ -680,19 +703,28 @@ class StdioAgentApi implements MakaiAgentApi {
           continue;
         }
         if (frame.type === "nack") {
+          if (!startAccepted && frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Reply to another call's request on this session id (e.g. a
+            // concurrent duplicate start's agent_busy nack delivered by the
+            // shared per-session route) — not our start's rejection.
+            continue;
+          }
           const error = nackToStreamError(frame, fallbackProviderId);
           if (!startAccepted && error.code === "agent_busy") this.abandonForeignAgentSession(activeSession);
           throw error;
         }
         if (frame.type === "agent_error" && !startAccepted) {
-          if (streamErrorFrameToError(frame).code !== "agent_busy") {
-            // Stale reply to a prior attempt's stop (e.g. agent_not_found).
+          if (frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Reply to another call's request on this session id (including
+            // a prior attempt's teardown stop) — not ours.
             continue;
           }
-          // Duplicate start on a live foreign session: the frame flows into
-          // normalizeAgentFrame so the consumer sees the refusal, but this
-          // attempt must never stop a session it does not own.
-          this.abandonForeignAgentSession(activeSession);
+          if (streamErrorFrameToError(frame).code === "agent_busy") {
+            // Duplicate start on a live foreign session: the frame flows into
+            // normalizeAgentFrame so the consumer sees the refusal, but this
+            // attempt must never stop a session it does not own.
+            this.abandonForeignAgentSession(activeSession);
+          }
         }
         if (frame.type === "agent_started" && !messageSent) {
           startAccepted = true;

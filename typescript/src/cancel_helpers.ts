@@ -9,7 +9,7 @@
  */
 
 import { ulid } from "ulid";
-import type { MakaiStdioClient, StdioFrame } from "./stdio_client";
+import type { MakaiStdioClient } from "./stdio_client";
 
 const ENVELOPE_VERSION = 1;
 
@@ -120,8 +120,13 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * its deadline, this returns as soon as the peer acknowledges the session's
  * teardown — an `agent_stopped` (or `agent_error`) reply is the server's last
  * possible frame for the session, so nothing further can poison a later run
- * reusing the id — or when an idle window passes with no frame. Bounded by
- * `maxMs` so a chatty or wedged peer cannot stall the caller.
+ * reusing the id — or when an idle window passes with no frame.
+ *
+ * The `maxMs` budget covers read-lock acquisition too: the per-read timeout
+ * only starts once the transport's read lock is granted, and the lock can be
+ * held by a concurrent long-lived read on the shared transport, so the read
+ * is raced against the remaining budget. An abandoned read settles within
+ * its own idle window and at worst consumes one stale frame.
  */
 export async function drainSessionFramesUntilQuiescent(
   transport: MakaiStdioClient,
@@ -134,13 +139,9 @@ export async function drainSessionFramesUntilQuiescent(
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const waitMs = Math.min(idleMs, remaining);
-    let frame: StdioFrame;
-    try {
-      frame = await transport.nextFrameForSession(sessionId, waitMs);
-    } catch {
-      // Idle window elapsed with no frame — the session buffer is quiescent.
-      return;
-    }
+    const read = transport.nextFrameForSession(sessionId, waitMs).catch(() => null);
+    const frame = await Promise.race([read, new Promise<null>((resolve) => setTimeout(resolve, remaining, null))]);
+    if (!frame) return;
     // The stop's correlated reply is the server's final word for the session;
     // exiting on positive acknowledgement beats waiting out the idle window
     // and cannot miss a later trailing frame.
