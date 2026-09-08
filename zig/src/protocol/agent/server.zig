@@ -12,6 +12,11 @@ pub const SessionState = struct {
     message_count: u32,
     created_at: i64,
     updated_at: i64,
+    /// Last activity on the monotonic clock (`compat.time.monotonicMillis`
+    /// domain) — the TTL idleness clock (§13.2.6), kept separate from the
+    /// wall-clock `updated_at` (protocol-visible in `session_info`) so
+    /// wall-clock adjustments cannot distort eviction age math.
+    last_activity_ms: i64,
 };
 
 pub const PendingAgentMessage = struct {
@@ -39,29 +44,11 @@ pub const ProviderModelsDelegateFn = *const fn (
     request: agent_types.ModelsRequest,
 ) anyerror!agent_types.ModelsResponse;
 
-pub const Options = struct {
-    /// Explicit kill-switch for the model catalog feature. When `false`,
-    /// `models_request` always returns a `not_implemented` nack regardless of
-    /// whether a delegate is configured.
-    ///
-    /// NOTE: this flag alone does not advertise the capability. A
-    /// `models_request` is only answered with a `models_response` when BOTH
-    /// `supports_model_catalog == true` AND `provider_models_delegate != null`.
-    /// All four combinations resolve as follows:
-    ///   * supports=true,  delegate=set  -> delegate is invoked.
-    ///   * supports=true,  delegate=null -> `not_implemented` nack (default).
-    ///   * supports=false, delegate=set  -> `not_implemented` nack (kill-switch).
-    ///   * supports=false, delegate=null -> `not_implemented` nack.
-    /// In other words, the default-constructed server is a NO-OP responder
-    /// until a delegate is wired; flipping this flag is only meaningful when
-    /// callers want to disable an otherwise-configured delegate at runtime.
-    supports_model_catalog: bool = true,
-    /// Provider-protocol passthrough for model discovery. When null, the agent
-    /// server replies with `not_implemented` to advertise capability absence.
-    provider_models_delegate: ?ProviderModelsDelegateFn = null,
-    /// Opaque context passed to `provider_models_delegate`.
-    provider_models_ctx: ?*anyopaque = null,
-};
+/// Default idle-session TTL (spec §13.2.6 rule 6): 30 minutes. Long enough
+/// that an interactive multi-message conversation never sees an eviction on
+/// human-paced gaps, short enough that abandoned ids from clients that never
+/// send `agent_stop` do not accumulate for the process lifetime (#202).
+pub const default_session_idle_ttl_ms: u64 = 30 * 60 * 1_000;
 
 pub const AgentProtocolServer = struct {
     allocator: std.mem.Allocator,
@@ -73,6 +60,40 @@ pub const AgentProtocolServer = struct {
     options: Options,
 
     const Self = @This();
+
+    pub const Options = struct {
+        /// Idle-session TTL in milliseconds (spec §13.2.6 rule 6): a sweep
+        /// (`evictIdleSessions`) removes sessions whose last activity —
+        /// measured on the monotonic clock — is strictly older than this.
+        /// Last activity is inbound (`agent_message` acceptance,
+        /// `agent_status` poll) or server-side run publication (`agent_event`,
+        /// `agent_result`, `agent_error`); sessions with an in-flight run
+        /// (status `.processing`) are never evicted. Defaults to
+        /// `default_session_idle_ttl_ms`; `0` disables eviction (sessions live
+        /// until `agent_stop` or process exit).
+        session_idle_ttl_ms: u64 = default_session_idle_ttl_ms,
+        /// Explicit kill-switch for the model catalog feature. When `false`,
+        /// `models_request` always returns a `not_implemented` nack regardless of
+        /// whether a delegate is configured.
+        ///
+        /// NOTE: this flag alone does not advertise the capability. A
+        /// `models_request` is only answered with a `models_response` when BOTH
+        /// `supports_model_catalog == true` AND `provider_models_delegate != null`.
+        /// All four combinations resolve as follows:
+        ///   * supports=true,  delegate=set  -> delegate is invoked.
+        ///   * supports=true,  delegate=null -> `not_implemented` nack (default).
+        ///   * supports=false, delegate=set  -> `not_implemented` nack (kill-switch).
+        ///   * supports=false, delegate=null -> `not_implemented` nack.
+        /// In other words, the default-constructed server is a NO-OP responder
+        /// until a delegate is wired; flipping this flag is only meaningful when
+        /// callers want to disable an otherwise-configured delegate at runtime.
+        supports_model_catalog: bool = true,
+        /// Provider-protocol passthrough for model discovery. When null, the agent
+        /// server replies with `not_implemented` to advertise capability absence.
+        provider_models_delegate: ?ProviderModelsDelegateFn = null,
+        /// Opaque context passed to `provider_models_delegate`.
+        provider_models_ctx: ?*anyopaque = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return initWithOptions(allocator, .{});
@@ -181,6 +202,7 @@ pub const AgentProtocolServer = struct {
             .message_count = 0,
             .created_at = now,
             .updated_at = now,
+            .last_activity_ms = try compat.time.monotonicMillis(),
         });
 
         return .{
@@ -230,7 +252,7 @@ pub const AgentProtocolServer = struct {
 
         session.status = .processing;
         session.message_count += 1;
-        session.updated_at = compat.time.nowMillis();
+        try touchSession(session);
 
         return null;
     }
@@ -246,15 +268,9 @@ pub const AgentProtocolServer = struct {
         }
 
         const stop_sequence = self.nextOutgoingSequence(req.session_id);
-        const removed = self.sessions.fetchRemove(req.session_id) orelse {
+        if (!self.removeSession(req.session_id)) {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
-        };
-        self.allocator.free(removed.value.model);
-        self.allocator.free(removed.value.config_json);
-        self.allocator.free(removed.value.system_prompt);
-        _ = self.expected_sequences.remove(req.session_id);
-        _ = self.outgoing_sequences.remove(req.session_id);
-        self.removePendingMessages(req.session_id);
+        }
 
         const reason = if (req.getReason()) |r| try self.allocator.dupe(u8, r) else try self.allocator.dupe(u8, "stopped");
         return .{
@@ -271,9 +287,14 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleStatus(self: *Self, req: anytype, env: agent_types.Envelope) !?agent_types.Envelope {
-        const session = self.sessions.get(req.session_id) orelse {
+        const session = self.sessions.getPtr(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
+
+        // A status poll is inbound activity: it refreshes the session's
+        // idleness clock ahead of TTL eviction (§13.2.6). The reply therefore
+        // reports the poll itself as the latest activity.
+        try touchSession(session);
 
         return .{
             .session_id = req.session_id,
@@ -416,7 +437,10 @@ pub const AgentProtocolServer = struct {
     }
 
     pub fn publishAgentEvent(self: *Self, session_id: agent_types.SessionId, event_json: []const u8) !void {
-        if (!self.sessions.contains(session_id)) return error.SessionNotFound;
+        const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
+        // Run activity (event publication) refreshes the idleness clock
+        // ahead of TTL eviction (§13.2.6).
+        try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
@@ -429,7 +453,7 @@ pub const AgentProtocolServer = struct {
     pub fn publishAgentResult(self: *Self, session_id: agent_types.SessionId, result_json: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
         session.status = .ready;
-        session.updated_at = compat.time.nowMillis();
+        try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
@@ -442,7 +466,7 @@ pub const AgentProtocolServer = struct {
     pub fn publishAgentError(self: *Self, session_id: agent_types.SessionId, code: agent_types.AgentErrorCode, message: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
         session.status = .@"error";
-        session.updated_at = compat.time.nowMillis();
+        try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
             .message_id = agent_types.generateUlid(),
@@ -478,14 +502,118 @@ pub const AgentProtocolServer = struct {
         const next = try self.allocator.dupe(u8, model);
         self.allocator.free(session.model);
         session.model = next;
-        session.updated_at = compat.time.nowMillis();
+        try touchSession(session);
     }
 
-    pub fn markSessionError(self: *Self, session_id: agent_types.SessionId) void {
+    pub fn markSessionError(self: *Self, session_id: agent_types.SessionId) !void {
         if (self.sessions.getPtr(session_id)) |session| {
             session.status = .@"error";
-            session.updated_at = compat.time.nowMillis();
+            try touchSession(session);
         }
+    }
+
+    /// Stamps both activity clocks on a session: the wall-clock `updated_at`
+    /// (protocol-visible in `session_info`) and the monotonic
+    /// `last_activity_ms` (the TTL idleness clock, §13.2.6 — immune to
+    /// wall-clock adjustments).
+    fn touchSession(session: *SessionState) !void {
+        session.updated_at = compat.time.nowMillis();
+        session.last_activity_ms = try compat.time.monotonicMillis();
+    }
+
+    /// Removes a session together with every piece of bookkeeping tied to it:
+    /// the state container (freeing its owned strings), the expected/outgoing
+    /// sequence entries, and any still-queued pending messages. `agent_stop`
+    /// handling and idle-TTL eviction (§13.2.6) share this removal so an
+    /// evicted id is indistinguishable from a stopped one. Returns false when
+    /// the id is not registered.
+    fn removeSession(self: *Self, session_id: agent_types.SessionId) bool {
+        const removed = self.sessions.fetchRemove(session_id) orelse return false;
+        self.allocator.free(removed.value.model);
+        self.allocator.free(removed.value.config_json);
+        self.allocator.free(removed.value.system_prompt);
+        _ = self.expected_sequences.remove(session_id);
+        _ = self.outgoing_sequences.remove(session_id);
+        self.removePendingMessages(session_id);
+        return true;
+    }
+
+    /// Evicts every session idle longer than the configured TTL, appending
+    /// the evicted ids to `evicted_out` and returning how many THIS call
+    /// appended (spec §13.2.6 rule 6). Idleness is measured on the monotonic
+    /// clock (`now_mono_ms` is a `compat.time.monotonicMillis` reading —
+    /// hosts pass a live one, tests pass a synthetic time) from the session's
+    /// last activity — inbound (`agent_message` acceptance, `agent_status`
+    /// poll) or server-side run publication (`agent_event`, `agent_result`,
+    /// `agent_error`) — and only strictly exceeds the TTL. The wall clock is
+    /// deliberately not consulted: NTP steps or snapshot restores must not
+    /// evict fresh sessions or strand stale ones. Eviction requires no client
+    /// participation: the evicted id behaves exactly like a stopped one — the
+    /// next `agent_message`/`agent_stop`/`agent_status` fails with
+    /// `agent_not_found`, and a fresh `agent_start` registers a new container
+    /// (whose output can still be confused with the old registration's
+    /// buffered publications — the §13.4.5 id-reuse race, shared with
+    /// `agent_stop` and closed for both by #204's generation/tombstone
+    /// tokens).
+    ///
+    /// The admission-vs-eviction race (§13.2.6 rule 6) is closed server-side
+    /// by construction in every current host: admission (`handleMessage`)
+    /// sets `.processing` synchronously before accepting, admission and this
+    /// sweep run serialized on the host's single pump thread, and the stdio
+    /// run pump already cancels any run whose session disappeared (the
+    /// `agent_stop` path) with post-removal publications surfacing as
+    /// swallowed `SessionNotFound` no-ops. A session is therefore either
+    /// `.processing` (never selected here — a long-running turn or tool
+    /// execution cannot be evicted out from under its run) or removed before
+    /// its message arrives (the request fails with `agent_not_found`, no run
+    /// admitted). Multi-threaded hosts must preserve this serialization
+    /// before sweeping.
+    ///
+    /// Eligible ids are collected in one traversal and removed afterwards
+    /// (removing mid-iteration would invalidate the map iterator, and
+    /// rescanning per removal would cost one full pass per expired session
+    /// when many expire together — time the single pump thread cannot
+    /// spare). Only the ids this call appended are removed, so callers may
+    /// reuse the list across sweeps. If collecting exhausts the allocator,
+    /// the batch collected so far is STILL evicted before the error
+    /// propagates — dropping it would wedge the sweep under the very memory
+    /// pressure eviction exists to relieve; the error signals an incomplete
+    /// sweep, and the next sweep retries what remains.
+    pub fn evictIdleSessions(
+        self: *Self,
+        now_mono_ms: i64,
+        evicted_out: *std.ArrayList(agent_types.SessionId),
+    ) !usize {
+        if (self.options.session_idle_ttl_ms == 0) return 0;
+        const ttl_ms = self.options.session_idle_ttl_ms;
+
+        const first_new = evicted_out.items.len;
+        var collect_err: ?anyerror = null;
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr;
+            // In-flight runs (admitted or executing) are never idle.
+            if (session.status == .processing) continue;
+            // A reading older than the stamp (possible only with a synthetic
+            // test clock) reads as zero idle time; "idle longer than the
+            // TTL" is strict.
+            const idle_ms: u64 = if (now_mono_ms > session.last_activity_ms)
+                @intCast(now_mono_ms - session.last_activity_ms)
+            else
+                0;
+            if (idle_ms > ttl_ms) {
+                evicted_out.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    collect_err = err;
+                    break;
+                };
+            }
+        }
+
+        for (evicted_out.items[first_new..]) |session_id| {
+            _ = self.removeSession(session_id);
+        }
+        if (collect_err) |err| return err;
+        return evicted_out.items.len - first_new;
     }
 
     fn removePendingMessages(self: *Self, session_id: agent_types.SessionId) void {
@@ -912,4 +1040,251 @@ test "AgentProtocolServer rejects out-of-order stop without removing session" {
     try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, stop_resp.payload.agent_error.code);
     try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
     try std.testing.expect(server.hasSession(sid));
+}
+
+// ============================================================================
+// Idle-session TTL eviction (spec §13.2.6 rule 6, #202)
+// ============================================================================
+
+fn startTestSession(server: *AgentProtocolServer, allocator: std.mem.Allocator) !agent_types.SessionId {
+    var start = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{ .config_json = try allocator.dupe(u8, "{}") } },
+    };
+    defer start.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(start)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_started);
+    return resp.payload.agent_started.session_id;
+}
+
+fn makeTestAgentMessage(session_id: agent_types.SessionId, sequence: u64, allocator: std.mem.Allocator) !agent_types.Envelope {
+    return .{
+        .session_id = session_id,
+        .message_id = agent_types.generateUlid(),
+        .sequence = sequence,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_message = .{
+            .session_id = session_id,
+            .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
+        } },
+    };
+}
+
+fn makeTestAgentStatus(session_id: agent_types.SessionId, sequence: u64) agent_types.Envelope {
+    return .{
+        .session_id = session_id,
+        .message_id = agent_types.generateUlid(),
+        .sequence = sequence,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_status = .{ .session_id = session_id } },
+    };
+}
+
+fn makeTestAgentStop(session_id: agent_types.SessionId, sequence: u64) agent_types.Envelope {
+    return .{
+        .session_id = session_id,
+        .message_id = agent_types.generateUlid(),
+        .sequence = sequence,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stop = .{ .session_id = session_id } },
+    };
+}
+
+test "AgentProtocolServer evicts idle sessions past the TTL with agent_not_found after" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = try startTestSession(&server, allocator);
+    const idle_since = server.sessions.get(sid).?.last_activity_ms;
+    const default_ttl: i64 = @intCast(default_session_idle_ttl_ms);
+    var evicted = std.ArrayList(agent_types.SessionId).empty;
+    defer evicted.deinit(allocator);
+
+    // "Idle longer than the TTL" is strict: at exactly the TTL the session
+    // survives, one millisecond past it the sweep removes it.
+    try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions(idle_since + default_ttl, &evicted));
+    try std.testing.expect(server.hasSession(sid));
+    try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(idle_since + default_ttl + 1, &evicted));
+    try std.testing.expectEqual(@as(usize, 1), evicted.items.len);
+    try std.testing.expectEqualSlices(u8, sid[0..], evicted.items[0][0..]);
+    try std.testing.expect(!server.hasSession(sid));
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+
+    // An evicted id is indistinguishable from a stopped one: the next
+    // session-scoped request fails with agent_not_found...
+    var msg = try makeTestAgentMessage(sid, 2, allocator);
+    defer msg.deinit(allocator);
+    var msg_resp = (try server.handleEnvelope(msg)).?;
+    defer msg_resp.deinit(allocator);
+    try std.testing.expect(msg_resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.agent_not_found, msg_resp.payload.agent_error.code);
+
+    // ...and a fresh agent_start on the id registers a new container.
+    var restart = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = sid,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer restart.deinit(allocator);
+    var restart_resp = (try server.handleEnvelope(restart)).?;
+    defer restart_resp.deinit(allocator);
+    try std.testing.expect(restart_resp.payload == .agent_started);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
+}
+
+test "AgentProtocolServer never evicts sessions with in-flight runs or recent activity" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = try startTestSession(&server, allocator);
+    var evicted = std.ArrayList(agent_types.SessionId).empty;
+    defer evicted.deinit(allocator);
+
+    // A session with an in-flight run (admitted message, status
+    // `.processing`) is never idle: even a sweep far past the TTL leaves it
+    // alone, so a long-running turn cannot be evicted mid-run.
+    var msg = try makeTestAgentMessage(sid, 2, allocator);
+    defer msg.deinit(allocator);
+    try std.testing.expect((try server.handleEnvelope(msg)) == null);
+    try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions((try compat.time.monotonicMillis()) + 100 * 365 * 24 * 60 * 60 * 1_000, &evicted));
+    try std.testing.expect(server.hasSession(sid));
+
+    // Settlement returns the session to `.ready` and resets the idle clock:
+    // at exactly one TTL after the settlement it still survives.
+    try server.publishAgentResult(sid, "{\"messages\":[]}");
+    const settled_at = server.sessions.get(sid).?.last_activity_ms;
+    const default_ttl: i64 = @intCast(default_session_idle_ttl_ms);
+    try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions(settled_at + default_ttl, &evicted));
+    try std.testing.expect(server.hasSession(sid));
+
+    // The multi-message conversation continues on the same session.
+    var msg2 = try makeTestAgentMessage(sid, 3, allocator);
+    defer msg2.deinit(allocator);
+    try std.testing.expect((try server.handleEnvelope(msg2)) == null);
+    try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
+
+    // A status poll is inbound activity and refreshes the idleness clock.
+    const before_poll = try compat.time.monotonicMillis();
+    var status = makeTestAgentStatus(sid, 4);
+    defer status.deinit(allocator);
+    var status_resp = (try server.handleEnvelope(status)).?;
+    defer status_resp.deinit(allocator);
+    try std.testing.expect(status_resp.payload == .session_info);
+    try std.testing.expect(server.sessions.get(sid).?.last_activity_ms >= before_poll);
+}
+
+test "AgentProtocolServer session TTL is configurable and can be disabled" {
+    const allocator = std.testing.allocator;
+
+    {
+        var server = AgentProtocolServer.initWithOptions(allocator, .{ .session_idle_ttl_ms = 100 });
+        defer server.deinit();
+
+        const sid = try startTestSession(&server, allocator);
+        const idle_since = server.sessions.get(sid).?.last_activity_ms;
+        var evicted = std.ArrayList(agent_types.SessionId).empty;
+        defer evicted.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions(idle_since + 100, &evicted));
+        try std.testing.expect(server.hasSession(sid));
+        try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(idle_since + 101, &evicted));
+        try std.testing.expect(!server.hasSession(sid));
+    }
+
+    {
+        var server = AgentProtocolServer.initWithOptions(allocator, .{ .session_idle_ttl_ms = 0 });
+        defer server.deinit();
+
+        const sid = try startTestSession(&server, allocator);
+        const idle_since = server.sessions.get(sid).?.last_activity_ms;
+        var evicted = std.ArrayList(agent_types.SessionId).empty;
+        defer evicted.deinit(allocator);
+
+        // TTL 0 disables eviction: even a year of idleness keeps the session.
+        const one_year_ms: i64 = 365 * 24 * 60 * 60 * 1_000;
+        try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions(idle_since + one_year_ms, &evicted));
+        try std.testing.expect(server.hasSession(sid));
+    }
+}
+
+test "AgentProtocolServer eviction removes sequence and pending-message bookkeeping" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.initWithOptions(allocator, .{ .session_idle_ttl_ms = 100 });
+    defer server.deinit();
+
+    const sid = try startTestSession(&server, allocator);
+
+    // An accepted-but-unconsumed pending message plus the session's sequence
+    // entries are exactly the bookkeeping eviction must take with it.
+    var msg = try makeTestAgentMessage(sid, 2, allocator);
+    defer msg.deinit(allocator);
+    try std.testing.expect((try server.handleEnvelope(msg)) == null);
+    try server.publishAgentResult(sid, "{\"messages\":[]}");
+    try std.testing.expectEqual(@as(usize, 1), server.pending_messages.items.len);
+
+    const idle_since = server.sessions.get(sid).?.last_activity_ms;
+    var evicted = std.ArrayList(agent_types.SessionId).empty;
+    defer evicted.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(idle_since + 101, &evicted));
+
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+    try std.testing.expect(!server.expected_sequences.contains(sid));
+    try std.testing.expect(!server.outgoing_sequences.contains(sid));
+    try std.testing.expectEqual(@as(usize, 0), server.pending_messages.items.len);
+}
+
+test "AgentProtocolServer stop after eviction returns agent_not_found" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = try startTestSession(&server, allocator);
+    const idle_since = server.sessions.get(sid).?.last_activity_ms;
+    const default_ttl: i64 = @intCast(default_session_idle_ttl_ms);
+    var evicted = std.ArrayList(agent_types.SessionId).empty;
+    defer evicted.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(idle_since + default_ttl + 1, &evicted));
+
+    var stop = makeTestAgentStop(sid, 2);
+    defer stop.deinit(allocator);
+    var stop_resp = (try server.handleEnvelope(stop)).?;
+    defer stop_resp.deinit(allocator);
+    try std.testing.expect(stop_resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.agent_not_found, stop_resp.payload.agent_error.code);
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+}
+
+test "AgentProtocolServer idleness ignores wall-clock adjustments" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.initWithOptions(allocator, .{ .session_idle_ttl_ms = 100 });
+    defer server.deinit();
+
+    const sid = try startTestSession(&server, allocator);
+    var evicted = std.ArrayList(agent_types.SessionId).empty;
+    defer evicted.deinit(allocator);
+
+    // Wall-clock jumps (NTP steps, snapshot restores) distort `updated_at`
+    // but must not affect eviction: idleness rides the monotonic clock only.
+    const session = server.sessions.getPtr(sid).?;
+    const anchor = session.last_activity_ms;
+
+    session.updated_at -= 100 * 365 * 24 * 60 * 60 * 1_000; // far in the past
+    try std.testing.expectEqual(@as(usize, 0), try server.evictIdleSessions(anchor + 100, &evicted));
+    try std.testing.expect(server.hasSession(sid));
+
+    session.updated_at += 200 * 365 * 24 * 60 * 60 * 1_000; // far in the future
+    try std.testing.expectEqual(@as(usize, 1), try server.evictIdleSessions(anchor + 101, &evicted));
+    try std.testing.expect(!server.hasSession(sid));
 }
