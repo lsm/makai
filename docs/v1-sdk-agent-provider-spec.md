@@ -1048,8 +1048,9 @@ granted, server eviction), and holds no transcript and no persistence.
    reading still receives them (lost only when the read side is gone), and only
    until the run needs client input: a provider turn that returns
    `stop_reason = tool_use` after EOF moves the run into the tool-waiting case
-   when the call reaches the distributed executor (unknown tools or invalid
-   arguments synthesize local error results and the loop continues);
+   when the call reaches the distributed executor (unknown tools, invalid
+   arguments, and approval-required calls synthesize local results and the loop
+   continues);
    a run WAITING on a distributed
    `tool_result` cannot complete — the tool host is the disconnected client, the
    tool wait polls with no EOF-triggered cancel, and the host loop never sees the
@@ -1183,10 +1184,12 @@ granted, server eviction), and holds no transcript and no persistence.
    read side is gone or the process dies. This holds only while the run needs no
    further client input: if the in-flight provider turn returns
    `stop_reason = tool_use` after EOF AND the call reaches the distributed
-   executor (a configured tool with schema-valid arguments), the run transitions
-   into the tool-waiting case below and produces no terminal; an unknown tool or
-   schema-invalid arguments synthesizes a local error tool-result instead, the
-   loop continues, and the run can still settle on stdout. A run waiting on a distributed `tool_result` produces
+   executor (a configured tool with schema-valid arguments whose approval path
+   permits execution), the run transitions into the tool-waiting case below and
+   produces no terminal; an unknown tool, schema-invalid arguments, or an
+   approval-required call (the stdio host locally rejects those without a
+   reachable approver) synthesizes a local error tool-result instead, the loop
+   continues, and the run can still settle on stdout. A run waiting on a distributed `tool_result` produces
    NO terminal at all — the server process hangs (#204 gap 4) and only the
    client's response timeout surfaces an error. In every case an unsettled run is
    never a success; recovery is retry with full context (§12).
