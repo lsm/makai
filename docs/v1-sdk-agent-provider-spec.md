@@ -981,7 +981,13 @@ Rules:
   `session_id` is ignored — the server generates the container id and returns it in
   `agent_started` (both its envelope `session_id` and payload). Consumers MUST adopt
   the id from `agent_started` and MUST NOT assume their request envelope id became
-  the session key. Enforcement of the agreement rule is
+  the session key. Because `agent_started` then travels under the GENERATED id, a
+  consumer waiting on an exact session-id route (`nextFrameForSession`-style)
+  cannot receive it: such consumers MUST NOT omit the payload id (send envelope and
+  payload ids equal) — id-omitting starts are usable only with an untargeted
+  waiter or once `in_reply_to`-aware routing lands (#201); otherwise the reply is
+  unreachable and the generated session leaks registered. Enforcement of the
+  agreement rule is
   `[planned — #204]`: today the server keys all session handlers on the payload id
   and does not compare the envelope id, so agreement is a client convention, not a
   server-checked invariant; #204 adds the `invalid_request` rejection for mismatches.
@@ -1129,9 +1135,13 @@ granted, server eviction), and holds no transcript and no persistence.
    `agent_error` and enqueues nothing; a rejected submission MUST be treated as
    non-admission — an adapter that records it as accepted would wait for a
    settlement that can never arrive. Acceptance has no positive receipt: it is
-   observable only through subsequent run output, or — probabilistically — the
-   continued absence of a correlated rejection (the receipt-less admission is a
-   ledger deviation). Silence is NOT proof of acceptance: an allocation failure
+   observable only through subsequent run output — and that output proves
+   acceptance only for a caller with an EXCLUSIVE, quiescent session route; on a
+   shared or recently reused id, run output is session-scoped and uncorrelated
+   (§13.3.2), so a caller whose `agent_message` was rejected can lose its
+   validation error and consume another run's output instead — or —
+   probabilistically — the continued absence of a correlated rejection (the
+   receipt-less admission is a ledger deviation). Silence is NOT proof of acceptance: an allocation failure
    inside the server's message-acceptance path (duplicating the message, updating
    the expected sequence, or enqueueing) propagates without a correlated
    rejection, so the client sees an unscoped runtime error or nothing at all;
@@ -1190,7 +1200,9 @@ granted, server eviction), and holds no transcript and no persistence.
        error detail); §3.5's one-terminal-`error`/no-`agent_end` rule applies to the
        loop-internal shape above, not to this one.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
-   exactly once, via result XOR error, never both. Children settle first: pending
+   exactly once, via result XOR error, never both — absent publication failure:
+   under memory pressure a run can emit no settlement or re-emit its terminal
+   projection (§13.4.2's OOM exceptions; #204 gap 5). Children settle first: pending
    tool work resolves and the trailing `agent_end` is published only after
    `agent_result`. Duplicate or late frames after settlement (e.g. a stale
    `agent_end` read by a follow-up run on the same id) MUST NOT produce a second
