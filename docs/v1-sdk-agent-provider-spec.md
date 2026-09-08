@@ -710,7 +710,7 @@ Normative rule: provider protocol remains canonical source; agent protocol passt
 
 The server removes an agent session only on `agent_stop`; as of this revision there is no TTL and no terminal-state eviction (V1.1 §13.2 grants servers eviction rights; the idle-TTL requirement is tracked in #202). Session teardown is therefore client-owned:
 
-- A client that uses one session per run (start → message → result) MUST send `agent_stop` when a run it owns reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered for the process lifetime and its id is permanently rejected on reuse (`agent_busy`). The mandate is bounded by ownership: a client MUST NOT stop a session its own `agent_start` did not establish — in particular, a start rejected with `agent_busy` means the id belongs to another live run, and a stop carrying the live session's expected sequence would remove and cancel that unrelated run. If the start's outcome is unknowable (reply lost, timeout), stopping is NOT unconditionally safe: the id may have been registered by another caller whose start won the race (ours rejected `agent_busy` with the reply lost), and that owner's fresh pre-message session also expects inbound sequence 2 — a sequence-2 stop is then ACCEPTED and destroys the owner's session. A client MAY stop on an unknown start outcome only with positive evidence the start was its own (its `agent_started` or any of its run output observed later, or a client-generated id no other caller could have supplied); otherwise it SHOULD NOT stop — the residual leaked session is bounded by server eviction (§13.2.6), strictly preferable to destroying another caller's live session. Ownership-safe teardown of unknown-outcome starts requires request-scoped ownership (a generation token on `agent_started`), tracked with the §13.4.5 reuse race in #204.
+- A client that uses one session per run (start → message → result) MUST send `agent_stop` when a run it owns reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered for the process lifetime and its id is permanently rejected on reuse (`agent_busy`). The mandate is bounded by ownership: a client MUST NOT stop a session its own `agent_start` did not establish — in particular, a start rejected with `agent_busy` means the id belongs to another live run, and a stop carrying the live session's expected sequence would remove and cancel that unrelated run. If the start's outcome is unknowable (reply lost, timeout), stopping is NOT unconditionally safe: the id may have been registered by another caller whose start won the race (ours rejected `agent_busy` with the reply lost), and that owner's fresh pre-message session also expects inbound sequence 2 — a sequence-2 stop is then ACCEPTED and destroys the owner's session. A client MAY stop on an unknown start outcome only with positive evidence the start was its own — a request-correlated `agent_started` (`in_reply_to` naming its own start) or a client-generated id no other caller could have supplied; session-scoped run output does NOT qualify (it carries no `in_reply_to`, §13.3.2, and on a colliding id may belong to the caller that won). Otherwise it SHOULD NOT stop: today the un-stopped session stays registered for the process lifetime — no eviction exists until #202 lands (§13.2.6), so repeated timeouts accumulate leaked sessions — still strictly preferable to destroying another caller's live session; the leak becomes bounded only once eviction ships. Ownership-safe teardown of unknown-outcome starts requires request-scoped ownership (a generation token on `agent_started`), tracked with the §13.4.5 reuse race in #204.
 - The stop MUST carry the session's next expected inbound sequence (start=1, message=2, then one per follow-up message); out-of-order stops are rejected and leave the session registered. Tool-result replies do not consume inbound sequence numbers.
 - `reason` is a free-form string; the TS SDK sends `"completed"` for terminal and error teardown and `"client aborted"` for signal aborts.
 - After a successful stop, clients SHOULD drain remaining per-session frames: the server queues a terminal `agent_end` event after the `agent_result` frame, and a later run reusing the session id would otherwise consume that stale frame as its first frame.
@@ -1029,7 +1029,11 @@ granted, server eviction), and holds no transcript and no persistence.
      idle-but-alive with a full TTL ahead of it, by design (rule 3) — settlement
      never evicts; it only starts the idle interval.
    - Resource caps: a server MAY additionally bound registered sessions and evict
-     least-recently-active entries.
+     least-recently-active entries — with the same in-flight protection as the TTL
+     (evicting a session with a live run cancels it, and an evicted id re-registered
+     while its cancelled run drains reproduces the §13.4.5 reuse race, so the
+     eviction path MUST ship with #204's generation protection or defer evicting
+     sessions with in-flight runs).
    - An evicted session's next session-scoped request other than `agent_start`
      (`agent_message`, `agent_stop`, `agent_status`) receives the existing
      `agent_not_found` error ("session not found") — identical to an unknown or
@@ -1174,8 +1178,11 @@ granted, server eviction), and holds no transcript and no persistence.
    SHOULD drain quiescent first (§6.1) and accept the residual race, or use a fresh
    id.
 6. Transport death `[current]`: process exit before settlement is failure, never
-   success — the client transport rejects all pending frame waits on exit, and no
-   result is fabricated for an unsettled run. Stdin EOF splits by run state
+   success — the client transport rejects the frame wait currently registered with
+   it on exit (reads queued behind the transport's read lock install their waiter
+   only after acquiring the lock, so they surface the death as their response
+   timeout rather than a prompt rejection), and no result is fabricated for an
+   unsettled run. Stdin EOF splits by run state
    (§13.2.7): a provider-executing run is pumped toward settlement and its frames
    are still drained to stdout — stdin and stdout are independent pipes, so a
    client that closed only its write side but keeps reading CAN receive its
@@ -1192,7 +1199,12 @@ granted, server eviction), and holds no transcript and no persistence.
    continues, and the run can still settle on stdout. A run waiting on a distributed `tool_result` produces
    NO terminal at all — the server process hangs (#204 gap 4) and only the
    client's response timeout surfaces an error. In every case an unsettled run is
-   never a success; recovery is retry with full context (§12).
+   never a success. Recovery is not unconditional: makai has no run identity,
+   reconciliation, or replay (§13.5), so a client cannot prove an unsettled
+   attempt did not execute — if the run used tools or other non-idempotent side
+   effects, retrying with full context (§12) may execute them again. Retry is the
+   general recovery for idempotent workloads only; otherwise the application must
+   treat the outcome as unknown (at-least-once semantics).
 
 ### 13.5 Load, Resume, and Replay Trichotomy (Normative)
 
