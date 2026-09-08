@@ -1156,7 +1156,16 @@ granted, server eviction), and holds no transcript and no persistence.
    the expected sequence, or enqueueing) propagates without a correlated
    rejection, so the client sees an unscoped runtime error or nothing at all;
    clients MUST bound their wait with a response timeout regardless and treat it
-   as an unknown outcome (§13.4.6). A start rejected before admission
+   as an unknown outcome (§13.4.6). Cleanup sequencing for that unknown outcome
+   is defined by the server's rollback invariant: an acceptance-path failure
+   leaves the expected counter at its PRE-SEND value (field-duplication failures
+   occur before the counter update; an enqueue failure runs the rollback), so a
+   cleanup stop after an uncorroborated admission MUST retry at the pre-send
+   sequence — a stop at the client's advanced sequence is rejected
+   `invalid_request` and the owned session leaks indefinitely. Both current
+   clients advance before the outcome is known; the fix (rollback or
+   explicit-sequence control covering the unknown-outcome case) is
+   `[planned — #204 gap 7]`. A start rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
 2. Settlement `[current]`: exactly one settlement frame settles an admitted run
@@ -1198,7 +1207,12 @@ granted, server eviction), and holds no transcript and no persistence.
        second publication succeeds, SDK consumers report SUCCESS despite no
        authoritative `agent_result` having been emitted — a false-success
        projection (the gap-5 fix must suppress or couple the trailing event to the
-       result publication). An OOM BETWEEN the two frames of the
+       result publication). Tool-request publication has the same failure family:
+       the pending tool request is removed from the bridge before its envelope is
+       built, so an allocation failure in between frees the request without
+       emitting `tool_execute` — the agent thread blocks in the tool wait forever
+       and the run settles never (transactional publication required, #204 gap 5).
+       An OOM BETWEEN the two frames of the
        failure pair is the same exception from the other side: the event is
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the
