@@ -323,6 +323,48 @@ test("aborted correlated wait leaves its parked reply for the replacement waiter
   }
 });
 
+test("replies-only wait skips frames already parked on the session queue", async () => {
+  // The pre-lock fast-path dequeue must honor repliesOnly too: an
+  // uncorrelated frame parked on the session route before the duplicate's
+  // wait starts belongs to the established owner, not to the pre-acceptance
+  // duplicate (whose SDK would discard it as a stale tail).
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    // A foreign waiter on another session reads the owner's bare frame and
+    // parks it on the a1 session queue.
+    const foreign = client.nextFrameForSession("a2", 5000);
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-owner-output", payload: { omit_in_reply_to: true } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // The pre-acceptance duplicate's wait starts AFTER the frame was parked.
+    const duplicate = client.nextFrameForSession("a1", 5000, { correlate: "req-duplicate", repliesOnly: true });
+    const skipped = await Promise.race([
+      duplicate.then((frame) => ({ took: true, in_reply_to: frame.in_reply_to })),
+      new Promise<{ took: boolean }>((resolve) => setTimeout(() => resolve({ took: false }), 100)),
+    ]);
+    assert.deepEqual(skipped, { took: false });
+
+    // The duplicate receives only its own reply...
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-duplicate" });
+    assert.equal((await duplicate).in_reply_to, "req-duplicate");
+    // ...and the owner claims the parked frame.
+    const owner = await client.nextFrameForSession("a1", 5000);
+    assert.equal(owner.session_id, "a1");
+    assert.equal(owner.in_reply_to, undefined);
+    // The foreign waiter settles with its own session's frame.
+    client.send({ type: "agent_message", session_id: "a2", message_id: "req-foreign", payload: { omit_in_reply_to: true } });
+    assert.equal((await foreign).session_id, "a2");
+  } finally {
+    await client.close();
+  }
+});
+
 test("nextFrameForStream evicts late orphaned frames from the shared buffer", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,

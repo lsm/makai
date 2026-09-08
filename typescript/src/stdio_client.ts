@@ -273,7 +273,7 @@ export class MakaiStdioClient {
     const correlate = options?.correlate;
     if (correlate !== undefined) this.retainCorrelate(correlate);
     try {
-      const queued = this.dequeueOwnFrame(route, routeId, correlate);
+      const queued = this.dequeueOwnFrame(route, routeId, correlate, options?.repliesOnly);
       if (queued) return queued;
 
       if (correlate === undefined) {
