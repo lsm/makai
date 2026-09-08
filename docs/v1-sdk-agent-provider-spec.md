@@ -1041,7 +1041,10 @@ granted, server eviction), and holds no transcript and no persistence.
    no runs, provider streams, or auth flows remain active, bounding session lifetime
    by the connection. Disconnect does not cancel in-flight work in V1, with two
    distinct outcomes: a run executing against a provider is pumped to completion
-   (its result is written to a dead pipe); a run WAITING on a distributed
+   and its settlement frames are still drained to stdout — stdin and stdout are
+   independent pipes, so a client that closed only its write side but keeps
+   reading still receives them (lost only when the read side is gone); a run
+   WAITING on a distributed
    `tool_result` cannot complete — the tool host is the disconnected client, the
    tool wait polls with no EOF-triggered cancel, and the host loop never sees the
    run go idle — so the process (and every session it owns) stays alive
@@ -1157,11 +1160,15 @@ granted, server eviction), and holds no transcript and no persistence.
 6. Transport death `[current]`: process exit before settlement is failure, never
    success — the client transport rejects all pending frame waits on exit, and no
    result is fabricated for an unsettled run. Stdin EOF splits by run state
-   (§13.2.7): a provider-executing run is pumped to settlement and written to the
-   dead pipe (failure under this rule), while a run waiting on a distributed
-   `tool_result` produces NO terminal at all — the server process hangs (#204 gap
-   4) and only the client's response timeout surfaces an error. In every case an
-   unsettled run is never a success; recovery is retry with full context (§12).
+   (§13.2.7): a provider-executing run is pumped to settlement and its frames are
+   still drained to stdout — stdin and stdout are independent pipes, so a client
+   that closed only its write side but keeps reading CAN receive its settlement
+   (a delivered settlement is not a transport failure, and a client MUST NOT retry
+   a run it already saw settle); the frames are lost only when the read side is
+   gone or the process dies. A run waiting on a distributed `tool_result` produces
+   NO terminal at all — the server process hangs (#204 gap 4) and only the
+   client's response timeout surfaces an error. In every case an unsettled run is
+   never a success; recovery is retry with full context (§12).
 
 ### 13.5 Load, Resume, and Replay Trichotomy (Normative)
 
