@@ -53,7 +53,7 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | admission (`session.message.submit.response` before stream) | server ACCEPTS `agent_message` by enqueueing it; rejected writes (unknown session / bad sequence / `.processing`) return a request-correlated validation `agent_error` and admit nothing | deviating: no admission receipt | OAP separates "the endpoint accepted the submission" from execution; makai acceptance has no positive frame — observable only through subsequent run output on an EXCLUSIVE, quiescent route (shared/reused-id output is uncorrelated and can belong to another run, §13.3.2) or the PROBABILISTIC absence of a correlated rejection (an allocation failure in the acceptance path escapes without one), so adapters MUST bound waits and treat expiry as an unknown outcome (§13.4.1/§13.4.6). |
 | settlement (exactly one terminal per accepted run) | `agent_result` frame for both `run()` and `stream()` (the SDK projects it into the terminal `agent_end` event); loop-internal failure = the `agent_event`(error) + settlement `agent_error` pair counted as ONE settlement; provider-originated failure (auth/network/URL) = an error-valued `agent_result` (`stop_reason: "error"` + `error_message`) — classified by payload, not frame type | aligned for natural outcomes; deviating: cancelled runs | A run cancelled by `agent_stop` produces NO run settlement frame — the session is removed and the cancelled run's later publications are discarded; the `agent_stopped` reply is the client's only terminal (unless that reply's own publication fails — gap 5: the session is removed before the reply is built, and a failure can also strike the direct synchronous write of an already-built reply outside the outbox, skipping run cancellation and tool-bridge cleanup with it). No OAP `run.cancelled` equivalent exists. §13.4.2/§13.4.4. |
 | single terminal arbiter (children settle first; duplicate terminals suppressed) | run pump settles result XOR error; trailing `agent_end` held until after `agent_result` | aligned, with known deviations | §13.4.3. Residual races/failures: a stopped session's cancelled run can publish into the same id re-created by an immediate start (generation/tombstone pending #204); under memory pressure a run can emit NO settlement (swallowed result-publication OOM) or re-emit its terminal projection repeatedly (mid-pair OOM leaves the run queued) — exactly-once terminal behavior is not provided under publication failure (#204 gap 5). |
-| `run.cancel` (run-scoped; intent ≠ settlement; races defined) | `agent_stop` — session-scoped teardown that also cancels the in-flight run | deviating: cancellation is session-scoped, not run-scoped | No mid-message run-scoped cancel in v1; a cancelled run emits no run settlement frame (see settlement row). Per OAP Decision 0001's consequence, session-scoped cancellation forces one foreground run per session — makai enforces exactly that (`agent_busy` on duplicate start and on message-to-processing-session). Eviction (#202) and stop share cancel semantics. |
+| `run.cancel` (run-scoped; intent ≠ settlement; races defined) | `agent_stop` — session-scoped teardown that also cancels the in-flight run | deviating: cancellation is session-scoped, not run-scoped | No mid-message run-scoped cancel in v1; a cancelled run emits no run settlement frame (see settlement row). Per OAP Decision 0001's consequence, session-scoped cancellation forces one foreground run per session — makai enforces exactly that (`agent_busy` on duplicate start and on message-to-processing-session). Idle-TTL eviction (§13.2.6, #202) never selects sessions with in-flight runs, and where a removal does land under a live run the host cancels it exactly as stop does. |
 | run statuses (`queued`/`running`/`waiting_for_input`/`cancelling`/terminals) | `AgentStatus` (starting/ready/processing/waiting_for_tool/stopping/stopped/error) | renamed + partial: session-level, not run-level; declared ≠ observable | The stdio runtime only ever assigns `ready` → `processing` → `ready` \| `error` (stop removes the entry outright): `starting`, `waiting_for_tool`, `stopping`, and `stopped` are declared enum values no host currently emits — adapters MUST NOT wait on them. No cancelled/failed terminal distinction at the status level; failure is carried by settlement frames (§3.5), not session status. |
 | state reconciliation (`session.state`) | `agent_status` → `session_info` | deviating: counters only | Returns status, model, message_count, timestamps — no transcript cursor, no authoritative transcript. Not a recovery source of truth. |
 | transcript load | none | absent by design | §13.5; client supplies full history in `messages` every call. |
@@ -72,13 +72,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
 1. #201 — `in_reply_to`-aware frame routing in the transport (implements §13.3.1;
    today the SDK correlates only pre-acceptance and the general case can misdeliver
    same-session replies).
-2. #202 — server-side eviction: idle TTL with default + config knob, optional bounded
-   map, `agent_not_found` semantics for evicted ids (implements §13.2.6). Ordering
-   dependency: an admission racing a cap eviction MUST be closed server-side —
-   #204's generation/tombstone tokens, or deferral of removal/re-registration until
-   the cancelled run's publications cease — the client cannot observe the eviction
-   to drain, so #202 MUST NOT ship without one of those protections.
-3. #204 — server enforcement gaps the spec marks `[planned]`: envelope/payload
+2. #204 — server enforcement gaps the spec marks `[planned]`: envelope/payload
    session-id agreement rejection, consistent outbound sequencing for echo replies
    (`session_info`/`pong`/`tool_list_response`), session generation/tombstone so a
    stopped OR evicted session's cancelled run cannot settle a re-created id, EOF /
@@ -105,7 +99,7 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    then post-send on a correlated `invalid_request`): rollback alone is wrong when
    the message was actually accepted and output was merely delayed or lost.
    Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
-4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
+3. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
    outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused client-generated id
    is the only sufficient evidence until #204 supplies generation tokens (a buffered
    correlated `agent_started` can outlive removal and re-registration of the id and
@@ -115,8 +109,19 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    (§13.5.3: a tool executed while its lifecycle events were dropped by a
    publication failure is invisible to the yielded-event gate, so a retry can
    duplicate its side effects).
-5. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
+4. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
    (wire change; semantics already fixed by §13.1/§13.5 — the rename rests on them).
+
+Landed: #202 — server-side idle-TTL eviction (§13.2.6 rule 6) shipped with the
+30-minute default, `AgentProtocolServer.Options.session_idle_ttl_ms` +
+`MAKAI_AGENT_SESSION_IDLE_TTL_MS` knobs (`0` disables), and `agent_not_found`
+semantics for evicted ids. The admission-vs-eviction race is closed server-side
+by construction: admission sets `.processing` synchronously, admission and the
+sweep run serialized on the host's single pump thread, and the stdio run pump
+already cancels runs whose session disappeared with post-removal publications
+swallowed as `SessionNotFound` no-ops. The optional bounded-map cap (§13.2.6
+resource-caps bullet, MAY) remains unimplemented — process-per-connection
+hosting bounds session count without it.
 
 Adapter mismatches discovered by OAP adapter #3 beyond these resolve per the feedback
 rule above.

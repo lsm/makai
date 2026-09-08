@@ -41,6 +41,10 @@ const READY_FRAME = "{\"type\":\"ready\",\"protocol_version\":\"1\"}\n";
 const STDIO_PROTOCOL_VERSION = "1";
 const STDIO_IDLE_SLEEP_NS = std.time.ns_per_ms;
 const STDIO_THREAD_JOIN_TIMEOUT_MS: u64 = 5_000;
+/// The background pump runs every loop iteration (~1ms while idle); the
+/// idle-session sweep inside it is throttled to this interval so the O(n)
+/// scan over registered sessions does not spin with the pump.
+const SESSION_SWEEP_INTERVAL_MS: i64 = 1_000;
 
 const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
@@ -372,6 +376,8 @@ const StdioProtocolLoop = struct {
     tool_bridge: StdioToolBridge,
     auth_server: AuthProtocolServer,
     auth_pipe: in_process.SerializedPipe,
+    /// Wall clock of the last idle-session sweep (ms); 0 = never swept.
+    last_session_sweep_ms: i64 = 0,
 
     const Self = @This();
     const DispatchTarget = enum { provider, agent, auth };
@@ -381,6 +387,7 @@ const StdioProtocolLoop = struct {
         registry: *api_registry.ApiRegistry,
         owns_registry: bool,
         auth_options: AuthProtocolServer.Options,
+        agent_options: AgentProtocolServer.Options,
     ) Self {
         const self = Self{
             .allocator = allocator,
@@ -388,7 +395,7 @@ const StdioProtocolLoop = struct {
             .owns_registry = owns_registry,
             .provider_server = ProviderProtocolServer.init(allocator, registry, .{}),
             .provider_pipe = in_process.createSerializedPipe(allocator),
-            .agent_server = AgentProtocolServer.init(allocator),
+            .agent_server = AgentProtocolServer.initWithOptions(allocator, agent_options),
             .agent_pipe = in_process.createSerializedPipe(allocator),
             .provider_bridge = agent_bridge.InProcessProviderProtocolBridge.init(registry),
             .active_agent_runs = std.ArrayList(ActiveAgentRun).empty,
@@ -408,14 +415,14 @@ const StdioProtocolLoop = struct {
         errdefer registry.deinit();
 
         try register_builtins.registerBuiltInApiProviders(registry);
-        return initWithRegistry(allocator, registry, true, .{});
+        return initWithRegistry(allocator, registry, true, .{}, agentServerOptionsFromEnv(allocator));
     }
 
     fn initForTesting(allocator: std.mem.Allocator, registry: *api_registry.ApiRegistry) Self {
         return initWithRegistry(allocator, registry, false, .{
             .persist_credentials = false,
             .enable_real_oauth = false,
-        });
+        }, .{});
     }
 
     pub fn deinit(self: *Self) void {
@@ -518,6 +525,7 @@ const StdioProtocolLoop = struct {
         forwarded += try self.pumpAgentRuns();
         forwarded += try self.publishPendingToolRequests();
         forwarded += try agent_runtime.pumpServerOutbox();
+        self.sweepIdleAgentSessions();
 
         var auth_runtime = AuthProtocolRuntime{
             .server = &self.auth_server,
@@ -526,6 +534,23 @@ const StdioProtocolLoop = struct {
         };
         forwarded += try auth_runtime.pumpServerOutbox();
         return forwarded;
+    }
+
+    /// Evicts agent sessions idle longer than the server's configured TTL
+    /// (spec §13.2.6 rule 6, #202). Runs after the run pumps so a session
+    /// settled in this tick already carries its fresh activity timestamp, and
+    /// is throttled to `SESSION_SWEEP_INTERVAL_MS` because the background
+    /// pump runs every loop iteration. An evicted session cannot have a live
+    /// run (in-flight runs are never idle), so the tool-bridge discard is
+    /// defensive parity with the `agent_stop` teardown path.
+    fn sweepIdleAgentSessions(self: *Self) void {
+        const now_ms = compat.time.nowMillis();
+        if (now_ms - self.last_session_sweep_ms < SESSION_SWEEP_INTERVAL_MS) return;
+        self.last_session_sweep_ms = now_ms;
+
+        while (self.agent_server.evictNextIdleSession(now_ms)) |session_id| {
+            self.tool_bridge.discardSession(self.allocator, session_id);
+        }
     }
 
     pub fn drainOutbound(self: *Self, lines: *std.ArrayList([]const u8)) !usize {
@@ -912,6 +937,23 @@ fn envFlag(allocator: std.mem.Allocator, key: []const u8) !bool {
     const value = try envOrEmpty(allocator, key) orelse return false;
     defer allocator.free(value);
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
+/// Parses the `MAKAI_AGENT_SESSION_IDLE_TTL_MS` value (milliseconds; `0`
+/// disables eviction). Absent, empty, or unparsable values yield null so the
+/// agent server falls back to its library default TTL.
+fn sessionIdleTtlFromEnvValue(raw: ?[]const u8) ?u64 {
+    const value = raw orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseInt(u64, trimmed, 10) catch null;
+}
+
+fn agentServerOptionsFromEnv(allocator: std.mem.Allocator) AgentProtocolServer.Options {
+    const raw = compat.getEnvVarOwned(allocator, "MAKAI_AGENT_SESSION_IDLE_TTL_MS") catch return .{};
+    defer allocator.free(raw);
+    const ttl_ms = sessionIdleTtlFromEnvValue(raw) orelse return .{};
+    return .{ .session_idle_ttl_ms = ttl_ms };
 }
 
 fn modelFromCanonicalRef(allocator: std.mem.Allocator, ref: []const u8) !ai_types.Model {
@@ -2843,6 +2885,21 @@ fn pumpAndDrainStdioLoop(
 ) !void {
     _ = try stdio_loop.pumpBackground();
     _ = try stdio_loop.drainOutbound(outbound);
+}
+
+test "MAKAI_AGENT_SESSION_IDLE_TTL_MS value parsing" {
+    // Absent / empty / garbage -> null (library default TTL applies).
+    try std.testing.expect(sessionIdleTtlFromEnvValue(null) == null);
+    try std.testing.expect(sessionIdleTtlFromEnvValue("") == null);
+    try std.testing.expect(sessionIdleTtlFromEnvValue("   ") == null);
+    try std.testing.expect(sessionIdleTtlFromEnvValue("soon") == null);
+    try std.testing.expect(sessionIdleTtlFromEnvValue("-1") == null);
+
+    // Well-formed values parse, including surrounding whitespace and the
+    // disable sentinel.
+    try std.testing.expectEqual(@as(?u64, 0), sessionIdleTtlFromEnvValue("0"));
+    try std.testing.expectEqual(@as(?u64, 1234), sessionIdleTtlFromEnvValue("1234"));
+    try std.testing.expectEqual(@as(?u64, 42), sessionIdleTtlFromEnvValue(" 42 \r\n"));
 }
 
 test "stdio protocol loop decodes and dispatches provider and agent envelopes" {
