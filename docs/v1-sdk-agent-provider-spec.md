@@ -922,7 +922,7 @@ even when their string values happen to coincide.
 | Envelope message | 26-char Crockford Base32 ULID (§3.1) | envelope `message_id`; envelope `in_reply_to` | Per-envelope identity; request/reply correlation |
 | Ordering | `u64` | envelope `sequence` | Per-direction, per-session monotonic ordering — never an identity |
 | Provider stream / auth flow | 26-char ULID | `stream_id` / `flow_id` on provider/auth frames of the same connection | Adjacent protocol domains; never valid agent-domain identifiers despite the shared format |
-| Tool call | server-generated string | payload `tool_call_id` on `tool_execute`/`tool_result` and tool-execution events | Correlates one tool execution within a session |
+| Tool call | provider-originated string | payload `tool_call_id` on `tool_execute`/`tool_result` and tool-execution events | Correlates one in-flight tool execution; uniqueness not enforced session-wide (see rules) |
 
 Rules:
 
@@ -940,17 +940,36 @@ Rules:
   output (`agent_event`, `agent_result`, settlement `agent_error`, `tool_execute`)
   carries no `in_reply_to` and is session-scoped (§13.3).
 - `sequence` is scoped per session AND per direction: the client's inbound counter and
-  the server's outbound counter are independent. Inbound: `agent_start` MUST carry
-  sequence 1; each `agent_message` and `agent_stop` consumes exactly one inbound
-  sequence number; `agent_status`, `ping`, `tool_list`, and `models_request` do not.
-  `tool_result` frames are intercepted by the stdio host before the agent protocol and
-  never consume agent inbound sequence numbers. Outbound: the server assigns one
-  monotonic counter per session covering every emitted frame; request-validation
-  `agent_error` envelopes are the exception and carry `sequence: 0` (outside the
-  ordering domain) so that rejecting a malformed request does not desynchronize it.
+  the server's outbound counter are independent.
+  Inbound `[current]`: `agent_start` MUST carry sequence 1. Each ACCEPTED
+  `agent_message` advances the expected counter by one; an accepted `agent_stop`
+  consumes the counter together with the session (the entry is removed). Rejected
+  requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
+  particular, an `agent_message` rejected `agent_busy` against a `.processing` session
+  leaves the counter unchanged, and the client retries with the same expected value.
+  `agent_status`, `ping`, `tool_list`, and `models_request` never consume inbound
+  sequence. `tool_result` frames are intercepted by the stdio host before the agent
+  protocol and never consume agent inbound sequence numbers.
+  Outbound `[current]`: emitted frames come in two classes. Allocated frames
+  (`agent_started`, `agent_stopped`, `ack`, `nack`, `models_response`, `agent_event`,
+  `agent_result`, settlement `agent_error`) draw from one monotonic per-session
+  counter. Echo replies (`session_info`, `pong`, `tool_list_response`) copy the
+  request's inbound sequence verbatim — a correlation echo, not an ordering
+  allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
+  (outside the ordering domain). Consumers MUST NOT order echo replies against
+  allocated frames by sequence. Whether echo replies should instead allocate from the
+  per-session counter (uniform outbound ordering) is the open decision in #204; until
+  it is resolved, the split above is the contract.
 - When a scoped identifier appears in both the envelope and the payload of one frame,
   the values MUST agree (OAP rule). On `agent_start` the envelope `session_id` and the
-  payload key select the same session-container key.
+  payload key select the same session-container key. Enforcement is
+  `[planned — #204]`: today the server keys all session handlers on the payload id
+  and does not compare the envelope id, so agreement is a client convention, not a
+  server-checked invariant; #204 adds the `invalid_request` rejection for mismatches.
+- `tool_call_id` correlation is scoped to concurrently in-flight calls. Ids originate
+  from provider output and the server keeps no session-wide registry: a provider MAY
+  reuse a value in a later turn or a later run of the same multi-message session.
+  Consumers and adapters MUST NOT key tool history by bare `tool_call_id`.
 
 ### 13.2 Session Lifecycle & Ownership (Normative)
 
@@ -967,11 +986,13 @@ granted, server eviction), and holds no transcript and no persistence.
    stdio host is process-per-connection: one agent protocol server per process, and
    sessions die with the process. No v1 host shares or persists sessions across
    connections.
-3. Multi-message by design `[current]`: when a run settles, the server returns the
-   session to `.ready`; subsequent `agent_message` frames on the same id are accepted
-   with the next expected sequence and increment the message counter. One
-   session per run is a client convention (the TS SDK pattern per §6.1), not a server
-   limitation.
+3. Multi-message by design `[current]`: a SUCCESSFUL settlement returns the session to
+   `.ready`; subsequent `agent_message` frames on the same id are accepted
+   with the next expected sequence and increment the message counter. A FAILED
+   settlement marks the session `.error` — it stays registered, and only
+   `.processing` blocks a further message, so a failed session may still be reused or
+   stopped. One session per run is a client convention (the TS SDK pattern per §6.1),
+   not a server limitation.
 4. One active run per session `[current]`: an `agent_message` against a session in
    `.processing` is rejected with `agent_busy` ("session already processing a
    message"). V1 defines no queueing, steering, or side-channel delivery.
@@ -982,15 +1003,20 @@ granted, server eviction), and holds no transcript and no persistence.
 6. Eviction rights `[planned — #202]`: servers are granted the right to evict
    sessions, with these semantics:
    - Idle TTL: a server MUST evict sessions idle longer than a configurable TTL with
-     a defined non-zero default. Idleness is measured from the session's last activity
-     (message, stop, status), never from run settlement — a settled multi-message
-     session is idle-but-alive, by design (rule 3).
+     a defined non-zero default. Idleness is measured from the session's last
+     activity — inbound (message, stop, status) OR server-side run activity (event
+     publication) — and a session with an in-flight run is NEVER idle, so a
+     long-running turn or tool execution cannot be evicted out from under its run.
+     Idleness is never measured from run settlement — a settled multi-message session
+     is idle-but-alive, by design (rule 3).
    - Resource caps: a server MAY additionally bound registered sessions and evict
      least-recently-active entries.
-   - An evicted session's next request receives the existing `agent_not_found` error
-     ("session not found") — identical to an unknown or already-stopped id. Eviction
-     MUST NOT be distinguishable from stop by error code; clients re-create with a
-     fresh `agent_start` (supplying full context, §12).
+   - An evicted session's next session-scoped request other than `agent_start`
+     (`agent_message`, `agent_stop`, `agent_status`) receives the existing
+     `agent_not_found` error ("session not found") — identical to an unknown or
+     already-stopped id; eviction MUST NOT be distinguishable from stop by error
+     code. `agent_start` on an unregistered id (evicted, stopped, or never created)
+     creates a fresh container per §13.5.2 — clients re-supply full context (§12).
    - Evicting a session with an in-flight run MUST cancel that run (same semantics as
      `agent_stop`).
    - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
@@ -1034,22 +1060,44 @@ granted, server eviction), and holds no transcript and no persistence.
    reply frame; acceptance is observable only through subsequent events. A start
    rejected before admission (`agent_busy`, invalid sequence, `nack`) never admits.
    Admission is not settlement.
-2. Settlement `[current]`: exactly one terminal frame settles an admitted run:
-   - non-streaming `run()`: the `agent_result` frame (or provider-shaped
-     `result`/`complete_response` frame);
-   - streaming `stream()`: the trailing `agent_end` event;
-   - failure: the terminal `error` event / settlement `agent_error` frame per §3.5
-     (one terminal per failure; `agent_end` is not emitted on failure).
-   The server publishes `agent_result` BEFORE the trailing terminal `agent_end` event;
-   the two frames belong to one settlement — `run()` consumers terminate on
-   `agent_result`, `stream()` consumers terminate on `agent_end` — and a consumer
-   MUST NOT treat the pair as two settlements.
-3. Single terminal arbiter `[current]`: an admitted run settles exactly once, via
-   result XOR error, never both. Children settle first: pending tool work resolves
-   and the terminal `agent_end` is published only after `agent_result`. Duplicate or
-   late frames after settlement (e.g. a stale `agent_end` read by a follow-up run on
-   the same id) MUST NOT produce a second settlement — clients drain per §6.1.
-4. Transport death `[current]`: EOF or process exit before settlement is failure,
+2. Settlement `[current]`: exactly one settlement frame settles an admitted run:
+   - success: the `agent_result` frame (or provider-shaped `result`/`complete_response`
+     frame). This is the settlement frame for BOTH consumption modes: the SDK's
+     `stream()` projects the `agent_result` frame into its terminal `agent_end` event
+     and terminates there — it does not wait for the server's trailing `agent_end`
+     frame, which is drained per §6.1. The server publishes `agent_result` BEFORE the
+     trailing `agent_end` event frame; the trailing frame is an aggregate restatement
+     of the same settlement for event-stream consumers, not a second settlement.
+   - failure: the failure pair — an `agent_event` carrying the terminal `error` event
+     (§3.5's one-terminal-error rule) followed by the settlement `agent_error`
+     envelope — is ONE settlement. The `agent_error` envelope is the settlement
+     frame; the `agent_event` is its event-stream projection. Consumers terminate on
+     the first-delivered frame of the pair and MUST NOT count the pair as two
+     settlements.
+3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
+   exactly once, via result XOR error, never both. Children settle first: pending
+   tool work resolves and the trailing `agent_end` is published only after
+   `agent_result`. Duplicate or late frames after settlement (e.g. a stale
+   `agent_end` read by a follow-up run on the same id) MUST NOT produce a second
+   settlement — clients drain per §6.1.
+4. Cancellation is session settlement, not run settlement `[current]`: a validated
+   `agent_stop` removes the session mid-run and cancels the run; the cancelled run's
+   subsequent result/error publications are discarded because the session no longer
+   exists. A cancelled run therefore produces NO run settlement frame — the
+   `agent_stopped` reply correlated to the stop request is the client's terminal
+   observation. Makai has no run-scoped cancelled terminal (OAP `run.cancelled` is a
+   ledger deviation); there is nothing for a consumer to wait on after
+   `agent_stopped`.
+5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
+   stays alive until its provider stream drains. If a new `agent_start` re-registers
+   the same id before then, late frames from the old run can publish into the new
+   container, and the new run can be rejected `agent_busy` against the still-active
+   old one. Draining (§6.1) narrows but does not eliminate this; a session
+   generation/tombstone (#204) is required before immediate id reuse can be
+   considered safe. Until then, clients that reuse an explicit id after a stop
+   SHOULD drain quiescent first (§6.1) and accept the residual race, or use a fresh
+   id.
+6. Transport death `[current]`: EOF or process exit before settlement is failure,
    never success. The client transport rejects all pending frame waits on process
    exit; no result is fabricated for an unsettled run. Recovery is retry with full
    context (§12).
