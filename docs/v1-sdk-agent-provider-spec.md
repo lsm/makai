@@ -1043,11 +1043,12 @@ granted, server eviction), and holds no transcript and no persistence.
      creates a fresh container per §13.5.2 — clients re-supply full context (§12).
    - If an eviction lands on a session whose run admission raced the eviction
      decision (the run is in flight at removal), the eviction MUST cancel that run
-     (same semantics as `agent_stop`): the cancelled run's publications are
-     discarded (§13.4.4), and until #204's generation tokens land, an id
-     re-registered while such a run drains reproduces the §13.4.5 reuse race —
-     eviction implementations MUST apply the same drain/defer-on-reuse discipline
-     as stop.
+     (same semantics as `agent_stop`), and this race MUST be closed server-side:
+     by #204's generation/tombstone tokens, or by deferring removal or
+     re-registration of the id until the cancelled run's publications have ceased.
+     The client-side drain discipline from §6.1 does NOT apply here — the client
+     cannot observe the eviction in time — so eviction (#202) MUST NOT ship
+     without one of these server-side protections for this race.
    - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
@@ -1117,10 +1118,16 @@ granted, server eviction), and holds no transcript and no persistence.
    `agent_error` and enqueues nothing; a rejected submission MUST be treated as
    non-admission — an adapter that records it as accepted would wait for a
    settlement that can never arrive. Acceptance has no positive receipt: it is
-   observable only through subsequent run output, or the continued absence of a
-   correlated rejection (the receipt-less admission is a ledger deviation). A
-   start rejected before admission (`agent_busy`, invalid sequence, `nack`) never
-   admits. Admission is not settlement.
+   observable only through subsequent run output, or — probabilistically — the
+   continued absence of a correlated rejection (the receipt-less admission is a
+   ledger deviation). Silence is NOT proof of acceptance: an allocation failure
+   inside the server's message-acceptance path (duplicating the message, updating
+   the expected sequence, or enqueueing) propagates without a correlated
+   rejection, so the client sees an unscoped runtime error or nothing at all;
+   clients MUST bound their wait with a response timeout regardless and treat it
+   as an unknown outcome (§13.4.6). A start rejected before admission
+   (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
+   settlement.
 2. Settlement `[current]`: exactly one settlement frame settles an admitted run
    that reaches its own outcome — a run cancelled by `agent_stop` produces no run
    settlement frame at all (§13.4.4):
