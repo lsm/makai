@@ -544,7 +544,12 @@ const StdioProtocolLoop = struct {
     /// comparison ride the monotonic clock so wall-clock adjustments cannot
     /// distort them. An evicted session cannot have a live run (in-flight
     /// runs are never idle), so the tool-bridge discard is defensive parity
-    /// with the `agent_stop` teardown path.
+    /// with the `agent_stop` teardown path. On an allocation failure
+    /// mid-collection the server still evicts the partial batch before
+    /// erroring, so the bridge cleanup below runs for whatever was collected
+    /// BEFORE the error propagates — skipping it would leak bridge entries
+    /// for already-removed ids, and a re-registered id could then accept a
+    /// stale delayed tool_result against the leftover in-flight key.
     fn sweepIdleAgentSessions(self: *Self) !void {
         const now_mono_ms = try compat.time.monotonicMillis();
         if (now_mono_ms - self.last_session_sweep_mono_ms < SESSION_SWEEP_INTERVAL_MS) return;
@@ -552,10 +557,11 @@ const StdioProtocolLoop = struct {
 
         var evicted = std.ArrayList(AgentProtocolTypes.SessionId).empty;
         defer evicted.deinit(self.allocator);
-        _ = try self.agent_server.evictIdleSessions(now_mono_ms, &evicted);
+        const sweep_result = self.agent_server.evictIdleSessions(now_mono_ms, &evicted);
         for (evicted.items) |session_id| {
             self.tool_bridge.discardSession(self.allocator, session_id);
         }
+        _ = try sweep_result;
     }
 
     pub fn drainOutbound(self: *Self, lines: *std.ArrayList([]const u8)) !usize {
