@@ -1212,7 +1212,12 @@ granted, server eviction), and holds no transcript and no persistence.
        built, so an allocation failure in between frees the request without
        emitting `tool_execute` — the agent thread blocks in the tool wait forever
        and the run settles never (transactional publication required, #204 gap 5).
-       An OOM BETWEEN the two frames of the
+       Outbox delivery shares the failure: an envelope is popped (removed) before
+       it is serialized and written, so an allocation or write failure destroys an
+       already-built frame — an `agent_result` lost this way leaves the completed
+       run removed with no settlement and nothing to retry (transactional
+       serialization/write required, #204 gap 5). An OOM BETWEEN the two frames
+       of the
        failure pair is the same exception from the other side: the event is
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the

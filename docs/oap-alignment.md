@@ -86,11 +86,17 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
    publication failure instead of the swallowed/propagating OOM (settle or
    propagate once, never re-publish a processed terminal; tool-request publication
-   is transactional), and stale-`tool_result` correlation for reused
+   AND outbox delivery are transactional — an envelope popped for delivery is
+   currently dropped if serialization or write fails, and for a result the run is
+   already removed, leaving no settlement and nothing to retry), and
+   stale-`tool_result` correlation for reused
    `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`) —
-   plus gap 7: `AgentProtocolClient` sequence control (rollback on rejected sends
-   or explicit-sequence sends), without which same-sequence retries through the
-   built-in client are unsupported.
+   plus gap 7: client sequence control in BOTH clients — `AgentProtocolClient`
+   (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
+   (its tracker advances before the outcome is known, so an uncorrelated
+   timeout's cleanup stop sends N+1 against a server expecting N and the owned
+   session leaks) — without which same-sequence retries and unknown-outcome
+   cleanup are unsupported.
 4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
    outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused client-generated id
    is the only sufficient evidence until #204 supplies generation tokens (a buffered
