@@ -2625,6 +2625,54 @@ test("client.agent.stream does not stop a caller-supplied session when the start
   }
 });
 
+test("client.agent.run auth-retry attempt with a lost start reply still stops its SDK-generated session (#205)", async () => {
+  // Codex review on PR #208: auto_once retries store their SDK-generated id
+  // in options.session_id, so deriving the id's origin from the option's
+  // presence misclassifies the retry's id as caller-supplied — a retry whose
+  // start reply is lost (suppressed here) would then skip its teardown stop
+  // and leak the admitted session. The origin must be tracked when the retry
+  // request is constructed, not inferred from the request shape.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-retry-lost-"));
+  const logPath = path.join(tmpDir, "request.log");
+  const handle = await createMakaiClient({
+    command: process.execPath,
+    args: [fixtureScript],
+    env: { ...process.env, MAKAI_TEST_REQUEST_LOG: logPath, MAKAI_TEST_AUTH_REQUIRED_ONCE: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1", MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" },
+    handshakeTimeoutMs: 5000,
+    responseTimeoutMs: 300,
+    auth: { auth_retry_policy: "auto_once" },
+  });
+  try {
+    // Attempt 1 is auth-rejected (correlated nack — a resolved outcome, so
+    // its abandoned session is stopped); the auto_once retry gets a fresh
+    // SDK-generated id whose start reply is suppressed, so it times out with
+    // an unknown outcome — and must STILL stop, because no other caller
+    // could hold a client-generated id.
+    await assert.rejects(
+      () => handle.agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    const logged = await waitForLoggedRequests(logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2);
+    const starts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(starts.length, 2);
+    assert.equal(starts[0]?.session_id, "testNanoIdSess1234567");
+    const retryId = starts[1]?.session_id as string;
+    assert.match(retryId, /^[0-9A-Za-z]{21}$/);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    // Attempt 1's abandon stop (its correlated rejection resolved the start).
+    assert.equal(stops[0]?.session_id, "testNanoIdSess1234567");
+    assert.equal(stops[0]?.sequence, 2);
+    // Attempt 2's unknown-outcome teardown: SDK-generated id keeps the stop.
+    assert.equal(stops[1]?.session_id, retryId);
+    assert.equal(stops[1]?.sequence, 2);
+  } finally {
+    await handle.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("client.agent.run drains the failure pair's settlement before the error surfaces, so an immediate same-id run is not poisoned (#205)", async () => {
   // §13.4.2: a loop-internal failure settles via the pair agent_event(error)
   // + settlement agent_error — ONE settlement. The fixture emits BOTH frames
