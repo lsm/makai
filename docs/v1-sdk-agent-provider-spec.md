@@ -1239,7 +1239,12 @@ granted, server eviction), and holds no transcript and no persistence.
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the
        terminal event projection — consumers can observe multiple projections
-       under sustained memory pressure (also #204 gap 5).
+       under sustained memory pressure (also #204 gap 5). Run-START failures
+       differ from active-stream errors: the pending message is consumed before
+       the error pair is published and no active run exists to stay queued, so a
+       mid-pair failure there emits only the lone event projection, leaves the
+       session `.processing`, never settles, and does NOT re-emit (the
+       re-process behavior above applies only to active-stream errors).
      - provider-originated failures (auth, network, invalid URL): the provider turn
        converts the error into a result message with `stop_reason = "error"` and the
        provider's own `error_message` (§3.5), the loop completes normally, and the
@@ -1271,7 +1276,11 @@ granted, server eviction), and holds no transcript and no persistence.
    caller of the bridge's session discard): stale pending/in-flight tool keys
    survive, so a delayed old `tool_result` can be accepted against a later
    same-id call (compounding §13.1's tool-call-id hazard) and the bridge memory
-   persists until process exit (all part of #204 gap 5's stop transaction).
+   persists until process exit. The same failure occurs even when the reply IS
+   built: synchronous replies are serialized and written directly, outside the
+   outbox, and a failure there propagates before the run-cancel path — session
+   removed, no `agent_stopped`, cleanup skipped (the stop transaction in #204
+   gap 5 covers direct reply delivery as well as the outbox).
    Makai has no run-scoped cancelled terminal (OAP
    `run.cancelled` is a ledger deviation); there is nothing for a consumer to wait
    on after `agent_stopped`.
@@ -1345,7 +1354,12 @@ Rules:
    re-emit the failed attempt's lifecycle markers in a fresh session; that is
    client-side reconstruction across sessions, not protocol replay, and MUST NOT
    duplicate provider content or tool side effects (the SDK gates retry on no content
-   yielded and no tools executed).
+   yielded and no tools executed). `[current exception]` the gate is
+   event-delivery-based: a `tool_execute` that was executed while its tool-lifecycle
+   events were dropped by a publication failure (§13.4.2, #204 gap 5) is invisible
+   to the retry gate, so `auto_once` can re-run after a tool already executed.
+   Tracking tool execution independently of event delivery is `[planned — #205]`;
+   until then the no-duplicate guarantee holds absent publication failure.
 
 ### 13.6 OAP Alignment
 
