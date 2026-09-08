@@ -54,6 +54,43 @@ type PendingHandshake = {
 type StreamQueueEntry = {
   frame: StdioFrame;
   expiresAt: number;
+  /** `in_reply_to` of the parked frame, when it carries one. */
+  replyTo?: string;
+};
+
+/**
+ * Options for the targeted frame waits ({@link MakaiStdioClient.nextFrameForStream}
+ * / {@link MakaiStdioClient.nextFrameForSession}).
+ */
+export type FrameWaitOptions = {
+  /**
+   * `message_id` of the outstanding request this wait is correlated with.
+   * While the wait is in flight, a frame whose `in_reply_to` equals
+   * `correlate` is delivered to THIS waiter — even when other waiters share
+   * the same stream/session route — and a frame replying to another
+   * registered request is parked on that request's reply queue instead of
+   * the shared route (spec §13.3.1, issue #201). Frames without
+   * `in_reply_to`, or whose `in_reply_to` matches no registered request,
+   * keep stream/session-routed behavior.
+   */
+  correlate?: string;
+  /**
+   * Deliver ONLY frames replying to `correlate` (requires `correlate`):
+   * everything else read on the shared route — including frames without
+   * `in_reply_to` — is parked for its owner instead of consumed. Use while a
+   * request's reply is outstanding and the caller does not yet own the
+   * session's output (pre-acceptance agent waits): consuming uncorrelated
+   * frames there would eat the established run's async output, and parking
+   * them cannot spin because a replies-only waiter never dequeues what it
+   * parks.
+   */
+  repliesOnly?: boolean;
+};
+
+/** Options for {@link MakaiStdioClient.nextFrameForSession}. */
+export type SessionFrameWaitOptions = FrameWaitOptions & {
+  /** Abandons the wait; an in-flight read re-routes its frame instead of consuming it. */
+  signal?: AbortSignal;
 };
 
 const STREAM_FRAME_QUEUE_TTL_MS = 30_000;
@@ -70,6 +107,9 @@ export class MakaiStdioClient {
   private frameWaiters: PendingFrameWaiter[] = [];
   private streamFrameQueues = new Map<string, StreamQueueEntry[]>();
   private sessionFrameQueues = new Map<string, StreamQueueEntry[]>();
+  private replyFrameQueues = new Map<string, StreamQueueEntry[]>();
+  private activeCorrelates = new Map<string, number>();
+  private correlateDeliveries = new Map<string, { signal: () => void; state: { settled: boolean } }>();
   private streamReadLock: Promise<void> = Promise.resolve();
 
   /**
@@ -180,43 +220,15 @@ export class MakaiStdioClient {
    *
    * @param streamId Stream identifier to route by.
    * @param timeoutMs Maximum wait time in milliseconds.
+   * @param options Correlation options; see {@link FrameWaitOptions}.
    * @returns The next matching frame.
    * @throws If `streamId` is empty or no matching frame arrives before timeout.
    */
-  async nextFrameForStream(streamId: string, timeoutMs = 1000): Promise<StdioFrame> {
+  async nextFrameForStream(streamId: string, timeoutMs = 1000, options?: FrameWaitOptions): Promise<StdioFrame> {
     if (streamId.length === 0) {
       throw new Error("streamId is required");
     }
-
-    const queued = this.dequeueStreamFrame(streamId);
-    if (queued) return queued;
-
-    return this.withStreamReadLock(async () => {
-      const deadline = Date.now() + timeoutMs;
-      while (true) {
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) {
-          throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
-        }
-
-        const queued = this.dequeueStreamFrame(streamId);
-        if (queued) return queued;
-
-        let frame: StdioFrame;
-        try {
-          frame = await this.nextFrame(remainingMs);
-        } catch (error) {
-          if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
-            throw new Error(`timed out waiting for frame for stream ${streamId} after ${timeoutMs}ms`);
-          }
-          throw error;
-        }
-        const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
-        if (frameStreamId === streamId) return frame;
-        this.enqueueRoutableFrame(frame);
-        // Frames without stream_id/session_id cannot be routed to a targeted waiter.
-      }
-    });
+    return this.waitForRoutedFrame("stream", streamId, timeoutMs, options);
   }
 
   /**
@@ -224,53 +236,162 @@ export class MakaiStdioClient {
    *
    * @param sessionId Session identifier to route by.
    * @param timeoutMs Maximum wait time in milliseconds.
+   * @param options Correlation and abort options; see {@link SessionFrameWaitOptions}.
    * @returns The next matching frame.
    * @throws If `sessionId` is empty or no matching frame arrives before timeout.
    */
-  async nextFrameForSession(sessionId: string, timeoutMs = 1000, options?: { signal?: AbortSignal }): Promise<StdioFrame> {
+  async nextFrameForSession(sessionId: string, timeoutMs = 1000, options?: SessionFrameWaitOptions): Promise<StdioFrame> {
     if (sessionId.length === 0) {
       throw new Error("sessionId is required");
     }
+    return this.waitForRoutedFrame("session", sessionId, timeoutMs, options);
+  }
 
-    const queued = this.dequeueSessionFrame(sessionId);
-    if (queued) return queued;
-
-    return this.withStreamReadLock(async () => {
+  /**
+   * Shared implementation of the targeted frame waits. A waiter dequeues from
+   * its own routes — the reply queue keyed by its `correlate` (registered for
+   * the whole duration of this call, including while queued behind the read
+   * lock) first, then its stream/session queue — and, under the read lock,
+   * routes every inbound frame with `in_reply_to`-awareness (spec §13.3.1,
+   * #201): a reply to a REGISTERED outstanding request is delivered only to
+   * that request's waiter, never to a waiter that merely shares the
+   * stream/session route, so overlapping calls on one route cannot consume
+   * each other's replies. Re-routing never targets a queue the re-routing
+   * waiter itself dequeues from, so a shared route cannot spin.
+   *
+   * A correlated wait races its read-lock loop against a poke: the current
+   * lock holder parks a reply to `correlate` in this wait's reply queue and
+   * pokes it, so delivery does not wait for the holder's lock to cycle (the
+   * holder may be blocked for its full timeout on a silent route).
+   */
+  private async waitForRoutedFrame(
+    route: "stream" | "session",
+    routeId: string,
+    timeoutMs: number,
+    options?: FrameWaitOptions & { signal?: AbortSignal },
+  ): Promise<StdioFrame> {
+    const correlate = options?.correlate;
+    if (correlate !== undefined) this.retainCorrelate(correlate);
+    try {
       if (options?.signal?.aborted) {
-        throw new Error(`frame wait for session ${sessionId} aborted`);
+        // An already-abandoned wait must not consume a parked reply a
+        // replacement waiter may need — reject before dequeuing anything,
+        // mirroring the abort checks in the read loop and the poke path.
+        throw new Error(`frame wait for session ${routeId} aborted`);
       }
-      const deadline = Date.now() + timeoutMs;
-      while (true) {
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) {
-          throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
-        }
+      const queued = this.dequeueOwnFrame(route, routeId, correlate, options?.repliesOnly);
+      if (queued) return queued;
 
-        const queued = this.dequeueSessionFrame(sessionId);
-        if (queued) return queued;
+      if (correlate === undefined) {
+        return await this.withStreamReadLock(() => this.readRoutedLoop(route, routeId, timeoutMs, options));
+      }
 
-        let frame: StdioFrame;
-        try {
-          frame = await this.nextFrame(remainingMs);
-        } catch (error) {
-          if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
-            throw new Error(`timed out waiting for frame for session ${sessionId} after ${timeoutMs}ms`);
-          }
-          throw error;
+      const state = { settled: false };
+      let signalPoke!: () => void;
+      const poke = new Promise<void>((resolve) => {
+        signalPoke = resolve;
+      });
+      this.correlateDeliveries.set(correlate, { signal: signalPoke, state });
+      let winner: StdioFrame | undefined;
+      try {
+        winner = await Promise.race([
+          this.withStreamReadLock(async () => {
+            // The wait settled via a poke while queued behind the read lock:
+            // exit without reading so the next lock holder owns all reads.
+            if (state.settled) throw new Error(`frame wait for ${route} ${routeId} superseded`);
+            return await this.readRoutedLoop(route, routeId, timeoutMs, options);
+          }),
+          poke.then(() => {
+            // The wait was abandoned before its parked reply was claimed:
+            // reject like an aborted read and leave the reply parked for the
+            // replacement waiter instead of fulfilling with it.
+            if (options?.signal?.aborted) {
+              throw new Error(`frame wait for session ${routeId} aborted`);
+            }
+            return this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
+          }),
+        ]);
+      } finally {
+        state.settled = true;
+        if (this.correlateDeliveries.get(correlate)?.state === state) this.correlateDeliveries.delete(correlate);
+      }
+      if (winner !== undefined) return winner;
+      // Spurious poke (the reply is no longer queued): one more lock-gated
+      // pass. Its per-iteration dequeue re-checks the reply queue, and parks
+      // for this correlate now land there without a poke slot.
+      return await this.withStreamReadLock(() => this.readRoutedLoop(route, routeId, timeoutMs, options));
+    } finally {
+      if (correlate !== undefined) this.releaseCorrelate(correlate);
+    }
+  }
+
+  private async readRoutedLoop(
+    route: "stream" | "session",
+    routeId: string,
+    timeoutMs: number,
+    options?: FrameWaitOptions & { signal?: AbortSignal },
+  ): Promise<StdioFrame> {
+    if (options?.signal?.aborted) {
+      throw new Error(`frame wait for session ${routeId} aborted`);
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(`timed out waiting for frame for ${route} ${routeId} after ${timeoutMs}ms`);
+      }
+
+      const queued = this.dequeueOwnFrame(route, routeId, options?.correlate, options?.repliesOnly);
+      if (queued) return queued;
+
+      let frame: StdioFrame;
+      try {
+        frame = await this.nextFrame(remainingMs);
+      } catch (error) {
+        if (deadline - Date.now() <= 0 || isNextFrameTimeout(error, remainingMs)) {
+          throw new Error(`timed out waiting for frame for ${route} ${routeId} after ${timeoutMs}ms`);
         }
-        if (options?.signal?.aborted) {
-          // The wait was abandoned while its read was in flight: put the
-          // frame back so the waiter it actually belongs to can still
-          // receive it, instead of consuming it here.
-          this.enqueueRoutableFrame(frame);
-          throw new Error(`frame wait for session ${sessionId} aborted`);
-        }
-        const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
-        if (frameSessionId === sessionId) return frame;
+        throw error;
+      }
+      if (options?.signal?.aborted) {
+        // The wait was abandoned while its read was in flight: put the
+        // frame back so the waiter it actually belongs to can still
+        // receive it, instead of consuming it here.
         this.enqueueRoutableFrame(frame);
-        // Frames without stream_id/session_id cannot be routed to a targeted waiter.
+        throw new Error(`frame wait for session ${routeId} aborted`);
       }
-    });
+      const frameReplyTo = typeof frame.in_reply_to === "string" ? frame.in_reply_to : undefined;
+      if (options?.correlate !== undefined && frameReplyTo === options.correlate) return frame;
+      if (frameReplyTo !== undefined && this.hasActiveCorrelate(frameReplyTo)) {
+        // Reply to another waiter's outstanding request: park it on that
+        // request's reply queue (and poke the waiter if it is queued behind
+        // this lock) instead of consuming it off the shared route.
+        this.enqueueRoutableFrame(frame);
+        continue;
+      }
+      if (frameReplyTo !== undefined && options?.correlate !== undefined) {
+        // Reply to a request that is not currently registered — its owner
+        // may simply be between waits (the correlate is retained per frame
+        // wait, not per SDK attempt). A correlated waiter must not consume
+        // it off the shared route even then (§13.3.1): park it with its
+        // replyTo recorded so the owner's next dequeue claims it and other
+        // correlated waiters skip it; uncorrelated waiters keep taking it.
+        this.enqueueRoutableFrame(frame);
+        continue;
+      }
+      if (options?.repliesOnly) {
+        // This waiter's request reply is still outstanding: nothing
+        // uncorrelated on the shared route is its to consume — park the
+        // frame (unmarked; its owner or a drain takes it) and keep waiting.
+        // Parking cannot spin: a replies-only waiter only dequeues entries
+        // whose replyTo equals its correlate.
+        this.enqueueRoutableFrame(frame);
+        continue;
+      }
+      if (this.frameMatchesRoute(frame, route, routeId)) return frame;
+      this.enqueueRoutableFrame(frame);
+      // Frames without stream_id/session_id cannot be routed to a targeted waiter.
+    }
   }
 
   /**
@@ -309,6 +430,47 @@ export class MakaiStdioClient {
     return this.dequeueRoutedFrame(this.sessionFrameQueues, sessionId);
   }
 
+  /**
+   * Dequeues for one waiter: its correlate-keyed reply queue first, then its
+   * stream/session queue. On the shared route a correlated waiter claims the
+   * first entry that is not a reply to a DIFFERENT request — entries parked
+   * with a replyTo (e.g. while their owner was between waits) are skipped
+   * until their owner (or an uncorrelated waiter) takes them; an entry whose
+   * replyTo equals this waiter's correlate is its own parked reply and is
+   * claimed. A replies-only waiter additionally skips entries with no
+   * replyTo: while its request's reply is outstanding nothing uncorrelated
+   * on the route is its to consume.
+   */
+  private dequeueOwnFrame(route: "stream" | "session", routeId: string, correlate?: string, repliesOnly = false): StdioFrame | undefined {
+    this.pruneExpiredRoutedFrames();
+    if (correlate !== undefined) {
+      const reply = this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
+      if (reply) return reply;
+    }
+    const queues = route === "stream" ? this.streamFrameQueues : this.sessionFrameQueues;
+    const queued = queues.get(routeId);
+    if (!queued || queued.length === 0) return undefined;
+    let index: number;
+    if (correlate === undefined) {
+      index = 0;
+    } else if (repliesOnly) {
+      index = queued.findIndex((entry) => entry.replyTo === correlate);
+    } else {
+      index = queued.findIndex((entry) => entry.replyTo === undefined || entry.replyTo === correlate);
+    }
+    if (index < 0) return undefined;
+    const [entry] = queued.splice(index, 1);
+    if (queued.length === 0) queues.delete(routeId);
+    return entry.frame;
+  }
+
+  private frameMatchesRoute(frame: StdioFrame, route: "stream" | "session", routeId: string): boolean {
+    if (route === "stream") {
+      return typeof frame.stream_id === "string" && frame.stream_id === routeId;
+    }
+    return typeof frame.session_id === "string" && frame.session_id === routeId;
+  }
+
   private dequeueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string): StdioFrame | undefined {
     this.pruneExpiredRoutedFrames();
     const queued = queues.get(id);
@@ -319,27 +481,63 @@ export class MakaiStdioClient {
   }
 
   private enqueueRoutableFrame(frame: StdioFrame): void {
+    const frameReplyTo = typeof frame.in_reply_to === "string" ? frame.in_reply_to : undefined;
+    if (frameReplyTo !== undefined && this.hasActiveCorrelate(frameReplyTo)) {
+      // §13.3.1: the frame replies to a registered outstanding request —
+      // park it on that request's reply queue, never on a shared route a
+      // foreign waiter could consume it from.
+      this.deliverCorrelatedFrame(frameReplyTo, frame);
+      return;
+    }
     const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
     if (frameStreamId) {
-      this.enqueueRoutedFrame(this.streamFrameQueues, frameStreamId, frame);
+      this.enqueueRoutedFrame(this.streamFrameQueues, frameStreamId, frame, frameReplyTo);
       return;
     }
     const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
     if (frameSessionId) {
-      this.enqueueRoutedFrame(this.sessionFrameQueues, frameSessionId, frame);
+      this.enqueueRoutedFrame(this.sessionFrameQueues, frameSessionId, frame, frameReplyTo);
     }
   }
 
-  private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame): void {
+  /**
+   * Parks a reply on its request's reply queue and pokes the request's
+   * waiter if it is currently queued behind the read lock (a settled or
+   * absent poke slot just leaves the frame parked for the waiter's next
+   * dequeue). Enqueueing before poking lets the poked waiter dequeue the
+   * frame synchronously in its poke continuation.
+   */
+  private deliverCorrelatedFrame(correlate: string, frame: StdioFrame): void {
+    this.enqueueRoutedFrame(this.replyFrameQueues, correlate, frame, correlate);
+    const pending = this.correlateDeliveries.get(correlate);
+    if (pending && !pending.state.settled) pending.signal();
+  }
+
+  private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame, replyTo?: string): void {
     this.pruneExpiredRoutedFrames();
     const queued = queues.get(id) ?? [];
-    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
+    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs, replyTo });
     queues.set(id, queued);
+  }
+
+  private retainCorrelate(correlate: string): void {
+    this.activeCorrelates.set(correlate, (this.activeCorrelates.get(correlate) ?? 0) + 1);
+  }
+
+  private releaseCorrelate(correlate: string): void {
+    const count = (this.activeCorrelates.get(correlate) ?? 0) - 1;
+    if (count > 0) this.activeCorrelates.set(correlate, count);
+    else this.activeCorrelates.delete(correlate);
+  }
+
+  private hasActiveCorrelate(correlate: string): boolean {
+    return (this.activeCorrelates.get(correlate) ?? 0) > 0;
   }
 
   private pruneExpiredRoutedFrames(now = Date.now()): void {
     this.pruneExpiredQueue(this.streamFrameQueues, now);
     this.pruneExpiredQueue(this.sessionFrameQueues, now);
+    this.pruneExpiredQueue(this.replyFrameQueues, now);
   }
 
   private pruneExpiredQueue(queues: Map<string, StreamQueueEntry[]>, now: number): void {

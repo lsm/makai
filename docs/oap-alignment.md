@@ -69,9 +69,12 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 
 These implement the `[planned]` rules of spec §13; each lands as its own PR:
 
-1. #201 — `in_reply_to`-aware frame routing in the transport (implements §13.3.1;
-   today the SDK correlates only pre-acceptance and the general case can misdeliver
-   same-session replies).
+1. #201 — LANDED: `in_reply_to`-aware frame routing in the transport (implements
+   §13.3.1; `correlate` wait option, reply-queue parking for registered requests,
+   SDK correlation of each attempt's `agent_start` `message_id` plus a
+   pre-acceptance `agent_started` correlation check). Overlapping same-session
+   calls now each receive their own replies; the pre-#201 modes (duplicate
+   timing out, established run destroyed, wrong request proceeding) are closed.
 2. #202 — server-side eviction: idle TTL with default + config knob, optional bounded
    map, `agent_not_found` semantics for evicted ids (implements §13.2.6). Ordering
    dependency: an admission racing a cap eviction MUST be closed server-side —

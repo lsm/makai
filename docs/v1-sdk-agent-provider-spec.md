@@ -1103,36 +1103,46 @@ granted, server eviction), and holds no transcript and no persistence.
 
 ### 13.3 Frame Routing (Normative)
 
-1. Request-correlated delivery `[planned — #201; partially current]`: a reply frame
-   carrying `in_reply_to` MUST be delivered to the waiter whose outstanding request's
+1. Request-correlated delivery `[current — #201]`: a reply frame carrying
+   `in_reply_to` MUST be delivered to the waiter whose outstanding request's
    `message_id` equals that `in_reply_to` — not merely to any waiter on the session.
-   Current state: the server sets `in_reply_to` on all synchronous replies, but the
-   TS transport routes frames per session id only; the SDK applies `in_reply_to`
-   correlation itself, only in the pre-acceptance window (before its own
-   `agent_start` is accepted), and only for `nack`/`agent_error` frames — an
-   `agent_started` reply is accepted without correlation. #201 tracks the general
-   rule in the transport.
+   The server sets `in_reply_to` on all synchronous replies; the TS transport
+   implements the rule via the `correlate` wait option on
+   `nextFrameForStream`/`nextFrameForSession`: a wait registered with
+   `correlate: M` receives frames whose `in_reply_to` equals `M` (delivered
+   promptly even while the waiter is queued behind the transport read lock), a
+   frame replying to another request is parked for its owner — on that
+   request's reply queue when registered, or on the shared route with its
+   `in_reply_to` recorded (claimable by the owner's next correlated wait,
+   skipped by foreign correlated waiters, visible to uncorrelated waiters)
+   during the owner's between-waits gap — and frames without `in_reply_to`
+   keep stream/session-routed behavior. A `repliesOnly` correlated wait
+   additionally parks uncorrelated frames instead of consuming them. The SDK
+   registers each attempt's `agent_start` `message_id` for its frame waits —
+   replies-only until the start is accepted (a pre-acceptance duplicate owns
+   nothing uncorrelated on the route), then the `agent_message` `message_id`
+   once sent — and additionally rejects a pre-acceptance `agent_started`
+   whose `in_reply_to` names a different request. Re-routing never targets a
+   queue the re-routing waiter itself dequeues from, so a shared route cannot
+   spin (SDK-layer re-enqueueing remains a non-fix).
 2. Session-scoped delivery `[current]`: asynchronous run output (`agent_event`,
    `agent_result`, settlement `agent_error`, `tool_execute`) carries no `in_reply_to`
    and is delivered on the session's route. Rule §13.2.4 (one active run per session)
    keeps session scope unambiguous for run output.
-3. Concurrent calls on one explicit session id `[current]`: until rule 1 lands, two
+3. Concurrent calls on one explicit session id `[current — #201]`: two
    overlapping calls sharing one consumer-supplied session id share one frame route
    and MUST fail rather than interleave: the server rejects the duplicate start with
    `agent_busy` ("session already exists") and a message against the processing
    session with `agent_busy` ("session already processing a message"). A client that
    receives `agent_busy` MUST treat the attempt as rejected and MUST NOT stop the
-   session (it is not the attempt's to stop — §6.1). The routing defect is worse
-   than a delayed rejection: the established call can consume the duplicate's
-   `agent_busy` `agent_error` AFTER its own start was accepted (the SDK's
-   `in_reply_to` correlation covers only the pre-acceptance window), treat it as
-   its own failure, and tear the legitimate session down — cancelling the live
-   run. And because `agent_started` acceptance is uncorrelated (§13.3.1), the
-   rejected duplicate can instead consume the ESTABLISHED call's `agent_started`,
-   mark its own start accepted, and submit its `agent_message` under the session
-   while the established call never sees its reply — the wrong request can
-   execute. All of these modes (the duplicate timing out; the established run
-   being destroyed; the wrong request proceeding) are what #201 fixes.
+   session (it is not the attempt's to stop — §6.1). With rule 1's correlated
+   delivery, each call receives its own start reply: the duplicate's `agent_busy`
+   rejection reaches it promptly (no response timeout), and the established call
+   neither consumes that rejection after acceptance (which tore the legitimate
+   session down — cancelling the live run) nor loses its `agent_started` to the
+   duplicate (which let the wrong request submit its `agent_message` under the
+   session). The SDK's pre-acceptance `in_reply_to` skips remain as defense for
+   unmatched-reply delivery.
 4. Tool side channel `[current]`: `tool_execute` is delivered on the session route;
    `tool_result` replies carry `in_reply_to` referencing the `tool_execute`
    `message_id` but are intercepted by the stdio host before the agent protocol
