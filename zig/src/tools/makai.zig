@@ -327,6 +327,12 @@ const StdioAgentToolExecutor = struct {
 
 const ActiveAgentRun = struct {
     session_id: AgentProtocolTypes.SessionId,
+    /// The registration generation this run was admitted under (§13.4.5,
+    /// #204). The run may publish only while `sessionGeneration(session_id)`
+    /// still equals this value: null means the id was stopped or evicted, a
+    /// different value means it was re-registered — either way the run is
+    /// stale and its remaining publications are discarded.
+    generation: u64,
     stream: *agent_loop.AgentEventStream,
     context: *agent_loop.AgentContext,
     model: ai_types.Model,
@@ -602,7 +608,21 @@ const StdioProtocolLoop = struct {
     }
 
     fn startAgentRun(self: *Self, pending: agent_protocol_server.PendingAgentMessage) !void {
-        if (self.findActiveAgentRun(pending.session_id) != null) return error.AgentBusy;
+        // §13.2.4's one-active-run-per-session rule is generation-scoped
+        // (§13.4.5, #204): only a run admitted under the id's CURRENT
+        // registration blocks a new start. A cancelled run of a previous
+        // registration can still be listed (it lives until its provider
+        // stream drains); it must not fail the re-created id's run with
+        // `AgentBusy` — the pump's generation check discards the stale run's
+        // publications instead.
+        const generation = self.agent_server.sessionGeneration(pending.session_id) orelse {
+            // Not reachable on the serialized single-threaded host
+            // (`removeSession` drops pending messages with the session);
+            // defensively refuse to start a run against no registration —
+            // there is nothing to execute for and nothing to publish to.
+            return error.SessionNotFound;
+        };
+        if (self.hasActiveRunForGeneration(pending.session_id, generation)) return error.AgentBusy;
 
         var prepared = try prepareAgentRun(self.allocator, pending);
         errdefer prepared.deinit(self.allocator);
@@ -658,6 +678,7 @@ const StdioProtocolLoop = struct {
 
         var run = ActiveAgentRun{
             .session_id = pending.session_id,
+            .generation = generation,
             .stream = stream,
             .context = context,
             .model = prepared.model,
@@ -685,13 +706,28 @@ const StdioProtocolLoop = struct {
         while (idx < self.active_agent_runs.items.len) {
             var run = &self.active_agent_runs.items[idx];
 
-            if (!self.agent_server.hasSession(run.session_id)) {
-                run.cancel();
-            }
+            // §13.4.5 (#204): a run may publish only while its own
+            // registration is still the CURRENT one for the id — the
+            // generation is null when the id was stopped or evicted, and a
+            // different value when it was re-registered. Either way the run
+            // is stale: cancel it (so its provider stream drains promptly)
+            // and discard every remaining publication — no events, no
+            // settlement, no state mutation — so a cancelled run can never
+            // settle an id a new `agent_start` re-created.
+            const registration_current = blk: {
+                const generation = self.agent_server.sessionGeneration(run.session_id);
+                break :blk generation != null and generation.? == run.generation;
+            };
+            if (!registration_current) run.cancel();
 
             while (run.stream.poll()) |event| {
                 var owned_event = event;
                 errdefer deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
+
+                if (!registration_current) {
+                    deinitSerializedStdioAgentEvent(self.allocator, &owned_event);
+                    continue;
+                }
 
                 if (std.meta.activeTag(event) == .agent_end) {
                     run.terminal_event_json = try serializeAgentLoopEvent(self.allocator, run.session_id, event);
@@ -711,29 +747,31 @@ const StdioProtocolLoop = struct {
                 continue;
             }
 
-            if (run.stream.getError()) |msg| {
-                try self.publishAgentLoopError(run.session_id, msg);
-                self.agent_server.markSessionError(run.session_id) catch {};
-                forwarded += 1;
-            } else if (run.stream.getResult()) |result| {
-                // The SDK derives its terminal agent_end from this frame, so an
-                // agent-level termination (iteration cap) must override the
-                // final turn's own stop reason here as well.
-                const result_reason: []const u8 = if (result.termination) |termination|
-                    @tagName(termination)
-                else
-                    @tagName(result.final_message.stop_reason);
-                const result_json = try transport.serializeResultWithStopReason(result.final_message, result_reason, self.allocator);
-                defer self.allocator.free(result_json);
-                self.agent_server.publishAgentResult(run.session_id, result_json) catch {};
-                forwarded += 1;
-            }
+            if (registration_current) {
+                if (run.stream.getError()) |msg| {
+                    try self.publishAgentLoopError(run.session_id, msg);
+                    self.agent_server.markSessionError(run.session_id) catch {};
+                    forwarded += 1;
+                } else if (run.stream.getResult()) |result| {
+                    // The SDK derives its terminal agent_end from this frame, so an
+                    // agent-level termination (iteration cap) must override the
+                    // final turn's own stop reason here as well.
+                    const result_reason: []const u8 = if (result.termination) |termination|
+                        @tagName(termination)
+                    else
+                        @tagName(result.final_message.stop_reason);
+                    const result_json = try transport.serializeResultWithStopReason(result.final_message, result_reason, self.allocator);
+                    defer self.allocator.free(result_json);
+                    self.agent_server.publishAgentResult(run.session_id, result_json) catch {};
+                    forwarded += 1;
+                }
 
-            if (run.terminal_event_json) |event_json| {
-                self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
-                self.allocator.free(event_json);
-                run.terminal_event_json = null;
-                forwarded += 1;
+                if (run.terminal_event_json) |event_json| {
+                    self.agent_server.publishAgentEvent(run.session_id, event_json) catch {};
+                    self.allocator.free(event_json);
+                    run.terminal_event_json = null;
+                    forwarded += 1;
+                }
             }
 
             var removed = self.active_agent_runs.orderedRemove(idx);
@@ -747,6 +785,18 @@ const StdioProtocolLoop = struct {
             if (std.mem.eql(u8, run.session_id[0..], session_id[0..])) return idx;
         }
         return null;
+    }
+
+    /// Whether a run admitted under `generation` is still listed for the
+    /// session — the generation-scoped form of the one-active-run-per-session
+    /// check (§13.2.4 read through §13.4.5, #204). Runs of older
+    /// registrations never match: they are cancelled and their publications
+    /// discarded by the pump, so they do not make the session busy.
+    fn hasActiveRunForGeneration(self: *Self, session_id: AgentProtocolTypes.SessionId, generation: u64) bool {
+        for (self.active_agent_runs.items) |run| {
+            if (run.generation == generation and std.mem.eql(u8, run.session_id[0..], session_id[0..])) return true;
+        }
+        return false;
     }
 
     fn cancelAgentRun(self: *Self, session_id: AgentProtocolTypes.SessionId) void {
@@ -1914,7 +1964,7 @@ fn validatedAgentStopSessionFromLine(line: []const u8, allocator: std.mem.Alloca
     if (!std.mem.eql(u8, getStringField(root, "type") orelse "", "agent_stop")) return null;
 
     const top_session = getStringField(root, "session_id") orelse return null;
-    if (AgentProtocolTypes.parseSessionId(top_session) == null) return null;
+    const envelope_id = AgentProtocolTypes.parseSessionId(top_session) orelse return null;
     const message_id = getStringField(root, "message_id") orelse return null;
     if (AgentProtocolTypes.parseUlid(message_id) == null) return null;
     if (!hasIntegerField(root, "sequence")) return null;
@@ -1924,7 +1974,15 @@ fn validatedAgentStopSessionFromLine(line: []const u8, allocator: std.mem.Alloca
     const payload = root.get("payload") orelse return null;
     if (payload != .object) return null;
     const payload_session = getStringField(payload.object, "session_id") orelse return null;
-    return AgentProtocolTypes.parseSessionId(payload_session);
+    const payload_id = AgentProtocolTypes.parseSessionId(payload_session) orelse return null;
+
+    // §13.1 (#204): a stop whose envelope and payload ids disagree is not a
+    // validated stop — the server rejects it `invalid_request` before any
+    // removal, and this host must likewise not cancel the payload-id
+    // session's run or discard its tool-bridge state on its own.
+    if (!std.mem.eql(u8, &envelope_id, &payload_id)) return null;
+
+    return payload_id;
 }
 
 fn hasValidAgentEnvelopeShape(line: []const u8, allocator: std.mem.Allocator) bool {
@@ -2746,6 +2804,22 @@ fn makeAgentStartEnvelopeJson(
     return agent_protocol_envelope.serializeEnvelope(env, allocator);
 }
 
+fn makeAgentStopEnvelopeJson(
+    allocator: std.mem.Allocator,
+    session_id: AgentProtocolTypes.SessionId,
+    sequence: u64,
+) ![]u8 {
+    var env = AgentProtocolTypes.Envelope{
+        .session_id = session_id,
+        .message_id = AgentProtocolTypes.generateUlid(),
+        .sequence = sequence,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stop = .{ .session_id = session_id } },
+    };
+    defer env.deinit(allocator);
+    return agent_protocol_envelope.serializeEnvelope(env, allocator);
+}
+
 fn makeAgentMessageEnvelopeJson(
     allocator: std.mem.Allocator,
     session_id: AgentProtocolTypes.SessionId,
@@ -3340,6 +3414,10 @@ test "stdio protocol loop ignores malformed agent_stop for cancellation" {
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
+        // No registration exists for this id in this test; generation 0
+        // matches no real registration, which is fine — the run is never
+        // pumped, only torn down at deinit.
+        .generation = 0,
         .stream = stream,
         .context = context,
         .model = try modelFromCanonicalRef(allocator, "fixture/fixture-ok-api@fixture-model"),
@@ -4304,6 +4382,9 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
 
     try stdio_loop.active_agent_runs.append(allocator, .{
         .session_id = session_id,
+        // The failure pair must reach the client, so this hand-built run
+        // binds the generation of the live registration created above.
+        .generation = stdio_loop.agent_server.sessionGeneration(session_id).?,
         .stream = stream,
         .context = context,
         .model = try modelFromCanonicalRef(allocator, "fixture/fixture-ok-api@fixture-model"),
@@ -4330,6 +4411,203 @@ test "stdio protocol loop emits terminal agent_error when active run fails" {
     try std.testing.expect(saw_error_event);
     try std.testing.expect(saw_terminal_error);
     try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+}
+
+// ============================================================================
+// Stopped-id reuse race (spec §13.4.5, #204 gap 3): a cancelled run's late
+// publications must not settle — or mutate — an id a new agent_start
+// re-created.
+// ============================================================================
+
+test "stopped session's late run publications are discarded after id re-registration" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+
+    // First registration, with an in-flight run whose stream yields an event
+    // and then fails — exactly the publications a stale run must never
+    // deliver to the re-created id.
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const first_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    const stream = try allocator.create(agent_loop.AgentEventStream);
+    stream.* = agent_loop.AgentEventStream.init(allocator);
+    try stream.push(.{ .agent_start = {} });
+    stream.completeWithError("late stale failure");
+
+    const context = try allocator.create(agent_loop.AgentContext);
+    context.* = agent_loop.AgentContext.init(allocator);
+
+    const cancel_flag = try allocator.create(std.atomic.Value(bool));
+    cancel_flag.* = std.atomic.Value(bool).init(false);
+    const tool_executor = try allocator.create(StdioAgentToolExecutor);
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+
+    try stdio_loop.active_agent_runs.append(allocator, .{
+        .session_id = session_id,
+        .generation = first_generation,
+        .stream = stream,
+        .context = context,
+        .model = try modelFromCanonicalRef(allocator, "fixture/fixture-ok-api@fixture-model"),
+        .prompts = try allocator.alloc(ai_types.Message, 0),
+        .tools = try allocator.alloc(agent_loop.AgentTool, 0),
+        .cancel_flag = cancel_flag,
+        .tool_executor = tool_executor,
+    });
+
+    // Stop mid-run, then immediately re-register the same id. No run pump
+    // executes in between (dispatchInboundLine only pumps client messages),
+    // so the cancelled run is still listed with its publications undelivered
+    // — the §13.4.5 race window.
+    const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
+    defer allocator.free(stop_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
+
+    const restart_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(restart_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(restart_req));
+    const second_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+    try std.testing.expect(second_generation > first_generation);
+
+    try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+
+    // The stale run was drained and removed, and it was cancelled by the
+    // stop.
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+    try std.testing.expect(cancel_flag.load(.acquire));
+
+    // But it published nothing into the re-created registration: no run
+    // events, no settlement error, and the fresh container was never marked
+    // .error by the stale run's failure.
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "late stale failure") == null);
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        try std.testing.expect(env.payload != .agent_error);
+        try std.testing.expect(env.payload != .agent_event);
+    }
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.ready,
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
+}
+
+test "re-created session's admitted run is not failed by the stopped registration's run" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-ok-api",
+        .stream = fixtureOkStream,
+        .stream_simple = fixtureOkStreamSimple,
+    }, "test-fixtures");
+
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-ok-api@fixture-model";
+
+    // First registration with an in-flight run whose provider stream never
+    // drains: after the stop it stays listed (cancelled) while the id is
+    // re-registered — the run a naive one-active-run check would wrongly
+    // treat as making the session busy.
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const first_generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    const stream = try allocator.create(agent_loop.AgentEventStream);
+    stream.* = agent_loop.AgentEventStream.init(allocator);
+
+    const context = try allocator.create(agent_loop.AgentContext);
+    context.* = agent_loop.AgentContext.init(allocator);
+
+    const cancel_flag = try allocator.create(std.atomic.Value(bool));
+    cancel_flag.* = std.atomic.Value(bool).init(false);
+    const tool_executor = try allocator.create(StdioAgentToolExecutor);
+    tool_executor.* = .{ .bridge = &stdio_loop.tool_bridge, .session_id = session_id };
+
+    try stdio_loop.active_agent_runs.append(allocator, .{
+        .session_id = session_id,
+        .generation = first_generation,
+        .stream = stream,
+        .context = context,
+        .model = try modelFromCanonicalRef(allocator, model_ref_text),
+        .prompts = try allocator.alloc(ai_types.Message, 0),
+        .tools = try allocator.alloc(agent_loop.AgentTool, 0),
+        .cancel_flag = cancel_flag,
+        .tool_executor = tool_executor,
+    });
+
+    // Stop mid-run (the old run is cancelled but stays listed), re-register,
+    // and admit a message against the fresh registration.
+    const stop_req = try makeAgentStopEnvelopeJson(allocator, session_id, 2);
+    defer allocator.free(stop_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(stop_req));
+    try std.testing.expect(cancel_flag.load(.acquire));
+
+    const restart_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(restart_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(restart_req));
+
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+
+    // The new run must start despite the listed old-registration run and
+    // settle through agent_result (the pre-fix behavior was an AgentBusy
+    // run-start failure pair that marked the fresh session .error).
+    var saw_result_line = false;
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        for (outbound.items) |line| {
+            if (std.mem.find(u8, line, "\"type\":\"agent_result\"") != null) {
+                saw_result_line = true;
+                break;
+            }
+        }
+        if (saw_result_line) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(saw_result_line);
+
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "AgentBusy") == null);
+        var env = try agent_protocol_envelope.deserializeEnvelope(line, allocator);
+        defer env.deinit(allocator);
+        try std.testing.expect(env.payload != .agent_error);
+    }
+
+    // The re-created registration settled clean through its own run's
+    // result, and the stale run is still listed (its stream never drained)
+    // without blocking anything.
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.ready,
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
+    try std.testing.expect(stdio_loop.hasActiveAgentRuns());
 }
 
 test "writeOwnedLinesAndClear clears owned lines on write failure" {
