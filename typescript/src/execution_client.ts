@@ -468,7 +468,9 @@ class StdioAgentApi implements MakaiAgentApi {
     }
     const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
     this.transport.send(startEnvelope);
-    const startMessageId = startEnvelope.message_id;
+    // Correlation key for this attempt's frame waits (§13.3.1): buildAgentEnvelope always assigns a ULID
+    // message_id; the frame type's index signature just widens it to unknown.
+    const startMessageId = startEnvelope.message_id as string;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent result", this.responseTimeoutMs, sessionId, request);
     const events: AgentStreamEvent[] = [];
@@ -486,7 +488,11 @@ class StdioAgentApi implements MakaiAgentApi {
     try {
       while (true) {
         checkAbort(signal, "agent.run aborted");
-        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext), signal, "agent.run aborted");
+        // Correlate every frame wait of this attempt with its agent_start's
+        // message id: the transport then delivers replies to that request to
+        // this attempt even when a concurrent call shares the session id
+        // (spec §13.3.1, #201), instead of both competing on one route.
+        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, startMessageId), signal, "agent.run aborted");
         if (frame.type === "ack" || frame.type === "agent_stopped") continue;
         if (!startAccepted && frame.type !== "agent_started" && frame.type !== "nack" && frame.type !== "agent_error") {
           // Stale tail of a prior attempt on this session id (its cancelled
@@ -520,6 +526,12 @@ class StdioAgentApi implements MakaiAgentApi {
           throw error;
         }
         if (frame.type === "agent_started") {
+          if (!startAccepted && frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Another call's started reply delivered on the shared session
+            // route — accepting it would send our message under a session
+            // this attempt does not own (spec §13.3.3).
+            continue;
+          }
           startAccepted = true;
           if (!messageSent) {
             this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy)));
@@ -676,7 +688,9 @@ class StdioAgentApi implements MakaiAgentApi {
     }
     const startEnvelope = buildAgentEnvelope("agent_start", sessionId, 1, buildAgentStartPayload(request, sessionId));
     this.transport.send(startEnvelope);
-    const startMessageId = startEnvelope.message_id;
+    // Correlation key for this attempt's frame waits (§13.3.1): buildAgentEnvelope always assigns a ULID
+    // message_id; the frame type's index signature just widens it to unknown.
+    const startMessageId = startEnvelope.message_id as string;
     if (activeSession) activeSession.nextSequence = 2;
     const timeoutContext = agentTimeoutContext("agent stream event", this.responseTimeoutMs, sessionId, request);
     let terminal = false;
@@ -694,7 +708,11 @@ class StdioAgentApi implements MakaiAgentApi {
     try {
       while (!terminal) {
         checkAbort(signal, "agent.stream aborted");
-        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext), signal, "agent.stream aborted");
+        // Correlate every frame wait of this attempt with its agent_start's
+        // message id: the transport then delivers replies to that request to
+        // this attempt even when a concurrent call shares the session id
+        // (spec §13.3.1, #201), instead of both competing on one route.
+        const frame = await raceWithAbort(nextAgentFrame(this.transport, sessionId, timeoutContext, startMessageId), signal, "agent.stream aborted");
         if (frame.type === "ack" || frame.type === "agent_stopped") continue;
         if (!startAccepted && frame.type !== "agent_started" && frame.type !== "nack" && frame.type !== "agent_error") {
           // Stale tail of a prior attempt on this session id (its cancelled
@@ -727,6 +745,12 @@ class StdioAgentApi implements MakaiAgentApi {
           }
         }
         if (frame.type === "agent_started" && !messageSent) {
+          if (frame.in_reply_to !== undefined && frame.in_reply_to !== startMessageId) {
+            // Another call's started reply delivered on the shared session
+            // route — accepting it would send our message under a session
+            // this attempt does not own (spec §13.3.3).
+            continue;
+          }
           startAccepted = true;
           this.transport.send(buildAgentEnvelope("agent_message", sessionId, 2, buildAgentMessagePayload(request, sessionId, effectivePolicy)));
           if (activeSession) activeSession.nextSequence = 3;
@@ -1143,9 +1167,14 @@ async function nextFrame(transport: MakaiStdioClient, streamId: string, context:
   }
 }
 
-async function nextAgentFrame(transport: MakaiStdioClient, sessionId: string, context: TimeoutDiagnosticContext): Promise<StdioFrame> {
+async function nextAgentFrame(
+  transport: MakaiStdioClient,
+  sessionId: string,
+  context: TimeoutDiagnosticContext,
+  correlate?: string,
+): Promise<StdioFrame> {
   try {
-    return await transport.nextFrameForSession(sessionId, context.timeout_ms);
+    return await transport.nextFrameForSession(sessionId, context.timeout_ms, correlate !== undefined ? { correlate } : undefined);
   } catch (error) {
     throw timeoutAwareStreamError(error, context);
   }
