@@ -2540,3 +2540,133 @@ test("client.agent.stream tears down the session and drains the trailing termina
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("client.agent.run does not stop a caller-supplied session when the start outcome is unknown (§6.1, #205)", async () => {
+  // Timeout on a caller-supplied id with no reply to our own agent_start
+  // observed: the id may have been registered by another caller whose start
+  // won the race while our agent_busy reply was lost, and that owner's fresh
+  // pre-message session also expects inbound sequence 2 — a sequence-2 stop
+  // would be ACCEPTED and destroy it. The teardown must settle without
+  // sending (spec §6.1: the leaked-if-ours session is strictly preferable).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    // The stop decision is made synchronously in the error path, so by the
+    // time the run rejects the log already reflects whatever was sent.
+    const logged = readLoggedRequests(harness.logPath);
+    const starts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(starts.length, 1);
+    assert.equal(starts[0]?.session_id, "testNanoIdSess1234567");
+    assert.equal(logged.filter((entry) => entry.type === "agent_stop").length, 0);
+
+    // A same-id follow-up attempt is refused with a correlated agent_busy —
+    // the un-stopped session stayed registered (the §6.1 leak, bounded only
+    // by server eviction) — and the refusal must still not stop it: the
+    // guard is per attempt, and the busy path settles without a send too.
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.code === "agent_busy" && err.message === "session already exists",
+    );
+    const loggedAfterRetry = readLoggedRequests(harness.logPath);
+    assert.equal(loggedAfterRetry.filter((entry) => entry.type === "agent_start").length, 2);
+    assert.equal(loggedAfterRetry.filter((entry) => entry.type === "agent_stop").length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run still stops a client-generated session when the start outcome is unknown (#205)", async () => {
+  // An exclusive client-generated id is the one sufficient ownership evidence
+  // for stopping on an unknown start outcome (§6.1, until #204's generation
+  // tokens): no other caller could hold the id, so the timeout teardown keeps
+  // the always-stop behavior.
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
+    await assert.rejects(
+      () => agent.run({ ...request(), options: { temperature: 0.2 } }),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const starts = logged.filter((entry) => entry.type === "agent_start");
+    assert.equal(starts.length, 1);
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    // Start sent (sequence 1), message never sent — the session expects the
+    // stop at sequence 2.
+    assert.equal(stops[0]?.session_id, starts[0]?.session_id);
+    assert.equal(stops[0]?.sequence, 2);
+    assert.equal((stops[0]?.payload as Record<string, unknown>).reason, "completed");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.stream does not stop a caller-supplied session when the start outcome is unknown (#205)", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_SUPPRESS_AGENT_START_RESPONSE: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 300 });
+    await assert.rejects(
+      () => collect(agent.stream(request())),
+      (err: unknown) => err instanceof MakaiStreamError && err.kind === "transport_error",
+    );
+
+    const logged = readLoggedRequests(harness.logPath);
+    assert.equal(logged.filter((entry) => entry.type === "agent_start").length, 1);
+    assert.equal(logged.filter((entry) => entry.type === "agent_stop").length, 0);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("client.agent.run drains the failure pair's settlement before the error surfaces, so an immediate same-id run is not poisoned (#205)", async () => {
+  // §13.4.2: a loop-internal failure settles via the pair agent_event(error)
+  // + settlement agent_error — ONE settlement. The fixture emits BOTH frames
+  // uncorrelated (faithful to the real server's async output), so a consumer
+  // terminating on the first frame must drain the second before the id is
+  // reused: the queued settlement agent_error would otherwise be claimed by
+  // the follow-up run's first post-acceptance wait, treated as its own
+  // rejection, and stop the newly registered session.
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-failure-pair-"));
+  const pairPath = path.join(tmpDir, "failure-pair.json");
+  fs.writeFileSync(pairPath, JSON.stringify({ code: "internal_error", message: "fixture loop failure" }));
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_FAILURE_PAIR_PATH: pairPath });
+  try {
+    const agent = createMakaiAgentApi(harness.client);
+    await assert.rejects(
+      () => agent.run(request()),
+      (err: unknown) => err instanceof MakaiStreamError && err.message === "fixture loop failure" && err.code === "internal_error",
+    );
+
+    // The failing run tore its session down at the throw site: the stop is
+    // sent and the quiescent drain has consumed the settlement agent_error.
+    // (The fixture logs the stop a beat after the rejection, so wait for it.)
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    assert.equal(logged.filter((entry) => entry.type === "agent_stop").length, 1);
+    assert.equal((logged.find((entry) => entry.type === "agent_stop")?.payload as Record<string, unknown>).reason, "completed");
+
+    // The immediate same-id follow-up must NOT consume the stale settlement
+    // (it runs the fixture's normal event flow — the pair fires once) and
+    // must NOT send a session-destroying stop of its own before completing.
+    const second = await agent.run(request());
+    assert.equal(second.stop_reason, "end_turn");
+
+    const loggedAfter = await waitForLoggedRequests(harness.logPath, (entries) => entries.filter((entry) => entry.type === "agent_stop").length >= 2);
+    const stops = loggedAfter.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 2);
+    for (const stop of stops) {
+      assert.equal(stop.session_id, "testNanoIdSess1234567");
+      assert.equal(stop.sequence, 3);
+      assert.equal((stop.payload as Record<string, unknown>).reason, "completed");
+    }
+  } finally {
+    await harness.cleanup();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
