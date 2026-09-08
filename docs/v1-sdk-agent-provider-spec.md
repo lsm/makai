@@ -975,8 +975,11 @@ Rules:
   the counter to 0 (overwriting any numbers the id consumed for `models_request`s
   issued before the start), and an id re-registered after a stop restarts it, so
   sequence values may repeat across registrations of the same id. Consumers MUST
-  treat the outbound counter as per-registration. Echo replies (`session_info`,
-  `pong`, `tool_list_response`) copy the
+  treat the outbound counter as per-registration. `[current exception]` the
+  counter update itself ignores allocation failure (`nextOutgoingSequence`'s map
+  put is `catch {}`), so under memory pressure two frames can receive the same
+  sequence — monotonic allocation holds absent allocation failure (#204). Echo
+  replies (`session_info`, `pong`, `tool_list_response`) copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
   (outside the ordering domain). Consumers MUST NOT order echo replies against
@@ -1157,22 +1160,29 @@ granted, server eviction), and holds no transcript and no persistence.
    rejection, so the client sees an unscoped runtime error or nothing at all;
    clients MUST bound their wait with a response timeout regardless and treat it
    as an unknown outcome (§13.4.6). Cleanup sequencing for that unknown outcome
-   is defined by the server's rollback invariant: an acceptance-path failure
-   leaves the expected counter at its PRE-SEND value (field-duplication failures
-   occur before the counter update; an enqueue failure runs the rollback), so a
-   cleanup stop after an uncorroborated admission MUST retry at the pre-send
-   sequence — a stop at the client's advanced sequence is rejected
-   `invalid_request` and the owned session leaks indefinitely. Both current
-   clients advance before the outcome is known; the fix (rollback or
-   explicit-sequence control covering the unknown-outcome case) is
-   `[planned — #204 gap 7]`. A start rejected before admission
+   MUST probe both possible counter states — a timeout does not prove the
+   acceptance path failed: the server may have accepted and advanced (a slow
+   provider or any documented publication loss delays output past the timeout),
+   or the acceptance may have failed with the counter rolled back to its
+   PRE-SEND value. A cleanup stop therefore tries the pre-send sequence and, if
+   rejected with a correlated `invalid_request`, the post-send value; acceptance
+   at either settles cleanup. Both current clients advance before the outcome is
+   known and send only the advanced value, so their cleanup stop fails in the
+   rolled-back case and the owned session leaks indefinitely; the fix (probing,
+   or rollback/explicit-sequence control) is `[planned — #204 gap 7]`. A start
+   rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
 2. Settlement `[current]`: exactly one settlement frame settles an admitted run
    that reaches its own outcome — a run cancelled by `agent_stop` produces no run
    settlement frame at all (§13.4.4):
-   - success: the `agent_result` frame (or provider-shaped `result`/`complete_response`
-     frame). This is the settlement frame for BOTH consumption modes: the SDK's
+   - success: the `agent_result` frame — the ONLY agent-protocol settlement
+     frame. (The TypeScript SDK additionally accepts provider-shaped
+     `result`/`complete_response` frames as a non-protocol compatibility fallback
+     on the shared transport; those belong to the provider protocol and are never
+     emitted by the agent server — the Zig agent client cannot parse them, so
+     implementations MUST NOT emit them on the agent surface.) This is the
+     settlement frame for BOTH consumption modes: the SDK's
      `stream()` projects the `agent_result` frame into its terminal `agent_end` event
      and terminates there — it does not wait for the server's trailing `agent_end`
      frame, which is drained per §6.1. The server publishes `agent_result` BEFORE the

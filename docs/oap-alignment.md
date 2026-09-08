@@ -88,7 +88,10 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    propagate once, never re-publish a processed terminal; tool-request publication
    AND outbox delivery are transactional — an envelope popped for delivery is
    currently dropped if serialization or write fails, and for a result the run is
-   already removed, leaving no settlement and nothing to retry), and
+   already removed, leaving no settlement and nothing to retry — transactionality
+   extends through the final pipe-to-stdout handoff: the stdio drain advances the
+   pipe read position before its buffer append, and a failure there is swallowed,
+   dropping an already-delivered frame), and
    stale-`tool_result` correlation for reused
    `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`) —
    plus gap 7: client sequence control in BOTH clients — `AgentProtocolClient`
