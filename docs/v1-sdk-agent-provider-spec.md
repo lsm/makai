@@ -956,8 +956,11 @@ Rules:
   same-sequence retries through that client are unsupported — callers needing that
   discipline must drive the transport directly until sequence control is exposed
   (`[planned — #204 gap 7]`).
-  `agent_status`, `ping`, `tool_list`, and `models_request` never consume inbound
-  sequence. `tool_result` frames are intercepted by the stdio host before the agent
+  `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
+  consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
+  session nor produces a reply — the session remains usable afterward (only the
+  stdio host's EOF/exit logic ends the process). `tool_result` frames are
+  intercepted by the stdio host before the agent
   protocol and never consume agent inbound sequence numbers.
   Outbound `[current]`: emitted frames come in two classes. Allocated frames
   (`agent_started`, `agent_stopped`, `ack`, `nack`, `models_response`, `agent_event`,
@@ -1224,9 +1227,13 @@ granted, server eviction), and holds no transcript and no persistence.
    subsequent result/error publications are discarded because the session no longer
    exists. A cancelled run therefore produces NO run settlement frame — the
    `agent_stopped` reply correlated to the stop request is the client's terminal
-   observation. Makai has no run-scoped cancelled terminal (OAP `run.cancelled` is a
-   ledger deviation); there is nothing for a consumer to wait on after
-   `agent_stopped`.
+   observation `[current exception]`: the server removes the session BEFORE
+   building the reply, so an allocation failure in between tears the session down
+   with no `agent_stopped` at all — the client sees an uncorrelated runtime error
+   or times out although teardown succeeded (part of #204 gap 5's correlated-reply
+   publication family). Makai has no run-scoped cancelled terminal (OAP
+   `run.cancelled` is a ledger deviation); there is nothing for a consumer to wait
+   on after `agent_stopped`.
 5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
    stays alive until its provider stream drains. If a new `agent_start` re-registers
    the same id before then, late frames from the old run can publish into the new

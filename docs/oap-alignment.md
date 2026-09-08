@@ -86,11 +86,17 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    settlement on result- OR failure-pair-publication failure instead of the
    swallowed/propagating OOM (settle or propagate once, never re-publish a
    processed terminal), and stale-`tool_result` correlation for reused
-   `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`).
-4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start outcomes
-   (no stop without a correlated `agent_started` or exclusive id), and a mandatory
-   drain (or correlation/generation discard) of the failure pair's second frame
-   before id reuse.
+   `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`) —
+   plus gap 7: `AgentProtocolClient` sequence control (rollback on rejected sends
+   or explicit-sequence sends), without which same-sequence retries through the
+   built-in client are unsupported.
+4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
+   outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused client-generated id
+   is the only sufficient evidence until #204 supplies generation tokens (a buffered
+   correlated `agent_started` can outlive removal and re-registration of the id and
+   authorize a stop of the NEW session) — and a mandatory drain (or
+   correlation/generation discard) of the failure pair's second frame before id
+   reuse.
 5. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
    (wire change; semantics already fixed by §13.1/§13.5 — the rename rests on them).
 
