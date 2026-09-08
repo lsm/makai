@@ -478,7 +478,7 @@ Agent stream rules:
 - The SDK keeps provider auth failures retryable: when the terminal `agent_end` (or the non-streaming run response) reports `stop_reason: "error"` with an auth failure `error_message` (mirroring the server-side auth failure detector: `auth_required` / `auth_expired` / `auth_refresh_failed` / 401 / 403 / unauthorized / forbidden), the SDK raises the typed auth error path (`MakaiAuthRequiredError`, engaging `auth_retry_policy`) instead of treating the run as a normal completion. Non-auth provider failures surface via the `error_message` fields above.
 - V1 tool execution events are lifecycle-only: `tool_execution_start` and `tool_execution_end`.
 - `tool_execution_update` is deferred to a future revision and is not required for V1 compatibility.
-- For a single failure, SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted.
+- For a single failure that surfaces as a stream `error` event (the loop-internal failure shape, §13.4.2), SDK-visible stream events must contain one terminal `error` event (no duplicate provider+agent terminal errors for the same failure), and `agent_end` must not be emitted. Provider-originated failures follow the preceding bullet instead: the failed turn still settles through the result path and `agent_end` IS emitted carrying the error detail — the two bullets are the event-stream projections of §13.4.2's two failure shapes.
 
 SDK behavior:
 - Async iterator failure paths may throw `MakaiStreamError`.
@@ -936,9 +936,11 @@ Rules:
   rule). It never references a session id, stream id, flow id, or payload-level id,
   even where values coincide. Synchronous server replies (`agent_started`,
   `agent_stopped`, `ack`, `nack`, `agent_error` from request validation,
-  `session_info`, `pong`, `tool_list_response`) set `in_reply_to`; asynchronous run
-  output (`agent_event`, `agent_result`, settlement `agent_error`, `tool_execute`)
-  carries no `in_reply_to` and is session-scoped (§13.3).
+  `session_info`, `pong`, `tool_list_response`) set `in_reply_to`; a queued
+  `models_response` is likewise request-correlated (`in_reply_to` names its
+  `models_request`) though delivered asynchronously after its `ack`; asynchronous
+  run output (`agent_event`, `agent_result`, settlement `agent_error`,
+  `tool_execute`) carries no `in_reply_to` and is session-scoped (§13.3).
 - `sequence` is scoped per session AND per direction: the client's inbound counter and
   the server's outbound counter are independent.
   Inbound `[current]`: `agent_start` MUST carry sequence 1. Each ACCEPTED
@@ -1026,9 +1028,16 @@ granted, server eviction), and holds no transcript and no persistence.
    - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
-   by the connection. An in-flight run is not cancelled by disconnect in V1; the host
-   pumps it to completion. Future multi-connection hosts MUST scope sessions to their
-   owning connection (rule 2) and evict on disconnect (#202).
+   by the connection. Disconnect does not cancel in-flight work in V1, with two
+   distinct outcomes: a run executing against a provider is pumped to completion
+   (its result is written to a dead pipe); a run WAITING on a distributed
+   `tool_result` cannot complete — the tool host is the disconnected client, the
+   tool wait polls with no EOF-triggered cancel, and the host loop never sees the
+   run go idle — so the process (and every session it owns) stays alive
+   indefinitely until killed. EOF-triggered cancellation of active runs is tracked
+   with the disconnect-cleanup family in #202/#204. Future multi-connection hosts
+   MUST scope sessions to their owning connection (rule 2) and evict on disconnect
+   (#202).
 
 ### 13.3 Frame Routing (Normative)
 
@@ -1097,7 +1106,10 @@ granted, server eviction), and holds no transcript and no persistence.
        run settles through the SUCCESS shape — an `agent_result` frame carrying
        `stop_reason: "error"` + `error_message`, followed by the trailing
        `agent_end`. No `agent_error` envelope is emitted for these. An adapter that
-       treats every `agent_result` as success will misreport these failures.
+       treats every `agent_result` as success will misreport these failures. This is
+       §3.5's "turn fails at the provider" rule (`turn_end`/`agent_end` carry the
+       error detail); §3.5's one-terminal-`error`/no-`agent_end` rule applies to the
+       loop-internal shape above, not to this one.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
    exactly once, via result XOR error, never both. Children settle first: pending
    tool work resolves and the trailing `agent_end` is published only after
