@@ -9,7 +9,9 @@ export {
   StdioProtocolError,
   createMakaiStdioClient,
   type CreateMakaiStdioClientOptions,
+  type FrameWaitOptions,
   type MakaiStdioClientOptions,
+  type SessionFrameWaitOptions,
   type StdioFrame,
   // Deprecated aliases retained under transport-specific names to avoid
   // colliding with the unified high-level client factory options.

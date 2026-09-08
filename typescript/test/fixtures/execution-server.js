@@ -194,7 +194,15 @@ rl.on("line", (line) => {
   } else if (env.type === "agent_start") {
     if (trackAgentSessions) {
       if (agentSessions.has(env.session_id)) {
-        emit(frame(env, "nack", { error_code: "agent_busy", reason: "session already exists" }, 3));
+        // The real agent server rejects a duplicate start with an
+        // agent_error frame (code+message, both carrying in_reply_to); the
+        // nack flavor stays the default so coverage exercises both SDK
+        // rejection paths.
+        if (process.env.MAKAI_TEST_AGENT_BUSY_AS_ERROR) {
+          emit(frame(env, "agent_error", { code: "agent_busy", message: "session already exists" }, 3));
+        } else {
+          emit(frame(env, "nack", { error_code: "agent_busy", reason: "session already exists" }, 3));
+        }
         return;
       }
       // Registered before any auth rejection so a failed attempt's teardown

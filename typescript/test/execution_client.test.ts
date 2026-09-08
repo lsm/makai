@@ -2361,6 +2361,94 @@ test("client.agent.run does not stop a session owned by another run after agent_
   }
 });
 
+test("concurrent client.agent.run on one session id: duplicate is rejected promptly, established run completes", async () => {
+  // §13.3.1 (#201): two overlapping runs on the same consumer-supplied
+  // session id share one session route. With in_reply_to-aware waiter
+  // routing each run receives its own start reply — the duplicate learns of
+  // its agent_busy rejection immediately instead of surfacing the response
+  // timeout after the established run finishes, and the established run is
+  // unaffected (neither consuming the rejection nor losing its own reply).
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
+    const startedAt = Date.now();
+    const [established, duplicate] = await Promise.allSettled([agent.run(request()), agent.run(request())]);
+    const elapsedMs = Date.now() - startedAt;
+
+    // The duplicate's rejection is delivered by correlation, not by waiting
+    // out the response timeout.
+    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
+    assert.equal(established.status, "fulfilled");
+    assert.equal((established as PromiseFulfilledResult<{ stop_reason?: string }>).value.stop_reason, "end_turn");
+    assert.equal(duplicate.status, "rejected");
+    const reason = (duplicate as PromiseRejectedResult).reason;
+    assert.ok(reason instanceof MakaiStreamError && reason.code === "agent_busy" && reason.message === "session already exists", `unexpected duplicate rejection: ${String(reason)}`);
+
+    // Exactly one teardown stop — the established run's. The duplicate owns
+    // nothing on the session and must not stop it (its tracked sequence
+    // would validate and tear the established run's session down).
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.sequence, 3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("concurrent client.agent.run duplicate receives the agent_error-shaped agent_busy rejection", async () => {
+  // Same scenario with the real agent server's rejection flavor: the
+  // duplicate start is refused with an agent_error frame (not a nack); the
+  // correlated delivery must route it to the duplicate regardless of frame
+  // type.
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1", MAKAI_TEST_AGENT_BUSY_AS_ERROR: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
+    const startedAt = Date.now();
+    const [established, duplicate] = await Promise.allSettled([agent.run(request()), agent.run(request())]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
+    assert.equal(established.status, "fulfilled");
+    assert.equal((established as PromiseFulfilledResult<{ stop_reason?: string }>).value.stop_reason, "end_turn");
+    assert.equal(duplicate.status, "rejected");
+    const reason = (duplicate as PromiseRejectedResult).reason;
+    assert.ok(reason instanceof MakaiStreamError && reason.code === "agent_busy" && reason.message === "session already exists", `unexpected duplicate rejection: ${String(reason)}`);
+
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.sequence, 3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("concurrent client.agent.stream on one session id: duplicate is rejected promptly, established stream completes", async () => {
+  const harness = await setupHarness({ MAKAI_TEST_TRACK_AGENT_SESSIONS: "1" });
+  try {
+    const agent = createMakaiAgentApi(harness.client, { responseTimeoutMs: 3000 });
+    const startedAt = Date.now();
+    const [established, duplicate] = await Promise.allSettled([collect(agent.stream(request())), collect(agent.stream(request()))]);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.ok(elapsedMs < 1500, `duplicate rejection took ${elapsedMs}ms; expected correlated delivery, not a timeout`);
+    assert.equal(established.status, "fulfilled");
+    const events = (established as PromiseFulfilledResult<AgentStreamEvent[]>).value;
+    assert.equal(events.at(-1)?.type, "agent_end");
+    assert.equal(duplicate.status, "rejected");
+    const reason = (duplicate as PromiseRejectedResult).reason;
+    assert.ok(reason instanceof MakaiStreamError && reason.code === "agent_busy" && reason.message === "session already exists", `unexpected duplicate rejection: ${String(reason)}`);
+
+    const logged = await waitForLoggedRequests(harness.logPath, (entries) => entries.some((entry) => entry.type === "agent_stop"));
+    const stops = logged.filter((entry) => entry.type === "agent_stop");
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0]?.sequence, 3);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("client.agent.run auth retry stops the abandoned session", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "makai-agent-stop-auth-retry-"));
   const logPath = path.join(tmpDir, "request.log");

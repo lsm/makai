@@ -97,6 +97,314 @@ test("targeted frame reads preserve frames across stream and session owners", as
   }
 });
 
+test("correlated session waits on one session each receive their own reply", async () => {
+  // §13.3.1: two waits sharing one session route, each correlated with its
+  // own outstanding request — each must receive the reply to ITS request,
+  // regardless of arrival order on the shared route (#201).
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const first = client.nextFrameForSession("a1", 5000, { correlate: "req-first" });
+    const second = client.nextFrameForSession("a1", 5000, { correlate: "req-second" });
+    // The second request's reply arrives FIRST on the wire: whichever wait
+    // holds the read lock must park it for its owner, not consume it.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-second" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-first" });
+
+    const [firstFrame, secondFrame] = await Promise.all([first, second]);
+    assert.equal(firstFrame.in_reply_to, "req-first");
+    assert.equal(secondFrame.in_reply_to, "req-second");
+  } finally {
+    await client.close();
+  }
+});
+
+test("correlated reply is not consumed by an uncorrelated waiter on the same session", async () => {
+  // The duplicate-start misdelivery mode (#201): the established run's
+  // output wait (no correlate) must not swallow a duplicate's correlated
+  // agent_busy rejection while it holds the read lock.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const established = client.nextFrameForSession("a1", 5000);
+    const duplicate = client.nextFrameForSession("a1", 5000, { correlate: "req-duplicate" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-duplicate" });
+
+    const duplicateFrame = await duplicate;
+    assert.equal(duplicateFrame.in_reply_to, "req-duplicate");
+
+    // The established wait stays pending (it did not steal the rejection)
+    // while the event loop keeps serving macrotasks — no busy-spin from
+    // re-dequeueing re-routed frames.
+    let timersFired = 0;
+    setTimeout(() => { timersFired += 1; }, 25);
+    setTimeout(() => { timersFired += 1; }, 75);
+    const stolen = await Promise.race([
+      established.then((frame) => ({ stole: true, in_reply_to: frame.in_reply_to })),
+      new Promise<{ stole: false }>((resolve) => setTimeout(() => resolve({ stole: false }), 150)),
+    ]);
+    assert.deepEqual(stolen, { stole: false });
+    assert.equal(timersFired, 2);
+
+    // Session-routed output (no in_reply_to) still reaches the established
+    // waiter on the shared route.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-output", payload: { omit_in_reply_to: true } });
+    const establishedFrame = await established;
+    assert.equal(establishedFrame.session_id, "a1");
+    assert.equal(establishedFrame.in_reply_to, undefined);
+  } finally {
+    await client.close();
+  }
+});
+
+test("correlated stream waits on one stream each receive their own reply", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const first = client.nextFrameForStream("s1", 5000, { correlate: "req-first" });
+    const second = client.nextFrameForStream("s1", 5000, { correlate: "req-second" });
+    client.send({ type: "stream_request", stream_id: "s1", message_id: "req-first" });
+    client.send({ type: "stream_request", stream_id: "s1", message_id: "req-second" });
+
+    const [firstFrame, secondFrame] = await Promise.all([first, second]);
+    assert.equal(firstFrame.in_reply_to, "req-first");
+    assert.equal(secondFrame.in_reply_to, "req-second");
+    assert.equal(firstFrame.stream_id, "s1");
+    assert.equal(secondFrame.stream_id, "s1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("frames with unmatched or absent in_reply_to keep session-routed behavior", async () => {
+  // A reply whose in_reply_to matches no registered correlate — and frames
+  // without in_reply_to at all — stay deliverable on the session route.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const unmatched = client.nextFrameForSession("a1", 5000);
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-nobody-waiting-for" });
+    const unmatchedFrame = await unmatched;
+    assert.equal(unmatchedFrame.in_reply_to, "req-nobody-waiting-for");
+    assert.equal(unmatchedFrame.session_id, "a1");
+
+    const uncorrelated = client.nextFrameForSession("a1", 5000, { correlate: "req-registered" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-no-reply-to", payload: { omit_in_reply_to: true } });
+    const uncorrelatedFrame = await uncorrelated;
+    assert.equal(uncorrelatedFrame.in_reply_to, undefined);
+    assert.equal(uncorrelatedFrame.session_id, "a1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("reply arriving while its owner is between waits is parked, not consumed by a foreign correlated waiter", async () => {
+  // Regression for the first cut of #201: a correlate is retained per frame
+  // wait, not per SDK attempt, so a reply can be read while its owner is
+  // between waits (correlate released). A foreign correlated waiter sharing
+  // the route must park it — claimable by the owner's next correlated wait,
+  // skipped by other correlated waiters, still visible to uncorrelated
+  // waiters — instead of consuming it off the shared route.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const established = client.nextFrameForSession("a1", 5000, { correlate: "req-a" });
+    const ownerFirst = client.nextFrameForSession("a1", 5000, { correlate: "req-b" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-b" });
+    assert.equal((await ownerFirst).in_reply_to, "req-b");
+
+    // The owner is now between waits; its next reply is read by the
+    // established waiter while "req-b" is unregistered.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-b" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const stolen = await Promise.race([
+      established.then((frame) => ({ stole: true, in_reply_to: frame.in_reply_to })),
+      new Promise<{ stole: false }>((resolve) => setTimeout(() => resolve({ stole: false }), 100)),
+    ]);
+    assert.deepEqual(stolen, { stole: false });
+
+    // The parked reply is claimed by its owner's next correlated wait...
+    const reclaimed = await client.nextFrameForSession("a1", 5000, { correlate: "req-b" });
+    assert.equal(reclaimed.in_reply_to, "req-b");
+    // ...and the established waiter still receives its own reply afterwards.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-a" });
+    assert.equal((await established).in_reply_to, "req-a");
+  } finally {
+    await client.close();
+  }
+});
+
+test("replies-only wait parks uncorrelated frames for the route owner", async () => {
+  // A pre-acceptance duplicate holding the read lock must not consume the
+  // established run's uncorrelated async output (agent_event/agent_result
+  // carry no in_reply_to) off the shared session route — it parks the frames
+  // for the owner and receives only its own reply.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const duplicate = client.nextFrameForSession("a1", 5000, { correlate: "req-duplicate", repliesOnly: true });
+    const owner = client.nextFrameForSession("a1", 5000, { correlate: "req-owner" });
+    // The owner's async output arrives while the duplicate holds the lock.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-output", payload: { omit_in_reply_to: true } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const consumed = await Promise.race([
+      duplicate.then((frame) => ({ by: "duplicate", type: frame.type })),
+      new Promise<{ by: string }>((resolve) => setTimeout(() => resolve({ by: "none" }), 100)),
+    ]);
+    assert.deepEqual(consumed, { by: "none" });
+
+    // The duplicate's own reply settles it (releasing the read lock)...
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-duplicate" });
+    assert.equal((await duplicate).in_reply_to, "req-duplicate");
+    // ...and the owner then receives the parked uncorrelated frame.
+    const ownerFrame = await owner;
+    assert.equal(ownerFrame.session_id, "a1");
+    assert.equal(ownerFrame.in_reply_to, undefined);
+  } finally {
+    await client.close();
+  }
+});
+
+test("aborted correlated wait leaves its parked reply for the replacement waiter", async () => {
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    const established = client.nextFrameForSession("a1", 5000);
+    const controller = new AbortController();
+    const aborted = client.nextFrameForSession("a1", 5000, { correlate: "req-aborted", signal: controller.signal });
+    controller.abort();
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-aborted" });
+
+    // The abandoned wait rejects without consuming its parked reply...
+    await assert.rejects(aborted, /frame wait for session a1 aborted/);
+    // ...which stays claimable by a replacement wait on the same correlate...
+    const replacement = await client.nextFrameForSession("a1", 5000, { correlate: "req-aborted" });
+    assert.equal(replacement.in_reply_to, "req-aborted");
+    // ...while the lock holder is unaffected.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-established", payload: { omit_in_reply_to: true } });
+    assert.equal((await established).session_id, "a1");
+  } finally {
+    await client.close();
+  }
+});
+
+test("replies-only wait skips frames already parked on the session queue", async () => {
+  // The pre-lock fast-path dequeue must honor repliesOnly too: an
+  // uncorrelated frame parked on the session route before the duplicate's
+  // wait starts belongs to the established owner, not to the pre-acceptance
+  // duplicate (whose SDK would discard it as a stale tail).
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    // A foreign waiter on another session reads the owner's bare frame and
+    // parks it on the a1 session queue.
+    const foreign = client.nextFrameForSession("a2", 5000);
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-owner-output", payload: { omit_in_reply_to: true } });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // The pre-acceptance duplicate's wait starts AFTER the frame was parked.
+    const duplicate = client.nextFrameForSession("a1", 5000, { correlate: "req-duplicate", repliesOnly: true });
+    const skipped = await Promise.race([
+      duplicate.then((frame) => ({ took: true, in_reply_to: frame.in_reply_to })),
+      new Promise<{ took: boolean }>((resolve) => setTimeout(() => resolve({ took: false }), 100)),
+    ]);
+    assert.deepEqual(skipped, { took: false });
+
+    // The duplicate receives only its own reply...
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-duplicate" });
+    assert.equal((await duplicate).in_reply_to, "req-duplicate");
+    // ...and the owner claims the parked frame.
+    const owner = await client.nextFrameForSession("a1", 5000);
+    assert.equal(owner.session_id, "a1");
+    assert.equal(owner.in_reply_to, undefined);
+    // The foreign waiter settles with its own session's frame.
+    client.send({ type: "agent_message", session_id: "a2", message_id: "req-foreign", payload: { omit_in_reply_to: true } });
+    assert.equal((await foreign).session_id, "a2");
+  } finally {
+    await client.close();
+  }
+});
+
+test("already-aborted correlated wait rejects without consuming its parked reply", async () => {
+  // The pre-lock fast path must check the AbortSignal before dequeuing: a
+  // call made with an already-aborted signal and a matching parked reply
+  // must reject (leaving the reply for a replacement waiter) instead of
+  // fulfilling.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    // A second correlated waiter on the session parks req-x's follow-up
+    // reply (marked) while req-x's owner is between waits.
+    const foreignReader = client.nextFrameForSession("a1", 5000, { correlate: "req-foreign" });
+    const ownerFirst = client.nextFrameForSession("a1", 5000, { correlate: "req-x" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-x" });
+    assert.equal((await ownerFirst).in_reply_to, "req-x");
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-x" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      client.nextFrameForSession("a1", 5000, { correlate: "req-x", signal: controller.signal }),
+      /frame wait for session a1 aborted/,
+    );
+
+    // The parked reply survives for the replacement waiter.
+    const replacement = await client.nextFrameForSession("a1", 5000, { correlate: "req-x" });
+    assert.equal(replacement.in_reply_to, "req-x");
+    // The parking reader is unaffected.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-foreign" });
+    assert.equal((await foreignReader).in_reply_to, "req-foreign");
+  } finally {
+    await client.close();
+  }
+});
+
 test("nextFrameForStream evicts late orphaned frames from the shared buffer", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,

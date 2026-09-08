@@ -69,9 +69,12 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 
 These implement the `[planned]` rules of spec §13; each lands as its own PR:
 
-1. #201 — `in_reply_to`-aware frame routing in the transport (implements §13.3.1;
-   today the SDK correlates only pre-acceptance and the general case can misdeliver
-   same-session replies).
+1. #201 — LANDED: `in_reply_to`-aware frame routing in the transport (implements
+   §13.3.1; `correlate` wait option, reply-queue parking for registered requests,
+   SDK correlation of each attempt's `agent_start` `message_id` plus a
+   pre-acceptance `agent_started` correlation check). Overlapping same-session
+   calls now each receive their own replies; the pre-#201 modes (duplicate
+   timing out, established run destroyed, wrong request proceeding) are closed.
 2. #204 — server enforcement gaps the spec marks `[planned]`: envelope/payload
    session-id agreement rejection, consistent outbound sequencing for echo replies
    (`session_info`/`pong`/`tool_list_response`), session generation/tombstone so a
