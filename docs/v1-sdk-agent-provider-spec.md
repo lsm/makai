@@ -1029,19 +1029,25 @@ granted, server eviction), and holds no transcript and no persistence.
      idle-but-alive with a full TTL ahead of it, by design (rule 3) — settlement
      never evicts; it only starts the idle interval.
    - Resource caps: a server MAY additionally bound registered sessions and evict
-     least-recently-active entries — with the same in-flight protection as the TTL
-     (evicting a session with a live run cancels it, and an evicted id re-registered
-     while its cancelled run drains reproduces the §13.4.5 reuse race, so the
-     eviction path MUST ship with #204's generation protection or defer evicting
-     sessions with in-flight runs).
+     least-recently-active entries. Cap eviction, like the TTL, selects ONLY among
+     sessions without in-flight runs — a session with a live run is never
+     cap-evicted; if no idle candidate exists, the server surfaces the pressure by
+     rejecting new `agent_start`s (`agent_busy` or a resource error) rather than
+     cancelling live work. The cancel-on-eviction mandate below covers only the
+     race where a run's admission interleaves with the eviction decision.
    - An evicted session's next session-scoped request other than `agent_start`
      (`agent_message`, `agent_stop`, `agent_status`) receives the existing
      `agent_not_found` error ("session not found") — identical to an unknown or
      already-stopped id; eviction MUST NOT be distinguishable from stop by error
      code. `agent_start` on an unregistered id (evicted, stopped, or never created)
      creates a fresh container per §13.5.2 — clients re-supply full context (§12).
-   - Evicting a session with an in-flight run MUST cancel that run (same semantics as
-     `agent_stop`).
+   - If an eviction lands on a session whose run admission raced the eviction
+     decision (the run is in flight at removal), the eviction MUST cancel that run
+     (same semantics as `agent_stop`): the cancelled run's publications are
+     discarded (§13.4.4), and until #204's generation tokens land, an id
+     re-registered while such a run drains reproduces the §13.4.5 reuse race —
+     eviction implementations MUST apply the same drain/defer-on-reuse discipline
+     as stop.
    - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
