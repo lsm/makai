@@ -952,7 +952,8 @@ Rules:
   protocol and never consume agent inbound sequence numbers.
   Outbound `[current]`: emitted frames come in two classes. Allocated frames
   (`agent_started`, `agent_stopped`, `ack`, `nack`, `models_response`, `agent_event`,
-  `agent_result`, settlement `agent_error`) draw from one monotonic per-session
+  `agent_result`, settlement `agent_error`, `tool_execute`) draw from one monotonic
+  per-session
   counter. Echo replies (`session_info`, `pong`, `tool_list_response`) copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
@@ -1068,12 +1069,22 @@ granted, server eviction), and holds no transcript and no persistence.
      frame, which is drained per §6.1. The server publishes `agent_result` BEFORE the
      trailing `agent_end` event frame; the trailing frame is an aggregate restatement
      of the same settlement for event-stream consumers, not a second settlement.
-   - failure: the failure pair — an `agent_event` carrying the terminal `error` event
-     (§3.5's one-terminal-error rule) followed by the settlement `agent_error`
-     envelope — is ONE settlement. The `agent_error` envelope is the settlement
-     frame; the `agent_event` is its event-stream projection. Consumers terminate on
-     the first-delivered frame of the pair and MUST NOT count the pair as two
-     settlements.
+   - failure comes in two shapes, and consumers MUST classify by payload
+     (`stop_reason`), never by frame type:
+     - loop-internal failures (run start failure, agent run stream error): the
+       failure pair — an `agent_event` carrying the terminal `error` event (§3.5's
+       one-terminal-error rule) followed by the settlement `agent_error` envelope —
+       is ONE settlement. The `agent_error` envelope is the settlement frame; the
+       `agent_event` is its event-stream projection. Consumers terminate on the
+       first-delivered frame of the pair and MUST NOT count the pair as two
+       settlements.
+     - provider-originated failures (auth, network, invalid URL): the provider turn
+       converts the error into a result message with `stop_reason = "error"` and the
+       provider's own `error_message` (§3.5), the loop completes normally, and the
+       run settles through the SUCCESS shape — an `agent_result` frame carrying
+       `stop_reason: "error"` + `error_message`, followed by the trailing
+       `agent_end`. No `agent_error` envelope is emitted for these. An adapter that
+       treats every `agent_result` as success will misreport these failures.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
    exactly once, via result XOR error, never both. Children settle first: pending
    tool work resolves and the trailing `agent_end` is published only after
