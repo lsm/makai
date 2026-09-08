@@ -54,6 +54,8 @@ type PendingHandshake = {
 type StreamQueueEntry = {
   frame: StdioFrame;
   expiresAt: number;
+  /** `in_reply_to` of the parked frame, when it carries one. */
+  replyTo?: string;
 };
 
 /**
@@ -72,6 +74,17 @@ export type FrameWaitOptions = {
    * keep stream/session-routed behavior.
    */
   correlate?: string;
+  /**
+   * Deliver ONLY frames replying to `correlate` (requires `correlate`):
+   * everything else read on the shared route — including frames without
+   * `in_reply_to` — is parked for its owner instead of consumed. Use while a
+   * request's reply is outstanding and the caller does not yet own the
+   * session's output (pre-acceptance agent waits): consuming uncorrelated
+   * frames there would eat the established run's async output, and parking
+   * them cannot spin because a replies-only waiter never dequeues what it
+   * parks.
+   */
+  repliesOnly?: boolean;
 };
 
 /** Options for {@link MakaiStdioClient.nextFrameForSession}. */
@@ -282,7 +295,15 @@ export class MakaiStdioClient {
             if (state.settled) throw new Error(`frame wait for ${route} ${routeId} superseded`);
             return await this.readRoutedLoop(route, routeId, timeoutMs, options);
           }),
-          poke.then(() => this.dequeueRoutedFrame(this.replyFrameQueues, correlate)),
+          poke.then(() => {
+            // The wait was abandoned before its parked reply was claimed:
+            // reject like an aborted read and leave the reply parked for the
+            // replacement waiter instead of fulfilling with it.
+            if (options?.signal?.aborted) {
+              throw new Error(`frame wait for session ${routeId} aborted`);
+            }
+            return this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
+          }),
         ]);
       } finally {
         state.settled = true;
@@ -314,7 +335,7 @@ export class MakaiStdioClient {
         throw new Error(`timed out waiting for frame for ${route} ${routeId} after ${timeoutMs}ms`);
       }
 
-      const queued = this.dequeueOwnFrame(route, routeId, options?.correlate);
+      const queued = this.dequeueOwnFrame(route, routeId, options?.correlate, options?.repliesOnly);
       if (queued) return queued;
 
       let frame: StdioFrame;
@@ -339,6 +360,25 @@ export class MakaiStdioClient {
         // Reply to another waiter's outstanding request: park it on that
         // request's reply queue (and poke the waiter if it is queued behind
         // this lock) instead of consuming it off the shared route.
+        this.enqueueRoutableFrame(frame);
+        continue;
+      }
+      if (frameReplyTo !== undefined && options?.correlate !== undefined) {
+        // Reply to a request that is not currently registered — its owner
+        // may simply be between waits (the correlate is retained per frame
+        // wait, not per SDK attempt). A correlated waiter must not consume
+        // it off the shared route even then (§13.3.1): park it with its
+        // replyTo recorded so the owner's next dequeue claims it and other
+        // correlated waiters skip it; uncorrelated waiters keep taking it.
+        this.enqueueRoutableFrame(frame);
+        continue;
+      }
+      if (options?.repliesOnly) {
+        // This waiter's request reply is still outstanding: nothing
+        // uncorrelated on the shared route is its to consume — park the
+        // frame (unmarked; its owner or a drain takes it) and keep waiting.
+        // Parking cannot spin: a replies-only waiter only dequeues entries
+        // whose replyTo equals its correlate.
         this.enqueueRoutableFrame(frame);
         continue;
       }
@@ -384,15 +424,38 @@ export class MakaiStdioClient {
     return this.dequeueRoutedFrame(this.sessionFrameQueues, sessionId);
   }
 
-  /** Dequeues for one waiter: its correlate-keyed reply queue first, then its stream/session queue. */
-  private dequeueOwnFrame(route: "stream" | "session", routeId: string, correlate?: string): StdioFrame | undefined {
+  /**
+   * Dequeues for one waiter: its correlate-keyed reply queue first, then its
+   * stream/session queue. On the shared route a correlated waiter claims the
+   * first entry that is not a reply to a DIFFERENT request — entries parked
+   * with a replyTo (e.g. while their owner was between waits) are skipped
+   * until their owner (or an uncorrelated waiter) takes them; an entry whose
+   * replyTo equals this waiter's correlate is its own parked reply and is
+   * claimed. A replies-only waiter additionally skips entries with no
+   * replyTo: while its request's reply is outstanding nothing uncorrelated
+   * on the route is its to consume.
+   */
+  private dequeueOwnFrame(route: "stream" | "session", routeId: string, correlate?: string, repliesOnly = false): StdioFrame | undefined {
+    this.pruneExpiredRoutedFrames();
     if (correlate !== undefined) {
       const reply = this.dequeueRoutedFrame(this.replyFrameQueues, correlate);
       if (reply) return reply;
     }
-    return route === "stream"
-      ? this.dequeueStreamFrame(routeId)
-      : this.dequeueSessionFrame(routeId);
+    const queues = route === "stream" ? this.streamFrameQueues : this.sessionFrameQueues;
+    const queued = queues.get(routeId);
+    if (!queued || queued.length === 0) return undefined;
+    let index: number;
+    if (correlate === undefined) {
+      index = 0;
+    } else if (repliesOnly) {
+      index = queued.findIndex((entry) => entry.replyTo === correlate);
+    } else {
+      index = queued.findIndex((entry) => entry.replyTo === undefined || entry.replyTo === correlate);
+    }
+    if (index < 0) return undefined;
+    const [entry] = queued.splice(index, 1);
+    if (queued.length === 0) queues.delete(routeId);
+    return entry.frame;
   }
 
   private frameMatchesRoute(frame: StdioFrame, route: "stream" | "session", routeId: string): boolean {
@@ -422,12 +485,12 @@ export class MakaiStdioClient {
     }
     const frameStreamId = typeof frame.stream_id === "string" ? frame.stream_id : undefined;
     if (frameStreamId) {
-      this.enqueueRoutedFrame(this.streamFrameQueues, frameStreamId, frame);
+      this.enqueueRoutedFrame(this.streamFrameQueues, frameStreamId, frame, frameReplyTo);
       return;
     }
     const frameSessionId = typeof frame.session_id === "string" ? frame.session_id : undefined;
     if (frameSessionId) {
-      this.enqueueRoutedFrame(this.sessionFrameQueues, frameSessionId, frame);
+      this.enqueueRoutedFrame(this.sessionFrameQueues, frameSessionId, frame, frameReplyTo);
     }
   }
 
@@ -439,15 +502,15 @@ export class MakaiStdioClient {
    * frame synchronously in its poke continuation.
    */
   private deliverCorrelatedFrame(correlate: string, frame: StdioFrame): void {
-    this.enqueueRoutedFrame(this.replyFrameQueues, correlate, frame);
+    this.enqueueRoutedFrame(this.replyFrameQueues, correlate, frame, correlate);
     const pending = this.correlateDeliveries.get(correlate);
     if (pending && !pending.state.settled) pending.signal();
   }
 
-  private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame): void {
+  private enqueueRoutedFrame(queues: Map<string, StreamQueueEntry[]>, id: string, frame: StdioFrame, replyTo?: string): void {
     this.pruneExpiredRoutedFrames();
     const queued = queues.get(id) ?? [];
-    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs });
+    queued.push({ frame, expiresAt: Date.now() + this.options.streamFrameQueueTtlMs, replyTo });
     queues.set(id, queued);
   }
 

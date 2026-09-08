@@ -1111,14 +1111,20 @@ granted, server eviction), and holds no transcript and no persistence.
    `nextFrameForStream`/`nextFrameForSession`: a wait registered with
    `correlate: M` receives frames whose `in_reply_to` equals `M` (delivered
    promptly even while the waiter is queued behind the transport read lock), a
-   frame replying to another REGISTERED request is parked on that request's
-   reply queue for its owner, and frames without `in_reply_to` — or whose
-   `in_reply_to` matches no registered request — keep stream/session-routed
-   behavior. The SDK registers each attempt's `agent_start` `message_id` for
-   all of its frame waits and additionally rejects a pre-acceptance
-   `agent_started` whose `in_reply_to` names a different request. Re-routing
-   never targets a queue the re-routing waiter itself dequeues from, so a
-   shared route cannot spin (SDK-layer re-enqueueing remains a non-fix).
+   frame replying to another request is parked for its owner — on that
+   request's reply queue when registered, or on the shared route with its
+   `in_reply_to` recorded (claimable by the owner's next correlated wait,
+   skipped by foreign correlated waiters, visible to uncorrelated waiters)
+   during the owner's between-waits gap — and frames without `in_reply_to`
+   keep stream/session-routed behavior. A `repliesOnly` correlated wait
+   additionally parks uncorrelated frames instead of consuming them. The SDK
+   registers each attempt's `agent_start` `message_id` for its frame waits —
+   replies-only until the start is accepted (a pre-acceptance duplicate owns
+   nothing uncorrelated on the route), then the `agent_message` `message_id`
+   once sent — and additionally rejects a pre-acceptance `agent_started`
+   whose `in_reply_to` names a different request. Re-routing never targets a
+   queue the re-routing waiter itself dequeues from, so a shared route cannot
+   spin (SDK-layer re-enqueueing remains a non-fix).
 2. Session-scoped delivery `[current]`: asynchronous run output (`agent_event`,
    `agent_result`, settlement `agent_error`, `tool_execute`) carries no `in_reply_to`
    and is delivered on the session's route. Rule §13.2.4 (one active run per session)
