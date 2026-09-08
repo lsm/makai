@@ -365,6 +365,46 @@ test("replies-only wait skips frames already parked on the session queue", async
   }
 });
 
+test("already-aborted correlated wait rejects without consuming its parked reply", async () => {
+  // The pre-lock fast path must check the AbortSignal before dequeuing: a
+  // call made with an already-aborted signal and a matching parked reply
+  // must reject (leaving the reply for a replacement waiter) instead of
+  // fulfilling.
+  const client = new MakaiStdioClient({
+    command: process.execPath,
+    args: [path.join(sourceFixturesDir, "correlate-server.js")],
+    handshakeTimeoutMs: 5000,
+  });
+
+  await client.connect();
+  try {
+    // A second correlated waiter on the session parks req-x's follow-up
+    // reply (marked) while req-x's owner is between waits.
+    const foreignReader = client.nextFrameForSession("a1", 5000, { correlate: "req-foreign" });
+    const ownerFirst = client.nextFrameForSession("a1", 5000, { correlate: "req-x" });
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-x" });
+    assert.equal((await ownerFirst).in_reply_to, "req-x");
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-x" });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      client.nextFrameForSession("a1", 5000, { correlate: "req-x", signal: controller.signal }),
+      /frame wait for session a1 aborted/,
+    );
+
+    // The parked reply survives for the replacement waiter.
+    const replacement = await client.nextFrameForSession("a1", 5000, { correlate: "req-x" });
+    assert.equal(replacement.in_reply_to, "req-x");
+    // The parking reader is unaffected.
+    client.send({ type: "agent_message", session_id: "a1", message_id: "req-foreign" });
+    assert.equal((await foreignReader).in_reply_to, "req-foreign");
+  } finally {
+    await client.close();
+  }
+});
+
 test("nextFrameForStream evicts late orphaned frames from the shared buffer", async () => {
   const client = new MakaiStdioClient({
     command: process.execPath,

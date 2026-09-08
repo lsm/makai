@@ -273,6 +273,12 @@ export class MakaiStdioClient {
     const correlate = options?.correlate;
     if (correlate !== undefined) this.retainCorrelate(correlate);
     try {
+      if (options?.signal?.aborted) {
+        // An already-abandoned wait must not consume a parked reply a
+        // replacement waiter may need — reject before dequeuing anything,
+        // mirroring the abort checks in the read loop and the poke path.
+        throw new Error(`frame wait for session ${routeId} aborted`);
+      }
       const queued = this.dequeueOwnFrame(route, routeId, correlate, options?.repliesOnly);
       if (queued) return queued;
 
