@@ -469,9 +469,13 @@ class StdioAgentApi implements MakaiAgentApi {
       }
       session.stopped = true;
     }
-    bestEffortStopAgent(this.transport, sessionId, sequence, reason);
+    const stopMessageId = bestEffortStopAgent(this.transport, sessionId, sequence, reason);
     if (options.drain === "quiescent") {
-      return drainSessionFramesUntilQuiescent(this.transport, sessionId);
+      // Correlating the drain's early exit to THIS stop's reply keeps it
+      // draining through terminal-shaped frames that are not ours (the
+      // failure pair's uncorrelated settlement, a stale agent_stopped from
+      // an earlier stop on the same id) — see drainSessionFramesUntilQuiescent.
+      return drainSessionFramesUntilQuiescent(this.transport, sessionId, { stopReplyTo: stopMessageId });
     }
     if (options.drain === "background") {
       drainSessionFrames(this.transport, sessionId);
@@ -634,7 +638,10 @@ class StdioAgentApi implements MakaiAgentApi {
             // quiescent drain — stop, then consume the settlement and any
             // trailing frames — before surfacing the error, so the id is
             // reusable the moment this run settles. The drain is bounded
-            // (~50ms idle window, 250ms hard cap) and cannot throw.
+            // (~50ms idle window, 250ms hard cap), cannot throw, and exits
+            // early only on THIS stop's correlated agent_stopped reply — it
+            // keeps draining through the settlement, which is terminal-
+            // shaped but not a reply to our stop.
             await teardownSession("completed", "quiescent");
             throw new MakaiStreamError(event.message, { kind: "provider_error", code: event.code, provider_id: event.provider_id });
           }

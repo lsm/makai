@@ -7,6 +7,7 @@ import {
   createMakaiAgentApi,
   createMakaiClient,
   createMakaiProviderApi,
+  drainSessionFramesUntilQuiescent,
   MakaiStdioClient,
   MakaiAuthRequiredError,
   MakaiProtocolError,
@@ -2671,6 +2672,40 @@ test("client.agent.run auth-retry attempt with a lost start reply still stops it
     await handle.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("session teardown drain consumes terminal-shaped frames before the current stop's reply (#205)", async () => {
+  // Codex P1 on PR #208: the quiescent drain exited on ANY agent_error /
+  // agent_stopped, so the failure pair's uncorrelated settlement ended the
+  // drain before the CURRENT stop's agent_stopped reply was consumed. That
+  // stale reply could then terminate a later same-id run's drain early,
+  // leaving its trailing agent_end for a subsequent run to claim as its own
+  // completion. The early exit must key on the reply's in_reply_to naming
+  // the current stop only.
+  const sessionId = "testNanoIdSess1234567";
+  const frames: StdioFrame[] = [
+    // The failure pair's settlement: terminal-shaped, but NOT a reply to the stop.
+    { type: "agent_error", session_id: sessionId, message_id: "m-settlement", sequence: 4, timestamp: 1, version: 1, payload: { code: "internal_error", message: "fixture loop failure" } },
+    // A stale agent_stopped replying to an EARLIER stop on the same id.
+    { type: "agent_stopped", session_id: sessionId, message_id: "m-stale", sequence: 9, timestamp: 1, version: 1, in_reply_to: "earlier-stop-message-id", payload: {} },
+    // The current stop's reply — the only frame that may end the drain early.
+    { type: "agent_stopped", session_id: sessionId, message_id: "m-current", sequence: 9, timestamp: 1, version: 1, in_reply_to: "current-stop-message-id", payload: {} },
+  ];
+  const consumed: string[] = [];
+  const transport = {
+    nextFrameForSession: async (sid: string, timeoutMs?: number) => {
+      const frame = frames.shift();
+      if (!frame) throw new Error(`timed out waiting for frame for session ${sid} after ${timeoutMs ?? 1000}ms`);
+      consumed.push(String(frame.type));
+      return frame;
+    },
+  };
+  await drainSessionFramesUntilQuiescent(transport as never, sessionId, { stopReplyTo: "current-stop-message-id" }, 20, 500);
+  // All three frames were consumed: the settlement and the stale reply did
+  // not end the drain (pre-fix it stopped at the settlement, leaving the
+  // stale and current stop replies queued for later runs to trip over).
+  assert.deepEqual(consumed, ["agent_error", "agent_stopped", "agent_stopped"]);
+  assert.equal(frames.length, 0);
 });
 
 test("client.agent.run drains the failure pair's settlement before the error surfaces, so an immediate same-id run is not poisoned (#205)", async () => {
