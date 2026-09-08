@@ -1043,8 +1043,10 @@ granted, server eviction), and holds no transcript and no persistence.
    distinct outcomes: a run executing against a provider is pumped to completion
    and its settlement frames are still drained to stdout — stdin and stdout are
    independent pipes, so a client that closed only its write side but keeps
-   reading still receives them (lost only when the read side is gone); a run
-   WAITING on a distributed
+   reading still receives them (lost only when the read side is gone), and only
+   until the run needs client input: a provider turn that returns
+   `stop_reason = tool_use` after EOF moves the run into the tool-waiting case;
+   a run WAITING on a distributed
    `tool_result` cannot complete — the tool host is the disconnected client, the
    tool wait polls with no EOF-triggered cancel, and the host loop never sees the
    run go idle — so the process (and every session it owns) stays alive
@@ -1060,8 +1062,10 @@ granted, server eviction), and holds no transcript and no persistence.
    `message_id` equals that `in_reply_to` — not merely to any waiter on the session.
    Current state: the server sets `in_reply_to` on all synchronous replies, but the
    TS transport routes frames per session id only; the SDK applies `in_reply_to`
-   correlation itself, and only in the pre-acceptance window (before its own
-   `agent_start` is accepted). #201 tracks the general rule in the transport.
+   correlation itself, only in the pre-acceptance window (before its own
+   `agent_start` is accepted), and only for `nack`/`agent_error` frames — an
+   `agent_started` reply is accepted without correlation. #201 tracks the general
+   rule in the transport.
 2. Session-scoped delivery `[current]`: asynchronous run output (`agent_event`,
    `agent_result`, settlement `agent_error`, `tool_execute`) carries no `in_reply_to`
    and is delivered on the session's route. Rule §13.2.4 (one active run per session)
@@ -1077,8 +1081,12 @@ granted, server eviction), and holds no transcript and no persistence.
    `agent_busy` `agent_error` AFTER its own start was accepted (the SDK's
    `in_reply_to` correlation covers only the pre-acceptance window), treat it as
    its own failure, and tear the legitimate session down — cancelling the live
-   run. Both failure modes (the duplicate timing out; the established run being
-   destroyed) are what #201 fixes.
+   run. And because `agent_started` acceptance is uncorrelated (§13.3.1), the
+   rejected duplicate can instead consume the ESTABLISHED call's `agent_started`,
+   mark its own start accepted, and submit its `agent_message` under the session
+   while the established call never sees its reply — the wrong request can
+   execute. All of these modes (the duplicate timing out; the established run
+   being destroyed; the wrong request proceeding) are what #201 fixes.
 4. Tool side channel `[current]`: `tool_execute` is delivered on the session route;
    `tool_result` replies carry `in_reply_to` referencing the `tool_execute`
    `message_id` but are intercepted by the stdio host before the agent protocol
@@ -1160,12 +1168,15 @@ granted, server eviction), and holds no transcript and no persistence.
 6. Transport death `[current]`: process exit before settlement is failure, never
    success — the client transport rejects all pending frame waits on exit, and no
    result is fabricated for an unsettled run. Stdin EOF splits by run state
-   (§13.2.7): a provider-executing run is pumped to settlement and its frames are
-   still drained to stdout — stdin and stdout are independent pipes, so a client
-   that closed only its write side but keeps reading CAN receive its settlement
-   (a delivered settlement is not a transport failure, and a client MUST NOT retry
-   a run it already saw settle); the frames are lost only when the read side is
-   gone or the process dies. A run waiting on a distributed `tool_result` produces
+   (§13.2.7): a provider-executing run is pumped toward settlement and its frames
+   are still drained to stdout — stdin and stdout are independent pipes, so a
+   client that closed only its write side but keeps reading CAN receive its
+   settlement (a delivered settlement is not a transport failure, and a client
+   MUST NOT retry a run it already saw settle); the frames are lost only when the
+   read side is gone or the process dies. This holds only while the run needs no
+   further client input: if the in-flight provider turn returns
+   `stop_reason = tool_use` after EOF, the run transitions into the tool-waiting
+   case below and produces no terminal. A run waiting on a distributed `tool_result` produces
    NO terminal at all — the server process hangs (#204 gap 4) and only the
    client's response timeout surfaces an error. In every case an unsettled run is
    never a success; recovery is retry with full context (§12).
