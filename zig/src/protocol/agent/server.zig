@@ -45,39 +45,6 @@ pub const ProviderModelsDelegateFn = *const fn (
 /// send `agent_stop` do not accumulate for the process lifetime (#202).
 pub const default_session_idle_ttl_ms: u64 = 30 * 60 * 1_000;
 
-pub const Options = struct {
-    /// Idle-session TTL in milliseconds (spec §13.2.6 rule 6): a sweep
-    /// (`evictIdleSessions`/`evictNextIdleSession`) removes sessions whose
-    /// last activity is strictly older than this. Last activity is inbound
-    /// (`agent_message` acceptance, `agent_status` poll) or server-side run
-    /// publication (`agent_event`, `agent_result`, `agent_error`); sessions
-    /// with an in-flight run (status `.processing`) are never evicted.
-    /// Defaults to `default_session_idle_ttl_ms`; `0` disables eviction
-    /// (sessions live until `agent_stop` or process exit).
-    session_idle_ttl_ms: u64 = default_session_idle_ttl_ms,
-    /// Explicit kill-switch for the model catalog feature. When `false`,
-    /// `models_request` always returns a `not_implemented` nack regardless of
-    /// whether a delegate is configured.
-    ///
-    /// NOTE: this flag alone does not advertise the capability. A
-    /// `models_request` is only answered with a `models_response` when BOTH
-    /// `supports_model_catalog == true` AND `provider_models_delegate != null`.
-    /// All four combinations resolve as follows:
-    ///   * supports=true,  delegate=set  -> delegate is invoked.
-    ///   * supports=true,  delegate=null -> `not_implemented` nack (default).
-    ///   * supports=false, delegate=set  -> `not_implemented` nack (kill-switch).
-    ///   * supports=false, delegate=null -> `not_implemented` nack.
-    /// In other words, the default-constructed server is a NO-OP responder
-    /// until a delegate is wired; flipping this flag is only meaningful when
-    /// callers want to disable an otherwise-configured delegate at runtime.
-    supports_model_catalog: bool = true,
-    /// Provider-protocol passthrough for model discovery. When null, the agent
-    /// server replies with `not_implemented` to advertise capability absence.
-    provider_models_delegate: ?ProviderModelsDelegateFn = null,
-    /// Opaque context passed to `provider_models_delegate`.
-    provider_models_ctx: ?*anyopaque = null,
-};
-
 pub const AgentProtocolServer = struct {
     allocator: std.mem.Allocator,
     sessions: std.AutoHashMap(agent_types.SessionId, SessionState),
@@ -88,6 +55,39 @@ pub const AgentProtocolServer = struct {
     options: Options,
 
     const Self = @This();
+
+    pub const Options = struct {
+        /// Idle-session TTL in milliseconds (spec §13.2.6 rule 6): a sweep
+        /// (`evictIdleSessions`/`evictNextIdleSession`) removes sessions whose
+        /// last activity is strictly older than this. Last activity is inbound
+        /// (`agent_message` acceptance, `agent_status` poll) or server-side run
+        /// publication (`agent_event`, `agent_result`, `agent_error`); sessions
+        /// with an in-flight run (status `.processing`) are never evicted.
+        /// Defaults to `default_session_idle_ttl_ms`; `0` disables eviction
+        /// (sessions live until `agent_stop` or process exit).
+        session_idle_ttl_ms: u64 = default_session_idle_ttl_ms,
+        /// Explicit kill-switch for the model catalog feature. When `false`,
+        /// `models_request` always returns a `not_implemented` nack regardless of
+        /// whether a delegate is configured.
+        ///
+        /// NOTE: this flag alone does not advertise the capability. A
+        /// `models_request` is only answered with a `models_response` when BOTH
+        /// `supports_model_catalog == true` AND `provider_models_delegate != null`.
+        /// All four combinations resolve as follows:
+        ///   * supports=true,  delegate=set  -> delegate is invoked.
+        ///   * supports=true,  delegate=null -> `not_implemented` nack (default).
+        ///   * supports=false, delegate=set  -> `not_implemented` nack (kill-switch).
+        ///   * supports=false, delegate=null -> `not_implemented` nack.
+        /// In other words, the default-constructed server is a NO-OP responder
+        /// until a delegate is wired; flipping this flag is only meaningful when
+        /// callers want to disable an otherwise-configured delegate at runtime.
+        supports_model_catalog: bool = true,
+        /// Provider-protocol passthrough for model discovery. When null, the agent
+        /// server replies with `not_implemented` to advertise capability absence.
+        provider_models_delegate: ?ProviderModelsDelegateFn = null,
+        /// Opaque context passed to `provider_models_delegate`.
+        provider_models_ctx: ?*anyopaque = null,
+    };
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return initWithOptions(allocator, .{});
