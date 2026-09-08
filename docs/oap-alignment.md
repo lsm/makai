@@ -62,7 +62,8 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | capability negotiation (revisioned descriptors) | implicit probing (`not_implemented` nack) | deviating: no negotiated capabilities | Spec §9. Adapters synthesize OAP capability revisions from probe results + policy, as the ACP ledger does. |
 | delivery modes `queue`/`steer`/`btw` | none — `agent_busy` on concurrent delivery | absent by design | §13.2.4; OAP optional units, unavailable here. |
 | envelope shape | flat envelope: `version`, `type`, `session_id`, `message_id`, `sequence`, `in_reply_to`, `timestamp`, `payload` | aligned structurally | OAP's envelope adds `protocol`/`profile` strings and scope fields (`run_id`, `turn_id`, …) makai does not carry; mapping is mechanical for the adapter. |
-| EOF/process exit before settlement | transport rejects pending frame waits; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule. |
+| process exit before settlement | transport rejects all pending frame waits; no fabricated result | aligned | "Failure, never success" — §13.4.6, matching the ACP ledger's process-exit rule. |
+| stdin EOF while a run waits on a distributed `tool_result` | server process stays alive; the client observes silence until its response timeout | deviating: tracked (#204 gap 4) | The tool wait has no EOF-triggered cancel (`makai.zig` `executeStdioToolViaAgentProtocol` polls until result or run-cancel), so the process and its sessions hang indefinitely (§13.2.7); client frame waits are rejected only on process exit, so this case surfaces as timeout, not a prompt terminal. |
 
 ## P0 makai follow-ups (queued)
 

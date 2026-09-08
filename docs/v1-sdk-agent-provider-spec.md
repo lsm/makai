@@ -918,7 +918,7 @@ even when their string values happen to coincide.
 
 | Domain | Wire format | Carried by | Role |
 | --- | --- | --- | --- |
-| Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_message`/`agent_stop`/`agent_status`; payload `resume_session_id` on `agent_start` | Session-container key and frame-correlation scope ONLY |
+| Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_message`/`agent_stop`/`agent_status`; payload `resume_session_id` on `agent_start` | Session-container key and frame-correlation scope ONLY (see the `agent_start` id-allocation exception below) |
 | Envelope message | 26-char Crockford Base32 ULID (§3.1) | envelope `message_id`; envelope `in_reply_to` | Per-envelope identity; request/reply correlation |
 | Ordering | `u64` | envelope `sequence` | Per-direction, per-session monotonic ordering — never an identity |
 | Provider stream / auth flow | 26-char ULID | `stream_id` / `flow_id` on provider/auth frames of the same connection | Adjacent protocol domains; never valid agent-domain identifiers despite the shared format |
@@ -955,8 +955,13 @@ Rules:
   Outbound `[current]`: emitted frames come in two classes. Allocated frames
   (`agent_started`, `agent_stopped`, `ack`, `nack`, `models_response`, `agent_event`,
   `agent_result`, settlement `agent_error`, `tool_execute`) draw from one monotonic
-  per-session
-  counter. Echo replies (`session_info`, `pong`, `tool_list_response`) copy the
+  per-session counter — scoped to the session-container REGISTRATION, not the id
+  string: `agent_start` initializes the counter to 0 (overwriting any numbers the
+  id consumed for `models_request`s issued before the start), and an id
+  re-registered after a stop restarts it, so sequence values may repeat across
+  registrations of the same id. Consumers MUST treat the outbound counter as
+  per-registration. Echo replies (`session_info`, `pong`, `tool_list_response`)
+  copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
   (outside the ordering domain). Consumers MUST NOT order echo replies against
@@ -964,8 +969,14 @@ Rules:
   per-session counter (uniform outbound ordering) is the open decision in #204; until
   it is resolved, the split above is the contract.
 - When a scoped identifier appears in both the envelope and the payload of one frame,
-  the values MUST agree (OAP rule). On `agent_start` the envelope `session_id` and the
-  payload key select the same session-container key. Enforcement is
+  the values MUST agree (OAP rule). On `agent_start` — when the payload id is
+  present — the envelope `session_id` and the payload key select the same
+  session-container key (the SDK always sends them equal). Exception
+  `[current]`: when `agent_start` OMITS the payload id, the request envelope's
+  `session_id` is ignored — the server generates the container id and returns it in
+  `agent_started` (both its envelope `session_id` and payload). Consumers MUST adopt
+  the id from `agent_started` and MUST NOT assume their request envelope id became
+  the session key. Enforcement of the agreement rule is
   `[planned — #204]`: today the server keys all session handlers on the payload id
   and does not compare the envelope id, so agreement is a client convention, not a
   server-checked invariant; #204 adds the `invalid_request` rejection for mismatches.
