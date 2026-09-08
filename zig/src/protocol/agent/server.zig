@@ -574,7 +574,11 @@ pub const AgentProtocolServer = struct {
     /// rescanning per removal would cost one full pass per expired session
     /// when many expire together — time the single pump thread cannot
     /// spare). Only the ids this call appended are removed, so callers may
-    /// reuse the list across sweeps.
+    /// reuse the list across sweeps. If collecting exhausts the allocator,
+    /// the batch collected so far is STILL evicted before the error
+    /// propagates — dropping it would wedge the sweep under the very memory
+    /// pressure eviction exists to relieve; the error signals an incomplete
+    /// sweep, and the next sweep retries what remains.
     pub fn evictIdleSessions(
         self: *Self,
         now_mono_ms: i64,
@@ -584,6 +588,7 @@ pub const AgentProtocolServer = struct {
         const ttl_ms = self.options.session_idle_ttl_ms;
 
         const first_new = evicted_out.items.len;
+        var collect_err: ?anyerror = null;
         var it = self.sessions.iterator();
         while (it.next()) |entry| {
             const session = entry.value_ptr;
@@ -596,12 +601,18 @@ pub const AgentProtocolServer = struct {
                 @intCast(now_mono_ms - session.last_activity_ms)
             else
                 0;
-            if (idle_ms > ttl_ms) try evicted_out.append(self.allocator, entry.key_ptr.*);
+            if (idle_ms > ttl_ms) {
+                evicted_out.append(self.allocator, entry.key_ptr.*) catch |err| {
+                    collect_err = err;
+                    break;
+                };
+            }
         }
 
         for (evicted_out.items[first_new..]) |session_id| {
             _ = self.removeSession(session_id);
         }
+        if (collect_err) |err| return err;
         return evicted_out.items.len - first_new;
     }
 
