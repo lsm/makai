@@ -708,9 +708,9 @@ Normative rule: provider protocol remains canonical source; agent protocol passt
 
 ### 6.1 Agent Session Teardown (Normative)
 
-The server removes an agent session only on `agent_stop`; as of this revision there is no TTL and no terminal-state eviction (V1.1 §13.2 grants servers eviction rights; the idle-TTL requirement is tracked in #202). Session teardown is therefore client-owned:
+The server removes an agent session on `agent_stop` and, since the #202 idle-TTL eviction landed, on idleness past the configured TTL (§13.2.6 rule 6 — default 30 minutes, sessions with in-flight runs exempt, evicted ids indistinguishable from stopped ones). Session teardown is therefore client-owned for well-behaved clients, with server eviction as the backstop for abandoned ones:
 
-- A client that uses one session per run (start → message → result) MUST send `agent_stop` when a run it owns reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered for the process lifetime and its id is permanently rejected on reuse (`agent_busy`). The mandate is bounded by ownership: a client MUST NOT stop a session its own `agent_start` did not establish — in particular, a start rejected with `agent_busy` means the id belongs to another live run, and a stop carrying the live session's expected sequence would remove and cancel that unrelated run. If the start's outcome is unknowable (reply lost, timeout), stopping is NOT unconditionally safe: the id may have been registered by another caller whose start won the race (ours rejected `agent_busy` with the reply lost), and that owner's fresh pre-message session also expects inbound sequence 2 — a sequence-2 stop is then ACCEPTED and destroys the owner's session. A client MAY stop on an unknown start outcome only with positive evidence the start was its own, and until generation tokens exist (#204) only ONE form is sufficient: an exclusive client-generated id that no other caller could have supplied AND that this client has not since allowed to be removed and re-registered. A request-correlated `agent_started` (`in_reply_to` naming its own start) proves ownership of the registration that request created, NOT that the same registration still occupies the id when the delayed reply is finally observed — if the id was stopped and re-registered in between (§13.4.5), the buffered correlated reply authorizes a sequence-2 stop against the NEW pre-message session; it qualifies only with generation proof. Session-scoped run output does NOT qualify at all (it carries no `in_reply_to`, §13.3.2, and on a colliding id may belong to the caller that won). Otherwise it SHOULD NOT stop: today the un-stopped session stays registered for the process lifetime — no eviction exists until #202 lands (§13.2.6), so repeated timeouts accumulate leaked sessions — still strictly preferable to destroying another caller's live session; the leak becomes bounded only once eviction ships. This ownership guard is `[current — #205]`: the TS SDK settles the teardown tracker WITHOUT sending when an attempt ends without any reply to its own `agent_start` (timeout, lost reply, abort inside the start window) and the id was caller-supplied — a client-generated id keeps the unconditional stop (the one sufficient pre-#204 evidence), and any request-correlated reply to the start (`agent_started`, `nack`, or `agent_error` reaching the attempt's own correlation) resolves the start's outcome and restores the normal teardown; a correlated `agent_busy` still settles without stopping via the foreign-session guard. Ownership-safe teardown of unknown-outcome starts ultimately requires request-scoped ownership (a generation token on `agent_started`), tracked with the §13.4.5 reuse race in #204.
+- A client that uses one session per run (start → message → result) MUST send `agent_stop` when a run it owns reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered until the idle TTL evicts it (§13.2.6 rule 6) — or for as long as continued activity keeps refreshing the TTL — and its id is rejected on reuse (`agent_busy`) for exactly as long as it stays registered. The mandate is bounded by ownership: a client MUST NOT stop a session its own `agent_start` did not establish — in particular, a start rejected with `agent_busy` means the id belongs to another live run, and a stop carrying the live session's expected sequence would remove and cancel that unrelated run. If the start's outcome is unknowable (reply lost, timeout), stopping is NOT unconditionally safe: the id may have been registered by another caller whose start won the race (ours rejected `agent_busy` with the reply lost), and that owner's fresh pre-message session also expects inbound sequence 2 — a sequence-2 stop is then ACCEPTED and destroys the owner's session. A client MAY stop on an unknown start outcome only with positive evidence the start was its own, and until generation tokens exist (#204) only ONE form is sufficient: an exclusive client-generated id that no other caller could have supplied AND that this client has not since allowed to be removed and re-registered. A request-correlated `agent_started` (`in_reply_to` naming its own start) proves ownership of the registration that request created, NOT that the same registration still occupies the id when the delayed reply is finally observed — if the id was stopped and re-registered in between (§13.4.5), the buffered correlated reply authorizes a sequence-2 stop against the NEW pre-message session; it qualifies only with generation proof. Session-scoped run output does NOT qualify at all (it carries no `in_reply_to`, §13.3.2, and on a colliding id may belong to the caller that won). Otherwise it SHOULD NOT stop: today the un-stopped session stays registered until the idle TTL evicts it (§13.2.6 rule 6) — repeated timeouts accumulate leaked sessions only until the TTL expires — still strictly preferable to destroying another caller's live session; the leak is bounded by eviction. This ownership guard is `[current — #205]`: the TS SDK settles the teardown tracker WITHOUT sending when an attempt ends without any reply to its own `agent_start` (timeout, lost reply, abort inside the start window) and the id was caller-supplied — a client-generated id keeps the unconditional stop (the one sufficient pre-#204 evidence), and any request-correlated reply to the start (`agent_started`, `nack`, or `agent_error` reaching the attempt's own correlation) resolves the start's outcome and restores the normal teardown; a correlated `agent_busy` still settles without stopping via the foreign-session guard. Ownership-safe teardown of unknown-outcome starts ultimately requires request-scoped ownership (a generation token on `agent_started`), tracked with the §13.4.5 reuse race in #204.
 - The stop MUST carry the session's next expected inbound sequence (start=1, message=2, then one per follow-up message); out-of-order stops are rejected and leave the session registered. Tool-result replies do not consume inbound sequence numbers.
 - `reason` is a free-form string; the TS SDK sends `"completed"` for terminal and error teardown and `"client aborted"` for signal aborts.
 - After a successful stop, clients SHOULD drain remaining per-session frames: the server queues a terminal `agent_end` event after the `agent_result` frame, and a later run reusing the session id would otherwise consume that stale frame as its first frame.
@@ -1019,8 +1019,8 @@ Rules:
 
 A session is a server-side, in-memory container of agent execution state (status,
 resolved model, config, system prompt, message counter, timestamps) keyed by its
-session id. It is created by `agent_start`, destroyed by `agent_stop` (or, once
-granted, server eviction), and holds no transcript and no persistence.
+session id. It is created by `agent_start`, destroyed by `agent_stop` or by
+server eviction (rule 6), and holds no transcript and no persistence.
 
 1. Creation `[current]`: `agent_start` allocates the session id — the payload id when
    supplied, else a server-generated NanoID — and registers the container in state
@@ -1043,28 +1043,38 @@ granted, server eviction), and holds no transcript and no persistence.
 4. One active run per session `[current]`: an `agent_message` against a session in
    `.processing` is rejected with `agent_busy` ("session already processing a
    message"). V1 defines no queueing, steering, or side-channel delivery.
-5. Teardown `[current, extends §6.1]`: `agent_stop` is the only session removal path;
-   a validated stop also cancels the session's in-flight run and discards its pending
-   tool work. The §6.1 client mandate (stop on terminal/error/abandon, bounded by
-   ownership) is normative for one-run-per-session clients.
-6. Eviction rights `[planned — #202]`: servers are granted the right to evict
-   sessions, with these semantics:
-   - Idle TTL: a server MUST evict sessions idle longer than a configurable TTL with
-     a defined non-zero default. Idleness is measured from the session's last
-     activity — inbound (message, stop, status) OR server-side run activity (event
-     or settlement publication) — and a session with an in-flight run is NEVER
-     idle, so a long-running turn or tool execution cannot be evicted out from
-     under its run. Settlement publication resets the idle clock (it is the final
-     activity of a completed run): a settled multi-message session is
-     idle-but-alive with a full TTL ahead of it, by design (rule 3) — settlement
-     never evicts; it only starts the idle interval.
-   - Resource caps: a server MAY additionally bound registered sessions and evict
-     least-recently-active entries. Cap eviction, like the TTL, selects ONLY among
-     sessions without in-flight runs — a session with a live run is never
-     cap-evicted; if no idle candidate exists, the server surfaces the pressure by
-     rejecting new `agent_start`s (`agent_busy` or a resource error) rather than
-     cancelling live work. The cancel-on-eviction mandate below covers only the
-     race where a run's admission interleaves with the eviction decision.
+5. Teardown `[current, extends §6.1]`: `agent_stop` is the only CLIENT-initiated
+   session removal path (server-initiated idle eviction is rule 6); a validated stop
+   also cancels the session's in-flight run and discards its pending tool work.
+   The §6.1 client mandate (stop on terminal/error/abandon, bounded by ownership)
+   is normative for one-run-per-session clients.
+6. Eviction rights `[current — #202]`: servers evict sessions idle longer than
+   a configurable TTL, with these semantics:
+   - Idle TTL `[current]`: the server evicts sessions idle longer than a
+     configurable TTL with a defined non-zero default (30 minutes;
+     `AgentProtocolServer.Options.session_idle_ttl_ms`, `0` disables; the stdio
+     host exposes it as `MAKAI_AGENT_SESSION_IDLE_TTL_MS`). Idleness is measured
+     from the session's last activity — inbound (`agent_message` acceptance,
+     `agent_status` poll; stop removes the session outright) OR server-side run
+     activity (`agent_event` or settlement publication) — and a session with an
+     in-flight run (status `.processing`) is NEVER idle, so a long-running turn
+     or tool execution cannot be evicted out from under its run. Settlement
+     publication resets the idle clock (it is the final activity of a completed
+     run): a settled multi-message session is idle-but-alive with a full TTL
+     ahead of it, by design (rule 3) — settlement never evicts; it only starts
+     the idle interval.
+   - Resource caps `[planned — optional]`: a server MAY additionally bound
+     registered sessions and evict least-recently-active entries. Cap eviction,
+     like the TTL, selects ONLY among sessions without in-flight runs — a
+     session with a live run is never cap-evicted; if no idle candidate exists,
+     the server surfaces the pressure by rejecting new `agent_start`s
+     (`agent_busy` or a resource error) rather than cancelling live work. Not
+     implemented in v1.1. Process-per-connection hosting scopes sessions to one
+     client connection (ownership and lifetime end with the process) but does
+     NOT bound their count: a single client may register arbitrarily many
+     distinct sessions within the TTL, so the cap remains the (unimplemented)
+     backstop for that growth — the TTL bounds how long leaked sessions live,
+     not how many can accumulate.
    - An evicted session's next session-scoped request other than `agent_start`
      (`agent_message`, `agent_stop`, `agent_status`) receives the existing
      `agent_not_found` error ("session not found") — identical to an unknown or
@@ -1077,9 +1087,20 @@ granted, server eviction), and holds no transcript and no persistence.
      by #204's generation/tombstone tokens, or by deferring removal or
      re-registration of the id until the cancelled run's publications have ceased.
      The client-side drain discipline from §6.1 does NOT apply here — the client
-     cannot observe the eviction in time — so eviction (#202) MUST NOT ship
-     without one of these server-side protections for this race.
-   - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
+     cannot observe the eviction in time. `[current]` The shipped TTL eviction
+     closes the race by construction: admission sets `.processing` synchronously
+     before accepting, admission and the sweep run serialized on the host's
+     single pump thread, and the stdio run pump already cancels any run whose
+     session disappeared (the `agent_stop` path) with post-removal publications
+     surfacing as swallowed `SessionNotFound` no-ops — so a session is either
+     `.processing` (never selected for eviction) or removed before its message
+     arrives (no run admitted). Multi-threaded hosts must preserve this
+     serialization before sweeping; the generation/tombstone tokens remain
+     tracked in #204 for the stopped-or-evicted-id reuse race (§13.4.5).
+     Idleness is measured on the host's monotonic clock — wall-clock
+     adjustments (NTP steps, snapshot restores) neither evict fresh sessions
+     nor strand stale ones; the wall-clock `updated_at` remains
+     protocol-reporting only.
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
    by the connection. Disconnect does not cancel in-flight work in V1, with two
@@ -1097,9 +1118,9 @@ granted, server eviction), and holds no transcript and no persistence.
    tool wait polls with no EOF-triggered cancel, and the host loop never sees the
    run go idle — so the process (and every session it owns) stays alive
    indefinitely until killed. EOF-triggered cancellation of active runs is tracked
-   with the disconnect-cleanup family in #202/#204. Future multi-connection hosts
+   with the disconnect-cleanup family in #204. Future multi-connection hosts
    MUST scope sessions to their owning connection (rule 2) and evict on disconnect
-   (#202).
+   (beyond the idle TTL of rule 6; per-connection ownership is not built yet).
 
 ### 13.3 Frame Routing (Normative)
 
@@ -1307,7 +1328,15 @@ granted, server eviction), and holds no transcript and no persistence.
 5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
    stays alive until its provider stream drains. If a new `agent_start` re-registers
    the same id before then, late frames from the old run can publish into the new
-   container, and the new run — already ADMITTED (its `agent_message` was accepted
+   container — the same confusion holds when the OLD registration's output is merely
+   still buffered downstream (outbox, pipe, stdout) while the id is re-registered
+   after eviction (§13.2.6 rule 6): async `agent_result`/`agent_event` frames carry
+   no generation or request correlation, so a consumer attributes them to whichever
+   registration currently occupies the id. Eviction does not widen this race (it
+   fires only after a full TTL of no activity, versus a stop's immediate reuse
+   window), and the same #204 generation/tombstone closes it for stopped AND
+   evicted ids alike. The new
+   run — already ADMITTED (its `agent_message` was accepted
    and enqueued against the re-created session) — fails at run start with an
    `internal_error` settlement: the run-start path refuses to double-start the id
    and the failure surfaces as the loop-error settlement pair (§13.4.2), not as a

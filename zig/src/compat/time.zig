@@ -51,6 +51,15 @@ pub fn monotonicNanos() !u64 {
     return @intCast(monotonic_origin.?.durationTo(now).nanoseconds);
 }
 
+/// Monotonic milliseconds suitable for TTL/idle age math.
+///
+/// Differences of these readings are immune to wall-clock adjustments (NTP
+/// steps, snapshot restores), unlike `nowMillis`. See `monotonicNanos` for
+/// the shared-origin guarantee.
+pub fn monotonicMillis() !i64 {
+    return @intCast(try monotonicNanos() / std.time.ns_per_ms);
+}
+
 /// Sleep for a number of nanoseconds.
 ///
 /// Routes through the Makai default I/O context timeout/sleep primitive while
@@ -70,11 +79,13 @@ test "compat time helpers return expected public types" {
     const seconds: i64 = nowSeconds();
     const nanos: i64 = nowNanos();
     const monotonic: u64 = try monotonicNanos();
+    const monotonic_ms: i64 = try monotonicMillis();
 
     _ = millis;
     _ = seconds;
     _ = nanos;
     _ = monotonic;
+    _ = monotonic_ms;
 }
 
 test "compat time helpers return plausible wall-clock timestamps" {
