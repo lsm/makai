@@ -920,7 +920,7 @@ even when their string values happen to coincide.
 | --- | --- | --- | --- |
 | Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_message`/`agent_stop`/`agent_status`; payload `resume_session_id` on `agent_start` | Session-container key and frame-correlation scope ONLY (see the `agent_start` id-allocation exception below) |
 | Envelope message | 26-char Crockford Base32 ULID (§3.1) | envelope `message_id`; envelope `in_reply_to` | Per-envelope identity; request/reply correlation |
-| Ordering | `u64` | envelope `sequence` | Per-direction, per-session monotonic ordering — never an identity |
+| Ordering | `u64` | envelope `sequence` | Per-direction, per-session ALLOCATION counter — never an identity; observed wire order can interleave and echo/validation frames do not participate (see rules) |
 | Provider stream / auth flow | 26-char ULID | `stream_id` / `flow_id` on provider/auth frames of the same connection | Adjacent protocol domains; never valid agent-domain identifiers despite the shared format |
 | Tool call | provider-originated string | payload `tool_call_id` on `tool_execute`/`tool_result` and tool-execution events | Correlates one in-flight tool execution; uniqueness not enforced session-wide (see rules) |
 
