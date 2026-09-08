@@ -1069,9 +1069,13 @@ granted, server eviction), and holds no transcript and no persistence.
    `agent_busy` ("session already exists") and a message against the processing
    session with `agent_busy` ("session already processing a message"). A client that
    receives `agent_busy` MUST treat the attempt as rejected and MUST NOT stop the
-   session (it is not the attempt's to stop — §6.1); the defect that the rejection may
-   reach the wrong waiter late (surfacing as a response timeout) is exactly what #201
-   fixes.
+   session (it is not the attempt's to stop — §6.1). The routing defect is worse
+   than a delayed rejection: the established call can consume the duplicate's
+   `agent_busy` `agent_error` AFTER its own start was accepted (the SDK's
+   `in_reply_to` correlation covers only the pre-acceptance window), treat it as
+   its own failure, and tear the legitimate session down — cancelling the live
+   run. Both failure modes (the duplicate timing out; the established run being
+   destroyed) are what #201 fixes.
 4. Tool side channel `[current]`: `tool_execute` is delivered on the session route;
    `tool_result` replies carry `in_reply_to` referencing the `tool_execute`
    `message_id` but are intercepted by the stdio host before the agent protocol
@@ -1091,7 +1095,9 @@ granted, server eviction), and holds no transcript and no persistence.
    correlated rejection (the receipt-less admission is a ledger deviation). A
    start rejected before admission (`agent_busy`, invalid sequence, `nack`) never
    admits. Admission is not settlement.
-2. Settlement `[current]`: exactly one settlement frame settles an admitted run:
+2. Settlement `[current]`: exactly one settlement frame settles an admitted run
+   that reaches its own outcome — a run cancelled by `agent_stop` produces no run
+   settlement frame at all (§13.4.4):
    - success: the `agent_result` frame (or provider-shaped `result`/`complete_response`
      frame). This is the settlement frame for BOTH consumption modes: the SDK's
      `stream()` projects the `agent_result` frame into its terminal `agent_end` event
@@ -1138,16 +1144,24 @@ granted, server eviction), and holds no transcript and no persistence.
 5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
    stays alive until its provider stream drains. If a new `agent_start` re-registers
    the same id before then, late frames from the old run can publish into the new
-   container, and the new run can be rejected `agent_busy` against the still-active
-   old one. Draining (§6.1) narrows but does not eliminate this; a session
+   container, and the new run — already ADMITTED (its `agent_message` was accepted
+   and enqueued against the re-created session) — fails at run start with an
+   `internal_error` settlement: the run-start path refuses to double-start the id
+   and the failure surfaces as the loop-error settlement pair (§13.4.2), not as a
+   request-level `agent_busy` rejection. Draining (§6.1) narrows but does not
+   eliminate this; a session
    generation/tombstone (#204) is required before immediate id reuse can be
    considered safe. Until then, clients that reuse an explicit id after a stop
    SHOULD drain quiescent first (§6.1) and accept the residual race, or use a fresh
    id.
-6. Transport death `[current]`: EOF or process exit before settlement is failure,
-   never success. The client transport rejects all pending frame waits on process
-   exit; no result is fabricated for an unsettled run. Recovery is retry with full
-   context (§12).
+6. Transport death `[current]`: process exit before settlement is failure, never
+   success — the client transport rejects all pending frame waits on exit, and no
+   result is fabricated for an unsettled run. Stdin EOF splits by run state
+   (§13.2.7): a provider-executing run is pumped to settlement and written to the
+   dead pipe (failure under this rule), while a run waiting on a distributed
+   `tool_result` produces NO terminal at all — the server process hangs (#204 gap
+   4) and only the client's response timeout surfaces an error. In every case an
+   unsettled run is never a success; recovery is retry with full context (§12).
 
 ### 13.5 Load, Resume, and Replay Trichotomy (Normative)
 
