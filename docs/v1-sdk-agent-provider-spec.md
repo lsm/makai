@@ -708,7 +708,7 @@ Normative rule: provider protocol remains canonical source; agent protocol passt
 
 ### 6.1 Agent Session Teardown (Normative)
 
-The server removes an agent session only on `agent_stop`; there is no TTL and no terminal-state eviction. Session teardown is therefore client-owned:
+The server removes an agent session only on `agent_stop`; as of this revision there is no TTL and no terminal-state eviction (V1.1 §13.2 grants servers eviction rights; the idle-TTL requirement is tracked in #202). Session teardown is therefore client-owned:
 
 - A client that uses one session per run (start → message → result) MUST send `agent_stop` when a run it owns reaches a terminal state: success, failure, or abandonment (including an auth-retry attempt whose session id is discarded). Otherwise the session stays registered for the process lifetime and its id is permanently rejected on reuse (`agent_busy`). The mandate is bounded by ownership: a client MUST NOT stop a session its own `agent_start` did not establish — in particular, a start rejected with `agent_busy` means the id belongs to another live run, and a stop carrying the live session's expected sequence would remove and cancel that unrelated run. If the start's outcome is unknowable (reply lost, timeout), the client MAY stop: either the session is its own and is cleaned up, or the stop is rejected harmlessly.
 - The stop MUST carry the session's next expected inbound sequence (start=1, message=2, then one per follow-up message); out-of-order stops are rejected and leave the session registered. Tool-result replies do not consume inbound sequence numbers.
@@ -890,4 +890,203 @@ Capability negotiation:
 
 - V1 streams are not resumable after transport interruption.
 - Client behavior on interruption: retry request with full context.
-- Session-level replay/resume is deferred to a future revision.
+- Session-level replay/resume is deferred to a future revision; §13.5 defines the load/resume/replay trichotomy these deferrals are stated against.
+
+## 13. Session Lifecycle & Frame Routing (V1.1)
+
+Status: normative revision (docs-only; no wire-format changes). Amends §6, §6.1, and
+§12. Vocabulary is aligned to the Open Agent Protocol (OAP) agent-control core — the
+full OAP term → makai construct mapping is the deviations ledger in
+[`docs/oap-alignment.md`](oap-alignment.md); the governing OAP references are
+Decision 0001 ("Agent-Control v0.1 Executable Core") and the cross-repo coordination
+issue lsm/open-agent-protocol#3 (makai is queued as OAP adapter #3).
+
+This section defines what a session *is*. Makai issues #198, #199 (fixed by PR #200),
+#201, and #202 all trace to the V1 spec never defining session semantics.
+
+Rules below are tagged:
+
+- `[current]` — codifies behavior verified on `main` as of this revision;
+- `[planned]` — normative requirement whose implementation is tracked in the listed
+  makai issue; until it lands, the `[current]` behavior remains in force.
+
+### 13.1 Typed Identity Domains (Normative)
+
+Makai agent-protocol identifiers are opaque strings in distinct semantic domains.
+Following OAP Decision 0001, identifiers in different domains are not interchangeable,
+even when their string values happen to coincide.
+
+| Domain | Wire format | Carried by | Role |
+| --- | --- | --- | --- |
+| Session | 21-char alphanumeric NanoID (`[A-Za-z0-9]{21}`, §3.1) | envelope `session_id` on every agent frame; payload `session_id` on `agent_message`/`agent_stop`/`agent_status`; payload `resume_session_id` on `agent_start` | Session-container key and frame-correlation scope ONLY |
+| Envelope message | 26-char Crockford Base32 ULID (§3.1) | envelope `message_id`; envelope `in_reply_to` | Per-envelope identity; request/reply correlation |
+| Ordering | `u64` | envelope `sequence` | Per-direction, per-session monotonic ordering — never an identity |
+| Provider stream / auth flow | 26-char ULID | `stream_id` / `flow_id` on provider/auth frames of the same connection | Adjacent protocol domains; never valid agent-domain identifiers despite the shared format |
+| Tool call | server-generated string | payload `tool_call_id` on `tool_execute`/`tool_result` and tool-execution events | Correlates one tool execution within a session |
+
+Rules:
+
+- `session_id` is a correlation key and the server-side session-container key. It is
+  NOT a resume, replay, or persistence handle (§13.5); treating it as one is the error
+  makai #198 exists to correct. The `agent_start` payload key is currently spelled
+  `resume_session_id` for historical reasons; its semantics are those of `session_id`,
+  and the rename is tracked in #198 (this revision defines semantics only and does not
+  change the wire).
+- `in_reply_to` references the request envelope's `message_id` ONLY (OAP Decision 0001
+  rule). It never references a session id, stream id, flow id, or payload-level id,
+  even where values coincide. Synchronous server replies (`agent_started`,
+  `agent_stopped`, `ack`, `nack`, `agent_error` from request validation,
+  `session_info`, `pong`, `tool_list_response`) set `in_reply_to`; asynchronous run
+  output (`agent_event`, `agent_result`, settlement `agent_error`, `tool_execute`)
+  carries no `in_reply_to` and is session-scoped (§13.3).
+- `sequence` is scoped per session AND per direction: the client's inbound counter and
+  the server's outbound counter are independent. Inbound: `agent_start` MUST carry
+  sequence 1; each `agent_message` and `agent_stop` consumes exactly one inbound
+  sequence number; `agent_status`, `ping`, `tool_list`, and `models_request` do not.
+  `tool_result` frames are intercepted by the stdio host before the agent protocol and
+  never consume agent inbound sequence numbers. Outbound: the server assigns one
+  monotonic counter per session covering every emitted frame; request-validation
+  `agent_error` envelopes are the exception and carry `sequence: 0` (outside the
+  ordering domain) so that rejecting a malformed request does not desynchronize it.
+- When a scoped identifier appears in both the envelope and the payload of one frame,
+  the values MUST agree (OAP rule). On `agent_start` the envelope `session_id` and the
+  payload key select the same session-container key.
+
+### 13.2 Session Lifecycle & Ownership (Normative)
+
+A session is a server-side, in-memory container of agent execution state (status,
+resolved model, config, system prompt, message counter, timestamps) keyed by its
+session id. It is created by `agent_start`, destroyed by `agent_stop` (or, once
+granted, server eviction), and holds no transcript and no persistence.
+
+1. Creation `[current]`: `agent_start` allocates the session id — the payload id when
+   supplied, else a server-generated NanoID — and registers the container in state
+   `.ready`. A start naming an id already registered is rejected with `agent_busy`
+   ("session already exists").
+2. Ownership `[current]`: sessions are owned by the connection that created them. The
+   stdio host is process-per-connection: one agent protocol server per process, and
+   sessions die with the process. No v1 host shares or persists sessions across
+   connections.
+3. Multi-message by design `[current]`: when a run settles, the server returns the
+   session to `.ready`; subsequent `agent_message` frames on the same id are accepted
+   with the next expected sequence and increment the message counter. One
+   session per run is a client convention (the TS SDK pattern per §6.1), not a server
+   limitation.
+4. One active run per session `[current]`: an `agent_message` against a session in
+   `.processing` is rejected with `agent_busy` ("session already processing a
+   message"). V1 defines no queueing, steering, or side-channel delivery.
+5. Teardown `[current, extends §6.1]`: `agent_stop` is the only session removal path;
+   a validated stop also cancels the session's in-flight run and discards its pending
+   tool work. The §6.1 client mandate (stop on terminal/error/abandon, bounded by
+   ownership) is normative for one-run-per-session clients.
+6. Eviction rights `[planned — #202]`: servers are granted the right to evict
+   sessions, with these semantics:
+   - Idle TTL: a server MUST evict sessions idle longer than a configurable TTL with
+     a defined non-zero default. Idleness is measured from the session's last activity
+     (message, stop, status), never from run settlement — a settled multi-message
+     session is idle-but-alive, by design (rule 3).
+   - Resource caps: a server MAY additionally bound registered sessions and evict
+     least-recently-active entries.
+   - An evicted session's next request receives the existing `agent_not_found` error
+     ("session not found") — identical to an unknown or already-stopped id. Eviction
+     MUST NOT be distinguishable from stop by error code; clients re-create with a
+     fresh `agent_start` (supplying full context, §12).
+   - Evicting a session with an in-flight run MUST cancel that run (same semantics as
+     `agent_stop`).
+   - Until #202 lands, no eviction exists: lifetime is 100% client-owned (§6.1).
+7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
+   no runs, provider streams, or auth flows remain active, bounding session lifetime
+   by the connection. An in-flight run is not cancelled by disconnect in V1; the host
+   pumps it to completion. Future multi-connection hosts MUST scope sessions to their
+   owning connection (rule 2) and evict on disconnect (#202).
+
+### 13.3 Frame Routing (Normative)
+
+1. Request-correlated delivery `[planned — #201; partially current]`: a reply frame
+   carrying `in_reply_to` MUST be delivered to the waiter whose outstanding request's
+   `message_id` equals that `in_reply_to` — not merely to any waiter on the session.
+   Current state: the server sets `in_reply_to` on all synchronous replies, but the
+   TS transport routes frames per session id only; the SDK applies `in_reply_to`
+   correlation itself, and only in the pre-acceptance window (before its own
+   `agent_start` is accepted). #201 tracks the general rule in the transport.
+2. Session-scoped delivery `[current]`: asynchronous run output (`agent_event`,
+   `agent_result`, settlement `agent_error`, `tool_execute`) carries no `in_reply_to`
+   and is delivered on the session's route. Rule §13.2.4 (one active run per session)
+   keeps session scope unambiguous for run output.
+3. Concurrent calls on one explicit session id `[current]`: until rule 1 lands, two
+   overlapping calls sharing one consumer-supplied session id share one frame route
+   and MUST fail rather than interleave: the server rejects the duplicate start with
+   `agent_busy` ("session already exists") and a message against the processing
+   session with `agent_busy` ("session already processing a message"). A client that
+   receives `agent_busy` MUST treat the attempt as rejected and MUST NOT stop the
+   session (it is not the attempt's to stop — §6.1); the defect that the rejection may
+   reach the wrong waiter late (surfacing as a response timeout) is exactly what #201
+   fixes.
+4. Tool side channel `[current]`: `tool_execute` is delivered on the session route;
+   `tool_result` replies carry `in_reply_to` referencing the `tool_execute`
+   `message_id` but are intercepted by the stdio host before the agent protocol
+   (§13.1 sequence rule) and never appear on the session route.
+
+### 13.4 Admission, Settlement, and the Single Terminal Arbiter (Normative)
+
+1. Admission `[current]`: writing `agent_message` (after `agent_started`) admits the
+   run. The server's acceptance is implicit — `agent_message` has no synchronous
+   reply frame; acceptance is observable only through subsequent events. A start
+   rejected before admission (`agent_busy`, invalid sequence, `nack`) never admits.
+   Admission is not settlement.
+2. Settlement `[current]`: exactly one terminal frame settles an admitted run:
+   - non-streaming `run()`: the `agent_result` frame (or provider-shaped
+     `result`/`complete_response` frame);
+   - streaming `stream()`: the trailing `agent_end` event;
+   - failure: the terminal `error` event / settlement `agent_error` frame per §3.5
+     (one terminal per failure; `agent_end` is not emitted on failure).
+   The server publishes `agent_result` BEFORE the trailing terminal `agent_end` event;
+   the two frames belong to one settlement — `run()` consumers terminate on
+   `agent_result`, `stream()` consumers terminate on `agent_end` — and a consumer
+   MUST NOT treat the pair as two settlements.
+3. Single terminal arbiter `[current]`: an admitted run settles exactly once, via
+   result XOR error, never both. Children settle first: pending tool work resolves
+   and the terminal `agent_end` is published only after `agent_result`. Duplicate or
+   late frames after settlement (e.g. a stale `agent_end` read by a follow-up run on
+   the same id) MUST NOT produce a second settlement — clients drain per §6.1.
+4. Transport death `[current]`: EOF or process exit before settlement is failure,
+   never success. The client transport rejects all pending frame waits on process
+   exit; no result is fabricated for an unsettled run. Recovery is retry with full
+   context (§12).
+
+### 13.5 Load, Resume, and Replay Trichotomy (Normative)
+
+Terms, aligned with OAP Decision 0001 ("resume, reconciliation, and replay are
+separate"):
+
+- **Load** (transcript reconstruction): materialize a session's message history from
+  a persisted store. Inherently lossy — it reconstructs content, not the original
+  event stream, run identities, or ordering.
+- **Resume** (attachment without history): re-attach a client to existing execution or
+  conversation state without replaying anything.
+- **Replay** (canonical event replay): re-deliver the canonical event stream from a
+  cursor, with explicit gap reporting when the cursor can no longer be satisfied.
+
+Rules:
+
+1. Makai V1 has none of the three `[current]`: streams are not resumable (§12);
+   sessions hold no transcript; `session_info` exposes status and counters only; no
+   persistence, cursor, or journal exists.
+2. No V1 field implies any of the three `[normative]`. A session id — including the
+   `agent_start` payload key `resume_session_id`, whose name is historical (#198) — is
+   a correlation and container key only. Supplying a previously-used id to
+   `agent_start` either creates a fresh, empty container (unknown, stopped, or
+   evicted id) or is rejected `agent_busy` (registered id); it never restores state.
+   History is supplied by the client in `messages` on every call.
+3. Client retry artifacts are not replay `[current]`: `auto_once` auth retry may
+   re-emit the failed attempt's lifecycle markers in a fresh session; that is
+   client-side reconstruction across sessions, not protocol replay, and MUST NOT
+   duplicate provider content or tool side effects (the SDK gates retry on no content
+   yielded and no tools executed).
+
+### 13.6 OAP Alignment
+
+The deviations ledger in [`docs/oap-alignment.md`](oap-alignment.md) is the
+convergence contract between makai and OAP: adapter #3 (lsm/open-agent-protocol#3)
+maps against it, and per that issue's feedback rule, an adapter mismatch resolves as
+either an OAP revision or a makai change — never silent adapter-side compensation.
