@@ -1225,9 +1225,16 @@ granted, server eviction), and holds no transcript and no persistence.
        Outbox delivery shares the failure: an envelope is popped (removed) before
        it is serialized and written, so an allocation or write failure destroys an
        already-built frame — an `agent_result` lost this way leaves the completed
-       run removed with no settlement and nothing to retry (transactional
-       serialization/write required, #204 gap 5). An OOM BETWEEN the two frames
-       of the
+       run removed with no settlement and nothing to retry. The final stdio drain
+       extends the exposure: it advances the pipe read position before buffering
+       the line, and its failure is swallowed, so an already-delivered frame can
+       still be dropped after a successful outbox transaction. Ordinary
+       `agent_event` frames share it too: each event is consumed from the run
+       stream before publication and publication failures are swallowed, so a
+       dropped delta or tool-lifecycle event is never reconstructed — a stream
+       that still settles successfully can be silently truncated (all part of
+       #204 gap 5's transactional-publication scope). An OOM BETWEEN the two
+       frames of the
        failure pair is the same exception from the other side: the event is
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the
@@ -1259,8 +1266,13 @@ granted, server eviction), and holds no transcript and no persistence.
    observation `[current exception]`: the server removes the session BEFORE
    building the reply, so an allocation failure in between tears the session down
    with no `agent_stopped` at all — the client sees an uncorrelated runtime error
-   or times out although teardown succeeded (part of #204 gap 5's correlated-reply
-   publication family). Makai has no run-scoped cancelled terminal (OAP
+   or times out although teardown succeeded, AND tool-bridge cleanup is skipped
+   (the stop's dispatch returns before reaching the run-cancel path, the only
+   caller of the bridge's session discard): stale pending/in-flight tool keys
+   survive, so a delayed old `tool_result` can be accepted against a later
+   same-id call (compounding §13.1's tool-call-id hazard) and the bridge memory
+   persists until process exit (all part of #204 gap 5's stop transaction).
+   Makai has no run-scoped cancelled terminal (OAP
    `run.cancelled` is a ledger deviation); there is nothing for a consumer to wait
    on after `agent_stopped`.
 5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session

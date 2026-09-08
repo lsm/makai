@@ -35,7 +35,7 @@ numbers in both directions.
 | --- | --- | --- | --- |
 | envelope `session_id` + payload `session_id` / `resume_session_id` | `session_id` | aligned (semantics), `renamed` (wire key) | Correlation + session-container key only; never a resume/replay handle (#198). OAP `session.open` returns a stable id; makai's `agent_start`/`agent_started` pair plays that role. |
 | envelope `message_id` / `in_reply_to` | envelope `id` / `in_reply_to` | aligned | `in_reply_to` references the request envelope's `message_id` only; set on synchronous replies, absent on async run output. |
-| envelope `sequence` | `sequence` | deviating: scope | Makai: per-direction, per-session. Inbound consumption is accepted-only: each ACCEPTED `agent_message` advances the counter (an accepted `agent_stop` removes it with the session); rejected requests and the non-consuming request types (`agent_status`, `ping`, `tool_list`, `models_request`, `goodbye` — accepted silently, no teardown, no reply) never advance it. Outbound has two frame classes: allocated frames draw a monotonic counter scoped to the session-container registration (a re-registered id restarts it), while echo replies (`session_info`, `pong`, `tool_list_response`) copy the inbound sequence verbatim and validation errors carry 0 (see #204). OAP v0.1: run-scoped, positive, contiguous, and requests/responses do not consume it. Adapters must renumber per OAP run sequence from native receive order and must not order echo replies by sequence. |
+| envelope `sequence` | `sequence` | deviating: scope | Makai: per-direction, per-session. Inbound consumption is accepted-only: each ACCEPTED `agent_message` advances the counter (an accepted `agent_stop` removes it with the session); rejected requests and the non-consuming request types (`agent_status`, `ping`, `tool_list`, `models_request`, `goodbye` — accepted silently, no teardown, no reply) never advance it. Outbound has two frame classes: allocated frames draw a monotonic counter scoped to the session-container registration (a re-registered id restarts) — monotonic ABSENT allocation failure (`nextOutgoingSequence` ignores its map-update failure, so duplicate values are possible under memory pressure, #204) — while echo replies (`session_info`, `pong`, `tool_list_response`) copy the inbound sequence verbatim and validation errors carry 0 (see #204). OAP v0.1: run-scoped, positive, contiguous, and requests/responses do not consume it. Adapters must renumber per OAP run sequence from native receive order and must not order echo replies by sequence. |
 | provider `stream_id` / auth `flow_id` | none (binding-private) | aligned by analogy | Correlation values private to their adjacent protocols on the same connection; never OAP identities (OAP Decision 0001 keeps native IDs out of portable identity). |
 | payload `tool_call_id` | `tool_call_id` | deviating: uniqueness scope | Correlates concurrently in-flight calls only. Ids originate from provider output and the server keeps no session-wide registry — a provider may reuse a value across turns or runs of one session. Adapters must not key tool history by bare `tool_call_id` (namespacing or per-run scoping required). |
 | — | `endpoint_id`, `participant_id` | absent (deviation) | Makai has no endpoint or participant identity; the transport connection is implicit and there is exactly one server per stdio process. Affects reverse-interaction ownership: `tool_execute` is the only server-initiated request and its ownership is implicitly "the session's client." |
@@ -85,9 +85,13 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    disconnect-triggered cancellation of active runs (the distributed-tool EOF hang),
    settlement on result-, failure-pair-, correlated-stop-reply-, or tool-request-
    publication failure instead of the swallowed/propagating OOM (settle or
-   propagate once, never re-publish a processed terminal; tool-request publication
-   AND outbox delivery are transactional — an envelope popped for delivery is
-   currently dropped if serialization or write fails, and for a result the run is
+   propagate once, never re-publish a processed terminal; tool-request
+   publication, outbox delivery, the final pipe-to-stdout drain, and ORDINARY
+   event publication are all transactional — a popped envelope is dropped on
+   serialization/write failure, the stdio drain advances its pipe position before
+   buffering (failures swallowed), and a dropped `agent_event` is never
+   reconstructed, silently truncating a stream that still settles successfully;
+   the stop transaction includes tool-bridge cleanup, and for a result the run is
    already removed, leaving no settlement and nothing to retry — transactionality
    extends through the final pipe-to-stdout handoff: the stdio drain advances the
    pipe read position before its buffer append, and a failure there is swallowed,
@@ -96,10 +100,11 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`) —
    plus gap 7: client sequence control in BOTH clients — `AgentProtocolClient`
    (rollback on rejected sends or explicit-sequence sends) and the TypeScript SDK
-   (its tracker advances before the outcome is known, so an uncorrelated
-   timeout's cleanup stop sends N+1 against a server expecting N and the owned
-   session leaks) — without which same-sequence retries and unknown-outcome
-   cleanup are unsupported.
+   (its tracker advances before the outcome is known) — where "control" includes
+   bounded probing of BOTH counter states after an uncorrelated outcome (pre-send,
+   then post-send on a correlated `invalid_request`): rollback alone is wrong when
+   the message was actually accepted and output was merely delayed or lost.
+   Without it, same-sequence retries and unknown-outcome cleanup are unsupported.
 4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start
    outcomes — per §6.1's raised bar, an EXCLUSIVE, never-reused client-generated id
    is the only sufficient evidence until #204 supplies generation tokens (a buffered
