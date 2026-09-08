@@ -1242,9 +1242,13 @@ granted, server eviction), and holds no transcript and no persistence.
        under sustained memory pressure (also #204 gap 5). Run-START failures
        differ from active-stream errors: the pending message is consumed before
        the error pair is published and no active run exists to stay queued, so a
-       mid-pair failure there emits only the lone event projection, leaves the
-       session `.processing`, never settles, and does NOT re-emit (the
-       re-process behavior above applies only to active-stream errors).
+       mid-pair failure there emits only the lone event projection, never
+       settles, and does NOT re-emit (the re-process behavior above applies only
+       to active-stream errors). The surviving session is `.error`, not
+       `.processing` (the status is set before the settlement frame is built),
+       so `agent_status` reports `.error` and another `agent_message` is
+       permitted — recovery logic MUST NOT wait on a processing run that no
+       longer exists.
      - provider-originated failures (auth, network, invalid URL): the provider turn
        converts the error into a result message with `stop_reason = "error"` and the
        provider's own `error_message` (§3.5), the loop completes normally, and the
