@@ -50,7 +50,7 @@ Statuses: `aligned` · `renamed` · `deviating: reason` · `absent by design`.
 | endpoint / participant identity | none | deviating: no endpoint or participant exists to address | Required for OAP initialization and reverse-interaction ownership; a makai introduction needs its own spec pass. |
 | `submission_id` / `run_id` split | none — one `agent_message` per run in SDK usage | absent by design (v1) | No admission receipt: `agent_message` has no synchronous reply. A run is identified operationally by `(session_id, settlement frame)`. Candidate future revision if the adapter needs stable run identity; nothing queued. |
 | `message_id` / `in_reply_to` / `sequence` | envelope fields of the same names | aligned (`in_reply_to`), deviating: sequence scope (see identity table) | Per §13.1/§13.3. |
-| admission (`session.message.submit.response` before stream) | server ACCEPTS `agent_message` by enqueueing it; rejected writes (unknown session / bad sequence / `.processing`) return a request-correlated validation `agent_error` and admit nothing | deviating: no admission receipt | OAP separates "the endpoint accepted the submission" from execution; makai acceptance has no positive frame — observable only through subsequent run output or the absence of a correlated rejection. §13.4.1. |
+| admission (`session.message.submit.response` before stream) | server ACCEPTS `agent_message` by enqueueing it; rejected writes (unknown session / bad sequence / `.processing`) return a request-correlated validation `agent_error` and admit nothing | deviating: no admission receipt | OAP separates "the endpoint accepted the submission" from execution; makai acceptance has no positive frame — observable only through subsequent run output or the PROBABILISTIC absence of a correlated rejection (an allocation failure in the acceptance path escapes without one), so adapters MUST bound waits and treat expiry as an unknown outcome (§13.4.1/§13.4.6). |
 | settlement (exactly one terminal per accepted run) | `agent_result` frame for both `run()` and `stream()` (the SDK projects it into the terminal `agent_end` event); loop-internal failure = the `agent_event`(error) + settlement `agent_error` pair counted as ONE settlement; provider-originated failure (auth/network/URL) = an error-valued `agent_result` (`stop_reason: "error"` + `error_message`) — classified by payload, not frame type | aligned for natural outcomes; deviating: cancelled runs | A run cancelled by `agent_stop` produces NO run settlement frame — the session is removed and the cancelled run's later publications are discarded; the `agent_stopped` reply is the client's only terminal. No OAP `run.cancelled` equivalent exists. §13.4.2/§13.4.4. |
 | single terminal arbiter (children settle first; duplicate terminals suppressed) | run pump settles result XOR error; trailing `agent_end` held until after `agent_result` | aligned, with a known race | §13.4.3. Residual race: a stopped session's cancelled run can publish into the same id re-created by an immediate start — generation/tombstone pending #204. |
 | `run.cancel` (run-scoped; intent ≠ settlement; races defined) | `agent_stop` — session-scoped teardown that also cancels the in-flight run | deviating: cancellation is session-scoped, not run-scoped | No mid-message run-scoped cancel in v1; a cancelled run emits no run settlement frame (see settlement row). Per OAP Decision 0001's consequence, session-scoped cancellation forces one foreground run per session — makai enforces exactly that (`agent_busy` on duplicate start and on message-to-processing-session). Eviction (#202) and stop share cancel semantics. |
@@ -73,12 +73,22 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    today the SDK correlates only pre-acceptance and the general case can misdeliver
    same-session replies).
 2. #202 — server-side eviction: idle TTL with default + config knob, optional bounded
-   map, `agent_not_found` semantics for evicted ids (implements §13.2.6).
+   map, `agent_not_found` semantics for evicted ids (implements §13.2.6). Ordering
+   dependency: an admission racing a cap eviction MUST be closed server-side —
+   #204's generation/tombstone tokens, or deferral of removal/re-registration until
+   the cancelled run's publications cease — the client cannot observe the eviction
+   to drain, so #202 MUST NOT ship without one of those protections.
 3. #204 — server enforcement gaps the spec marks `[planned]`: envelope/payload
    session-id agreement rejection, consistent outbound sequencing for echo replies
-   (`session_info`/`pong`/`tool_list_response`), and a session generation/tombstone
-   so a stopped session's cancelled run cannot settle a re-created id.
-4. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
+   (`session_info`/`pong`/`tool_list_response`), session generation/tombstone so a
+   stopped OR evicted session's cancelled run cannot settle a re-created id, EOF /
+   disconnect-triggered cancellation of active runs (the distributed-tool EOF hang),
+   and settlement on result-publication failure instead of the swallowed OOM.
+4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start outcomes
+   (no stop without a correlated `agent_started` or exclusive id), and a mandatory
+   drain (or correlation/generation discard) of the failure pair's second frame
+   before id reuse.
+5. #198 — rename the `agent_start` payload key `resume_session_id` → `session_id`
    (wire change; semantics already fixed by §13.1/§13.5 — the rename rests on them).
 
 Adapter mismatches discovered by OAP adapter #3 beyond these resolve per the feedback
