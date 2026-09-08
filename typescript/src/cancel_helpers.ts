@@ -149,13 +149,18 @@ export async function drainSessionFrames(transport: MakaiStdioClient, sessionId:
  * is raced against the remaining budget — and on timeout the pending read is
  * aborted via its signal, which re-routes any frame it had dequeued instead
  * of letting it be consumed after this drain has given up.
+ *
+ * `opts` is APPENDED after the pre-existing positional arguments so callers
+ * written against the original `(transport, sessionId, idleMs, maxMs)`
+ * signature keep compiling — and already-built JavaScript keeps landing each
+ * positional argument where it belongs.
  */
 export async function drainSessionFramesUntilQuiescent(
   transport: MakaiStdioClient,
   sessionId: string,
-  opts: { stopReplyTo?: string } = {},
   idleMs = 50,
   maxMs = 250,
+  opts: { stopReplyTo?: string } = {},
 ): Promise<void> {
   const deadline = Date.now() + maxMs;
   while (Date.now() < deadline) {

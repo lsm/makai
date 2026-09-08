@@ -475,7 +475,7 @@ class StdioAgentApi implements MakaiAgentApi {
       // draining through terminal-shaped frames that are not ours (the
       // failure pair's uncorrelated settlement, a stale agent_stopped from
       // an earlier stop on the same id) — see drainSessionFramesUntilQuiescent.
-      return drainSessionFramesUntilQuiescent(this.transport, sessionId, { stopReplyTo: stopMessageId });
+      return drainSessionFramesUntilQuiescent(this.transport, sessionId, 50, 250, { stopReplyTo: stopMessageId });
     }
     if (options.drain === "background") {
       drainSessionFrames(this.transport, sessionId);

@@ -2700,7 +2700,10 @@ test("session teardown drain consumes terminal-shaped frames before the current 
       return frame;
     },
   };
-  await drainSessionFramesUntilQuiescent(transport as never, sessionId, { stopReplyTo: "current-stop-message-id" }, 20, 500);
+  // Positional timeouts in their original (pre-#205) slots with `opts`
+  // appended — the exported signature stays source-compatible with callers
+  // written against `(transport, sessionId, idleMs, maxMs)`.
+  await drainSessionFramesUntilQuiescent(transport as never, sessionId, 20, 500, { stopReplyTo: "current-stop-message-id" });
   // All three frames were consumed: the settlement and the stale reply did
   // not end the drain (pre-fix it stopped at the settlement, leaving the
   // stale and current stop replies queued for later runs to trip over).
