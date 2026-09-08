@@ -1069,8 +1069,12 @@ server eviction (rule 6), and holds no transcript and no persistence.
      session with a live run is never cap-evicted; if no idle candidate exists,
      the server surfaces the pressure by rejecting new `agent_start`s
      (`agent_busy` or a resource error) rather than cancelling live work. Not
-     implemented in v1.1: the stdio host's process-per-connection shape bounds
-     session count without a cap.
+     implemented in v1.1. Process-per-connection hosting scopes sessions to one
+     client connection (ownership and lifetime end with the process) but does
+     NOT bound their count: a single client may register arbitrarily many
+     distinct sessions within the TTL, so the cap remains the (unimplemented)
+     backstop for that growth — the TTL bounds how long leaked sessions live,
+     not how many can accumulate.
    - An evicted session's next session-scoped request other than `agent_start`
      (`agent_message`, `agent_stop`, `agent_status`) receives the existing
      `agent_not_found` error ("session not found") — identical to an unknown or

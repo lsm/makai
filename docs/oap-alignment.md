@@ -9,9 +9,14 @@ Frame Routing, V1.1") defines the semantics summarized here.
 
 ## Provenance
 
-- Makai pin: `lsm/makai` `main` @ `67ad514` ("fix(agent): send agent_stop on session
-  teardown — terminal, error, and auth-retry paths (#200)"). Every `[current]` claim
-  in §13 and every status below was verified against this revision.
+- Makai pins: `lsm/makai` `main` @ `1413ef7` ("fix(sdk): in_reply_to-aware waiter
+  routing in the stdio transport (#207)") for the §13.3 routing claims, and
+  `lsm/makai#206` for the §13.2.6-rule-6 eviction claims — that PR IS this
+  revision of the ledger; re-pin it to its squash merge commit on `main` when it
+  lands. The session-lifecycle pass itself was verified against `67ad514`
+  ("fix(agent): send agent_stop on session teardown — terminal, error, and
+  auth-retry paths (#200)"). Every `[current]` claim in §13 and every status
+  below was verified against one of these revisions.
 - OAP references:
   - Decision 0001 — "Agent-Control v0.1 Executable Core" (accepted 2026-09-06):
     typed identity domains, one-foreground-run-per-session, deterministic run event
@@ -123,8 +128,10 @@ by construction: admission sets `.processing` synchronously, admission and the
 sweep run serialized on the host's single pump thread, and the stdio run pump
 already cancels runs whose session disappeared with post-removal publications
 swallowed as `SessionNotFound` no-ops. The optional bounded-map cap (§13.2.6
-resource-caps bullet, MAY) remains unimplemented — process-per-connection
-hosting bounds session count without it.
+resource-caps bullet, MAY) remains unimplemented: process-per-connection hosting
+scopes session ownership and lifetime to one connection but does not bound the
+count — a single client may register arbitrarily many sessions within the TTL,
+which is exactly the growth the cap would backstop.
 
 Adapter mismatches discovered by OAP adapter #3 beyond these resolve per the feedback
 rule above.
