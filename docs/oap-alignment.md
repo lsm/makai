@@ -83,7 +83,10 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    (`session_info`/`pong`/`tool_list_response`), session generation/tombstone so a
    stopped OR evicted session's cancelled run cannot settle a re-created id, EOF /
    disconnect-triggered cancellation of active runs (the distributed-tool EOF hang),
-   and settlement on result-publication failure instead of the swallowed OOM.
+   settlement on result- OR failure-pair-publication failure instead of the
+   swallowed/propagating OOM (settle or propagate once, never re-publish a
+   processed terminal), and stale-`tool_result` correlation for reused
+   `tool_call_id`s (validate `in_reply_to` against the current `tool_execute`).
 4. #205 — TS SDK teardown guards: ownership-evidence stop on unknown start outcomes
    (no stop without a correlated `agent_started` or exclusive id), and a mandatory
    drain (or correlation/generation discard) of the failure pair's second frame

@@ -955,13 +955,18 @@ Rules:
   Outbound `[current]`: emitted frames come in two classes. Allocated frames
   (`agent_started`, `agent_stopped`, `ack`, `nack`, `models_response`, `agent_event`,
   `agent_result`, settlement `agent_error`, `tool_execute`) draw from one monotonic
-  per-session counter — scoped to the session-container REGISTRATION, not the id
-  string: `agent_start` initializes the counter to 0 (overwriting any numbers the
-  id consumed for `models_request`s issued before the start), and an id
-  re-registered after a stop restarts it, so sequence values may repeat across
-  registrations of the same id. Consumers MUST treat the outbound counter as
-  per-registration. Echo replies (`session_info`, `pong`, `tool_list_response`)
-  copy the
+  per-session counter — describing ALLOCATION order, not necessarily observed wire
+  order: when several requests are consumed in one input batch, their synchronous
+  replies are written before the outbox flushes queued responses, so the peer can
+  observe allocated frames out of counter order (e.g. `ack(1), ack(3),
+  models_response(2), models_response(4)`); consumers MUST NOT detect gaps or
+  reorder from observed allocated-frame sequences alone. The counter is scoped to
+  the session-container REGISTRATION, not the id string: `agent_start` initializes
+  the counter to 0 (overwriting any numbers the id consumed for `models_request`s
+  issued before the start), and an id re-registered after a stop restarts it, so
+  sequence values may repeat across registrations of the same id. Consumers MUST
+  treat the outbound counter as per-registration. Echo replies (`session_info`,
+  `pong`, `tool_list_response`) copy the
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
   (outside the ordering domain). Consumers MUST NOT order echo replies against
@@ -983,7 +988,13 @@ Rules:
 - `tool_call_id` correlation is scoped to concurrently in-flight calls. Ids originate
   from provider output and the server keeps no session-wide registry: a provider MAY
   reuse a value in a later turn or a later run of the same multi-message session.
-  Consumers and adapters MUST NOT key tool history by bare `tool_call_id`.
+  Consumers and adapters MUST NOT key tool history by bare `tool_call_id`. Reuse
+  carries a `[current]` hazard: `tool_result` frames are matched by
+  `(session_id, tool_call_id)` only — the stdio interception discards their
+  `in_reply_to` — so a delayed or retried result from an earlier call can complete a
+  later call reusing the id while its real reply is dropped; correlating results
+  against the current `tool_execute` (or enforcing per-session id uniqueness) is
+  `[planned — #204 gap 6]`.
 
 ### 13.2 Session Lifecycle & Ownership (Normative)
 
