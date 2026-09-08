@@ -1162,7 +1162,12 @@ granted, server eviction), and holds no transcript and no persistence.
        out-of-memory failure in the RESULT-publication path is a further current
        exception: the host ignores publication errors (`makai.zig` `pumpAgentRuns`
        `catch {}`), so under memory pressure an admitted run can emit no
-       settlement at all (#204 gap 5).
+       settlement at all (#204 gap 5). An OOM BETWEEN the two frames of the
+       failure pair is the same exception from the other side: the event is
+       published, the envelope publication fails, the completed run stays queued,
+       and the next pump re-processes the same stream error and re-emits the
+       terminal event projection — consumers can observe multiple projections
+       under sustained memory pressure (also #204 gap 5).
      - provider-originated failures (auth, network, invalid URL): the provider turn
        converts the error into a result message with `stop_reason = "error"` and the
        provider's own `error_message` (§3.5), the loop completes normally, and the
