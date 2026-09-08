@@ -987,13 +987,16 @@ granted, server eviction), and holds no transcript and no persistence.
    stdio host is process-per-connection: one agent protocol server per process, and
    sessions die with the process. No v1 host shares or persists sessions across
    connections.
-3. Multi-message by design `[current]`: a SUCCESSFUL settlement returns the session to
+3. Multi-message by design `[current]`: a successful settlement returns the session to
    `.ready`; subsequent `agent_message` frames on the same id are accepted
-   with the next expected sequence and increment the message counter. A FAILED
-   settlement marks the session `.error` — it stays registered, and only
-   `.processing` blocks a further message, so a failed session may still be reused or
-   stopped. One session per run is a client convention (the TS SDK pattern per §6.1),
-   not a server limitation.
+   with the next expected sequence and increment the message counter. A
+   loop-internal failure (settlement via the `agent_error` envelope, §13.4.2) marks
+   the session `.error` — it stays registered, and only `.processing` blocks a
+   further message, so a failed session may still be reused or stopped. A
+   provider-originated failure (§13.4.2) settles through `agent_result` and leaves
+   the session `.ready` despite the error-valued `stop_reason` — `agent_status`
+   after such a failure reports `.ready`, not `.error`. One session per run is a
+   client convention (the TS SDK pattern per §6.1), not a server limitation.
 4. One active run per session `[current]`: an `agent_message` against a session in
    `.processing` is rejected with `agent_busy` ("session already processing a
    message"). V1 defines no queueing, steering, or side-channel delivery.
@@ -1056,11 +1059,18 @@ granted, server eviction), and holds no transcript and no persistence.
 
 ### 13.4 Admission, Settlement, and the Single Terminal Arbiter (Normative)
 
-1. Admission `[current]`: writing `agent_message` (after `agent_started`) admits the
-   run. The server's acceptance is implicit — `agent_message` has no synchronous
-   reply frame; acceptance is observable only through subsequent events. A start
-   rejected before admission (`agent_busy`, invalid sequence, `nack`) never admits.
-   Admission is not settlement.
+1. Admission `[current]`: a run is admitted when the server ACCEPTS an
+   `agent_message` (after `agent_started`) and enqueues it for execution — writing
+   the frame alone is not admission. A message rejected for an unknown session
+   (`agent_not_found`), an out-of-order sequence (`invalid_request`), or a
+   `.processing` session (`agent_busy`) produces a request-correlated validation
+   `agent_error` and enqueues nothing; a rejected submission MUST be treated as
+   non-admission — an adapter that records it as accepted would wait for a
+   settlement that can never arrive. Acceptance has no positive receipt: it is
+   observable only through subsequent run output, or the continued absence of a
+   correlated rejection (the receipt-less admission is a ledger deviation). A
+   start rejected before admission (`agent_busy`, invalid sequence, `nack`) never
+   admits. Admission is not settlement.
 2. Settlement `[current]`: exactly one settlement frame settles an admitted run:
    - success: the `agent_result` frame (or provider-shaped `result`/`complete_response`
      frame). This is the settlement frame for BOTH consumption modes: the SDK's
@@ -1069,8 +1079,11 @@ granted, server eviction), and holds no transcript and no persistence.
      frame, which is drained per §6.1. The server publishes `agent_result` BEFORE the
      trailing `agent_end` event frame; the trailing frame is an aggregate restatement
      of the same settlement for event-stream consumers, not a second settlement.
-   - failure comes in two shapes, and consumers MUST classify by payload
-     (`stop_reason`), never by frame type:
+   - failure comes in two shapes, classified per shape: a settlement `agent_error`
+     frame IS a failure by frame type (its payload carries only `code` and
+     `message` — no `stop_reason`); an `agent_result` frame must be classified by
+     its payload (`stop_reason`), because the same frame type settles both
+     successes and provider-originated failures:
      - loop-internal failures (run start failure, agent run stream error): the
        failure pair — an `agent_event` carrying the terminal `error` event (§3.5's
        one-terminal-error rule) followed by the settlement `agent_error` envelope —
