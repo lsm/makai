@@ -1043,10 +1043,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
 4. One active run per session `[current]`: an `agent_message` against a session in
    `.processing` is rejected with `agent_busy` ("session already processing a
    message"). V1 defines no queueing, steering, or side-channel delivery.
-5. Teardown `[current, extends §6.1]`: `agent_stop` is the only session removal path;
-   a validated stop also cancels the session's in-flight run and discards its pending
-   tool work. The §6.1 client mandate (stop on terminal/error/abandon, bounded by
-   ownership) is normative for one-run-per-session clients.
+5. Teardown `[current, extends §6.1]`: `agent_stop` is the only CLIENT-initiated
+   session removal path (server-initiated idle eviction is rule 6); a validated stop
+   also cancels the session's in-flight run and discards its pending tool work.
+   The §6.1 client mandate (stop on terminal/error/abandon, bounded by ownership)
+   is normative for one-run-per-session clients.
 6. Eviction rights `[current — #202]`: servers evict sessions idle longer than
    a configurable TTL, with these semantics:
    - Idle TTL `[current]`: the server evicts sessions idle longer than a
@@ -1091,7 +1092,11 @@ server eviction (rule 6), and holds no transcript and no persistence.
      `.processing` (never selected for eviction) or removed before its message
      arrives (no run admitted). Multi-threaded hosts must preserve this
      serialization before sweeping; the generation/tombstone tokens remain
-     tracked in #204 for the stopped-id reuse race (§13.4.5).
+     tracked in #204 for the stopped-or-evicted-id reuse race (§13.4.5).
+     Idleness is measured on the host's monotonic clock — wall-clock
+     adjustments (NTP steps, snapshot restores) neither evict fresh sessions
+     nor strand stale ones; the wall-clock `updated_at` remains
+     protocol-reporting only.
 7. Disconnect `[current for the stdio host]`: the process exits when stdin closes and
    no runs, provider streams, or auth flows remain active, bounding session lifetime
    by the connection. Disconnect does not cancel in-flight work in V1, with two
@@ -1303,7 +1308,15 @@ server eviction (rule 6), and holds no transcript and no persistence.
 5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
    stays alive until its provider stream drains. If a new `agent_start` re-registers
    the same id before then, late frames from the old run can publish into the new
-   container, and the new run — already ADMITTED (its `agent_message` was accepted
+   container — the same confusion holds when the OLD registration's output is merely
+   still buffered downstream (outbox, pipe, stdout) while the id is re-registered
+   after eviction (§13.2.6 rule 6): async `agent_result`/`agent_event` frames carry
+   no generation or request correlation, so a consumer attributes them to whichever
+   registration currently occupies the id. Eviction does not widen this race (it
+   fires only after a full TTL of no activity, versus a stop's immediate reuse
+   window), and the same #204 generation/tombstone closes it for stopped AND
+   evicted ids alike. For the new
+   run — already ADMITTED (its `agent_message` was accepted
    and enqueued against the re-created session) — fails at run start with an
    `internal_error` settlement: the run-start path refuses to double-start the id
    and the failure surfaces as the loop-error settlement pair (§13.4.2), not as a

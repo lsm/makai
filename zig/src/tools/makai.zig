@@ -376,8 +376,8 @@ const StdioProtocolLoop = struct {
     tool_bridge: StdioToolBridge,
     auth_server: AuthProtocolServer,
     auth_pipe: in_process.SerializedPipe,
-    /// Wall clock of the last idle-session sweep (ms); 0 = never swept.
-    last_session_sweep_ms: i64 = 0,
+    /// Monotonic clock of the last idle-session sweep (ms); 0 = never swept.
+    last_session_sweep_mono_ms: i64 = 0,
 
     const Self = @This();
     const DispatchTarget = enum { provider, agent, auth };
@@ -525,7 +525,7 @@ const StdioProtocolLoop = struct {
         forwarded += try self.pumpAgentRuns();
         forwarded += try self.publishPendingToolRequests();
         forwarded += try agent_runtime.pumpServerOutbox();
-        self.sweepIdleAgentSessions();
+        try self.sweepIdleAgentSessions();
 
         var auth_runtime = AuthProtocolRuntime{
             .server = &self.auth_server,
@@ -540,15 +540,20 @@ const StdioProtocolLoop = struct {
     /// (spec §13.2.6 rule 6, #202). Runs after the run pumps so a session
     /// settled in this tick already carries its fresh activity timestamp, and
     /// is throttled to `SESSION_SWEEP_INTERVAL_MS` because the background
-    /// pump runs every loop iteration. An evicted session cannot have a live
-    /// run (in-flight runs are never idle), so the tool-bridge discard is
-    /// defensive parity with the `agent_stop` teardown path.
-    fn sweepIdleAgentSessions(self: *Self) void {
-        const now_ms = compat.time.nowMillis();
-        if (now_ms - self.last_session_sweep_ms < SESSION_SWEEP_INTERVAL_MS) return;
-        self.last_session_sweep_ms = now_ms;
+    /// pump runs every loop iteration. Both the throttle and the idleness
+    /// comparison ride the monotonic clock so wall-clock adjustments cannot
+    /// distort them. An evicted session cannot have a live run (in-flight
+    /// runs are never idle), so the tool-bridge discard is defensive parity
+    /// with the `agent_stop` teardown path.
+    fn sweepIdleAgentSessions(self: *Self) !void {
+        const now_mono_ms = try compat.time.monotonicMillis();
+        if (now_mono_ms - self.last_session_sweep_mono_ms < SESSION_SWEEP_INTERVAL_MS) return;
+        self.last_session_sweep_mono_ms = now_mono_ms;
 
-        while (self.agent_server.evictNextIdleSession(now_ms)) |session_id| {
+        var evicted = std.ArrayList(AgentProtocolTypes.SessionId).empty;
+        defer evicted.deinit(self.allocator);
+        _ = try self.agent_server.evictIdleSessions(now_mono_ms, &evicted);
+        for (evicted.items) |session_id| {
             self.tool_bridge.discardSession(self.allocator, session_id);
         }
     }
@@ -582,7 +587,7 @@ const StdioProtocolLoop = struct {
             self.startAgentRun(owned_pending) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 try self.publishAgentLoopError(owned_pending.session_id, @errorName(err));
-                self.agent_server.markSessionError(owned_pending.session_id);
+                self.agent_server.markSessionError(owned_pending.session_id) catch {};
                 continue;
             };
             started += 1;
@@ -702,7 +707,7 @@ const StdioProtocolLoop = struct {
 
             if (run.stream.getError()) |msg| {
                 try self.publishAgentLoopError(run.session_id, msg);
-                self.agent_server.markSessionError(run.session_id);
+                self.agent_server.markSessionError(run.session_id) catch {};
                 forwarded += 1;
             } else if (run.stream.getResult()) |result| {
                 // The SDK derives its terminal agent_end from this frame, so an
