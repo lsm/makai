@@ -1022,10 +1022,12 @@ granted, server eviction), and holds no transcript and no persistence.
    - Idle TTL: a server MUST evict sessions idle longer than a configurable TTL with
      a defined non-zero default. Idleness is measured from the session's last
      activity — inbound (message, stop, status) OR server-side run activity (event
-     publication) — and a session with an in-flight run is NEVER idle, so a
-     long-running turn or tool execution cannot be evicted out from under its run.
-     Idleness is never measured from run settlement — a settled multi-message session
-     is idle-but-alive, by design (rule 3).
+     or settlement publication) — and a session with an in-flight run is NEVER
+     idle, so a long-running turn or tool execution cannot be evicted out from
+     under its run. Settlement publication resets the idle clock (it is the final
+     activity of a completed run): a settled multi-message session is
+     idle-but-alive with a full TTL ahead of it, by design (rule 3) — settlement
+     never evicts; it only starts the idle interval.
    - Resource caps: a server MAY additionally bound registered sessions and evict
      least-recently-active entries.
    - An evicted session's next session-scoped request other than `agent_start`
@@ -1045,7 +1047,9 @@ granted, server eviction), and holds no transcript and no persistence.
    independent pipes, so a client that closed only its write side but keeps
    reading still receives them (lost only when the read side is gone), and only
    until the run needs client input: a provider turn that returns
-   `stop_reason = tool_use` after EOF moves the run into the tool-waiting case;
+   `stop_reason = tool_use` after EOF moves the run into the tool-waiting case
+   when the call reaches the distributed executor (unknown tools or invalid
+   arguments synthesize local error results and the loop continues);
    a run WAITING on a distributed
    `tool_result` cannot complete — the tool host is the disconnected client, the
    tool wait polls with no EOF-triggered cancel, and the host loop never sees the
@@ -1121,13 +1125,16 @@ granted, server eviction), and holds no transcript and no persistence.
      `message` — no `stop_reason`); an `agent_result` frame must be classified by
      its payload (`stop_reason`), because the same frame type settles both
      successes and provider-originated failures:
-     - loop-internal failures (run start failure, agent run stream error): the
-       failure pair — an `agent_event` carrying the terminal `error` event (§3.5's
-       one-terminal-error rule) followed by the settlement `agent_error` envelope —
-       is ONE settlement. The `agent_error` envelope is the settlement frame; the
-       `agent_event` is its event-stream projection. Consumers terminate on the
-       first-delivered frame of the pair and MUST NOT count the pair as two
-       settlements.
+     - loop-internal failures (non-OOM run-start failure, agent-run stream error):
+       the failure pair — an `agent_event` carrying the terminal `error` event
+       (§3.5's one-terminal-error rule) followed by the settlement `agent_error`
+       envelope — is ONE settlement. The `agent_error` envelope is the settlement
+       frame; the `agent_event` is its event-stream projection. Consumers terminate
+       on the first-delivered frame of the pair and MUST NOT count the pair as two
+       settlements. An out-of-memory run-start failure is the exception: it
+       propagates unbound (the pending-run pump returns without publishing),
+       leaving the admitted message consumed, the session in `.processing`, and no
+       settlement frame at all — the host itself is failing.
      - provider-originated failures (auth, network, invalid URL): the provider turn
        converts the error into a result message with `stop_reason = "error"` and the
        provider's own `error_message` (§3.5), the loop completes normally, and the
@@ -1175,8 +1182,11 @@ granted, server eviction), and holds no transcript and no persistence.
    MUST NOT retry a run it already saw settle); the frames are lost only when the
    read side is gone or the process dies. This holds only while the run needs no
    further client input: if the in-flight provider turn returns
-   `stop_reason = tool_use` after EOF, the run transitions into the tool-waiting
-   case below and produces no terminal. A run waiting on a distributed `tool_result` produces
+   `stop_reason = tool_use` after EOF AND the call reaches the distributed
+   executor (a configured tool with schema-valid arguments), the run transitions
+   into the tool-waiting case below and produces no terminal; an unknown tool or
+   schema-invalid arguments synthesizes a local error tool-result instead, the
+   loop continues, and the run can still settle on stdout. A run waiting on a distributed `tool_result` produces
    NO terminal at all — the server process hangs (#204 gap 4) and only the
    client's response timeout surfaces an error. In every case an unsettled run is
    never a success; recovery is retry with full context (§12).
