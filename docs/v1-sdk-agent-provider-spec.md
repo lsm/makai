@@ -949,6 +949,12 @@ Rules:
   requests (`invalid_request`, `agent_busy`, `agent_not_found`) never advance it — in
   particular, an `agent_message` rejected `agent_busy` against a `.processing` session
   leaves the counter unchanged, and the client retries with the same expected value.
+  `[current deviation]` the built-in `AgentProtocolClient` does not honor this yet:
+  it advances its per-session counter eagerly on every send and does not restore it
+  when the send is rejected (`client.zig` `nextSequence`), so a retry through that
+  client sends the rejected sequence + 1 and fails `invalid_request` — callers using
+  it must track the expected sequence themselves; rollback on rejected sends is a
+  client obligation.
   `agent_status`, `ping`, `tool_list`, and `models_request` never consume inbound
   sequence. `tool_result` frames are intercepted by the stdio host before the agent
   protocol and never consume agent inbound sequence numbers.
