@@ -50,13 +50,19 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
             try w.writeStringField("config_json", p.config_json);
             if (p.getSystemPrompt()) |prompt| try w.writeStringField("system_prompt", prompt);
             // #198: canonical payload key is `session_id` — a correlation key
-            // (spec §13.1), never a resume handle. Only the canonical key is
-            // emitted; `resume_session_id` remains accepted on parse as a
-            // legacy alias for older clients.
+            // (spec §13.1), never a resume handle. The legacy
+            // `resume_session_id` alias is ALSO emitted, with the same value:
+            // a pre-rename server cannot read the canonical key and would
+            // otherwise generate its own id (the Zig client adopts it, but
+            // its sequence counter stays keyed under the sent id, so the
+            // next message would carry sequence 1 where the server expects
+            // 2). Dual-key servers take the canonical value when both keys
+            // appear; the alias emission is transitional.
             if (p.session_id) |id| {
                 const id_str = try agent_types.sessionIdToString(id, allocator);
                 defer allocator.free(id_str);
                 try w.writeStringField("session_id", id_str);
+                try w.writeStringField("resume_session_id", id_str);
             }
         },
         .agent_message => |p| {
@@ -666,7 +672,7 @@ test "agent envelope roundtrip" {
     try std.testing.expectEqualStrings("{\"role\":\"user\"}", parsed.payload.agent_message.message_json);
 }
 
-test "agent_start payload serializes the id under session_id only (#198)" {
+test "agent_start payload serializes the id under session_id plus the legacy alias (#198)" {
     const allocator = std.testing.allocator;
 
     const sid = agent_types.generateSessionId();
@@ -685,9 +691,14 @@ test "agent_start payload serializes the id under session_id only (#198)" {
     const json = try serializeEnvelope(env, allocator);
     defer allocator.free(json);
 
-    // Canonical key present, legacy key absent.
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"session_id\":\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "resume_session_id") == null);
+    // Canonical key present AND the legacy alias rides along with the SAME
+    // value, so pre-rename servers (which read only the alias) keep binding
+    // the caller's id; dual-key servers take the canonical value.
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed_json.deinit();
+    const payload = parsed_json.value.object.get("payload").?.object;
+    try std.testing.expectEqualStrings(&sid, payload.get("session_id").?.string);
+    try std.testing.expectEqualStrings(&sid, payload.get("resume_session_id").?.string);
 
     var parsed = try deserializeEnvelope(json, allocator);
     defer parsed.deinit(allocator);

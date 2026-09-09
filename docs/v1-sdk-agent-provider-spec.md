@@ -866,11 +866,11 @@ Backward compatibility:
 - Unknown fields must be ignored by parsers.
 - `agent_start` payload session key (#198): `session_id` is canonical; servers accept
   the legacy `resume_session_id` alias permanently (dual-key parse; the canonical key
-  wins when both appear). The TS SDK sends both keys with the same value so
-  pre-rename servers (which read only the alias) keep binding the caller's id; the
-  Zig serializer sends only the canonical key and pairs with a same-version server.
-  A canonical-only emitter against a pre-rename server degrades to the §13.1
-  id-omitting exception.
+  wins when both appear). Both makai emitters (TS SDK and Zig serializer) send the
+  two keys with the same value so pre-rename servers (which read only the alias)
+  keep binding the caller's id; the alias emission is transitional and drops once
+  pre-rename servers are gone. A canonical-only emitter against a pre-rename server
+  degrades to the §13.1 id-omitting exception.
 
 Capability negotiation:
 - V1 uses implicit feature detection (`not_implemented` probing).
@@ -945,16 +945,20 @@ Rules:
   is `session_id` `[current]`; the server accepts `resume_session_id` as a permanent
   legacy alias carrying the same value, and when both keys appear the canonical one
   wins. The envelope-agreement rule below compares the effective payload id whichever
-  key carried it. Emitters SHOULD send only the canonical key (the Zig serializer
-  does; it pairs with a same-version server). The TS SDK additionally emits the
-  legacy alias with the SAME value during the transition: a pre-rename server cannot
-  read the canonical key, and without the alias it would treat the payload id as
-  absent, generate its own id (the id-omitting exception below), and reject the
-  client's subsequent session-scoped frames (`agent_not_found`) since the SDK does
-  not adopt a generated id — the alias keeps old servers binding the caller's id
-  while dual-key servers take the canonical value. A canonical-only emitter against
-  a pre-rename server degrades to that same id-omitting exception; such consumers
-  MUST adopt the id from `agent_started` (rule below).
+  key carried it. During the transition makai's own emitters (the TS SDK and the
+  Zig serializer/client) additionally emit the legacy alias with the SAME value: a
+  pre-rename server cannot read the canonical key, and without the alias it would
+  treat the payload id as absent and generate its own id (the id-omitting exception
+  below) — the TS SDK does not adopt a generated id and would then fail every
+  subsequent session-scoped frame with `agent_not_found`, and while the Zig
+  `AgentProtocolClient` does adopt the returned id, its per-session sequence counter
+  stays keyed under the sent id, so the first `agent_message` under the adopted id
+  carries sequence 1 where the server expects 2 (`invalid_request`). The alias keeps
+  old servers binding the caller's id on both clients while dual-key servers take
+  the canonical value; the alias emission drops once pre-rename servers are gone. A
+  canonical-only emitter against a pre-rename server degrades to that same
+  id-omitting exception; such consumers MUST adopt the id from `agent_started`
+  (rule below) and re-key their per-session sequence state to it.
 - `in_reply_to` references the request envelope's `message_id` ONLY (OAP Decision 0001
   rule). It never references a session id, stream id, flow id, or payload-level id,
   even where values coincide. Synchronous server replies (`agent_started`,
