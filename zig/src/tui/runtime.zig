@@ -732,7 +732,16 @@ pub const TuiRuntime = struct {
         if (self.remote_client) |*client| {
             const stop_sid = self.remote_session_id orelse self.remote_pending_session_id;
             if (stop_sid) |sid| {
-                _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                // Unknown-outcome reconciliation (#210 gap 7, §13.4.1): when
+                // the attempt's message outcome never resolved, stop via the
+                // bounded two-state probe (pre-send sequence first). The id is
+                // client-generated (exclusive, §6.1), so when the probe is
+                // ineligible — outcome already resolved, or nothing sent — the
+                // plain tracked stop is safe and its sequence is the correct
+                // one.
+                if (client.sendAgentStopProbing(sid, "client disconnect") catch null) |_| {} else {
+                    _ = client.sendAgentStop(sid, "client disconnect") catch {};
+                }
                 client.removeSessionState(sid);
             }
             // Cancel and join the WebSocket reader before closing the sender so
@@ -1089,7 +1098,12 @@ pub const TuiRuntime = struct {
         if (self.local_agent) |*local| local.abort();
         if (self.remote_client) |*client| {
             if (self.remote_session_id orelse self.remote_pending_session_id) |sid| {
-                _ = client.sendAgentStop(sid, "cancelled") catch {};
+                // Same probe-first teardown as the disconnect path (#210 gap
+                // 7): the pump below processes the stop's replies, driving
+                // the probe's post-send retry when the first was rejected.
+                if (client.sendAgentStopProbing(sid, "cancelled") catch null) |_| {} else {
+                    _ = client.sendAgentStop(sid, "cancelled") catch {};
+                }
                 self.pumpRemoteIncoming() catch {};
                 if (client.isSessionComplete(sid) or self.stream_active) self.completeRemoteCancelled();
                 client.removeSessionState(sid);

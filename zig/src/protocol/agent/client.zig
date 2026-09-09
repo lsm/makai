@@ -139,15 +139,6 @@ pub const AgentProtocolClient = struct {
         return self.next_sequence_by_session.get(session_id) orelse 1;
     }
 
-    /// Allocates the next sequence for a counter-advancing send. Callers
-    /// record the send via `recordPendingSend` once it is actually on the wire.
-    fn advanceSequence(self: *Self, session_id: agent_types.SessionId) !u64 {
-        const next = self.peekNextSequence(session_id);
-        try self.next_sequence_by_session.put(session_id, next + 1);
-        self.sequence = next; // compatibility mirror
-        return next;
-    }
-
     /// Records a counter-advancing send BEFORE it is written to the wire, so
     /// the post-send bookkeeping is infallible: an allocation failure here
     /// errors out with nothing on the wire, never after the server may have
@@ -174,7 +165,17 @@ pub const AgentProtocolClient = struct {
             payload.agent_start.system_prompt = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, sp));
         }
 
-        const seq = try self.advanceSequence(sid);
+        const seq = self.peekNextSequence(sid);
+        const start_json = try self.serializeEnvelopeForSend(.{
+            .session_id = sid,
+            .message_id = msg_id,
+            .sequence = seq,
+            .timestamp = compat.time.nowMillis(),
+            .payload = payload,
+        });
+        defer self.allocator.free(start_json);
+        try self.next_sequence_by_session.put(sid, seq + 1);
+        self.sequence = seq; // compatibility mirror
         self.recordPendingSend(sid, msg_id, seq, .start) catch |err| {
             // Nothing reached the wire: restore the tracker so a retry of the
             // start reuses `seq` instead of running ahead of the server.
@@ -182,13 +183,7 @@ pub const AgentProtocolClient = struct {
             return err;
         };
 
-        try self.sendEnvelope(.{
-            .session_id = sid,
-            .message_id = msg_id,
-            .sequence = seq,
-            .timestamp = compat.time.nowMillis(),
-            .payload = payload,
-        });
+        try self.writeEnvelopeJson(start_json);
 
         return msg_id;
     }
@@ -217,6 +212,14 @@ pub const AgentProtocolClient = struct {
         defer payload.deinit(self.allocator);
         if (options_json) |opts| payload.agent_message.options_json = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, opts));
 
+        const message_json_buf = try self.serializeEnvelopeForSend(.{
+            .session_id = session_id,
+            .message_id = msg_id,
+            .sequence = sequence,
+            .timestamp = compat.time.nowMillis(),
+            .payload = payload,
+        });
+        defer self.allocator.free(message_json_buf);
         try self.next_sequence_by_session.put(session_id, sequence + 1);
         self.sequence = sequence; // compatibility mirror
         self.recordPendingSend(session_id, msg_id, sequence, .message) catch |err| {
@@ -227,13 +230,7 @@ pub const AgentProtocolClient = struct {
             return err;
         };
 
-        try self.sendEnvelope(.{
-            .session_id = session_id,
-            .message_id = msg_id,
-            .sequence = sequence,
-            .timestamp = compat.time.nowMillis(),
-            .payload = payload,
-        });
+        try self.writeEnvelopeJson(message_json_buf);
         return msg_id;
     }
 
@@ -259,13 +256,15 @@ pub const AgentProtocolClient = struct {
         defer payload.deinit(self.allocator);
         if (reason) |r| payload.agent_stop.reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, r));
 
-        try self.sendEnvelope(.{
+        const json = try self.serializeEnvelopeForSend(.{
             .session_id = session_id,
             .message_id = msg_id,
             .sequence = sequence,
             .timestamp = compat.time.nowMillis(),
             .payload = payload,
         });
+        defer self.allocator.free(json);
+        try self.writeEnvelopeJson(json);
     }
 
     /// Bounded two-state stop probe for an UNCORRELATED `agent_message`
@@ -316,14 +315,19 @@ pub const AgentProtocolClient = struct {
 
         // Register the probe BEFORE the stop reaches the wire so the
         // post-send bookkeeping is infallible; a failed write unregisters it.
+        // The reason buffer has exactly one owner at every point: the local
+        // variable until the map insert succeeds, the map entry after — the
+        // guard flag keeps the two errdefers from double-freeing it.
         const msg_id = agent_types.generateUlid();
         var owned_reason = OwnedSlice(u8).initOwned(try self.allocator.dupe(u8, reason orelse ""));
-        errdefer owned_reason.deinit(self.allocator);
+        var reason_owned_by_map = false;
+        errdefer if (!reason_owned_by_map) owned_reason.deinit(self.allocator);
         try self.stop_probes_by_session.put(session_id, .{
             .first_msg_id = msg_id,
             .second_sequence = pre_send + 1,
             .reason = owned_reason,
         });
+        reason_owned_by_map = true;
         errdefer {
             if (self.stop_probes_by_session.fetchRemove(session_id)) |entry| {
                 var probe = entry.value;
@@ -334,10 +338,20 @@ pub const AgentProtocolClient = struct {
         return msg_id;
     }
 
-    fn sendEnvelope(self: *Self, env: agent_types.Envelope) !void {
+    /// Serializes an envelope for sending, failing BEFORE anything is
+    /// written (no sender configured, serialization allocation) — callers
+    /// perform their fallible serialization here, before any tracker
+    /// mutation, so a failure leaves the client state untouched (#210
+    /// gap 7). The returned buffer is caller-owned.
+    fn serializeEnvelopeForSend(self: *Self, env: agent_types.Envelope) ![]u8 {
         if (self.sender == null) return error.NoSender;
-        const json = try envelope.serializeEnvelope(env, self.allocator);
-        defer self.allocator.free(json);
+        return try envelope.serializeEnvelope(env, self.allocator);
+    }
+
+    /// Writes an already-serialized envelope. Failures here are AMBIGUOUS
+    /// (the write may have partially delivered), so callers keep their
+    /// optimistic tracker state through them (§13.4.6 unknown outcome).
+    fn writeEnvelopeJson(self: *Self, json: []const u8) !void {
         try self.sender.?.write(json);
         try self.sender.?.flush();
     }
@@ -529,15 +543,23 @@ pub const AgentProtocolClient = struct {
 
     /// Retires the pending-send records a settlement resolves. A settlement
     /// (`agent_result`, or the uncorrelated settlement `agent_error`) proves
-    /// every send RECORDED BEFORE the settled run resolved — but a newer send
-    /// may already be in flight (recorded after the server committed the
-    /// result, before this client processed it), and its unknown outcome is
-    /// exactly what a later probe reconciles. So all-but-the-NEWEST entries
-    /// retire; the newest is retained as the possibly-unresolved send, which
-    /// also bounds growth to a small constant across turns.
+    /// the settled run's own send and everything recorded before it resolved.
+    /// With exactly ONE pending send, that send IS the settled run's own
+    /// message (serial use) — retire it, so the next turn starts from an
+    /// empty list and a later lost-output probe is not bracketed by the
+    /// settled record's stale sequence. With TWO OR MORE pending sends, the
+    /// settled run's message is among the OLDER entries and the NEWEST
+    /// genuinely postdates it (a send recorded after the server committed,
+    /// before this client processed the settlement) — its unknown outcome is
+    /// exactly what a later probe reconciles, so only it is retained. Either
+    /// way growth stays bounded across turns.
     fn retireSettledPendingSends(self: *Self, session_id: agent_types.SessionId) void {
         const list = self.pending_sends_by_session.getPtr(session_id) orelse return;
-        if (list.items.len <= 1) return;
+        if (list.items.len == 0) return;
+        if (list.items.len == 1) {
+            _ = list.orderedRemove(0);
+            return;
+        }
         const keep = list.items[list.items.len - 1];
         list.clearRetainingCapacity();
         list.append(self.allocator, keep) catch return;
@@ -1192,9 +1214,9 @@ test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)
     try client.processEnvelope(started_env);
     _ = try client.sendAgentMessage(sid, "{\"m\":1}", null); // seq 2, tracker 3
 
-    // The run settles: every send recorded BEFORE the settled run resolved
-    // and is retired; the NEWEST pending send may be a later, still-
-    // unresolved one and is retained (growth stays bounded across turns).
+    // The run settles with ONE pending send — the settled run's own message
+    // (serial use): it resolved and is retired, so the next turn starts from
+    // an empty list (no stale record can bracket a later lost-output probe).
     var result_env = agent_types.Envelope{
         .session_id = sid,
         .message_id = agent_types.generateUlid(),
@@ -1206,8 +1228,27 @@ test "AgentProtocolClient settlements retire resolved pending sends (#210 gap 7)
     defer result_env.deinit(allocator);
     try client.processEnvelope(result_env);
 
+    const remaining_serial = if (client.pending_sends_by_session.getPtr(sid)) |l| l.items.len else 0;
+    try std.testing.expectEqual(@as(usize, 0), remaining_serial);
+
+    // Two or more pending sends at settlement: the newest postdates the
+    // settled run (recorded after the server committed, before this client
+    // processed it) — its unknown outcome is retained for a later probe.
+    _ = try client.sendAgentMessage(sid, "{\"m\":2}", null); // seq 2 again (serial retry)
+    _ = try client.sendAgentMessage(sid, "{\"m\":3}", null); // seq 3, concurrently in flight
+    var second_result = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 4,
+        .in_reply_to = null,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_result = try allocator.dupe(u8, "{\"ok\":true}") },
+    };
+    defer second_result.deinit(allocator);
+    try client.processEnvelope(second_result);
+
     const pending = client.pending_sends_by_session.getPtr(sid).?;
-    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only the newest send retained
+    try std.testing.expectEqual(@as(usize, 1), pending.items.len); // only the newest — possibly unresolved — send retained
 }
 
 test "AgentProtocolClient probing stop derives its candidates from the OLDEST unresolved message (#210 gap 7)" {

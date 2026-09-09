@@ -164,7 +164,12 @@ These implement the `[planned]` rules of spec §13; each lands as its own PR:
    correlated reads, acceptance at either settles; both `run()` and
    `stream()`, awaited on error paths so the probe's reads cannot race a
    same-id follow-up). Same-sequence retries and unknown-outcome cleanup
-   are supported in both clients (§13.1/§13.4.1). Residual, documented
+   are supported in both clients (§13.1/§13.4.1); the TUI's remote
+   disconnect/cancel teardown routes through the probe first, with the
+   plain tracked stop as the ineligible fallback (its ids are
+   client-generated and exclusive, §6.1 — the fallback's optimistic
+   sequence is the correct one exactly when the probe is ineligible).
+   Residual, documented
    (§13.1): the admission gate cannot prove CURRENT-registration ownership of
    a caller-supplied id after a silent TTL eviction — eviction emits no
    frame, so a foreign re-registration and our own are wire-indistinguishable
