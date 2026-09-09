@@ -882,7 +882,6 @@ test "AgentProtocolClient probing stop requires a message send: a start-only out
     // sendAgentStopProbing must send nothing and register no probe: leaking a
     // session that might be ours is strictly preferable to stopping one that
     // is not.
-    const allocator = std.testing.allocator;
     var harness = Gap7Harness.init();
     defer harness.deinit();
     harness.wire();
