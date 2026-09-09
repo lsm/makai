@@ -1821,7 +1821,7 @@ test("client.agent.stream auto_once retries for non-canonical model_ref when err
   }
 });
 
-test("agent_start payload includes resume_session_id", async () => {
+test("agent_start payload includes session_id (#198)", async () => {
   const harness = await setupHarness();
   try {
     const agent = createMakaiAgentApi(harness.client);
@@ -1830,6 +1830,10 @@ test("agent_start payload includes resume_session_id", async () => {
     const start = logged.find((entry) => entry.type === "agent_start");
     assert.ok(start);
     const payload = start?.payload as Record<string, unknown>;
+    assert.equal(payload.session_id, "testNanoIdSess1234567");
+    // The legacy `resume_session_id` alias rides along with the SAME value so
+    // pre-rename servers keep binding the caller's id; dual-key servers
+    // prefer the canonical key (#198).
     assert.equal(payload.resume_session_id, "testNanoIdSess1234567");
   } finally {
     await harness.cleanup();

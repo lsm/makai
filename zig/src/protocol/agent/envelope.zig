@@ -49,9 +49,19 @@ fn serializePayload(w: *json_writer.JsonWriter, payload: agent_types.Payload, al
         .agent_start => |p| {
             try w.writeStringField("config_json", p.config_json);
             if (p.getSystemPrompt()) |prompt| try w.writeStringField("system_prompt", prompt);
+            // #198: canonical payload key is `session_id` — a correlation key
+            // (spec §13.1), never a resume handle. The legacy
+            // `resume_session_id` alias is ALSO emitted, with the same value:
+            // a pre-rename server cannot read the canonical key and would
+            // otherwise generate its own id (the Zig client adopts it, but
+            // its sequence counter stays keyed under the sent id, so the
+            // next message would carry sequence 1 where the server expects
+            // 2). Dual-key servers take the canonical value when both keys
+            // appear; the alias emission is transitional.
             if (p.session_id) |id| {
                 const id_str = try agent_types.sessionIdToString(id, allocator);
                 defer allocator.free(id_str);
+                try w.writeStringField("session_id", id_str);
                 try w.writeStringField("resume_session_id", id_str);
             }
         },
@@ -264,7 +274,16 @@ fn deserializePayload(type_str: []const u8, payload: std.json.ObjectMap, allocat
         const config = try allocator.dupe(u8, payload.get("config_json").?.string);
         var result = agent_types.AgentStartRequest{ .config_json = config };
         if (payload.get("system_prompt")) |v| result.system_prompt = OwnedSlice(u8).initOwned(try allocator.dupe(u8, v.string));
-        if (payload.get("resume_session_id")) |v| result.session_id = try parseSessionIdRequired(v.string);
+        // #198: canonical payload key is `session_id`; `resume_session_id` is
+        // a legacy alias (same value, misleading name) accepted permanently
+        // for older clients. When both keys appear the canonical one wins —
+        // the §13.1 envelope-agreement check compares the effective payload
+        // id whichever key carried it.
+        if (payload.get("session_id")) |v| {
+            result.session_id = try parseSessionIdRequired(v.string);
+        } else if (payload.get("resume_session_id")) |v| {
+            result.session_id = try parseSessionIdRequired(v.string);
+        }
         return .{ .agent_start = result };
     }
     if (std.mem.eql(u8, type_str, "agent_message")) {
@@ -651,6 +670,74 @@ test "agent envelope roundtrip" {
 
     try std.testing.expect(parsed.payload == .agent_message);
     try std.testing.expectEqualStrings("{\"role\":\"user\"}", parsed.payload.agent_message.message_json);
+}
+
+test "agent_start payload serializes the id under session_id plus the legacy alias (#198)" {
+    const allocator = std.testing.allocator;
+
+    const sid = agent_types.generateSessionId();
+    var env = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = sid,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer env.deinit(allocator);
+
+    const json = try serializeEnvelope(env, allocator);
+    defer allocator.free(json);
+
+    // Canonical key present AND the legacy alias rides along with the SAME
+    // value, so pre-rename servers (which read only the alias) keep binding
+    // the caller's id; dual-key servers take the canonical value.
+    var parsed_json = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed_json.deinit();
+    const payload = parsed_json.value.object.get("payload").?.object;
+    try std.testing.expectEqualStrings(&sid, payload.get("session_id").?.string);
+    try std.testing.expectEqualStrings(&sid, payload.get("resume_session_id").?.string);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(sid, parsed.payload.agent_start.session_id.?);
+}
+
+test "agent_start deserialization accepts the legacy resume_session_id alias (#198)" {
+    const allocator = std.testing.allocator;
+    const sid = "aaaaaaaaaaaaaaaaaaaaa";
+    const mid = "00000000000000000000000002";
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{}}\",\"resume_session_id\":\"{s}\"}}}}",
+        .{ sid, mid, sid },
+    );
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.payload == .agent_start);
+    try std.testing.expectEqualStrings(sid, &parsed.payload.agent_start.session_id.?);
+}
+
+test "agent_start deserialization prefers session_id when both payload keys appear (#198)" {
+    const allocator = std.testing.allocator;
+    const canonical = "aaaaaaaaaaaaaaaaaaaaa";
+    const legacy = "bbbbbbbbbbbbbbbbbbbbb";
+    const mid = "00000000000000000000000002";
+    const json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"agent_start\",\"session_id\":\"{s}\",\"message_id\":\"{s}\",\"sequence\":1,\"timestamp\":1,\"version\":1,\"payload\":{{\"config_json\":\"{{}}\",\"session_id\":\"{s}\",\"resume_session_id\":\"{s}\"}}}}",
+        .{ canonical, mid, canonical, legacy },
+    );
+    defer allocator.free(json);
+
+    var parsed = try deserializeEnvelope(json, allocator);
+    defer parsed.deinit(allocator);
+    try std.testing.expect(parsed.payload == .agent_start);
+    try std.testing.expectEqualStrings(canonical, &parsed.payload.agent_start.session_id.?);
 }
 
 test "agent envelope roundtrip for models_request" {

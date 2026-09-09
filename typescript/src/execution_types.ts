@@ -93,6 +93,13 @@ export interface RunOptions {
   max_tokens?: number;
   reasoning_effort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   auth_retry_policy?: AuthRetryPolicy;
+  /**
+   * Correlation key for the run's agent session (21-char NanoID, sent as the
+   * `agent_start` payload `session_id`). NOT a resume handle — sessions are not
+   * resumable; resend the full context on interruption. Not stable under
+   * `auth_retry_policy: "auto_once"`: the SDK silently regenerates the id for
+   * the retried attempt (#198).
+   */
   session_id?: string;
   metadata?: Record<string, string>;
   /** Abort signal to cancel in-flight execution. */
