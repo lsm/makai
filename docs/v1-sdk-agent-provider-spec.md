@@ -983,9 +983,14 @@ Rules:
   request's inbound sequence verbatim — a correlation echo, not an ordering
   allocation — and request-validation `agent_error` envelopes carry `sequence: 0`
   (outside the ordering domain). Consumers MUST NOT order echo replies against
-  allocated frames by sequence. Whether echo replies should instead allocate from the
-  per-session counter (uniform outbound ordering) is the open decision in #204; until
-  it is resolved, the split above is the contract.
+  allocated frames by sequence. `[current — #204 decision (b)]` the echo is kept
+  permanently: a reply's sequence names the request it answers, which consumers
+  may rely on for correlation without inspecting `in_reply_to`; allocating echo
+  replies from the per-session counter (#204 option (a)) was considered and
+  rejected as a breaking change for echo-relying consumers that would buy only
+  the cross-class monotonicity the rule above already forbids depending on.
+  Recorded as a permanent deviation in the deviations ledger
+  ([`oap-alignment.md`](oap-alignment.md)).
 - When a scoped identifier appears in both the envelope and the payload of one frame,
   the values MUST agree (OAP rule). On `agent_start` — when the payload id is
   present — the envelope `session_id` and the payload key select the same
@@ -1001,9 +1006,14 @@ Rules:
   waiter or once `in_reply_to`-aware routing lands (#201); otherwise the reply is
   unreachable and the generated session leaks registered. Enforcement of the
   agreement rule is
-  `[planned — #204]`: today the server keys all session handlers on the payload id
-  and does not compare the envelope id, so agreement is a client convention, not a
-  server-checked invariant; #204 adds the `invalid_request` rejection for mismatches.
+  `[current — #204]`: every session-scoped handler (`agent_start` when the payload
+  id is present, `agent_message`, `agent_stop`, `agent_status`) compares the two
+  ids FIRST and rejects a mismatch with a request-correlated `invalid_request`
+  before any lookup, mutation, removal, or cancellation — the expected inbound
+  sequence is not consumed and the idleness clock is not touched. The stdio host
+  applies the same rule to its stop interception: a stop whose envelope and
+  payload ids disagree is not a validated stop, so the host neither cancels the
+  payload-id session's run nor discards its tool-bridge state on its own.
 - `tool_call_id` correlation is scoped to concurrently in-flight calls. Ids originate
   from provider output and the server keeps no session-wide registry: a provider MAY
   reuse a value in a later turn or a later run of the same multi-message session.
@@ -1095,8 +1105,10 @@ server eviction (rule 6), and holds no transcript and no persistence.
      surfacing as swallowed `SessionNotFound` no-ops — so a session is either
      `.processing` (never selected for eviction) or removed before its message
      arrives (no run admitted). Multi-threaded hosts must preserve this
-     serialization before sweeping; the generation/tombstone tokens remain
-     tracked in #204 for the stopped-or-evicted-id reuse race (§13.4.5).
+     serialization before sweeping; the registration-generation counter
+     (`[current — #204]`, §13.4.5) closes the stopped-or-evicted-id reuse race
+     for run publications — downstream-buffered frames of the old registration
+     remain attributable to a re-registered id until drained (§6.1).
      Idleness is measured on the host's monotonic clock — wall-clock
      adjustments (NTP steps, snapshot restores) neither evict fresh sessions
      nor strand stale ones; the wall-clock `updated_at` remains
@@ -1325,27 +1337,34 @@ server eviction (rule 6), and holds no transcript and no persistence.
    Makai has no run-scoped cancelled terminal (OAP
    `run.cancelled` is a ledger deviation); there is nothing for a consumer to wait
    on after `agent_stopped`.
-5. Stopped-id reuse race `[planned — #204]`: the cancelled run of a stopped session
-   stays alive until its provider stream drains. If a new `agent_start` re-registers
-   the same id before then, late frames from the old run can publish into the new
-   container — the same confusion holds when the OLD registration's output is merely
-   still buffered downstream (outbox, pipe, stdout) while the id is re-registered
-   after eviction (§13.2.6 rule 6): async `agent_result`/`agent_event` frames carry
-   no generation or request correlation, so a consumer attributes them to whichever
-   registration currently occupies the id. Eviction does not widen this race (it
-   fires only after a full TTL of no activity, versus a stop's immediate reuse
-   window), and the same #204 generation/tombstone closes it for stopped AND
-   evicted ids alike. The new
-   run — already ADMITTED (its `agent_message` was accepted
-   and enqueued against the re-created session) — fails at run start with an
-   `internal_error` settlement: the run-start path refuses to double-start the id
-   and the failure surfaces as the loop-error settlement pair (§13.4.2), not as a
-   request-level `agent_busy` rejection. Draining (§6.1) narrows but does not
-   eliminate this; a session
-   generation/tombstone (#204) is required before immediate id reuse can be
-   considered safe. Until then, clients that reuse an explicit id after a stop
-   SHOULD drain quiescent first (§6.1) and accept the residual race, or use a fresh
-   id.
+5. Stopped-id reuse race `[current — #204]`: the cancelled run of a stopped session
+   stays alive until its provider stream drains, and a new `agent_start` may
+   re-register the same id before then. Server-side, the race is closed by
+   REGISTRATION GENERATIONS: every registration stamps a monotonically
+   increasing generation from one server-wide counter; a run binds the
+   generation it was admitted under and may publish only while that generation
+   is still the id's current one. A stopped or evicted id (no current
+   generation) or a re-registered one (a newer generation) makes the run
+   stale, and every stale publication is discarded — no run events, no
+   settlement, no state mutation: the re-created container is never marked
+   `.error` by the stale run's failure, its idleness clock is untouched, and
+   a stale run's queued `tool_execute` requests are dropped at publication
+   (the enqueuing agent thread does not observe its cancel token before
+   enqueueing, so a request can land after the stop's bridge discard —
+   requests carry their registration generation and publication validates
+   it against the id's current one).
+   The generation check also scopes the one-active-run rule (§13.2.4): a
+   listed stale run no longer fails the re-created id's ADMITTED run at start
+   with an `internal_error` settlement — the fresh registration's run starts
+   and settles on its own. Generations close the run-to-container race for
+   stopped AND evicted ids alike (eviction does not widen the race to begin
+   with — it fires only after a full TTL of no activity, versus a stop's
+   immediate reuse window). What generations do NOT close is the
+   downstream-buffer confusion: frames the OLD registration already published
+   (outbox, pipe, stdout) carry no generation on the wire, so a consumer
+   attributes them to whichever registration currently occupies the id —
+   clients that reuse an explicit id after a stop SHOULD still drain quiescent
+   first (§6.1) or use a fresh id.
 6. Transport death `[current]`: process exit before settlement is failure, never
    success — the client transport rejects the frame wait currently registered with
    it on exit (reads queued behind the transport's read lock install their waiter

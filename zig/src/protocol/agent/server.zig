@@ -17,6 +17,13 @@ pub const SessionState = struct {
     /// wall-clock `updated_at` (protocol-visible in `session_info`) so
     /// wall-clock adjustments cannot distort eviction age math.
     last_activity_ms: i64,
+    /// Registration generation (§13.4.5, #204): stamped from the server-wide
+    /// monotonic counter at registration, so every registration — and in
+    /// particular a re-registration of an id whose previous registration was
+    /// stopped or evicted mid-run — carries a strictly newer generation. Runs
+    /// bind the generation they were admitted under; a mismatch identifies a
+    /// stale run whose publications must be discarded.
+    generation: u64,
 };
 
 pub const PendingAgentMessage = struct {
@@ -58,6 +65,13 @@ pub const AgentProtocolServer = struct {
     outbox: std.ArrayList(agent_types.Envelope),
     pending_messages: std.ArrayList(PendingAgentMessage),
     options: Options,
+    /// Monotonic source for `SessionState.generation` (§13.4.5, #204): one
+    /// counter serves all registrations — globally unique stamps are strictly
+    /// ordered across ids too, so no per-id bookkeeping that outlives session
+    /// removal (and would grow with every distinct id for the process
+    /// lifetime) is needed to keep generations increasing across a
+    /// stop/evict + re-register cycle.
+    next_session_generation: u64 = 0,
 
     const Self = @This();
 
@@ -171,6 +185,16 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleStart(self: *Self, req: agent_types.AgentStartRequest, env: agent_types.Envelope) !?agent_types.Envelope {
+        // §13.1 (#204): when the payload names a session id, the envelope id
+        // MUST agree — a mismatch is rejected before any lookup or mutation.
+        // (A start that OMITS the payload id is the sanctioned exception: the
+        // envelope id is ignored and the server generates the container id.)
+        if (req.session_id) |payload_id| {
+            if (!std.mem.eql(u8, &payload_id, &env.session_id)) {
+                return try self.makeError(env.session_id, env.message_id, .invalid_request, "envelope and payload session_id disagree");
+            }
+        }
+
         if (env.sequence != 1) {
             return try self.makeError(env.session_id, env.message_id, .invalid_request, "agent_start sequence must be 1");
         }
@@ -193,6 +217,7 @@ pub const AgentProtocolServer = struct {
         errdefer _ = self.outgoing_sequences.remove(session_id);
 
         const now = compat.time.nowMillis();
+        self.next_session_generation += 1;
         try self.sessions.put(session_id, .{
             .session_id = session_id,
             .status = .ready,
@@ -203,6 +228,7 @@ pub const AgentProtocolServer = struct {
             .created_at = now,
             .updated_at = now,
             .last_activity_ms = try compat.time.monotonicMillis(),
+            .generation = self.next_session_generation,
         });
 
         return .{
@@ -216,6 +242,12 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleMessage(self: *Self, req: agent_types.AgentMessageRequest, env: agent_types.Envelope) !?agent_types.Envelope {
+        // §13.1 (#204): envelope and payload session ids MUST agree — reject
+        // before any session lookup, admission, or mutation.
+        if (!std.mem.eql(u8, &req.session_id, &env.session_id)) {
+            return try self.makeError(env.session_id, env.message_id, .invalid_request, "envelope and payload session_id disagree");
+        }
+
         const session = self.sessions.getPtr(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
@@ -258,6 +290,13 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleStop(self: *Self, req: agent_types.AgentStopRequest, env: agent_types.Envelope) !?agent_types.Envelope {
+        // §13.1 (#204): envelope and payload session ids MUST agree — reject
+        // before any lookup or removal, so a mismatched stop can never tear
+        // down a session other than its routing identity.
+        if (!std.mem.eql(u8, &req.session_id, &env.session_id)) {
+            return try self.makeError(env.session_id, env.message_id, .invalid_request, "envelope and payload session_id disagree");
+        }
+
         if (!self.sessions.contains(req.session_id)) {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         }
@@ -287,6 +326,12 @@ pub const AgentProtocolServer = struct {
     }
 
     fn handleStatus(self: *Self, req: anytype, env: agent_types.Envelope) !?agent_types.Envelope {
+        // §13.1 (#204): envelope and payload session ids MUST agree — reject
+        // before any lookup (the idleness clock is not touched either).
+        if (!std.mem.eql(u8, &req.session_id, &env.session_id)) {
+            return try self.makeError(env.session_id, env.message_id, .invalid_request, "envelope and payload session_id disagree");
+        }
+
         const session = self.sessions.getPtr(req.session_id) orelse {
             return try self.makeError(env.session_id, env.message_id, .agent_not_found, "session not found");
         };
@@ -495,6 +540,16 @@ pub const AgentProtocolServer = struct {
 
     pub fn hasSession(self: *Self, session_id: agent_types.SessionId) bool {
         return self.sessions.contains(session_id);
+    }
+
+    /// The registration generation of the currently registered session
+    /// (§13.4.5, #204), or null when the id is not registered. A run binds the
+    /// value at its start and compares against this to detect staleness: a
+    /// null (stopped/evicted id) or a different value (id re-registered)
+    /// means the run's remaining publications must be discarded.
+    pub fn sessionGeneration(self: *Self, session_id: agent_types.SessionId) ?u64 {
+        const session = self.sessions.get(session_id) orelse return null;
+        return session.generation;
     }
 
     pub fn updateSessionModel(self: *Self, session_id: agent_types.SessionId, model: []const u8) !void {
@@ -1040,6 +1095,230 @@ test "AgentProtocolServer rejects out-of-order stop without removing session" {
     try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, stop_resp.payload.agent_error.code);
     try std.testing.expectEqual(@as(usize, 1), server.sessionCount());
     try std.testing.expect(server.hasSession(sid));
+}
+
+// ============================================================================
+// Envelope/payload session-id agreement (spec §13.1, #204 gap 1)
+// ============================================================================
+
+/// Registers a session under an explicit caller-supplied id (envelope and
+/// payload ids agreeing, as §13.1 requires of clients).
+fn startTestSessionWithId(server: *AgentProtocolServer, allocator: std.mem.Allocator, session_id: agent_types.SessionId) !void {
+    var start = agent_types.Envelope{
+        .session_id = session_id,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = session_id,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer start.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(start)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_started);
+}
+
+test "AgentProtocolServer rejects agent_start whose envelope and payload session ids disagree" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    var start = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = agent_types.generateSessionId(),
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer start.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(start)).?;
+    defer resp.deinit(allocator);
+
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, resp.payload.agent_error.code);
+    // Rejected before any mutation: neither the envelope id nor the payload
+    // id owns a session afterwards.
+    try std.testing.expectEqual(@as(usize, 0), server.sessionCount());
+}
+
+test "AgentProtocolServer rejects agent_message id mismatch without mutating the session" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    try startTestSessionWithId(&server, allocator, sid);
+
+    var msg = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_message = .{
+            .session_id = sid,
+            .message_json = try allocator.dupe(u8, "{\"role\":\"user\"}"),
+        } },
+    };
+    defer msg.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(msg)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, resp.payload.agent_error.code);
+
+    // No mutation occurred: the expected inbound sequence was not consumed,
+    // so the next well-formed message (ids agreeing) is accepted at the same
+    // value.
+    var valid = try makeTestAgentMessage(sid, 2, allocator);
+    defer valid.deinit(allocator);
+    try std.testing.expect((try server.handleEnvelope(valid)) == null);
+    try std.testing.expectEqual(agent_types.AgentStatus.processing, server.sessions.get(sid).?.status);
+}
+
+test "AgentProtocolServer rejects agent_stop id mismatch without removing the session" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    try startTestSessionWithId(&server, allocator, sid);
+
+    var stop = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 2,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_stop = .{ .session_id = sid } },
+    };
+    defer stop.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(stop)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, resp.payload.agent_error.code);
+    try std.testing.expect(server.hasSession(sid));
+
+    // The payload-id session survived; a valid stop still tears it down at
+    // the same expected sequence.
+    var valid = makeTestAgentStop(sid, 2);
+    defer valid.deinit(allocator);
+    var valid_resp = (try server.handleEnvelope(valid)).?;
+    defer valid_resp.deinit(allocator);
+    try std.testing.expect(valid_resp.payload == .agent_stopped);
+    try std.testing.expect(!server.hasSession(sid));
+}
+
+test "AgentProtocolServer rejects agent_status id mismatch" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+    try startTestSessionWithId(&server, allocator, sid);
+
+    var status = agent_types.Envelope{
+        .session_id = agent_types.generateSessionId(),
+        .message_id = agent_types.generateUlid(),
+        .sequence = 5,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_status = .{ .session_id = sid } },
+    };
+    defer status.deinit(allocator);
+
+    var resp = (try server.handleEnvelope(status)).?;
+    defer resp.deinit(allocator);
+    try std.testing.expect(resp.payload == .agent_error);
+    try std.testing.expectEqual(agent_types.AgentErrorCode.invalid_request, resp.payload.agent_error.code);
+    try std.testing.expect(server.hasSession(sid));
+    try std.testing.expectEqual(agent_types.AgentStatus.ready, server.sessions.get(sid).?.status);
+}
+
+// ============================================================================
+// Registration generations (spec §13.4.5, #204 gap 3)
+// ============================================================================
+
+test "AgentProtocolServer registration generations are strictly increasing across re-registration" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid_a = agent_types.generateSessionId();
+    const sid_b = agent_types.generateSessionId();
+    try startTestSessionWithId(&server, allocator, sid_a);
+    const gen_a1 = server.sessionGeneration(sid_a).?;
+    try std.testing.expectEqual(@as(u64, 1), gen_a1);
+
+    // Stamps are unique across ids, not just per id.
+    try startTestSessionWithId(&server, allocator, sid_b);
+    const gen_b = server.sessionGeneration(sid_b).?;
+    try std.testing.expect(gen_b > gen_a1);
+
+    // Stop + re-register the same id: the new registration out-generates the
+    // old one, so a run still draining for the old registration is stale.
+    var stop = makeTestAgentStop(sid_a, 2);
+    defer stop.deinit(allocator);
+    var stop_resp = (try server.handleEnvelope(stop)).?;
+    defer stop_resp.deinit(allocator);
+    try std.testing.expect(stop_resp.payload == .agent_stopped);
+    try std.testing.expect(server.sessionGeneration(sid_a) == null);
+
+    try startTestSessionWithId(&server, allocator, sid_a);
+    const gen_a2 = server.sessionGeneration(sid_a).?;
+    try std.testing.expect(gen_a2 > gen_b);
+    try std.testing.expect(gen_a2 > gen_a1);
+}
+
+// ============================================================================
+// Echo-reply sequencing (spec §13.1, #204 gap 2 — decision (b): keep + ledger)
+// ============================================================================
+
+test "AgentProtocolServer echo replies copy the inbound sequence without consuming the outbound counter" {
+    const allocator = std.testing.allocator;
+    var server = AgentProtocolServer.init(allocator);
+    defer server.deinit();
+
+    const sid = agent_types.generateSessionId();
+
+    // Allocated frame: agent_started draws the per-session outbound counter.
+    var start = agent_types.Envelope{
+        .session_id = sid,
+        .message_id = agent_types.generateUlid(),
+        .sequence = 1,
+        .timestamp = compat.time.nowMillis(),
+        .payload = .{ .agent_start = .{
+            .session_id = sid,
+            .config_json = try allocator.dupe(u8, "{}"),
+        } },
+    };
+    defer start.deinit(allocator);
+    var start_resp = (try server.handleEnvelope(start)).?;
+    defer start_resp.deinit(allocator);
+    try std.testing.expect(start_resp.payload == .agent_started);
+    try std.testing.expectEqual(@as(u64, 1), start_resp.sequence);
+
+    // Echo frame: session_info copies the request's inbound sequence
+    // verbatim (a correlation echo, not an ordering allocation) — here 7,
+    // deliberately out of band from every allocated value.
+    var status = makeTestAgentStatus(sid, 7);
+    defer status.deinit(allocator);
+    var status_resp = (try server.handleEnvelope(status)).?;
+    defer status_resp.deinit(allocator);
+    try std.testing.expect(status_resp.payload == .session_info);
+    try std.testing.expectEqual(@as(u64, 7), status_resp.sequence);
+
+    // The echo consumed no allocation: the next allocated frame still gets
+    // the counter's next value.
+    try server.publishAgentEvent(sid, "{}");
+    var event = server.popOutbound().?;
+    defer event.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 2), event.sequence);
 }
 
 // ============================================================================
