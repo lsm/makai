@@ -1429,17 +1429,17 @@ fn executeStdioToolViaAgentProtocol(
     const popAndBuild = struct {
         fn run(
             bridge: *StdioToolBridge,
-            allocator: std.mem.Allocator,
-            session_id: AgentProtocolTypes.SessionId,
-            tool_call_id: []const u8,
+            alloc: std.mem.Allocator,
+            pop_session_id: AgentProtocolTypes.SessionId,
+            pop_tool_call_id: []const u8,
         ) !?agent_loop.AgentToolResult {
-            const result = bridge.popResult(allocator, session_id, tool_call_id) orelse return null;
+            const result = bridge.popResult(alloc, pop_session_id, pop_tool_call_id) orelse return null;
             var owned_result = result;
-            defer owned_result.deinit(allocator);
-            const content = try parseToolResultContentPartsJson(allocator, owned_result.result_json);
-            errdefer deinitUserContentParts(allocator, content);
-            const details_json = try allocator.dupe(u8, owned_result.details_json);
-            errdefer allocator.free(details_json);
+            defer owned_result.deinit(alloc);
+            const content = try parseToolResultContentPartsJson(alloc, owned_result.result_json);
+            errdefer deinitUserContentParts(alloc, content);
+            const details_json = try alloc.dupe(u8, owned_result.details_json);
+            errdefer alloc.free(details_json);
             return .{
                 .content = ai_types.OwnedSlice(ai_types.UserContentPart).initOwned(content),
                 .details_json = ai_types.OwnedSlice(u8).initOwned(details_json),
