@@ -518,7 +518,6 @@ pub const AgentProtocolServer = struct {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
         const owned_json = try self.allocator.dupe(u8, result_json);
         errdefer self.allocator.free(owned_json);
-        session.status = .ready;
         try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
@@ -527,13 +526,22 @@ pub const AgentProtocolServer = struct {
             .timestamp = compat.time.nowMillis(),
             .payload = .{ .agent_result = owned_json },
         });
+        // The status follows the COMMITTED frame (#210 gap 5, review):
+        // flipping `.ready` before the append admitted a follow-up
+        // `agent_message` while the result publication was still pending —
+        // the retained run then tripped the one-active-run rule and turned
+        // the ACCEPTED message into an `AgentBusy` internal-error
+        // settlement. With the flip after the append, a failed publication
+        // leaves the session `.processing`: follow-ups are rejected
+        // `agent_busy` at admission (clean non-admission) until the retry
+        // commits.
+        session.status = .ready;
     }
 
     pub fn publishAgentError(self: *Self, session_id: agent_types.SessionId, code: agent_types.AgentErrorCode, message: []const u8) !void {
         const session = self.sessions.getPtr(session_id) orelse return error.SessionNotFound;
         const owned_message = try self.allocator.dupe(u8, message);
         errdefer self.allocator.free(owned_message);
-        session.status = .@"error";
         try touchSession(session);
         try self.outbox.append(self.allocator, .{
             .session_id = session_id,
@@ -545,6 +553,10 @@ pub const AgentProtocolServer = struct {
                 .message = owned_message,
             } },
         });
+        // Same commit-then-flip ordering as `publishAgentResult`: while the
+        // settlement envelope's publication is being retried the session
+        // stays non-admissible (`.processing`) instead of `.error`.
+        session.status = .@"error";
     }
 
     pub fn enqueueEnvelope(self: *Self, env: agent_types.Envelope) !void {
@@ -780,37 +792,43 @@ fn registerTestSession(server: *AgentProtocolServer, allocator: std.mem.Allocato
 }
 
 // #210 gap 5: a publication that fails partway (dupe succeeds, outbox
-// append hits OOM) must leave the outbox UNCHANGED and leak nothing — the
-// caller retries the whole publication. Sweeping fail_index covers every
-// allocation of each publish path; the std.testing.allocator's leak check
-// guards the copies.
+// append hits OOM) must leave the outbox UNCHANGED, leak nothing, and leave
+// the session status untouched — the status flips only after the frame
+// commits, so a failed publication keeps the session non-admissible
+// (`.processing`) until the retry succeeds. Sweeping fail_index covers
+// every allocation of each publish path; the std.testing.allocator's leak
+// check guards the copies.
 test "AgentProtocolServer publish paths are transactional under allocation failure" {
     const allocator = std.testing.allocator;
 
     inline for (.{
-        publishAgentEventCase,
-        publishAgentResultCase,
-        publishAgentErrorCase,
-    }) |publish_fn| {
+        .{ .publish = publishAgentEventCase, .success_status = agent_types.AgentStatus.processing },
+        .{ .publish = publishAgentResultCase, .success_status = agent_types.AgentStatus.ready },
+        .{ .publish = publishAgentErrorCase, .success_status = agent_types.AgentStatus.@"error" },
+    }) |case| {
         var fail_index: usize = 0;
         while (fail_index <= 6) : (fail_index += 1) {
             var server = AgentProtocolServer.init(allocator);
             defer server.deinit();
             const sid = try registerTestSession(&server, allocator);
+            server.sessions.getPtr(sid).?.status = .processing;
 
             var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
             // Re-point the server's allocator at the failing wrapper: the
             // session map itself is already populated, so only the
             // publication's allocations can fail.
             server.allocator = failing.allocator();
-            if (publish_fn(&server, sid)) |_| {
+            if (case.publish(&server, sid)) |_| {
                 var popped = server.popOutbound().?;
                 popped.deinit(allocator);
                 try std.testing.expect(server.popOutbound() == null);
+                try std.testing.expectEqual(case.success_status, server.sessions.getPtr(sid).?.status);
             } else |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
-                // The append failed atomically: no half-queued frame.
+                // The append failed atomically: no half-queued frame, no
+                // status flip.
                 try std.testing.expect(server.popOutbound() == null);
+                try std.testing.expectEqual(agent_types.AgentStatus.processing, server.sessions.getPtr(sid).?.status);
             }
         }
     }

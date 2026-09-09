@@ -57,6 +57,12 @@ const STDIO_DISCONNECT_TOOL_WAIT_MESSAGE = "client disconnected while the run wa
 /// never settle "successfully" through `agent_result`; it settles through
 /// the loop-internal failure pair instead.
 const STDIO_EVENT_PUBLICATION_FAILED_MESSAGE = "run event publication failed; event stream truncated before settlement";
+/// Settlement message for a stream that completed with neither a result nor
+/// a recoverable error (§13.4.2, #210 gap 5): `completeWithError` marks the
+/// stream done even when its error-message copy hit OOM, leaving no outcome
+/// to publish or retry — the run settles through the failure pair with this
+/// typed failure rather than being retained forever.
+const STDIO_RUN_WITHOUT_OUTCOME_MESSAGE = "run ended without a deliverable outcome (terminal lost to allocation failure)";
 
 const TEST_AUTH_POLL_ITERS_SHORT: usize = 20; // ~20ms with STDIO_IDLE_SLEEP_NS.
 const TEST_AUTH_POLL_ITERS_DEFAULT: usize = 600; // ~600ms with STDIO_IDLE_SLEEP_NS.
@@ -996,17 +1002,11 @@ const StdioProtocolLoop = struct {
                         // `agent_end`, so the captured terminal projection is
                         // dropped rather than published after the pair.
                         self.dropTerminalProjection(run);
-                        self.publishRunFailurePair(run, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE) catch |err| {
-                            self.handleFailurePairPublicationError(run, idx);
-                            return err;
-                        };
+                        try self.publishRunFailurePair(run, .tool_execution_error, STDIO_DISCONNECT_TOOL_WAIT_MESSAGE);
                         forwarded += 1;
                     } else if (run.stream.getError()) |msg| {
                         self.dropTerminalProjection(run);
-                        self.publishRunFailurePair(run, .internal_error, msg) catch |err| {
-                            self.handleFailurePairPublicationError(run, idx);
-                            return err;
-                        };
+                        try self.publishRunFailurePair(run, .internal_error, msg);
                         forwarded += 1;
                     } else if (run.event_publication_failed) {
                         // (#210 gap 5): events were consumed from the
@@ -1015,10 +1015,7 @@ const StdioProtocolLoop = struct {
                         // "successfully". Same loop-internal failure shape:
                         // one terminal error event, no trailing agent_end.
                         self.dropTerminalProjection(run);
-                        self.publishRunFailurePair(run, .internal_error, STDIO_EVENT_PUBLICATION_FAILED_MESSAGE) catch |err| {
-                            self.handleFailurePairPublicationError(run, idx);
-                            return err;
-                        };
+                        try self.publishRunFailurePair(run, .internal_error, STDIO_EVENT_PUBLICATION_FAILED_MESSAGE);
                         forwarded += 1;
                     } else if (run.stream.getResult()) |result| {
                         // The SDK derives its terminal agent_end from this frame, so an
@@ -1046,6 +1043,19 @@ const StdioProtocolLoop = struct {
                             else => {},
                         };
                         run.settlement_frame_published = true;
+                        forwarded += 1;
+                    } else {
+                        // Done with neither result nor error: the stream's
+                        // `completeWithError` marks it completed even when
+                        // duplicating its error message hit OOM (the outcome
+                        // is then unrecoverable — retrying cannot make it
+                        // reappear), so settle through the failure pair with
+                        // a generic typed failure instead of retaining the
+                        // run forever: the stdio shutdown drain waits on
+                        // `hasActiveAgentRuns()` and would hang (#210 gap 5,
+                        // review).
+                        self.dropTerminalProjection(run);
+                        try self.publishRunFailurePair(run, .internal_error, STDIO_RUN_WITHOUT_OUTCOME_MESSAGE);
                         forwarded += 1;
                     }
                 }
@@ -1090,18 +1100,18 @@ const StdioProtocolLoop = struct {
     /// settlement (§13.4.2) — transactionally (#210 gap 5): progress is
     /// recorded on the run after each frame commits, so a retry after a
     /// propagated failure resumes where it stopped instead of re-publishing
-    /// the projection.
+    /// the projection. The pair's session-status flip rides the ENVELOPE's
+    /// commit (`publishAgentError` flips after appending): while any part
+    /// of the pair is pending the session stays `.processing` — a follow-up
+    /// `agent_message` is then rejected `agent_busy` at admission (clean
+    /// non-admission) rather than accepted and later converted into an
+    /// `AgentBusy` settlement by the retained run.
     fn publishRunFailurePair(
         self: *Self,
         run: *ActiveAgentRun,
         code: AgentProtocolTypes.AgentErrorCode,
         message: []const u8,
     ) !void {
-        // The error status is set BEFORE publication (§13.4.2): a failure
-        // inside the pair then propagates with the session already `.error`
-        // — recoverable, another `agent_message` is admitted — instead of
-        // stuck `.processing`, which neither accepts messages nor evicts.
-        self.agent_server.markSessionError(run.session_id) catch {};
         if (!run.failure_event_published) {
             const event_json = try serializeAgentErrorEvent(self.allocator, message, @tagName(code));
             defer self.allocator.free(event_json);
@@ -1113,27 +1123,16 @@ const StdioProtocolLoop = struct {
             };
             run.failure_event_published = true;
         }
+        // The authoritative envelope is retried until it commits — never
+        // abandoned after the projection: the Zig client settles only on
+        // `agent_error`/`agent_result` (`processEnvelope` merely queues an
+        // `agent_event`), so a projection-only delivery would strand its
+        // session-complete tracking (#210 gap 5, review).
         self.agent_server.publishAgentError(run.session_id, code, message) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => {},
         };
         run.settlement_frame_published = true;
-    }
-
-    /// Handles a propagated failure-pair publication error at the pump's
-    /// call site (#210 gap 5, §13.4.2). Mid-pair — the leading error-event
-    /// projection committed but the settlement envelope did not — the pair
-    /// has already reached the client as one settlement (consumers
-    /// terminate on the pair's first-delivered frame): remove the run so no
-    /// later pump re-processes the stream and re-emits the terminal
-    /// projection; the caller still propagates the error for the host to
-    /// surface. Before the projection — nothing was published — the run
-    /// stays queued and the next pump retries the pair whole.
-    fn handleFailurePairPublicationError(self: *Self, run: *ActiveAgentRun, idx: usize) void {
-        if (run.failure_event_published) {
-            var removed = self.active_agent_runs.orderedRemove(idx);
-            removed.deinit(self.allocator);
-        }
     }
 
     /// Drops the run's captured trailing `agent_end` projection — the
@@ -5060,10 +5059,11 @@ test "failure-pair settlement is transactional under allocation failure: single 
             if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null) error_envelopes += 1;
         }
         // The pair is ONE settlement (§13.4.2): its leading projection is
-        // never re-emitted by a retry; the envelope commits unless the run
-        // was already removed mid-pair (the projection alone settled it).
+        // never re-emitted by a retry, and the authoritative envelope — the
+        // frame the Zig client actually settles on — is retried until it
+        // commits, so it is ALWAYS delivered exactly once.
         try std.testing.expectEqual(@as(usize, 1), error_events);
-        try std.testing.expect(error_envelopes <= 1);
+        try std.testing.expectEqual(@as(usize, 1), error_envelopes);
         try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
         try std.testing.expectEqual(
             AgentProtocolTypes.AgentStatus.@"error",
@@ -5400,6 +5400,136 @@ test "a settled run retrying its trailing projection does not make the session b
     for (outbound.items) |line| {
         try std.testing.expect(std.mem.find(u8, line, "AgentBusy") == null);
     }
+}
+
+test "a pending result publication keeps the session non-admissible until the retry commits" {
+    const allocator = std.testing.allocator;
+
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.registerApiProvider(.{
+        .api = "fixture-ok-api",
+        .stream = fixtureOkStream,
+        .stream_simple = fixtureOkStreamSimple,
+    }, "test-fixtures");
+    var stdio_loop = StdioProtocolLoop.initForTesting(allocator, &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const model_ref_text = "fixture/fixture-ok-api@fixture-model";
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    // The state a failed result publication leaves (review on #210 gap 5):
+    // the run is retained with its settlement uncommitted and — because the
+    // status flip now rides the append — the session is still
+    // `.processing`, exactly as an admitted run implies.
+    const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
+    completeManualRunWithResult(run);
+    stdio_loop.agent_server.sessions.getPtr(session_id).?.status = .processing;
+
+    // A follow-up message while the result publication is pending is
+    // REJECTED at admission (clean non-admission: `agent_busy`, sequence
+    // not consumed) — not accepted and later converted into an `AgentBusy`
+    // internal-error settlement by the retained run.
+    const message_req = try makeAgentMessageEnvelopeJson(allocator, session_id, model_ref_text);
+    defer allocator.free(message_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+    _ = try stdio_loop.drainOutbound(&outbound);
+
+    var saw_busy_rejection = false;
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "AgentBusy") == null);
+        if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
+            std.mem.find(u8, line, "agent_busy") != null)
+        {
+            saw_busy_rejection = true;
+        }
+    }
+    try std.testing.expect(saw_busy_rejection);
+
+    // The retry commits the result: the session becomes admissible again —
+    // the same message is now admitted (its sequence was never consumed).
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.ready,
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(message_req));
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.processing,
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
+    for (0..TEST_AGENT_POLL_ITERS_DEFAULT) |_| {
+        try pumpAndDrainStdioLoop(&stdio_loop, &outbound);
+        if (!stdio_loop.hasActiveAgentRuns()) break;
+        compat.time.sleepNs(STDIO_IDLE_SLEEP_NS);
+    }
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+}
+
+test "a stream completed without an outcome settles with a typed failure instead of hanging" {
+    const allocator = std.testing.allocator;
+
+    var failing = std.testing.FailingAllocator.init(allocator, .{});
+    var registry = api_registry.ApiRegistry.init(allocator);
+    defer registry.deinit();
+    var stdio_loop = StdioProtocolLoop.initForTesting(failing.allocator(), &registry);
+    defer stdio_loop.deinit();
+
+    var outbound = std.ArrayList([]const u8).empty;
+    defer {
+        clearOwnedLines(allocator, &outbound);
+        outbound.deinit(allocator);
+    }
+
+    const session_id = AgentProtocolTypes.generateSessionId();
+    const start_req = try makeAgentStartEnvelopeJson(allocator, session_id, "fixture/fixture-ok-api@fixture-model");
+    defer allocator.free(start_req);
+    try std.testing.expect(try stdio_loop.dispatchInboundLine(start_req));
+    const generation = stdio_loop.agent_server.sessionGeneration(session_id).?;
+
+    const run = try appendManualAgentRun(&stdio_loop, session_id, generation);
+    // `completeWithError` marks the stream done even when copying its error
+    // message hits OOM (review on #210 gap 5): done with neither an error
+    // nor a result — no branch of the settlement chain has an outcome to
+    // publish, and retrying can never produce one.
+    failing.fail_index = failing.alloc_index;
+    run.stream.completeWithError("lost outcome");
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expect(run.stream.isDone());
+    try std.testing.expect(run.stream.getError() == null);
+
+    // The run must still settle — through the generic failure pair — and be
+    // removed, or `hasActiveAgentRuns()` would hang the stdio shutdown.
+    _ = try stdio_loop.pumpBackground();
+    _ = try stdio_loop.drainOutbound(&outbound);
+
+    try std.testing.expect(!stdio_loop.hasActiveAgentRuns());
+    var saw_outcome_settlement = false;
+    for (outbound.items) |line| {
+        try std.testing.expect(std.mem.find(u8, line, "\"type\":\"agent_result\"") == null);
+        if (std.mem.find(u8, line, "\"type\":\"agent_error\"") != null and
+            std.mem.find(u8, line, STDIO_RUN_WITHOUT_OUTCOME_MESSAGE) != null)
+        {
+            saw_outcome_settlement = true;
+        }
+    }
+    try std.testing.expect(saw_outcome_settlement);
+    try std.testing.expectEqual(
+        AgentProtocolTypes.AgentStatus.@"error",
+        stdio_loop.agent_server.sessions.get(session_id).?.status,
+    );
 }
 
 test "stdio protocol loop forwards provider event result and error envelopes" {

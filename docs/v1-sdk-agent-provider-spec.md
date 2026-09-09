@@ -1309,17 +1309,34 @@ server eviction (rule 6), and holds no transcript and no persistence.
          `agent_result` publication keeps the run queued and propagates, the
          next pump retries the frame, and the trailing `agent_end` projection
          publishes ONLY after the frame commits — a failed result publication
-         can no longer produce a false-success projection. A run whose
-         settlement frame committed no longer occupies the session's
+         can no longer produce a false-success projection. The session's
+         status flip rides the append (commit-then-flip): while the result
+         publication is pending the session stays `.processing`, so a
+         follow-up `agent_message` is rejected `agent_busy` at admission
+         (clean non-admission) rather than accepted and later converted into
+         an `AgentBusy` internal-error settlement by the retained run. A run
+         whose settlement frame committed no longer occupies the session's
          one-active-run slot while it retries the trailing projection: the
          next `agent_message` is admitted (the late trailing `agent_end` is
          the §13.4.3 stale-`agent_end` interleave consumers drain per §6.1).
        - the failure pair: the leading error-event projection and the
          settlement envelope each record their commitment; a failure before
          the projection retries the pair whole; a failure BETWEEN them (the
-         projection delivered, the envelope not) removes the run — the pair
-         is ONE settlement delivered by its first frame, so the projection is
-         never re-emitted — and the error propagates.
+         projection delivered, the envelope not) retries ONLY the envelope —
+         the projection is never re-emitted, and the envelope is never
+         abandoned after its projection because it is the frame clients
+         settle on (the Zig `AgentProtocolClient` marks a session complete
+         only on `agent_error`/`agent_result`/`agent_stopped`; a bare
+         `agent_event` is merely queued). The session's `.error` flip rides
+         the envelope's commit, so a pair being published or retried keeps
+         the session non-admissible exactly like a pending result.
+       - a stream that completed with NEITHER a result nor a recoverable
+         error — `completeWithError` marks the stream done even when copying
+         its error message hits OOM, leaving no outcome to publish and none
+         that a retry could produce — settles through the failure pair with
+         a generic typed failure; the run is never retained on an outcome
+         that cannot appear (the stdio shutdown drain waits on the run
+         list).
        - ORDINARY `agent_event` frames: an event consumed from the run stream
          but not committed to the outbox (serialization or publication
          failure) cannot be reconstructed; the run is marked truncated and
