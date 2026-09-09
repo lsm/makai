@@ -955,7 +955,7 @@ Rules:
   sequence control surface (no rollback, no explicit-sequence send), so
   same-sequence retries through that client are unsupported — callers needing that
   discipline must drive the transport directly until sequence control is exposed
-  (`[planned — #204 gap 7]`).
+  (`[planned — #210 gap 7]`).
   `agent_status`, `ping`, `tool_list`, `models_request`, and `goodbye` never
   consume inbound sequence. `goodbye` is accepted silently: it neither tears down a
   session nor produces a reply — the session remains usable afterward (only the
@@ -1224,7 +1224,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
    at either settles cleanup. Both current clients advance before the outcome is
    known and send only the advanced value, so their cleanup stop fails in the
    rolled-back case and the owned session leaks indefinitely; the fix (probing,
-   or rollback/explicit-sequence control) is `[planned — #204 gap 7]`. A start
+   or rollback/explicit-sequence control) is `[planned — #210 gap 7]`. A start
    rejected before admission
    (`agent_busy`, invalid sequence, `nack`) never admits. Admission is not
    settlement.
@@ -1273,7 +1273,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
        out-of-memory failure in the RESULT-publication path is a further current
        exception: the host ignores publication errors (`makai.zig` `pumpAgentRuns`
        `catch {}`), so under memory pressure an admitted run can emit no
-       settlement at all (#204 gap 5). Worse, the host does not stop at that
+       settlement at all (#210 gap 5). Worse, the host does not stop at that
        failure: it proceeds to publish the saved trailing `agent_end`, and if that
        second publication succeeds, SDK consumers report SUCCESS despite no
        authoritative `agent_result` having been emitted — a false-success
@@ -1282,7 +1282,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
        the pending tool request is removed from the bridge before its envelope is
        built, so an allocation failure in between frees the request without
        emitting `tool_execute` — the agent thread blocks in the tool wait forever
-       and the run settles never (transactional publication required, #204 gap 5).
+       and the run settles never (transactional publication required, #210 gap 5).
        Outbox delivery shares the failure: an envelope is popped (removed) before
        it is serialized and written, so an allocation or write failure destroys an
        already-built frame — an `agent_result` lost this way leaves the completed
@@ -1294,13 +1294,13 @@ server eviction (rule 6), and holds no transcript and no persistence.
        stream before publication and publication failures are swallowed, so a
        dropped delta or tool-lifecycle event is never reconstructed — a stream
        that still settles successfully can be silently truncated (all part of
-       #204 gap 5's transactional-publication scope). An OOM BETWEEN the two
+       #210 gap 5's transactional-publication scope). An OOM BETWEEN the two
        frames of the
        failure pair is the same exception from the other side: the event is
        published, the envelope publication fails, the completed run stays queued,
        and the next pump re-processes the same stream error and re-emits the
        terminal event projection — consumers can observe multiple projections
-       under sustained memory pressure (also #204 gap 5). Run-START failures
+       under sustained memory pressure (also #210 gap 5). Run-START failures
        differ from active-stream errors: the pending message is consumed before
        the error pair is published and no active run exists to stay queued, so a
        mid-pair failure there emits only the lone event projection, never
@@ -1323,7 +1323,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
 3. Single terminal arbiter `[current]`: a run that reaches its own outcome settles
    exactly once, via result XOR error, never both — absent publication failure:
    under memory pressure a run can emit no settlement or re-emit its terminal
-   projection (§13.4.2's OOM exceptions; #204 gap 5). Children settle first: pending
+   projection (§13.4.2's OOM exceptions; #210 gap 5). Children settle first: pending
    tool work resolves and the trailing `agent_end` is published only after
    `agent_result`. Duplicate or late frames after settlement (e.g. a stale
    `agent_end` read by a follow-up run on the same id) MUST NOT produce a second
@@ -1343,7 +1343,7 @@ server eviction (rule 6), and holds no transcript and no persistence.
    nonetheless closed by `in_reply_to` correlation (`[current — #210]`, §13.1): a
    delayed old `tool_result` names the old `tool_execute`'s `message_id` and is
    discarded against a later same-id call; only the leaked bridge memory remains
-   (still part of the stop transaction in #204 gap 5). The same failure occurs even when the reply IS
+   (still part of the stop transaction in #210 gap 5). The same failure occurs even when the reply IS
    built: synchronous replies are serialized and written directly, outside the
    outbox, and a failure there propagates before the run-cancel path — session
    removed, no `agent_stopped`, cleanup skipped (the stop transaction in #204
@@ -1441,7 +1441,7 @@ Rules:
    duplicate provider content or tool side effects (the SDK gates retry on no content
    yielded and no tools executed). `[current exception]` the gate is
    event-delivery-based: a `tool_execute` that was executed while its tool-lifecycle
-   events were dropped by a publication failure (§13.4.2, #204 gap 5) is invisible
+   events were dropped by a publication failure (§13.4.2, #210 gap 5) is invisible
    to the retry gate, so `auto_once` can re-run after a tool already executed.
    Tracking tool execution independently of event delivery is `[planned — #205]`;
    until then the no-duplicate guarantee holds absent publication failure.
